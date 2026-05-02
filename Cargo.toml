@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    # More crates land in subsequent tasks (rupu-workspace, rupu-auth,
-    # rupu-providers, rupu-tools).
+    # More crates land in subsequent tasks (rupu-auth, rupu-providers,
+    # rupu-tools).
     "crates/rupu-transcript",
     "crates/rupu-config",
+    "crates/rupu-workspace",
 ]
 
 [workspace.package]
