@@ -9,11 +9,11 @@
 //! workspace")` on the ToolOutput. The tool itself returns `Ok(...)` —
 //! the agent sees the error and decides what to do.
 
+use crate::path_scope::is_inside;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::Path;
 use std::time::Instant;
 
 #[derive(Deserialize)]
@@ -69,23 +69,4 @@ fn err_output(started: Instant, msg: String) -> ToolOutput {
         duration_ms: started.elapsed().as_millis() as u64,
         derived: None,
     }
-}
-
-/// True if `candidate` (relative or absolute) resolves into `root`.
-/// Canonicalizes both ends; falls back to the parent for missing
-/// candidates so we can validate writes too.
-fn is_inside(root: &Path, candidate: &Path) -> bool {
-    let Ok(root) = root.canonicalize() else {
-        return false;
-    };
-    let mut cur = candidate.to_path_buf();
-    if !cur.exists() {
-        if let Some(parent) = cur.parent() {
-            cur = parent.to_path_buf();
-        }
-    }
-    let Ok(cur) = cur.canonicalize() else {
-        return false;
-    };
-    cur.starts_with(&root)
 }

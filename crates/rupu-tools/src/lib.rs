@@ -14,6 +14,8 @@
 
 pub mod tool;
 
+mod path_scope;
+
 // implemented in Task 18 (PermissionGate decision API)
 pub mod permission;
 // implemented in Task 19 (line-numbered output + workspace-scope check)
