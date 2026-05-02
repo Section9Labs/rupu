@@ -9,6 +9,7 @@ pub mod cmd;
 pub mod crash;
 pub mod logging;
 pub mod paths;
+pub mod provider_factory;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
