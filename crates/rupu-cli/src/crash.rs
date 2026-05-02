@@ -21,7 +21,10 @@ fn write_crash_log(info_display: &str) -> anyhow::Result<()> {
     paths::ensure_dir(&cache)?;
     let now = chrono::Utc::now().to_rfc3339();
     let path = cache.join(format!("crash-{now}.log"));
-    let body = format!("{info_display}\n\n{}", std::backtrace::Backtrace::force_capture());
+    let body = format!(
+        "{info_display}\n\n{}",
+        std::backtrace::Backtrace::force_capture()
+    );
     std::fs::write(&path, body)?;
     eprintln!("rupu: crash log written to {}", path.display());
     Ok(())

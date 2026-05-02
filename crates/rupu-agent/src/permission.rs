@@ -127,21 +127,21 @@ impl<'r, 'w, W: Write> PermissionPrompt<'r, 'w, W> {
     }
 }
 
-impl<'w> PermissionPrompt<'static, 'w, std::io::StderrLock<'w>> {
+impl<'w> PermissionPrompt<'static, 'w, std::io::Stderr> {
     /// Constructor for the CLI's `Ask` mode: wraps real `stdin` for
-    /// input and a borrowed `stderr` lock for output.
+    /// input and a borrowed `Stderr` for output.
     ///
     /// Returns a prompt whose reader is `stdin()` boxed behind
     /// `dyn BufRead + 'static`, and whose writer is the provided
-    /// `&mut StderrLock`. The caller is responsible for holding the
-    /// `StderrLock` alive for the duration of the prompt — typically by
-    /// stashing it in a local
-    /// `let mut stderr = std::io::stderr().lock();` and passing
-    /// `&mut stderr`.
+    /// `&mut Stderr`. The caller stashes a stderr handle in a local
+    /// (`let mut stderr = std::io::stderr();`) and passes `&mut stderr`.
+    /// `Stderr` (not `StderrLock`) implements `Write` directly and
+    /// re-locks per-write — fine for interactive prompts where each
+    /// write is small and operator-paced.
     ///
     /// Output goes to stderr (not stdout) so any piped command output
     /// stays clean — interactive prompts are operator UI, not data.
-    pub fn for_stdio(stderr: &'w mut std::io::StderrLock<'w>) -> Self {
+    pub fn for_stdio(stderr: &'w mut std::io::Stderr) -> Self {
         let reader: Box<dyn BufRead + 'static> = Box::new(BufReader::new(std::io::stdin()));
         Self {
             reader,
