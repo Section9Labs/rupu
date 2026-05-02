@@ -127,6 +127,29 @@ impl<'r, 'w, W: Write> PermissionPrompt<'r, 'w, W> {
     }
 }
 
+impl<'w> PermissionPrompt<'static, 'w, std::io::StderrLock<'w>> {
+    /// Constructor for the CLI's `Ask` mode: wraps real `stdin` for
+    /// input and a borrowed `stderr` lock for output.
+    ///
+    /// Returns a prompt whose reader is `stdin()` boxed behind
+    /// `dyn BufRead + 'static`, and whose writer is the provided
+    /// `&mut StderrLock`. The caller is responsible for holding the
+    /// `StderrLock` alive for the duration of the prompt — typically by
+    /// stashing it in a local
+    /// `let mut stderr = std::io::stderr().lock();` and passing
+    /// `&mut stderr`.
+    ///
+    /// Output goes to stderr (not stdout) so any piped command output
+    /// stays clean — interactive prompts are operator UI, not data.
+    pub fn for_stdio(stderr: &'w mut std::io::StderrLock<'w>) -> Self {
+        let reader: Box<dyn BufRead + 'static> = Box::new(BufReader::new(std::io::stdin()));
+        Self {
+            reader,
+            writer: stderr,
+        }
+    }
+}
+
 fn render_input(v: &Value) -> String {
     let s = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
     let mut lines: Vec<String> = Vec::new();
