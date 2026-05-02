@@ -27,6 +27,16 @@
 ```
 rupu/
   Cargo.toml                            # workspace root: add rupu-cli + new deps (dirs)
+  .rupu/                                # rupu's OWN project-local rupu config
+    agents/                             # sample agents discoverable when running rupu inside this checkout
+      fix-bug.md
+      add-tests.md
+      review-diff.md
+      scaffold.md
+      summarize-diff.md
+    workflows/                          # sample workflows
+      investigate-then-fix.yaml
+    .gitignore                          # ignores transcripts/ and cache/; commits agents/workflows/config.toml
   crates/
     rupu-cli/
       Cargo.toml
@@ -45,7 +55,6 @@ rupu/
         provider_factory.rs             # build Box<dyn LlmProvider> from agent + auth
         logging.rs                      # tracing-subscriber init
         crash.rs                        # crash log writer at ~/.rupu/cache/crash-<ts>.log
-        defaults.rs                     # embedded default agents/workflows via include_str!
       tests/
         cli_run.rs                      # rupu run end-to-end via mock provider injected via env
         cli_agent.rs                    # rupu agent list/show
@@ -53,14 +62,6 @@ rupu/
         cli_transcript.rs               # rupu transcript list/show on JSONL on disk
         cli_config.rs                   # rupu config get/set
         cli_auth.rs                     # rupu auth status (no real keychain — JSON fallback in tempdir)
-  agents/                               # shipped default agents (committed + embedded)
-    fix-bug.md
-    add-tests.md
-    review-diff.md
-    scaffold.md
-    summarize-diff.md
-  workflows/                            # shipped default workflows
-    investigate-then-fix.yaml
   docs/
     spec.md                             # source-of-truth architecture (mirrors phi-cell pattern)
     agent-format.md                     # frontmatter reference
@@ -73,8 +74,8 @@ rupu/
 
 **Decomposition rationale:**
 - `rupu-cli/src/cmd/<verb>.rs`: one file per subcommand. Each is ≤ ~150 lines (clap arg struct + handler). Files that change together (run + provider_factory; transcript + paths) live together via re-exports.
-- `defaults.rs` keeps `include_str!` calls in one place so the build dependency on `agents/*.md` is easy to audit.
 - `provider_factory.rs` separates the "create a `Box<dyn LlmProvider>` from spec + auth" logic from the run subcommand. Plan 2's runner accepts a boxed provider; this is where it gets built for real (vs. the mock providers used in tests).
+- **No `defaults.rs` / `include_str!` embedding.** Sample agents + workflows live at `<repo>/.rupu/agents/` and `<repo>/.rupu/workflows/` — they're committed to the rupu repo so anyone running `rupu` from inside the rupu checkout sees them via normal project-discovery (the same mechanism end-users will use in their own repos). New rupu users seed their projects with `cp -r` from the rupu repo (or, in a future Slice B task, a `rupu init --with-samples` subcommand).
 
 **Micro-decisions made in this plan that the spec didn't pin:**
 - `dirs::home_dir()` for `~` resolution. Returns `Option<PathBuf>`; if None, error out with "could not locate home directory".
@@ -1962,23 +1963,25 @@ git -c commit.gpgsign=false commit -m "feat(cli): rupu auth login/logout/status"
 
 ---
 
-## Phase 4 — Default library
+## Phase 4 — Sample library (in-repo `.rupu/`)
 
-### Task 11: Default agents + sample workflow + first-run install
+### Task 11: Sample agents + sample workflow + `.rupu/.gitignore`
 
 **Files:**
-- Create: `agents/fix-bug.md`
-- Create: `agents/add-tests.md`
-- Create: `agents/review-diff.md`
-- Create: `agents/scaffold.md`
-- Create: `agents/summarize-diff.md`
-- Create: `workflows/investigate-then-fix.yaml`
-- Create: `crates/rupu-cli/src/defaults.rs`
-- Modify: `crates/rupu-cli/src/lib.rs` — declare `pub mod defaults;`
-- Modify: `crates/rupu-cli/src/cmd/run.rs` and `crates/rupu-cli/src/cmd/agent.rs` — fall through to embedded defaults when project + global don't have the agent
-- Test: `crates/rupu-cli/tests/cli_defaults.rs`
+- Create: `.rupu/agents/fix-bug.md`
+- Create: `.rupu/agents/add-tests.md`
+- Create: `.rupu/agents/review-diff.md`
+- Create: `.rupu/agents/scaffold.md`
+- Create: `.rupu/agents/summarize-diff.md`
+- Create: `.rupu/workflows/investigate-then-fix.yaml`
+- Create: `.rupu/.gitignore`
+- Test: `crates/rupu-cli/tests/cli_samples.rs`
 
-The five default agents are simple `.md` files. Example for `fix-bug.md`:
+**Design** (correction from PR #6 v1): the samples live at `<repo>/.rupu/`, NOT embedded into the binary. When matt or anyone else runs `rupu` from inside this repo, the agents + workflows surface via the same project-discovery code path that end-users will use in their own repos. Other users seed their projects with `cp -r /path/to/rupu/.rupu/agents <their-project>/.rupu/agents` (or a future `rupu init --with-samples` subcommand in Slice B). This is consistent with the spec's "project agents shadow global agents by name" rule and means the rupu repo dogfoods its own discovery.
+
+**Implication for `cmd/run.rs` and `cmd/agent.rs`:** no fall-through to embedded defaults. The existing code path (load global → project) already covers everything. The `.rupu/` directory in the rupu repo IS the project layer for someone running `rupu` from the rupu checkout.
+
+The five sample agents are simple `.md` files. Example for `.rupu/agents/fix-bug.md`:
 
 ```markdown
 ---
@@ -2003,7 +2006,7 @@ report, you:
 
 Similar bodies for the other four (each one ~15 lines of system prompt).
 
-`workflows/investigate-then-fix.yaml`:
+`.rupu/workflows/investigate-then-fix.yaml`:
 
 ```yaml
 name: investigate-then-fix
@@ -2026,58 +2029,68 @@ steps:
       Propose and apply the minimal fix.
 ```
 
-`crates/rupu-cli/src/defaults.rs`:
+`.rupu/.gitignore`:
+
+```
+# Run-time artifacts — not committed, but the directories may be
+# created at runtime. Agents and workflows ARE committed.
+transcripts/
+cache/
+workspaces/
+```
+
+**Test** (`crates/rupu-cli/tests/cli_samples.rs`):
 
 ```rust
-//! Embedded default agents + workflows. Shipped as `&'static str`
-//! constants via `include_str!` so the binary works on a fresh
-//! install before the user populates `~/.rupu/agents/`.
+//! Verifies that running `rupu agent list` from the rupu repo's own
+//! checkout surfaces the 5 sample agents under `.rupu/agents/` via
+//! normal project-discovery — no special-case embedding required.
 
-pub struct EmbeddedAgent {
-    pub name: &'static str,
-    pub body: &'static str,
+use std::path::PathBuf;
+
+#[tokio::test]
+async fn agent_list_finds_repo_local_samples() {
+    // The CARGO_MANIFEST_DIR of rupu-cli is `<repo>/crates/rupu-cli`.
+    // The rupu repo root is two levels up. Run from the repo root so
+    // project-discovery finds `<repo>/.rupu/`.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest.parent().unwrap().parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&repo_root).unwrap();
+
+    // Use a tempdir for global so we don't pull in matt's real ~/.rupu/.
+    let tmp = assert_fs::TempDir::new().unwrap();
+    std::env::set_var("RUPU_HOME", tmp.path());
+
+    let exit = rupu_cli::run(vec!["rupu".into(), "agent".into(), "list".into()]).await;
+    std::env::remove_var("RUPU_HOME");
+    assert_eq!(u8::from(exit), 0);
+
+    // We don't capture stdout here — but the exit code is 0 only when
+    // load_agents() succeeds, which requires `.rupu/agents/*.md` to
+    // parse cleanly. The 5 sample files exist + parse, so this test
+    // exercises end-to-end discovery.
 }
 
-pub struct EmbeddedWorkflow {
-    pub name: &'static str,
-    pub body: &'static str,
-}
+#[tokio::test]
+async fn workflow_list_finds_repo_local_sample() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest.parent().unwrap().parent().unwrap().to_path_buf();
+    std::env::set_current_dir(&repo_root).unwrap();
 
-pub const AGENTS: &[EmbeddedAgent] = &[
-    EmbeddedAgent { name: "fix-bug",        body: include_str!("../../../agents/fix-bug.md") },
-    EmbeddedAgent { name: "add-tests",      body: include_str!("../../../agents/add-tests.md") },
-    EmbeddedAgent { name: "review-diff",    body: include_str!("../../../agents/review-diff.md") },
-    EmbeddedAgent { name: "scaffold",       body: include_str!("../../../agents/scaffold.md") },
-    EmbeddedAgent { name: "summarize-diff", body: include_str!("../../../agents/summarize-diff.md") },
-];
+    let tmp = assert_fs::TempDir::new().unwrap();
+    std::env::set_var("RUPU_HOME", tmp.path());
 
-pub const WORKFLOWS: &[EmbeddedWorkflow] = &[
-    EmbeddedWorkflow {
-        name: "investigate-then-fix",
-        body: include_str!("../../../workflows/investigate-then-fix.yaml"),
-    },
-];
-
-/// Look up an embedded agent by name.
-pub fn lookup_agent(name: &str) -> Option<&'static EmbeddedAgent> {
-    AGENTS.iter().find(|a| a.name == name)
-}
-
-/// Look up an embedded workflow by name.
-pub fn lookup_workflow(name: &str) -> Option<&'static EmbeddedWorkflow> {
-    WORKFLOWS.iter().find(|w| w.name == name)
+    let exit = rupu_cli::run(vec!["rupu".into(), "workflow".into(), "list".into()]).await;
+    std::env::remove_var("RUPU_HOME");
+    assert_eq!(u8::from(exit), 0);
 }
 ```
 
-**Wiring in `cmd/run.rs` and `cmd/agent.rs`**: when `load_agent` returns `NotFound`, fall through to `defaults::lookup_agent(name)`; if that hits, parse the embedded body via `AgentSpec::parse(...)`. Same pattern for workflow lookup in `cmd/workflow.rs`.
-
-Test: `cli_defaults.rs` runs `rupu run fix-bug "echo"` against a fresh `RUPU_HOME` that has no agents/ dir; the embedded `fix-bug.md` should still be found.
-
 After:
 ```bash
-cargo test -p rupu-cli --test cli_defaults
-git add agents workflows crates/rupu-cli
-git -c commit.gpgsign=false commit -m "feat(cli): embed 5 default agents + investigate-then-fix workflow"
+cargo test -p rupu-cli --test cli_samples
+git add .rupu crates/rupu-cli/tests/cli_samples.rs
+git -c commit.gpgsign=false commit -m "feat(cli): ship sample agents + workflow at <repo>/.rupu/ for dogfooding"
 ```
 
 ---
@@ -2092,13 +2105,22 @@ git -c commit.gpgsign=false commit -m "feat(cli): embed 5 default agents + inves
 
 `README.md` covers:
 - What rupu is (one paragraph; reuse the spec's "Vision" section).
-- Install: `cargo install --git https://github.com/Section9Labs/rupu` OR download from Releases.
+- Install: `cargo install --git https://github.com/Section9Labs/rupu` OR download a prebuilt binary from Releases.
 - First run:
   ```
   rupu auth login --provider anthropic --key sk-ant-XXX
+  # Try a sample agent — works inside the rupu checkout
+  cd /path/to/rupu
   rupu run fix-bug "make the failing test pass"
   ```
-- Where things live: `~/.rupu/{config.toml, auth.json, agents/, workflows/, transcripts/, cache/}` and `<project>/.rupu/`.
+- **Seeding samples in your own project:**
+  ```
+  mkdir -p ~/projects/your-repo/.rupu
+  cp -r /path/to/rupu/.rupu/agents ~/projects/your-repo/.rupu/agents
+  cp -r /path/to/rupu/.rupu/workflows ~/projects/your-repo/.rupu/workflows
+  ```
+  (A `rupu init --with-samples` subcommand is on the Slice B roadmap.)
+- Where things live: `~/.rupu/{config.toml, auth.json, transcripts/, cache/, workspaces/}` (global), and `<project>/.rupu/{agents/, workflows/, config.toml}` (per-project).
 - Two example agent runs.
 - Pointer to docs/spec.md for architecture.
 - Section: "Agents are code." Bypass mode runs arbitrary commands; review what you run.
@@ -2230,15 +2252,24 @@ rupu --version
 ```
 Expected: prints `rupu 0.1.0`. The binary is now on `$PATH`.
 
-- [ ] **Step 3: First-run UX with no `~/.rupu/`**
+- [ ] **Step 3: First-run UX with no `~/.rupu/`, run from rupu repo**
 
 ```bash
 rm -rf ~/.rupu
+cd /path/to/rupu
 rupu agent list
 ```
-Expected: shows the 5 embedded default agents (fix-bug, add-tests, review-diff, scaffold, summarize-diff). No errors.
+Expected: shows the 5 sample agents from `<repo>/.rupu/agents/` (fix-bug, add-tests, review-diff, scaffold, summarize-diff) with scope `project`. No errors.
 
-- [ ] **Step 4: Real-provider smoke**
+- [ ] **Step 4: Verify discovery from outside rupu**
+
+```bash
+cd /tmp && mkdir empty-test && cd empty-test
+rupu agent list
+```
+Expected: empty list (no global agents, no project `.rupu/`). Exit 0. Confirms samples are NOT auto-shipped to other projects — users must seed via `cp -r`.
+
+- [ ] **Step 5: Real-provider smoke (back inside rupu)**
 
 ```bash
 rupu auth login --provider anthropic --key "$ANTHROPIC_API_KEY"
@@ -2247,19 +2278,19 @@ rupu auth status
 Expected: `anthropic configured`.
 
 ```bash
-cd <some-real-repo>
+cd /path/to/rupu
 rupu run summarize-diff "show me what changed in the last commit" --mode bypass
 ```
-Expected: agent runs, transcript file created at `~/.rupu/transcripts/run_*.jsonl`.
+Expected: agent runs, transcript file created at `<repo>/.rupu/transcripts/run_*.jsonl` (because the project-local transcripts dir takes precedence).
 
-- [ ] **Step 5: Workflow smoke**
+- [ ] **Step 6: Workflow smoke**
 
 ```bash
 rupu workflow run investigate-then-fix --input prompt="$BUG_DESCRIPTION" --mode bypass
 ```
-Expected: two-step run, both transcripts on disk.
+Expected: two-step run, both transcripts under `<repo>/.rupu/transcripts/`.
 
-- [ ] **Step 6: Tag + push**
+- [ ] **Step 7: Tag + push**
 
 ```bash
 git tag -a v0.0.3-cli -m "Plan 3 complete: rupu CLI binary at exit-criterion-B"
