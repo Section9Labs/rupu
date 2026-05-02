@@ -121,6 +121,6 @@ fn iter_yields_all_events_in_order() {
         .filter_map(|r| r.ok())
         .collect();
     assert_eq!(events.len(), 3);
-    matches!(events[0], Event::TurnStart { turn_idx: 0 });
-    matches!(events[2], Event::TurnStart { turn_idx: 1 });
+    assert!(matches!(events[0], Event::TurnStart { turn_idx: 0 }));
+    assert!(matches!(events[2], Event::TurnStart { turn_idx: 1 }));
 }

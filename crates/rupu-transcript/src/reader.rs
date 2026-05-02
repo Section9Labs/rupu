@@ -1,8 +1,16 @@
 //! JSONL reader for transcript events.
 //!
-//! Aborted runs (no `run_complete` event) are surfaced via [`RunSummary`].
-//! Truncated last lines are silently skipped (a partial last line is the
-//! signature of an aborted/crashed write, not corruption to surface).
+//! Aborted runs (no `run_complete` event) are surfaced via [`RunSummary`]
+//! with [`crate::RunStatus::Aborted`].
+//!
+//! Tolerated input variations:
+//!
+//! - **Empty lines** are silently skipped (formatting artifacts, not data).
+//! - **Truncated last lines** are silently skipped (signature of an
+//!   aborted/crashed write, not corruption).
+//! - **Bad JSON lines mid-file** are returned as `Err(ReadError::Parse)`
+//!   from [`JsonlReader::iter`]; [`JsonlReader::summary`] silently
+//!   ignores them since they cannot be a `RunStart` or `RunComplete`.
 
 use crate::event::{Event, RunMode, RunStatus};
 use chrono::{DateTime, Utc};
@@ -22,6 +30,7 @@ pub enum ReadError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RunSummary {
     pub run_id: String,
     pub workspace_id: String,
@@ -47,13 +56,17 @@ impl JsonlReader {
         let mut start: Option<Event> = None;
         let mut complete: Option<Event> = None;
 
+        let mut last_io_err: Option<std::io::Error> = None;
         for ev in Self::iter(path)? {
             match ev {
-                Ok(e @ Event::RunStart { .. }) => start = Some(e),
+                Ok(e @ Event::RunStart { .. }) if start.is_none() => start = Some(e),
                 Ok(e @ Event::RunComplete { .. }) => complete = Some(e),
                 Ok(_) => {}
-                // Bad lines silently ignored (truncated tail of aborted run).
-                Err(_) => {}
+                // Track IO errors so we can surface them if no RunStart was found
+                // (concatenated/truncated runs are expected; permission denied is not).
+                Err(ReadError::Io(e)) => last_io_err = Some(e),
+                // Parse errors are silently ignored — truncated tails are normal.
+                Err(ReadError::Parse(_)) | Err(ReadError::MissingRunStart) => {}
             }
         }
 
@@ -67,6 +80,11 @@ impl JsonlReader {
             mode,
         }) = start
         else {
+            // Surface a real IO error if we hit one; otherwise the file genuinely
+            // lacks a RunStart event.
+            if let Some(e) = last_io_err {
+                return Err(ReadError::Io(e));
+            }
             return Err(ReadError::MissingRunStart);
         };
 
@@ -96,9 +114,14 @@ impl JsonlReader {
         })
     }
 
-    /// Stream events line-by-line. Bad lines yield `Err(ReadError::Parse)`;
-    /// the iterator continues to the next line. Empty lines are skipped
-    /// silently (they're not errors).
+    /// Stream events line-by-line.
+    ///
+    /// - Empty lines are skipped silently (they're not data).
+    /// - Bad JSON lines yield `Err(ReadError::Parse)`; iteration continues
+    ///   to the next line. Callers that want to stop at the first parse
+    ///   error should call `.take_while(Result::is_ok)`.
+    /// - I/O errors during the read yield `Err(ReadError::Io)`; iteration
+    ///   continues but most callers should treat this as fatal.
     pub fn iter(
         path: impl AsRef<Path>,
     ) -> Result<impl Iterator<Item = Result<Event, ReadError>>, ReadError> {
