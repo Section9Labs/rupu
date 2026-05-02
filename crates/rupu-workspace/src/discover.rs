@@ -12,7 +12,7 @@ pub enum DiscoverError {
 }
 
 /// Result of walking up from `pwd` looking for a `.rupu/` directory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovery {
     /// First ancestor of `canonical_pwd` that contains a `.rupu/` dir,
     /// or `None` if none was found (no project root).
