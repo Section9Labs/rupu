@@ -574,6 +574,7 @@ fn normalize_tool_call_id(id: &str) -> String {
 }
 
 /// Parse a complete (non-streaming) Responses API response into LlmResponse.
+#[allow(dead_code)]
 fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError> {
     let id = json["id"].as_str().unwrap_or("").to_string();
     let model = json["model"].as_str().unwrap_or("").to_string();

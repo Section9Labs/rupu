@@ -29,6 +29,25 @@ evolves independently. If phi-cell's provider stack gets a meaningful
 improvement we want to bring back, port it as a deliberate change with its
 own commit and PR — not a merge.
 
+## Adaptations to rupu's stricter lints
+
+phi-cell's clippy config is looser than rupu's `clippy::all = deny`.
+The following lifted-code lint failures were fixed in the lift commit's
+follow-up. They are mechanical conformance changes, not behavioral:
+
+- `fs2::FileExt::unlock` (3 call sites: anthropic.rs, auth/credential_store.rs,
+  credential_store.rs) replaced with `drop(...)` — `unlock()` is stable
+  since Rust 1.89; rupu's MSRV is 1.77. `drop()` is semantically equivalent
+  for the file-lock release path.
+- `parse_response` in openai_codex.rs marked `#[allow(dead_code)]` —
+  preserves upstream code, may become live in Plan 2.
+- Type-aliased the complex return type of credential_store.rs:102.
+- Added `Default` impl for `ModelPool` matching its `new()`.
+- Collapsed nested `if`/`match` in model_pool.rs:316.
+- Replaced manual `Default for BudgetMode` with `#[derive(Default)]`.
+- Replaced `0u64 * 1000` with `0u64` in github_copilot.rs test.
+- Replaced `events.len() >= 1` with `!events.is_empty()` in google_gemini.rs test.
+
 ## How to refresh from upstream (manual)
 
 If you ever need to bring in newer phi-cell work, do NOT do a tree-merge.

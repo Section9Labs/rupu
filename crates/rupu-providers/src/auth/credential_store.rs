@@ -185,7 +185,6 @@ pub fn save_provider_auth(
     std::fs::rename(&temp, path)
         .map_err(|e| ProviderError::AuthConfig(format!("cannot rename: {e}")))?;
 
-    lock_file.unlock().ok();
     drop(lock_file);
     let _ = std::fs::remove_file(&lock_path);
 

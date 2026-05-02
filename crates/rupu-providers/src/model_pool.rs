@@ -108,6 +108,12 @@ pub struct ModelPool {
     models: RwLock<Vec<ModelInfo>>,
 }
 
+impl Default for ModelPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModelPool {
     /// Create an empty pool.
     pub fn new() -> Self {
@@ -312,15 +318,13 @@ impl ModelPool {
                         }
                     }
                 }
-                ModelState::QuotaExhausted { recheck_after } => {
-                    if now >= *recheck_after {
-                        model.status.state = ModelState::Available;
-                        debug!(
-                            provider = %model.provider,
-                            model = model.id.as_str(),
-                            "model recovered from quota exhaustion"
-                        );
-                    }
+                ModelState::QuotaExhausted { recheck_after } if now >= *recheck_after => {
+                    model.status.state = ModelState::Available;
+                    debug!(
+                        provider = %model.provider,
+                        model = model.id.as_str(),
+                        "model recovered from quota exhaustion"
+                    );
                 }
                 ModelState::Degraded => {
                     // Auto-recover after 5 minutes

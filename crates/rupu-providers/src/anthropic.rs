@@ -310,7 +310,6 @@ pub fn save_auth_json(path: &Path, auth_method: &AuthMethod) -> Result<(), Provi
     std::fs::rename(&temp, path)
         .map_err(|e| ProviderError::AuthConfig(format!("cannot rename: {e}")))?;
 
-    lock_file.unlock().ok();
     drop(lock_file);
     let _ = std::fs::remove_file(&lock_path);
 

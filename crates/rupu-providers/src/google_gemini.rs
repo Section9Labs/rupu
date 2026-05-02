@@ -1039,7 +1039,7 @@ mod tests {
         let response = acc.into_response().unwrap();
         assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
         assert_eq!(response.tool_calls().len(), 1);
-        assert!(events.len() >= 1); // ToolUseStart + InputJsonDelta
+        assert!(!events.is_empty()); // ToolUseStart + InputJsonDelta
     }
 
     #[test]

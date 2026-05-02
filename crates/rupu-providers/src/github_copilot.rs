@@ -1144,7 +1144,7 @@ mod tests {
     #[test]
     fn test_expiry_saturating_sub() {
         // expires_at=0 should not underflow
-        let expires_ms = (0u64 * 1000).saturating_sub(5 * 60 * 1000);
+        let expires_ms = 0u64.saturating_sub(5 * 60 * 1000);
         assert_eq!(expires_ms, 0);
         assert!(is_copilot_expired(expires_ms));
     }

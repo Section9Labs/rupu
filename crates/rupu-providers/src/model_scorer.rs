@@ -8,18 +8,13 @@ use crate::routing_history::RoutingHistory;
 use crate::task_classifier::TaskType;
 
 /// Budget enforcement mode for the smart router.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetMode {
+    #[default]
     Unlimited,
     CostAware,
     BudgetStrict,
-}
-
-impl Default for BudgetMode {
-    fn default() -> Self {
-        Self::Unlimited
-    }
 }
 
 /// Budget state snapshot passed from CostTracker.

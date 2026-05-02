@@ -67,6 +67,14 @@ pub struct CredentialStore {
     invalidations: RwLock<HashMap<ProviderId, InvalidationEntry>>,
 }
 
+type CredentialStoreLoadResult = Result<
+    (
+        HashMap<ProviderId, AuthCredentials>,
+        HashMap<ProviderId, String>,
+    ),
+    ProviderError,
+>;
+
 impl CredentialStore {
     /// Load the credential store from disk. Creates files if they don't exist.
     ///
@@ -97,15 +105,7 @@ impl CredentialStore {
         })
     }
 
-    fn read_auth_file(
-        path: &Path,
-    ) -> Result<
-        (
-            HashMap<ProviderId, AuthCredentials>,
-            HashMap<ProviderId, String>,
-        ),
-        ProviderError,
-    > {
+    fn read_auth_file(path: &Path) -> CredentialStoreLoadResult {
         let content = if path.exists() {
             fs::read_to_string(path).map_err(|e| {
                 ProviderError::AuthConfig(format!("cannot read {}: {e}", path.display()))
@@ -214,7 +214,6 @@ impl CredentialStore {
         fs::rename(&tmp, &self.auth_path)
             .map_err(|e| ProviderError::AuthConfig(format!("rename failed: {e}")))?;
 
-        lock_file.unlock().ok();
         drop(lock_file);
         let _ = fs::remove_file(&lock_path);
 
