@@ -25,15 +25,37 @@ pub enum BackendChoice {
 /// Cache file location for the probe result.
 #[derive(Debug, Clone)]
 pub struct ProbeCache {
-    pub path: PathBuf,
+    path: PathBuf,
 }
 
 impl ProbeCache {
+    /// Construct a cache pointing at `path` (typically
+    /// `~/.rupu/cache/auth-backend.json`).
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Cache file path.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     /// Read the cached backend choice, if any. Returns `None` if the
-    /// file is absent or cannot be parsed.
+    /// file is absent. A corrupt cache file emits a `tracing::warn!`
+    /// before returning `None`, so silent re-probes are diagnosable.
     pub fn read(&self) -> Option<BackendChoice> {
         let text = std::fs::read_to_string(&self.path).ok()?;
-        serde_json::from_str(&text).ok()
+        match serde_json::from_str(&text) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "auth-backend cache is corrupt; will re-probe"
+                );
+                None
+            }
+        }
     }
 
     /// Write `c` as the cached choice. Creates parent directories as
@@ -42,7 +64,9 @@ impl ProbeCache {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.path, serde_json::to_string(&c).unwrap())
+        let body = serde_json::to_string(&c)
+            .expect("BackendChoice serialization is infallible (Copy enum, two unit variants)");
+        std::fs::write(&self.path, body)
     }
 
     /// Remove the cache file. No-op if it doesn't exist.
@@ -78,7 +102,7 @@ pub fn select_backend(cache: &ProbeCache, fallback_path: PathBuf) -> Box<dyn Aut
         if let Err(e) = cache.write(chosen) {
             warn!(
                 error = %e,
-                cache = %cache.path.display(),
+                cache = %cache.path().display(),
                 "failed to write probe cache; will re-probe next run"
             );
         }

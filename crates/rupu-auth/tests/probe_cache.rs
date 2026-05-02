@@ -5,9 +5,7 @@ use rupu_auth::ProbeCache;
 fn writes_cache_file_on_first_call() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let cache_child = tmp.child("cache.json");
-    let cache = ProbeCache {
-        path: cache_child.to_path_buf(),
-    };
+    let cache = ProbeCache::new(cache_child.to_path_buf());
 
     let _backend = rupu_auth::select_backend(&cache, tmp.child("auth.json").to_path_buf());
 
@@ -18,9 +16,7 @@ fn writes_cache_file_on_first_call() {
 fn second_call_uses_cached_choice() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let cache_path = tmp.child("cache.json").to_path_buf();
-    let cache = ProbeCache {
-        path: cache_path.clone(),
-    };
+    let cache = ProbeCache::new(cache_path);
 
     let b1 = rupu_auth::select_backend(&cache, tmp.child("auth.json").to_path_buf());
     let b2 = rupu_auth::select_backend(&cache, tmp.child("auth.json").to_path_buf());
@@ -31,9 +27,7 @@ fn second_call_uses_cached_choice() {
 fn invalidate_clears_cache() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let cache_child = tmp.child("cache.json");
-    let cache = ProbeCache {
-        path: cache_child.to_path_buf(),
-    };
+    let cache = ProbeCache::new(cache_child.to_path_buf());
 
     let _ = rupu_auth::select_backend(&cache, tmp.child("auth.json").to_path_buf());
     cache.invalidate().unwrap();
