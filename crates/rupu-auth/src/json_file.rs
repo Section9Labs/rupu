@@ -38,11 +38,12 @@ pub struct JsonFileBackend {
 
 impl JsonFileBackend {
     fn read(&self) -> Result<Stored, AuthError> {
-        if !self.path.exists() {
-            return Ok(Stored::default());
-        }
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Stored::default()),
+            Err(e) => return Err(e.into()),
+        };
         self.warn_on_wrong_mode();
-        let text = std::fs::read_to_string(&self.path)?;
         let s: Stored = serde_json::from_str(&text)?;
         Ok(s)
     }
@@ -62,7 +63,13 @@ impl JsonFileBackend {
         if let Ok(meta) = std::fs::metadata(&self.path) {
             let mut perms = meta.permissions();
             perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(&self.path, perms);
+            if let Err(e) = std::fs::set_permissions(&self.path, perms) {
+                warn!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "could not enforce mode 0600 on auth.json — file may be readable by other users"
+                );
+            }
         }
     }
 
@@ -105,8 +112,10 @@ impl AuthBackend for JsonFileBackend {
 
     fn forget(&self, p: ProviderId) -> Result<(), AuthError> {
         let mut s = self.read()?;
-        s.secrets.remove(p.as_str());
-        self.write(&s)
+        if s.secrets.remove(p.as_str()).is_some() {
+            self.write(&s)?;
+        }
+        Ok(())
     }
 
     fn name(&self) -> &'static str {
