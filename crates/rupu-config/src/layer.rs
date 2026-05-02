@@ -1,7 +1,9 @@
 //! Global+project config layering.
 //!
 //! Real implementation lands in Task 8 of Plan 1; this stub exists so
-//! the public surface of `rupu-config` is stable from the skeleton stage.
+//! the function signature of `layer_files` is stable from the skeleton
+//! stage. `LayerError` variants will gain `path: String` context fields
+//! in Task 8 (current `#[from]` tuple variants are placeholders).
 
 use thiserror::Error;
 
