@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    # Crates land in subsequent tasks (rupu-transcript, rupu-config, rupu-workspace,
-    # rupu-auth, rupu-providers, rupu-tools). Empty during workspace bootstrap so
-    # `cargo metadata` does not fail on missing member directories.
+    # More crates land in subsequent tasks (rupu-config, rupu-workspace,
+    # rupu-auth, rupu-providers, rupu-tools).
+    "crates/rupu-transcript",
 ]
 
 [workspace.package]
