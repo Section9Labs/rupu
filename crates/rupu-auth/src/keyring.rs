@@ -7,10 +7,16 @@
 //! [`keyring`]: ::keyring
 
 use crate::backend::{AuthBackend, AuthError, ProviderId};
+use tracing::warn;
 
 /// Service name used as the keychain entry namespace. All rupu
 /// secrets share this service; the keychain entry username is the
 /// provider id (`anthropic`, `openai`, etc.).
+///
+/// Hardcoded for v0; multi-environment support (e.g., separate
+/// `rupu-dev` and `rupu-prod` namespaces) is deferred to Slice C
+/// where it ties into workspace/profile config. Until then, all rupu
+/// installs on the same machine share keychain entries.
 const SERVICE: &str = "rupu";
 
 /// Backend wrapping the OS keychain. Construct via [`Self::new`] or
@@ -33,8 +39,12 @@ impl KeyringBackend {
         // Try set then delete; either failing means we should fall back.
         entry.set_password("probe")?;
         // Best-effort cleanup. If the delete fails, the next probe will
-        // re-set and re-delete; the entry is harmless either way.
-        let _ = entry.delete_credential();
+        // re-set and re-delete; the entry is harmless either way. Warn
+        // so a stale `rupu/__probe__` entry is diagnosable in the user's
+        // keychain UI.
+        if let Err(e) = entry.delete_credential() {
+            warn!(error = %e, "keyring probe: delete_credential failed; stale rupu/__probe__ entry may persist");
+        }
         Ok(())
     }
 
