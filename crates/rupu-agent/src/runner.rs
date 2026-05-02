@@ -373,7 +373,7 @@ fn parse_file_edit_kind(s: &str) -> FileEditKind {
 // ---------------------------------------------------------------------------
 
 /// One scripted assistant turn the [`MockProvider`] will replay.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ScriptedTurn {
     AssistantText {
         text: String,

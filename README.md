@@ -1,0 +1,182 @@
+# rupu
+
+**Status:** Slice A — local CLI
+
+---
+
+## What is rupu?
+
+`rupu` is "Okesu, but for code development in an agentic engineering world": a CLI for
+orchestrating coding agents across repositories, triggered by issues from any tracker,
+with sandboxed sessions that can be saved and resumed. The full vision spans SaaS,
+native desktop, and multi-SCM connectors. **Slice A** — what you have now — is the
+local-only foundation: a single Rust binary that loads agent definitions from your
+project, drives a real LLM provider, and writes a JSONL transcript on every run.
+Slice B adds SCM connectors and issue-tracker triggers; Slice C adds the control plane,
+remote sandboxes, and session persistence.
+
+---
+
+## Install
+
+**From source (requires Rust 1.77+):**
+
+```sh
+cargo install --git https://github.com/Section9Labs/rupu
+```
+
+**Prebuilt binary:**
+
+Download the tarball for your platform from the
+[Releases](https://github.com/Section9Labs/rupu/releases) page and place `rupu`
+somewhere on your `$PATH`.
+
+---
+
+## Quick start
+
+### 1. Authenticate
+
+```sh
+rupu auth login --provider anthropic --key sk-ant-XXX
+```
+
+Your key is stored in `~/.rupu/auth.json`. Run `rupu auth status` to confirm.
+
+### 2. Run your first agent
+
+The rupu repository ships sample agents in `.rupu/agents/`. If you run `rupu` from
+inside the rupu checkout, project-discovery picks them up automatically — the same
+mechanism end-users use in their own repos.
+
+```sh
+cd /path/to/rupu
+rupu run fix-bug "make the failing test pass"
+```
+
+A JSONL transcript is written to `~/.rupu/transcripts/<run-id>.jsonl`.
+
+### 3. Use the samples in your own project
+
+```sh
+mkdir -p ~/projects/your-repo/.rupu
+cp -r /path/to/rupu/.rupu/agents  ~/projects/your-repo/.rupu/agents
+cp -r /path/to/rupu/.rupu/workflows ~/projects/your-repo/.rupu/workflows
+```
+
+Then from inside `~/projects/your-repo`:
+
+```sh
+rupu run summarize-diff "summarize changes since main"
+rupu run review-diff "look for bugs and missing tests"
+```
+
+> A `rupu init --with-samples` subcommand is on the Slice B roadmap.
+
+---
+
+## Where things live
+
+### Global (`~/.rupu/`)
+
+| Path | Purpose |
+|------|---------|
+| `~/.rupu/config.toml` | Global config (default provider, log level, …) |
+| `~/.rupu/auth.json` | Stored provider credentials |
+| `~/.rupu/transcripts/` | JSONL run transcripts |
+| `~/.rupu/cache/` | Scratch space + crash logs |
+| `~/.rupu/workspaces/` | Reserved for Slice C session state |
+
+### Per-project (`<project>/.rupu/`)
+
+| Path | Purpose |
+|------|---------|
+| `<project>/.rupu/agents/` | Agent `.md` files for this repo |
+| `<project>/.rupu/workflows/` | Workflow YAML files for this repo |
+| `<project>/.rupu/config.toml` | Project-local config overrides |
+
+---
+
+## Example runs
+
+### Summarise what changed
+
+```sh
+rupu run summarize-diff "what changed in the last three commits?"
+```
+
+The `summarize-diff` agent reads `git diff` output and returns a commit-message-style
+summary. Useful before writing a PR description.
+
+### Review a diff for issues
+
+```sh
+rupu run review-diff "check staged changes for bugs and missing tests"
+```
+
+`review-diff` inspects staged (or HEAD) diff and reports bugs, code smells, and
+coverage gaps.
+
+---
+
+## Subcommands
+
+```
+rupu run <agent> [prompt]          Run an agent from the project's .rupu/agents/
+rupu agent list                    List available agents
+rupu agent show <name>             Print agent definition
+rupu workflow list                 List available workflows
+rupu workflow show <name>          Print workflow definition
+rupu workflow run <name> [prompt]  Run a multi-step workflow
+rupu transcript list               List past run transcripts
+rupu transcript show <id>          Stream a transcript to stdout
+rupu config get [key]              Read global config
+rupu config set <key> <value>      Write global config
+rupu auth login --provider <p>     Store a provider credential
+rupu auth logout --provider <p>    Remove a provider credential
+rupu auth status                   Show stored credentials
+```
+
+---
+
+## Architecture overview
+
+See [`docs/spec.md`](docs/spec.md) for the full architecture. Short version:
+
+- **Agents** are `.md` files with YAML frontmatter (name, provider, model, tools,
+  permissions) and a markdown system prompt as the body.
+- **Workflows** are YAML files with a linear sequence of steps; each step names an
+  agent and optionally passes context from previous steps.
+- **Transcripts** are append-only JSONL files — one event per line. Every run writes
+  one regardless of whether it succeeds or fails.
+- **Action protocol** gates what tools an agent may call. The runtime validates every
+  proposed action against an allowlist before execution.
+
+---
+
+## Agents are code
+
+Bypass mode runs arbitrary shell commands on your machine. Review every agent file
+before you run it, just as you would review a shell script. The action-protocol
+allowlist in the agent frontmatter controls what tools the runtime will execute, but
+the content of `shell` tool calls is determined by the LLM. Treat an agent you did
+not write with the same caution you would treat untrusted code.
+
+---
+
+## Hacking / development
+
+```sh
+git clone https://github.com/Section9Labs/rupu
+cd rupu
+cargo build --workspace
+cargo test --workspace
+```
+
+MSRV: **1.77**. Set `RUPU_LOG=debug` for verbose tracing output.
+
+---
+
+## License
+
+[MIT](LICENSE)

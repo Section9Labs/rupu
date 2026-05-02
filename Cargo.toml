@@ -9,6 +9,7 @@ members = [
     "crates/rupu-tools",
     "crates/rupu-agent",
     "crates/rupu-orchestrator",
+    "crates/rupu-cli",
 ]
 
 [workspace.package]
@@ -53,6 +54,7 @@ base64 = "0.22"
 # CLI / templating (used in Plan 2 but pinned now for cohesion)
 clap = { version = "4", features = ["derive"] }
 minijinja = "2"
+dirs = "5"
 
 # Auth
 keyring = "3"

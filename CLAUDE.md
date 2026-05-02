@@ -5,10 +5,18 @@
 - Plan 1 (foundation libraries, in progress): `docs/superpowers/plans/2026-05-01-rupu-slice-a-plan-1-foundation.md`
 
 ## Architecture rules (enforced)
-1. **Hexagonal separation.** `rupu-providers`, `rupu-tools`, `rupu-auth` define traits (ports). The agent runtime in `rupu-agent` (Plan 2) only knows traits.
-2. **`rupu-cli` is thin** (Plan 2). Subcommands are arg parsing + delegation. No business logic in the CLI crate.
+1. **Hexagonal separation.** `rupu-providers`, `rupu-tools`, `rupu-auth` define traits (ports). The agent runtime in `rupu-agent` only knows traits.
+2. **`rupu-cli` is thin.** Subcommands are arg parsing + delegation. No business logic in the CLI crate.
 3. **Workspace deps only.** Versions pinned in root `Cargo.toml`; never in crate `Cargo.toml` files.
 4. `#![deny(clippy::all)]` workspace-wide via `[workspace.lints]`. `unsafe_code` forbidden.
+
+### Crates
+
+- **`rupu-agent`** — agent file format (`.md` + YAML frontmatter), agent loop, and permission resolver. Lifts spec/loader/permission/runner/tool_registry into one integration crate. Mock-provider tests use `MockProvider` + `BypassDecider` exposed from `runner`.
+- **`rupu-orchestrator`** — workflow YAML parser + minijinja rendering + linear runner with pluggable `StepFactory`. Action-protocol allowlist validation lives here.
+- **`rupu-cli`** — the `rupu` binary. Thin clap dispatcher to the libraries. Seven subcommands: `run` / `agent` / `workflow` / `transcript` / `config` / `auth`.
+
+**Run-time samples:** live at `<repo>/.rupu/agents/` and `<repo>/.rupu/workflows/`. Running `rupu` from inside the rupu checkout exercises the same project-discovery code path end-users use in their own repos.
 
 ## Code standards
 - Rust 2021, MSRV pinned in `rust-toolchain.toml`.

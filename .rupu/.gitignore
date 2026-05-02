@@ -1,0 +1,5 @@
+# Run-time artifacts — not committed, but the directories may be
+# created at runtime. Agents and workflows ARE committed.
+transcripts/
+cache/
+workspaces/

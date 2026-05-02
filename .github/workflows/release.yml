@@ -1,0 +1,57 @@
+name: release
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,         target: aarch64-apple-darwin     }
+          - { os: macos-14,         target: x86_64-apple-darwin      }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest,    target: aarch64-unknown-linux-gnu, cross: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.77
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross (Linux arm64)
+        if: matrix.cross
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }} -p rupu-cli
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }} -p rupu-cli
+      - name: Strip + tar
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip rupu || true
+          tar -czf rupu-${{ github.ref_name }}-${{ matrix.target }}.tar.gz rupu
+          shasum -a 256 rupu-${{ github.ref_name }}-${{ matrix.target }}.tar.gz > rupu-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/rupu-*.tar.gz*
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten
+        run: find artifacts -type f -name 'rupu-*' -exec mv {} . \;
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: rupu-*
+          generate_release_notes: true
