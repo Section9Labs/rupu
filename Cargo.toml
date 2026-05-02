@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rupu-transcript",
+    "crates/rupu-config",
+    "crates/rupu-workspace",
+    "crates/rupu-auth",
+    "crates/rupu-providers",
+    "crates/rupu-tools",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/section9labs/rupu"
+rust-version = "1.77"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+serde_yaml = "0.9"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# IDs / time
+ulid = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP / streaming (lifted phi-providers)
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "http2", "charset"], default-features = false }
+async-trait = "0.1"
+futures-util = "0.3"
+fs2 = "0.4"
+
+# Crypto (lifted)
+ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
+base64 = "0.22"
+
+# CLI / templating (used in Plan 2 but pinned now for cohesion)
+clap = { version = "4", features = ["derive"] }
+minijinja = "2"
+
+# Auth
+keyring = "3"
+
+# Test deps
+tempfile = "3"
+assert_fs = "1"
+predicates = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
