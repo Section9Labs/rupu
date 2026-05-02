@@ -26,8 +26,13 @@ pub enum LayerError {
         #[source]
         source: toml::de::Error,
     },
-    #[error("layered config invalid: {0}")]
-    Layered(toml::de::Error),
+    #[error("layered config invalid (merging {global_path:?} + {project_path:?}): {source}")]
+    Layered {
+        global_path: Option<String>,
+        project_path: Option<String>,
+        #[source]
+        source: Box<toml::de::Error>,
+    },
 }
 
 /// Layer global and project config files into a single [`Config`].
@@ -55,24 +60,37 @@ pub fn layer_files(global: Option<&Path>, project: Option<&Path>) -> Result<Conf
         (None, None) => Value::Table(toml::value::Table::new()),
     };
 
-    let cfg: Config = merged.try_into().map_err(LayerError::Layered)?;
+    let cfg: Config = merged.try_into().map_err(|source| LayerError::Layered {
+        global_path: global.map(|p| p.display().to_string()),
+        project_path: project.map(|p| p.display().to_string()),
+        source: Box::new(source),
+    })?;
     Ok(cfg)
 }
 
-fn read_optional_toml(path: Option<&Path>) -> Result<Option<Value>, LayerError> {
-    let Some(path) = path else { return Ok(None) };
-    if !path.exists() {
-        return Ok(None);
-    }
+fn read_toml_file(path: &Path) -> Result<Value, LayerError> {
     let text = std::fs::read_to_string(path).map_err(|e| LayerError::Io {
         path: path.display().to_string(),
         source: e,
     })?;
-    let v: Value = toml::from_str(&text).map_err(|e| LayerError::Parse {
+    toml::from_str(&text).map_err(|e| LayerError::Parse {
         path: path.display().to_string(),
         source: e,
-    })?;
-    Ok(Some(v))
+    })
+}
+
+fn read_optional_toml(path: Option<&Path>) -> Result<Option<Value>, LayerError> {
+    let Some(path) = path else { return Ok(None) };
+    match read_toml_file(path) {
+        Ok(v) => Ok(Some(v)),
+        Err(LayerError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            // File genuinely absent — treat as an empty layer. This is the
+            // expected path on a fresh install where ~/.rupu/config.toml
+            // doesn't exist yet.
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Merge `overlay` into `base`. Tables merge key-by-key; everything else

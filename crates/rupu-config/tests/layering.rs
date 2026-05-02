@@ -78,3 +78,24 @@ fn only_global_works() {
     let cfg = layer_files(Some(g.path()), None).unwrap();
     assert_eq!(cfg.default_provider.as_deref(), Some("openai"));
 }
+
+#[test]
+fn directory_passed_as_config_returns_error() {
+    // A directory at the path is NOT NotFound (it exists, just isn't a file).
+    // The error should surface to the caller rather than silently defaulting.
+    let dir = tempfile::tempdir().unwrap();
+    let result = layer_files(Some(dir.path()), None);
+    assert!(
+        result.is_err(),
+        "passing a directory as a config file path must error, got: {:?}",
+        result.ok()
+    );
+    // Specifically should be a non-NotFound IO error
+    if let Err(e) = result {
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("io reading"),
+            "expected io error message, got: {msg}"
+        );
+    }
+}
