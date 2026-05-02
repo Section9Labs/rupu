@@ -1,13 +1,17 @@
 [workspace]
 resolver = "2"
-members = []
+members = [
+    # Crates land in subsequent tasks (rupu-transcript, rupu-config, rupu-workspace,
+    # rupu-auth, rupu-providers, rupu-tools). Empty during workspace bootstrap so
+    # `cargo metadata` does not fail on missing member directories.
+]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/section9labs/rupu"
-rust-version = "1.75"
+rust-version = "1.77"
 
 [workspace.dependencies]
 # Async runtime
@@ -32,7 +36,7 @@ ulid = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP / streaming (lifted phi-providers)
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "http2", "charset"], default-features = false }
 async-trait = "0.1"
 futures-util = "0.3"
 fs2 = "0.4"
