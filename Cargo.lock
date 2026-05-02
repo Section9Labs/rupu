@@ -1384,6 +1384,8 @@ dependencies = [
  "minijinja",
  "predicates",
  "rupu-agent",
+ "rupu-providers",
+ "rupu-tools",
  "rupu-transcript",
  "serde",
  "serde_json",
@@ -1392,6 +1394,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "ulid",
 ]
 
 [[package]]
