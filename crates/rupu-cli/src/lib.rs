@@ -6,6 +6,9 @@
 //! one-line wrapper that calls into here.
 
 pub mod cmd;
+pub mod crash;
+pub mod logging;
+pub mod paths;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -51,6 +54,9 @@ pub enum Cmd {
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
 /// dispatches, and returns an `ExitCode`. Tests pass synthetic argv.
 pub async fn run(args: Vec<String>) -> ExitCode {
+    logging::init();
+    crash::install_panic_hook();
+
     let cli = match Cli::try_parse_from(args) {
         Ok(c) => c,
         Err(e) => {
