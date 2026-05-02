@@ -6,6 +6,7 @@
 //! or a chmod-600 fallback file at `~/.rupu/auth.json`.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 /// Identifies a credential namespace within the backend (one secret
@@ -32,6 +33,12 @@ impl ProviderId {
     }
 }
 
+impl fmt::Display for ProviderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Errors from credential storage operations.
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -40,9 +47,9 @@ pub enum AuthError {
     #[error("serialize: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error("keyring: {0}")]
-    Keyring(String),
+    Keyring(#[from] keyring::Error),
     #[error("not configured for provider {0}")]
-    NotConfigured(&'static str),
+    NotConfigured(ProviderId),
 }
 
 /// Credential store. Implementations: [`crate::KeyringBackend`] and

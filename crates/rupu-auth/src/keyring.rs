@@ -3,6 +3,7 @@
 use crate::backend::{AuthBackend, AuthError, ProviderId};
 
 /// Backend wrapping the OS keychain via the `keyring` crate.
+#[derive(Default)]
 pub struct KeyringBackend;
 
 impl KeyringBackend {
@@ -15,12 +16,6 @@ impl KeyringBackend {
     /// backend at startup.
     pub fn probe() -> Result<(), AuthError> {
         todo!("KeyringBackend::probe lands in Task 14")
-    }
-}
-
-impl Default for KeyringBackend {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
