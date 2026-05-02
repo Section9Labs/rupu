@@ -1,8 +1,9 @@
-//! Event schema for rupu transcripts. See `docs/transcript-schema.md`.
+//! Event schema for rupu transcripts. See the Slice A spec for details.
 //!
 //! All events are tagged JSON objects with a `type` discriminator and a
 //! `data` payload. JSONL on disk is one event per line.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -15,8 +16,8 @@ pub enum Event {
         agent: String,
         provider: String,
         model: String,
-        started_at: String,
-        mode: String,
+        started_at: DateTime<Utc>,
+        mode: RunMode,
     },
     TurnStart {
         turn_idx: u32,
@@ -40,7 +41,7 @@ pub enum Event {
     },
     FileEdit {
         path: String,
-        kind: String,
+        kind: FileEditKind,
         diff: String,
     },
     CommandRun {
@@ -68,8 +69,10 @@ pub enum Event {
     },
     TurnEnd {
         turn_idx: u32,
-        tokens_in: u64,
-        tokens_out: u64,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        tokens_in: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        tokens_out: Option<u64>,
     },
     RunComplete {
         run_id: String,
@@ -87,4 +90,20 @@ pub enum RunStatus {
     Ok,
     Error,
     Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunMode {
+    Ask,
+    Bypass,
+    Readonly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEditKind {
+    Create,
+    Modify,
+    Delete,
 }

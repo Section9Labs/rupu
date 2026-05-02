@@ -1,9 +1,13 @@
-use rupu_transcript::event::{Event, RunStatus};
+use chrono::{TimeZone, Utc};
+use rupu_transcript::event::{Event, FileEditKind, RunMode, RunStatus};
 
 fn assert_roundtrip(e: &Event) {
     let json = serde_json::to_string(e).expect("serialize");
     let back: Event = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(e, &back, "roundtrip differed:\n  in:  {e:?}\n  out: {back:?}");
+    assert_eq!(
+        e, &back,
+        "roundtrip differed:\n  in:  {e:?}\n  out: {back:?}"
+    );
 }
 
 #[test]
@@ -14,8 +18,8 @@ fn roundtrip_run_start() {
         agent: "fix-bug".into(),
         provider: "anthropic".into(),
         model: "claude-sonnet-4-6".into(),
-        started_at: "2026-05-01T17:00:00Z".into(),
-        mode: "ask".into(),
+        started_at: Utc.with_ymd_and_hms(2026, 5, 1, 17, 0, 0).unwrap(),
+        mode: RunMode::Ask,
     });
 }
 
@@ -61,7 +65,7 @@ fn roundtrip_tool_call_and_result() {
 fn roundtrip_file_edit() {
     assert_roundtrip(&Event::FileEdit {
         path: "src/lib.rs".into(),
-        kind: "modify".into(),
+        kind: FileEditKind::Modify,
         diff: "@@ -1,3 +1,4 @@\n fn foo() {\n+    todo!()\n }".into(),
     });
 }
@@ -109,8 +113,17 @@ fn roundtrip_gate_requested() {
 fn roundtrip_turn_end() {
     assert_roundtrip(&Event::TurnEnd {
         turn_idx: 0,
-        tokens_in: 1234,
-        tokens_out: 567,
+        tokens_in: Some(1234),
+        tokens_out: Some(567),
+    });
+}
+
+#[test]
+fn roundtrip_turn_end_no_token_counts() {
+    assert_roundtrip(&Event::TurnEnd {
+        turn_idx: 0,
+        tokens_in: None,
+        tokens_out: None,
     });
 }
 

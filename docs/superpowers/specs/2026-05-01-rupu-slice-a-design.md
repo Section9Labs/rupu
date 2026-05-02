@@ -137,7 +137,7 @@ created_at      = "2026-05-01T17:00:00Z"
 last_run_at     = "2026-05-01T17:42:00Z"
 ```
 
-Every transcript event carries `workspace_id` so Slice C/D plug in without retrofit.
+`workspace_id` and `run_id` are recorded in `run_start` (and `run_id` in `run_complete`); the JSONL filename is `<run_id>.jsonl` so intermediate events stay lean. Slice C/D plug in without retrofit via a transport-layer envelope.
 
 ## Agent file format
 
@@ -228,7 +228,7 @@ JSONL on disk. Single source of truth for what happened in a run. No separate ru
 - `file_edit` and `command_run` are **derived events** — the runtime emits both `tool_result` AND a derived event when the tool kind is known. Consumers can index on derived events without parsing tool inputs.
 - `action_emitted` carries the action-protocol verb even in v0, where the only effects are logged. Schema-stable from day one so Slice B can wire effects without renaming events.
 - `gate_requested` reserved for Slice B (workflow approval gates); not emitted in v0 but defined in the schema.
-- Every event carries `workspace_id` and `run_id`.
+- The transcript filename is `<run_id>.jsonl`, so individual events do not repeat `run_id`. `workspace_id` and `run_id` appear in `run_start` (and `run_id` in `run_complete`); intermediate events stay lean. Slice C remote streaming wraps each event in a `{run_id, workspace_id, event}` envelope at the transport layer rather than inflating every event payload.
 
 ### Aborted runs
 
