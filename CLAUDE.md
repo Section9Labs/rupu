@@ -1,0 +1,21 @@
+# rupu — agentic code-development CLI
+
+## Read first
+- Slice A spec: `docs/superpowers/specs/2026-05-01-rupu-slice-a-design.md`
+- Plan 1 (foundation libraries, in progress): `docs/superpowers/plans/2026-05-01-rupu-slice-a-plan-1-foundation.md`
+
+## Architecture rules (enforced)
+1. **Hexagonal separation.** `rupu-providers`, `rupu-tools`, `rupu-auth` define traits (ports). The agent runtime in `rupu-agent` (Plan 2) only knows traits.
+2. **`rupu-cli` is thin** (Plan 2). Subcommands are arg parsing + delegation. No business logic in the CLI crate.
+3. **Workspace deps only.** Versions pinned in root `Cargo.toml`; never in crate `Cargo.toml` files.
+4. `#![deny(clippy::all)]` workspace-wide via `[workspace.lints]`. `unsafe_code` forbidden.
+
+## Code standards
+- Rust 2021, MSRV pinned in `rust-toolchain.toml`.
+- Errors: `thiserror` for libraries; `anyhow` for the CLI binary (Plan 2).
+- Async: `tokio`.
+- Logging: `tracing` + `tracing-subscriber`.
+
+## Heritage
+- **Okesu** (`/Users/matt/Code/Oracle/Okesu`) — Go security-ops sibling. Same architectural shape (agent files = `.md` + YAML, JSONL transcripts, action protocol).
+- **phi-cell** (`/Users/matt/Code/phi-cell`) — Rust workspace; `crates/phi-providers` is lifted near-verbatim into `crates/rupu-providers`. Lift origin: `Section9Labs/phi-cell` commit `3c7394cb1f5a87088954a1ff64fce86303066f55`.
