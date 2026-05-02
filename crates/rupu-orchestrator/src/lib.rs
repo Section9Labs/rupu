@@ -14,5 +14,5 @@ pub mod workflow;
 
 pub use action_protocol::{validate_actions, ActionValidationResult};
 pub use runner::{run_workflow, OrchestratorRunOpts, OrchestratorRunResult, RunWorkflowError};
-pub use templates::{render_step_prompt, RenderError};
+pub use templates::{render_step_prompt, RenderError, StepContext, StepOutput};
 pub use workflow::{Step, Workflow, WorkflowParseError};
