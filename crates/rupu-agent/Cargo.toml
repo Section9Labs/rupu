@@ -33,3 +33,4 @@ tempfile.workspace = true
 assert_fs.workspace = true
 predicates.workspace = true
 serde_yaml.workspace = true
+pty-process = "0.5"
