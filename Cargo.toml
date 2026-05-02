@@ -57,7 +57,7 @@ minijinja = "2"
 dirs = "5"
 
 # Auth
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 
 # Test deps
 tempfile = "3"
