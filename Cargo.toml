@@ -17,7 +17,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/section9labs/rupu"
-rust-version = "1.77"
+rust-version = "1.85"
 
 [workspace.dependencies]
 # Async runtime
