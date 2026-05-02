@@ -1,33 +1,35 @@
-//! Workspace record store. Lives at `~/.rupu/workspaces/`. Implemented
-//! in Task 11 of Plan 1.
+//! Workspace record store. Lives at `~/.rupu/workspaces/`.
 //!
-//! NOTE FOR TASK 11 IMPLEMENTER:
-//! - The `StoreError` variants below are placeholder shapes (`#[from]`
-//!   tuple variants). Task 11 restructures them to struct variants
-//!   carrying path/action context — see the layered-fix pattern in
-//!   `rupu-config::layer::LayerError`. This is a deliberate breaking
-//!   change at the type level; nothing else in the workspace yet
-//!   matches on `StoreError`.
-//! - When converting the canonicalized path to a string for the
-//!   `Workspace.path` field, prefer `path.to_str().ok_or(...)` (or
-//!   `path.to_string_lossy().into_owned()` with an explicit comment)
-//!   over `path.display().to_string()`. The latter inserts replacement
-//!   characters on non-UTF-8 paths and would make `upsert`'s
-//!   "same-path-already-recorded" lookup miss.
+//! Records are keyed by canonicalized path; on `upsert` we read every
+//! record in the store dir and reuse the matching one rather than
+//! generating a new id. New records auto-detect the git remote and
+//! default branch (snapshot at workspace-creation time only — they are
+//! not refreshed on subsequent runs).
 
-use crate::Workspace;
+use crate::record::{new_id, Workspace};
+use chrono::Utc;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Errors from the workspace record store.
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("parse: {0}")]
-    Parse(#[from] toml::de::Error),
+    #[error("io {action}: {source}")]
+    Io {
+        action: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("parse {path}: {source}")]
+    Parse {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
     #[error("serialize: {0}")]
     Ser(#[from] toml::ser::Error),
+    #[error("workspace path is not valid UTF-8: {path}")]
+    NonUtf8Path { path: String },
 }
 
 /// Handle to the on-disk workspace store directory.
@@ -37,7 +39,140 @@ pub struct WorkspaceStore {
     pub root: PathBuf,
 }
 
-/// Implemented in Task 11.
-pub fn upsert(_store: &WorkspaceStore, _path: &Path) -> Result<Workspace, StoreError> {
-    todo!("upsert lands in Task 11")
+impl WorkspaceStore {
+    fn ensure_root(&self) -> Result<(), StoreError> {
+        std::fs::create_dir_all(&self.root).map_err(|e| StoreError::Io {
+            action: format!("create_dir_all {}", self.root.display()),
+            source: e,
+        })
+    }
+
+    fn record_path(&self, id: &str) -> PathBuf {
+        self.root.join(format!("{id}.toml"))
+    }
+
+    fn list(&self) -> Result<Vec<Workspace>, StoreError> {
+        if !self.root.exists() {
+            return Ok(vec![]);
+        }
+        let mut out = vec![];
+        for entry in std::fs::read_dir(&self.root).map_err(|e| StoreError::Io {
+            action: format!("read_dir {}", self.root.display()),
+            source: e,
+        })? {
+            let entry = entry.map_err(|e| StoreError::Io {
+                action: "read_dir entry".into(),
+                source: e,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).map_err(|e| StoreError::Io {
+                action: format!("read {}", path.display()),
+                source: e,
+            })?;
+            let ws: Workspace = toml::from_str(&text).map_err(|e| StoreError::Parse {
+                path: path.display().to_string(),
+                source: e,
+            })?;
+            out.push(ws);
+        }
+        Ok(out)
+    }
+
+    fn write(&self, ws: &Workspace) -> Result<(), StoreError> {
+        self.ensure_root()?;
+        let body = toml::to_string(ws)?;
+        let path = self.record_path(&ws.id);
+        std::fs::write(&path, body).map_err(|e| StoreError::Io {
+            action: format!("write {}", path.display()),
+            source: e,
+        })
+    }
+}
+
+/// Look up an existing workspace for `path` (canonicalized) or create a
+/// new one. Bumps `last_run_at` to "now" in either case.
+///
+/// On a new workspace, attempts to detect the git remote URL and the
+/// current branch by shelling out to `git`. Failures are non-fatal —
+/// the corresponding fields stay `None`.
+pub fn upsert(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreError> {
+    let canonical = path.canonicalize().map_err(|e| StoreError::Io {
+        action: format!("canonicalize {}", path.display()),
+        source: e,
+    })?;
+    // Use to_str() to avoid display()'s lossy replacement chars on
+    // non-UTF-8 paths. The path is the lookup key for "same workspace
+    // already recorded" — a mangled path here would create a duplicate
+    // record on every run.
+    let canonical_str = canonical
+        .to_str()
+        .ok_or_else(|| StoreError::NonUtf8Path {
+            path: canonical.display().to_string(),
+        })?
+        .to_string();
+
+    let now = Utc::now().to_rfc3339();
+    let existing = store.list()?.into_iter().find(|w| {
+        Path::new(&w.path)
+            .canonicalize()
+            .map(|p| p == canonical)
+            .unwrap_or(false)
+    });
+
+    let ws = match existing {
+        Some(mut w) => {
+            w.last_run_at = Some(now);
+            w
+        }
+        None => Workspace {
+            id: new_id(),
+            path: canonical_str,
+            repo_remote: detect_repo_remote(&canonical),
+            default_branch: detect_default_branch(&canonical),
+            created_at: now.clone(),
+            last_run_at: Some(now),
+        },
+    };
+
+    store.write(&ws)?;
+    Ok(ws)
+}
+
+fn detect_repo_remote(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn detect_default_branch(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
 }
