@@ -39,19 +39,21 @@ pub fn discover(pwd: &Path) -> Result<Discovery, DiscoverError> {
         source: e,
     })?;
 
+    // A `.rupu` entry that is NOT a directory is silently skipped; it
+    // is almost certainly a user mistake. Plan 2 should add a
+    // `tracing::warn!` once logging is wired up at the agent runtime.
     let mut cursor: Option<&Path> = Some(&canonical_pwd);
+    let mut found: Option<PathBuf> = None;
     while let Some(dir) = cursor {
         if dir.join(".rupu").is_dir() {
-            return Ok(Discovery {
-                project_root: Some(dir.to_path_buf()),
-                canonical_pwd: canonical_pwd.clone(),
-            });
+            found = Some(dir.to_path_buf());
+            break;
         }
         cursor = dir.parent();
     }
 
     Ok(Discovery {
-        project_root: None,
+        project_root: found,
         canonical_pwd,
     })
 }

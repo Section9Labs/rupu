@@ -36,3 +36,15 @@ fn no_rupu_dir_means_no_project_root() {
     assert!(d.project_root.is_none());
     assert_eq!(d.canonical_pwd, nested.path().canonicalize().unwrap());
 }
+
+#[test]
+fn nonexistent_pwd_returns_io_error() {
+    use rupu_workspace::DiscoverError;
+    let result = discover(std::path::Path::new(
+        "/this/path/does/not/exist/hopefully-rupu",
+    ));
+    assert!(
+        matches!(result, Err(DiscoverError::Io { .. })),
+        "expected DiscoverError::Io for nonexistent pwd, got: {result:?}"
+    );
+}
