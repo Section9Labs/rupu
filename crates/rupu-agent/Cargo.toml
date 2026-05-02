@@ -1,0 +1,36 @@
+[package]
+name = "rupu-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+async-trait.workspace = true
+chrono.workspace = true
+ulid.workspace = true
+
+# In-workspace
+rupu-transcript = { path = "../rupu-transcript" }
+rupu-tools = { path = "../rupu-tools" }
+rupu-providers = { path = "../rupu-providers" }
+rupu-workspace = { path = "../rupu-workspace" }
+rupu-config = { path = "../rupu-config" }
+rupu-auth = { path = "../rupu-auth" }
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_fs.workspace = true
+predicates.workspace = true
+serde_yaml.workspace = true
+pty-process = "0.5"

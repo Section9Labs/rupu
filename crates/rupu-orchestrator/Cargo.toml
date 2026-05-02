@@ -1,0 +1,33 @@
+[package]
+name = "rupu-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_yaml.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+async-trait.workspace = true
+chrono.workspace = true
+minijinja.workspace = true
+ulid.workspace = true
+
+# In-workspace
+rupu-agent = { path = "../rupu-agent" }
+rupu-transcript = { path = "../rupu-transcript" }
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_fs.workspace = true
+predicates.workspace = true
+rupu-providers = { path = "../rupu-providers" }
+rupu-tools = { path = "../rupu-tools" }
