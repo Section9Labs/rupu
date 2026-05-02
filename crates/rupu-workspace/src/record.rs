@@ -19,10 +19,17 @@ pub struct Workspace {
     /// with an `origin` remote configured at workspace creation time).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub repo_remote: Option<String>,
-    /// Detected default branch (current `HEAD` symbolic-ref short name
-    /// at workspace creation time).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub default_branch: Option<String>,
+    /// The branch that was checked out when this workspace was first
+    /// registered (snapshot of `git symbolic-ref --short HEAD` at
+    /// workspace-creation time). NOT necessarily the repo's
+    /// integration/default branch — if rupu was first invoked while
+    /// on a feature branch, that's what gets recorded here.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        alias = "default_branch"
+    )]
+    pub initial_branch: Option<String>,
     /// RFC3339 timestamp of workspace creation.
     pub created_at: String,
     /// RFC3339 timestamp of the most recent `rupu run` against this

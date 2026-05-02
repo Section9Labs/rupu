@@ -6,7 +6,7 @@ fn round_trip_workspace_toml() {
         id: "ws_01HXXX0123456789ABCDEFGHJK".into(),
         path: "/Users/matt/Code/rupu".into(),
         repo_remote: Some("git@github.com:section9labs/rupu.git".into()),
-        default_branch: Some("main".into()),
+        initial_branch: Some("main".into()),
         created_at: "2026-05-01T17:00:00Z".into(),
         last_run_at: Some("2026-05-01T17:42:00Z".into()),
     };
@@ -24,5 +24,5 @@ created_at      = "2026-05-01T17:00:00Z"
 "#;
     let ws: Workspace = toml::from_str(toml).unwrap();
     assert_eq!(ws.repo_remote, None);
-    assert_eq!(ws.default_branch, None);
+    assert_eq!(ws.initial_branch, None);
 }

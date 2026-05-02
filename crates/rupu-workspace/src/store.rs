@@ -10,6 +10,7 @@ use crate::record::{new_id, Workspace};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tracing::warn;
 
 /// Errors from the workspace record store.
 #[derive(Debug, Error)]
@@ -68,27 +69,49 @@ impl WorkspaceStore {
             if path.extension().and_then(|s| s.to_str()) != Some("toml") {
                 continue;
             }
-            let text = std::fs::read_to_string(&path).map_err(|e| StoreError::Io {
-                action: format!("read {}", path.display()),
-                source: e,
-            })?;
-            let ws: Workspace = toml::from_str(&text).map_err(|e| StoreError::Parse {
-                path: path.display().to_string(),
-                source: e,
-            })?;
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping unreadable workspace record"
+                    );
+                    continue;
+                }
+            };
+            let ws: Workspace = match toml::from_str(&text) {
+                Ok(w) => w,
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping corrupt workspace record"
+                    );
+                    continue;
+                }
+            };
             out.push(ws);
         }
         Ok(out)
     }
 
+    /// Write the record atomically: serialize to `<id>.toml.tmp`, then
+    /// rename. POSIX rename is atomic; readers never see a partial file.
     fn write(&self, ws: &Workspace) -> Result<(), StoreError> {
         self.ensure_root()?;
         let body = toml::to_string(ws)?;
         let path = self.record_path(&ws.id);
-        std::fs::write(&path, body).map_err(|e| StoreError::Io {
-            action: format!("write {}", path.display()),
+        let tmp_path = path.with_extension("toml.tmp");
+        std::fs::write(&tmp_path, body).map_err(|e| StoreError::Io {
+            action: format!("write {}", tmp_path.display()),
             source: e,
-        })
+        })?;
+        std::fs::rename(&tmp_path, &path).map_err(|e| StoreError::Io {
+            action: format!("rename {} -> {}", tmp_path.display(), path.display()),
+            source: e,
+        })?;
+        Ok(())
     }
 }
 
@@ -131,7 +154,7 @@ pub fn upsert(store: &WorkspaceStore, path: &Path) -> Result<Workspace, StoreErr
             id: new_id(),
             path: canonical_str,
             repo_remote: detect_repo_remote(&canonical),
-            default_branch: detect_default_branch(&canonical),
+            initial_branch: detect_initial_branch(&canonical),
             created_at: now.clone(),
             last_run_at: Some(now),
         },
@@ -159,7 +182,7 @@ fn detect_repo_remote(path: &Path) -> Option<String> {
     }
 }
 
-fn detect_default_branch(path: &Path) -> Option<String> {
+fn detect_initial_branch(path: &Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(path)
