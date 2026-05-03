@@ -67,9 +67,13 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
         std::env::set_var("RUPU_OAUTH_LAST_STATE", &state);
     }
 
-    // Bind the listener on port 0 (OS picks).
-    let server = tiny_http::Server::http("127.0.0.1:0")
-        .map_err(|e| anyhow!("bind localhost listener: {e}"))?;
+    // Bind the listener. Some IdPs (notably OpenAI Hydra) only allow
+    // specific pre-registered ports; honor `fixed_ports` if set,
+    // otherwise let the OS assign one. We always bind on 127.0.0.1
+    // even when the redirect URI advertises "localhost" — that's a
+    // hostname-in-the-URL question, not a bind question, and 127.0.0.1
+    // is portable across name-resolution oddities.
+    let server = bind_listener(oauth.fixed_ports)?;
 
     // Discover the bound port via tiny_http's ListenAddr.
     let bound_port = server
@@ -78,7 +82,10 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
         .ok_or_else(|| anyhow!("listener bound to unexpected address type"))?
         .port();
 
-    let redirect_uri = format!("http://127.0.0.1:{bound_port}{}", oauth.redirect_path);
+    let redirect_uri = format!(
+        "http://{}:{bound_port}{}",
+        oauth.redirect_host, oauth.redirect_path
+    );
 
     // Test seam: write the port to a file so the test harness can discover it.
     if let Ok(path) = std::env::var("RUPU_OAUTH_PORT_FILE") {
@@ -203,13 +210,49 @@ fn build_authorize_url(
     redirect_uri: &str,
 ) -> Result<String> {
     let mut url = url::Url::parse(oauth.authorize_url)?;
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", oauth.client_id)
-        .append_pair("redirect_uri", redirect_uri)
-        .append_pair("scope", &oauth.scopes.join(" "))
-        .append_pair("state", state)
-        .append_pair("code_challenge", challenge)
-        .append_pair("code_challenge_method", "S256");
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("response_type", "code")
+            .append_pair("client_id", oauth.client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", &oauth.scopes.join(" "))
+            .append_pair("state", state)
+            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge_method", "S256");
+        for (k, v) in oauth.extra_authorize_params {
+            q.append_pair(k, v);
+        }
+    }
     Ok(url.to_string())
+}
+
+/// Bind the redirect listener. When `fixed_ports` is `Some`, walk the
+/// list and use the first one that succeeds (mirrors Codex CLI's
+/// 1455 → 1457 fallback). When `None`, bind to OS-assigned port 0.
+fn bind_listener(fixed_ports: Option<&'static [u16]>) -> Result<tiny_http::Server> {
+    // Allow tests to force a specific port by env var (legacy seam).
+    if let Ok(p) = std::env::var("RUPU_OAUTH_FORCE_PORT") {
+        if let Ok(port) = p.parse::<u16>() {
+            return tiny_http::Server::http(format!("127.0.0.1:{port}"))
+                .map_err(|e| anyhow!("bind 127.0.0.1:{port}: {e}"));
+        }
+    }
+    match fixed_ports {
+        Some(ports) => {
+            let mut last_err: Option<String> = None;
+            for &port in ports {
+                match tiny_http::Server::http(format!("127.0.0.1:{port}")) {
+                    Ok(s) => return Ok(s),
+                    Err(e) => last_err = Some(format!("port {port}: {e}")),
+                }
+            }
+            Err(anyhow!(
+                "could not bind any of the required ports {ports:?} ({})",
+                last_err.unwrap_or_else(|| "unknown".into())
+            ))
+        }
+        None => {
+            tiny_http::Server::http("127.0.0.1:0").map_err(|e| anyhow!("bind 127.0.0.1:0: {e}"))
+        }
+    }
 }
