@@ -1,0 +1,18 @@
+[
+  {
+    "name": "main",
+    "commit": {
+      "sha": "0000aabbccddeeff",
+      "url": "https://api.github.com/repos/section9labs/rupu/commits/0000aabbccddeeff"
+    },
+    "protected": true
+  },
+  {
+    "name": "feat/stream",
+    "commit": {
+      "sha": "deadbeef01234567",
+      "url": "https://api.github.com/repos/section9labs/rupu/commits/deadbeef01234567"
+    },
+    "protected": false
+  }
+]

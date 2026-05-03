@@ -138,3 +138,62 @@ async fn list_repos_translates_octocrab_response() {
     assert_eq!(repos[0].description.as_deref(), Some("agentic coding CLI"));
     assert_eq!(repos[1].description, None);
 }
+
+#[tokio::test]
+async fn list_prs_paginates_and_translates() {
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/prs_list_happy.json").unwrap();
+    let m = server.mock(|when, then| {
+        when.method(GET).path("/repos/section9labs/rupu/pulls");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+
+    let connector = common::github_connector_against(&server);
+    let prs = connector
+        .list_prs(
+            &rupu_scm::RepoRef {
+                platform: Platform::Github,
+                owner: "section9labs".into(),
+                repo: "rupu".into(),
+            },
+            rupu_scm::PrFilter::default(),
+        )
+        .await
+        .expect("list_prs");
+    m.assert();
+
+    assert_eq!(prs.len(), 2);
+    assert_eq!(prs[0].state, rupu_scm::PrState::Open);
+    assert_eq!(prs[1].state, rupu_scm::PrState::Merged);
+}
+
+#[tokio::test]
+async fn list_branches_translates() {
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/branches_list_happy.json").unwrap();
+    let m = server.mock(|when, then| {
+        when.method(GET).path("/repos/section9labs/rupu/branches");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+
+    let connector = common::github_connector_against(&server);
+    let branches = connector
+        .list_branches(&rupu_scm::RepoRef {
+            platform: Platform::Github,
+            owner: "section9labs".into(),
+            repo: "rupu".into(),
+        })
+        .await
+        .expect("list_branches");
+    m.assert();
+
+    assert_eq!(branches.len(), 2);
+    assert_eq!(branches[0].name, "main");
+    assert!(branches[0].protected);
+    assert_eq!(branches[1].name, "feat/stream");
+    assert!(!branches[1].protected);
+}

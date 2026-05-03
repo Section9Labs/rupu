@@ -79,8 +79,38 @@ impl RepoConnector for GithubRepoConnector {
         })
     }
 
-    async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn list_branches(&self, r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = r.owner.clone();
+        let repo = r.repo.clone();
+        self.client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                async move {
+                    let pages = inner
+                        .repos(&owner, &repo)
+                        .list_branches()
+                        .send()
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    let all = inner
+                        .all_pages(pages)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    Ok(all
+                        .into_iter()
+                        .map(|b| Branch {
+                            name: b.name,
+                            sha: b.commit.sha,
+                            protected: b.protected,
+                        })
+                        .collect::<Vec<_>>())
+                }
+            })
+            .await
     }
 
     async fn create_branch(
@@ -140,8 +170,45 @@ impl RepoConnector for GithubRepoConnector {
         })
     }
 
-    async fn list_prs(&self, _r: &RepoRef, _filter: PrFilter) -> Result<Vec<Pr>, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn list_prs(&self, r: &RepoRef, filter: PrFilter) -> Result<Vec<Pr>, ScmError> {
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = r.owner.clone();
+        let repo = r.repo.clone();
+        let repo_ref = r.clone();
+        let state = filter.state;
+        self.client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let repo_ref = repo_ref.clone();
+                async move {
+                    let pulls_handler = inner.pulls(&owner, &repo);
+                    let mut req = pulls_handler.list();
+                    if let Some(s) = state {
+                        req = req.state(match s {
+                            crate::types::PrState::Open => octocrab::params::State::Open,
+                            crate::types::PrState::Closed | crate::types::PrState::Merged => {
+                                octocrab::params::State::Closed
+                            }
+                        });
+                    }
+                    let pages = req
+                        .send()
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    let all = inner
+                        .all_pages(pages)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    Ok(all
+                        .into_iter()
+                        .map(|p| pr_from_octocrab(repo_ref.clone(), p))
+                        .collect::<Vec<_>>())
+                }
+            })
+            .await
     }
 
     async fn get_pr(&self, p: &PrRef) -> Result<Pr, ScmError> {
