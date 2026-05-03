@@ -9,9 +9,11 @@
 //!
 //! We currently impersonate two existing first-party CLI clients:
 //!
-//! - Anthropic: Claude Code's `9d1c250a-...` (consent screen reads
-//!   "Claude Code wants access ..."). Scope set matches Claude Code so
-//!   the consent UI is internally consistent.
+//! - Anthropic: Claude Code's RFC 7591 dynamic-client-registration
+//!   metadata URL (`https://claude.ai/oauth/claude-code-client-metadata`)
+//!   as the `client_id`; consent screen reads "Claude Code wants
+//!   access ...". Scope set matches Claude Code so the consent UI is
+//!   internally consistent.
 //! - OpenAI: Codex CLI's `app_EMoamEEZ73f0CkXaXp7hrann`. Required port
 //!   range (1455 / 1457) and `/auth/callback` path are pinned because
 //!   they're allowlisted on OpenAI's Hydra registration for that
@@ -58,16 +60,20 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
     match p {
         ProviderId::Anthropic => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
-            // Claude Code's official OAuth client_id; matches what we see
-            // when impersonating its flow. See module-level note.
-            client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-            authorize_url: "https://claude.ai/oauth/authorize",
-            token_url: "https://console.anthropic.com/v1/oauth/token",
+            // Claude Code uses dynamic client registration (RFC 7591):
+            // its `client_id` is literally the URL of the published
+            // client-metadata document. Verified by fetching:
+            //   curl https://claude.ai/oauth/claude-code-client-metadata
+            // returns {"client_id": "https://claude.ai/oauth/claude-code-client-metadata", ...}
+            // and the metadata's `redirect_uris` allow loopback callbacks.
+            client_id: "https://claude.ai/oauth/claude-code-client-metadata",
+            // Authorize and token endpoints live on platform.claude.com
+            // (claude.ai/oauth/authorize returns 403 — that's the
+            // "Invalid request format" we were hitting earlier).
+            authorize_url: "https://platform.claude.com/oauth/authorize",
+            token_url: "https://platform.claude.com/v1/oauth/token",
             device_url: None,
-            // Full Claude Code scope set so the consent screen we
-            // surface matches what users already trust from Claude Code,
-            // and so we have headroom for future MCP/session features
-            // without forcing a re-login round.
+            // Full Claude Code scope set; see module-level note.
             scopes: &[
                 "user:inference",
                 "user:profile",
@@ -75,6 +81,8 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
                 "user:mcp_servers",
             ],
             redirect_path: "/callback",
+            // The DCR document explicitly lists both 127.0.0.1 and
+            // localhost; per RFC 8252 §7.3, loopback ports are wildcard.
             redirect_host: "127.0.0.1",
             fixed_ports: None,
             extra_authorize_params: &[],
@@ -199,6 +207,23 @@ mod tests {
         // be present — it was the cause of the "Invalid request format"
         // rejection on claude.ai.
         assert!(!c.scopes.contains(&"org:create_api_key"));
+    }
+
+    #[test]
+    fn anthropic_uses_dcr_metadata_url_as_client_id() {
+        let c = provider_oauth(ProviderId::Anthropic).unwrap();
+        // Per RFC 7591 dynamic client registration: client_id is the
+        // metadata URL itself, not a UUID. The stale UUID was the
+        // cause of the "Invalid request format" rejection.
+        assert_eq!(
+            c.client_id,
+            "https://claude.ai/oauth/claude-code-client-metadata"
+        );
+        assert_eq!(
+            c.authorize_url,
+            "https://platform.claude.com/oauth/authorize"
+        );
+        assert_eq!(c.token_url, "https://platform.claude.com/v1/oauth/token");
     }
 
     #[test]
