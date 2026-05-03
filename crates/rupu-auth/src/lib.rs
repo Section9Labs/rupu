@@ -27,6 +27,9 @@ pub mod probe;
 pub mod keychain_layout;
 pub use keychain_layout::{key_for, legacy_key_for, KeychainKey};
 
+pub mod stored;
+pub use stored::StoredCredential;
+
 pub use backend::{AuthBackend, AuthError, ProviderId};
 pub use json_file::JsonFileBackend;
 pub use keyring::KeyringBackend;
