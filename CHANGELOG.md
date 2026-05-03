@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.2 — Anthropic SSO follow-up hotfix (2026-05-03)
+
+### Fixed
+
+- **Anthropic SSO** — `v0.1.1`'s scope-set fix wasn't enough. The actual root cause was that the entire OAuth client identity was wrong:
+  - **`client_id`** must be `https://claude.ai/oauth/claude-code-client-metadata` (a URL, per RFC 7591 dynamic client registration), not the stale UUID `9d1c250a-...` we had baked in.
+  - **`authorize_url`** moved from `claude.ai/oauth/authorize` (returns 403) to `platform.claude.com/oauth/authorize` (returns 200).
+  - **`token_url`** moved from `console.anthropic.com/v1/oauth/token` to `platform.claude.com/v1/oauth/token`.
+  
+  Verified by fetching the published DCR metadata and confirming the endpoint behaviors. This is the OAuth identity Claude Code actually uses (`client_name: "Claude Code"` in the metadata document); we continue to impersonate it pending rupu-specific OAuth client registration.
+
 ## v0.1.1 — SSO hotfix (2026-05-03)
 
 ### Fixed
