@@ -16,6 +16,7 @@ use thiserror::Error;
 pub enum ProviderId {
     Anthropic,
     Openai,
+    Gemini,
     Copilot,
     Local,
 }
@@ -27,6 +28,7 @@ impl ProviderId {
         match self {
             Self::Anthropic => "anthropic",
             Self::Openai => "openai",
+            Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::Local => "local",
         }
@@ -63,4 +65,22 @@ pub trait AuthBackend: Send + Sync {
     fn forget(&self, provider: ProviderId) -> Result<(), AuthError>;
     /// Human-readable backend name for `rupu auth status`.
     fn name(&self) -> &'static str;
+}
+
+#[cfg(test)]
+mod gemini_id_tests {
+    use super::*;
+
+    #[test]
+    fn provider_id_gemini_string_form() {
+        assert_eq!(ProviderId::Gemini.as_str(), "gemini");
+    }
+
+    #[test]
+    fn provider_id_gemini_serde_roundtrip() {
+        let json = serde_json::to_string(&ProviderId::Gemini).unwrap();
+        assert_eq!(json, "\"gemini\"");
+        let parsed: ProviderId = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ProviderId::Gemini);
+    }
 }
