@@ -12,5 +12,8 @@ pub mod config;
 // that the lib re-export shape is stable from skeleton onward.
 pub mod layer;
 
+pub mod provider_config;
+
 pub use config::{BashConfig, Config, RetryConfig};
 pub use layer::{layer_files, LayerError};
+pub use provider_config::ProviderConfig;

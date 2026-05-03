@@ -1,6 +1,10 @@
 //! Configuration types. See the Slice A spec for semantics.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::provider_config::ProviderConfig;
 
 /// Top-level rupu configuration. Loaded from `~/.rupu/config.toml`
 /// (global) and optionally overridden by `<repo>/.rupu/config.toml`
@@ -18,6 +22,8 @@ pub struct Config {
     pub log_level: Option<String>,
     pub bash: BashConfig,
     pub retry: RetryConfig,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfig>,
 }
 
 /// Bash tool configuration.
