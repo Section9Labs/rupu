@@ -197,3 +197,46 @@ async fn list_branches_translates() {
     assert_eq!(branches[1].name, "feat/stream");
     assert!(!branches[1].protected);
 }
+
+#[tokio::test]
+async fn get_issue_translates() {
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/issue_get_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET).path("/repos/section9labs/rupu/issues/123");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let c = common::github_issue_connector_against(&server);
+    let i = c
+        .get_issue(&rupu_scm::IssueRef {
+            tracker: rupu_scm::IssueTracker::Github,
+            project: "section9labs/rupu".into(),
+            number: 123,
+        })
+        .await
+        .unwrap();
+    assert_eq!(i.title, "Investigate flaky test");
+    assert_eq!(i.state, rupu_scm::IssueState::Open);
+    assert_eq!(i.labels, vec!["bug".to_string(), "ci".to_string()]);
+}
+
+#[tokio::test]
+async fn list_issues_translates() {
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/issues_list_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET).path("/repos/section9labs/rupu/issues");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let c = common::github_issue_connector_against(&server);
+    let items = c
+        .list_issues("section9labs/rupu", rupu_scm::IssueFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].labels, vec!["bug".to_string()]);
+}
