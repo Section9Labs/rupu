@@ -190,7 +190,22 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             include_state_in_token_body: false,
         }),
         ProviderId::Local => None,
-        ProviderId::Github | ProviderId::Gitlab => None,
+        ProviderId::Github => Some(ProviderOAuth {
+            flow: OAuthFlow::Device,
+            client_id: "Iv1.b507a08c87ecfe98",
+            authorize_url: "",
+            token_url: "https://github.com/login/oauth/access_token",
+            device_url: Some("https://github.com/login/device/code"),
+            scopes: &["read:user", "repo", "workflow", "gist", "read:org"],
+            redirect_path: "",
+            redirect_host: "",
+            fixed_ports: None,
+            extra_authorize_params: &[],
+            token_body_format: TokenBodyFormat::Form,
+            state_is_verifier: false,
+            include_state_in_token_body: false,
+        }),
+        ProviderId::Gitlab => None,
     }
 }
 
@@ -292,5 +307,21 @@ mod tests {
         assert_eq!(extras.get("id_token_add_organizations"), Some(&"true"));
         assert_eq!(extras.get("codex_cli_simplified_flow"), Some(&"true"));
         assert_eq!(extras.get("originator"), Some(&"codex_cli_rs"));
+    }
+
+    #[test]
+    fn github_provider_oauth_uses_device_flow_and_scm_scopes() {
+        let c = provider_oauth(crate::backend::ProviderId::Github)
+            .expect("github oauth config present");
+        assert_eq!(c.flow, OAuthFlow::Device);
+        assert_eq!(c.token_url, "https://github.com/login/oauth/access_token");
+        assert_eq!(c.device_url, Some("https://github.com/login/device/code"));
+        for required in ["read:user", "repo", "workflow", "gist", "read:org"] {
+            assert!(
+                c.scopes.contains(&required),
+                "scope {required} missing: {:?}",
+                c.scopes
+            );
+        }
     }
 }
