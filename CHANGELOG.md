@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.1.3 — Anthropic SSO regression fix (2026-05-03)
+
+### Fixed
+
+- **Anthropic SSO** — `v0.1.2` was a regression. Authorized URL switched to `platform.claude.com/oauth/authorize` (the **Console** flow, for API-customer organizations issuing console-managed API keys), not the SSO flow that paid Claude.ai subscribers actually use. Verified by extracting the prod config object literal from Claude Code's binary at `/Users/matt/.local/share/claude/versions/2.1.126`:
+
+```js
+{
+  CONSOLE_AUTHORIZE_URL:  "https://platform.claude.com/oauth/authorize",   // wrong path for SSO
+  CLAUDE_AI_AUTHORIZE_URL: "https://claude.com/cai/oauth/authorize",       // ← SSO
+  TOKEN_URL:               "https://platform.claude.com/v1/oauth/token",
+  CLIENT_ID:               "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+}
+```
+
+  - Authorize URL: now `https://claude.com/cai/oauth/authorize`.
+  - Client ID: reverted to the UUID `9d1c250a-...` (the literal `CLIENT_ID` from the prod config; the metadata URL that v0.1.2 used is a separate registration document, not the OAuth client_id).
+  - Token URL stays at `platform.claude.com/v1/oauth/token` (correct in v0.1.2).
+  - Regression test pinned to lock the SSO-not-Console choice.
+
 ## v0.1.2 — Anthropic SSO follow-up hotfix (2026-05-03)
 
 ### Fixed
