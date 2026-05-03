@@ -9,7 +9,6 @@
 //! them with secrets.
 
 use rupu_providers::auth::AuthCredentials;
-use rupu_providers::provider::LlmProvider;
 use rupu_providers::types::{LlmRequest, Message};
 
 fn live_enabled() -> bool {
