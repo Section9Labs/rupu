@@ -112,10 +112,54 @@ async fn build_gemini(
 }
 
 async fn build_copilot(
-    _model: &str,
-    _backend: &dyn rupu_auth::AuthBackend,
+    model: &str,
+    backend: &dyn rupu_auth::AuthBackend,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    Err(FactoryError::NotWiredInV0("copilot".to_string())) // wired in Task 14
+    let _ = model;
+    let api_key = match backend.retrieve(rupu_auth::ProviderId::Copilot) {
+        Ok(k) => k,
+        Err(_) => std::env::var("GITHUB_TOKEN").map_err(|_| FactoryError::MissingCredential {
+            provider: "copilot".to_string(),
+        })?,
+    };
+    let creds = rupu_providers::auth::AuthCredentials::ApiKey { key: api_key };
+    let client = rupu_providers::github_copilot::GithubCopilotClient::new(creds, None)
+        .map_err(|e| FactoryError::Other(format!("copilot client init: {e}")))?;
+    Ok(Box::new(client))
+}
+
+#[cfg(test)]
+mod build_copilot_tests {
+    use super::*;
+    use rupu_auth::{AuthBackend, AuthError, ProviderId as AuthProviderId};
+
+    struct FixedKeyBackend;
+    impl AuthBackend for FixedKeyBackend {
+        fn store(&self, _: AuthProviderId, _: &str) -> Result<(), AuthError> {
+            Ok(())
+        }
+        fn retrieve(&self, p: AuthProviderId) -> Result<String, AuthError> {
+            if p == AuthProviderId::Copilot {
+                Ok("ghp_test_copilot".to_string())
+            } else {
+                Err(AuthError::NotConfigured(p))
+            }
+        }
+        fn forget(&self, _: AuthProviderId) -> Result<(), AuthError> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "fixed-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn build_copilot_returns_provider() {
+        let p = build_for_provider("copilot", "gpt-4o", &FixedKeyBackend)
+            .await
+            .expect("build");
+        assert_eq!(p.provider_id(), rupu_providers::ProviderId::GithubCopilot);
+    }
 }
 
 #[cfg(test)]
