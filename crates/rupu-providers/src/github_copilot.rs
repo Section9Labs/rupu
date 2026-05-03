@@ -392,6 +392,18 @@ impl GithubCopilotClient {
     }
 }
 
+fn make_model_info(id: &str) -> crate::model_pool::ModelInfo {
+    crate::model_pool::ModelInfo {
+        id: id.to_string(),
+        provider: crate::provider_id::ProviderId::GithubCopilot,
+        context_window: 0,
+        max_output_tokens: 0,
+        capabilities: Vec::new(),
+        cost: crate::model_pool::ModelCost::default(),
+        status: crate::model_pool::ModelStatus::default(),
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::provider::LlmProvider for GithubCopilotClient {
     async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
@@ -404,6 +416,17 @@ impl crate::provider::LlmProvider for GithubCopilotClient {
         on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<LlmResponse, ProviderError> {
         GithubCopilotClient::stream(self, request, on_event).await
+    }
+
+    async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
+        // GitHub Copilot doesn't expose a public /models endpoint.
+        // Slice B-1 spec §6a: ship a baked-in list. Users who have access
+        // to additional models register them as custom entries in
+        // ~/.rupu/config.toml.
+        ["gpt-4o", "gpt-4o-mini", "claude-sonnet-4", "o4-mini"]
+            .into_iter()
+            .map(make_model_info)
+            .collect()
     }
 
     fn default_model(&self) -> &str {
@@ -1194,5 +1217,23 @@ mod llm_provider_impl_tests {
         let boxed: Box<dyn LlmProvider> = Box::new(client);
         assert_eq!(boxed.provider_id(), ProviderId::GithubCopilot);
         assert!(!boxed.default_model().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod baked_in_tests {
+    use super::*;
+    use crate::auth::AuthCredentials;
+    use crate::provider::LlmProvider;
+
+    #[tokio::test]
+    async fn list_models_returns_baked_in_when_offline() {
+        let creds = AuthCredentials::ApiKey {
+            key: "ghp-test".into(),
+        };
+        let client = GithubCopilotClient::new(creds, None).unwrap();
+        let models = client.list_models().await;
+        assert!(!models.is_empty());
+        assert!(models.iter().any(|m| m.id == "gpt-4o"));
     }
 }
