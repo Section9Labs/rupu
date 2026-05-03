@@ -42,7 +42,6 @@ pub fn semaphore_for(provider: &str, permits_override: Option<usize>) -> Arc<Sem
 }
 
 #[cfg(test)]
-#[allow(clippy::all)]
 mod tests {
     use super::*;
 
@@ -74,5 +73,6 @@ mod tests {
         // Same Arc → same permits.
         assert_eq!(a1.available_permits(), 3);
         assert_eq!(a2.available_permits(), 3);
+        assert!(std::sync::Arc::ptr_eq(&a1, &a2));
     }
 }
