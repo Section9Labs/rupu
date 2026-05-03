@@ -561,6 +561,7 @@ fn parse_chat_completion(json: &serde_json::Value) -> Result<LlmResponse, Provid
         Usage {
             input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
             output_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
+            ..Default::default()
         }
     } else {
         Usage::default()
@@ -739,6 +740,7 @@ impl CompletionAccumulator {
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                ..Default::default()
             },
         })
     }

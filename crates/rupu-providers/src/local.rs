@@ -146,6 +146,7 @@ impl LlmProvider for LocalModelProvider {
             usage: Usage {
                 input_tokens,
                 output_tokens,
+                ..Default::default()
             },
         })
     }

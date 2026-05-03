@@ -2353,6 +2353,7 @@ dependencies = [
 name = "rupu-auth"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "assert_fs",
  "async-trait",
  "base64 0.22.1",
@@ -2450,6 +2451,7 @@ dependencies = [
  "ed25519-dalek",
  "fs2",
  "futures-util",
+ "httpmock",
  "reqwest",
  "serde",
  "serde_json",

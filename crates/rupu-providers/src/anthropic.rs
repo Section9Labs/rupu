@@ -667,6 +667,11 @@ impl AnthropicClient {
                             .get("input_tokens")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0) as u32;
+                        acc.cached_tokens = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u32)
+                            .unwrap_or(0);
                     }
                 }
             }
@@ -783,6 +788,7 @@ struct StreamAccumulator {
     stop_reason: Option<StopReason>,
     input_tokens: u32,
     output_tokens: u32,
+    cached_tokens: u32,
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
     current_tool_input: String,
@@ -811,6 +817,7 @@ impl StreamAccumulator {
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                cached_tokens: self.cached_tokens,
             },
         })
     }
@@ -1422,5 +1429,25 @@ mod tests {
             );
         }
         // None is also acceptable — no Claude Code installed
+    }
+
+    #[test]
+    fn decode_response_populates_cached_tokens() {
+        let body = r#"{
+            "id": "msg_x",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type":"text","text":"hi"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 200
+            }
+        }"#;
+        let parsed: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let resp: LlmResponse = parsed.into_llm_response();
+        assert_eq!(resp.usage.cached_tokens, 200);
+        assert_eq!(resp.usage.input_tokens, 10);
+        assert_eq!(resp.usage.output_tokens, 5);
     }
 }

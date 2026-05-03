@@ -26,6 +26,7 @@ fn test_full_request_response_type_flow() {
         usage: Usage {
             input_tokens: 15,
             output_tokens: 1,
+            ..Default::default()
         },
     };
     assert_eq!(response.text(), Some("4"));

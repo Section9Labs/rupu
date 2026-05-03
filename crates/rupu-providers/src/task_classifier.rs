@@ -315,6 +315,7 @@ mod tests {
                     usage: Usage {
                         input_tokens: 5,
                         output_tokens: 1,
+                        ..Default::default()
                     },
                 })
             }

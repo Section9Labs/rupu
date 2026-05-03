@@ -92,6 +92,8 @@ pub enum StopReason {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default, alias = "cache_read_input_tokens")]
+    pub cached_tokens: u32,
 }
 
 /// A request to an LLM provider.
@@ -244,6 +246,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         };
         assert_eq!(response.text(), Some("Hello!"));

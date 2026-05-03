@@ -680,6 +680,7 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
         Usage {
             input_tokens: u["input_tokens"].as_u64().unwrap_or(0) as u32,
             output_tokens: u["output_tokens"].as_u64().unwrap_or(0) as u32,
+            ..Default::default()
         }
     } else {
         Usage::default()
@@ -756,6 +757,7 @@ impl ResponseAccumulator {
             usage: Usage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                ..Default::default()
             },
         })
     }

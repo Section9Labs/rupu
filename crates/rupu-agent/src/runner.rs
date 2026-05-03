@@ -165,7 +165,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             },
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
-            cached_tokens: 0,
+            cached_tokens: resp.usage.cached_tokens,
         })?;
 
         // Emit any text content as assistant_message events; collect
@@ -450,6 +450,7 @@ impl LlmProvider for MockProvider {
                 usage: Usage {
                     input_tokens,
                     output_tokens,
+                    ..Default::default()
                 },
             }),
             ScriptedTurn::AssistantToolUse {
@@ -476,6 +477,7 @@ impl LlmProvider for MockProvider {
                     usage: Usage {
                         input_tokens: 1,
                         output_tokens: 1,
+                        ..Default::default()
                     },
                 })
             }
