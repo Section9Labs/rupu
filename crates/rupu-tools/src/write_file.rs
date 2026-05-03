@@ -31,6 +31,27 @@ impl Tool for WriteFileTool {
         "write_file"
     }
 
+    fn description(&self) -> &'static str {
+        "Create a file or overwrite an existing one in the workspace. Use this for new files; for edits to existing files prefer `edit_file` to preserve unrelated content. Intermediate directories are created as needed. Paths must be inside the workspace root."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the workspace root."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full content of the file. Existing content is replaced."
+                }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
         let i: Input =

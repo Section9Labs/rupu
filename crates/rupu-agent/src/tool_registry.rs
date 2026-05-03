@@ -34,6 +34,21 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Convert each registered tool into the `ToolDefinition` shape the
+    /// LLM provider expects in `LlmRequest.tools`. Used by the agent
+    /// loop to tell the model what tools are available before sending
+    /// the request.
+    pub fn to_tool_definitions(&self) -> Vec<rupu_providers::ToolDefinition> {
+        self.tools
+            .iter()
+            .map(|(name, tool)| rupu_providers::ToolDefinition {
+                name: name.clone(),
+                description: tool.description().to_string(),
+                input_schema: tool.input_schema(),
+            })
+            .collect()
+    }
+
     /// New registry containing only the entries whose names are in
     /// `whitelist`. Used to honor an agent's frontmatter `tools:` field.
     pub fn filter_to(&self, whitelist: &[String]) -> Self {

@@ -114,6 +114,15 @@ pub trait Tool: Send + Sync {
     /// agent runtime dispatches on this string.
     fn name(&self) -> &'static str;
 
+    /// Human-readable description shown to the LLM. Should explain
+    /// what the tool does, when to use it, and any pitfalls.
+    fn description(&self) -> &'static str;
+
+    /// JSON Schema describing the tool's input. Sent to the LLM as
+    /// part of the request so it knows how to call the tool. Format
+    /// matches Anthropic's tool-use input_schema convention.
+    fn input_schema(&self) -> serde_json::Value;
+
     /// Invoke the tool with JSON-encoded input. The boxed `Send +
     /// Sync` future makes this trait object-safe for `Box<dyn Tool>`.
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;

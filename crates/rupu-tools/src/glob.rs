@@ -26,6 +26,23 @@ impl Tool for GlobTool {
         "glob"
     }
 
+    fn description(&self) -> &'static str {
+        "List files in the workspace matching a glob pattern. Output is one path per line, sorted, relative to the workspace root. Supports `**` for recursive descent. Returns empty stdout when nothing matches."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern, e.g. `src/**/*.rs` or `*.toml`."
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
         let i: Input =

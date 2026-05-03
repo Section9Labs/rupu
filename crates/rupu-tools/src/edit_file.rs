@@ -34,6 +34,31 @@ impl Tool for EditFileTool {
         "edit_file"
     }
 
+    fn description(&self) -> &'static str {
+        "Replace an exact string in a file. The `old_string` must match exactly once in the file; if it matches zero times or more than once, the edit fails. Pass enough surrounding context (a few lines before/after) to make `old_string` uniquely identifying. The file must already exist; for new files use `write_file`."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the workspace root."
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact substring to replace. Must match exactly once."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement substring."
+                }
+            },
+            "required": ["path", "old_string", "new_string"]
+        })
+    }
+
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
         let i: Input =

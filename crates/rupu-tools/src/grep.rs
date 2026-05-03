@@ -36,6 +36,27 @@ impl Tool for GrepTool {
         "grep"
     }
 
+    fn description(&self) -> &'static str {
+        "Search the workspace for a pattern using ripgrep. Output is `path:line:match` lines, gitignore-aware. Use this to locate symbols, callers, or any text across the workspace. Returns empty stdout (not an error) when there are no matches."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to search for. Ripgrep's default regex syntax (similar to PCRE)."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional sub-path within the workspace to restrict the search. Defaults to the whole workspace."
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
         let i: Input =

@@ -45,6 +45,23 @@ impl Tool for BashTool {
         "bash"
     }
 
+    fn description(&self) -> &'static str {
+        "Execute a shell command in the workspace directory. The command runs with a controlled environment (PATH, HOME, USER, TERM, LANG plus a per-workspace allowlist). Default timeout 120 seconds, configurable per-call. Use this for compilation, tests, git operations, and anything else that needs a shell. The cwd is locked to the workspace path; cd outside the workspace will produce an error from the shell, not an escape."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute, e.g. `cargo test`, `git diff HEAD`, `ls -la src/`."
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
         let started = Instant::now();
         let i: Input =

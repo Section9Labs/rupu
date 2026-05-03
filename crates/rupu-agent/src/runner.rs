@@ -115,6 +115,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         Some(list) => default_tool_registry().filter_to(list),
         None => default_tool_registry(),
     };
+    let tool_defs = registry.to_tool_definitions();
 
     let mut messages: Vec<Message> = vec![Message::user(&opts.user_message)];
     let mut turn_idx: u32 = 0;
@@ -128,15 +129,12 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         }
         writer.write(&Event::TurnStart { turn_idx })?;
         // LlmRequest does not derive Default — construct explicitly.
-        // For v0 the runner does not surface tool schemas to the model;
-        // tool_use blocks come from the mock script in tests. Wiring
-        // real `tools` for live providers is deferred to Plan 2 Phase 3.
         let req = LlmRequest {
             model: opts.model.clone(),
             system: Some(opts.agent_system_prompt.clone()),
             messages: messages.clone(),
             max_tokens: 4096,
-            tools: vec![],
+            tools: tool_defs.clone(),
             cell_id: None,
             trace_id: None,
             thinking: None,
@@ -473,5 +471,57 @@ impl LlmProvider for MockProvider {
 
     fn provider_id(&self) -> rupu_providers::ProviderId {
         rupu_providers::ProviderId::Anthropic
+    }
+}
+
+/// Like [`MockProvider`], but stores every received [`LlmRequest`] for
+/// post-run assertion. Use in tests that need to verify the runner's
+/// outbound request shape (e.g., that `tools` is populated).
+pub struct CapturingMockProvider {
+    inner: MockProvider,
+    /// Captured requests in the order they were sent. Populated by
+    /// `send` calls.
+    pub captured: std::sync::Arc<std::sync::Mutex<Vec<LlmRequest>>>,
+}
+
+impl CapturingMockProvider {
+    pub fn new(turns: Vec<ScriptedTurn>) -> Self {
+        Self {
+            inner: MockProvider::new(turns),
+            captured: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Snapshot of captured requests. Call after `run_agent` returns.
+    pub fn captured_requests(&self) -> Vec<LlmRequest> {
+        self.captured.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CapturingMockProvider {
+    async fn send(
+        &mut self,
+        req: &LlmRequest,
+    ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+        self.captured.lock().unwrap().push(req.clone());
+        self.inner.send(req).await
+    }
+
+    async fn stream(
+        &mut self,
+        req: &LlmRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+        self.captured.lock().unwrap().push(req.clone());
+        self.inner.stream(req, on_event).await
+    }
+
+    fn default_model(&self) -> &str {
+        self.inner.default_model()
+    }
+
+    fn provider_id(&self) -> rupu_providers::ProviderId {
+        self.inner.provider_id()
     }
 }
