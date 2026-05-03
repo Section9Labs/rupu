@@ -88,9 +88,15 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
                 "user:mcp_servers",
             ],
             redirect_path: "/callback",
-            redirect_host: "127.0.0.1",
+            // Claude Code's URL builder hardcodes "localhost" — not
+            // 127.0.0.1. The OAuth server's allowlist matches on the
+            // literal string.
+            redirect_host: "localhost",
             fixed_ports: None,
-            extra_authorize_params: &[],
+            // Claude Code's authorize URL begins with `code=true` —
+            // see the prod URL builder GI_ extracted from the binary.
+            // Omitting this is what surfaces as "Invalid request format".
+            extra_authorize_params: &[("code", "true")],
         }),
         ProviderId::Openai => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -232,6 +238,23 @@ mod tests {
         assert_eq!(c.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
         // TOKEN_URL literal from the prod config.
         assert_eq!(c.token_url, "https://platform.claude.com/v1/oauth/token");
+    }
+
+    #[test]
+    fn anthropic_authorize_request_matches_claude_code_url_builder() {
+        let c = provider_oauth(ProviderId::Anthropic).unwrap();
+        // The Claude Code prod URL builder (`GI_` in the binary)
+        // appends `code=true` first, then the standard OAuth params,
+        // and uses `http://localhost:<port>/callback` as the redirect.
+        // Omitting `code=true` is what surfaces as "Invalid request
+        // format" on the consent screen.
+        assert_eq!(c.redirect_host, "localhost");
+        assert_eq!(c.redirect_path, "/callback");
+        assert!(
+            c.extra_authorize_params.contains(&("code", "true")),
+            "must send code=true: {:?}",
+            c.extra_authorize_params
+        );
     }
 
     #[test]
