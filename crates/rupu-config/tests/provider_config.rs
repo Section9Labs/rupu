@@ -39,6 +39,31 @@ fn provider_config_empty_when_unset() {
 }
 
 #[test]
+fn provider_config_parses_custom_models() {
+    let toml = r#"
+[providers.openai]
+default_model = "gpt-5"
+
+[[providers.openai.models]]
+id = "gpt-5-internal-finetune"
+context_window = 200000
+max_output = 16000
+
+[[providers.openai.models]]
+id = "gpt-5-org-private"
+context_window = 128000
+"#;
+    let cfg: rupu_config::Config = toml::from_str(toml).expect("parse");
+    let openai = cfg.providers.get("openai").expect("openai block");
+    assert_eq!(openai.models.len(), 2);
+    assert_eq!(openai.models[0].id, "gpt-5-internal-finetune");
+    assert_eq!(openai.models[0].context_window, Some(200000));
+    assert_eq!(openai.models[0].max_output, Some(16000));
+    assert_eq!(openai.models[1].id, "gpt-5-org-private");
+    assert_eq!(openai.models[1].max_output, None);
+}
+
+#[test]
 fn provider_config_serialize_omits_none_fields() {
     let mut cfg = Config::default();
     cfg.providers.insert(

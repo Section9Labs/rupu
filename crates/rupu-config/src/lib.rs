@@ -16,4 +16,4 @@ pub mod provider_config;
 
 pub use config::{BashConfig, Config, RetryConfig};
 pub use layer::{layer_files, LayerError};
-pub use provider_config::ProviderConfig;
+pub use provider_config::{CustomModel, ProviderConfig};
