@@ -145,9 +145,7 @@ fn scope_missing(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.split(',').map(|p| p.trim().to_string()).collect())
         .unwrap_or_default();
     let missing: Vec<&String> = needed.iter().filter(|s| !granted.contains(*s)).collect();
-    if missing.is_empty() && needed.is_empty() {
-        None
-    } else if missing.is_empty() {
+    if missing.is_empty() {
         None
     } else {
         Some(
