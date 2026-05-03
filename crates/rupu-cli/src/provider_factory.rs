@@ -103,7 +103,12 @@ async fn build_gemini(
     _model: &str,
     _backend: &dyn rupu_auth::AuthBackend,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    Err(FactoryError::NotWiredInV0("gemini".to_string())) // wired in Task 13
+    // The lifted GoogleGeminiClient (phi-providers) only supports OAuth
+    // (Vertex/CLI path). AI Studio API-key support is deferred to Plan 2
+    // alongside SSO. Spec §4 / Plan 2 Task 8 wires this.
+    Err(FactoryError::NotWiredInV0(
+        "gemini (API-key path requires AI Studio endpoint, deferred to Plan 2 SSO)".to_string(),
+    ))
 }
 
 async fn build_copilot(
@@ -175,5 +180,48 @@ mod build_openai_tests {
             result,
             Err(FactoryError::MissingCredential { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod build_gemini_tests {
+    use super::*;
+    use rupu_auth::{AuthBackend, AuthError, ProviderId as AuthProviderId};
+
+    struct EmptyBackend;
+    impl AuthBackend for EmptyBackend {
+        fn store(&self, _: AuthProviderId, _: &str) -> Result<(), AuthError> {
+            Ok(())
+        }
+        fn retrieve(&self, p: AuthProviderId) -> Result<String, AuthError> {
+            Err(AuthError::NotConfigured(p))
+        }
+        fn forget(&self, _: AuthProviderId) -> Result<(), AuthError> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "empty"
+        }
+    }
+
+    #[tokio::test]
+    async fn build_gemini_returns_not_wired_until_sso() {
+        // Plan 1 reality: Gemini's lifted client rejects ApiKey credentials
+        // (the Vertex/CLI path requires OAuth). API-key support via AI
+        // Studio is deferred to Plan 2 along with SSO. The factory must
+        // surface this constraint clearly rather than panic or silently
+        // succeed.
+        let prev = std::env::var("GOOGLE_GEMINI_API_KEY").ok();
+        std::env::remove_var("GOOGLE_GEMINI_API_KEY");
+        std::env::remove_var("GEMINI_API_KEY");
+        let result = build_for_provider("gemini", "gemini-2.5-pro", &EmptyBackend).await;
+        if let Some(p) = prev {
+            std::env::set_var("GOOGLE_GEMINI_API_KEY", p);
+        }
+        match result {
+            Err(FactoryError::NotWiredInV0(_)) => {}
+            Err(e) => panic!("expected NotWiredInV0, got Err({e})"),
+            Ok(_) => panic!("expected NotWiredInV0, got Ok(provider)"),
+        }
     }
 }
