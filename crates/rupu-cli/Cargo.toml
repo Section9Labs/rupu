@@ -43,3 +43,4 @@ tempfile.workspace = true
 assert_fs.workspace = true
 assert_cmd = { workspace = true }
 predicates.workspace = true
+httpmock.workspace = true

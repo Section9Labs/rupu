@@ -388,6 +388,19 @@ impl AnthropicClient {
         }
     }
 
+    /// Create a client from an explicit `AuthMethod` pointing at a custom URL
+    /// (for testing OAuth flows against mock servers — the api-key-only
+    /// `with_url` cannot exercise the OAuth header path).
+    pub fn from_auth_with_url(auth: AuthMethod, api_url: String) -> Self {
+        Self {
+            client: Client::new(),
+            auth,
+            api_url,
+            auth_json_path: None,
+            credential_store: None,
+        }
+    }
+
     /// Ensure the OAuth token is still valid, refreshing if expired.
     /// Persists refreshed tokens via CredentialStore (preferred) or save_auth_json (legacy).
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {

@@ -2387,6 +2387,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "httpmock",
  "predicates",
  "rupu-agent",
  "rupu-auth",
