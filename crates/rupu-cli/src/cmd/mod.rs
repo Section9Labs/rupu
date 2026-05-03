@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod auth;
 pub mod config;
+pub mod models;
 pub mod run;
 pub mod transcript;
 pub mod workflow;

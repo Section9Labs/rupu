@@ -50,6 +50,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::auth::Action,
     },
+    /// List or refresh available models.
+    Models {
+        #[command(subcommand)]
+        action: cmd::models::Action,
+    },
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -73,5 +78,6 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Transcript { action } => cmd::transcript::handle(action).await,
         Cmd::Config { action } => cmd::config::handle(action).await,
         Cmd::Auth { action } => cmd::auth::handle(action).await,
+        Cmd::Models { action } => cmd::models::handle(action).await,
     }
 }
