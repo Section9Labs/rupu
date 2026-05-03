@@ -15,7 +15,10 @@ org_id = "org-abc123"
 "#;
     let cfg: Config = toml::from_str(toml).expect("parse");
     let anthro = cfg.providers.get("anthropic").expect("anthropic block");
-    assert_eq!(anthro.base_url.as_deref(), Some("https://example-proxy.test"));
+    assert_eq!(
+        anthro.base_url.as_deref(),
+        Some("https://example-proxy.test")
+    );
     assert_eq!(anthro.timeout_ms, Some(60000));
     assert_eq!(anthro.max_retries, Some(5));
     assert_eq!(anthro.max_concurrency, Some(4));
@@ -26,7 +29,7 @@ org_id = "org-abc123"
     assert_eq!(openai.base_url, None);
 
     // Unset block: default_model is None
-    assert!(cfg.providers.get("gemini").is_none());
+    assert!(!cfg.providers.contains_key("gemini"));
 }
 
 #[test]
