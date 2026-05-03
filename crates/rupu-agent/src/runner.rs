@@ -473,3 +473,55 @@ impl LlmProvider for MockProvider {
         rupu_providers::ProviderId::Anthropic
     }
 }
+
+/// Like [`MockProvider`], but stores every received [`LlmRequest`] for
+/// post-run assertion. Use in tests that need to verify the runner's
+/// outbound request shape (e.g., that `tools` is populated).
+pub struct CapturingMockProvider {
+    inner: MockProvider,
+    /// Captured requests in the order they were sent. Populated by
+    /// `send` calls.
+    pub captured: std::sync::Arc<std::sync::Mutex<Vec<LlmRequest>>>,
+}
+
+impl CapturingMockProvider {
+    pub fn new(turns: Vec<ScriptedTurn>) -> Self {
+        Self {
+            inner: MockProvider::new(turns),
+            captured: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Snapshot of captured requests. Call after `run_agent` returns.
+    pub fn captured_requests(&self) -> Vec<LlmRequest> {
+        self.captured.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CapturingMockProvider {
+    async fn send(
+        &mut self,
+        req: &LlmRequest,
+    ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+        self.captured.lock().unwrap().push(req.clone());
+        self.inner.send(req).await
+    }
+
+    async fn stream(
+        &mut self,
+        req: &LlmRequest,
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+        self.captured.lock().unwrap().push(req.clone());
+        self.inner.stream(req, on_event).await
+    }
+
+    fn default_model(&self) -> &str {
+        self.inner.default_model()
+    }
+
+    fn provider_id(&self) -> rupu_providers::ProviderId {
+        self.inner.provider_id()
+    }
+}
