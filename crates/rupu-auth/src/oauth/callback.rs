@@ -19,7 +19,7 @@ use tracing::{debug, info};
 
 use crate::backend::ProviderId;
 use crate::oauth::pkce::PkcePair;
-use crate::oauth::providers::{provider_oauth, OAuthFlow};
+use crate::oauth::providers::{provider_oauth, OAuthFlow, TokenBodyFormat};
 use crate::stored::StoredCredential;
 
 const CALLBACK_TIMEOUT_SECS: u64 = 300;
@@ -59,7 +59,15 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     }
 
     let pkce = PkcePair::generate();
-    let state = random_state();
+    // Anthropic's OAuth server appears to validate that the state on
+    // the authorize URL matches the verifier produced for the code
+    // challenge — pi-mono's anthropic.ts mirrors this. Other providers
+    // use an independent random state nonce.
+    let state = if oauth.state_is_verifier {
+        pkce.verifier.clone()
+    } else {
+        random_state()
+    };
 
     // For tests, expose the state so the test driver can craft the redirect.
     if std::env::var_os("RUPU_OAUTH_SKIP_BROWSER").is_some() {
@@ -165,17 +173,26 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
         .unwrap_or_else(|_| oauth.token_url.to_string());
 
     let client = reqwest::Client::new();
-    let body = [
-        ("grant_type", "authorization_code"),
-        ("code", code.as_str()),
-        ("client_id", oauth.client_id),
-        ("redirect_uri", redirect_uri.as_str()),
-        ("code_verifier", pkce.verifier.as_str()),
+    let mut params: Vec<(&str, String)> = vec![
+        ("grant_type", "authorization_code".into()),
+        ("code", code.clone()),
+        ("client_id", oauth.client_id.into()),
+        ("redirect_uri", redirect_uri.clone()),
+        ("code_verifier", pkce.verifier.clone()),
     ];
+    if oauth.include_state_in_token_body {
+        params.push(("state", state.clone()));
+    }
 
-    let token: TokenResponse = client
-        .post(&token_url)
-        .form(&body)
+    let request = match oauth.token_body_format {
+        TokenBodyFormat::Form => client.post(&token_url).form(&params),
+        TokenBodyFormat::Json => {
+            let json: std::collections::BTreeMap<&str, String> = params.into_iter().collect();
+            client.post(&token_url).json(&json)
+        }
+    };
+
+    let token: TokenResponse = request
         .send()
         .await
         .context("token exchange request")?
