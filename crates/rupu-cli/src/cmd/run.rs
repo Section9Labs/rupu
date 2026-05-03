@@ -24,6 +24,9 @@ pub struct Args {
     /// Override permission mode (`ask` | `bypass` | `readonly`).
     #[arg(long)]
     pub mode: Option<String>,
+    /// Skip token streaming; receive the full response at once.
+    #[arg(long)]
+    pub no_stream: bool,
 }
 
 pub async fn handle(args: Args) -> ExitCode {
@@ -135,6 +138,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         tool_context,
         user_message,
         mode_str: mode_str.to_string(),
+        no_stream: args.no_stream,
     };
 
     let result = rupu_agent::run_agent(opts).await?;

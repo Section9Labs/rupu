@@ -32,6 +32,7 @@ async fn happy_path_one_turn_no_tools() {
         tool_context: ToolContext::default(),
         user_message: "say hi".into(),
         mode_str: "bypass".into(),
+        no_stream: false,
     };
 
     let res = run_agent(opts).await.unwrap();

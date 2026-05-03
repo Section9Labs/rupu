@@ -86,6 +86,9 @@ pub struct AgentRunOpts {
     pub tool_context: ToolContext,
     pub user_message: String,
     pub mode_str: String,
+    /// If true, skip token streaming and use `provider.send` for one-shot
+    /// completions. Default is false (streaming). Used by --no-stream.
+    pub no_stream: bool,
 }
 
 /// Outcome of a finished run.
@@ -140,18 +143,45 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             thinking: None,
             task_type: None,
         };
-        let resp: LlmResponse = match opts.provider.send(&req).await {
-            Ok(r) => r,
-            Err(e) => {
-                writer.write(&Event::RunComplete {
-                    run_id: opts.run_id.clone(),
-                    status: RunStatus::Error,
-                    total_tokens: total_in + total_out,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    error: Some(format!("provider: {e}")),
-                })?;
-                writer.flush()?;
-                return Err(RunError::Provider(e.to_string()));
+        let resp: LlmResponse = if opts.no_stream {
+            match opts.provider.send(&req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    writer.write(&Event::RunComplete {
+                        run_id: opts.run_id.clone(),
+                        status: RunStatus::Error,
+                        total_tokens: total_in + total_out,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        error: Some(format!("provider: {e}")),
+                    })?;
+                    writer.flush()?;
+                    return Err(RunError::Provider(e.to_string()));
+                }
+            }
+        } else {
+            let mut on_event = |ev: StreamEvent| {
+                if let StreamEvent::TextDelta(chunk) = ev {
+                    use std::io::Write;
+                    print!("{chunk}");
+                    let _ = std::io::stdout().flush();
+                }
+            };
+            match opts.provider.stream(&req, &mut on_event).await {
+                Ok(r) => {
+                    println!();
+                    r
+                }
+                Err(e) => {
+                    writer.write(&Event::RunComplete {
+                        run_id: opts.run_id.clone(),
+                        status: RunStatus::Error,
+                        total_tokens: total_in + total_out,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        error: Some(format!("provider: {e}")),
+                    })?;
+                    writer.flush()?;
+                    return Err(RunError::Provider(e.to_string()));
+                }
             }
         };
         total_in += resp.usage.input_tokens as u64;

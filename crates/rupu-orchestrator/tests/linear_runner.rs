@@ -57,6 +57,7 @@ impl StepFactory for FakeFactory {
             tool_context: ToolContext::default(),
             user_message: rendered_prompt,
             mode_str: "bypass".into(),
+            no_stream: false,
         }
     }
 }

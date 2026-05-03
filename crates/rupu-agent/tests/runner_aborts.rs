@@ -26,6 +26,7 @@ fn opts(
         tool_context: ToolContext::default(),
         user_message: "go".into(),
         mode_str: "bypass".into(),
+        no_stream: false,
     }
 }
 
