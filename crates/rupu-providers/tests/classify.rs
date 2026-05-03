@@ -61,3 +61,26 @@ fn unknown_status_falls_to_other() {
     let e = classify_anthropic(418, "I'm a teapot", None);
     assert!(matches!(e, ProviderError::Other(_)));
 }
+
+#[test]
+fn classify_handles_multibyte_utf8_body_without_panic() {
+    // 200 crab emojis (4 bytes each = 800 bytes total), truncated to a
+    // 500-byte limit with the helper inside classify_openai's BadRequest
+    // arm. Pre-fix this would panic with "byte index 500 is not a char
+    // boundary" for any multi-byte char whose size doesn't evenly divide
+    // the limit.
+    let body: String = "🦀".repeat(200);
+    let e = rupu_providers::classify::classify_openai(400, &body, None);
+    match e {
+        rupu_providers::error::ProviderError::BadRequest { message } => {
+            // Should produce a String that ends with the ellipsis.
+            assert!(
+                message.ends_with('…'),
+                "expected ellipsis suffix, got: {message:?}"
+            );
+            // Should be <= 500 + the size of the ellipsis byte sequence.
+            assert!(message.len() <= 500 + '…'.len_utf8());
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
