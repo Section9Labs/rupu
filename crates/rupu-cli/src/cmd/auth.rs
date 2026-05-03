@@ -22,8 +22,19 @@ pub enum Action {
     },
     /// Remove a stored credential.
     Logout {
-        #[arg(long)]
-        provider: String,
+        /// Provider name (omit with --all to clear everything).
+        #[arg(long, conflicts_with = "all")]
+        provider: Option<String>,
+        /// Specific auth mode to remove. If omitted, both api-key and sso
+        /// for that provider are removed.
+        #[arg(long, value_enum)]
+        mode: Option<AuthModeArg>,
+        /// Remove every stored credential across all providers and modes.
+        #[arg(long, conflicts_with = "provider")]
+        all: bool,
+        /// Skip the confirmation prompt for --all.
+        #[arg(long, requires = "all")]
+        yes: bool,
     },
     /// Show configured providers + backend.
     Status,
@@ -52,7 +63,20 @@ pub async fn handle(action: Action) -> ExitCode {
             mode,
             key,
         } => login(&provider, mode, key.as_deref()).await,
-        Action::Logout { provider } => logout(&provider).await,
+        Action::Logout {
+            provider,
+            mode,
+            all,
+            yes,
+        } => {
+            logout(LogoutOpts {
+                provider,
+                mode,
+                all,
+                yes,
+            })
+            .await
+        }
         Action::Status => status().await,
     };
     match result {
@@ -114,11 +138,59 @@ async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::
     Ok(())
 }
 
-async fn logout(provider: &str) -> anyhow::Result<()> {
+struct LogoutOpts {
+    provider: Option<String>,
+    mode: Option<AuthModeArg>,
+    all: bool,
+    yes: bool,
+}
+
+async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
+    let resolver = rupu_auth::resolver::KeychainResolver::new();
+    if opts.all {
+        if !opts.yes {
+            print!("Remove all stored credentials? [y/N]: ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            let mut buf = String::new();
+            std::io::stdin().read_line(&mut buf)?;
+            if !matches!(buf.trim(), "y" | "yes" | "Y") {
+                println!("aborted.");
+                return Ok(());
+            }
+        }
+        for p in [
+            ProviderId::Anthropic,
+            ProviderId::Openai,
+            ProviderId::Gemini,
+            ProviderId::Copilot,
+            ProviderId::Local,
+        ] {
+            for m in [
+                rupu_providers::AuthMode::ApiKey,
+                rupu_providers::AuthMode::Sso,
+            ] {
+                let _ = resolver.forget(p, m).await;
+            }
+        }
+        println!("rupu: cleared all credentials");
+        return Ok(());
+    }
+    let provider = opts
+        .provider
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--provider required (or use --all)"))?;
     let pid = parse_provider(provider)?;
-    let backend = backend_for_global()?;
-    backend.forget(pid)?;
-    println!("rupu: forgot credential for {provider}");
+    let modes = match opts.mode {
+        Some(m) => vec![m.into()],
+        None => vec![
+            rupu_providers::AuthMode::ApiKey,
+            rupu_providers::AuthMode::Sso,
+        ],
+    };
+    for m in modes {
+        resolver.forget(pid, m).await?;
+    }
+    println!("rupu: forgot credential(s) for {provider}");
     Ok(())
 }
 
