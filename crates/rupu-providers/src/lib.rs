@@ -24,6 +24,7 @@ pub mod google_gemini;
 pub mod local;
 pub mod model_catalog;
 pub mod model_pool;
+pub mod model_registry;
 pub mod model_scorer;
 pub mod model_tier;
 pub mod openai_codex;
@@ -53,6 +54,7 @@ pub use local::{LocalModelProvider, RoutingDecision, RoutingPolicy};
 pub use model_pool::{
     ModelCapability, ModelCost, ModelInfo, ModelPool, ModelState, ModelStatus, ResponseHeaders,
 };
+pub use model_registry::{ModelRegistry, ModelSource, ResolvedModel};
 pub use model_scorer::{BudgetMode, BudgetState, ScoreBreakdown, ScoredModel};
 pub use model_tier::{ModelMap, ModelTier, ThinkingLevel};
 pub use openai_codex::OpenAiCodexClient;
