@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod auth;
+pub mod auth_mode;
 pub mod broker_client;
 pub mod broker_types;
 pub mod credential_source;
@@ -38,6 +39,7 @@ pub use anthropic::AnthropicClient;
 pub use auth::{
     resolve_anthropic_auth, resolve_provider_auth, save_provider_auth, AuthCredentials, AuthMethod,
 };
+pub use auth_mode::AuthMode;
 pub use broker_client::BrokerClient;
 pub use broker_types::{BrokerError, BrokerRequest, BudgetStatus, CallCost, LlmRequestWire};
 pub use credential_source::{CredentialSource, ProviderAuthStatus};
