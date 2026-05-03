@@ -44,7 +44,7 @@ git -c url."https://github.com/".insteadOf="git@github.com:" push origin "$TAG"
 For your current platform:
 
 ```bash
-cargo build --release -p rupu-cli
+make release                       # cargo build --release + sign with Developer ID
 cd target/release
 strip rupu                         # smaller binary; no debug symbols
 TARGET=$(rustc -vV | awk '/^host/ { print $2 }')   # e.g., aarch64-apple-darwin
@@ -54,7 +54,31 @@ shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
 ls -la "${NAME}.tar.gz"*
 ```
 
-Repeat on each host you have access to (macOS arm64 + Intel; Linux x86_64; Linux arm64). v0 only ships what you happen to build; users on unsupported platforms install via `cargo install --git https://github.com/Section9Labs/rupu --tag $TAG`.
+`make release` runs `cargo build --release -p rupu-cli` and then `scripts/sign-dev.sh release`, which signs the binary with the Developer ID Application cert and the hardened runtime. Required for both the keychain-trust workflow (so successive builds don't re-prompt) and notarization in step 4a.
+
+#### 4a. Notarize the macOS binary (one-time prereq + per-release submit)
+
+**One-time setup** (skip if you've already done this once):
+
+```bash
+xcrun notarytool store-credentials rupu \
+  --apple-id <your@apple.id> \
+  --team-id 995PCLM9KH
+```
+
+You'll be prompted for an [app-specific password](https://appleid.apple.com/account/manage) — generate one under "Sign-In and Security → App-Specific Passwords" and paste it. Stored in your login keychain as profile `rupu`.
+
+**Per release** (run after step 4's sign step, before tarring):
+
+```bash
+scripts/notarize-release.sh
+```
+
+This wraps `target/release/rupu` in a temp .zip, submits to `xcrun notarytool` with the `rupu` keychain profile, waits for the verdict, and exits non-zero on failure (printing the notarization log). On success the binary's signature carries the notarization ticket online; Gatekeeper will accept it on first run for end users.
+
+There's no `stapler` step — bare command-line binaries can't be stapled (stapler only attaches tickets to `.app`/`.pkg`/`.dmg`). The online notarization check via Gatekeeper covers this.
+
+Repeat steps 4 + 4a on each host you have access to (macOS arm64 + Intel; Linux x86_64; Linux arm64). Linux/Windows skip the sign + notarize steps via the script's OS check. v0 only ships what you happen to build; users on unsupported platforms install via `cargo install --git https://github.com/Section9Labs/rupu --tag $TAG`.
 
 ### 5. Create the GitHub release
 
