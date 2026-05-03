@@ -23,6 +23,7 @@ url.workspace = true
 octocrab.workspace = true
 git2.workspace = true
 lru.workspace = true
+rand.workspace = true
 
 # In-workspace
 rupu-auth = { path = "../rupu-auth" }
