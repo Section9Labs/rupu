@@ -10,8 +10,8 @@ use rupu_config::Config;
 use crate::connectors::{IssueConnector, RepoConnector};
 
 mod client;
-mod issues;
-mod repo;
+pub mod issues;
+pub mod repo;
 
 pub use client::{classify_octocrab_error, GithubClient};
 

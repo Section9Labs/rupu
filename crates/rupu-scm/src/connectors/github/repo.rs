@@ -28,10 +28,30 @@ impl RepoConnector for GithubRepoConnector {
     }
 
     async fn list_repos(&self) -> Result<Vec<Repo>, ScmError> {
-        let _ = &self.client;
-        Err(ScmError::Transient(anyhow::anyhow!(
-            "github::list_repos not yet implemented (Task 12)"
-        )))
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        self.client
+            .with_retry(|| {
+                let inner = inner.clone();
+                async move {
+                    let pages = inner
+                        .current()
+                        .list_repos_for_authenticated_user()
+                        .per_page(100)
+                        .send()
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    let all = inner
+                        .all_pages(pages)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    Ok(all
+                        .into_iter()
+                        .filter_map(repo_from_octocrab)
+                        .collect::<Vec<_>>())
+                }
+            })
+            .await
     }
 
     async fn get_repo(&self, _r: &RepoRef) -> Result<Repo, ScmError> {
@@ -83,4 +103,21 @@ impl RepoConnector for GithubRepoConnector {
     async fn clone_to(&self, _r: &RepoRef, _dir: &std::path::Path) -> Result<(), ScmError> {
         Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
     }
+}
+
+fn repo_from_octocrab(r: octocrab::models::Repository) -> Option<Repo> {
+    let full = r.full_name?;
+    let (owner, name) = full.split_once('/')?;
+    Some(Repo {
+        r: RepoRef {
+            platform: Platform::Github,
+            owner: owner.to_string(),
+            repo: name.to_string(),
+        },
+        default_branch: r.default_branch.unwrap_or_else(|| "main".into()),
+        clone_url_https: r.clone_url.map(|u| u.to_string()).unwrap_or_default(),
+        clone_url_ssh: r.ssh_url.unwrap_or_default(),
+        private: r.private.unwrap_or(false),
+        description: r.description,
+    })
 }
