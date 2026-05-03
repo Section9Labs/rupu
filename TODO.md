@@ -16,16 +16,12 @@ Long-term these should be rupu-specific OAuth clients so users see "rupu wants a
 
 **Why deferred:** vendors take days to weeks to approve OAuth client registrations, and matt's primary use case (paid Claude.ai subscribers running inference) works today via impersonation. Revisit once a clean release/branding window exists.
 
-## Code-signing & keychain trust (deferred from Slice B-1)
+## Code-signing & keychain trust
 
-macOS keychain re-prompts on every rebuild because each binary has a different code identity. Three layers, do them in order:
-
-1. **Local dev (fast fix, ~30 min):** `make sign-dev` target that runs a self-signed `codesign -f -s "rupu-dev"` after `cargo build`. Click "Always Allow" once on the first keychain prompt; future builds inherit the trust because the signing identity is stable. No Apple Developer account needed for this.
-2. **Released binaries (proper fix):** add `Developer ID Application` signing + `xcrun notarytool` notarization to `docs/RELEASING.md`. Released binaries are trusted out of the box for end users. **Prereqs to verify before starting:**
-   - `security find-identity -v -p codesigning` returns a `Developer ID Application: <name> (<TEAM_ID>)` entry (NOT `Apple Development` — that won't notarize).
-   - `xcrun notarytool store-credentials rupu --apple-id <you@…> --team-id <TEAMID>` succeeds.
-   - `entitlements.plist` allows `keychain-access-groups` for the hardened runtime.
-3. **Programmatic keychain ACL (optional polish):** when `rupu auth login` writes a credential, set the keychain item's access-control list to include the rupu code-signing identity directly via `Security.framework` / `SecAccessCreateWithFlags`. Removes the "Always Allow" click on first use. The `keyring` crate v3 doesn't expose this — needs a small native shim (or contribute upstream).
+Status:
+- ✅ **Layer 1 (local dev)**: `Makefile` + `scripts/sign-dev.sh` sign every `cargo build` with the Developer ID Application cert. Click "Always Allow" once on the first keychain prompt; the signing identity is stable across rebuilds, so subsequent builds inherit the trust.
+- ✅ **Layer 2 (released binaries)**: `scripts/notarize-release.sh` submits a signed binary to `xcrun notarytool` with the `rupu` keychain profile. `docs/RELEASING.md` updated with the one-time `notarytool store-credentials` setup and the per-release notarization step. Notarized binaries are trusted by Gatekeeper out of the box for end users.
+- ⚠️ **Layer 3 (programmatic keychain ACL)** — deferred. After L1+L2, the dev re-prompt is gone (stable signing identity = persistent "Always Allow") and end-user releases are notarized, so most of the user-facing pain is solved. Layer 3 would remove the *first-time* "Always Allow" prompt by setting the keychain item's ACL to include the rupu signing identity directly via `Security.framework` / `SecAccessCreateWithFlags`. The `keyring` crate v3 doesn't expose this — needs a small native shim (or upstream contribution). Worth doing only if first-launch friction becomes a complaint.
 
 ## `rupu usage` aggregation subcommand (deferred from Slice B-1)
 
