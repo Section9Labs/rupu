@@ -21,6 +21,7 @@ chrono.workspace = true
 reqwest.workspace = true
 url.workspace = true
 octocrab.workspace = true
+http.workspace = true
 git2.workspace = true
 lru.workspace = true
 rand.workspace = true

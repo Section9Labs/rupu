@@ -54,8 +54,29 @@ impl RepoConnector for GithubRepoConnector {
             .await
     }
 
-    async fn get_repo(&self, _r: &RepoRef) -> Result<Repo, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn get_repo(&self, r: &RepoRef) -> Result<Repo, ScmError> {
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = r.owner.clone();
+        let repo = r.repo.clone();
+        let model = self
+            .client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                async move {
+                    inner
+                        .repos(&owner, &repo)
+                        .get()
+                        .await
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await?;
+        repo_from_octocrab(model).ok_or_else(|| {
+            ScmError::Transient(anyhow::anyhow!("malformed repo response from github"))
+        })
     }
 
     async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
@@ -73,23 +94,128 @@ impl RepoConnector for GithubRepoConnector {
 
     async fn read_file(
         &self,
-        _r: &RepoRef,
-        _path: &str,
-        _ref_: Option<&str>,
+        r: &RepoRef,
+        path: &str,
+        ref_: Option<&str>,
     ) -> Result<FileContent, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = r.owner.clone();
+        let repo = r.repo.clone();
+        let path_owned = path.to_string();
+        let ref_owned = ref_.map(|s| s.to_string());
+        let mut items = self
+            .client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let path = path_owned.clone();
+                let ref_ = ref_owned.clone();
+                async move {
+                    let handler = inner.repos(&owner, &repo);
+                    let mut builder = handler.get_content().path(path);
+                    if let Some(r) = ref_ {
+                        builder = builder.r#ref(r);
+                    }
+                    builder
+                        .send()
+                        .await
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await?;
+        let first = items
+            .items
+            .pop()
+            .ok_or_else(|| ScmError::NotFound { what: path.into() })?;
+        let content = first.decoded_content().ok_or_else(|| {
+            ScmError::Transient(anyhow::anyhow!("github: content not decodable for {path}"))
+        })?;
+        Ok(FileContent {
+            path: first.path,
+            ref_: ref_.unwrap_or("HEAD").to_string(),
+            content,
+            encoding: crate::types::FileEncoding::Utf8,
+        })
     }
 
     async fn list_prs(&self, _r: &RepoRef, _filter: PrFilter) -> Result<Vec<Pr>, ScmError> {
         Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
     }
 
-    async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn get_pr(&self, p: &PrRef) -> Result<Pr, ScmError> {
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = p.repo.owner.clone();
+        let repo = p.repo.repo.clone();
+        let number = p.number;
+        let pr = self
+            .client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                async move {
+                    inner
+                        .pulls(&owner, &repo)
+                        .get(number as u64)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await?;
+        Ok(pr_from_octocrab(p.repo.clone(), pr))
     }
 
-    async fn diff_pr(&self, _p: &PrRef) -> Result<Diff, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn diff_pr(&self, p: &PrRef) -> Result<Diff, ScmError> {
+        let _permit = self.client.permit().await;
+        let path = format!("/repos/{}/{}/pulls/{}", p.repo.owner, p.repo.repo, p.number);
+        let inner = self.client.inner.clone();
+        let patch = self
+            .client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let path = path.clone();
+                async move {
+                    let mut headers = http::header::HeaderMap::new();
+                    headers.insert(
+                        http::header::ACCEPT,
+                        http::header::HeaderValue::from_static("application/vnd.github.v3.diff"),
+                    );
+                    let response = inner
+                        ._get_with_headers(&path as &str, Some(headers))
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    // Check for error status before reading body.
+                    let response = octocrab::map_github_error(response)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    inner
+                        .body_to_string(response)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await?;
+        let files_changed = patch
+            .lines()
+            .filter(|l| l.starts_with("diff --git "))
+            .count() as u32;
+        let additions = patch
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .count() as u32;
+        let deletions = patch
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .count() as u32;
+        Ok(Diff {
+            patch,
+            files_changed,
+            additions,
+            deletions,
+        })
     }
 
     async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
@@ -120,4 +246,26 @@ fn repo_from_octocrab(r: octocrab::models::Repository) -> Option<Repo> {
         private: r.private.unwrap_or(false),
         description: r.description,
     })
+}
+
+fn pr_from_octocrab(repo: RepoRef, pr: octocrab::models::pulls::PullRequest) -> Pr {
+    use crate::types::PrState;
+    Pr {
+        r: PrRef {
+            repo,
+            number: pr.number as u32,
+        },
+        title: pr.title.unwrap_or_default(),
+        body: pr.body.unwrap_or_default(),
+        state: match pr.state {
+            Some(octocrab::models::IssueState::Open) => PrState::Open,
+            _ if pr.merged_at.is_some() => PrState::Merged,
+            _ => PrState::Closed,
+        },
+        head_branch: pr.head.ref_field,
+        base_branch: pr.base.ref_field,
+        author: pr.user.map(|u| u.login).unwrap_or_default(),
+        created_at: pr.created_at.unwrap_or_else(chrono::Utc::now),
+        updated_at: pr.updated_at.unwrap_or_else(chrono::Utc::now),
+    }
 }

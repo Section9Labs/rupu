@@ -50,6 +50,7 @@ futures-util = "0.3"
 fs2 = "0.4"
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2", "vendored-openssl"] }
 octocrab = "0.42"
+http = "1"
 
 # Crypto (lifted)
 ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
