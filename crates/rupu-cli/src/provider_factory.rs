@@ -47,8 +47,10 @@ pub async fn build_for_provider(
     }
     match name {
         "anthropic" => build_anthropic(model, backend).await,
-        "openai" | "openai_codex" | "codex" | "copilot" | "github_copilot" | "gemini"
-        | "google_gemini" | "local" => Err(FactoryError::NotWiredInV0(name.to_string())),
+        "openai" | "openai_codex" | "codex" => build_openai(model, backend).await,
+        "gemini" | "google_gemini" => build_gemini(model, backend).await,
+        "copilot" | "github_copilot" => build_copilot(model, backend).await,
+        "local" => Err(FactoryError::NotWiredInV0(name.to_string())),
         _ => Err(FactoryError::UnknownProvider(name.to_string())),
     }
 }
@@ -77,4 +79,101 @@ async fn build_anthropic(
     };
     let client = rupu_providers::anthropic::AnthropicClient::new(api_key);
     Ok(Box::new(client))
+}
+
+async fn build_openai(
+    model: &str,
+    backend: &dyn rupu_auth::AuthBackend,
+) -> Result<Box<dyn LlmProvider>, FactoryError> {
+    // model is supplied per-request via LlmRequest.model, not at construction.
+    let _ = model;
+    let api_key = match backend.retrieve(rupu_auth::ProviderId::Openai) {
+        Ok(k) => k,
+        Err(_) => std::env::var("OPENAI_API_KEY").map_err(|_| FactoryError::MissingCredential {
+            provider: "openai".to_string(),
+        })?,
+    };
+    let creds = rupu_providers::auth::AuthCredentials::ApiKey { key: api_key };
+    let client = rupu_providers::openai_codex::OpenAiCodexClient::new(creds, None)
+        .map_err(|e| FactoryError::Other(format!("openai client init: {e}")))?;
+    Ok(Box::new(client))
+}
+
+async fn build_gemini(
+    _model: &str,
+    _backend: &dyn rupu_auth::AuthBackend,
+) -> Result<Box<dyn LlmProvider>, FactoryError> {
+    Err(FactoryError::NotWiredInV0("gemini".to_string())) // wired in Task 13
+}
+
+async fn build_copilot(
+    _model: &str,
+    _backend: &dyn rupu_auth::AuthBackend,
+) -> Result<Box<dyn LlmProvider>, FactoryError> {
+    Err(FactoryError::NotWiredInV0("copilot".to_string())) // wired in Task 14
+}
+
+#[cfg(test)]
+mod build_openai_tests {
+    use super::*;
+    use rupu_auth::{AuthBackend, AuthError, ProviderId as AuthProviderId};
+
+    struct FixedKeyBackend(&'static str);
+    impl AuthBackend for FixedKeyBackend {
+        fn store(&self, _: AuthProviderId, _: &str) -> Result<(), AuthError> {
+            Ok(())
+        }
+        fn retrieve(&self, p: AuthProviderId) -> Result<String, AuthError> {
+            if p == AuthProviderId::Openai {
+                Ok(self.0.to_string())
+            } else {
+                Err(AuthError::NotConfigured(p))
+            }
+        }
+        fn forget(&self, _: AuthProviderId) -> Result<(), AuthError> {
+            Ok(())
+        }
+        fn name(&self) -> &'static str {
+            "fixed-test"
+        }
+    }
+
+    #[tokio::test]
+    async fn build_openai_returns_provider() {
+        let backend = FixedKeyBackend("sk-test-openai");
+        let p = build_for_provider("openai", "gpt-5", &backend)
+            .await
+            .expect("build");
+        assert_eq!(p.provider_id(), rupu_providers::ProviderId::OpenaiCodex);
+    }
+
+    #[tokio::test]
+    async fn build_openai_missing_credential_errors() {
+        struct EmptyBackend;
+        impl AuthBackend for EmptyBackend {
+            fn store(&self, _: AuthProviderId, _: &str) -> Result<(), AuthError> {
+                Ok(())
+            }
+            fn retrieve(&self, p: AuthProviderId) -> Result<String, AuthError> {
+                Err(AuthError::NotConfigured(p))
+            }
+            fn forget(&self, _: AuthProviderId) -> Result<(), AuthError> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "empty"
+            }
+        }
+        // Clear env var so the env fallback doesn't accidentally satisfy the request.
+        let prev = std::env::var("OPENAI_API_KEY").ok();
+        std::env::remove_var("OPENAI_API_KEY");
+        let result = build_for_provider("openai", "gpt-5", &EmptyBackend).await;
+        if let Some(p) = prev {
+            std::env::set_var("OPENAI_API_KEY", p);
+        }
+        assert!(matches!(
+            result,
+            Err(FactoryError::MissingCredential { .. })
+        ));
+    }
 }

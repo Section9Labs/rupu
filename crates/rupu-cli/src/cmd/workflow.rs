@@ -232,6 +232,7 @@ impl StepFactory for CliStepFactory {
                         description: None,
                         provider: Some("anthropic".to_string()),
                         model: Some("claude-sonnet-4-6".to_string()),
+                        auth: None,
                         tools: None,
                         max_turns: Some(50),
                         permission_mode: Some(self.mode_str.clone()),
