@@ -74,6 +74,14 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         tokens_out: Option<u64>,
     },
+    Usage {
+        provider: String,
+        model: String,
+        input_tokens: u32,
+        output_tokens: u32,
+        #[serde(default)]
+        cached_tokens: u32,
+    },
     RunComplete {
         run_id: String,
         status: RunStatus,
