@@ -41,4 +41,5 @@ rupu-transcript = { path = "../rupu-transcript" }
 [dev-dependencies]
 tempfile.workspace = true
 assert_fs.workspace = true
+assert_cmd = { workspace = true }
 predicates.workspace = true

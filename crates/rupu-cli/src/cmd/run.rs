@@ -93,6 +93,16 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     let provider =
         provider_factory::build_for_provider(&provider_name, &model, backend.as_ref()).await?;
 
+    println!(
+        "agent: {}  provider: {}/{}  model: {}",
+        spec.name,
+        provider_name,
+        spec.auth
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "?".into()),
+        model,
+    );
+
     // Transcript path.
     let run_id = format!("run_{}", Ulid::new());
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
