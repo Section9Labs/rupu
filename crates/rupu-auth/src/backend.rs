@@ -11,7 +11,7 @@ use thiserror::Error;
 
 /// Identifies a credential namespace within the backend (one secret
 /// per provider).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Anthropic,

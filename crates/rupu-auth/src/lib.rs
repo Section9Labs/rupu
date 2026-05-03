@@ -32,6 +32,10 @@ pub mod oauth;
 pub mod stored;
 pub use stored::StoredCredential;
 
+pub mod in_memory;
+pub mod resolver;
+pub use resolver::CredentialResolver;
+
 pub use backend::{AuthBackend, AuthError, ProviderId};
 pub use json_file::JsonFileBackend;
 pub use keyring::KeyringBackend;
