@@ -80,6 +80,23 @@ async fn deferred_provider_returns_blocked_error() {
     }
 }
 
+/// Regression: the suggestion command in `MissingCredential`'s error message
+/// used to embed the resolver error inside the `{provider}` field, producing
+/// `configure with \`rupu auth login --provider anthropic: expected value at
+/// line 1 column 1\`` — copy-paste-broken advice. The resolver error now
+/// lives in a separate `source` field and the suggestion stays clean.
+#[tokio::test]
+async fn missing_credential_error_keeps_suggestion_command_clean() {
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    let resolver = InMemoryResolver::new();
+    let res = build_for_provider("anthropic", "claude-sonnet-4-6", None, &resolver).await;
+    let err = format!("{}", res.err().expect("expected Err"));
+    assert!(
+        err.contains("`rupu auth login --provider anthropic`"),
+        "suggestion command should be clean: {err}"
+    );
+}
+
 /// Regression test for the SSO bug where an OAuth credential resolved
 /// for Anthropic was being shipped via the `x-api-key` header instead
 /// of `Authorization: Bearer …`. The httpmock matcher fires only when

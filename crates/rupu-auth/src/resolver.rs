@@ -81,7 +81,7 @@ impl KeychainResolver {
     fn read(&self, p: ProviderId, mode: AuthMode) -> Result<Option<StoredCredential>> {
         let key = key_for(p, mode);
         match self.entry(&key)?.get_password() {
-            Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
+            Ok(s) => Ok(Some(parse_stored_credential(&s, mode)?)),
             Err(keyring::Error::NoEntry) => {
                 // Slice A legacy fallback: try the old single-key shape
                 // (treated as api-key). Only relevant for ApiKey lookups.
@@ -202,6 +202,25 @@ impl Default for KeychainResolver {
     }
 }
 
+/// Deserialize a keychain entry's payload into a [`StoredCredential`].
+///
+/// Most entries hold the canonical JSON-serialized `StoredCredential`. For
+/// ApiKey entries we additionally tolerate a raw plain-string payload —
+/// pre-StoredCredential builds wrote api-keys that way under the new keyspace,
+/// and the only way to recover from one of those entries (without surfacing a
+/// confusing JSON-parse error to the user) is to treat the raw payload as a
+/// legacy api-key. SSO entries cannot be recovered this way because the SSO
+/// shape requires structured fields.
+fn parse_stored_credential(s: &str, mode: AuthMode) -> Result<StoredCredential> {
+    match serde_json::from_str::<StoredCredential>(s) {
+        Ok(sc) => Ok(sc),
+        Err(_) if mode == AuthMode::ApiKey => Ok(StoredCredential::api_key(s)),
+        Err(e) => Err(anyhow::anyhow!(
+            "keychain payload not StoredCredential JSON: {e}"
+        )),
+    }
+}
+
 #[async_trait]
 impl CredentialResolver for KeychainResolver {
     async fn get(
@@ -239,5 +258,50 @@ impl CredentialResolver for KeychainResolver {
         let new = self.refresh_inner(p, mode, &sc).await?;
         self.store(p, mode, &new).await?;
         Ok(new.credentials)
+    }
+}
+
+#[cfg(test)]
+mod parse_stored_credential_tests {
+    use super::*;
+    use rupu_providers::auth::AuthCredentials;
+
+    #[test]
+    fn json_payload_parses_as_stored_credential() {
+        let json = r#"{"credentials":{"type":"api_key","key":"sk-test"}}"#;
+        let sc = parse_stored_credential(json, AuthMode::ApiKey).expect("parse");
+        match sc.credentials {
+            AuthCredentials::ApiKey { key } => assert_eq!(key, "sk-test"),
+            _ => panic!("expected ApiKey credential"),
+        }
+    }
+
+    #[test]
+    fn raw_string_in_api_key_slot_falls_back_to_legacy_api_key() {
+        // Legacy 0.1.5 builds wrote api-keys as raw strings under the new
+        // keyspace. The resolver must recover instead of bubbling up a
+        // confusing serde_json parse error to `rupu run`.
+        let raw = "sk-ant-api03-legacy-plain-string";
+        let sc = parse_stored_credential(raw, AuthMode::ApiKey).expect("legacy fallback");
+        match sc.credentials {
+            AuthCredentials::ApiKey { key } => assert_eq!(key, raw),
+            _ => panic!("expected legacy api-key fallback"),
+        }
+        assert!(sc.refresh_token.is_none());
+        assert!(sc.expires_at.is_none());
+    }
+
+    #[test]
+    fn raw_string_in_sso_slot_returns_error() {
+        // SSO requires structured fields (refresh_token, expires_at, etc.),
+        // so a raw-string payload there really is unrecoverable garbage —
+        // surface it rather than silently forging a half-broken credential.
+        let raw = "not-a-real-oauth-token";
+        let err = parse_stored_credential(raw, AuthMode::Sso).expect_err("should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("StoredCredential"),
+            "expected typed error, got: {msg}"
+        );
     }
 }

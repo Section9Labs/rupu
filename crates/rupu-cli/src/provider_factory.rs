@@ -18,10 +18,13 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum FactoryError {
     #[error(
-        "missing credential for provider {provider}: configure with \
+        "missing credential for provider {provider} ({source}): configure with \
          `rupu auth login --provider {provider}` or set the env var the provider expects"
     )]
-    MissingCredential { provider: String },
+    MissingCredential {
+        provider: String,
+        source: anyhow::Error,
+    },
     #[error("unknown provider: {0}")]
     UnknownProvider(String),
     #[error("provider {0} is not wired in v0; only `anthropic` is currently supported")]
@@ -58,8 +61,9 @@ pub async fn build_for_provider(
         resolver
             .get(name, auth_hint)
             .await
-            .map_err(|e| FactoryError::MissingCredential {
-                provider: format!("{name}: {e}"),
+            .map_err(|source| FactoryError::MissingCredential {
+                provider: name.to_string(),
+                source,
             })?;
     let client = match name {
         "anthropic" => build_anthropic(creds, model).await?,
