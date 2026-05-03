@@ -27,6 +27,8 @@ pub mod probe;
 pub mod keychain_layout;
 pub use keychain_layout::{key_for, legacy_key_for, KeychainKey};
 
+pub mod oauth;
+
 pub mod stored;
 pub use stored::StoredCredential;
 
