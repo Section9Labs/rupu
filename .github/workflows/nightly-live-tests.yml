@@ -1,0 +1,25 @@
+name: nightly-live-tests
+on:
+  schedule:
+    - cron: "0 8 * * *"  # 08:00 UTC every day
+  workflow_dispatch: {}
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUPU_LIVE_TESTS: "1"
+      RUPU_LIVE_ANTHROPIC_KEY: ${{ secrets.RUPU_LIVE_ANTHROPIC_KEY }}
+      RUPU_LIVE_OPENAI_KEY: ${{ secrets.RUPU_LIVE_OPENAI_KEY }}
+      RUPU_LIVE_GEMINI_KEY: ${{ secrets.RUPU_LIVE_GEMINI_KEY }}
+      RUPU_LIVE_COPILOT_TOKEN: ${{ secrets.RUPU_LIVE_COPILOT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - name: Cargo build
+        run: cargo build -p rupu-providers --tests
+      - name: Live smoke tests
+        run: cargo test -p rupu-providers --test live_smoke -- --nocapture
