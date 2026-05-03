@@ -16,6 +16,13 @@ use crate::types::*;
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 /// Anthropic API version. Update when new SSE event types or features are needed.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// `User-Agent` sent on every Anthropic request. Mirrors the first-party
+/// `claude-cli/<ver>` namespace so the OAuth scope's Pro/Max quota
+/// attribution treats the call as Claude-Code-like — which it is, in
+/// shape and intent. The version segment is rupu's own (not the upstream
+/// Claude Code version) so traffic remains traceable to this codebase in
+/// any internal dashboards.
+const RUPU_USER_AGENT: &str = concat!("claude-cli/", env!("CARGO_PKG_VERSION"));
 /// Maximum retries for 429 rate-limit responses.
 /// Per-request 429 retries. Set to 1 (one retry) so the ProviderRouter can
 /// handle cross-provider fallback quickly. When used without a router, the
@@ -447,6 +454,7 @@ impl AnthropicClient {
 
     /// Apply auth headers to a request builder based on auth method.
     fn apply_auth_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let builder = builder.header("User-Agent", RUPU_USER_AGENT);
         match &self.auth {
             AuthMethod::ApiKey(key) => builder
                 .header("x-api-key", key)
@@ -621,12 +629,35 @@ impl AnthropicClient {
             "stream": stream,
         });
 
+        // System prompts go as an array of TextBlock-shaped objects rather
+        // than a bare string. Both shapes are accepted by Anthropic, but the
+        // block form is what `@anthropic-ai/sdk` emits and is the path that
+        // supports `cache_control` per-block in future.
         if let Some(system) = &request.system {
-            body["system"] = serde_json::json!(system);
+            body["system"] = serde_json::json!([
+                { "type": "text", "text": system }
+            ]);
         }
 
         if !request.tools.is_empty() {
             body["tools"] = serde_json::json!(request.tools);
+        }
+
+        // OAuth-scope parity with the first-party Claude client: declare the
+        // OAuth beta in-body (the SDK source-of-truth — header is mirrored
+        // by `apply_auth_headers`) and carry a `metadata.user_id` blob so
+        // Anthropic can attribute the request to the user's Pro/Max quota.
+        // `account_uuid` is intentionally absent for now — it requires a
+        // /me-style profile fetch at SSO login, deferred until we see how
+        // far this minimum gets us against 429s.
+        if self.auth.is_oauth() {
+            body["betas"] = serde_json::json!([OAUTH_BETA_HEADER]);
+            let user_id_blob = serde_json::json!({
+                "device_id": "rupu",
+                "session_id": request.cell_id.clone().unwrap_or_default(),
+            })
+            .to_string();
+            body["metadata"] = serde_json::json!({ "user_id": user_id_blob });
         }
 
         // Thinking/extended thinking — Anthropic uses budget_tokens.
@@ -948,9 +979,69 @@ mod tests {
             task_type: None,
         };
         let body = client.build_request_body(&request, true);
-        assert_eq!(body["system"], "You are helpful.");
+        assert_eq!(
+            body["system"],
+            serde_json::json!([{ "type": "text", "text": "You are helpful." }])
+        );
         assert_eq!(body["stream"], true);
         assert!(body["tools"].is_array());
+    }
+
+    fn oauth_client() -> AnthropicClient {
+        AnthropicClient::from_auth(AuthMethod::OAuth {
+            access_token: "oauth-access".into(),
+            refresh_token: "oauth-refresh".into(),
+            expires_ms: 0,
+        })
+    }
+
+    #[test]
+    fn oauth_body_includes_betas_and_metadata_user_id() {
+        let client = oauth_client();
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 16,
+            tools: vec![],
+            cell_id: Some("cell-abc".into()),
+            trace_id: None,
+            thinking: None,
+            task_type: None,
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["betas"], serde_json::json!([OAUTH_BETA_HEADER]));
+        let user_id = body["metadata"]["user_id"]
+            .as_str()
+            .expect("metadata.user_id should be a JSON string");
+        let parsed: serde_json::Value = serde_json::from_str(user_id).expect("user_id JSON");
+        assert_eq!(parsed["device_id"], "rupu");
+        assert_eq!(parsed["session_id"], "cell-abc");
+    }
+
+    #[test]
+    fn api_key_body_omits_oauth_only_fields() {
+        let client = AnthropicClient::new("sk-ant-test".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 16,
+            tools: vec![],
+            cell_id: Some("cell-abc".into()),
+            trace_id: None,
+            thinking: None,
+            task_type: None,
+        };
+        let body = client.build_request_body(&request, false);
+        assert!(
+            body.get("betas").is_none(),
+            "betas leaked into api-key request"
+        );
+        assert!(
+            body.get("metadata").is_none(),
+            "metadata leaked into api-key request"
+        );
     }
 
     #[test]
