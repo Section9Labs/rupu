@@ -1149,3 +1149,33 @@ mod tests {
         assert!(acc.into_response().is_none());
     }
 }
+
+#[cfg(test)]
+mod llm_provider_impl_tests {
+    use super::*;
+    use crate::provider::LlmProvider;
+    use crate::provider_id::ProviderId;
+
+    fn oauth_creds() -> AuthCredentials {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert(
+            "project_id".to_string(),
+            serde_json::Value::String("test-project".to_string()),
+        );
+        AuthCredentials::OAuth {
+            access: "test-token".into(),
+            refresh: "test-refresh".into(),
+            expires: 9_999_999_999_999,
+            extra,
+        }
+    }
+
+    #[test]
+    fn implements_llm_provider_trait() {
+        let client =
+            GoogleGeminiClient::new(oauth_creds(), GeminiVariant::GeminiCli, None).expect("new");
+        let boxed: Box<dyn LlmProvider> = Box::new(client);
+        assert_eq!(boxed.provider_id(), ProviderId::GoogleGeminiCli);
+        assert!(!boxed.default_model().is_empty());
+    }
+}
