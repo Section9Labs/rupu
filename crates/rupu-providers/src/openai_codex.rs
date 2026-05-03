@@ -516,6 +516,62 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
     fn provider_id(&self) -> crate::provider_id::ProviderId {
         crate::provider_id::ProviderId::OpenaiCodex
     }
+
+    async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
+        // Strip the `/v1/responses` suffix (this client targets the Responses API
+        // for `send`/`stream`) and append `/v1/models` for the listing endpoint.
+        let base = self
+            .api_url
+            .trim_end_matches("/v1/responses")
+            .trim_end_matches('/');
+        let url = format!("{base}/v1/models");
+        let resp = self
+            .client
+            .get(&url)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", self.access_token),
+            )
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) if r.status().is_success() => r,
+            _ => return Vec::new(),
+        };
+        #[derive(serde::Deserialize)]
+        struct ListResp {
+            data: Vec<ModelEntry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ModelEntry {
+            id: String,
+        }
+        let body: ListResp = match resp.json().await {
+            Ok(b) => b,
+            Err(_) => return Vec::new(),
+        };
+        body.data
+            .into_iter()
+            .map(|e| make_model_info(e.id, crate::provider_id::ProviderId::OpenaiCodex))
+            .collect()
+    }
+}
+
+// ── model_pool helper ────────────────────────────────────────────────
+
+fn make_model_info(
+    id: String,
+    provider: crate::provider_id::ProviderId,
+) -> crate::model_pool::ModelInfo {
+    crate::model_pool::ModelInfo {
+        id,
+        provider,
+        context_window: 0,
+        max_output_tokens: 0,
+        capabilities: Vec::new(),
+        cost: crate::model_pool::ModelCost::default(),
+        status: crate::model_pool::ModelStatus::default(),
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -1248,5 +1304,34 @@ mod tests {
         let truncated = truncate_error(text, 10);
         assert!(truncated.ends_with("..."));
         // Must not panic — the important thing is it doesn't crash
+    }
+
+    #[tokio::test]
+    async fn list_models_parses_response() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "data": [
+                        { "id": "gpt-5", "object": "model" },
+                        { "id": "gpt-4o", "object": "model" }
+                    ]
+                }));
+        });
+        let creds = AuthCredentials::ApiKey {
+            key: "sk-test".into(),
+        };
+        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        // Override api_url so list_models hits the mock instead of api.openai.com.
+        // The list_models implementation strips the /responses suffix and appends /models,
+        // so set api_url to "<server>/v1/responses".
+        client.api_url = format!("{}/v1/responses", server.url(""));
+        let models =
+            <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
+        assert!(models.iter().any(|m| m.id == "gpt-5"));
+        assert!(models.iter().any(|m| m.id == "gpt-4o"));
     }
 }
