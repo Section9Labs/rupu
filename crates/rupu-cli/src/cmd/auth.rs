@@ -8,12 +8,15 @@ use std::process::ExitCode;
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
-    /// Store an API key for a provider.
+    /// Store credentials for a provider.
     Login {
         /// Provider name (anthropic | openai | gemini | copilot | local).
         #[arg(long)]
         provider: String,
-        /// API key. If omitted, reads from stdin.
+        /// Authentication mode.
+        #[arg(long, value_enum, default_value = "api-key")]
+        mode: AuthModeArg,
+        /// API key (only valid with --mode api-key). If omitted, reads from stdin.
         #[arg(long)]
         key: Option<String>,
     },
@@ -26,9 +29,29 @@ pub enum Action {
     Status,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug)]
+pub enum AuthModeArg {
+    #[clap(name = "api-key")]
+    ApiKey,
+    Sso,
+}
+
+impl From<AuthModeArg> for rupu_providers::AuthMode {
+    fn from(a: AuthModeArg) -> Self {
+        match a {
+            AuthModeArg::ApiKey => Self::ApiKey,
+            AuthModeArg::Sso => Self::Sso,
+        }
+    }
+}
+
 pub async fn handle(action: Action) -> ExitCode {
     let result = match action {
-        Action::Login { provider, key } => login(&provider, key.as_deref()).await,
+        Action::Login {
+            provider,
+            mode,
+            key,
+        } => login(&provider, mode, key.as_deref()).await,
         Action::Logout { provider } => logout(&provider).await,
         Action::Status => status().await,
     };
@@ -52,25 +75,42 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
     }
 }
 
-async fn login(provider: &str, key: Option<&str>) -> anyhow::Result<()> {
+async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::Result<()> {
     let pid = parse_provider(provider)?;
-    let secret = match key {
-        Some(k) => k.to_string(),
-        None => {
-            let mut buf = String::new();
-            std::io::stdin().read_to_string(&mut buf)?;
-            buf.trim().to_string()
+    let resolver = rupu_auth::resolver::KeychainResolver::new();
+    let mode_neutral: rupu_providers::AuthMode = mode.clone().into();
+    match mode {
+        AuthModeArg::ApiKey => {
+            let secret = match key {
+                Some(k) => k.to_string(),
+                None => {
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf.trim().to_string()
+                }
+            };
+            if secret.is_empty() {
+                anyhow::bail!("empty API key");
+            }
+            let sc = rupu_auth::stored::StoredCredential::api_key(secret);
+            resolver.store(pid, mode_neutral, &sc).await?;
+            println!("rupu: stored {provider} api-key credential");
         }
-    };
-    if secret.is_empty() {
-        anyhow::bail!("empty API key");
+        AuthModeArg::Sso => {
+            let oauth = rupu_auth::oauth::providers::provider_oauth(pid)
+                .ok_or_else(|| anyhow::anyhow!("provider {provider} has no SSO flow"))?;
+            let stored = match oauth.flow {
+                rupu_auth::oauth::providers::OAuthFlow::Callback => {
+                    rupu_auth::oauth::callback::run(pid).await?
+                }
+                rupu_auth::oauth::providers::OAuthFlow::Device => {
+                    rupu_auth::oauth::device::run(pid).await?
+                }
+            };
+            resolver.store(pid, mode_neutral, &stored).await?;
+            println!("rupu: stored {provider} sso credential");
+        }
     }
-    let backend = backend_for_global()?;
-    backend.store(pid, &secret)?;
-    println!(
-        "rupu: stored credential for {provider} via {}",
-        backend.name()
-    );
     Ok(())
 }
 
