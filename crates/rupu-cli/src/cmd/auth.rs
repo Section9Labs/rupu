@@ -10,7 +10,7 @@ use std::process::ExitCode;
 pub enum Action {
     /// Store an API key for a provider.
     Login {
-        /// Provider name (anthropic | openai | copilot | local).
+        /// Provider name (anthropic | openai | gemini | copilot | local).
         #[arg(long)]
         provider: String,
         /// API key. If omitted, reads from stdin.
@@ -45,6 +45,7 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
     match s {
         "anthropic" => Ok(ProviderId::Anthropic),
         "openai" => Ok(ProviderId::Openai),
+        "gemini" => Ok(ProviderId::Gemini),
         "copilot" => Ok(ProviderId::Copilot),
         "local" => Ok(ProviderId::Local),
         _ => Err(anyhow::anyhow!("unknown provider: {s}")),
@@ -87,6 +88,7 @@ async fn status() -> anyhow::Result<()> {
     for p in [
         ProviderId::Anthropic,
         ProviderId::Openai,
+        ProviderId::Gemini,
         ProviderId::Copilot,
         ProviderId::Local,
     ] {
@@ -106,4 +108,22 @@ fn backend_for_global() -> anyhow::Result<Box<dyn AuthBackend>> {
     let cache = ProbeCache::new(global.join("cache/auth-backend.json"));
     let auth_json = global.join("auth.json");
     Ok(rupu_auth::select_backend(&cache, auth_json))
+}
+
+#[cfg(test)]
+mod parse_provider_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_all_four_providers() {
+        assert_eq!(parse_provider("anthropic").unwrap(), ProviderId::Anthropic);
+        assert_eq!(parse_provider("openai").unwrap(), ProviderId::Openai);
+        assert_eq!(parse_provider("gemini").unwrap(), ProviderId::Gemini);
+        assert_eq!(parse_provider("copilot").unwrap(), ProviderId::Copilot);
+    }
+
+    #[test]
+    fn rejects_unknown() {
+        assert!(parse_provider("typo").is_err());
+    }
 }
