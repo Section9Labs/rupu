@@ -34,6 +34,15 @@ pub enum OAuthFlow {
     Device,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenBodyFormat {
+    /// `application/x-www-form-urlencoded` body. Used by OpenAI / Codex.
+    Form,
+    /// `application/json` body with all params as JSON keys. Used by
+    /// Anthropic per pi-mono's reference implementation.
+    Json,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderOAuth {
     pub flow: OAuthFlow,
@@ -55,48 +64,58 @@ pub struct ProviderOAuth {
     /// Extra fixed query parameters appended to the authorize URL.
     /// Provider-specific signaling (e.g., Codex CLI flags).
     pub extra_authorize_params: &'static [(&'static str, &'static str)],
+    /// Format for the token-exchange request body.
+    pub token_body_format: TokenBodyFormat,
+    /// Use the PKCE verifier as the state value rather than a fresh
+    /// random nonce. Anthropic's server appears to require this; pi.dev's
+    /// known-working impl does this.
+    pub state_is_verifier: bool,
+    /// Include the `state` field in the token-exchange body. OAuth
+    /// standard doesn't require it at exchange time, but Anthropic's
+    /// server seems to want it.
+    pub include_state_in_token_body: bool,
 }
 
 pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
     match p {
         ProviderId::Anthropic => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
-            // Verified against the Claude Code binary's prod config
-            // object (extracted from /Users/matt/.local/share/claude
-            // /versions/2.1.126):
-            //
-            //   {
-            //     CONSOLE_AUTHORIZE_URL: "https://platform.claude.com/oauth/authorize",   // Console (API customers)
-            //     CLAUDE_AI_AUTHORIZE_URL: "https://claude.com/cai/oauth/authorize",      // SSO (Claude.ai users)
-            //     TOKEN_URL: "https://platform.claude.com/v1/oauth/token",
-            //     CLIENT_ID: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-            //   }
-            //
-            // rupu uses the SSO flow (Claude.ai users) since matt's
-            // primary use case is paid Claude subscribers running
-            // inference. The Console flow is for organizations issuing
-            // API keys via console.anthropic.com.
+            // Mirrored from pi-mono (a known-working third-party
+            // implementation of Anthropic's OAuth flow at
+            // packages/ai/src/utils/oauth/anthropic.ts) plus the
+            // Claude Code binary. The pi.dev shape is the exact
+            // request matt's "Pi Coding Agent" sends and we know it
+            // succeeds against the consent screen.
             client_id: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-            authorize_url: "https://claude.com/cai/oauth/authorize",
+            // claude.ai/oauth/authorize directly — NOT
+            // claude.com/cai/oauth/authorize (that was a v0.1.3
+            // misread of the prod config; pi.dev hits claude.ai).
+            authorize_url: "https://claude.ai/oauth/authorize",
             token_url: "https://platform.claude.com/v1/oauth/token",
             device_url: None,
-            // Full Claude Code scope set; see module-level note.
+            // Full pi.dev scope set: includes org:create_api_key
+            // (used during the post-auth API-key creation handshake)
+            // and user:file_upload alongside the inference / profile
+            // / session / MCP scopes.
             scopes: &[
-                "user:inference",
+                "org:create_api_key",
                 "user:profile",
+                "user:inference",
                 "user:sessions:claude_code",
                 "user:mcp_servers",
+                "user:file_upload",
             ],
             redirect_path: "/callback",
-            // Claude Code's URL builder hardcodes "localhost" — not
-            // 127.0.0.1. The OAuth server's allowlist matches on the
-            // literal string.
+            // Bound on 127.0.0.1, advertised as "localhost".
             redirect_host: "localhost",
             fixed_ports: None,
-            // Claude Code's authorize URL begins with `code=true` —
-            // see the prod URL builder GI_ extracted from the binary.
-            // Omitting this is what surfaces as "Invalid request format".
             extra_authorize_params: &[("code", "true")],
+            // Anthropic-specific quirks pulled from pi-mono's
+            // anthropic.ts: JSON body, state == verifier, state
+            // included in token-exchange body.
+            token_body_format: TokenBodyFormat::Json,
+            state_is_verifier: true,
+            include_state_in_token_body: true,
         }),
         ProviderId::Openai => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -132,6 +151,9 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
                 // for now since we're impersonating their client.
                 ("originator", "codex_cli_rs"),
             ],
+            token_body_format: TokenBodyFormat::Form,
+            state_is_verifier: false,
+            include_state_in_token_body: false,
         }),
         ProviderId::Gemini => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -148,6 +170,9 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             redirect_host: "127.0.0.1",
             fixed_ports: None,
             extra_authorize_params: &[],
+            token_body_format: TokenBodyFormat::Form,
+            state_is_verifier: false,
+            include_state_in_token_body: false,
         }),
         ProviderId::Copilot => Some(ProviderOAuth {
             flow: OAuthFlow::Device,
@@ -160,6 +185,9 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             redirect_host: "",
             fixed_ports: None,
             extra_authorize_params: &[],
+            token_body_format: TokenBodyFormat::Form,
+            state_is_verifier: false,
+            include_state_in_token_body: false,
         }),
         ProviderId::Local => None,
     }
@@ -208,46 +236,39 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_carries_full_claude_code_scope_set() {
+    fn anthropic_carries_full_pi_dev_scope_set() {
         let c = provider_oauth(ProviderId::Anthropic).unwrap();
-        assert!(c.scopes.contains(&"user:inference"));
-        assert!(c.scopes.contains(&"user:profile"));
-        assert!(c.scopes.contains(&"user:sessions:claude_code"));
-        assert!(c.scopes.contains(&"user:mcp_servers"));
-        // The legacy "org:create_api_key" Console-flow scope must NOT
-        // be present — it was the cause of the "Invalid request format"
-        // rejection on claude.ai.
-        assert!(!c.scopes.contains(&"org:create_api_key"));
+        // Mirrors pi-mono's anthropic.ts SCOPES literal:
+        // "org:create_api_key user:profile user:inference
+        //  user:sessions:claude_code user:mcp_servers user:file_upload"
+        for required in [
+            "org:create_api_key",
+            "user:profile",
+            "user:inference",
+            "user:sessions:claude_code",
+            "user:mcp_servers",
+            "user:file_upload",
+        ] {
+            assert!(
+                c.scopes.contains(&required),
+                "scope `{required}` missing from {:?}",
+                c.scopes
+            );
+        }
     }
 
     #[test]
-    fn anthropic_uses_sso_path_from_claude_code_prod_config() {
+    fn anthropic_authorize_request_matches_pi_dev_shape() {
         let c = provider_oauth(ProviderId::Anthropic).unwrap();
-        // Verified against the prod config object embedded in the
-        // Claude Code binary (extracted with `strings`). Two distinct
-        // authorize URLs exist there:
-        //   CONSOLE_AUTHORIZE_URL  = platform.claude.com/oauth/authorize
-        //   CLAUDE_AI_AUTHORIZE_URL = claude.com/cai/oauth/authorize  ← SSO
-        // rupu must use the SSO path; the Console one is for users
-        // signing in to issue API keys via the Anthropic console, not
-        // for paid Claude.ai subscription inference.
-        assert_eq!(c.authorize_url, "https://claude.com/cai/oauth/authorize");
-        // CLIENT_ID literal from the prod config (NOT the DCR
-        // metadata URL — that document exists separately and is not
-        // the OAuth client_id at request time).
-        assert_eq!(c.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
-        // TOKEN_URL literal from the prod config.
+        // Mirrors pi-mono's anthropic.ts (a known-working impl):
+        //   AUTHORIZE_URL = https://claude.ai/oauth/authorize
+        //   TOKEN_URL     = https://platform.claude.com/v1/oauth/token
+        //   CLIENT_ID     = 9d1c250a-...
+        //   redirect_uri  = http://localhost:<port>/callback
+        //   `code=true`   appended as the first param
+        assert_eq!(c.authorize_url, "https://claude.ai/oauth/authorize");
         assert_eq!(c.token_url, "https://platform.claude.com/v1/oauth/token");
-    }
-
-    #[test]
-    fn anthropic_authorize_request_matches_claude_code_url_builder() {
-        let c = provider_oauth(ProviderId::Anthropic).unwrap();
-        // The Claude Code prod URL builder (`GI_` in the binary)
-        // appends `code=true` first, then the standard OAuth params,
-        // and uses `http://localhost:<port>/callback` as the redirect.
-        // Omitting `code=true` is what surfaces as "Invalid request
-        // format" on the consent screen.
+        assert_eq!(c.client_id, "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
         assert_eq!(c.redirect_host, "localhost");
         assert_eq!(c.redirect_path, "/callback");
         assert!(

@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.5 — Anthropic SSO mirrors pi-mono (2026-05-03)
+
+### Fixed
+
+- **Anthropic SSO** finally aligned against pi-mono's `anthropic.ts` (a known-working third-party reference at `github.com/badlogic/pi-mono/packages/ai/src/utils/oauth/anthropic.ts`). Five differences vs `v0.1.4`:
+  - **Authorize URL**: back to `https://claude.ai/oauth/authorize` (v0.1.3's `claude.com/cai/oauth/authorize` was a misread; pi-mono hits `claude.ai` directly).
+  - **Scopes**: added `org:create_api_key` and `user:file_upload` to match pi-mono's full set.
+  - **State**: now equals the PKCE verifier (Anthropic-specific). pi-mono's impl does this; we were using a fresh random nonce.
+  - **Token-exchange body**: JSON (`Content-Type: application/json`), not form-encoded. The token endpoint apparently rejects form-encoded bodies for this client.
+  - **Token-exchange body**: now includes `state`. OAuth standard doesn't require it at exchange time but Anthropic's server expects it.
+
+### Internal
+
+- `ProviderOAuth` gains three per-provider fields: `token_body_format` (`Form` | `Json`), `state_is_verifier` (Anthropic quirk), `include_state_in_token_body` (Anthropic quirk). OpenAI / Gemini / Copilot keep the standard form-encoded, random-state, no-state-in-body shape.
+
 ## v0.1.4 — Anthropic SSO request format (2026-05-03)
 
 ### Fixed
