@@ -5,6 +5,7 @@
 
 pub mod callback;
 pub mod device;
+pub mod pkce;
 pub mod providers;
 
 pub use providers::{provider_oauth, OAuthFlow, ProviderOAuth};
