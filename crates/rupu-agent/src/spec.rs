@@ -6,6 +6,7 @@
 //! `maxTurns`, `permissionMode`). Unknown fields are rejected at parse
 //! time so typos like `permision_mode` surface as errors.
 
+use rupu_providers::AuthMode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -29,6 +30,8 @@ struct Frontmatter {
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
+    auth: Option<AuthMode>,
+    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     tools: Option<Vec<String>>,
@@ -44,6 +47,7 @@ pub struct AgentSpec {
     pub name: String,
     pub description: Option<String>,
     pub provider: Option<String>,
+    pub auth: Option<AuthMode>,
     pub model: Option<String>,
     pub tools: Option<Vec<String>>,
     pub max_turns: Option<u32>,
@@ -73,6 +77,7 @@ impl AgentSpec {
             name: fm.name,
             description: fm.description,
             provider: fm.provider,
+            auth: fm.auth,
             model: fm.model,
             tools: fm.tools,
             max_turns: fm.max_turns,
