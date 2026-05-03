@@ -47,10 +47,14 @@ async fn max_turns_aborts_with_run_complete() {
         ScriptedTurn::AssistantText {
             text: "1".into(),
             stop: StopReason::ToolUse,
+            input_tokens: 1,
+            output_tokens: 1,
         },
         ScriptedTurn::AssistantText {
             text: "2".into(),
             stop: StopReason::ToolUse,
+            input_tokens: 1,
+            output_tokens: 1,
         },
     ]);
     let tmp = assert_fs::TempDir::new().unwrap();

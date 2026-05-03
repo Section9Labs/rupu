@@ -38,6 +38,8 @@ impl StepFactory for FakeFactory {
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
             text: format!("step {step_id} echo: {rendered_prompt}"),
             stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
         }]);
         AgentRunOpts {
             agent_name: format!("ag-{step_id}"),

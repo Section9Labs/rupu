@@ -156,6 +156,17 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         };
         total_in += resp.usage.input_tokens as u64;
         total_out += resp.usage.output_tokens as u64;
+        writer.write(&Event::Usage {
+            provider: opts.provider_name.clone(),
+            model: if resp.model.is_empty() {
+                opts.model.clone()
+            } else {
+                resp.model.clone()
+            },
+            input_tokens: resp.usage.input_tokens,
+            output_tokens: resp.usage.output_tokens,
+            cached_tokens: 0,
+        })?;
 
         // Emit any text content as assistant_message events; collect
         // tool_use blocks for dispatch.
@@ -376,6 +387,12 @@ pub enum ScriptedTurn {
     AssistantText {
         text: String,
         stop: StopReason,
+        /// Token counts reported in the mock response. Defaults to 1/1 when
+        /// omitted so existing scripts stay valid.
+        #[serde(default = "default_mock_tokens")]
+        input_tokens: u32,
+        #[serde(default = "default_mock_tokens")]
+        output_tokens: u32,
     },
     AssistantToolUse {
         text: Option<String>,
@@ -385,6 +402,10 @@ pub enum ScriptedTurn {
         stop: StopReason,
     },
     ProviderError(String),
+}
+
+fn default_mock_tokens() -> u32 {
+    1
 }
 
 /// In-memory `LlmProvider` that replays a fixed script. Used by tests
@@ -416,14 +437,19 @@ impl LlmProvider for MockProvider {
         })?;
         match turn {
             ScriptedTurn::ProviderError(e) => Err(rupu_providers::ProviderError::Http(e)),
-            ScriptedTurn::AssistantText { text, stop } => Ok(LlmResponse {
+            ScriptedTurn::AssistantText {
+                text,
+                stop,
+                input_tokens,
+                output_tokens,
+            } => Ok(LlmResponse {
                 id: "mock".to_string(),
                 model: "mock-1".to_string(),
                 content: vec![ContentBlock::Text { text }],
                 stop_reason: Some(stop),
                 usage: Usage {
-                    input_tokens: 1,
-                    output_tokens: 1,
+                    input_tokens,
+                    output_tokens,
                 },
             }),
             ScriptedTurn::AssistantToolUse {

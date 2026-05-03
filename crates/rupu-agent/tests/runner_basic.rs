@@ -10,6 +10,8 @@ async fn happy_path_one_turn_no_tools() {
     let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
         text: "Hello! I have nothing to do.".into(),
         stop: StopReason::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
     }]);
     let tmp = assert_fs::TempDir::new().unwrap();
     let transcript_path = tmp.path().join("run.jsonl");

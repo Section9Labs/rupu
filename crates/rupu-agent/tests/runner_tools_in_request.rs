@@ -9,6 +9,8 @@ async fn run_passes_all_six_default_tools_to_provider() {
     let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
         text: "done".into(),
         stop: StopReason::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
     }]);
     let captured = provider.captured.clone();
 
@@ -75,6 +77,8 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
     let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
         text: "done".into(),
         stop: StopReason::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
     }]);
     let captured = provider.captured.clone();
 

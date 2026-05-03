@@ -147,6 +147,10 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
 
     let result = rupu_agent::run_agent(opts).await?;
     println!(
+        "Total: {} input / {} output tokens",
+        result.total_tokens_in, result.total_tokens_out
+    );
+    println!(
         "rupu: run {} complete in {} turn(s); transcript: {}",
         run_id,
         result.turns,
