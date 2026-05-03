@@ -6,6 +6,7 @@ members = [
     "crates/rupu-workspace",
     "crates/rupu-auth",
     "crates/rupu-providers",
+    "crates/rupu-scm",
     "crates/rupu-tools",
     "crates/rupu-agent",
     "crates/rupu-orchestrator",
