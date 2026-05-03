@@ -14,6 +14,7 @@ pub mod auth;
 pub mod auth_mode;
 pub mod broker_client;
 pub mod broker_types;
+pub mod classify;
 pub mod concurrency;
 pub mod credential_source;
 pub mod credential_store;
