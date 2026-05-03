@@ -24,6 +24,9 @@ pub mod json_file;
 pub mod keyring;
 pub mod probe;
 
+pub mod keychain_layout;
+pub use keychain_layout::{key_for, legacy_key_for, KeychainKey};
+
 pub use backend::{AuthBackend, AuthError, ProviderId};
 pub use json_file::JsonFileBackend;
 pub use keyring::KeyringBackend;
