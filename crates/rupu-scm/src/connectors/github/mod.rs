@@ -14,6 +14,8 @@ pub mod issues;
 pub mod repo;
 
 pub use client::{classify_octocrab_error, GithubClient};
+pub use issues::GithubIssueConnector;
+pub use repo::GithubRepoConnector;
 
 /// Try to build the GitHub Repo + Issue connectors from configured
 /// credentials. Returns `Ok(None)` when no GitHub credential is
