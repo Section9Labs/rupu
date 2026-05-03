@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.1.4 — Anthropic SSO request format (2026-05-03)
+
+### Fixed
+
+- **Anthropic SSO** "Invalid request format" error finally resolved by extracting Claude Code's actual URL builder (`GI_` function) from the binary. Two missing pieces:
+  - The request must include `code=true` as a query parameter (Claude Code appends it as the FIRST param). Omitting it is what claude.ai's authorize endpoint rejects as "Invalid request format". This wasn't documented anywhere; only visible by reading the prod URL builder.
+  - The `redirect_uri` must use literal `localhost`, not `127.0.0.1`. Claude Code hardcodes `http://localhost:${port}/callback`.
+
+The decoded URL builder (the function rupu must mirror):
+
+```js
+function GI_({ codeChallenge, state, port, ... }) {
+  let url = new URL(O ? CLAUDE_AI_AUTHORIZE_URL : CONSOLE_AUTHORIZE_URL);
+  url.searchParams.append("code", "true");                                  // ← was missing
+  url.searchParams.append("client_id", CLIENT_ID);
+  url.searchParams.append("response_type", "code");
+  url.searchParams.append("redirect_uri", `http://localhost:${port}/callback`);
+  // ... scope, code_challenge, code_challenge_method, state
+}
+```
+
+Two new regression tests pin both behaviors so the next dive into Claude Code's binary doesn't have to re-discover them.
+
 ## v0.1.3 — Anthropic SSO regression fix (2026-05-03)
 
 ### Fixed
