@@ -115,11 +115,40 @@ impl RepoConnector for GithubRepoConnector {
 
     async fn create_branch(
         &self,
-        _r: &RepoRef,
-        _name: &str,
-        _from_sha: &str,
+        r: &RepoRef,
+        name: &str,
+        from_sha: &str,
     ) -> Result<Branch, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = r.owner.clone();
+        let repo = r.repo.clone();
+        let name_owned = name.to_string();
+        let sha_owned = from_sha.to_string();
+        self.client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let name = name_owned.clone();
+                let sha = sha_owned.clone();
+                async move {
+                    inner
+                        .repos(&owner, &repo)
+                        .create_ref(
+                            &octocrab::params::repos::Reference::Branch(name.clone()),
+                            sha.clone(),
+                        )
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    Ok(Branch {
+                        name,
+                        sha,
+                        protected: false,
+                    })
+                }
+            })
+            .await
     }
 
     async fn read_file(
@@ -285,16 +314,78 @@ impl RepoConnector for GithubRepoConnector {
         })
     }
 
-    async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn comment_pr(&self, p: &PrRef, body: &str) -> Result<Comment, ScmError> {
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = p.repo.owner.clone();
+        let repo = p.repo.repo.clone();
+        let number = p.number;
+        let body = body.to_string();
+        let model = self
+            .client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let body = body.clone();
+                async move {
+                    inner
+                        .issues(&owner, &repo)
+                        .create_comment(number as u64, &body)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await?;
+        Ok(Comment {
+            id: model.id.to_string(),
+            author: model.user.login,
+            body,
+            created_at: model.created_at,
+        })
     }
 
-    async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn create_pr(&self, r: &RepoRef, opts: CreatePr) -> Result<Pr, ScmError> {
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = r.owner.clone();
+        let repo = r.repo.clone();
+        let repo_ref = r.clone();
+        let pr = self
+            .client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let opts = opts.clone();
+                async move {
+                    inner
+                        .pulls(&owner, &repo)
+                        .create(opts.title, opts.head, opts.base)
+                        .body(opts.body)
+                        .draft(opts.draft)
+                        .send()
+                        .await
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await?;
+        Ok(pr_from_octocrab(repo_ref, pr))
     }
 
-    async fn clone_to(&self, _r: &RepoRef, _dir: &std::path::Path) -> Result<(), ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn clone_to(&self, r: &RepoRef, dir: &std::path::Path) -> Result<(), ScmError> {
+        let token = self.client.token.clone();
+        let owner = r.owner.clone();
+        let repo = r.repo.clone();
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let url = format!("https://{token}@github.com/{owner}/{repo}.git");
+            git2::Repository::clone(&url, &dir)
+                .map(|_| ())
+                .map_err(|e| ScmError::Network(anyhow::anyhow!("git clone failed: {e}")))
+        })
+        .await
+        .map_err(|e| ScmError::Network(anyhow::anyhow!("clone_to task panicked: {e}")))?
     }
 }
 

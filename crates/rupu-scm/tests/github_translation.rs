@@ -1,4 +1,5 @@
 use httpmock::prelude::*;
+use httpmock::Method::POST;
 use rupu_scm::Platform;
 
 mod common;
@@ -239,4 +240,71 @@ async fn list_issues_translates() {
         .unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].labels, vec!["bug".to_string()]);
+}
+
+#[tokio::test]
+async fn comment_pr_posts_body() {
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/comment_create_happy.json").unwrap();
+    let m = server.mock(|when, then| {
+        when.method(POST)
+            .path("/repos/section9labs/rupu/issues/42/comments");
+        then.status(201)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let c = common::github_connector_against(&server);
+    let comment = c
+        .comment_pr(
+            &rupu_scm::PrRef {
+                repo: rupu_scm::RepoRef {
+                    platform: Platform::Github,
+                    owner: "section9labs".into(),
+                    repo: "rupu".into(),
+                },
+                number: 42,
+            },
+            "LGTM, ship it.",
+        )
+        .await
+        .unwrap();
+    m.assert();
+    assert_eq!(comment.id, "555");
+    assert_eq!(comment.author, "matias");
+    assert_eq!(comment.body, "LGTM, ship it.");
+}
+
+#[tokio::test]
+async fn create_pr_posts_payload() {
+    let server = MockServer::start();
+    let body = std::fs::read_to_string("tests/fixtures/github/pr_create_happy.json").unwrap();
+    let m = server.mock(|when, then| {
+        when.method(POST).path("/repos/section9labs/rupu/pulls");
+        then.status(201)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let c = common::github_connector_against(&server);
+    let pr = c
+        .create_pr(
+            &rupu_scm::RepoRef {
+                platform: Platform::Github,
+                owner: "section9labs".into(),
+                repo: "rupu".into(),
+            },
+            rupu_scm::CreatePr {
+                title: "feat: new write paths".into(),
+                body: "Adds create_branch, comment_pr, create_pr, clone_to.".into(),
+                head: "feat/write-paths".into(),
+                base: "main".into(),
+                draft: false,
+            },
+        )
+        .await
+        .unwrap();
+    m.assert();
+    assert_eq!(pr.r.number, 99);
+    assert_eq!(pr.title, "feat: new write paths");
+    assert_eq!(pr.head_branch, "feat/write-paths");
+    assert_eq!(pr.base_branch, "main");
 }

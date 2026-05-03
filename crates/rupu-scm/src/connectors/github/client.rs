@@ -24,8 +24,6 @@ const CACHE_CAP: usize = 256;
 const CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_RETRIES: u32 = 5;
 
-// `inner` and `token` are used in Task 12; suppress the premature lint.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct GithubClient {
     pub(crate) inner: Octocrab,

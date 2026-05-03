@@ -85,16 +85,88 @@ impl IssueConnector for GithubIssueConnector {
         Ok(issue_from_octocrab(project, model))
     }
 
-    async fn comment_issue(&self, _i: &IssueRef, _body: &str) -> Result<Comment, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn comment_issue(&self, i: &IssueRef, body: &str) -> Result<Comment, ScmError> {
+        let _permit = self.client.permit().await;
+        let (owner, repo) = parse_project(&i.project)?;
+        let number = i.number;
+        let inner = self.client.inner.clone();
+        let body = body.to_string();
+        let model = self
+            .client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let body = body.clone();
+                async move {
+                    inner
+                        .issues(&owner, &repo)
+                        .create_comment(number, &body)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await?;
+        Ok(Comment {
+            id: model.id.to_string(),
+            author: model.user.login,
+            body,
+            created_at: model.created_at,
+        })
     }
 
-    async fn create_issue(&self, _project: &str, _opts: CreateIssue) -> Result<Issue, ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn create_issue(&self, project: &str, opts: CreateIssue) -> Result<Issue, ScmError> {
+        let _permit = self.client.permit().await;
+        let (owner, repo) = parse_project(project)?;
+        let inner = self.client.inner.clone();
+        let project_str = project.to_string();
+        let model = self
+            .client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let opts = opts.clone();
+                async move {
+                    inner
+                        .issues(&owner, &repo)
+                        .create(opts.title)
+                        .body(opts.body)
+                        .labels(opts.labels)
+                        .send()
+                        .await
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await?;
+        Ok(issue_from_octocrab(project_str, model))
     }
 
-    async fn update_issue_state(&self, _i: &IssueRef, _state: IssueState) -> Result<(), ScmError> {
-        Err(ScmError::Transient(anyhow::anyhow!("not yet implemented")))
+    async fn update_issue_state(&self, i: &IssueRef, state: IssueState) -> Result<(), ScmError> {
+        let _permit = self.client.permit().await;
+        let (owner, repo) = parse_project(&i.project)?;
+        let number = i.number;
+        let inner = self.client.inner.clone();
+        self.client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                async move {
+                    inner
+                        .issues(&owner, &repo)
+                        .update(number)
+                        .state(match state {
+                            IssueState::Open => octocrab::models::IssueState::Open,
+                            IssueState::Closed => octocrab::models::IssueState::Closed,
+                        })
+                        .send()
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    Ok(())
+                }
+            })
+            .await
     }
 }
 
