@@ -78,29 +78,21 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     };
     let ws = rupu_workspace::upsert(&ws_store, &pwd)?;
 
-    // Auth backend selection (cached probe).
-    let auth_json_path = global.join("auth.json");
-    let cache = rupu_auth::ProbeCache::new(global.join("cache/auth-backend.json"));
-    let backend = rupu_auth::select_backend(&cache, auth_json_path);
-
-    // Provider build.
+    // Provider build via CredentialResolver.
+    let resolver = rupu_auth::KeychainResolver::new();
     let provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
     let model = spec
         .model
         .clone()
         .or_else(|| cfg.default_model.clone())
         .unwrap_or_else(|| "claude-sonnet-4-6".into());
-    let provider =
-        provider_factory::build_for_provider(&provider_name, &model, backend.as_ref()).await?;
+    let auth_hint = spec.auth;
+    let (resolved_auth, provider) =
+        provider_factory::build_for_provider(&provider_name, &model, auth_hint, &resolver).await?;
 
     println!(
         "agent: {}  provider: {}/{}  model: {}",
-        spec.name,
-        provider_name,
-        spec.auth
-            .map(|m| m.to_string())
-            .unwrap_or_else(|| "?".into()),
-        model,
+        spec.name, provider_name, resolved_auth, model,
     );
 
     // Transcript path.

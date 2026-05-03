@@ -144,13 +144,8 @@ async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> a
     };
     let ws = rupu_workspace::upsert(&ws_store, &pwd)?;
 
-    // Auth backend selection (cached probe). The factory takes
-    // `&dyn AuthBackend`; build it once here and clone the `Arc`
-    // into each step build.
-    let cache = rupu_auth::ProbeCache::new(global.join("cache/auth-backend.json"));
-    let auth_json = global.join("auth.json");
-    let backend: Arc<dyn rupu_auth::AuthBackend> =
-        Arc::from(rupu_auth::select_backend(&cache, auth_json));
+    // Credential resolver (shared across all steps in this workflow run).
+    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
 
     let mode_str = mode.unwrap_or("ask").to_string();
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
@@ -160,7 +155,7 @@ async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> a
         workflow: workflow.clone(),
         global: global.clone(),
         project_root: project_root.clone(),
-        backend,
+        resolver,
         mode_str,
     });
 
@@ -193,7 +188,7 @@ struct CliStepFactory {
     workflow: Workflow,
     global: PathBuf,
     project_root: Option<PathBuf>,
-    backend: Arc<dyn rupu_auth::AuthBackend>,
+    resolver: Arc<rupu_auth::KeychainResolver>,
     mode_str: String,
 }
 
@@ -245,10 +240,15 @@ impl StepFactory for CliStepFactory {
             .model
             .clone()
             .unwrap_or_else(|| "claude-sonnet-4-6".into());
-        let provider =
-            provider_factory::build_for_provider(&provider_name, &model, self.backend.as_ref())
-                .await
-                .expect("provider build failed in step factory");
+        let auth_hint = spec.auth;
+        let (_resolved_auth, provider) = provider_factory::build_for_provider(
+            &provider_name,
+            &model,
+            auth_hint,
+            self.resolver.as_ref(),
+        )
+        .await
+        .expect("provider build failed in step factory");
 
         AgentRunOpts {
             agent_name: spec.name,

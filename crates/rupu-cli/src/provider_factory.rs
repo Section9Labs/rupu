@@ -1,13 +1,13 @@
 //! Build a `Box<dyn LlmProvider>` from a provider-name string +
-//! credential lookup. v0 wires Anthropic only; other providers (OpenAI
-//! Codex, Copilot, Gemini, local) return a clear "not wired in v0"
-//! error so the failure mode is informative rather than a silent
-//! provider-discovery miss.
+//! credential lookup. v0 wires Anthropic, OpenAI/Codex, and Copilot;
+//! Gemini is deferred (AI Studio API-key endpoint not yet wired;
+//! SSO/Vertex path pending verification). Local returns a clear
+//! "not wired in v0" error so the failure mode is informative rather
+//! than a silent provider-discovery miss.
 //!
-//! Credentials come from a `&dyn AuthBackend` (keychain or chmod-600
-//! JSON file — selected once at the call site by `rupu_auth::select_backend`).
-//! The factory does not read `auth.json` directly, keeping the storage
-//! abstraction in one place.
+//! Credentials come from a `&dyn CredentialResolver`. The resolver is
+//! the single authoritative source for credentials; the factory does
+//! not read env vars or `auth.json` directly.
 //!
 //! When the lifted `rupu-providers` API stabilizes, this file is the
 //! one place to extend.
@@ -30,29 +30,46 @@ pub enum FactoryError {
     Other(String),
 }
 
-/// Build a provider for `name`. Reads credentials from `backend`
-/// (keychain or JSON file) with an env-var fallback for unattended use.
+/// Build a provider for `name`. Reads credentials from `resolver`
+/// (the single authoritative source — keychain, in-memory for tests,
+/// or any other `CredentialResolver` impl).
+///
+/// `auth_hint` may force a specific auth mode; `None` lets the resolver
+/// apply SSO > API-key precedence. Returns the resolved mode alongside
+/// the provider so callers can display the actual mode in run headers.
 ///
 /// Test-only seam: when `RUPU_MOCK_PROVIDER_SCRIPT` is set, the factory
 /// builds a `MockProvider` from the JSON script in the env var and
-/// ignores `name`/`backend`. Production users never set this; tests
+/// ignores `name`/`resolver`. Production users never set this; tests
 /// use it to drive the agent loop end-to-end without an API key.
 pub async fn build_for_provider(
     name: &str,
     model: &str,
-    backend: &dyn rupu_auth::AuthBackend,
-) -> Result<Box<dyn LlmProvider>, FactoryError> {
+    auth_hint: Option<rupu_providers::AuthMode>,
+    resolver: &dyn rupu_auth::CredentialResolver,
+) -> Result<(rupu_providers::AuthMode, Box<dyn LlmProvider>), FactoryError> {
     if let Ok(json) = std::env::var("RUPU_MOCK_PROVIDER_SCRIPT") {
-        return build_mock_from_script(&json);
+        return Ok((
+            rupu_providers::AuthMode::ApiKey,
+            build_mock_from_script(&json)?,
+        ));
     }
-    match name {
-        "anthropic" => build_anthropic(model, backend).await,
-        "openai" | "openai_codex" | "codex" => build_openai(model, backend).await,
-        "gemini" | "google_gemini" => build_gemini(model, backend).await,
-        "copilot" | "github_copilot" => build_copilot(model, backend).await,
-        "local" => Err(FactoryError::NotWiredInV0(name.to_string())),
-        _ => Err(FactoryError::UnknownProvider(name.to_string())),
-    }
+    let (mode, creds) =
+        resolver
+            .get(name, auth_hint)
+            .await
+            .map_err(|e| FactoryError::MissingCredential {
+                provider: format!("{name}: {e}"),
+            })?;
+    let client = match name {
+        "anthropic" => build_anthropic(creds, model).await?,
+        "openai" | "openai_codex" | "codex" => build_openai(creds, model).await?,
+        "gemini" | "google_gemini" => build_gemini(creds, model).await?,
+        "copilot" | "github_copilot" => build_copilot(creds, model).await?,
+        "local" => return Err(FactoryError::NotWiredInV0("local".to_string())),
+        _ => return Err(FactoryError::UnknownProvider(name.to_string())),
+    };
+    Ok((mode, client))
 }
 
 fn build_mock_from_script(json: &str) -> Result<Box<dyn LlmProvider>, FactoryError> {
@@ -63,66 +80,42 @@ fn build_mock_from_script(json: &str) -> Result<Box<dyn LlmProvider>, FactoryErr
 }
 
 async fn build_anthropic(
-    model: &str,
-    backend: &dyn rupu_auth::AuthBackend,
+    creds: rupu_providers::auth::AuthCredentials,
+    _model: &str,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    // model is supplied per-request via LlmRequest.model, not at construction.
-    let _ = model;
-    let api_key = match backend.retrieve(rupu_auth::ProviderId::Anthropic) {
-        Ok(k) => k,
-        Err(_) => {
-            // Fall back to env var for unattended use cases (CI etc).
-            std::env::var("ANTHROPIC_API_KEY").map_err(|_| FactoryError::MissingCredential {
-                provider: "anthropic".to_string(),
-            })?
-        }
+    let api_key = match creds {
+        rupu_providers::auth::AuthCredentials::ApiKey { key } => key,
+        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
     };
     let client = rupu_providers::anthropic::AnthropicClient::new(api_key);
     Ok(Box::new(client))
 }
 
 async fn build_openai(
-    model: &str,
-    backend: &dyn rupu_auth::AuthBackend,
+    creds: rupu_providers::auth::AuthCredentials,
+    _model: &str,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    // model is supplied per-request via LlmRequest.model, not at construction.
-    let _ = model;
-    let api_key = match backend.retrieve(rupu_auth::ProviderId::Openai) {
-        Ok(k) => k,
-        Err(_) => std::env::var("OPENAI_API_KEY").map_err(|_| FactoryError::MissingCredential {
-            provider: "openai".to_string(),
-        })?,
-    };
-    let creds = rupu_providers::auth::AuthCredentials::ApiKey { key: api_key };
     let client = rupu_providers::openai_codex::OpenAiCodexClient::new(creds, None)
         .map_err(|e| FactoryError::Other(format!("openai client init: {e}")))?;
     Ok(Box::new(client))
 }
 
 async fn build_gemini(
+    _creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
-    _backend: &dyn rupu_auth::AuthBackend,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    // The lifted GoogleGeminiClient (phi-providers) only supports OAuth
-    // (Vertex/CLI path). AI Studio API-key support is deferred to Plan 2
-    // alongside SSO. Spec §4 / Plan 2 Task 8 wires this.
+    // Gemini API-key path requires AI Studio endpoint; not yet implemented.
+    // OAuth/Vertex path can be wired here when SSO support is verified end-to-end.
     Err(FactoryError::NotWiredInV0(
-        "gemini (API-key path requires AI Studio endpoint, deferred to Plan 2 SSO)".to_string(),
+        "gemini (AI Studio API-key endpoint not yet wired; SSO/Vertex pending verification)"
+            .to_string(),
     ))
 }
 
 async fn build_copilot(
-    model: &str,
-    backend: &dyn rupu_auth::AuthBackend,
+    creds: rupu_providers::auth::AuthCredentials,
+    _model: &str,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    let _ = model;
-    let api_key = match backend.retrieve(rupu_auth::ProviderId::Copilot) {
-        Ok(k) => k,
-        Err(_) => std::env::var("GITHUB_TOKEN").map_err(|_| FactoryError::MissingCredential {
-            provider: "copilot".to_string(),
-        })?,
-    };
-    let creds = rupu_providers::auth::AuthCredentials::ApiKey { key: api_key };
     let client = rupu_providers::github_copilot::GithubCopilotClient::new(creds, None)
         .map_err(|e| FactoryError::Other(format!("copilot client init: {e}")))?;
     Ok(Box::new(client))
@@ -131,31 +124,23 @@ async fn build_copilot(
 #[cfg(test)]
 mod build_copilot_tests {
     use super::*;
-    use rupu_auth::{AuthBackend, AuthError, ProviderId as AuthProviderId};
-
-    struct FixedKeyBackend;
-    impl AuthBackend for FixedKeyBackend {
-        fn store(&self, _: AuthProviderId, _: &str) -> Result<(), AuthError> {
-            Ok(())
-        }
-        fn retrieve(&self, p: AuthProviderId) -> Result<String, AuthError> {
-            if p == AuthProviderId::Copilot {
-                Ok("ghp_test_copilot".to_string())
-            } else {
-                Err(AuthError::NotConfigured(p))
-            }
-        }
-        fn forget(&self, _: AuthProviderId) -> Result<(), AuthError> {
-            Ok(())
-        }
-        fn name(&self) -> &'static str {
-            "fixed-test"
-        }
-    }
+    use rupu_auth::backend::ProviderId;
+    use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::stored::StoredCredential;
+    use rupu_providers::AuthMode;
 
     #[tokio::test]
     async fn build_copilot_returns_provider() {
-        let p = build_for_provider("copilot", "gpt-4o", &FixedKeyBackend)
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let resolver = InMemoryResolver::new();
+        resolver
+            .put(
+                ProviderId::Copilot,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test_copilot"),
+            )
+            .await;
+        let (_mode, p) = build_for_provider("copilot", "gpt-4o", None, &resolver)
             .await
             .expect("build");
         assert_eq!(p.provider_id(), rupu_providers::ProviderId::GithubCopilot);
@@ -165,32 +150,23 @@ mod build_copilot_tests {
 #[cfg(test)]
 mod build_openai_tests {
     use super::*;
-    use rupu_auth::{AuthBackend, AuthError, ProviderId as AuthProviderId};
-
-    struct FixedKeyBackend(&'static str);
-    impl AuthBackend for FixedKeyBackend {
-        fn store(&self, _: AuthProviderId, _: &str) -> Result<(), AuthError> {
-            Ok(())
-        }
-        fn retrieve(&self, p: AuthProviderId) -> Result<String, AuthError> {
-            if p == AuthProviderId::Openai {
-                Ok(self.0.to_string())
-            } else {
-                Err(AuthError::NotConfigured(p))
-            }
-        }
-        fn forget(&self, _: AuthProviderId) -> Result<(), AuthError> {
-            Ok(())
-        }
-        fn name(&self) -> &'static str {
-            "fixed-test"
-        }
-    }
+    use rupu_auth::backend::ProviderId;
+    use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::stored::StoredCredential;
+    use rupu_providers::AuthMode;
 
     #[tokio::test]
     async fn build_openai_returns_provider() {
-        let backend = FixedKeyBackend("sk-test-openai");
-        let p = build_for_provider("openai", "gpt-5", &backend)
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let resolver = InMemoryResolver::new();
+        resolver
+            .put(
+                ProviderId::Openai,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("sk-test-openai"),
+            )
+            .await;
+        let (_mode, p) = build_for_provider("openai", "gpt-5", None, &resolver)
             .await
             .expect("build");
         assert_eq!(p.provider_id(), rupu_providers::ProviderId::OpenaiCodex);
@@ -198,28 +174,10 @@ mod build_openai_tests {
 
     #[tokio::test]
     async fn build_openai_missing_credential_errors() {
-        struct EmptyBackend;
-        impl AuthBackend for EmptyBackend {
-            fn store(&self, _: AuthProviderId, _: &str) -> Result<(), AuthError> {
-                Ok(())
-            }
-            fn retrieve(&self, p: AuthProviderId) -> Result<String, AuthError> {
-                Err(AuthError::NotConfigured(p))
-            }
-            fn forget(&self, _: AuthProviderId) -> Result<(), AuthError> {
-                Ok(())
-            }
-            fn name(&self) -> &'static str {
-                "empty"
-            }
-        }
-        // Clear env var so the env fallback doesn't accidentally satisfy the request.
-        let prev = std::env::var("OPENAI_API_KEY").ok();
-        std::env::remove_var("OPENAI_API_KEY");
-        let result = build_for_provider("openai", "gpt-5", &EmptyBackend).await;
-        if let Some(p) = prev {
-            std::env::set_var("OPENAI_API_KEY", p);
-        }
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let resolver = InMemoryResolver::new();
+        // No credentials inserted — resolver returns missing-credential error.
+        let result = build_for_provider("openai", "gpt-5", None, &resolver).await;
         assert!(matches!(
             result,
             Err(FactoryError::MissingCredential { .. })
@@ -230,38 +188,29 @@ mod build_openai_tests {
 #[cfg(test)]
 mod build_gemini_tests {
     use super::*;
-    use rupu_auth::{AuthBackend, AuthError, ProviderId as AuthProviderId};
-
-    struct EmptyBackend;
-    impl AuthBackend for EmptyBackend {
-        fn store(&self, _: AuthProviderId, _: &str) -> Result<(), AuthError> {
-            Ok(())
-        }
-        fn retrieve(&self, p: AuthProviderId) -> Result<String, AuthError> {
-            Err(AuthError::NotConfigured(p))
-        }
-        fn forget(&self, _: AuthProviderId) -> Result<(), AuthError> {
-            Ok(())
-        }
-        fn name(&self) -> &'static str {
-            "empty"
-        }
-    }
+    use rupu_auth::backend::ProviderId;
+    use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::stored::StoredCredential;
+    use rupu_providers::AuthMode;
 
     #[tokio::test]
     async fn build_gemini_returns_not_wired_until_sso() {
-        // Plan 1 reality: Gemini's lifted client rejects ApiKey credentials
-        // (the Vertex/CLI path requires OAuth). API-key support via AI
-        // Studio is deferred to Plan 2 along with SSO. The factory must
-        // surface this constraint clearly rather than panic or silently
-        // succeed.
-        let prev = std::env::var("GOOGLE_GEMINI_API_KEY").ok();
-        std::env::remove_var("GOOGLE_GEMINI_API_KEY");
-        std::env::remove_var("GEMINI_API_KEY");
-        let result = build_for_provider("gemini", "gemini-2.5-pro", &EmptyBackend).await;
-        if let Some(p) = prev {
-            std::env::set_var("GOOGLE_GEMINI_API_KEY", p);
-        }
+        // Plan 2 reality: Gemini's lifted client needs the AI Studio
+        // API-key endpoint (not yet implemented) or the Vertex/SSO path
+        // (pending verification). The factory must surface this constraint
+        // clearly rather than panic or silently succeed.
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let resolver = InMemoryResolver::new();
+        // Insert a dummy credential so we exercise the NotWiredInV0 path,
+        // not the resolver-side missing-credential path.
+        resolver
+            .put(
+                ProviderId::Gemini,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("dummy"),
+            )
+            .await;
+        let result = build_for_provider("gemini", "gemini-2.5-pro", None, &resolver).await;
         match result {
             Err(FactoryError::NotWiredInV0(_)) => {}
             Err(e) => panic!("expected NotWiredInV0, got Err({e})"),
