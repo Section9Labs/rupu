@@ -83,11 +83,17 @@ async fn build_anthropic(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    let api_key = match creds {
-        rupu_providers::auth::AuthCredentials::ApiKey { key } => key,
-        rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access,
+    // Convert the resolved credential into an Anthropic AuthMethod so OAuth
+    // tokens travel via `Authorization: Bearer …` and API keys via
+    // `x-api-key`. The earlier shape pulled `access` out of the OAuth variant
+    // and shoved it into an ApiKey-mode client, which routed bearer tokens
+    // through the api-key header and produced a confusing "invalid x-api-key"
+    // 401 for every SSO request.
+    let auth = creds.into_anthropic_auth_method();
+    let client = match std::env::var("RUPU_ANTHROPIC_BASE_URL_OVERRIDE") {
+        Ok(url) => rupu_providers::anthropic::AnthropicClient::from_auth_with_url(auth, url),
+        Err(_) => rupu_providers::anthropic::AnthropicClient::from_auth(auth),
     };
-    let client = rupu_providers::anthropic::AnthropicClient::new(api_key);
     Ok(Box::new(client))
 }
 

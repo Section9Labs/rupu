@@ -4,6 +4,11 @@ use rupu_auth::stored::StoredCredential;
 use rupu_cli::provider_factory::build_for_provider;
 use rupu_providers::AuthMode;
 
+/// Test-only seam consumed by `build_anthropic` to redirect the Anthropic
+/// Messages endpoint at an httpmock server. Mirrors the
+/// `RUPU_OAUTH_TOKEN_URL_OVERRIDE` seam used by the resolver.
+const ANTHROPIC_BASE_URL_OVERRIDE: &str = "RUPU_ANTHROPIC_BASE_URL_OVERRIDE";
+
 #[tokio::test]
 async fn anthropic_factory_requires_credential() {
     // No stored secret. Should fail with a clear missing-credential message.
@@ -73,4 +78,90 @@ async fn deferred_provider_returns_blocked_error() {
             "{p}: expected v0-deferral error: {err}"
         );
     }
+}
+
+/// Regression test for the SSO bug where an OAuth credential resolved
+/// for Anthropic was being shipped via the `x-api-key` header instead
+/// of `Authorization: Bearer …`. The httpmock matcher fires only when
+/// the bearer header is present, so a regression results in 404 →
+/// `send()` returns `Err`, and `assert_hits(1)` fails.
+#[tokio::test]
+async fn anthropic_factory_oauth_credential_uses_bearer_not_x_api_key() {
+    use httpmock::prelude::*;
+    use rupu_providers::types::{LlmRequest, Message};
+
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+    let server = MockServer::start();
+    let mock = server.mock(|when, then| {
+        when.method(POST)
+            .path("/v1/messages")
+            .header("Authorization", "Bearer test-access-token");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "hi"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }));
+    });
+
+    std::env::set_var(
+        ANTHROPIC_BASE_URL_OVERRIDE,
+        format!("{}/v1/messages", server.url("")),
+    );
+
+    let resolver = InMemoryResolver::new();
+    let stored = StoredCredential {
+        credentials: rupu_providers::auth::AuthCredentials::OAuth {
+            access: "test-access-token".into(),
+            refresh: "test-refresh-token".into(),
+            // 0 == non-expiring per `is_token_expired`; prevents the
+            // client from kicking off a real refresh round-trip.
+            expires: 0,
+            extra: Default::default(),
+        },
+        refresh_token: Some("test-refresh-token".into()),
+        expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+    };
+    resolver
+        .put(ProviderId::Anthropic, AuthMode::Sso, stored)
+        .await;
+
+    let (mode, mut provider) = build_for_provider(
+        "anthropic",
+        "claude-sonnet-4-6",
+        Some(AuthMode::Sso),
+        &resolver,
+    )
+    .await
+    .expect("build_for_provider should succeed with OAuth credential");
+    assert_eq!(mode, AuthMode::Sso);
+
+    let request = LlmRequest {
+        model: "claude-sonnet-4-6".into(),
+        system: None,
+        messages: vec![Message::user("hi")],
+        max_tokens: 16,
+        tools: vec![],
+        cell_id: None,
+        trace_id: None,
+        thinking: None,
+        task_type: None,
+    };
+
+    let result = provider.send(&request).await;
+
+    std::env::remove_var(ANTHROPIC_BASE_URL_OVERRIDE);
+
+    mock.assert_hits(1);
+    assert!(
+        result.is_ok(),
+        "send() should succeed when factory emits Bearer auth: {:?}",
+        result.err()
+    );
 }
