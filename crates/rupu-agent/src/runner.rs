@@ -115,6 +115,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         Some(list) => default_tool_registry().filter_to(list),
         None => default_tool_registry(),
     };
+    let tool_defs = registry.to_tool_definitions();
 
     let mut messages: Vec<Message> = vec![Message::user(&opts.user_message)];
     let mut turn_idx: u32 = 0;
@@ -128,15 +129,12 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         }
         writer.write(&Event::TurnStart { turn_idx })?;
         // LlmRequest does not derive Default — construct explicitly.
-        // For v0 the runner does not surface tool schemas to the model;
-        // tool_use blocks come from the mock script in tests. Wiring
-        // real `tools` for live providers is deferred to Plan 2 Phase 3.
         let req = LlmRequest {
             model: opts.model.clone(),
             system: Some(opts.agent_system_prompt.clone()),
             messages: messages.clone(),
             max_tokens: 4096,
-            tools: vec![],
+            tools: tool_defs.clone(),
             cell_id: None,
             trace_id: None,
             thinking: None,
