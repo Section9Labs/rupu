@@ -37,16 +37,44 @@ async fn unknown_provider_errors_clearly() {
 
 #[tokio::test]
 async fn deferred_provider_returns_blocked_error() {
-    // openai/copilot/gemini/local are defined types but v0 wires only
-    // anthropic. Expect a clear "not wired in v0" error.
+    // After Slice B-1 Plan 1 Tasks 12-14: openai and copilot are wired
+    // (fall through to MissingCredential when no key configured), while
+    // gemini and local remain NotWiredInV0 in this slice. Both shapes
+    // produce a clear, named error rather than a silent miss.
     std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    // Clear env-var fallbacks so we exercise the missing-credential path
+    // for the wired providers instead of accidentally succeeding.
+    let prev_openai = std::env::var("OPENAI_API_KEY").ok();
+    let prev_github = std::env::var("GITHUB_TOKEN").ok();
+    std::env::remove_var("OPENAI_API_KEY");
+    std::env::remove_var("GITHUB_TOKEN");
+
     let backend = fresh_backend();
-    for p in ["openai", "copilot", "gemini", "local"] {
+
+    // openai + copilot: wired, should fail with MissingCredential when no key.
+    for p in ["openai", "copilot"] {
+        let res = build_for_provider(p, "x", &backend).await;
+        let err = format!("{}", res.err().expect("expected Err"));
+        assert!(
+            err.contains(p) && err.contains("missing credential"),
+            "{p}: expected missing-credential error: {err}"
+        );
+    }
+
+    // gemini + local: still NotWiredInV0 in Plan 1.
+    for p in ["gemini", "local"] {
         let res = build_for_provider(p, "x", &backend).await;
         let err = format!("{}", res.err().expect("expected Err"));
         assert!(
             err.contains(p) && (err.contains("not wired") || err.contains("v0")),
             "{p}: expected v0-deferral error: {err}"
         );
+    }
+
+    if let Some(v) = prev_openai {
+        std::env::set_var("OPENAI_API_KEY", v);
+    }
+    if let Some(v) = prev_github {
+        std::env::set_var("GITHUB_TOKEN", v);
     }
 }
