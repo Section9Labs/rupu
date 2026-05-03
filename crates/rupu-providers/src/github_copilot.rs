@@ -1177,3 +1177,22 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod llm_provider_impl_tests {
+    use super::*;
+    use crate::auth::AuthCredentials;
+    use crate::provider::LlmProvider;
+    use crate::provider_id::ProviderId;
+
+    #[test]
+    fn implements_llm_provider_trait() {
+        let creds = AuthCredentials::ApiKey {
+            key: "ghp_test".into(),
+        };
+        let client = GithubCopilotClient::new(creds, None).expect("new");
+        let boxed: Box<dyn LlmProvider> = Box::new(client);
+        assert_eq!(boxed.provider_id(), ProviderId::GithubCopilot);
+        assert!(!boxed.default_model().is_empty());
+    }
+}
