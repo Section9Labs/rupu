@@ -110,10 +110,35 @@ async fn anthropic_factory_oauth_credential_uses_bearer_not_x_api_key() {
     std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
 
     let server = MockServer::start();
+    // Match the wire-level shape we want OAuth requests to take:
+    // Bearer auth + a `User-Agent` rupu identifies itself with + a body
+    // carrying the OAuth `betas` array. If any of these regress the
+    // matcher won't fire and `assert_hits(1)` below will fail.
     let mock = server.mock(|when, then| {
         when.method(POST)
             .path("/v1/messages")
-            .header("Authorization", "Bearer test-access-token");
+            .header("Authorization", "Bearer test-access-token")
+            .matches(|req| {
+                let ua_ok = req
+                    .headers
+                    .as_ref()
+                    .map(|hs| {
+                        hs.iter().any(|(k, v)| {
+                            k.eq_ignore_ascii_case("User-Agent") && v.starts_with("claude-cli/")
+                        })
+                    })
+                    .unwrap_or(false);
+                let body_ok = req
+                    .body
+                    .as_ref()
+                    .map(|b| {
+                        let s = String::from_utf8_lossy(b);
+                        s.contains("\"betas\":[\"oauth-2025-04-20\"]")
+                            && s.contains("\"metadata\":")
+                    })
+                    .unwrap_or(false);
+                ua_ok && body_ok
+            });
         then.status(200)
             .header("content-type", "application/json")
             .json_body(serde_json::json!({
