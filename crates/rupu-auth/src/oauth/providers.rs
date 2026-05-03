@@ -190,6 +190,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             include_state_in_token_body: false,
         }),
         ProviderId::Local => None,
+        ProviderId::Github | ProviderId::Gitlab => None,
     }
 }
 
