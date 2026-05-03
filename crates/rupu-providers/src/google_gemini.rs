@@ -1178,4 +1178,21 @@ mod llm_provider_impl_tests {
         assert_eq!(boxed.provider_id(), ProviderId::GoogleGeminiCli);
         assert!(!boxed.default_model().is_empty());
     }
+
+    #[tokio::test]
+    async fn list_models_returns_empty_until_ai_studio_wired() {
+        // Plan 3 reality: Vertex/CLI endpoint has no equivalent of AI Studio's
+        // `/v1beta/models?key=...` listing. Gemini API-key path is deferred
+        // (see TODO.md). Until then, list_models defaults to empty and the
+        // ModelRegistry's baked-in fallback (Plan 3 Task 5) provides a
+        // curated v0 list.
+        let client =
+            GoogleGeminiClient::new(oauth_creds(), GeminiVariant::GeminiCli, None).unwrap();
+        let models = <GoogleGeminiClient as LlmProvider>::list_models(&client).await;
+        assert!(
+            models.is_empty(),
+            "Gemini list_models should be empty until AI Studio endpoint is wired; got {} entries",
+            models.len()
+        );
+    }
 }
