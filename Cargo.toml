@@ -59,11 +59,19 @@ dirs = "5"
 # Auth
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 
+# OAuth / PKCE
+tiny_http = "0.12"
+webbrowser = "1"
+rand = "0.8"
+sha2 = "0.10"
+url = "2"
+
 # Test deps
 tempfile = "3"
 assert_fs = "1"
 assert_cmd = "2"
 predicates = "3"
+httpmock = "0.7"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
