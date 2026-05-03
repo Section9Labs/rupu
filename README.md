@@ -37,11 +37,32 @@ somewhere on your `$PATH`.
 
 ### 1. Authenticate
 
+rupu supports four providers; each works with API-key auth or SSO.
+
+| Provider  | API key                              | SSO                                |
+| --------- | ------------------------------------ | ---------------------------------- |
+| anthropic | `console.anthropic.com` → API Keys   | Claude.ai login (browser callback) |
+| openai    | `platform.openai.com` → API Keys     | ChatGPT login (browser callback)   |
+| gemini    | `aistudio.google.com` → Get API Key  | Google account (browser callback)  |
+| copilot   | (PAT via `gh` token)                 | GitHub login (device code)         |
+
 ```sh
-rupu auth login --provider anthropic --key sk-ant-XXX
+# API key
+rupu auth login --provider anthropic --mode api-key --key sk-ant-XXX
+
+# SSO (opens a browser; Copilot prints a device code instead)
+rupu auth login --provider anthropic --mode sso
+
+# Verify
+rupu auth status
 ```
 
-Your key is stored in `~/.rupu/auth.json`. Run `rupu auth status` to confirm.
+Credentials are stored in the OS keychain at `rupu/<provider>/<api-key|sso>`.
+SSO entries auto-refresh near expiry; failure surfaces an actionable error
+pointing at `rupu auth login --mode sso`.
+
+See `docs/providers.md` for the full reference and `docs/providers/<name>.md`
+for per-provider walkthroughs.
 
 ### 2. Run your first agent
 
