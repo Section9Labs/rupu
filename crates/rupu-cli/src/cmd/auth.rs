@@ -1,8 +1,7 @@
 //! `rupu auth login | logout | status`.
 
-use crate::paths;
 use clap::Subcommand;
-use rupu_auth::{AuthBackend, ProbeCache, ProviderId};
+use rupu_auth::ProviderId;
 use std::io::Read;
 use std::process::ExitCode;
 
@@ -195,31 +194,26 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
 }
 
 async fn status() -> anyhow::Result<()> {
-    let backend = backend_for_global()?;
-    println!("backend: {}", backend.name());
-    for p in [
-        ProviderId::Anthropic,
-        ProviderId::Openai,
-        ProviderId::Gemini,
-        ProviderId::Copilot,
-        ProviderId::Local,
+    let resolver = rupu_auth::resolver::KeychainResolver::new();
+    println!("{:<10} {:<10} SSO", "PROVIDER", "API-KEY");
+    for (label, pid) in [
+        ("anthropic", ProviderId::Anthropic),
+        ("openai", ProviderId::Openai),
+        ("gemini", ProviderId::Gemini),
+        ("copilot", ProviderId::Copilot),
     ] {
-        let configured = backend.retrieve(p).is_ok();
-        println!(
-            "{:<10} {}",
-            p.as_str(),
-            if configured { "configured" } else { "-" }
-        );
+        let api = if resolver.peek(pid, rupu_providers::AuthMode::ApiKey).await {
+            "✓"
+        } else {
+            "-"
+        };
+        let sso = match resolver.peek_sso(pid).await {
+            Some(expiry_repr) => format!("✓ ({expiry_repr})"),
+            None => "-".to_string(),
+        };
+        println!("{:<10} {:<10} {}", label, api, sso);
     }
     Ok(())
-}
-
-fn backend_for_global() -> anyhow::Result<Box<dyn AuthBackend>> {
-    let global = paths::global_dir()?;
-    paths::ensure_dir(&global)?;
-    let cache = ProbeCache::new(global.join("cache/auth-backend.json"));
-    let auth_json = global.join("auth.json");
-    Ok(rupu_auth::select_backend(&cache, auth_json))
 }
 
 #[cfg(test)]
