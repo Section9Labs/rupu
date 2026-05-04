@@ -60,6 +60,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::cron::Action,
     },
+    /// Webhook receiver for event-triggered workflows (GitHub / GitLab).
+    Webhook {
+        #[command(subcommand)]
+        action: cmd::webhook::Action,
+    },
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -85,5 +90,6 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Auth { action } => cmd::auth::handle(action).await,
         Cmd::Models { action } => cmd::models::handle(action).await,
         Cmd::Cron { action } => cmd::cron::handle(action).await,
+        Cmd::Webhook { action } => cmd::webhook::handle(action).await,
     }
 }

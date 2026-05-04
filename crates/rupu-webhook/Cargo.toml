@@ -1,0 +1,39 @@
+[package]
+name = "rupu-webhook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+subtle.workspace = true
+minijinja.workspace = true
+
+# In-workspace
+rupu-orchestrator = { path = "../rupu-orchestrator" }
+
+[dev-dependencies]
+tempfile.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+async-trait.workspace = true
+anyhow.workspace = true

@@ -11,6 +11,7 @@ members = [
     "crates/rupu-agent",
     "crates/rupu-orchestrator",
     "crates/rupu-mcp",
+    "crates/rupu-webhook",
     "crates/rupu-cli",
 ]
 
@@ -76,6 +77,12 @@ webbrowser = "1"
 rand = "0.8"
 sha2 = "0.10"
 url = "2"
+
+# Webhook receiver (axum chosen for async-native + tower middleware)
+axum = "0.7"
+hmac = "0.12"
+hex = "0.4"
+subtle = "2"
 
 # Test deps
 tempfile = "3"
