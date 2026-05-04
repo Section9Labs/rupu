@@ -123,3 +123,54 @@ fn is_recoverable_classifies_correctly() {
     }
     .is_recoverable());
 }
+
+#[test]
+fn gitlab_403_with_insufficient_scope_is_missing_scope() {
+    let mut h = headers(&[]);
+    h.insert(
+        reqwest::header::WWW_AUTHENTICATE,
+        reqwest::header::HeaderValue::from_static(
+            r#"Bearer error="insufficient_scope" error_description="The request requires read_repository""#,
+        ),
+    );
+    let e = classify_scm_error(Platform::Gitlab, 403, "{}", &h);
+    match e {
+        ScmError::MissingScope {
+            platform, scope, ..
+        } => {
+            assert_eq!(platform, "gitlab");
+            assert_eq!(scope, "read_repository");
+        }
+        other => panic!("expected MissingScope, got {other:?}"),
+    }
+}
+
+#[test]
+fn gitlab_403_without_www_authenticate_is_rate_limited() {
+    let e = classify_scm_error(Platform::Gitlab, 403, "{}", &headers(&[]));
+    assert!(matches!(e, ScmError::RateLimited { .. }));
+}
+
+#[test]
+fn gitlab_429_with_retry_after_parses() {
+    let h = headers(&[("Retry-After", "30")]);
+    let e = classify_scm_error(Platform::Gitlab, 429, "{}", &h);
+    match e {
+        ScmError::RateLimited { retry_after } => {
+            assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
+}
+
+#[test]
+fn gitlab_401_is_unauthorized() {
+    let e = classify_scm_error(Platform::Gitlab, 401, "{}", &headers(&[]));
+    match e {
+        ScmError::Unauthorized { platform, hint } => {
+            assert_eq!(platform, "gitlab");
+            assert!(hint.contains("rupu auth login --provider gitlab"));
+        }
+        other => panic!("expected Unauthorized, got {other:?}"),
+    }
+}
