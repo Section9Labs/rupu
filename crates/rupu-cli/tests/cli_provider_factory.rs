@@ -133,8 +133,9 @@ async fn anthropic_factory_oauth_credential_uses_bearer_not_x_api_key() {
                     .as_ref()
                     .map(|b| {
                         let s = String::from_utf8_lossy(b);
-                        s.contains("\"betas\":[\"oauth-2025-04-20\"]")
-                            && s.contains("\"metadata\":")
+                        // `betas` must NOT appear in the body — it is a
+                        // header-only field; including it 400s.
+                        s.contains("\"metadata\":") && !s.contains("\"betas\":")
                     })
                     .unwrap_or(false);
                 ua_ok && body_ok

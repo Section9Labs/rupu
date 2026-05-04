@@ -643,15 +643,18 @@ impl AnthropicClient {
             body["tools"] = serde_json::json!(request.tools);
         }
 
-        // OAuth-scope parity with the first-party Claude client: declare the
-        // OAuth beta in-body (the SDK source-of-truth — header is mirrored
-        // by `apply_auth_headers`) and carry a `metadata.user_id` blob so
-        // Anthropic can attribute the request to the user's Pro/Max quota.
-        // `account_uuid` is intentionally absent for now — it requires a
-        // /me-style profile fetch at SSO login, deferred until we see how
-        // far this minimum gets us against 429s.
+        // OAuth-scope parity with the first-party Claude client: carry a
+        // `metadata.user_id` blob so Anthropic can attribute the request to
+        // the user's Pro/Max quota. The OAuth beta itself goes on the wire
+        // exclusively as the `anthropic-beta` header (set by
+        // `apply_auth_headers`); putting it in the body too is rejected by
+        // /v1/messages with `"betas: Extra inputs are not permitted"` —
+        // `betas` is an `@anthropic-ai/sdk` call-options field that the SDK
+        // strips into the header before sending, not a wire-level body
+        // field. `account_uuid` is intentionally absent here — it requires
+        // a /me-style profile fetch at SSO login, deferred until we see how
+        // far this minimum gets us.
         if self.auth.is_oauth() {
-            body["betas"] = serde_json::json!([OAUTH_BETA_HEADER]);
             let user_id_blob = serde_json::json!({
                 "device_id": "rupu",
                 "session_id": request.cell_id.clone().unwrap_or_default(),
@@ -996,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn oauth_body_includes_betas_and_metadata_user_id() {
+    fn oauth_body_includes_metadata_user_id() {
         let client = oauth_client();
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
@@ -1010,7 +1013,12 @@ mod tests {
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
-        assert_eq!(body["betas"], serde_json::json!([OAUTH_BETA_HEADER]));
+        // `betas` belongs in the `anthropic-beta` header only — including it
+        // in the body trips Anthropic's "Extra inputs are not permitted".
+        assert!(
+            body.get("betas").is_none(),
+            "`betas` must not appear in the body — it is a header-only field"
+        );
         let user_id = body["metadata"]["user_id"]
             .as_str()
             .expect("metadata.user_id should be a JSON string");
