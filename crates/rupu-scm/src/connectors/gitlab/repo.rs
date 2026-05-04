@@ -120,6 +120,49 @@ fn translate_branch(v: &serde_json::Value) -> Result<Branch, ScmError> {
     })
 }
 
+fn translate_note_to_comment(v: &serde_json::Value) -> Result<Comment, ScmError> {
+    let id = v
+        .get("id")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0)
+        .to_string();
+    let body = v
+        .get("body")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let author = v
+        .get("author")
+        .and_then(|a| a.get("username"))
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let created_at = v
+        .get("created_at")
+        .and_then(|x| x.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+    Ok(Comment {
+        id,
+        author,
+        body,
+        created_at,
+    })
+}
+
+/// URL-encode a value for query parameter use (handles `/`, `+`, etc.).
+fn urlencode_value(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
 fn translate_mr_to_pr(repo: RepoRef, v: &serde_json::Value) -> Result<Pr, ScmError> {
     let iid = v
         .get("iid")
@@ -242,11 +285,22 @@ impl RepoConnector for GitlabRepoConnector {
     }
     async fn create_branch(
         &self,
-        _r: &RepoRef,
-        _name: &str,
-        _from_sha: &str,
+        r: &RepoRef,
+        name: &str,
+        from_sha: &str,
     ) -> Result<Branch, ScmError> {
-        unimplemented!("subtask 4f")
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&r.owner, &r.repo);
+        let path = format!(
+            "/projects/{id}/repository/branches?branch={}&ref={}",
+            urlencode_value(name),
+            urlencode_value(from_sha),
+        );
+        let resp = self
+            .client
+            .write_json(reqwest::Method::POST, &path, serde_json::Value::Null)
+            .await?;
+        translate_branch(&resp)
     }
     async fn read_file(
         &self,
@@ -355,13 +409,54 @@ impl RepoConnector for GitlabRepoConnector {
             deletions,
         })
     }
-    async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
-        unimplemented!("subtask 4f")
+    async fn comment_pr(&self, p: &PrRef, body: &str) -> Result<Comment, ScmError> {
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&p.repo.owner, &p.repo.repo);
+        let payload = serde_json::json!({ "body": body });
+        let resp = self
+            .client
+            .write_json(
+                reqwest::Method::POST,
+                &format!("/projects/{id}/merge_requests/{}/notes", p.number),
+                payload,
+            )
+            .await?;
+        translate_note_to_comment(&resp)
     }
-    async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
-        unimplemented!("subtask 4f")
+    async fn create_pr(&self, r: &RepoRef, opts: CreatePr) -> Result<Pr, ScmError> {
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&r.owner, &r.repo);
+        let payload = serde_json::json!({
+            "source_branch": opts.head,
+            "target_branch": opts.base,
+            "title": opts.title,
+            "description": opts.body,
+            "draft": opts.draft,
+        });
+        let resp = self
+            .client
+            .write_json(
+                reqwest::Method::POST,
+                &format!("/projects/{id}/merge_requests"),
+                payload,
+            )
+            .await?;
+        translate_mr_to_pr(r.clone(), &resp)
     }
-    async fn clone_to(&self, _r: &RepoRef, _dir: &Path) -> Result<(), ScmError> {
-        unimplemented!("subtask 4f")
+    async fn clone_to(&self, r: &RepoRef, dir: &Path) -> Result<(), ScmError> {
+        // GitLab PAT-as-password convention with username "oauth2".
+        let url = format!(
+            "https://oauth2:{}@gitlab.com/{}/{}.git",
+            self.client.token, r.owner, r.repo
+        );
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<(), ScmError> {
+            git2::Repository::clone(&url, &dir)
+                .map_err(|e| ScmError::Network(anyhow::anyhow!("git clone failed: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| ScmError::Transient(anyhow::anyhow!("join: {e}")))??;
+        Ok(())
     }
 }

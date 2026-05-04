@@ -1,6 +1,7 @@
 //! GitLab httpmock round-trip integration tests.
 
 use httpmock::prelude::*;
+use httpmock::Method::POST;
 use rupu_scm::connectors::gitlab::client::GitlabClient;
 use rupu_scm::connectors::gitlab::repo::GitlabRepoConnector;
 use rupu_scm::RepoConnector;
@@ -203,4 +204,102 @@ async fn diff_pr_aggregates_changes() {
     assert_eq!(d.files_changed, 1);
     assert!(d.patch.contains("diff --git a/src/main.rs b/src/main.rs"));
     assert_eq!(d.additions, 1);
+}
+
+#[tokio::test]
+async fn comment_pr_posts_note() {
+    let server = MockServer::start_async().await;
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/note_create_happy.json").unwrap();
+    let m = server.mock(|when, then| {
+        when.method(POST)
+            .path("/projects/section9labs%2Frupu/merge_requests/42/notes");
+        then.status(201)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let conn = common::gitlab_repo_connector_against(&server);
+    let comment = conn
+        .comment_pr(
+            &rupu_scm::PrRef {
+                repo: rupu_scm::RepoRef {
+                    platform: rupu_scm::Platform::Gitlab,
+                    owner: "section9labs".into(),
+                    repo: "rupu".into(),
+                },
+                number: 42,
+            },
+            "looks great",
+        )
+        .await
+        .unwrap();
+    m.assert();
+    assert_eq!(comment.id, "7777");
+    assert_eq!(comment.body, "looks great");
+    assert_eq!(comment.author, "matias");
+}
+
+#[tokio::test]
+async fn create_pr_posts_mr() {
+    let server = MockServer::start_async().await;
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/mr_create_happy.json").unwrap();
+    let m = server.mock(|when, then| {
+        when.method(POST)
+            .path("/projects/section9labs%2Frupu/merge_requests");
+        then.status(201)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let conn = common::gitlab_repo_connector_against(&server);
+    let pr = conn
+        .create_pr(
+            &rupu_scm::RepoRef {
+                platform: rupu_scm::Platform::Gitlab,
+                owner: "section9labs".into(),
+                repo: "rupu".into(),
+            },
+            rupu_scm::CreatePr {
+                title: "feat: add foo".into(),
+                body: "adds foo".into(),
+                head: "feat/foo".into(),
+                base: "main".into(),
+                draft: false,
+            },
+        )
+        .await
+        .unwrap();
+    m.assert();
+    assert_eq!(pr.r.number, 200);
+    assert_eq!(pr.title, "feat: add foo");
+    assert_eq!(pr.head_branch, "feat/foo");
+}
+
+#[tokio::test]
+async fn create_branch_posts_with_ref() {
+    let server = MockServer::start_async().await;
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/branch_create_happy.json").unwrap();
+    let m = server.mock(|when, then| {
+        when.method(POST)
+            .path("/projects/section9labs%2Frupu/repository/branches")
+            .query_param("branch", "feat/new-branch")
+            .query_param("ref", "abc123");
+        then.status(201)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let conn = common::gitlab_repo_connector_against(&server);
+    let b = conn
+        .create_branch(
+            &rupu_scm::RepoRef {
+                platform: rupu_scm::Platform::Gitlab,
+                owner: "section9labs".into(),
+                repo: "rupu".into(),
+            },
+            "feat/new-branch",
+            "abc123",
+        )
+        .await
+        .unwrap();
+    m.assert();
+    assert_eq!(b.name, "feat/new-branch");
+    assert!(!b.protected);
 }
