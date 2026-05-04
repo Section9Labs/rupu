@@ -596,14 +596,8 @@ impl AnthropicClient {
         let mut b = builder
             .header("Accept", "application/json")
             .header("User-Agent", RUPU_USER_AGENT)
-            .header(
-                "X-Claude-Code-Session-Id",
-                uuid::Uuid::new_v4().to_string(),
-            )
-            .header(
-                "x-client-request-id",
-                uuid::Uuid::new_v4().to_string(),
-            )
+            .header("X-Claude-Code-Session-Id", uuid::Uuid::new_v4().to_string())
+            .header("x-client-request-id", uuid::Uuid::new_v4().to_string())
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("Connection", "keep-alive");
