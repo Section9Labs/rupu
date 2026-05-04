@@ -334,6 +334,12 @@ pub struct AnthropicClient {
     auth_json_path: Option<std::path::PathBuf>,
     /// Credential store for persisting refreshed tokens (preferred over auth_json_path).
     credential_store: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
+    /// Anthropic OAuth account UUID, captured from the token-exchange
+    /// response and persisted in `AuthCredentials::OAuth.extra`. Sent as
+    /// `metadata.user_id.account_uuid` so the request binds to the
+    /// caller's Pro/Max quota; without it Anthropic falls back to a
+    /// stricter rate-limit pool.
+    oauth_account_uuid: Option<String>,
 }
 
 impl AnthropicClient {
@@ -345,7 +351,16 @@ impl AnthropicClient {
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: None,
             credential_store: None,
+            oauth_account_uuid: None,
         }
+    }
+
+    /// Set the OAuth account UUID. Used by the factory after reading it
+    /// from the resolved credential's `extra` map. Returns `self` for
+    /// builder-style chaining.
+    pub fn with_oauth_account_uuid(mut self, uuid: Option<String>) -> Self {
+        self.oauth_account_uuid = uuid;
+        self
     }
 
     /// Create a client with an auth.json path for persisting refreshed tokens.
@@ -356,6 +371,7 @@ impl AnthropicClient {
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: Some(auth_json_path),
             credential_store: None,
+            oauth_account_uuid: None,
         }
     }
 
@@ -370,6 +386,7 @@ impl AnthropicClient {
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: None,
             credential_store: Some(store),
+            oauth_account_uuid: None,
         }
     }
 
@@ -392,6 +409,7 @@ impl AnthropicClient {
             api_url,
             auth_json_path: None,
             credential_store: None,
+            oauth_account_uuid: None,
         }
     }
 
@@ -405,6 +423,7 @@ impl AnthropicClient {
             api_url,
             auth_json_path: None,
             credential_store: None,
+            oauth_account_uuid: None,
         }
     }
 
@@ -651,16 +670,23 @@ impl AnthropicClient {
         // /v1/messages with `"betas: Extra inputs are not permitted"` —
         // `betas` is an `@anthropic-ai/sdk` call-options field that the SDK
         // strips into the header before sending, not a wire-level body
-        // field. `account_uuid` is intentionally absent here — it requires
-        // a /me-style profile fetch at SSO login, deferred until we see how
-        // far this minimum gets us.
+        // field.
+        //
+        // `account_uuid` is captured from the OAuth token-exchange
+        // response (see `oauth/callback.rs::TokenResponse`) and threaded
+        // here via `with_oauth_account_uuid`. Without it Anthropic cannot
+        // bind the call to the authenticated account's quota and falls
+        // back to a default-pool rate limit — that was the second 429 we
+        // saw post-#24.
         if self.auth.is_oauth() {
-            let user_id_blob = serde_json::json!({
+            let mut user_id = serde_json::json!({
                 "device_id": "rupu",
                 "session_id": request.cell_id.clone().unwrap_or_default(),
-            })
-            .to_string();
-            body["metadata"] = serde_json::json!({ "user_id": user_id_blob });
+            });
+            if let Some(uuid) = &self.oauth_account_uuid {
+                user_id["account_uuid"] = serde_json::Value::String(uuid.clone());
+            }
+            body["metadata"] = serde_json::json!({ "user_id": user_id.to_string() });
         }
 
         // Thinking/extended thinking — Anthropic uses budget_tokens.
@@ -998,6 +1024,10 @@ mod tests {
         })
     }
 
+    fn oauth_client_with_account_uuid(uuid: &str) -> AnthropicClient {
+        oauth_client().with_oauth_account_uuid(Some(uuid.to_string()))
+    }
+
     #[test]
     fn oauth_body_includes_metadata_user_id() {
         let client = oauth_client();
@@ -1049,6 +1079,55 @@ mod tests {
         assert!(
             body.get("metadata").is_none(),
             "metadata leaked into api-key request"
+        );
+    }
+
+    #[test]
+    fn oauth_metadata_user_id_includes_account_uuid_when_set() {
+        let client = oauth_client_with_account_uuid("acct-12345");
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 16,
+            tools: vec![],
+            cell_id: Some("cell-xyz".into()),
+            trace_id: None,
+            thinking: None,
+            task_type: None,
+        };
+        let body = client.build_request_body(&request, false);
+        let user_id = body["metadata"]["user_id"]
+            .as_str()
+            .expect("metadata.user_id should be a JSON string");
+        let parsed: serde_json::Value = serde_json::from_str(user_id).expect("user_id JSON");
+        assert_eq!(parsed["account_uuid"], "acct-12345");
+        assert_eq!(parsed["device_id"], "rupu");
+        assert_eq!(parsed["session_id"], "cell-xyz");
+    }
+
+    #[test]
+    fn oauth_metadata_user_id_omits_account_uuid_when_unset() {
+        let client = oauth_client();
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 16,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            task_type: None,
+        };
+        let body = client.build_request_body(&request, false);
+        let user_id = body["metadata"]["user_id"]
+            .as_str()
+            .expect("metadata.user_id should be a JSON string");
+        let parsed: serde_json::Value = serde_json::from_str(user_id).expect("user_id JSON");
+        assert!(
+            parsed.get("account_uuid").is_none(),
+            "account_uuid must not appear when not configured"
         );
     }
 

@@ -178,6 +178,15 @@ impl KeychainResolver {
             .json()
             .await
             .map_err(|e| anyhow::anyhow!("refresh json: {e}"))?;
+        // Preserve `extra` (account_uuid, organization_uuid, etc.) from
+        // the prior credential — refresh-token responses generally don't
+        // re-emit the account block, but those identifiers don't change
+        // for the lifetime of the OAuth grant, so carrying them forward
+        // keeps `metadata.user_id.account_uuid` populated post-refresh.
+        let prior_extra = match &sc.credentials {
+            rupu_providers::auth::AuthCredentials::OAuth { extra, .. } => extra.clone(),
+            _ => Default::default(),
+        };
         Ok(StoredCredential {
             credentials: rupu_providers::auth::AuthCredentials::OAuth {
                 access: r.access_token.clone(),
@@ -186,7 +195,7 @@ impl KeychainResolver {
                     .clone()
                     .unwrap_or_else(|| refresh_token.to_string()),
                 expires: r.expires_in.unwrap_or(0) as u64,
-                extra: Default::default(),
+                extra: prior_extra,
             },
             refresh_token: Some(r.refresh_token.unwrap_or_else(|| refresh_token.to_string())),
             expires_at: r
