@@ -2794,6 +2794,7 @@ dependencies = [
  "rupu-config",
  "rupu-orchestrator",
  "rupu-providers",
+ "rupu-scm",
  "rupu-tools",
  "rupu-transcript",
  "rupu-workspace",
