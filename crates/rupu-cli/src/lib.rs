@@ -56,6 +56,16 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::models::Action,
     },
+    /// SCM repository operations.
+    Repos {
+        #[command(subcommand)]
+        action: cmd::repos::Action,
+    },
+    /// MCP server operations.
+    Mcp {
+        #[command(subcommand)]
+        action: cmd::mcp::Action,
+    },
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -80,5 +90,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Config { action } => cmd::config::handle(action).await,
         Cmd::Auth { action } => cmd::auth::handle(action).await,
         Cmd::Models { action } => cmd::models::handle(action).await,
+        Cmd::Repos { action } => cmd::repos::handle(action).await,
+        Cmd::Mcp { action } => cmd::mcp::handle(action).await,
     }
 }
