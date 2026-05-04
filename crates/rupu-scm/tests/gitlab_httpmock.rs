@@ -303,3 +303,129 @@ async fn create_branch_posts_with_ref() {
     assert_eq!(b.name, "feat/new-branch");
     assert!(!b.protected);
 }
+
+// ── Issue connector tests ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_issue_translates() {
+    let server = MockServer::start_async().await;
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/issue_get_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/projects/section9labs%2Frupu/issues/123");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let conn = common::gitlab_issue_connector_against(&server);
+    let i = conn
+        .get_issue(&rupu_scm::IssueRef {
+            tracker: rupu_scm::IssueTracker::Gitlab,
+            project: "section9labs/rupu".into(),
+            number: 123,
+        })
+        .await
+        .unwrap();
+    assert_eq!(i.title, "Investigate flaky test");
+    assert_eq!(i.state, rupu_scm::IssueState::Open);
+    assert_eq!(i.labels, vec!["bug".to_string(), "ci".to_string()]);
+}
+
+#[tokio::test]
+async fn list_issues_translates() {
+    let server = MockServer::start_async().await;
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/issues_list_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/projects/section9labs%2Frupu/issues");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let conn = common::gitlab_issue_connector_against(&server);
+    let items = conn
+        .list_issues("section9labs/rupu", rupu_scm::IssueFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].labels, vec!["bug".to_string()]);
+}
+
+#[tokio::test]
+async fn create_issue_posts_payload() {
+    let server = MockServer::start_async().await;
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/issue_create_happy.json").unwrap();
+    let m = server.mock(|when, then| {
+        when.method(POST)
+            .path("/projects/section9labs%2Frupu/issues");
+        then.status(201)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let conn = common::gitlab_issue_connector_against(&server);
+    let i = conn
+        .create_issue(
+            "section9labs/rupu",
+            rupu_scm::CreateIssue {
+                title: "New ticket".into(),
+                body: "auto-created via rupu".into(),
+                labels: vec!["bug".into(), "needs-triage".into()],
+            },
+        )
+        .await
+        .unwrap();
+    m.assert();
+    assert_eq!(i.r.number, 124);
+    assert_eq!(i.title, "New ticket");
+}
+
+#[tokio::test]
+async fn comment_issue_posts_note() {
+    let server = MockServer::start_async().await;
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/note_create_happy.json").unwrap();
+    let m = server.mock(|when, then| {
+        when.method(POST)
+            .path("/projects/section9labs%2Frupu/issues/123/notes");
+        then.status(201)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let conn = common::gitlab_issue_connector_against(&server);
+    let c = conn
+        .comment_issue(
+            &rupu_scm::IssueRef {
+                tracker: rupu_scm::IssueTracker::Gitlab,
+                project: "section9labs/rupu".into(),
+                number: 123,
+            },
+            "looks great",
+        )
+        .await
+        .unwrap();
+    m.assert();
+    assert_eq!(c.body, "looks great");
+}
+
+#[tokio::test]
+async fn update_issue_state_uses_state_event() {
+    let server = MockServer::start_async().await;
+    let m = server.mock(|when, then| {
+        when.method(httpmock::Method::PUT)
+            .path("/projects/section9labs%2Frupu/issues/123");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"id":99,"iid":123,"state":"closed","title":"x","description":"","labels":[],"author":{"username":"matias"},"created_at":"2026-05-01T09:00:00.000Z","updated_at":"2026-05-03T15:00:00.000Z"}"#);
+    });
+    let conn = common::gitlab_issue_connector_against(&server);
+    conn.update_issue_state(
+        &rupu_scm::IssueRef {
+            tracker: rupu_scm::IssueTracker::Gitlab,
+            project: "section9labs/rupu".into(),
+            number: 123,
+        },
+        rupu_scm::IssueState::Closed,
+    )
+    .await
+    .unwrap();
+    m.assert();
+}
