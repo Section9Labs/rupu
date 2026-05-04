@@ -36,12 +36,14 @@ rupu-workspace = { path = "../rupu-workspace" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-providers = { path = "../rupu-providers" }
 rupu-scm = { path = "../rupu-scm" }
+rupu-mcp = { path = "../rupu-mcp" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-webhook = { path = "../rupu-webhook" }
+comfy-table.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 assert_fs.workspace = true
 assert_cmd = { workspace = true }
 predicates.workspace = true

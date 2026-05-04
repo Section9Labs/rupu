@@ -10,6 +10,7 @@ pub mod crash;
 pub mod logging;
 pub mod paths;
 pub mod provider_factory;
+pub mod run_target;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -55,6 +56,16 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::models::Action,
     },
+    /// SCM repository operations.
+    Repos {
+        #[command(subcommand)]
+        action: cmd::repos::Action,
+    },
+    /// MCP server operations.
+    Mcp {
+        #[command(subcommand)]
+        action: cmd::mcp::Action,
+    },
     /// Schedule-driven workflow firing (designed for system cron).
     Cron {
         #[command(subcommand)]
@@ -89,6 +100,8 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Config { action } => cmd::config::handle(action).await,
         Cmd::Auth { action } => cmd::auth::handle(action).await,
         Cmd::Models { action } => cmd::models::handle(action).await,
+        Cmd::Repos { action } => cmd::repos::handle(action).await,
+        Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Cron { action } => cmd::cron::handle(action).await,
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
     }

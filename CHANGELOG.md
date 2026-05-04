@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.2.0 — Slice B-2: SCM + issue trackers (2026-05-04)
+
+### Added
+
+- **GitHub + GitLab connectors** (`rupu-scm`). RepoConnector + IssueConnector
+  trait families with per-platform impls; ETag-cached + retry-with-backoff
+  + per-platform Semaphore. classify_scm_error pure function gives every
+  error a recoverable/unrecoverable verdict.
+- **Embedded MCP server** (`rupu-mcp`). 17 tools (`scm.repos.*`, `scm.prs.*`,
+  `scm.files.read`, `scm.branches.*`, `issues.*`, `github.workflows_dispatch`,
+  `gitlab.pipeline_trigger`) auto-attached to every `rupu run` /
+  `rupu workflow run`. JSON-Schema-typed via schemars; permission gating
+  honors the agent's frontmatter `tools:` list AND `--mode` flag.
+- **`rupu auth login --provider github|gitlab`** with both api-key and SSO
+  flows. SSO uses GitHub's device-code flow / GitLab's browser-callback PKCE
+  flow.
+- **`rupu repos list [--platform <name>]`** — table-rendered list of repos
+  the user can access on configured platforms.
+- **`rupu mcp serve [--transport stdio]`** — MCP server for external
+  clients (Claude Desktop, Cursor, etc.).
+- **`rupu run <agent> [<target>]`** — optional positional arg; `target` is
+  a `<platform>:<owner>/<repo>[#N | !N | /issues/N]` reference. The runner
+  clones the repo to a tmpdir (or reuses the cwd) and preloads a
+  `## Run target` section into the agent's system prompt.
+
+### Architecture
+
+- Two new crates: `rupu-scm` (connectors) and `rupu-mcp` (MCP kernel).
+- `rupu-agent`'s `run_agent` now spins up `rupu_mcp::serve_in_process`
+  before the first turn and tears it down before returning. SCM tools
+  appear alongside the six built-in tools through a thin `McpToolAdapter`.
+- `Registry::discover` builds connectors from the same `KeychainResolver`
+  + `Config` that LLM-provider auth uses; missing credentials skip the
+  platform silently with an INFO log.
+
+### Internal
+
+- `Platform` and `IssueTracker` enums in `rupu-scm` cover GitHub + GitLab
+  today; `IssueTracker::Linear` and `IssueTracker::Jira` exist so future
+  adapters slot in without reshaping call sites.
+- New workspace deps: `octocrab`, `gitlab`, `git2` (vendored libgit2 +
+  vendored OpenSSL), `lru`, `schemars`, `comfy-table`, `jsonschema`.
+
+### Docs
+
+- `docs/scm.md` — canonical reference (capabilities, auth, target syntax,
+  full tool catalog, config schema, error classification, troubleshooting).
+- `docs/scm/github.md` + `docs/scm/gitlab.md` — per-platform walkthroughs.
+- `docs/mcp.md` — Claude Desktop / Cursor wiring + sample config.
+- README + CHANGELOG updates.
+
 ## v0.1.5 — Anthropic SSO mirrors pi-mono (2026-05-03)
 
 ### Fixed

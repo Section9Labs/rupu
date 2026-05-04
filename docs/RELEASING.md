@@ -142,3 +142,13 @@ Three release attempts on `v0.0.3-cli` each hit a different transient or environ
 Each fix was small (a one-line MSRV bump or a runner swap), but the iteration cost was real: every retry meant deleting the existing tag, re-pushing it, and waiting for runners to pick up. The native build path takes ~10 seconds per binary on a workstation, with no surprises.
 
 When external-contributor flow needs automation (Slice C+), reinstate the workflow from git history (`git show 6c30b31:.github/workflows/release.yml`).
+
+## Nightly-test secrets (live-API smokes)
+
+Set under repo Settings → Secrets and variables → Actions:
+- `RUPU_LIVE_ANTHROPIC_KEY`
+- `RUPU_LIVE_OPENAI_KEY`
+- `RUPU_LIVE_GEMINI_KEY`
+- `RUPU_LIVE_COPILOT_TOKEN`
+- `RUPU_LIVE_GITHUB_TOKEN`           # PAT, scopes: repo + read:user + read:org
+- `RUPU_LIVE_GITLAB_TOKEN`           # PAT, scopes: api + read_user + read_repository

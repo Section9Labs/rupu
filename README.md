@@ -64,6 +64,38 @@ pointing at `rupu auth login --mode sso`.
 See `docs/providers.md` for the full reference and `docs/providers/<name>.md`
 for per-provider walkthroughs.
 
+## SCM & issue trackers
+
+rupu integrates with GitHub and GitLab through a single embedded MCP
+server. Agents call typed tools (`scm.prs.diff`, `issues.get`, ...) and
+the right per-platform connector dispatches the call. See `docs/scm.md`
+for the full reference.
+
+```bash
+# 1. Authenticate
+rupu auth login --provider github --mode sso
+
+# 2. List your repos
+rupu repos list
+
+# 3. Run an agent against a PR
+rupu run review-pr github:section9labs/rupu#42
+
+# 4. Or expose the same surface to Claude Desktop / Cursor:
+rupu mcp serve --transport stdio
+```
+
+| Capability             | GitHub | GitLab |
+|------------------------|:------:|:------:|
+| Repos / branches       |   ✅   |   ✅   |
+| PRs / MRs              |   ✅   |   ✅   |
+| Issues                 |   ✅   |   ✅   |
+| Workflows / pipelines  |   ✅   |   ✅   |
+| Clone to local         |   ✅   |   ✅   |
+
+Linear and Jira issue trackers are designed-in but not shipped in this
+release; see [TODO.md](TODO.md) for the deferred-feature list.
+
 ### 2. Run your first agent
 
 The rupu repository ships sample agents in `.rupu/agents/`. If you run `rupu` from

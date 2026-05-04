@@ -65,6 +65,7 @@ lru = "0.12"
 
 # CLI / templating (used in Plan 2 but pinned now for cohesion)
 clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
 minijinja = "2"
 dirs = "5"
 

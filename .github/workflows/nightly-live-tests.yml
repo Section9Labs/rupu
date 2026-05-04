@@ -7,19 +7,23 @@ on:
 jobs:
   live:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       RUPU_LIVE_TESTS: "1"
       RUPU_LIVE_ANTHROPIC_KEY: ${{ secrets.RUPU_LIVE_ANTHROPIC_KEY }}
       RUPU_LIVE_OPENAI_KEY: ${{ secrets.RUPU_LIVE_OPENAI_KEY }}
       RUPU_LIVE_GEMINI_KEY: ${{ secrets.RUPU_LIVE_GEMINI_KEY }}
       RUPU_LIVE_COPILOT_TOKEN: ${{ secrets.RUPU_LIVE_COPILOT_TOKEN }}
+      RUPU_LIVE_GITHUB_TOKEN: ${{ secrets.RUPU_LIVE_GITHUB_TOKEN }}
+      RUPU_LIVE_GITLAB_TOKEN: ${{ secrets.RUPU_LIVE_GITLAB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.88"
-      - name: Cargo build
-        run: cargo build -p rupu-providers --tests
-      - name: Live smoke tests
+      - name: Cargo build (providers + scm)
+        run: cargo build -p rupu-providers -p rupu-scm --tests
+      - name: Live smoke (LLM providers)
         run: cargo test -p rupu-providers --test live_smoke -- --nocapture
+      - name: Live smoke (SCM connectors)
+        run: cargo test -p rupu-scm --test live_smoke -- --nocapture
