@@ -15,6 +15,21 @@
 use rupu_providers::provider::LlmProvider;
 use thiserror::Error;
 
+/// Per-build configuration for the provider factory. Optional knobs
+/// that flow from the agent file's frontmatter (or workflow step
+/// config) into provider-specific behavior. `Default` keeps historical
+/// behavior — every existing call site can pass `Default::default()`
+/// and observe no change.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderConfig {
+    /// For Anthropic OAuth requests, whether to prepend the canonical
+    /// "You are Claude Code, …" system-prompt prefix that signals
+    /// first-party traffic to the OAuth-quota router. `None` defers to
+    /// the client-side default (currently: enabled). `Some(false)` opts
+    /// the agent out — useful when the prefix corrupts persona.
+    pub anthropic_oauth_system_prefix: Option<bool>,
+}
+
 #[derive(Debug, Error)]
 pub enum FactoryError {
     #[error(
@@ -51,6 +66,20 @@ pub async fn build_for_provider(
     auth_hint: Option<rupu_providers::AuthMode>,
     resolver: &dyn rupu_auth::CredentialResolver,
 ) -> Result<(rupu_providers::AuthMode, Box<dyn LlmProvider>), FactoryError> {
+    build_for_provider_with_config(name, model, auth_hint, resolver, &ProviderConfig::default())
+        .await
+}
+
+/// Same as [`build_for_provider`] but accepts a [`ProviderConfig`] for
+/// per-build knobs that flow from agent frontmatter / workflow step
+/// config (currently: `anthropic_oauth_system_prefix`).
+pub async fn build_for_provider_with_config(
+    name: &str,
+    model: &str,
+    auth_hint: Option<rupu_providers::AuthMode>,
+    resolver: &dyn rupu_auth::CredentialResolver,
+    config: &ProviderConfig,
+) -> Result<(rupu_providers::AuthMode, Box<dyn LlmProvider>), FactoryError> {
     if let Ok(json) = std::env::var("RUPU_MOCK_PROVIDER_SCRIPT") {
         return Ok((
             rupu_providers::AuthMode::ApiKey,
@@ -66,7 +95,7 @@ pub async fn build_for_provider(
                 source,
             })?;
     let client = match name {
-        "anthropic" => build_anthropic(creds, model).await?,
+        "anthropic" => build_anthropic(creds, model, config).await?,
         "openai" | "openai_codex" | "codex" => build_openai(creds, model).await?,
         "gemini" | "google_gemini" => build_gemini(creds, model).await?,
         "copilot" | "github_copilot" => build_copilot(creds, model).await?,
@@ -86,6 +115,7 @@ fn build_mock_from_script(json: &str) -> Result<Box<dyn LlmProvider>, FactoryErr
 async fn build_anthropic(
     creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
+    config: &ProviderConfig,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
     // Convert the resolved credential into an Anthropic AuthMethod so OAuth
     // tokens travel via `Authorization: Bearer …` and API keys via
@@ -106,11 +136,14 @@ async fn build_anthropic(
         _ => None,
     };
     let auth = creds.into_anthropic_auth_method();
-    let client = match std::env::var("RUPU_ANTHROPIC_BASE_URL_OVERRIDE") {
+    let mut client = match std::env::var("RUPU_ANTHROPIC_BASE_URL_OVERRIDE") {
         Ok(url) => rupu_providers::anthropic::AnthropicClient::from_auth_with_url(auth, url),
         Err(_) => rupu_providers::anthropic::AnthropicClient::from_auth(auth),
     }
     .with_oauth_account_uuid(account_uuid);
+    if let Some(enabled) = config.anthropic_oauth_system_prefix {
+        client = client.with_oauth_system_prefix(enabled);
+    }
     Ok(Box::new(client))
 }
 

@@ -17,12 +17,19 @@ const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 /// Anthropic API version. Update when new SSE event types or features are needed.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// `User-Agent` sent on every Anthropic request. Mirrors the first-party
-/// `claude-cli/<ver>` namespace so the OAuth scope's Pro/Max quota
-/// attribution treats the call as Claude-Code-like — which it is, in
-/// shape and intent. The version segment is rupu's own (not the upstream
-/// Claude Code version) so traffic remains traceable to this codebase in
-/// any internal dashboards.
-const RUPU_USER_AGENT: &str = concat!("claude-cli/", env!("CARGO_PKG_VERSION"));
+/// `claude-cli/<ver> (<usertype>, <entrypoint>)` shape so the OAuth
+/// quota router recognizes the call as Claude-Code-shaped traffic. We
+/// are honestly `external` (not an Anthropic-internal employee) and
+/// `cli` (the entrypoint that launched this binary), so the parens
+/// content is accurate even though the `claude-cli/` prefix is a
+/// deliberate parity choice.
+const RUPU_USER_AGENT: &str = concat!("claude-cli/", env!("CARGO_PKG_VERSION"), " (external, cli)");
+
+/// First-line of the Anthropic OAuth system-prompt prefix. The full
+/// prefix appended to user agent prompts is built at request time so it
+/// can include CWD + date.
+const ANTHROPIC_OAUTH_SYSTEM_PREFIX_FIRST_LINE: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
 /// Maximum retries for 429 rate-limit responses.
 /// Per-request 429 retries. Set to 1 (one retry) so the ProviderRouter can
 /// handle cross-provider fallback quickly. When used without a router, the
@@ -340,6 +347,11 @@ pub struct AnthropicClient {
     /// caller's Pro/Max quota; without it Anthropic falls back to a
     /// stricter rate-limit pool.
     oauth_account_uuid: Option<String>,
+    /// Whether to prepend the canonical "You are Claude Code, …" system-
+    /// prompt prefix on OAuth requests. Defaults to true; per-agent
+    /// opt-out via `anthropicOauthPrefix: false` in agent frontmatter.
+    /// Has no effect on api-key requests.
+    oauth_system_prefix_enabled: bool,
 }
 
 impl AnthropicClient {
@@ -352,6 +364,7 @@ impl AnthropicClient {
             auth_json_path: None,
             credential_store: None,
             oauth_account_uuid: None,
+            oauth_system_prefix_enabled: true,
         }
     }
 
@@ -360,6 +373,15 @@ impl AnthropicClient {
     /// builder-style chaining.
     pub fn with_oauth_account_uuid(mut self, uuid: Option<String>) -> Self {
         self.oauth_account_uuid = uuid;
+        self
+    }
+
+    /// Toggle the canonical "You are Claude Code, …" system-prompt
+    /// prefix on OAuth requests. Default is enabled. Per-agent opt-out
+    /// flows here from the agent file's `anthropicOauthPrefix: false`
+    /// frontmatter — useful when the prefix corrupts agent persona.
+    pub fn with_oauth_system_prefix(mut self, enabled: bool) -> Self {
+        self.oauth_system_prefix_enabled = enabled;
         self
     }
 
@@ -372,6 +394,7 @@ impl AnthropicClient {
             auth_json_path: Some(auth_json_path),
             credential_store: None,
             oauth_account_uuid: None,
+            oauth_system_prefix_enabled: true,
         }
     }
 
@@ -387,6 +410,7 @@ impl AnthropicClient {
             auth_json_path: None,
             credential_store: Some(store),
             oauth_account_uuid: None,
+            oauth_system_prefix_enabled: true,
         }
     }
 
@@ -410,6 +434,7 @@ impl AnthropicClient {
             auth_json_path: None,
             credential_store: None,
             oauth_account_uuid: None,
+            oauth_system_prefix_enabled: true,
         }
     }
 
@@ -424,6 +449,7 @@ impl AnthropicClient {
             auth_json_path: None,
             credential_store: None,
             oauth_account_uuid: None,
+            oauth_system_prefix_enabled: true,
         }
     }
 
@@ -652,10 +678,32 @@ impl AnthropicClient {
         // than a bare string. Both shapes are accepted by Anthropic, but the
         // block form is what `@anthropic-ai/sdk` emits and is the path that
         // supports `cache_control` per-block in future.
+        //
+        // For OAuth requests, prepend the canonical "You are Claude Code,
+        // …" prefix block as system[0] when the per-client toggle is on
+        // (default). This is the first-party-identity signal Anthropic's
+        // OAuth quota router keys on; without it Pro/Max users still
+        // bind to a stricter pool even with `account_uuid`. Per-agent
+        // opt-out via `anthropicOauthPrefix: false` in frontmatter.
+        let mut system_blocks: Vec<serde_json::Value> = Vec::new();
+        if self.auth.is_oauth() && self.oauth_system_prefix_enabled {
+            system_blocks.push(serde_json::json!({
+                "type": "text",
+                "text": format!(
+                    "{first}\n\nCWD: {cwd}\nDate: {date}",
+                    first = ANTHROPIC_OAUTH_SYSTEM_PREFIX_FIRST_LINE,
+                    cwd = std::env::current_dir()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "<unknown>".to_string()),
+                    date = chrono::Utc::now().format("%Y-%m-%d"),
+                ),
+            }));
+        }
         if let Some(system) = &request.system {
-            body["system"] = serde_json::json!([
-                { "type": "text", "text": system }
-            ]);
+            system_blocks.push(serde_json::json!({ "type": "text", "text": system }));
+        }
+        if !system_blocks.is_empty() {
+            body["system"] = serde_json::Value::Array(system_blocks);
         }
 
         if !request.tools.is_empty() {
@@ -1129,6 +1177,70 @@ mod tests {
             parsed.get("account_uuid").is_none(),
             "account_uuid must not appear when not configured"
         );
+    }
+
+    fn make_request(system: Option<&str>) -> LlmRequest {
+        LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: system.map(str::to_string),
+            messages: vec![Message::user("hi")],
+            max_tokens: 16,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            task_type: None,
+        }
+    }
+
+    #[test]
+    fn oauth_request_prepends_claude_code_system_prefix_by_default() {
+        let client = oauth_client();
+        let body = client.build_request_body(&make_request(Some("agent persona")), false);
+        let blocks = body["system"].as_array().expect("system is array");
+        assert_eq!(blocks.len(), 2, "expected prefix block + agent block");
+        let first_text = blocks[0]["text"].as_str().expect("first block text");
+        assert!(
+            first_text.starts_with(ANTHROPIC_OAUTH_SYSTEM_PREFIX_FIRST_LINE),
+            "first block must start with the canonical prefix line, got: {first_text}"
+        );
+        assert!(
+            first_text.contains("CWD: "),
+            "prefix should include CWD line"
+        );
+        assert!(
+            first_text.contains("Date: "),
+            "prefix should include Date line"
+        );
+        assert_eq!(blocks[1]["text"], "agent persona");
+    }
+
+    #[test]
+    fn oauth_request_skips_prefix_when_opted_out() {
+        let client = oauth_client().with_oauth_system_prefix(false);
+        let body = client.build_request_body(&make_request(Some("agent persona")), false);
+        let blocks = body["system"].as_array().expect("system is array");
+        assert_eq!(blocks.len(), 1, "expected agent block only");
+        assert_eq!(blocks[0]["text"], "agent persona");
+    }
+
+    #[test]
+    fn api_key_request_never_prepends_oauth_prefix() {
+        let client = AnthropicClient::new("sk-ant-test".into());
+        let body = client.build_request_body(&make_request(Some("agent persona")), false);
+        let blocks = body["system"].as_array().expect("system is array");
+        assert_eq!(blocks.len(), 1, "api-key requests must not get the prefix");
+        assert_eq!(blocks[0]["text"], "agent persona");
+    }
+
+    #[test]
+    fn oauth_request_prefix_emits_even_with_no_agent_system() {
+        let client = oauth_client();
+        let body = client.build_request_body(&make_request(None), false);
+        let blocks = body["system"].as_array().expect("system is array");
+        assert_eq!(blocks.len(), 1, "expected just the prefix block");
+        let text = blocks[0]["text"].as_str().expect("block text");
+        assert!(text.starts_with(ANTHROPIC_OAUTH_SYSTEM_PREFIX_FIRST_LINE));
     }
 
     #[test]

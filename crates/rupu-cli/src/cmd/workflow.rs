@@ -231,6 +231,7 @@ impl StepFactory for CliStepFactory {
                         tools: None,
                         max_turns: Some(50),
                         permission_mode: Some(self.mode_str.clone()),
+                        anthropic_oauth_prefix: None,
                         system_prompt: rendered_prompt.clone(),
                     }
                 });

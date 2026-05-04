@@ -90,8 +90,17 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         .or_else(|| cfg.default_model.clone())
         .unwrap_or_else(|| "claude-sonnet-4-6".into());
     let auth_hint = spec.auth;
-    let (resolved_auth, provider) =
-        provider_factory::build_for_provider(&provider_name, &model, auth_hint, &resolver).await?;
+    let provider_config = provider_factory::ProviderConfig {
+        anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+    };
+    let (resolved_auth, provider) = provider_factory::build_for_provider_with_config(
+        &provider_name,
+        &model,
+        auth_hint,
+        &resolver,
+        &provider_config,
+    )
+    .await?;
 
     println!(
         "agent: {}  provider: {}/{}  model: {}",
