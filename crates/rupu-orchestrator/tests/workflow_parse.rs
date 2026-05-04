@@ -42,12 +42,48 @@ fn rejects_parallel_keyword() {
 }
 
 #[test]
-fn rejects_when_keyword() {
-    let s = "name: x\nsteps:\n  - id: a\n    agent: a\n    when: someday\n    actions: []\n    prompt: hi\n";
+fn accepts_when_expression() {
+    let s = "name: x\nsteps:\n  - id: a\n    agent: a\n    when: \"{{ inputs.go }}\"\n    actions: []\n    prompt: hi\n";
+    let wf = Workflow::parse(s).expect("when: should parse");
+    assert_eq!(wf.steps[0].when.as_deref(), Some("{{ inputs.go }}"));
+}
+
+#[test]
+fn accepts_continue_on_error_per_step() {
+    let s = "name: x\nsteps:\n  - id: a\n    agent: a\n    continue_on_error: true\n    actions: []\n    prompt: hi\n";
+    let wf = Workflow::parse(s).expect("continue_on_error: should parse");
+    assert_eq!(wf.steps[0].continue_on_error, Some(true));
+}
+
+#[test]
+fn accepts_typed_inputs_block() {
+    let s = "name: x\ninputs:\n  threshold:\n    type: int\n    default: 30\n  mode:\n    type: string\n    enum: [strict, lax]\n    default: strict\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
+    let wf = Workflow::parse(s).expect("inputs: should parse");
+    assert_eq!(wf.inputs.len(), 2);
+    assert_eq!(
+        wf.inputs["threshold"].ty,
+        rupu_orchestrator::workflow::InputType::Int
+    );
+    assert_eq!(wf.inputs["mode"].allowed, vec!["strict", "lax"]);
+}
+
+#[test]
+fn rejects_input_default_with_wrong_type() {
+    let s = "name: x\ninputs:\n  threshold:\n    type: int\n    default: \"thirty\"\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
     let err = format!("{}", Workflow::parse(s).unwrap_err());
     assert!(
-        err.contains("when"),
-        "expected unsupported-key error, got: {err}"
+        err.contains("default") && err.contains("int"),
+        "expected default-type error, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_input_default_not_in_enum() {
+    let s = "name: x\ninputs:\n  mode:\n    type: string\n    enum: [strict, lax]\n    default: chaos\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
+    let err = format!("{}", Workflow::parse(s).unwrap_err());
+    assert!(
+        err.contains("enum"),
+        "expected enum-mismatch error, got: {err}"
     );
 }
 
