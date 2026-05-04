@@ -1,0 +1,28 @@
+[
+  {
+    "id": 11,
+    "iid": 42,
+    "state": "opened",
+    "title": "feat: add streaming",
+    "description": "Streams TextDelta to stdout.",
+    "source_branch": "feat/stream",
+    "target_branch": "main",
+    "author": {"id": 1, "username": "matias", "name": "matias"},
+    "created_at": "2026-05-03T10:00:00.000Z",
+    "updated_at": "2026-05-03T11:00:00.000Z",
+    "merged_at": null
+  },
+  {
+    "id": 12,
+    "iid": 43,
+    "state": "merged",
+    "title": "chore: bump deps",
+    "description": "",
+    "source_branch": "chore/bump",
+    "target_branch": "main",
+    "author": {"id": 1, "username": "matias", "name": "matias"},
+    "created_at": "2026-05-02T10:00:00.000Z",
+    "updated_at": "2026-05-02T11:00:00.000Z",
+    "merged_at": "2026-05-02T11:30:00.000Z"
+  }
+]

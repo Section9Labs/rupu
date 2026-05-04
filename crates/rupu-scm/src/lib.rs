@@ -20,5 +20,5 @@ pub use platform::{IssueTracker, Platform};
 pub use registry::Registry;
 pub use types::{
     Branch, Comment, CreateIssue, CreatePr, Diff, FileContent, Issue, IssueFilter, IssueRef,
-    IssueState, Pr, PrFilter, PrRef, PrState, Repo, RepoRef,
+    IssueState, PipelineTrigger, Pr, PrFilter, PrRef, PrState, Repo, RepoRef, WorkflowDispatch,
 };

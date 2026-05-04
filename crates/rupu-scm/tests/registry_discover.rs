@@ -31,4 +31,31 @@ async fn github_connector_built_when_credential_present() {
     let r = Registry::discover(&resolver, &cfg).await;
     assert!(r.repo(Platform::Github).is_some());
     assert!(r.issues(IssueTracker::Github).is_some());
+    assert!(r.github_extras().is_some());
+    // Without GitLab credential, gitlab extras should be None.
+    assert!(r.gitlab_extras().is_none());
+}
+
+#[tokio::test]
+async fn gitlab_connector_built_when_credential_present() {
+    use rupu_auth::backend::ProviderId;
+    use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::stored::StoredCredential;
+    use rupu_providers::AuthMode;
+
+    let resolver = InMemoryResolver::new();
+    resolver
+        .put(
+            ProviderId::Gitlab,
+            AuthMode::ApiKey,
+            StoredCredential::api_key("glpat_test"),
+        )
+        .await;
+    let cfg = rupu_config::Config::default();
+    let r = Registry::discover(&resolver, &cfg).await;
+    assert!(r.repo(Platform::Gitlab).is_some());
+    assert!(r.issues(IssueTracker::Gitlab).is_some());
+    assert!(r.gitlab_extras().is_some());
+    // Without GitHub credential, github extras should be None.
+    assert!(r.github_extras().is_none());
 }

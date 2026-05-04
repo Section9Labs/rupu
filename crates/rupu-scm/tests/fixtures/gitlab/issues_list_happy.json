@@ -1,0 +1,13 @@
+[
+  {
+    "id": 99,
+    "iid": 123,
+    "state": "opened",
+    "title": "Investigate flaky test",
+    "description": "...",
+    "labels": ["bug"],
+    "author": {"id": 1, "username": "matias", "name": "matias"},
+    "created_at": "2026-05-01T09:00:00.000Z",
+    "updated_at": "2026-05-02T09:00:00.000Z"
+  }
+]

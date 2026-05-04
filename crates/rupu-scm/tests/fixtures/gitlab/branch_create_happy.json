@@ -1,0 +1,8 @@
+{
+  "name": "feat/new-branch",
+  "commit": {"id": "abc123def456", "short_id": "abc123de", "title": "init"},
+  "protected": false,
+  "default": false,
+  "developers_can_push": true,
+  "developers_can_merge": true
+}

@@ -1,0 +1,14 @@
+{
+  "id": 100,
+  "iid": 200,
+  "state": "opened",
+  "title": "feat: add foo",
+  "description": "adds foo",
+  "source_branch": "feat/foo",
+  "target_branch": "main",
+  "author": {"id": 1, "username": "matias", "name": "matias"},
+  "created_at": "2026-05-03T13:00:00.000Z",
+  "updated_at": "2026-05-03T13:00:00.000Z",
+  "merged_at": null,
+  "draft": false
+}

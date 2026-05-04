@@ -205,7 +205,24 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
-        ProviderId::Gitlab => None,
+        ProviderId::Gitlab => Some(ProviderOAuth {
+            flow: OAuthFlow::Callback,
+            // TODO(rupu-specific OAuth client): register a real gitlab.com
+            // OAuth app and replace this placeholder. See TODO.md "Register
+            // rupu-specific OAuth clients".
+            client_id: "rupu-gitlab-pkce-placeholder",
+            authorize_url: "https://gitlab.com/oauth/authorize",
+            token_url: "https://gitlab.com/oauth/token",
+            device_url: None,
+            scopes: &["api", "read_user", "read_repository", "write_repository"],
+            redirect_path: "/callback",
+            redirect_host: "localhost",
+            fixed_ports: None,
+            extra_authorize_params: &[],
+            token_body_format: TokenBodyFormat::Form,
+            state_is_verifier: false,
+            include_state_in_token_body: false,
+        }),
     }
 }
 
@@ -323,5 +340,21 @@ mod tests {
                 c.scopes
             );
         }
+    }
+
+    #[test]
+    fn gitlab_metadata_is_browser_callback_with_full_scope_set() {
+        let p = provider_oauth(crate::backend::ProviderId::Gitlab)
+            .expect("gitlab oauth config present");
+        assert_eq!(p.authorize_url, "https://gitlab.com/oauth/authorize");
+        assert_eq!(p.token_url, "https://gitlab.com/oauth/token");
+        assert_eq!(p.flow, OAuthFlow::Callback);
+        assert!(p.scopes.contains(&"api"));
+        assert!(p.scopes.contains(&"read_repository"));
+        assert!(p.scopes.contains(&"write_repository"));
+        assert!(p.scopes.contains(&"read_user"));
+        assert_eq!(p.token_body_format, TokenBodyFormat::Form);
+        assert!(!p.state_is_verifier);
+        assert!(!p.include_state_in_token_body);
     }
 }

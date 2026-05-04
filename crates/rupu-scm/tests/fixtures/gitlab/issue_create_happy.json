@@ -1,0 +1,11 @@
+{
+  "id": 100,
+  "iid": 124,
+  "state": "opened",
+  "title": "New ticket",
+  "description": "auto-created via rupu",
+  "labels": ["bug", "needs-triage"],
+  "author": {"id": 1, "username": "matias", "name": "matias"},
+  "created_at": "2026-05-03T15:00:00.000Z",
+  "updated_at": "2026-05-03T15:00:00.000Z"
+}

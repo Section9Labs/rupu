@@ -4,6 +4,7 @@
 //! live behind [`crate::Registry`].
 
 pub mod github;
+pub mod gitlab;
 
 use std::path::Path;
 

@@ -153,6 +153,21 @@ pub struct CreateIssue {
     pub labels: Vec<String>,
 }
 
+/// Args for `github.workflows_dispatch` (Plan 2 Task 13 surfaces it via MCP).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDispatch {
+    pub workflow: String,          // workflow file name or numeric ID
+    pub ref_: String,              // branch/tag/sha
+    pub inputs: serde_json::Value, // free-form, validated against workflow's `inputs:` schema
+}
+
+/// Args for `gitlab.pipeline_trigger` (Plan 2 Task 13 surfaces it via MCP).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineTrigger {
+    pub ref_: String,
+    pub variables: std::collections::BTreeMap<String, String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

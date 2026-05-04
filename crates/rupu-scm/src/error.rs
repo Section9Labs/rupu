@@ -75,12 +75,16 @@ pub fn classify_scm_error(
             ),
         },
         403 => {
-            // GitHub uses 403 both for missing-scope AND primary rate limits.
-            // Differentiate by the X-Accepted-OAuth-Scopes header.
-            if let Some(missing) = scope_missing(headers) {
+            // Branch by platform: GitHub uses X-Accepted-OAuth-Scopes; GitLab
+            // uses WWW-Authenticate with error="insufficient_scope".
+            let missing = match platform {
+                Platform::Github => scope_missing(headers),
+                Platform::Gitlab => parse_gitlab_insufficient_scope(headers),
+            };
+            if let Some(scope) = missing {
                 ScmError::MissingScope {
                     platform: platform.as_str().into(),
-                    scope: missing,
+                    scope,
                     hint: format!(
                         "re-login to grant the missing scope: rupu auth login --provider {} --mode sso",
                         platform.as_str()
@@ -155,6 +159,29 @@ fn scope_missing(headers: &HeaderMap) -> Option<String> {
                 .collect::<Vec<_>>()
                 .join(","),
         )
+    }
+}
+
+fn parse_gitlab_insufficient_scope(headers: &HeaderMap) -> Option<String> {
+    let hv = headers
+        .get(reqwest::header::WWW_AUTHENTICATE)?
+        .to_str()
+        .ok()?;
+    if !hv.contains("insufficient_scope") {
+        return None;
+    }
+    // Extract scope from `error_description="The request requires <scope>"`.
+    // Heuristic: look for `requires ` then capture until the next quote or whitespace.
+    let after = hv.split("requires ").nth(1)?;
+    let scope = after
+        .trim_start()
+        .split(|c: char| c == '"' || c.is_whitespace())
+        .next()?
+        .trim();
+    if scope.is_empty() {
+        None
+    } else {
+        Some(scope.to_string())
     }
 }
 

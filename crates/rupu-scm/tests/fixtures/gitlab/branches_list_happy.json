@@ -1,0 +1,18 @@
+[
+  {
+    "name": "main",
+    "commit": {"id": "abc123", "short_id": "abc123", "title": "init"},
+    "protected": true,
+    "default": true,
+    "developers_can_push": false,
+    "developers_can_merge": false
+  },
+  {
+    "name": "feat/x",
+    "commit": {"id": "def456", "short_id": "def456", "title": "wip"},
+    "protected": false,
+    "default": false,
+    "developers_can_push": true,
+    "developers_can_merge": true
+  }
+]
