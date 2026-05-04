@@ -66,6 +66,16 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::mcp::Action,
     },
+    /// Schedule-driven workflow firing (designed for system cron).
+    Cron {
+        #[command(subcommand)]
+        action: cmd::cron::Action,
+    },
+    /// Webhook receiver for event-triggered workflows (GitHub / GitLab).
+    Webhook {
+        #[command(subcommand)]
+        action: cmd::webhook::Action,
+    },
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -92,5 +102,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Models { action } => cmd::models::handle(action).await,
         Cmd::Repos { action } => cmd::repos::handle(action).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
+        Cmd::Cron { action } => cmd::cron::handle(action).await,
+        Cmd::Webhook { action } => cmd::webhook::handle(action).await,
     }
 }

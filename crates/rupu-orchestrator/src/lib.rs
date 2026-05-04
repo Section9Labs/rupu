@@ -8,6 +8,7 @@
 //! next step's prompt template (rendered with minijinja).
 
 pub mod action_protocol;
+pub mod cron_schedule;
 pub mod runner;
 pub mod templates;
 pub mod workflow;
@@ -17,5 +18,9 @@ pub use runner::{
     run_workflow, OrchestratorRunOpts, OrchestratorRunResult, RunWorkflowError, StepFactory,
     StepResult,
 };
-pub use templates::{render_step_prompt, RenderError, StepContext, StepOutput};
-pub use workflow::{Step, Workflow, WorkflowParseError};
+pub use templates::{
+    render_step_prompt, render_when_expression, RenderError, StepContext, StepOutput,
+};
+pub use workflow::{
+    InputDef, InputType, Step, Trigger, TriggerKind, Workflow, WorkflowDefaults, WorkflowParseError,
+};

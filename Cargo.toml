@@ -11,6 +11,7 @@ members = [
     "crates/rupu-agent",
     "crates/rupu-orchestrator",
     "crates/rupu-mcp",
+    "crates/rupu-webhook",
     "crates/rupu-cli",
 ]
 
@@ -45,6 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ulid = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+cron = "0.12"
 
 # HTTP / streaming (lifted phi-providers)
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "http2", "charset"], default-features = false }
@@ -76,6 +78,12 @@ webbrowser = "1"
 rand = "0.8"
 sha2 = "0.10"
 url = "2"
+
+# Webhook receiver (axum chosen for async-native + tower middleware)
+axum = "0.7"
+hmac = "0.12"
+hex = "0.4"
+subtle = "2"
 
 # Test deps
 tempfile = "3"

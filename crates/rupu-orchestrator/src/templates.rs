@@ -12,7 +12,7 @@
 //! render as empty strings. This is permissive but matches what
 //! Okesu does and keeps templates pleasant during iteration.
 
-use minijinja::{Environment, Value as MjValue};
+use minijinja::{Environment, UndefinedBehavior, Value as MjValue};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -24,17 +24,40 @@ pub enum RenderError {
 }
 
 /// Variable bag passed to the renderer.
+///
+/// `event` is populated when the workflow was kicked off by the
+/// webhook receiver (`trigger.on: event`). It carries the verbatim
+/// JSON payload the SCM vendor sent, so step prompts and `when:`
+/// expressions can reference `{{event.pull_request.number}}`,
+/// `{{event.repository.name}}`, etc. For manually-invoked or cron-
+/// triggered runs, `event` is `None` and references render as the
+/// minijinja default for missing values (empty string).
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct StepContext {
     pub inputs: BTreeMap<String, String>,
     pub steps: BTreeMap<String, StepOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<serde_json::Value>,
 }
 
 /// The output record for a completed step, available as
 /// `steps.<step_id>.output` in subsequent templates.
+///
+/// `success` and `skipped` are added so downstream `when:` gates can
+/// branch on whether a prior step ran cleanly. The convention:
+/// - `success = true, skipped = false` → step ran and finished without
+///   error
+/// - `success = false, skipped = false` → step errored (and was
+///   tolerated via `continue_on_error`)
+/// - `success = false, skipped = true` → step was skipped because its
+///   own `when:` evaluated false
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct StepOutput {
     pub output: String,
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 impl StepContext {
@@ -59,17 +82,32 @@ impl StepContext {
             step_id.into(),
             StepOutput {
                 output: output.into(),
+                success: true,
+                skipped: false,
             },
         );
+        self
+    }
+
+    /// Bind the event payload (builder style). For event-triggered
+    /// workflows; the same JSON the webhook receiver passed through
+    /// to the dispatcher.
+    pub fn with_event(mut self, event: serde_json::Value) -> Self {
+        self.event = Some(event);
         self
     }
 }
 
 /// Render `template` against `ctx`. Returns the rendered string or a
 /// `RenderError` for invalid syntax. Missing variables become empty
-/// strings (v0 default).
+/// strings (v0 default). We use [`UndefinedBehavior::Chainable`] so
+/// chained accesses through a missing root (e.g. `{{ event.pull_request.number }}`
+/// in a manually-triggered workflow where `event` is `None`) also
+/// render empty rather than erroring — matching the permissive
+/// philosophy stated in this module's docs.
 pub fn render_step_prompt(template: &str, ctx: &StepContext) -> Result<String, RenderError> {
     let mut env = Environment::new();
+    env.set_undefined_behavior(UndefinedBehavior::Chainable);
     env.add_template("step", template)
         .map_err(|e| RenderError::Template(e.to_string()))?;
     let tmpl = env
@@ -78,4 +116,107 @@ pub fn render_step_prompt(template: &str, ctx: &StepContext) -> Result<String, R
     let value = MjValue::from_serialize(ctx);
     tmpl.render(value)
         .map_err(|e| RenderError::Template(e.to_string()))
+}
+
+/// Evaluate a `when:` expression against the step context and reduce
+/// it to a boolean. Renders the expression with the same minijinja
+/// environment as `render_step_prompt`, then trims and matches the
+/// result against falsy literals (case-insensitive: `false`, `0`, ``,
+/// `no`, `off`); anything else is truthy. This matches what most
+/// workflow engines do — and lets agents emit `success: true` /
+/// `success: false` JSON in their final assistant message and have
+/// downstream steps gate on it via `{{steps.foo.output | trim}}`.
+pub fn render_when_expression(template: &str, ctx: &StepContext) -> Result<bool, RenderError> {
+    let rendered = render_step_prompt(template, ctx)?;
+    Ok(is_truthy(&rendered))
+}
+
+fn is_truthy(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    !matches!(
+        t.to_ascii_lowercase().as_str(),
+        "false" | "0" | "no" | "off"
+    )
+}
+
+#[cfg(test)]
+mod when_tests {
+    use super::*;
+
+    #[test]
+    fn falsy_values_skip_step() {
+        for s in ["false", "FALSE", "0", "", "no", "OFF", "  false  "] {
+            assert!(!is_truthy(s), "{s:?} should be falsy");
+        }
+    }
+
+    #[test]
+    fn truthy_values_run_step() {
+        for s in ["true", "1", "yes", "on", "anything-else", "found-issues"] {
+            assert!(is_truthy(s), "{s:?} should be truthy");
+        }
+    }
+
+    #[test]
+    fn render_when_expression_evaluates_step_output() {
+        let mut ctx = StepContext::new();
+        ctx.steps.insert(
+            "review".into(),
+            StepOutput {
+                output: "false".into(),
+                success: true,
+                skipped: false,
+            },
+        );
+        let v = render_when_expression("{{ steps.review.output }}", &ctx).expect("render");
+        assert!(!v);
+        let v = render_when_expression("{{ steps.review.success }}", &ctx).expect("render");
+        assert!(v);
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn event_fields_render_in_prompt() {
+        let ctx = StepContext::new().with_event(json!({
+            "pull_request": { "number": 42, "title": "Fix flaky test" },
+            "repository": { "name": "rupu", "full_name": "Section9Labs/rupu" }
+        }));
+        let out = render_step_prompt(
+            "PR #{{ event.pull_request.number }} in {{ event.repository.full_name }}: {{ event.pull_request.title }}",
+            &ctx,
+        )
+        .expect("render");
+        assert_eq!(out, "PR #42 in Section9Labs/rupu: Fix flaky test");
+    }
+
+    #[test]
+    fn missing_event_renders_empty_string() {
+        let ctx = StepContext::new();
+        let out =
+            render_step_prompt("repo={{ event.repository.name }}!", &ctx).expect("render");
+        assert_eq!(out, "repo=!");
+    }
+
+    #[test]
+    fn event_can_gate_when_expression() {
+        let ctx = StepContext::new().with_event(json!({
+            "pull_request": { "merged": true }
+        }));
+        let take = render_when_expression("{{ event.pull_request.merged }}", &ctx).expect("render");
+        assert!(take, "merged=true should be truthy");
+
+        let ctx2 = StepContext::new().with_event(json!({
+            "pull_request": { "merged": false }
+        }));
+        let take = render_when_expression("{{ event.pull_request.merged }}", &ctx2).expect("render");
+        assert!(!take, "merged=false should be falsy");
+    }
 }

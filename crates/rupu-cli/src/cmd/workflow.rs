@@ -66,7 +66,7 @@ pub async fn handle(action: Action) -> ExitCode {
             target,
             input,
             mode,
-        } => run(&name, target.as_deref(), input, mode.as_deref()).await,
+        } => run(&name, target.as_deref(), input, mode.as_deref(), None).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -138,11 +138,28 @@ fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
     Err(anyhow::anyhow!("workflow not found: {name}"))
 }
 
+/// Public wrapper around the workflow-run pipeline so other
+/// subcommands (notably `rupu cron tick` and the webhook receiver)
+/// can invoke a workflow by name without going through the clap
+/// layer. Same behavior as `rupu workflow run <name>`. The optional
+/// `event` argument carries the SCM-vendor JSON payload that
+/// triggered the run (when applicable); it lands as `{{event.*}}`
+/// bindings in step prompts and `when:` filters.
+pub async fn run_by_name(
+    name: &str,
+    inputs: Vec<(String, String)>,
+    mode: Option<&str>,
+    event: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
+    run(name, None, inputs, mode, event).await
+}
+
 async fn run(
     name: &str,
     target: Option<&str>,
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
+    event: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
@@ -257,6 +274,7 @@ async fn run(
         workspace_path,
         transcript_dir: transcripts,
         factory,
+        event,
     };
 
     let result = run_workflow(opts).await?;
