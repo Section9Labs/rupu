@@ -2,6 +2,27 @@
 
 Items deferred from completed slices. Each entry should name **why deferred**, **prereqs**, and **what unblocks it**.
 
+## Re-MITM and refresh the Anthropic OAuth wire-shape pins (when 429s return)
+
+The Anthropic OAuth path in `crates/rupu-providers/src/anthropic.rs` carries several **byte-equal pins** of upstream Claude Code values that gate Cloudflare/WAF/billing recognition. Captured 2026-05-04 from `claude --print "say hi"` MITM:
+
+- `RUPU_USER_AGENT` — `claude-cli/2.1.126 (external, sdk-cli)`
+- `ANTHROPIC_BETA_CSV` — full 10-element CSV
+- `STAINLESS_HEADERS` — SDK telemetry (Package-Version `0.81.0`, Runtime-Version `v24.3.0`, etc.)
+- `ANTHROPIC_BILLING_HEADER_BLOCK` — `system[0]` text with `cc_version=2.1.126.125; cc_entrypoint=sdk-cli; cch=0ab17;`
+- `ANTHROPIC_AGENT_SDK_SELF_DESCRIPTION` — fixed `system[1]` block
+
+**Symptom that this needs refreshing:** `/v1/messages` calls return `429 rate_limit_error` with **empty body** (`{"error":{"message":"Error"}}`) and **no `anthropic-ratelimit-*` headers**, while `claude --print` from the same shell still works. That signature is the WAF reject pool — request is no longer recognized as Claude-Code-shaped and we've drifted from upstream.
+
+**Recovery:**
+1. `claude --version` to confirm the upstream rev.
+2. Re-MITM a working `claude --print "say hi"` through `mitmdump --listen-port 8080` with `NODE_EXTRA_CA_CERTS=~/.mitmproxy/mitmproxy-ca-cert.pem HTTPS_PROXY=http://127.0.0.1:8080`.
+3. Diff captured headers + `system[0]` text against the constants in `anthropic.rs` and update.
+
+**Special case — `cch=0ab17`:** the short trailing token may be a checksum of other request fields (UA, beta CSV, account UUID, …). We send it statically. If a fresh re-MITM shows the value rotating per request, **reverse-engineer the hash function** producing it. Likely candidates: a truncated HMAC over the access-token-derived account UUID + cc_version + a build-time secret. `0ab17` is hex-ish, 5 chars — likely 20-bit prefix of a longer digest. Start by capturing two requests in quick succession and seeing if `cch` differs; if same, it's not request-bound.
+
+**Why deferred (not fixed now):** today's pin works against the live API. Reverse-engineering `cch` is only worthwhile if the static value stops working — premature otherwise. The durable cure is the rupu-specific OAuth client registration (next item), which sidesteps the WAF fingerprinting entirely.
+
 ## Register rupu-specific OAuth clients with each vendor (impersonation cleanup)
 
 Slice B-1's SSO flows currently impersonate first-party CLIs:
