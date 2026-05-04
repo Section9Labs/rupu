@@ -45,6 +45,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 ulid = { version = "1", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+cron = "0.12"
 
 # HTTP / streaming (lifted phi-providers)
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "http2", "charset"], default-features = false }

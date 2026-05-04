@@ -8,6 +8,7 @@
 //! next step's prompt template (rendered with minijinja).
 
 pub mod action_protocol;
+pub mod cron_schedule;
 pub mod runner;
 pub mod templates;
 pub mod workflow;

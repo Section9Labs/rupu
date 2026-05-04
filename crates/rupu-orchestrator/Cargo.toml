@@ -18,6 +18,7 @@ tracing.workspace = true
 tokio = { workspace = true }
 async-trait.workspace = true
 chrono.workspace = true
+cron.workspace = true
 minijinja.workspace = true
 ulid.workspace = true
 
