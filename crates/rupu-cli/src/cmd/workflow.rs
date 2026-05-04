@@ -36,6 +36,11 @@ pub enum Action {
     Run {
         /// Workflow name (filename stem under `workflows/`).
         name: String,
+        /// Optional target reference, e.g. `github:owner/repo#42`.
+        /// See `docs/scm.md#target-syntax` for the full grammar.
+        /// Distinguished from other positionals by parsing as a RunTarget.
+        /// Per-step propagation via StepFactory is wired in Plan 3 Task 3.
+        target: Option<String>,
         /// `KEY=VALUE` template inputs (repeatable).
         #[arg(long, value_parser = parse_kv)]
         input: Vec<(String, String)>,
@@ -56,7 +61,12 @@ pub async fn handle(action: Action) -> ExitCode {
     let result = match action {
         Action::List => list().await,
         Action::Show { name } => show(&name).await,
-        Action::Run { name, input, mode } => run(&name, input, mode.as_deref()).await,
+        Action::Run {
+            name,
+            target,
+            input,
+            mode,
+        } => run(&name, target.as_deref(), input, mode.as_deref()).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -128,7 +138,12 @@ fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
     Err(anyhow::anyhow!("workflow not found: {name}"))
 }
 
-async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> anyhow::Result<()> {
+async fn run(
+    name: &str,
+    target: Option<&str>,
+    inputs: Vec<(String, String)>,
+    mode: Option<&str>,
+) -> anyhow::Result<()> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
     let workflow = Workflow::parse(&body)?;
@@ -158,6 +173,68 @@ async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> a
     // skipped with INFO logs.
     let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
+    // Parse the workflow-level target (if any) and derive a system-prompt
+    // suffix that each step prepends. Clone-to-tmpdir for Repo/Pr targets
+    // follows the same pattern as `rupu run`; the tmpdir lives for the
+    // entire workflow execution.
+    let _clone_guard: Option<tempfile::TempDir>;
+    let workspace_path: std::path::PathBuf;
+    let system_prompt_suffix: Option<String>;
+    match target {
+        None => {
+            _clone_guard = None;
+            workspace_path = pwd.clone();
+            system_prompt_suffix = None;
+        }
+        Some(s) => match crate::run_target::parse_run_target(s) {
+            Err(_) => {
+                // Not a valid target — ignore silently (workflow inputs
+                // don't have a free-form prompt field to absorb it).
+                _clone_guard = None;
+                workspace_path = pwd.clone();
+                system_prompt_suffix = None;
+            }
+            Ok(run_target) => {
+                let suffix = Some(crate::run_target::format_run_target_for_prompt(&run_target));
+                let (guard, path) = match &run_target {
+                    crate::run_target::RunTarget::Repo {
+                        platform,
+                        owner,
+                        repo,
+                        ..
+                    }
+                    | crate::run_target::RunTarget::Pr {
+                        platform,
+                        owner,
+                        repo,
+                        ..
+                    } => {
+                        let r = rupu_scm::RepoRef {
+                            platform: *platform,
+                            owner: owner.clone(),
+                            repo: repo.clone(),
+                        };
+                        let conn = mcp_registry.repo(*platform).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "no {} credential — run `rupu auth login --provider {}`",
+                                platform,
+                                platform
+                            )
+                        })?;
+                        let tmp = tempfile::tempdir()?;
+                        conn.clone_to(&r, tmp.path()).await?;
+                        let p = tmp.path().to_path_buf();
+                        (Some(tmp), p)
+                    }
+                    _ => (None, pwd.clone()),
+                };
+                _clone_guard = guard;
+                workspace_path = path;
+                system_prompt_suffix = suffix;
+            }
+        },
+    }
+
     let mode_str = mode.unwrap_or("ask").to_string();
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
@@ -169,6 +246,7 @@ async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> a
         resolver,
         mode_str,
         mcp_registry,
+        system_prompt_suffix,
     });
 
     let inputs_map: BTreeMap<String, String> = inputs.into_iter().collect();
@@ -176,7 +254,7 @@ async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> a
         workflow,
         inputs: inputs_map,
         workspace_id: ws.id,
-        workspace_path: pwd.clone(),
+        workspace_path,
         transcript_dir: transcripts,
         factory,
     };
@@ -207,6 +285,9 @@ struct CliStepFactory {
     resolver: Arc<rupu_auth::KeychainResolver>,
     mode_str: String,
     mcp_registry: Arc<rupu_scm::Registry>,
+    /// Formatted `## Run target` text to append to each step's system prompt.
+    /// `None` when no `--target` was supplied at workflow invocation.
+    system_prompt_suffix: Option<String>,
 }
 
 #[async_trait]
@@ -270,9 +351,14 @@ impl StepFactory for CliStepFactory {
         .await
         .expect("provider build failed in step factory");
 
+        let agent_system_prompt = match self.system_prompt_suffix.as_deref() {
+            Some(suffix) => format!("{}\n\n## Run target\n\n{}", spec.system_prompt, suffix),
+            None => spec.system_prompt,
+        };
+
         AgentRunOpts {
             agent_name: spec.name,
-            agent_system_prompt: spec.system_prompt,
+            agent_system_prompt,
             agent_tools: spec.tools,
             provider,
             provider_name,

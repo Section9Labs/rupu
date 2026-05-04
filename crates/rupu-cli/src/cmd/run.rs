@@ -19,6 +19,10 @@ use ulid::Ulid;
 pub struct Args {
     /// Agent name (matches an `agents/*.md` file).
     pub agent: String,
+    /// Optional target reference, e.g. `github:owner/repo#42`.
+    /// See `docs/scm.md#target-syntax` for the full grammar.
+    /// Distinguished from `prompt` by parsing as a RunTarget.
+    pub target: Option<String>,
     /// Optional initial user message. Defaults to "go" if omitted.
     pub prompt: Option<String>,
     /// Override permission mode (`ask` | `bypass` | `readonly`).
@@ -119,16 +123,86 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
 
-    // Tool context.
+    // Tool context config (the path is filled in after target resolution below).
     let bash_timeout = cfg.bash.timeout_secs.unwrap_or(120);
     let bash_allowlist = cfg.bash.env_allowlist.clone().unwrap_or_default();
+
+    // Disambiguate: if `args.target` parses as a RunTarget, it's a target.
+    // Otherwise treat it (plus the remainder) as part of the user prompt.
+    let (run_target, user_message) = match args.target.as_deref() {
+        None => (None, args.prompt.clone().unwrap_or_else(|| "go".into())),
+        Some(s) => match crate::run_target::parse_run_target(s) {
+            Ok(t) => (Some(t), args.prompt.clone().unwrap_or_else(|| "go".into())),
+            Err(_) => {
+                // Not a target → it's the leading word(s) of the prompt.
+                let combined = match args.prompt.as_deref() {
+                    Some(p) => format!("{s} {p}"),
+                    None => s.to_string(),
+                };
+                (None, combined)
+            }
+        },
+    };
+
+    // Preload `## Run target` into the agent system prompt when a target is set.
+    let agent_system_prompt = match run_target.as_ref() {
+        Some(t) => format!(
+            "{}\n\n## Run target\n\n{}",
+            spec.system_prompt,
+            crate::run_target::format_run_target_for_prompt(t),
+        ),
+        None => spec.system_prompt.clone(),
+    };
+
+    // Clone the target repo into a tmpdir for Repo/Pr targets unless the
+    // cwd is already that checkout. Issue targets don't need a clone.
+    // _clone_guard is bound at function scope so its Drop runs on return,
+    // keeping the directory alive for the duration of the run.
+    let _clone_guard: Option<tempfile::TempDir>;
+    let workspace_path: std::path::PathBuf = match run_target.as_ref() {
+        Some(crate::run_target::RunTarget::Repo {
+            platform,
+            owner,
+            repo,
+            ..
+        })
+        | Some(crate::run_target::RunTarget::Pr {
+            platform,
+            owner,
+            repo,
+            ..
+        }) => {
+            let r = rupu_scm::RepoRef {
+                platform: *platform,
+                owner: owner.clone(),
+                repo: repo.clone(),
+            };
+            let conn = scm_registry.repo(*platform).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no {} credential — run `rupu auth login --provider {}`",
+                    platform,
+                    platform
+                )
+            })?;
+            let tmp = tempfile::tempdir()?;
+            conn.clone_to(&r, tmp.path()).await?;
+            let path = tmp.path().to_path_buf();
+            _clone_guard = Some(tmp);
+            path
+        }
+        _ => {
+            _clone_guard = None;
+            pwd.clone()
+        }
+    };
+
+    // Build tool context now that the resolved workspace_path is known.
     let tool_context = ToolContext {
-        workspace_path: pwd.clone(),
+        workspace_path: workspace_path.clone(),
         bash_env_allowlist: bash_allowlist,
         bash_timeout_secs: bash_timeout,
     };
 
-    let user_message = args.prompt.unwrap_or_else(|| "go".to_string());
     let mode_str = match mode {
         PermissionMode::Ask => "ask",
         PermissionMode::Bypass => "bypass",
@@ -139,14 +213,14 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
 
     let opts = AgentRunOpts {
         agent_name: spec.name.clone(),
-        agent_system_prompt: spec.system_prompt.clone(),
+        agent_system_prompt,
         agent_tools: spec.tools.clone(),
         provider,
         provider_name,
         model,
         run_id: run_id.clone(),
         workspace_id: ws.id.clone(),
-        workspace_path: pwd.clone(),
+        workspace_path: workspace_path.clone(),
         transcript_path: transcript_path.clone(),
         max_turns: spec.max_turns.unwrap_or(50),
         decider,
