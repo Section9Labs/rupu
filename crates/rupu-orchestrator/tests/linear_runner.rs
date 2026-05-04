@@ -58,6 +58,7 @@ impl StepFactory for FakeFactory {
             user_message: rendered_prompt,
             mode_str: "bypass".into(),
             no_stream: false,
+            mcp_registry: None,
         }
     }
 }

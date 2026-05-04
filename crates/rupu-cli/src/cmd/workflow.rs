@@ -272,6 +272,7 @@ impl StepFactory for CliStepFactory {
             user_message: rendered_prompt,
             mode_str: self.mode_str.clone(),
             no_stream: false,
+            mcp_registry: None,
         }
     }
 }
