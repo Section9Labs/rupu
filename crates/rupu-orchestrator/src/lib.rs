@@ -20,4 +20,6 @@ pub use runner::{
 pub use templates::{
     render_step_prompt, render_when_expression, RenderError, StepContext, StepOutput,
 };
-pub use workflow::{InputDef, InputType, Step, Workflow, WorkflowDefaults, WorkflowParseError};
+pub use workflow::{
+    InputDef, InputType, Step, Trigger, TriggerKind, Workflow, WorkflowDefaults, WorkflowParseError,
+};
