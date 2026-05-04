@@ -50,7 +50,10 @@ These add up to "platform-grade" orchestration but each is independently scoped.
 
 Concurrency cap (`max_parallel: N`) + result aggregation part of the schema. The single highest-leverage Tier 2 item — most non-trivial workflows want parallel agent dispatch.
 
-`for_each:` (data fan-out) shipped — see `Step.for_each` + `max_parallel:` in the schema, `ItemResult` in the runner, and `steps.<id>.results[*]` template binding. `parallel:` (agent fan-out) is the next slice.
+Both shapes shipped:
+- `for_each:` (data fan-out) — `Step.for_each` + `max_parallel:`, results bound as `steps.<id>.results[*]` (list of strings).
+- `parallel:` (agent fan-out) — `Step.parallel` (list of `SubStep`s, each with `id`/`agent`/`prompt`), results bound as `steps.<id>.sub_results.<sub_id>.{output,success}` (named map) and `steps.<id>.results[*]` (positional list).
+Per-unit failures honor `continue_on_error:`. Approval gates are the next slice.
 
 **Panel steps with gated review loop** (`kind: panel` — rupu's name; Okesu calls these "meeting steps"). A list of agents reviews/discusses something, emits structured findings, and the workflow loops with a fixer agent until the panel is satisfied:
 

@@ -75,14 +75,25 @@ pub enum RunWorkflowError {
     },
 }
 
-/// Trait the orchestrator uses to construct per-step [`AgentRunOpts`].
+/// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
 /// Production impl wires real providers + the default tool registry;
 /// tests inject mock providers.
+///
+/// `step_id` is the parent step id (used by the production impl to
+/// look up step-level config); `agent_name` is the agent to load and
+/// is the *sub-step's* agent for `parallel:` steps. For linear and
+/// `for_each:` steps `agent_name` matches the parent step's `agent:`.
 #[async_trait]
 pub trait StepFactory: Send + Sync {
+    // The signature is intentionally wide — every piece of context the
+    // factory needs to load an agent + build its run opts. Wrapping
+    // these in a struct adds friction for every test impl, so allow
+    // the lint at the trait boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn build_opts_for_step(
         &self,
         step_id: &str,
+        agent_name: &str,
         rendered_prompt: String,
         run_id: String,
         workspace_id: String,
@@ -128,17 +139,23 @@ pub struct StepResult {
     pub items: Vec<ItemResult>,
 }
 
-/// One row per item in a `for_each:` fan-out. Carries the same
-/// transcript pointer + final-output information as a top-level step
-/// so callers (the CLI summary, audit views) can drill into a
-/// specific item's run.
+/// One row per unit in a fan-out step — either a `for_each:` item or
+/// a `parallel:` sub-step. Carries the same transcript pointer +
+/// final-output information as a top-level step so callers (the CLI
+/// summary, audit views) can drill into a specific unit's run.
 #[derive(Debug, Clone)]
 pub struct ItemResult {
-    /// 0-based position in the rendered fan-out list.
+    /// 0-based position in the rendered fan-out list (for both shapes,
+    /// in declared order).
     pub index: usize,
-    /// The item value as it was bound to `{{item}}`, JSON-serialized
-    /// (for primitives this matches the original value's string form).
+    /// For `for_each:`: the item value as bound to `{{item}}`. For
+    /// `parallel:`: `serde_json::Value::Null` (sub-steps don't have
+    /// per-unit data; see `sub_id` instead).
     pub item: serde_json::Value,
+    /// For `parallel:`: the sub-step's declared id. Empty for
+    /// `for_each:`. When non-empty, this becomes the key in
+    /// `steps.<id>.sub_results.<sub_id>`.
+    pub sub_id: String,
     pub rendered_prompt: String,
     pub run_id: String,
     pub transcript_path: PathBuf,
@@ -193,7 +210,9 @@ pub async fn run_workflow(
         let effective_continue_on_error =
             step.continue_on_error.unwrap_or(workflow_default_continue);
 
-        let result = if step.for_each.is_some() {
+        let result = if step.parallel.is_some() {
+            run_parallel_step(step, &ctx, &opts, effective_continue_on_error).await?
+        } else if step.for_each.is_some() {
             run_fanout_step(step, &ctx, &opts, effective_continue_on_error).await?
         } else {
             run_linear_step(step, &ctx, &opts, effective_continue_on_error).await?
@@ -205,9 +224,9 @@ pub async fn run_workflow(
 }
 
 /// Build the read-only template context that a (linear) step or
-/// fan-out item sees: workflow inputs + event payload + every prior
-/// step's published output (including per-item `results[*]` for
-/// fan-out steps).
+/// fan-out unit sees: workflow inputs + event payload + every prior
+/// step's published output (including per-unit `results[*]` and the
+/// `sub_results.<sub_id>` map for `parallel:` steps).
 fn base_context_for_step(
     inputs: &BTreeMap<String, String>,
     event: Option<&serde_json::Value>,
@@ -218,6 +237,20 @@ fn base_context_for_step(
     ctx.event = event.cloned();
     for sr in prior {
         let results: Vec<String> = sr.items.iter().map(|i| i.output.clone()).collect();
+        let sub_results: std::collections::BTreeMap<String, crate::templates::SubResult> = sr
+            .items
+            .iter()
+            .filter(|i| !i.sub_id.is_empty())
+            .map(|i| {
+                (
+                    i.sub_id.clone(),
+                    crate::templates::SubResult {
+                        output: i.output.clone(),
+                        success: i.success,
+                    },
+                )
+            })
+            .collect();
         ctx.steps.insert(
             sr.step_id.clone(),
             StepOutput {
@@ -225,6 +258,7 @@ fn base_context_for_step(
                 success: sr.success,
                 skipped: sr.skipped,
                 results,
+                sub_results,
             },
         );
     }
@@ -240,7 +274,15 @@ async fn run_linear_step(
     opts: &OrchestratorRunOpts,
     continue_on_error: bool,
 ) -> Result<StepResult, RunWorkflowError> {
-    let rendered = render_step_prompt(&step.prompt, ctx).map_err(|e| RunWorkflowError::Render {
+    let prompt = step
+        .prompt
+        .as_deref()
+        .expect("validate_step_shape guarantees prompt for linear steps");
+    let agent_name = step
+        .agent
+        .as_deref()
+        .expect("validate_step_shape guarantees agent for linear steps");
+    let rendered = render_step_prompt(prompt, ctx).map_err(|e| RunWorkflowError::Render {
         step: step.id.clone(),
         source: e,
     })?;
@@ -250,6 +292,7 @@ async fn run_linear_step(
     let outcome = dispatch_one(
         &opts.factory,
         &step.id,
+        agent_name,
         rendered.clone(),
         run_id.clone(),
         opts.workspace_id.clone(),
@@ -347,12 +390,15 @@ async fn run_fanout_step(
                 last: idx + 1 == total,
             },
         );
-        let rendered = render_step_prompt(&step.prompt, &item_ctx).map_err(|e| {
-            RunWorkflowError::Render {
+        let item_prompt = step
+            .prompt
+            .as_deref()
+            .expect("validate_step_shape guarantees prompt for for_each steps");
+        let rendered =
+            render_step_prompt(item_prompt, &item_ctx).map_err(|e| RunWorkflowError::Render {
                 step: format!("{}[{}]", step.id, idx),
                 source: e,
-            }
-        })?;
+            })?;
         let run_id = format!("run_{}", Ulid::new());
         let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
         prepared.push((idx, item.clone(), rendered, run_id, transcript_path));
@@ -361,11 +407,17 @@ async fn run_fanout_step(
     // Spawn each item with the concurrency cap. We want declared
     // ordering of results regardless of finish order, so we collect
     // (idx, ItemResult) and sort by idx at the end.
+    let agent_name_root = step
+        .agent
+        .as_deref()
+        .expect("validate_step_shape guarantees agent for for_each steps")
+        .to_string();
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         let permit_sem = semaphore.clone();
         let factory = Arc::clone(&opts.factory);
         let step_id = step.id.clone();
+        let agent_name = agent_name_root.clone();
         let workspace_id = opts.workspace_id.clone();
         let workspace_path = opts.workspace_path.clone();
         let rendered_clone = rendered.clone();
@@ -382,6 +434,7 @@ async fn run_fanout_step(
             let outcome = dispatch_one(
                 &factory,
                 &step_id,
+                &agent_name,
                 rendered_clone.clone(),
                 run_id_clone.clone(),
                 workspace_id,
@@ -446,6 +499,7 @@ async fn run_fanout_step(
         .map(|o| ItemResult {
             index: o.idx,
             item: o.item.clone(),
+            sub_id: String::new(),
             rendered_prompt: o.rendered_prompt.clone(),
             run_id: o.run_id.clone(),
             transcript_path: o.transcript_path.clone(),
@@ -481,6 +535,180 @@ async fn run_fanout_step(
     })
 }
 
+/// Parallel step: render each sub-step's prompt against the same
+/// shared context, then dispatch all sub-steps with the configured
+/// `max_parallel:` cap. Sub-steps run independently — there's no
+/// shared per-unit binding (no `{{item}}`); each sub-step's prompt
+/// is just rendered against the parent context. Per-sub-step
+/// results land in both `steps.<id>.results[*]` (positional, in
+/// declared order) and `steps.<id>.sub_results.<sub_id>` (named).
+async fn run_parallel_step(
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    continue_on_error: bool,
+) -> Result<StepResult, RunWorkflowError> {
+    let subs = step
+        .parallel
+        .as_ref()
+        .expect("run_parallel_step called for a non-parallel step");
+    let total = subs.len();
+    let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
+    let semaphore = Arc::new(Semaphore::new(max_parallel));
+
+    // Render all sub-step prompts up front so a per-sub template
+    // error reports cleanly before any agent dispatches.
+    let mut prepared: Vec<(usize, String, String, String, String, PathBuf)> =
+        Vec::with_capacity(total);
+    for (idx, sub) in subs.iter().enumerate() {
+        let rendered = render_step_prompt(&sub.prompt, ctx).map_err(|e| {
+            RunWorkflowError::Render {
+                step: format!("{}.{}", step.id, sub.id),
+                source: e,
+            }
+        })?;
+        let run_id = format!("run_{}", Ulid::new());
+        let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+        prepared.push((
+            idx,
+            sub.id.clone(),
+            sub.agent.clone(),
+            rendered,
+            run_id,
+            transcript_path,
+        ));
+    }
+
+    let mut handles = Vec::with_capacity(total);
+    for (idx, sub_id, sub_agent_name, rendered, run_id, transcript_path) in prepared {
+        let permit_sem = semaphore.clone();
+        let factory = Arc::clone(&opts.factory);
+        let workspace_id = opts.workspace_id.clone();
+        let workspace_path = opts.workspace_path.clone();
+        let rendered_clone = rendered.clone();
+        let run_id_clone = run_id.clone();
+        let transcript_clone = transcript_path.clone();
+        let parent_step_id = step.id.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = permit_sem
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed");
+            let outcome = dispatch_one(
+                &factory,
+                // Parent step id (for the factory's step lookup)
+                // plus the sub-step's resolved agent name (which is
+                // what actually loads + runs).
+                &parent_step_id,
+                &sub_agent_name,
+                rendered_clone.clone(),
+                run_id_clone.clone(),
+                workspace_id,
+                workspace_path,
+                transcript_clone.clone(),
+            )
+            .await;
+            let (success, error_str, raw_error) = match outcome {
+                Ok(()) => (true, None, None),
+                Err(e) => (false, Some(e.to_string()), Some(e)),
+            };
+            let output = read_final_assistant_text(
+                &transcript_clone,
+                success,
+                &run_id_clone,
+                &parent_step_id,
+            );
+            ParallelSubOutcome {
+                idx,
+                sub_id,
+                rendered_prompt: rendered,
+                run_id,
+                transcript_path,
+                output,
+                success,
+                error: error_str,
+                raw_error,
+            }
+        }));
+    }
+
+    let mut outcomes: Vec<ParallelSubOutcome> = Vec::with_capacity(total);
+    for handle in handles {
+        match handle.await {
+            Ok(o) => outcomes.push(o),
+            Err(join_err) => {
+                return Err(RunWorkflowError::FanoutJoin {
+                    step: step.id.clone(),
+                    source: join_err,
+                });
+            }
+        }
+    }
+    outcomes.sort_by_key(|o| o.idx);
+
+    if !continue_on_error {
+        if let Some(failed) = outcomes.iter_mut().find(|o| !o.success) {
+            if let Some(err) = failed.raw_error.take() {
+                return Err(RunWorkflowError::Agent {
+                    step: format!("{}.{}", step.id, failed.sub_id),
+                    source: err,
+                });
+            }
+        }
+    }
+
+    let items_vec: Vec<ItemResult> = outcomes
+        .iter()
+        .map(|o| ItemResult {
+            index: o.idx,
+            item: serde_json::Value::Null,
+            sub_id: o.sub_id.clone(),
+            rendered_prompt: o.rendered_prompt.clone(),
+            run_id: o.run_id.clone(),
+            transcript_path: o.transcript_path.clone(),
+            output: o.output.clone(),
+            success: o.success,
+        })
+        .collect();
+    let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
+    let aggregate_output = serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".into());
+    let success = items_vec.iter().all(|i| i.success);
+
+    if !success {
+        warn!(
+            step = %step.id,
+            failed = items_vec.iter().filter(|i| !i.success).count(),
+            total,
+            "parallel completed with failed sub-steps (continue_on_error tolerated)"
+        );
+    }
+
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        rendered_prompt: String::new(),
+        run_id: String::new(),
+        transcript_path: PathBuf::new(),
+        output: aggregate_output,
+        success,
+        skipped: false,
+        items: items_vec,
+    })
+}
+
+struct ParallelSubOutcome {
+    idx: usize,
+    sub_id: String,
+    rendered_prompt: String,
+    run_id: String,
+    transcript_path: PathBuf,
+    output: String,
+    success: bool,
+    #[allow(dead_code)]
+    error: Option<String>,
+    raw_error: Option<RunError>,
+}
+
 /// Internal fan-out task return type. Carries the typed `RunError`
 /// separately from its display string so we can re-raise the original
 /// error when `continue_on_error` isn't set.
@@ -501,9 +729,11 @@ struct FanoutItemOutcome {
 
 /// Build the agent opts via the factory and dispatch one agent run.
 /// Shared by the linear and fan-out paths.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_one(
     factory: &Arc<dyn StepFactory>,
     step_id: &str,
+    agent_name: &str,
     rendered_prompt: String,
     run_id: String,
     workspace_id: String,
@@ -513,6 +743,7 @@ async fn dispatch_one(
     let agent_opts = factory
         .build_opts_for_step(
             step_id,
+            agent_name,
             rendered_prompt,
             run_id,
             workspace_id,

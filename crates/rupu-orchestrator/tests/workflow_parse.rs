@@ -26,18 +26,93 @@ fn parses_two_step_linear_workflow() {
     assert_eq!(wf.name, "investigate-then-fix");
     assert_eq!(wf.steps.len(), 2);
     assert_eq!(wf.steps[0].id, "investigate");
-    assert_eq!(wf.steps[0].agent, "investigator");
+    assert_eq!(wf.steps[0].agent.as_deref(), Some("investigator"));
     assert_eq!(wf.steps[0].actions, vec!["log_finding".to_string()]);
-    assert!(wf.steps[1].prompt.contains("Propose a minimal fix"));
+    assert!(wf.steps[1]
+        .prompt
+        .as_deref()
+        .unwrap()
+        .contains("Propose a minimal fix"));
 }
 
 #[test]
-fn rejects_parallel_keyword() {
-    let s = "name: x\nsteps:\n  - id: a\n    agent: a\n    parallel: [b, c]\n    actions: []\n    prompt: hi\n";
-    let err = format!("{}", Workflow::parse(s).unwrap_err());
+fn accepts_parallel_block() {
+    let s = r#"
+name: x
+steps:
+  - id: triage
+    actions: []
+    parallel:
+      - id: sec
+        agent: security-reviewer
+        prompt: "review {{ inputs.diff }}"
+      - id: perf
+        agent: perf-reviewer
+        prompt: "review {{ inputs.diff }}"
+"#;
+    let wf = Workflow::parse(s).expect("parallel: should parse");
+    let subs = wf.steps[0].parallel.as_ref().unwrap();
+    assert_eq!(subs.len(), 2);
+    assert_eq!(subs[0].id, "sec");
+    assert_eq!(subs[1].agent, "perf-reviewer");
+    assert!(wf.steps[0].agent.is_none());
+    assert!(wf.steps[0].prompt.is_none());
+}
+
+#[test]
+fn rejects_parallel_combined_with_for_each_or_agent() {
+    let s = r#"
+name: x
+steps:
+  - id: triage
+    agent: a
+    prompt: hi
+    actions: []
+    parallel:
+      - { id: x, agent: a, prompt: y }
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
     assert!(
-        err.contains("parallel"),
-        "expected unsupported-key error, got: {err}"
+        err.contains("mutually exclusive"),
+        "expected mutually-exclusive error, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_empty_parallel_block() {
+    let s = "name: x\nsteps:\n  - id: a\n    actions: []\n    parallel: []\n";
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("at least one sub-step"),
+        "expected empty-parallel error, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_duplicate_sub_step_id() {
+    let s = r#"
+name: x
+steps:
+  - id: triage
+    actions: []
+    parallel:
+      - { id: dup, agent: a, prompt: p }
+      - { id: dup, agent: b, prompt: q }
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("duplicate sub-step id"),
+        "expected duplicate-sub-step error, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_linear_step_without_agent() {
+    let s = "name: x\nsteps:\n  - id: a\n    actions: []\n    prompt: hi\n";
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("agent") && err.contains("required"),
+        "expected missing-agent error, got: {err}"
     );
 }
 

@@ -20,7 +20,9 @@ pub use runner::{
 };
 pub use templates::{
     render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,
+    SubResult,
 };
 pub use workflow::{
-    InputDef, InputType, Step, Trigger, TriggerKind, Workflow, WorkflowDefaults, WorkflowParseError,
+    InputDef, InputType, Step, SubStep, Trigger, TriggerKind, Workflow, WorkflowDefaults,
+    WorkflowParseError,
 };

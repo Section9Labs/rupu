@@ -80,12 +80,17 @@ pub struct LoopInfo {
 /// - `success = false, skipped = true` → step was skipped because its
 ///   own `when:` evaluated false
 ///
-/// For fan-out steps (`for_each:`):
-/// - `output` is the JSON array of per-item outputs (so legacy
+/// For fan-out steps (`for_each:` / `parallel:`):
+/// - `output` is the JSON array of per-unit outputs (so legacy
 ///   templates that read `steps.foo.output` still see something
 ///   structured),
-/// - `results` is the per-item list bound as `steps.<id>.results[*]`,
-/// - `success` is true iff every item finished without error.
+/// - `results` is the per-unit list of strings bound as
+///   `steps.<id>.results[*]` (in declared order — items for
+///   `for_each:`, sub-steps for `parallel:`),
+/// - `sub_results` is the per-sub-step name-keyed map bound as
+///   `steps.<id>.sub_results.<sub_id>` (only populated for
+///   `parallel:`),
+/// - `success` is true iff every unit finished without error.
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct StepOutput {
     pub output: String,
@@ -93,11 +98,24 @@ pub struct StepOutput {
     pub success: bool,
     #[serde(default)]
     pub skipped: bool,
-    /// Per-item outputs for fan-out steps. Empty for non-fan-out
-    /// steps. Bound as `steps.<id>.results[*]` in subsequent step
-    /// templates.
+    /// Per-unit outputs (strings) for fan-out steps. Empty for
+    /// non-fan-out steps. Bound as `steps.<id>.results[*]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<String>,
+    /// Per-sub-step map for `parallel:` steps. Empty for `for_each:`
+    /// and linear steps. Bound as
+    /// `steps.<id>.sub_results.<sub_id>.{output,success}`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sub_results: BTreeMap<String, SubResult>,
+}
+
+/// One sub-step's published output for `parallel:` steps. Carries
+/// enough surface for `when:` chains to branch on and for downstream
+/// prompts to quote.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct SubResult {
+    pub output: String,
+    pub success: bool,
 }
 
 impl StepContext {
@@ -125,6 +143,7 @@ impl StepContext {
                 success: true,
                 skipped: false,
                 results: Vec::new(),
+                sub_results: BTreeMap::new(),
             },
         );
         self
@@ -146,6 +165,7 @@ impl StepContext {
                 success: true,
                 skipped: false,
                 results,
+                sub_results: BTreeMap::new(),
             },
         );
         self
@@ -242,6 +262,7 @@ mod when_tests {
                 success: true,
                 skipped: false,
                 results: Vec::new(),
+                sub_results: BTreeMap::new(),
             },
         );
         let v = render_when_expression("{{ steps.review.output }}", &ctx).expect("render");

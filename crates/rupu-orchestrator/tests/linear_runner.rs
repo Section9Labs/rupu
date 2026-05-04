@@ -31,21 +31,24 @@ impl StepFactory for FakeFactory {
     async fn build_opts_for_step(
         &self,
         step_id: &str,
+        agent_name: &str,
         rendered_prompt: String,
         run_id: String,
         workspace_id: String,
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
     ) -> AgentRunOpts {
-        // Produce a single assistant text turn that echoes the rendered prompt.
+        // Produce a single assistant text turn that echoes the
+        // rendered prompt + records which (parent step, sub agent)
+        // pair dispatched it. Tests assert against this output.
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
-            text: format!("step {step_id} echo: {rendered_prompt}"),
+            text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
             stop: StopReason::EndTurn,
             input_tokens: 1,
             output_tokens: 1,
         }]);
         AgentRunOpts {
-            agent_name: format!("ag-{step_id}"),
+            agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
             provider: Box::new(provider),
@@ -85,7 +88,7 @@ async fn second_step_sees_first_step_output_via_template() {
     assert_eq!(res.step_results.len(), 2);
     let b_prompt = &res.step_results[1].rendered_prompt;
     assert!(
-        b_prompt.contains("step a echo: First step says: hello A"),
+        b_prompt.contains("step a agent ag echo: First step says: hello A"),
         "step b should see step a's output, got: {b_prompt}"
     );
 }
@@ -194,7 +197,7 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
         "summarize should see results length, got: {summary_prompt}"
     );
     assert!(
-        summary_prompt.contains("first: step review_each echo: review a.rs"),
+        summary_prompt.contains("first: step review_each agent ag echo: review a.rs"),
         "summarize should see first item's output, got: {summary_prompt}"
     );
 }
@@ -277,6 +280,7 @@ impl StepFactory for FailingFactory {
     async fn build_opts_for_step(
         &self,
         step_id: &str,
+        agent_name: &str,
         rendered_prompt: String,
         run_id: String,
         workspace_id: String,
@@ -287,7 +291,7 @@ impl StepFactory for FailingFactory {
             ScriptedTurn::ProviderError("simulated failure for fan-out test".into())
         } else {
             ScriptedTurn::AssistantText {
-                text: format!("step {step_id} echo: {rendered_prompt}"),
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
                 stop: StopReason::EndTurn,
                 input_tokens: 1,
                 output_tokens: 1,
@@ -295,7 +299,7 @@ impl StepFactory for FailingFactory {
         };
         let provider = MockProvider::new(vec![turn]);
         AgentRunOpts {
-            agent_name: format!("ag-{step_id}"),
+            agent_name: format!("ag-{agent_name}"),
             agent_system_prompt: "echo".into(),
             agent_tools: None,
             provider: Box::new(provider),
@@ -384,5 +388,149 @@ async fn for_each_without_continue_on_error_aborts_workflow_on_first_failure() {
     assert!(
         msg.contains("review_each[0]") && msg.contains("simulated failure"),
         "unexpected error message: {msg}"
+    );
+}
+
+// -- Parallel (agent fan-out) -----------------------------------------------
+
+const WF_PARALLEL: &str = r#"
+name: triage
+inputs:
+  diff: { type: string, default: "+ added line" }
+steps:
+  - id: triage
+    actions: []
+    parallel:
+      - id: sec
+        agent: security-reviewer
+        prompt: "security review of: {{ inputs.diff }}"
+      - id: perf
+        agent: perf-reviewer
+        prompt: "perf review of: {{ inputs.diff }}"
+      - id: maint
+        agent: maintainability-reviewer
+        prompt: "maintainability review of: {{ inputs.diff }}"
+    max_parallel: 2
+  - id: summarize
+    agent: writer
+    actions: []
+    prompt: |
+      sec: {{ steps.triage.sub_results.sec.output }}
+      perf: {{ steps.triage.sub_results.perf.output }}
+      list-len: {{ steps.triage.results | length }}
+"#;
+
+#[tokio::test]
+async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(WF_PARALLEL).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_orch_par".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FakeFactory),
+        event: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    assert_eq!(res.step_results.len(), 2);
+
+    let triage = &res.step_results[0];
+    assert_eq!(triage.items.len(), 3);
+    assert!(triage.success);
+    // Sub-step ids preserved in declared order.
+    let sub_ids: Vec<&str> = triage.items.iter().map(|i| i.sub_id.as_str()).collect();
+    assert_eq!(sub_ids, vec!["sec", "perf", "maint"]);
+    // Each sub-step's rendered prompt referenced its declared agent
+    // (asserted via the FakeFactory echo format).
+    assert!(triage.items[0].output.contains("agent security-reviewer"));
+    assert!(triage.items[1].output.contains("agent perf-reviewer"));
+    assert!(triage
+        .items[2]
+        .output
+        .contains("agent maintainability-reviewer"));
+
+    // The follow-up step can address sub-results by name (named map)
+    // and read the positional list length.
+    let summary_prompt = &res.step_results[1].rendered_prompt;
+    assert!(
+        summary_prompt.contains("agent security-reviewer")
+            && summary_prompt.contains("agent perf-reviewer")
+            && summary_prompt.contains("list-len: 3"),
+        "summarize should address sub_results by name + list length, got: {summary_prompt}"
+    );
+}
+
+const WF_PARALLEL_FAIL: &str = r#"
+name: triage-with-failure
+steps:
+  - id: triage
+    actions: []
+    continue_on_error: true
+    parallel:
+      - id: ok
+        agent: writer
+        prompt: "ok"
+      - id: bad
+        agent: writer
+        prompt: "FAIL on purpose"
+"#;
+
+#[tokio::test]
+async fn parallel_continue_on_error_records_per_sub_step_failures() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(WF_PARALLEL_FAIL).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_orch_par_fail".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FailingFactory),
+        event: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let triage = &res.step_results[0];
+    assert_eq!(triage.items.len(), 2);
+    assert!(!triage.success);
+    let ok = triage.items.iter().find(|i| i.sub_id == "ok").unwrap();
+    let bad = triage.items.iter().find(|i| i.sub_id == "bad").unwrap();
+    assert!(ok.success);
+    assert!(!bad.success);
+}
+
+const WF_PARALLEL_ABORTS: &str = r#"
+name: triage-no-tolerance
+steps:
+  - id: triage
+    actions: []
+    parallel:
+      - id: ok
+        agent: writer
+        prompt: "ok"
+      - id: bad
+        agent: writer
+        prompt: "FAIL on purpose"
+"#;
+
+#[tokio::test]
+async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(WF_PARALLEL_ABORTS).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_orch_par_aborts".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FailingFactory),
+        event: None,
+    };
+    let err = run_workflow(opts).await.expect_err("should abort");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("triage.bad") && msg.contains("simulated failure"),
+        "expected triage.bad in error message, got: {msg}"
     );
 }
