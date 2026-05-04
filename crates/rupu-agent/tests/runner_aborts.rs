@@ -27,6 +27,8 @@ fn opts(
         user_message: "go".into(),
         mode_str: "bypass".into(),
         no_stream: false,
+        effort: None,
+        context_window: None,
     }
 }
 

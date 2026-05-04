@@ -148,6 +148,8 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         user_message,
         mode_str: mode_str.to_string(),
         no_stream: args.no_stream,
+        effort: spec.effort,
+        context_window: spec.context_window,
     };
 
     let result = rupu_agent::run_agent(opts).await?;

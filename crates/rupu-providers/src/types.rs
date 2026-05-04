@@ -111,6 +111,12 @@ pub struct LlmRequest {
     /// Unified reasoning/effort level. Providers that support reasoning
     /// translate this to their native format; others silently ignore it.
     pub thinking: Option<crate::model_tier::ThinkingLevel>,
+    /// Desired context-window tier. Anthropic 1M-context is gated on
+    /// the `context-1m-2025-08-07` beta header; setting this to
+    /// `OneMillion` ensures the beta is sent on api-key requests (the
+    /// OAuth path already includes it via the static beta CSV). Other
+    /// providers currently ignore this.
+    pub context_window: Option<crate::model_tier::ContextWindow>,
     /// Task type for smart routing. Set by TaskClassifier or explicitly by caller.
     pub task_type: Option<crate::task_classifier::TaskType>,
 }

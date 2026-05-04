@@ -108,6 +108,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let response = provider.send(&request).await.unwrap();
@@ -128,6 +129,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let mut events = Vec::new();
@@ -180,6 +182,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let result = provider.send(&request).await;
