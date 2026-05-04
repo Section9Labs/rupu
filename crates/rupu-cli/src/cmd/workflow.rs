@@ -147,6 +147,17 @@ async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> a
     // Credential resolver (shared across all steps in this workflow run).
     let resolver = Arc::new(rupu_auth::KeychainResolver::new());
 
+    // Resolve config (global + project) so Registry::discover can read
+    // [scm] platform settings.
+    let global_cfg_path = global.join("config.toml");
+    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+
+    // Build the SCM/issue registry once for the entire workflow run.
+    // Cheap when no platforms are configured; missing credentials are
+    // skipped with INFO logs.
+    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+
     let mode_str = mode.unwrap_or("ask").to_string();
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
@@ -157,6 +168,7 @@ async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> a
         project_root: project_root.clone(),
         resolver,
         mode_str,
+        mcp_registry,
     });
 
     let inputs_map: BTreeMap<String, String> = inputs.into_iter().collect();
@@ -184,12 +196,17 @@ async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> a
 /// `StepFactory` impl that resolves each step's `agent:` against
 /// the project- and global-scope `agents/` dirs and constructs a
 /// real provider via [`provider_factory::build_for_provider`].
+///
+/// `mcp_registry` is built once in the `run` function and shared
+/// across all steps; this avoids redundant credential probes and
+/// ensures consistent SCM tool availability throughout the workflow.
 struct CliStepFactory {
     workflow: Workflow,
     global: PathBuf,
     project_root: Option<PathBuf>,
     resolver: Arc<rupu_auth::KeychainResolver>,
     mode_str: String,
+    mcp_registry: Arc<rupu_scm::Registry>,
 }
 
 #[async_trait]
@@ -272,7 +289,7 @@ impl StepFactory for CliStepFactory {
             user_message: rendered_prompt,
             mode_str: self.mode_str.clone(),
             no_stream: false,
-            mcp_registry: None,
+            mcp_registry: Some(Arc::clone(&self.mcp_registry)),
         }
     }
 }

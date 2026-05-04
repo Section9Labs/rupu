@@ -35,6 +35,7 @@ rupu-config = { path = "../rupu-config" }
 rupu-workspace = { path = "../rupu-workspace" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-providers = { path = "../rupu-providers" }
+rupu-scm = { path = "../rupu-scm" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-transcript = { path = "../rupu-transcript" }
 

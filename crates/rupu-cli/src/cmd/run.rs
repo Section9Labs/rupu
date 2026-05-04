@@ -83,6 +83,12 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
 
     // Provider build via CredentialResolver.
     let resolver = rupu_auth::KeychainResolver::new();
+
+    // Build the SCM/issue registry from the same resolver + config the
+    // LLM provider factory uses. Cheap when no platforms are configured;
+    // missing credentials are skipped with INFO logs.
+    let scm_registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
+
     let provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
     let model = spec
         .model
@@ -148,7 +154,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         user_message,
         mode_str: mode_str.to_string(),
         no_stream: args.no_stream,
-        mcp_registry: None,
+        mcp_registry: Some(scm_registry),
     };
 
     let result = rupu_agent::run_agent(opts).await?;
