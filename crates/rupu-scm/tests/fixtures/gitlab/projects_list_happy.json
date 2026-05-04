@@ -1,0 +1,35 @@
+[
+  {
+    "id": 12345,
+    "name": "rupu-mirror",
+    "path": "rupu-mirror",
+    "path_with_namespace": "section9labs/rupu-mirror",
+    "default_branch": "main",
+    "visibility": "private",
+    "http_url_to_repo": "https://gitlab.com/section9labs/rupu-mirror.git",
+    "ssh_url_to_repo": "git@gitlab.com:section9labs/rupu-mirror.git",
+    "description": "agentic CLI mirror"
+  },
+  {
+    "id": 67890,
+    "name": "phi-cell-fork",
+    "path": "phi-cell-fork",
+    "path_with_namespace": "section9labs/infra/phi-cell-fork",
+    "default_branch": "main",
+    "visibility": "private",
+    "http_url_to_repo": "https://gitlab.com/section9labs/infra/phi-cell-fork.git",
+    "ssh_url_to_repo": "git@gitlab.com:section9labs/infra/phi-cell-fork.git",
+    "description": null
+  },
+  {
+    "id": 11111,
+    "name": "public-demo",
+    "path": "public-demo",
+    "path_with_namespace": "matias/public-demo",
+    "default_branch": "trunk",
+    "visibility": "public",
+    "http_url_to_repo": "https://gitlab.com/matias/public-demo.git",
+    "ssh_url_to_repo": "git@gitlab.com:matias/public-demo.git",
+    "description": "open-source demo project"
+  }
+]
