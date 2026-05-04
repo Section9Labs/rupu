@@ -90,4 +90,38 @@ impl Registry {
     pub fn gitlab_extras(&self) -> Option<Arc<GitlabExtras>> {
         self.gitlab_extras.clone()
     }
+
+    /// Return the default platform for tools that omit the `platform`
+    /// argument. Prefers GitHub, then GitLab. Wiring to `[scm.default]`
+    /// config lands in Task 19; this is the v0 "first registered" fallback.
+    pub fn default_platform(&self) -> Option<Platform> {
+        if self.repo_connectors.contains_key(&Platform::Github) {
+            Some(Platform::Github)
+        } else if self.repo_connectors.contains_key(&Platform::Gitlab) {
+            Some(Platform::Gitlab)
+        } else {
+            None
+        }
+    }
+
+    /// Return the default issue tracker for tools that omit the `tracker`
+    /// argument. Prefers GitHub, then GitLab.
+    pub fn default_tracker(&self) -> Option<IssueTracker> {
+        if self.issue_connectors.contains_key(&IssueTracker::Github) {
+            Some(IssueTracker::Github)
+        } else if self.issue_connectors.contains_key(&IssueTracker::Gitlab) {
+            Some(IssueTracker::Gitlab)
+        } else {
+            None
+        }
+    }
+
+    /// Test-only: build a Registry with no connectors. Tools that
+    /// require a connector return McpError::NotWiredInV0 — they do
+    /// NOT panic. Honors the "no mock features" rule: the absence
+    /// of a connector is reported, not silently ignored.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn empty() -> Self {
+        Self::default()
+    }
 }

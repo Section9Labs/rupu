@@ -10,6 +10,7 @@ members = [
     "crates/rupu-tools",
     "crates/rupu-agent",
     "crates/rupu-orchestrator",
+    "crates/rupu-mcp",
     "crates/rupu-cli",
 ]
 

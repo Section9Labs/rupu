@@ -1,0 +1,605 @@
+[
+  {
+    "description": "List repositories the authenticated user can access on the given platform. Omit `platform` to use [scm.default].",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "platform": {
+          "description": "Platform to query (`github` | `gitlab`). Omit to use [scm.default].",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "title": "ListReposArgs",
+      "type": "object"
+    },
+    "name": "scm.repos.list"
+  },
+  {
+    "description": "Fetch a single repository (default branch, clone URLs, visibility, description).",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "owner": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner",
+        "repo"
+      ],
+      "title": "GetRepoArgs",
+      "type": "object"
+    },
+    "name": "scm.repos.get"
+  },
+  {
+    "description": "List branches on a repository. Returns name, sha, and protected flag for each.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "owner": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner",
+        "repo"
+      ],
+      "title": "ListBranchesArgs",
+      "type": "object"
+    },
+    "name": "scm.branches.list"
+  },
+  {
+    "description": "Create a new branch from a given SHA. Returns the new branch.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "from_sha": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from_sha",
+        "name",
+        "owner",
+        "repo"
+      ],
+      "title": "CreateBranchArgs",
+      "type": "object"
+    },
+    "name": "scm.branches.create"
+  },
+  {
+    "description": "Read a single file from a repository at an optional ref. Returns path, ref, content, and encoding.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "owner": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ref": {
+          "description": "Optional ref (branch / tag / sha). Defaults to repo's default branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner",
+        "path",
+        "repo"
+      ],
+      "title": "ReadFileArgs",
+      "type": "object"
+    },
+    "name": "scm.files.read"
+  },
+  {
+    "description": "List pull/merge requests on a repository. Optional filters: state (open/closed/merged), author, limit.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "author": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "owner": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        },
+        "state": {
+          "description": "`open` | `closed` | `merged`. Omit to list all states.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "owner",
+        "repo"
+      ],
+      "title": "ListPrsArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.list"
+  },
+  {
+    "description": "Fetch a single pull/merge request by number. Returns title, body, state, head/base branches, author, timestamps.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "number": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "number",
+        "owner",
+        "repo"
+      ],
+      "title": "GetPrArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.get"
+  },
+  {
+    "description": "Fetch the unified-diff patch for a pull/merge request. Returns patch text + per-file change counts.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "number": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "number",
+        "owner",
+        "repo"
+      ],
+      "title": "DiffPrArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.diff"
+  },
+  {
+    "description": "Post a top-level comment on a pull/merge request.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "number": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "body",
+        "number",
+        "owner",
+        "repo"
+      ],
+      "title": "CommentPrArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.comment"
+  },
+  {
+    "description": "Open a pull/merge request from `head` branch into `base`. Set draft=true to open as a draft.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "base": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "draft": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "head": {
+          "type": "string"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "platform": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "base",
+        "body",
+        "head",
+        "owner",
+        "repo",
+        "title"
+      ],
+      "title": "CreatePrArgs",
+      "type": "object"
+    },
+    "name": "scm.prs.create"
+  },
+  {
+    "description": "List issues on a tracker. Filters: state (open/closed), labels, author, limit.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "author": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project": {
+          "type": "string"
+        },
+        "state": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tracker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "title": "ListIssuesArgs",
+      "type": "object"
+    },
+    "name": "issues.list"
+  },
+  {
+    "description": "Fetch a single issue by number. Returns title, body, state, labels, author, timestamps.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "number": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "project": {
+          "type": "string"
+        },
+        "tracker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "number",
+        "project"
+      ],
+      "title": "GetIssueArgs",
+      "type": "object"
+    },
+    "name": "issues.get"
+  },
+  {
+    "description": "Post a comment on an issue.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "number": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "project": {
+          "type": "string"
+        },
+        "tracker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "body",
+        "number",
+        "project"
+      ],
+      "title": "CommentIssueArgs",
+      "type": "object"
+    },
+    "name": "issues.comment"
+  },
+  {
+    "description": "Open a new issue with title, body, and optional labels.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "project": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "tracker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "body",
+        "project",
+        "title"
+      ],
+      "title": "CreateIssueArgs",
+      "type": "object"
+    },
+    "name": "issues.create"
+  },
+  {
+    "description": "Transition an issue's state to `open` or `closed`.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "number": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "project": {
+          "type": "string"
+        },
+        "state": {
+          "description": "`open` | `closed`.",
+          "type": "string"
+        },
+        "tracker": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "number",
+        "project",
+        "state"
+      ],
+      "title": "UpdateIssueStateArgs",
+      "type": "object"
+    },
+    "name": "issues.update_state"
+  },
+  {
+    "description": "Trigger a GitHub Actions workflow run via workflow_dispatch. Requires the workflow file to declare `on: workflow_dispatch:`.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "inputs": {
+          "description": "Optional inputs map matching the workflow's `inputs:` schema."
+        },
+        "owner": {
+          "type": "string"
+        },
+        "ref": {
+          "description": "Branch / tag / sha to dispatch the workflow against.",
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "workflow": {
+          "description": "Workflow filename (e.g. `ci.yml`) or numeric ID.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner",
+        "ref",
+        "repo",
+        "workflow"
+      ],
+      "title": "WorkflowsDispatchArgs",
+      "type": "object"
+    },
+    "name": "github.workflows_dispatch"
+  },
+  {
+    "description": "Trigger a GitLab CI pipeline against a branch/tag with optional variables.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "owner": {
+          "type": "string"
+        },
+        "ref": {
+          "description": "Branch or tag to run the pipeline against.",
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "variables": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Map of pipeline variables (key → value).",
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "owner",
+        "ref",
+        "repo"
+      ],
+      "title": "PipelineTriggerArgs",
+      "type": "object"
+    },
+    "name": "gitlab.pipeline_trigger"
+  }
+]

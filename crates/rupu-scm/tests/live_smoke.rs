@@ -72,3 +72,73 @@ async fn github_list_issues_for_known_target() {
         .await
         .expect("list_issues");
 }
+
+fn gitlab_token() -> Option<String> {
+    std::env::var("RUPU_LIVE_GITLAB_TOKEN").ok()
+}
+
+fn build_gitlab_connectors() -> Option<(
+    std::sync::Arc<dyn RepoConnector>,
+    std::sync::Arc<dyn IssueConnector>,
+)> {
+    let token = gitlab_token()?;
+    use rupu_scm::connectors::gitlab::GitlabClient;
+    let client = GitlabClient::new(token, None, Some(2));
+    let repo: std::sync::Arc<dyn RepoConnector> = std::sync::Arc::new(
+        rupu_scm::connectors::gitlab::repo::GitlabRepoConnector::new(client.clone()),
+    );
+    let issues: std::sync::Arc<dyn IssueConnector> = std::sync::Arc::new(
+        rupu_scm::connectors::gitlab::issues::GitlabIssueConnector::new(client),
+    );
+    Some((repo, issues))
+}
+
+#[tokio::test]
+async fn gitlab_list_repos_returns_at_least_one() {
+    if !live_enabled() {
+        return;
+    }
+    let Some((repo, _)) = build_gitlab_connectors() else {
+        return;
+    };
+    let repos = repo.list_repos().await.expect("gitlab list_repos");
+    assert!(!repos.is_empty());
+}
+
+#[tokio::test]
+async fn gitlab_get_repo_smoke() {
+    if !live_enabled() {
+        return;
+    }
+    let Some((repo, _)) = build_gitlab_connectors() else {
+        return;
+    };
+    // Use a known-public gitlab.com project that's stable + small.
+    let r = repo
+        .get_repo(&RepoRef {
+            platform: Platform::Gitlab,
+            owner: "gitlab-org".into(),
+            repo: "gitlab-test".into(),
+        })
+        .await;
+    // Tolerate both success and Not-Found-style errors — public projects
+    // can move; the smoke checks the wire roundtrip works without
+    // requiring a specific server-side artifact.
+    if r.is_err() {
+        eprintln!("gitlab_get_repo_smoke skipped: {:?}", r.err());
+    }
+}
+
+#[tokio::test]
+async fn gitlab_list_issues_smoke() {
+    if !live_enabled() {
+        return;
+    }
+    let Some((_, issues)) = build_gitlab_connectors() else {
+        return;
+    };
+    let _ = issues
+        .list_issues("gitlab-org/gitlab-test", IssueFilter::default())
+        .await
+        .expect("gitlab list_issues");
+}

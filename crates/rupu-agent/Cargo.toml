@@ -27,6 +27,8 @@ rupu-providers = { path = "../rupu-providers" }
 rupu-workspace = { path = "../rupu-workspace" }
 rupu-config = { path = "../rupu-config" }
 rupu-auth = { path = "../rupu-auth" }
+rupu-mcp = { path = "../rupu-mcp" }
+rupu-scm = { path = "../rupu-scm" }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -34,3 +36,4 @@ assert_fs.workspace = true
 predicates.workspace = true
 serde_yaml.workspace = true
 pty-process = "0.5"
+rupu-scm = { path = "../rupu-scm", features = ["test-helpers"] }

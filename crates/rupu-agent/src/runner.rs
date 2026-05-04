@@ -5,14 +5,17 @@
 //! and `rupu-transcript`. The CLI (Plan 2 Phase 3) calls [`run_agent`]
 //! once per `rupu run` invocation.
 
+use crate::mcp_tool::McpToolAdapter;
 use crate::permission::PermissionDecision;
 use crate::tool_registry::{default_tool_registry, ToolRegistry};
 use async_trait::async_trait;
 use chrono::Utc;
+use rupu_mcp::{McpPermission, ServeHandle};
 use rupu_providers::provider::LlmProvider;
 use rupu_providers::types::{
     ContentBlock, LlmRequest, LlmResponse, Message, Role, StopReason, StreamEvent, Usage,
 };
+use rupu_scm::Registry;
 use rupu_tools::{DerivedEvent, PermissionMode, Tool, ToolContext};
 use rupu_transcript::{Event, FileEditKind, JsonlWriter, RunMode, RunStatus};
 use std::path::PathBuf;
@@ -89,6 +92,11 @@ pub struct AgentRunOpts {
     /// If true, skip token streaming and use `provider.send` for one-shot
     /// completions. Default is false (streaming). Used by --no-stream.
     pub no_stream: bool,
+    /// SCM/issue registry. When `Some`, the runner spins up an in-process
+    /// MCP server before the first turn and tears it down before returning.
+    /// `None` means MCP tools are unavailable for this run (test harness,
+    /// pre-Task-19 CLI invocations, etc.).
+    pub mcp_registry: Option<Arc<Registry>>,
     /// Reasoning / thinking effort level for every turn. Provider-specific
     /// translation (Anthropic `thinking.budget_tokens` / `thinking.type:adaptive`,
     /// OpenAI/Copilot `reasoning.effort`, Gemini `thinkingBudget`).
@@ -122,10 +130,40 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     })?;
     writer.flush()?;
 
-    let registry: ToolRegistry = match &opts.agent_tools {
+    let mut registry: ToolRegistry = match &opts.agent_tools {
         Some(list) => default_tool_registry().filter_to(list),
         None => default_tool_registry(),
     };
+
+    // MCP server: spin up before the loop if we have a Registry.
+    let mcp_guard: Option<(rupu_mcp::InProcessTransport, ServeHandle)> =
+        if let Some(scm_registry) = opts.mcp_registry.clone() {
+            let allowlist = opts
+                .agent_tools
+                .clone()
+                .unwrap_or_else(|| vec!["*".to_string()]);
+            let mode = parse_mode_for_runtime(&opts.mode_str);
+            let permission = McpPermission::new(mode, allowlist);
+            let (transport, handle) =
+                rupu_mcp::serve_in_process(scm_registry.clone(), permission.clone());
+            let dispatcher = Arc::new(rupu_mcp::ToolDispatcher::new(scm_registry, permission));
+
+            // Insert each MCP tool into the agent's tool registry.
+            for spec in rupu_mcp::tool_catalog() {
+                let adapter = Arc::new(McpToolAdapter::new(
+                    spec.name,
+                    spec.description,
+                    spec.input_schema.clone(),
+                    dispatcher.clone(),
+                ));
+                registry.insert(spec.name.to_string(), adapter as Arc<dyn Tool>);
+            }
+
+            Some((transport, handle))
+        } else {
+            None
+        };
+
     let tool_defs = registry.to_tool_definitions();
 
     let mut messages: Vec<Message> = vec![Message::user(&opts.user_message)];
@@ -384,6 +422,13 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         error: None,
     })?;
     writer.flush()?;
+
+    // Drop the MCP transport so the server's recv() returns None and exits.
+    // Then await its JoinHandle for deterministic shutdown.
+    if let Some((transport, handle)) = mcp_guard {
+        drop(transport);
+        let _ = handle.join.await;
+    }
 
     Ok(RunResult {
         turns: turn_idx,

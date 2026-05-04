@@ -13,6 +13,8 @@
 pub mod action;
 // implemented in Task 3
 pub mod loader;
+// Tasks 17+18: MCP tool adapter + runner wiring
+pub mod mcp_tool;
 // implemented in Task 4
 pub mod permission;
 // implemented in Task 5/7
