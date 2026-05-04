@@ -128,6 +128,18 @@ fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
     Err(anyhow::anyhow!("workflow not found: {name}"))
 }
 
+/// Public wrapper around the workflow-run pipeline so other
+/// subcommands (notably `rupu cron tick`) can invoke a workflow by
+/// name without going through the clap layer. Same behavior as
+/// `rupu workflow run <name>`.
+pub async fn run_by_name(
+    name: &str,
+    inputs: Vec<(String, String)>,
+    mode: Option<&str>,
+) -> anyhow::Result<()> {
+    run(name, inputs, mode).await
+}
+
 async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> anyhow::Result<()> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;

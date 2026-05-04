@@ -55,6 +55,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::models::Action,
     },
+    /// Schedule-driven workflow firing (designed for system cron).
+    Cron {
+        #[command(subcommand)]
+        action: cmd::cron::Action,
+    },
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -79,5 +84,6 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Config { action } => cmd::config::handle(action).await,
         Cmd::Auth { action } => cmd::auth::handle(action).await,
         Cmd::Models { action } => cmd::models::handle(action).await,
+        Cmd::Cron { action } => cmd::cron::handle(action).await,
     }
 }
