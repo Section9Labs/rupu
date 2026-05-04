@@ -25,6 +25,7 @@ fn minimal_request(model: &str) -> LlmRequest {
         cell_id: None,
         trace_id: None,
         thinking: None,
+        context_window: None,
         task_type: None,
     }
 }

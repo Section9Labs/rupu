@@ -205,6 +205,7 @@ impl TaskClassifier {
             cell_id: request.cell_id.clone(),
             trace_id: request.trace_id.clone(),
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -344,6 +345,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let result = classifier.classify(&request, None).await;
@@ -362,6 +364,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: Some(TaskType::Plan),
         };
         let result = classifier.classify(&request, None).await;
@@ -380,6 +383,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let result = classifier.classify(&request, None).await;

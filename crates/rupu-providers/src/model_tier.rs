@@ -2,16 +2,44 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider_id::ProviderId;
 
-/// Unified reasoning/effort level across all providers.
-/// Each provider translates this to its native format.
+/// Unified reasoning/effort level across all providers. Each provider
+/// translates this to its native format. The `xhigh` alias for `Max`
+/// is accepted for OpenAI-flavored agent files (their native ladder
+/// uses `xhigh` for the top rung); `max` is the canonical form.
+/// `Auto` requests the provider's adaptive/dynamic budget — Anthropic
+/// emits `thinking.type: "adaptive"`, Gemini sends `thinkingBudget:
+/// -1`, OpenAI / Copilot omit the reasoning field entirely (their
+/// server picks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
+    #[serde(alias = "adaptive")]
+    Auto,
     Minimal,
     Low,
     Medium,
     High,
+    #[serde(alias = "xhigh")]
     Max,
+}
+
+/// Desired context-window size for a request. Each provider maps this
+/// to the right beta header / generation setting. Currently rupu
+/// recognizes the default and the 1M-token tier (Anthropic Sonnet/Opus 4
+/// via `context-1m-2025-08-07`). Other windows are model-implicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextWindow {
+    /// Provider-default context window (Anthropic 200k, Gemini 2M, …).
+    Default,
+    /// 1M-token context window. Anthropic: enables the
+    /// `context-1m-2025-08-07` beta on the api-key path (the OAuth
+    /// path always includes it via the static beta CSV). Other
+    /// providers currently treat this as `Default` — most either
+    /// don't have a separate 1M tier or already select the large
+    /// window via model id.
+    #[serde(alias = "1m", alias = "1M", alias = "one_million")]
+    OneMillion,
 }
 
 /// Abstract model tier for provider-agnostic selection.
@@ -106,6 +134,7 @@ mod tests {
     #[test]
     fn test_thinking_level_serde_roundtrip() {
         let levels = [
+            ThinkingLevel::Auto,
             ThinkingLevel::Minimal,
             ThinkingLevel::Low,
             ThinkingLevel::Medium,
@@ -117,6 +146,28 @@ mod tests {
             let parsed: ThinkingLevel = serde_json::from_str(&json).unwrap();
             assert_eq!(*level, parsed);
         }
+    }
+
+    #[test]
+    fn test_thinking_level_aliases() {
+        // OpenAI-flavored agent files use `xhigh` for the top rung.
+        let parsed: ThinkingLevel = serde_json::from_str("\"xhigh\"").unwrap();
+        assert_eq!(parsed, ThinkingLevel::Max);
+        // `adaptive` is an alias for `auto` (Anthropic's native name).
+        let parsed: ThinkingLevel = serde_json::from_str("\"adaptive\"").unwrap();
+        assert_eq!(parsed, ThinkingLevel::Auto);
+    }
+
+    #[test]
+    fn test_context_window_aliases() {
+        let parsed: ContextWindow = serde_json::from_str("\"1m\"").unwrap();
+        assert_eq!(parsed, ContextWindow::OneMillion);
+        let parsed: ContextWindow = serde_json::from_str("\"1M\"").unwrap();
+        assert_eq!(parsed, ContextWindow::OneMillion);
+        let parsed: ContextWindow = serde_json::from_str("\"one_million\"").unwrap();
+        assert_eq!(parsed, ContextWindow::OneMillion);
+        let parsed: ContextWindow = serde_json::from_str("\"default\"").unwrap();
+        assert_eq!(parsed, ContextWindow::Default);
     }
 
     #[test]

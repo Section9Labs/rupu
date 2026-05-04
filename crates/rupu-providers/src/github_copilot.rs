@@ -285,17 +285,21 @@ impl GithubCopilotClient {
             body["tool_choice"] = serde_json::json!("auto");
         }
 
-        // Reasoning effort (same as OpenAI)
+        // Reasoning effort (same as OpenAI). `Auto` omits the field so
+        // the model picks; Copilot's API behaves like OpenAI here.
         if let Some(level) = &request.thinking {
             use crate::model_tier::ThinkingLevel;
             let effort = match level {
-                ThinkingLevel::Minimal => "minimal",
-                ThinkingLevel::Low => "low",
-                ThinkingLevel::Medium => "medium",
-                ThinkingLevel::High => "high",
-                ThinkingLevel::Max => "xhigh",
+                ThinkingLevel::Auto => None,
+                ThinkingLevel::Minimal => Some("minimal"),
+                ThinkingLevel::Low => Some("low"),
+                ThinkingLevel::Medium => Some("medium"),
+                ThinkingLevel::High => Some("high"),
+                ThinkingLevel::Max => Some("xhigh"),
             };
-            body["reasoning_effort"] = serde_json::json!(effort);
+            if let Some(e) = effort {
+                body["reasoning_effort"] = serde_json::json!(e);
+            }
         }
 
         body
@@ -813,6 +817,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -846,6 +851,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -870,6 +876,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::High),
+            context_window: None,
             task_type: None,
         };
 
@@ -891,6 +898,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -1114,6 +1122,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 

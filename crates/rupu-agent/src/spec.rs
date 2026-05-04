@@ -6,6 +6,7 @@
 //! `maxTurns`, `permissionMode`). Unknown fields are rejected at parse
 //! time so typos like `permision_mode` surface as errors.
 
+use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::AuthMode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -45,6 +46,23 @@ struct Frontmatter {
     /// resolved provider/auth is not Anthropic OAuth.
     #[serde(default, rename = "anthropicOauthPrefix")]
     anthropic_oauth_prefix: Option<bool>,
+    /// Reasoning / thinking effort level. Accepts the canonical
+    /// `auto|minimal|low|medium|high|max` plus aliases `adaptive`
+    /// (= auto) and `xhigh` (= max). Each provider maps to its native
+    /// shape — Anthropic emits `thinking.type: adaptive` for `auto`
+    /// and `thinking.budget_tokens: <n>` for the rest; OpenAI / Copilot
+    /// emit `reasoning.effort: <name>`; Gemini emits
+    /// `generationConfig.thinkingConfig.thinkingBudget: <budget>`.
+    #[serde(default)]
+    effort: Option<ThinkingLevel>,
+    /// Desired context-window tier. `default` or omitted picks the
+    /// model's native window; `1m` (alias `1M`, `one_million`) opts
+    /// into the 1M-token window. Anthropic Sonnet/Opus 4 honor this on
+    /// the api-key path by adding the `context-1m-2025-08-07` beta;
+    /// the OAuth path always includes that beta via the static CSV.
+    /// Other providers ignore this for now.
+    #[serde(default, rename = "contextWindow")]
+    context_window: Option<ContextWindow>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -59,6 +77,8 @@ pub struct AgentSpec {
     pub max_turns: Option<u32>,
     pub permission_mode: Option<String>,
     pub anthropic_oauth_prefix: Option<bool>,
+    pub effort: Option<ThinkingLevel>,
+    pub context_window: Option<ContextWindow>,
     pub system_prompt: String,
 }
 
@@ -90,6 +110,8 @@ impl AgentSpec {
             max_turns: fm.max_turns,
             permission_mode: fm.permission_mode,
             anthropic_oauth_prefix: fm.anthropic_oauth_prefix,
+            effort: fm.effort,
+            context_window: fm.context_window,
             system_prompt: body.to_string(),
         })
     }

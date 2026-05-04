@@ -32,6 +32,8 @@ async fn run_passes_all_six_default_tools_to_provider() {
         user_message: "go".into(),
         mode_str: "bypass".into(),
         no_stream: false,
+        effort: None,
+        context_window: None,
     };
 
     run_agent(opts).await.unwrap();
@@ -101,6 +103,8 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         user_message: "go".into(),
         mode_str: "bypass".into(),
         no_stream: false,
+        effort: None,
+        context_window: None,
     };
 
     run_agent(opts).await.unwrap();

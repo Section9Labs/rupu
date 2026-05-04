@@ -63,6 +63,7 @@ impl From<LlmRequestWire> for LlmRequest {
             cell_id: w.cell_id,
             trace_id: w.trace_id,
             thinking: w.thinking,
+            context_window: None,
             task_type: None,
         }
     }
@@ -184,6 +185,7 @@ mod tests {
             cell_id: Some("cell".into()),
             trace_id: Some("trace".into()),
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let wire = LlmRequestWire::from(&request);

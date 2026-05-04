@@ -246,21 +246,34 @@ impl GoogleGeminiClient {
             "maxOutputTokens": request.max_tokens,
         });
 
-        // Thinking config
+        // Thinking config. `Auto` uses Gemini's dynamic-budget sentinel
+        // (`thinkingBudget: -1`); the level field is omitted in that
+        // case because the server picks.
         if let Some(level) = &request.thinking {
             use crate::model_tier::ThinkingLevel;
-            let (level_str, budget) = match level {
-                ThinkingLevel::Minimal => ("MINIMAL", 128),
-                ThinkingLevel::Low => ("LOW", 2048),
-                ThinkingLevel::Medium => ("MEDIUM", 8192),
-                ThinkingLevel::High => ("HIGH", 32768),
-                ThinkingLevel::Max => ("HIGH", 32768), // clamped to High for Google
+            gen_config["thinkingConfig"] = match level {
+                ThinkingLevel::Auto => serde_json::json!({
+                    "includeThoughts": true,
+                    "thinkingBudget": -1,
+                }),
+                _ => {
+                    let (level_str, budget) = match level {
+                        ThinkingLevel::Minimal => ("MINIMAL", 128),
+                        ThinkingLevel::Low => ("LOW", 2048),
+                        ThinkingLevel::Medium => ("MEDIUM", 8192),
+                        ThinkingLevel::High => ("HIGH", 32768),
+                        // Gemini's API caps thinkingBudget at 32768; Max
+                        // is clamped to High for now.
+                        ThinkingLevel::Max => ("HIGH", 32768),
+                        ThinkingLevel::Auto => unreachable!(),
+                    };
+                    serde_json::json!({
+                        "includeThoughts": true,
+                        "thinkingLevel": level_str,
+                        "thinkingBudget": budget,
+                    })
+                }
             };
-            gen_config["thinkingConfig"] = serde_json::json!({
-                "includeThoughts": true,
-                "thinkingLevel": level_str,
-                "thinkingBudget": budget,
-            });
         }
 
         inner_request["generationConfig"] = gen_config;
@@ -765,6 +778,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -796,6 +810,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -821,6 +836,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -846,6 +862,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::Medium),
+            context_window: None,
             task_type: None,
         };
 
@@ -870,6 +887,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::Max),
+            context_window: None,
             task_type: None,
         };
 
@@ -1121,6 +1139,7 @@ mod tests {
                 cell_id: None,
                 trace_id: None,
                 thinking: Some(level),
+                context_window: None,
                 task_type: None,
             };
             let body = client.build_request_body(&request);

@@ -33,6 +33,8 @@ async fn happy_path_one_turn_no_tools() {
         user_message: "say hi".into(),
         mode_str: "bypass".into(),
         no_stream: false,
+        effort: None,
+        context_window: None,
     };
 
     let res = run_agent(opts).await.unwrap();
