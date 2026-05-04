@@ -49,6 +49,42 @@ fn accepts_when_expression() {
 }
 
 #[test]
+fn accepts_for_each_with_max_parallel() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: a
+    actions: []
+    for_each: "{{ inputs.files }}"
+    max_parallel: 4
+    prompt: "review {{ item }}"
+"#;
+    let wf = Workflow::parse(s).expect("for_each + max_parallel should parse");
+    assert_eq!(wf.steps[0].for_each.as_deref(), Some("{{ inputs.files }}"));
+    assert_eq!(wf.steps[0].max_parallel, Some(4));
+}
+
+#[test]
+fn rejects_max_parallel_zero() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: a
+    actions: []
+    for_each: "{{ inputs.files }}"
+    max_parallel: 0
+    prompt: "x"
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("max_parallel") && err.contains("at least 1"),
+        "expected max_parallel validation error, got: {err}"
+    );
+}
+
+#[test]
 fn accepts_continue_on_error_per_step() {
     let s = "name: x\nsteps:\n  - id: a\n    agent: a\n    continue_on_error: true\n    actions: []\n    prompt: hi\n";
     let wf = Workflow::parse(s).expect("continue_on_error: should parse");

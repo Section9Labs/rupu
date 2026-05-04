@@ -2,12 +2,11 @@
 //!
 //! Supports linear orchestrations with conditional step execution
 //! (`when:`), per-step / workflow-level error tolerance
-//! (`continue_on_error`), typed workflow inputs (`inputs:`), and
-//! a `trigger:` declaration (manual / cron / event). The cron
-//! runtime and event-webhook receiver are deferred (this PR only
-//! parses + validates the declaration; manual is the existing
-//! behavior). Parallel steps + panel steps also deferred — see
-//! TODO.md.
+//! (`continue_on_error`), typed workflow inputs (`inputs:`), a
+//! `trigger:` declaration (manual / cron / event), and data fan-out
+//! (`for_each:`) — one agent dispatched across N items in parallel
+//! with results aggregated into `steps.<id>.results[*]`. Panel steps
+//! still deferred — see TODO.md.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,6 +43,8 @@ pub enum WorkflowParseError {
         kind: &'static str,
         field: &'static str,
     },
+    #[error("step `{step}`: `max_parallel` must be at least 1, got {value}")]
+    InvalidMaxParallel { step: String, value: i64 },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -173,9 +174,33 @@ pub struct Step {
     pub when: Option<String>,
     /// When `Some(true)`, a failure in this step is logged and the
     /// workflow continues to the next step. Overrides
-    /// `WorkflowDefaults.continue_on_error`.
+    /// `WorkflowDefaults.continue_on_error`. For fan-out steps,
+    /// applies per-item: a failed item is recorded with `success=false`
+    /// and the remaining items still dispatch.
     #[serde(default)]
     pub continue_on_error: Option<bool>,
+    /// Optional minijinja expression that, when rendered against the
+    /// step context, yields a list of items to fan out across. Each
+    /// item is dispatched to the same `agent:` with the same
+    /// `prompt:` template, except the prompt also binds `{{item}}`
+    /// (the current value) and `{{loop.index}}` (1-based).
+    ///
+    /// The renderer accepts:
+    /// - a YAML / JSON array (parsed when the rendered string starts
+    ///   with `[`),
+    /// - one item per non-empty line otherwise.
+    ///
+    /// Per-item results are bound as `steps.<id>.results[*]` (a list
+    /// of strings — each item's final assistant text) and
+    /// `steps.<id>.output` is the JSON array of those strings, so
+    /// existing template paths still see *something* useful.
+    #[serde(default)]
+    pub for_each: Option<String>,
+    /// Cap on concurrent in-flight item runs for a fan-out step. `None`
+    /// (the default) is treated as 1 — items dispatch serially in
+    /// declared order. Ignored for non-fan-out steps. Must be >= 1.
+    #[serde(default)]
+    pub max_parallel: Option<u32>,
     pub prompt: String,
 }
 
@@ -207,10 +232,10 @@ impl Workflow {
     /// defaults / enum constraints; returns clear errors on failure.
     pub fn parse(s: &str) -> Result<Self, WorkflowParseError> {
         // Pre-scan for keys that are still deferred (panel steps,
-        // explicit parallelism, gates). `when:` and
-        // `continue_on_error:` are now supported; do NOT include them
-        // in the unsupported list.
-        for key in ["parallel", "for_each", "panelists", "gates"] {
+        // explicit `parallel:` substep blocks, approval gates). `when:`,
+        // `continue_on_error:`, and `for_each:` are now supported; do
+        // NOT include them in the unsupported list.
+        for key in ["parallel", "panelists", "gates"] {
             for line in s.lines() {
                 let trimmed = line.trim_start();
                 if trimmed.starts_with(&format!("{key}:")) {
@@ -227,6 +252,14 @@ impl Workflow {
         for step in &wf.steps {
             if !seen.insert(step.id.clone()) {
                 return Err(WorkflowParseError::DuplicateStep(step.id.clone()));
+            }
+            if let Some(mp) = step.max_parallel {
+                if mp < 1 {
+                    return Err(WorkflowParseError::InvalidMaxParallel {
+                        step: step.id.clone(),
+                        value: mp as i64,
+                    });
+                }
             }
         }
         for (name, def) in &wf.inputs {
@@ -408,7 +441,6 @@ pub(crate) fn yaml_scalar_to_string(v: &serde_yaml::Value) -> String {
 fn leak(key: &str) -> &'static str {
     match key {
         "parallel" => "parallel",
-        "for_each" => "for_each",
         "panelists" => "panelists",
         "gates" => "gates",
         _ => "unknown",

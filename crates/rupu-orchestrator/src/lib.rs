@@ -15,11 +15,11 @@ pub mod workflow;
 
 pub use action_protocol::{validate_actions, ActionValidationResult};
 pub use runner::{
-    run_workflow, OrchestratorRunOpts, OrchestratorRunResult, RunWorkflowError, StepFactory,
-    StepResult,
+    run_workflow, ItemResult, OrchestratorRunOpts, OrchestratorRunResult, RunWorkflowError,
+    StepFactory, StepResult,
 };
 pub use templates::{
-    render_step_prompt, render_when_expression, RenderError, StepContext, StepOutput,
+    render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,
 };
 pub use workflow::{
     InputDef, InputType, Step, Trigger, TriggerKind, Workflow, WorkflowDefaults, WorkflowParseError,
