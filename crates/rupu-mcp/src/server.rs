@@ -130,10 +130,10 @@ mod tests {
         let resp = client.recv().await.unwrap().unwrap();
         assert_eq!(resp["id"], 2);
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(
-            tools.len(),
-            0,
-            "Task 9 ships empty placeholder; Task 11+ adds entries"
+        assert!(
+            tools.len() >= 10,
+            "Task 11 adds 10 SCM tools; got {} entries",
+            tools.len()
         );
 
         // tools/call returns the not-yet-wired error gracefully (no panic)
