@@ -14,6 +14,9 @@ pub mod layer;
 
 pub mod provider_config;
 
+pub mod scm_config;
+
 pub use config::{BashConfig, Config, RetryConfig};
 pub use layer::{layer_files, LayerError};
 pub use provider_config::{CustomModel, ProviderConfig};
+pub use scm_config::{IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmSection};

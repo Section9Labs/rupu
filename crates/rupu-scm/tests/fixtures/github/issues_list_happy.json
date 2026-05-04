@@ -1,0 +1,52 @@
+[
+  {
+    "id": 99,
+    "node_id": "I_99",
+    "url": "https://api.github.com/repos/section9labs/rupu/issues/123",
+    "repository_url": "https://api.github.com/repos/section9labs/rupu",
+    "labels_url": "https://api.github.com/repos/section9labs/rupu/issues/123/labels{/name}",
+    "comments_url": "https://api.github.com/repos/section9labs/rupu/issues/123/comments",
+    "events_url": "https://api.github.com/repos/section9labs/rupu/issues/123/events",
+    "html_url": "https://github.com/section9labs/rupu/issues/123",
+    "number": 123,
+    "state": "open",
+    "title": "Investigate flaky test",
+    "body": "...",
+    "labels": [
+      {
+        "id": 1,
+        "node_id": "LA_1",
+        "url": "https://api.github.com/repos/section9labs/rupu/labels/bug",
+        "name": "bug",
+        "color": "d73a4a",
+        "default": true
+      }
+    ],
+    "user": {
+      "login": "matias",
+      "id": 1,
+      "node_id": "U_1",
+      "avatar_url": "https://avatars.githubusercontent.com/u/1",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/matias",
+      "html_url": "https://github.com/matias",
+      "followers_url": "https://api.github.com/users/matias/followers",
+      "following_url": "https://api.github.com/users/matias/following{/other_user}",
+      "gists_url": "https://api.github.com/users/matias/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/matias/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/matias/subscriptions",
+      "organizations_url": "https://api.github.com/users/matias/orgs",
+      "repos_url": "https://api.github.com/users/matias/repos",
+      "events_url": "https://api.github.com/users/matias/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/matias/received_events",
+      "type": "User",
+      "site_admin": false
+    },
+    "assignees": [],
+    "author_association": "OWNER",
+    "locked": false,
+    "comments": 0,
+    "created_at": "2026-05-01T09:00:00Z",
+    "updated_at": "2026-05-02T09:00:00Z"
+  }
+]

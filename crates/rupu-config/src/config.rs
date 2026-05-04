@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::provider_config::ProviderConfig;
+use crate::scm_config::{IssuesSection, ScmSection};
 
 /// Top-level rupu configuration. Loaded from `~/.rupu/config.toml`
 /// (global) and optionally overridden by `<repo>/.rupu/config.toml`
@@ -24,6 +25,10 @@ pub struct Config {
     pub retry: RetryConfig,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub scm: ScmSection,
+    #[serde(default)]
+    pub issues: IssuesSection,
 }
 
 /// Bash tool configuration.

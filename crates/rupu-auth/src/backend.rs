@@ -19,6 +19,8 @@ pub enum ProviderId {
     Gemini,
     Copilot,
     Local,
+    Github,
+    Gitlab,
 }
 
 impl ProviderId {
@@ -31,6 +33,8 @@ impl ProviderId {
             Self::Gemini => "gemini",
             Self::Copilot => "copilot",
             Self::Local => "local",
+            Self::Github => "github",
+            Self::Gitlab => "gitlab",
         }
     }
 }
@@ -82,5 +86,28 @@ mod gemini_id_tests {
         assert_eq!(json, "\"gemini\"");
         let parsed: ProviderId = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, ProviderId::Gemini);
+    }
+}
+
+#[cfg(test)]
+mod scm_provider_id_tests {
+    use super::*;
+
+    #[test]
+    fn github_string_form() {
+        assert_eq!(ProviderId::Github.as_str(), "github");
+    }
+
+    #[test]
+    fn gitlab_string_form() {
+        assert_eq!(ProviderId::Gitlab.as_str(), "gitlab");
+    }
+
+    #[test]
+    fn github_serde_roundtrip() {
+        let json = serde_json::to_string(&ProviderId::Github).unwrap();
+        assert_eq!(json, "\"github\"");
+        let p: ProviderId = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, ProviderId::Github);
     }
 }

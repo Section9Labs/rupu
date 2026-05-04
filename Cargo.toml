@@ -6,6 +6,7 @@ members = [
     "crates/rupu-workspace",
     "crates/rupu-auth",
     "crates/rupu-providers",
+    "crates/rupu-scm",
     "crates/rupu-tools",
     "crates/rupu-agent",
     "crates/rupu-orchestrator",
@@ -26,8 +27,9 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
 serde_yaml = "0.9"
+schemars = { version = "0.8", features = ["chrono"] }
+toml = "0.8"
 
 # Errors
 thiserror = "2"
@@ -46,10 +48,14 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "http2
 async-trait = "0.1"
 futures-util = "0.3"
 fs2 = "0.4"
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2", "vendored-openssl"] }
+octocrab = "0.42"
+http = "1"
 
 # Crypto (lifted)
 ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
 base64 = "0.22"
+lru = "0.12"
 
 # CLI / templating (used in Plan 2 but pinned now for cohesion)
 clap = { version = "4", features = ["derive"] }

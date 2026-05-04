@@ -1,0 +1,12 @@
+{
+  "id": 1,
+  "name": "rupu",
+  "full_name": "section9labs/rupu",
+  "owner": null,
+  "private": true,
+  "default_branch": "main",
+  "url": "https://api.github.com/repos/section9labs/rupu",
+  "clone_url": "https://github.com/section9labs/rupu.git",
+  "ssh_url": "git@github.com:section9labs/rupu.git",
+  "description": "agentic coding CLI"
+}
