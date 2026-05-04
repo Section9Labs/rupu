@@ -1,0 +1,15 @@
+{
+  "id": 11,
+  "iid": 42,
+  "state": "opened",
+  "changes": [
+    {
+      "old_path": "src/main.rs",
+      "new_path": "src/main.rs",
+      "diff": "@@ -0,0 +1 @@\n+fn main() { println!(\"hi\"); }\n",
+      "new_file": false,
+      "renamed_file": false,
+      "deleted_file": false
+    }
+  ]
+}

@@ -20,7 +20,7 @@ use crate::connectors::RepoConnector;
 use crate::error::ScmError;
 use crate::platform::Platform;
 use crate::types::{
-    Branch, Comment, CreatePr, Diff, FileContent, Pr, PrFilter, PrRef, Repo, RepoRef,
+    Branch, Comment, CreatePr, Diff, FileContent, Pr, PrFilter, PrRef, PrState, Repo, RepoRef,
 };
 
 use super::client::GitlabClient;
@@ -120,6 +120,73 @@ fn translate_branch(v: &serde_json::Value) -> Result<Branch, ScmError> {
     })
 }
 
+fn translate_mr_to_pr(repo: RepoRef, v: &serde_json::Value) -> Result<Pr, ScmError> {
+    let iid = v
+        .get("iid")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| ScmError::BadRequest {
+            message: "merge request missing iid".into(),
+        })?;
+    let state_str = v.get("state").and_then(|x| x.as_str()).unwrap_or("opened");
+    let state = match state_str {
+        "opened" => PrState::Open,
+        "merged" => PrState::Merged,
+        _ => PrState::Closed,
+    };
+    let title = v
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let body = v
+        .get("description")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let head_branch = v
+        .get("source_branch")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let base_branch = v
+        .get("target_branch")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let author = v
+        .get("author")
+        .and_then(|a| a.get("username"))
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let created_at = v
+        .get("created_at")
+        .and_then(|x| x.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+    let updated_at = v
+        .get("updated_at")
+        .and_then(|x| x.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+    Ok(Pr {
+        r: PrRef {
+            repo,
+            number: iid as u32,
+        },
+        title,
+        body,
+        state,
+        head_branch,
+        base_branch,
+        author,
+        created_at,
+        updated_at,
+    })
+}
+
 #[async_trait]
 impl RepoConnector for GitlabRepoConnector {
     fn platform(&self) -> Platform {
@@ -203,14 +270,90 @@ impl RepoConnector for GitlabRepoConnector {
             encoding: crate::types::FileEncoding::Utf8,
         })
     }
-    async fn list_prs(&self, _r: &RepoRef, _filter: PrFilter) -> Result<Vec<Pr>, ScmError> {
-        unimplemented!("subtask 4d")
+    async fn list_prs(&self, r: &RepoRef, filter: PrFilter) -> Result<Vec<Pr>, ScmError> {
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&r.owner, &r.repo);
+        let mut path = format!("/projects/{id}/merge_requests?per_page=100");
+        if let Some(state) = filter.state {
+            let s = match state {
+                PrState::Open => "opened",
+                PrState::Closed | PrState::Merged => "closed",
+            };
+            path.push_str(&format!("&state={s}"));
+        }
+        if let Some(author) = filter.author.as_ref() {
+            path.push_str(&format!("&author_username={author}"));
+        }
+        let body = self.client.get_json(&path).await?;
+        let arr = body.as_array().ok_or_else(|| ScmError::BadRequest {
+            message: "expected array from /merge_requests".into(),
+        })?;
+        let repo_ref = r.clone();
+        arr.iter()
+            .map(|v| translate_mr_to_pr(repo_ref.clone(), v))
+            .collect()
     }
-    async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
-        unimplemented!("subtask 4d")
+    async fn get_pr(&self, p: &PrRef) -> Result<Pr, ScmError> {
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&p.repo.owner, &p.repo.repo);
+        let body = self
+            .client
+            .get_json(&format!("/projects/{id}/merge_requests/{}", p.number))
+            .await?;
+        translate_mr_to_pr(p.repo.clone(), &body)
     }
-    async fn diff_pr(&self, _p: &PrRef) -> Result<Diff, ScmError> {
-        unimplemented!("subtask 4d")
+    async fn diff_pr(&self, p: &PrRef) -> Result<Diff, ScmError> {
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&p.repo.owner, &p.repo.repo);
+        let body = self
+            .client
+            .get_json(&format!(
+                "/projects/{id}/merge_requests/{}/changes",
+                p.number
+            ))
+            .await?;
+        let changes = body
+            .get("changes")
+            .and_then(|c| c.as_array())
+            .ok_or_else(|| ScmError::BadRequest {
+                message: "expected `changes` array on MR".into(),
+            })?;
+        let files_changed = changes.len() as u32;
+        let mut additions = 0u32;
+        let mut deletions = 0u32;
+        let mut patch = String::new();
+        for ch in changes {
+            let new_path = ch
+                .get("new_path")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default();
+            let old_path = ch
+                .get("old_path")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default();
+            let raw_diff = ch.get("diff").and_then(|x| x.as_str()).unwrap_or_default();
+            if !patch.is_empty() {
+                patch.push('\n');
+            }
+            patch.push_str(&format!("diff --git a/{old_path} b/{new_path}\n"));
+            patch.push_str(raw_diff);
+            for line in raw_diff.lines() {
+                if line.starts_with("+++") || line.starts_with("---") {
+                    continue;
+                }
+                if line.starts_with('+') {
+                    additions += 1;
+                } else if line.starts_with('-') {
+                    deletions += 1;
+                }
+            }
+        }
+        Ok(Diff {
+            patch,
+            files_changed,
+            additions,
+            deletions,
+        })
     }
     async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
         unimplemented!("subtask 4f")
