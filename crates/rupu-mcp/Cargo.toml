@@ -1,0 +1,31 @@
+[package]
+name = "rupu-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["io-util", "io-std", "rt-multi-thread", "macros", "sync"] }
+async-trait.workspace = true
+chrono.workspace = true
+
+# In-workspace
+rupu-scm = { path = "../rupu-scm" }
+rupu-tools = { path = "../rupu-tools" }
+rupu-config = { path = "../rupu-config" }
+
+[dev-dependencies]
+tempfile.workspace = true
+jsonschema.workspace = true
+serde_json.workspace = true
