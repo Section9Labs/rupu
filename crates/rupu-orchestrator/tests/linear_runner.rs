@@ -76,6 +76,7 @@ async fn second_step_sees_first_step_output_via_template() {
         workspace_path: tmp.path().to_path_buf(),
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FakeFactory),
+        event: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -83,5 +84,44 @@ async fn second_step_sees_first_step_output_via_template() {
     assert!(
         b_prompt.contains("step a echo: First step says: hello A"),
         "step b should see step a's output, got: {b_prompt}"
+    );
+}
+
+const WF_EVENT: &str = r#"
+name: event-aware
+trigger:
+  on: event
+  event: github.pr.opened
+steps:
+  - id: greet
+    agent: ag
+    actions: []
+    prompt: |
+      reviewing PR #{{ event.pull_request.number }} on {{ event.repository.full_name }}
+"#;
+
+#[tokio::test]
+async fn event_payload_is_visible_in_step_prompts() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(WF_EVENT).unwrap();
+    let event = serde_json::json!({
+        "pull_request": { "number": 99 },
+        "repository": { "full_name": "Section9Labs/rupu" }
+    });
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_orch_evt".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FakeFactory),
+        event: Some(event),
+    };
+    let res = run_workflow(opts).await.unwrap();
+    assert_eq!(res.step_results.len(), 1);
+    let prompt = &res.step_results[0].rendered_prompt;
+    assert!(
+        prompt.contains("PR #99") && prompt.contains("Section9Labs/rupu"),
+        "step prompt should bind {{event.*}} fields, got: {prompt}"
     );
 }

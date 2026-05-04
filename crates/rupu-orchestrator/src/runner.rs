@@ -85,6 +85,11 @@ pub struct OrchestratorRunOpts {
     /// Directory where per-step transcript files are written.
     pub transcript_dir: PathBuf,
     pub factory: Arc<dyn StepFactory>,
+    /// Event payload that triggered this run, if any. Populated by
+    /// the webhook receiver; `None` for manual / cron-triggered
+    /// runs. Bound as `{{event.*}}` in step prompts and `when:`
+    /// expressions.
+    pub event: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +126,7 @@ pub async fn run_workflow(
         // Build template context from inputs + prior step outputs.
         let mut ctx = StepContext::new();
         ctx.inputs = resolved_inputs.clone();
+        ctx.event = opts.event.clone();
         for prior in &step_results {
             ctx.steps.insert(
                 prior.step_id.clone(),

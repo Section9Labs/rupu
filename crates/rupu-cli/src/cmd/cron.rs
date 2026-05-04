@@ -128,7 +128,9 @@ async fn tick(dry_run: bool) -> anyhow::Result<()> {
             );
         }
         let inputs: Vec<(String, String)> = Vec::new();
-        if let Err(e) = super::workflow::run_by_name(&w.name, inputs, None).await {
+        // Cron-triggered runs have no event payload, so `{{event.*}}`
+        // bindings render as empty strings.
+        if let Err(e) = super::workflow::run_by_name(&w.name, inputs, None, None).await {
             warn!(workflow = %w.name, error = %e, "workflow run failed");
         }
     }

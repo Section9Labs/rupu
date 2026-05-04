@@ -56,7 +56,7 @@ pub async fn handle(action: Action) -> ExitCode {
     let result = match action {
         Action::List => list().await,
         Action::Show { name } => show(&name).await,
-        Action::Run { name, input, mode } => run(&name, input, mode.as_deref()).await,
+        Action::Run { name, input, mode } => run(&name, input, mode.as_deref(), None).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -129,18 +129,27 @@ fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Public wrapper around the workflow-run pipeline so other
-/// subcommands (notably `rupu cron tick`) can invoke a workflow by
-/// name without going through the clap layer. Same behavior as
-/// `rupu workflow run <name>`.
+/// subcommands (notably `rupu cron tick` and the webhook receiver)
+/// can invoke a workflow by name without going through the clap
+/// layer. Same behavior as `rupu workflow run <name>`. The optional
+/// `event` argument carries the SCM-vendor JSON payload that
+/// triggered the run (when applicable); it lands as `{{event.*}}`
+/// bindings in step prompts and `when:` filters.
 pub async fn run_by_name(
     name: &str,
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
+    event: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    run(name, inputs, mode).await
+    run(name, inputs, mode, event).await
 }
 
-async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> anyhow::Result<()> {
+async fn run(
+    name: &str,
+    inputs: Vec<(String, String)>,
+    mode: Option<&str>,
+    event: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
     let workflow = Workflow::parse(&body)?;
@@ -191,6 +200,7 @@ async fn run(name: &str, inputs: Vec<(String, String)>, mode: Option<&str>) -> a
         workspace_path: pwd.clone(),
         transcript_dir: transcripts,
         factory,
+        event,
     };
 
     let result = run_workflow(opts).await?;
