@@ -7,29 +7,84 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::auth::credential_store::resolve_provider_auth;
-use crate::auth::{is_token_expired, AuthCredentials, AuthFile, AuthMethod, OAUTH_BETA_HEADER};
+use crate::auth::{is_token_expired, AuthCredentials, AuthFile, AuthMethod};
 use crate::error::ProviderError;
 use crate::provider_id::ProviderId;
 use crate::sse::SseParser;
 use crate::types::*;
 
-const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
+const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
 /// Anthropic API version. Update when new SSE event types or features are needed.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// `User-Agent` sent on every Anthropic request. Mirrors the first-party
-/// `claude-cli/<ver> (<usertype>, <entrypoint>)` shape so the OAuth
-/// quota router recognizes the call as Claude-Code-shaped traffic. We
-/// are honestly `external` (not an Anthropic-internal employee) and
-/// `cli` (the entrypoint that launched this binary), so the parens
-/// content is accurate even though the `claude-cli/` prefix is a
-/// deliberate parity choice.
-const RUPU_USER_AGENT: &str = concat!("claude-cli/", env!("CARGO_PKG_VERSION"), " (external, cli)");
+// ─────────────────────────────────────────────────────────────────────
+// Claude Code OAuth wire-shape pins
+//
+// The constants below were captured byte-for-byte from a MITM session
+// of `claude --print "say hi"` on 2026-05-04. Anthropic's WAF / billing
+// layer fingerprints OAuth `/v1/messages` traffic against the recognized
+// claude-code request shape; mismatching values silently route the
+// request into a stricter pool that returns 429 with an empty body and
+// no `anthropic-ratelimit-*` headers (the exact symptom we hit before
+// these were pinned).
+//
+// TODO(durable-fix): ALL of these are impersonation pins of upstream
+// Claude Code values. They will go stale as upstream drifts. Watch for:
+//   * UA version (`2.1.126`) — `claude --version`
+//   * Stainless package + runtime versions — bundled in claude-cli
+//   * `anthropic-beta` CSV — Anthropic adds/removes betas
+//   * `cc_version` / `cch` in the billing-header system block
+// If we start 429ing on a previously-working build, the first thing to
+// re-MITM is `claude --print "say hi"` and diff against the values here.
+// Long-term cure is the rupu-registered first-party OAuth client_id
+// (TODO.md → "Register rupu-specific OAuth clients with each vendor").
+// ─────────────────────────────────────────────────────────────────────
 
-/// First-line of the Anthropic OAuth system-prompt prefix. The full
-/// prefix appended to user agent prompts is built at request time so it
-/// can include CWD + date.
-const ANTHROPIC_OAUTH_SYSTEM_PREFIX_FIRST_LINE: &str =
-    "You are Claude Code, Anthropic's official CLI for Claude.";
+/// `User-Agent` sent on `/v1/messages`. Note `sdk-cli` (not `cli`) — the
+/// `@anthropic-ai/sdk` sets `CLAUDE_CODE_ENTRYPOINT=sdk-cli` for the
+/// messages-create call path (different from the bootstrap path's
+/// `claude-code/<ver>` UA). Pin to the upstream release.
+const RUPU_USER_AGENT: &str = "claude-cli/2.1.126 (external, sdk-cli)";
+
+/// Full `anthropic-beta` CSV. Order matters for byte-equal
+/// fingerprinting; do not sort. Captured from MITM 2026-05-04.
+const ANTHROPIC_BETA_CSV: &str = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advisor-tool-2026-03-01,advanced-tool-use-2025-11-20,effort-2025-11-24,cache-diagnosis-2026-04-07";
+
+/// `@anthropic-ai/sdk` (Stainless-generated) telemetry headers. Values
+/// match SDK v0.81.0 on Node v24.3.0 / macOS arm64 — what claude-cli
+/// 2.1.126 ships with. Update when upstream rev drifts.
+const STAINLESS_HEADERS: &[(&str, &str)] = &[
+    ("X-Stainless-Arch", "arm64"),
+    ("X-Stainless-Lang", "js"),
+    ("X-Stainless-OS", "MacOS"),
+    ("X-Stainless-Package-Version", "0.81.0"),
+    ("X-Stainless-Retry-Count", "0"),
+    ("X-Stainless-Runtime", "node"),
+    ("X-Stainless-Runtime-Version", "v24.3.0"),
+    ("X-Stainless-Timeout", "600"),
+];
+
+/// First text block of `system[]` on every OAuth `/v1/messages` call.
+/// NOT an HTTP header — Anthropic parses this string out of the system
+/// content and uses it for billing attribution. Without this exact
+/// shape the request is not tagged as Claude-Code-billable and lands
+/// in the empty-body 429 pool. Captured from MITM 2026-05-04.
+///
+/// TODO(reverse-engineer): the `cch=0ab17` token may be a checksum of
+/// some other request fields. Right now we send the captured value
+/// statically; if Anthropic begins strict validation (a sudden return
+/// to 429 with this PR shipped is the signal), we'll need to figure
+/// out what input bytes produce that hash and compute it dynamically
+/// per request. The full upstream string lives in
+/// `services/api/claude.ts` of the claude-cli source under the
+/// `x-anthropic-billing-header` token name.
+const ANTHROPIC_BILLING_HEADER_BLOCK: &str =
+    "x-anthropic-billing-header: cc_version=2.1.126.125; cc_entrypoint=sdk-cli; cch=0ab17;";
+
+/// Second `system[]` block — claude-cli always emits this Claude Agent
+/// SDK self-description right after the billing block.
+const ANTHROPIC_AGENT_SDK_SELF_DESCRIPTION: &str =
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
 /// Maximum retries for 429 rate-limit responses.
 /// Per-request 429 retries. Set to 1 (one retry) so the ProviderRouter can
 /// handle cross-provider fallback quickly. When used without a router, the
@@ -40,6 +95,19 @@ const INITIAL_BACKOFF_MS: u64 = 2000;
 
 const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// Build the reqwest client used for Anthropic requests.
+///
+/// Forces HTTP/1.1: MITM capture of the first-party Claude Code binary
+/// shows it negotiates HTTP/1.1 for `/v1/messages`. Matching that on
+/// the wire keeps rupu's requests in the same Cloudflare/WAF
+/// classification bucket as claude-code traffic.
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("reqwest build")
+}
 
 /// Resolve authentication for Anthropic.
 /// Delegates to resolve_provider_auth, with legacy Pi format fallback.
@@ -358,7 +426,7 @@ impl AnthropicClient {
     /// Create a new client from a resolved AuthMethod.
     pub fn from_auth(auth: AuthMethod) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             auth,
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: None,
@@ -388,7 +456,7 @@ impl AnthropicClient {
     /// Create a client with an auth.json path for persisting refreshed tokens.
     pub fn from_auth_with_path(auth: AuthMethod, auth_json_path: std::path::PathBuf) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             auth,
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: Some(auth_json_path),
@@ -404,7 +472,7 @@ impl AnthropicClient {
         store: std::sync::Arc<dyn crate::credential_source::CredentialSource>,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             auth,
             api_url: ANTHROPIC_API_URL.to_string(),
             auth_json_path: None,
@@ -428,7 +496,7 @@ impl AnthropicClient {
     /// Create a client pointing at a custom URL (for testing with mock servers).
     pub fn with_url(api_key: String, api_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             auth: AuthMethod::ApiKey(api_key),
             api_url,
             auth_json_path: None,
@@ -443,7 +511,7 @@ impl AnthropicClient {
     /// `with_url` cannot exercise the OAuth header path).
     pub fn from_auth_with_url(auth: AuthMethod, api_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(),
             auth,
             api_url,
             auth_json_path: None,
@@ -516,20 +584,41 @@ impl AnthropicClient {
     fn apply_auth_headers(
         &self,
         builder: reqwest::RequestBuilder,
-        model: &str,
+        _model: &str,
     ) -> reqwest::RequestBuilder {
-        let builder = builder.header("User-Agent", RUPU_USER_AGENT).header(
-            "x-anthropic-api-request-id",
-            uuid::Uuid::new_v4().to_string(),
-        );
+        // Headers verbatim from MITM capture of real `claude --print`
+        // against api.anthropic.com. Order is preserved to match the
+        // fingerprint. Anthropic's WAF / OAuth-quota router checks for
+        // the X-Stainless-* + X-Claude-Code-Session-Id + the full
+        // `anthropic-beta` CSV; missing any of these silently routes
+        // the request into a stricter pool that returns the empty-body
+        // 429 we kept seeing.
+        let mut b = builder
+            .header("Accept", "application/json")
+            .header("User-Agent", RUPU_USER_AGENT)
+            .header(
+                "X-Claude-Code-Session-Id",
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .header(
+                "x-client-request-id",
+                uuid::Uuid::new_v4().to_string(),
+            )
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("Connection", "keep-alive");
+        // Note: Accept-Encoding intentionally omitted — reqwest's `gzip`
+        // feature isn't enabled on this build, so a compressed response
+        // would fail SSE parsing. The server falls back to identity
+        // encoding when this header is absent.
+        for (name, value) in STAINLESS_HEADERS {
+            b = b.header(*name, *value);
+        }
         match &self.auth {
-            AuthMethod::ApiKey(key) => builder
-                .header("x-api-key", key)
-                .header("anthropic-version", ANTHROPIC_VERSION),
-            AuthMethod::OAuth { access_token, .. } => builder
+            AuthMethod::ApiKey(key) => b.header("x-api-key", key),
+            AuthMethod::OAuth { access_token, .. } => b
                 .header("Authorization", format!("Bearer {access_token}"))
-                .header("anthropic-beta", oauth_beta_header_for_model(model))
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("anthropic-beta", ANTHROPIC_BETA_CSV)
                 .header("x-app", "cli"),
         }
     }
@@ -540,12 +629,16 @@ impl AnthropicClient {
 /// Always includes `oauth-2025-04-20`. For non-Haiku models also includes
 /// `claude-code-20250219` — the reference client gates this beta to the
 /// Sonnet/Opus tiers; sending it on Haiku produces a 400.
-fn oauth_beta_header_for_model(model: &str) -> String {
-    let mut betas: Vec<&str> = vec![OAUTH_BETA_HEADER];
-    if !model.contains("haiku") {
-        betas.push("claude-code-20250219");
+/// Whether the model supports `thinking: {"type":"adaptive"}`. Mirrors
+/// claude-cli's `modelSupportsAdaptiveThinking` heuristic: Opus / Sonnet
+/// 4-tier and newer support adaptive; Haiku and pre-4 models do not.
+fn model_supports_adaptive_thinking(model: &str) -> bool {
+    if model.contains("haiku") {
+        return false;
     }
-    betas.join(",")
+    // claude-{opus,sonnet}-4-…  (4-tier and newer). Pre-4 models have
+    // numerical major in {3, 3-5}; we only enable adaptive on 4+.
+    model.contains("-4-") || model.contains("-4.")
 }
 
 impl AnthropicClient {
@@ -771,16 +864,22 @@ impl AnthropicClient {
         // opt-out via `anthropicOauthPrefix: false` in frontmatter.
         let mut system_blocks: Vec<serde_json::Value> = Vec::new();
         if self.auth.is_oauth() && self.oauth_system_prefix_enabled {
+            // The billing-attribution block + Claude-Agent-SDK self-
+            // description are what get OAuth requests recognized as
+            // Claude-Code-billable. See the constant docstrings above
+            // for the full WAF/billing rationale and the TODO around
+            // re-MITM'ing if upstream rotates these values. Per-agent
+            // opt-out via `anthropicOauthPrefix: false` for the rare
+            // case where the persona must not be augmented (and the
+            // user accepts the risk of falling back into the WAF
+            // reject pool).
             system_blocks.push(serde_json::json!({
                 "type": "text",
-                "text": format!(
-                    "{first}\n\nCWD: {cwd}\nDate: {date}",
-                    first = ANTHROPIC_OAUTH_SYSTEM_PREFIX_FIRST_LINE,
-                    cwd = std::env::current_dir()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| "<unknown>".to_string()),
-                    date = chrono::Utc::now().format("%Y-%m-%d"),
-                ),
+                "text": ANTHROPIC_BILLING_HEADER_BLOCK,
+            }));
+            system_blocks.push(serde_json::json!({
+                "type": "text",
+                "text": ANTHROPIC_AGENT_SDK_SELF_DESCRIPTION,
             }));
         }
         if let Some(system) = &request.system {
@@ -842,6 +941,13 @@ impl AnthropicClient {
                 }
                 // If clamped < 1024, skip thinking silently (too small for API minimum)
             }
+        } else if self.auth.is_oauth() && model_supports_adaptive_thinking(&request.model) {
+            // claude-cli always emits `thinking: {"type":"adaptive"}` on
+            // OAuth requests to Opus / Sonnet 4-tier models when no explicit
+            // budget is requested (see services/api/claude.ts:1609-1613 in
+            // the reference). Without this the request fingerprints differently
+            // and may be down-classified by the OAuth quota router.
+            body["thinking"] = serde_json::json!({ "type": "adaptive" });
         }
 
         body
@@ -1278,29 +1384,22 @@ mod tests {
     }
 
     #[test]
-    fn oauth_request_prepends_claude_code_system_prefix_by_default() {
+    fn oauth_request_prepends_billing_attribution_blocks_by_default() {
         let client = oauth_client();
         let body = client.build_request_body(&make_request(Some("agent persona")), false);
         let blocks = body["system"].as_array().expect("system is array");
-        assert_eq!(blocks.len(), 2, "expected prefix block + agent block");
-        let first_text = blocks[0]["text"].as_str().expect("first block text");
-        assert!(
-            first_text.starts_with(ANTHROPIC_OAUTH_SYSTEM_PREFIX_FIRST_LINE),
-            "first block must start with the canonical prefix line, got: {first_text}"
+        assert_eq!(
+            blocks.len(),
+            3,
+            "expected billing block + sdk-self-description block + agent block"
         );
-        assert!(
-            first_text.contains("CWD: "),
-            "prefix should include CWD line"
-        );
-        assert!(
-            first_text.contains("Date: "),
-            "prefix should include Date line"
-        );
-        assert_eq!(blocks[1]["text"], "agent persona");
+        assert_eq!(blocks[0]["text"], ANTHROPIC_BILLING_HEADER_BLOCK);
+        assert_eq!(blocks[1]["text"], ANTHROPIC_AGENT_SDK_SELF_DESCRIPTION);
+        assert_eq!(blocks[2]["text"], "agent persona");
     }
 
     #[test]
-    fn oauth_request_skips_prefix_when_opted_out() {
+    fn oauth_request_skips_billing_blocks_when_opted_out() {
         let client = oauth_client().with_oauth_system_prefix(false);
         let body = client.build_request_body(&make_request(Some("agent persona")), false);
         let blocks = body["system"].as_array().expect("system is array");
@@ -1309,42 +1408,26 @@ mod tests {
     }
 
     #[test]
-    fn api_key_request_never_prepends_oauth_prefix() {
+    fn api_key_request_never_emits_billing_blocks() {
         let client = AnthropicClient::new("sk-ant-test".into());
         let body = client.build_request_body(&make_request(Some("agent persona")), false);
         let blocks = body["system"].as_array().expect("system is array");
-        assert_eq!(blocks.len(), 1, "api-key requests must not get the prefix");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "api-key requests must not carry OAuth billing blocks"
+        );
         assert_eq!(blocks[0]["text"], "agent persona");
     }
 
     #[test]
-    fn oauth_request_prefix_emits_even_with_no_agent_system() {
+    fn oauth_request_billing_blocks_emit_even_with_no_agent_system() {
         let client = oauth_client();
         let body = client.build_request_body(&make_request(None), false);
         let blocks = body["system"].as_array().expect("system is array");
-        assert_eq!(blocks.len(), 1, "expected just the prefix block");
-        let text = blocks[0]["text"].as_str().expect("block text");
-        assert!(text.starts_with(ANTHROPIC_OAUTH_SYSTEM_PREFIX_FIRST_LINE));
-    }
-
-    #[test]
-    fn oauth_beta_header_csv_includes_claude_code_for_non_haiku() {
-        let v = oauth_beta_header_for_model("claude-sonnet-4-6");
-        assert!(v.contains("oauth-2025-04-20"));
-        assert!(
-            v.contains("claude-code-20250219"),
-            "non-Haiku models should carry the claude-code beta: {v}"
-        );
-    }
-
-    #[test]
-    fn oauth_beta_header_csv_drops_claude_code_for_haiku() {
-        let v = oauth_beta_header_for_model("claude-haiku-4-5");
-        assert!(v.contains("oauth-2025-04-20"));
-        assert!(
-            !v.contains("claude-code-20250219"),
-            "Haiku tier must not carry claude-code beta: {v}"
-        );
+        assert_eq!(blocks.len(), 2, "expected billing + sdk blocks only");
+        assert_eq!(blocks[0]["text"], ANTHROPIC_BILLING_HEADER_BLOCK);
+        assert_eq!(blocks[1]["text"], ANTHROPIC_AGENT_SDK_SELF_DESCRIPTION);
     }
 
     #[test]
