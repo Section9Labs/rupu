@@ -2721,6 +2721,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "git2",
+ "http 1.4.0",
  "httpmock",
  "lru",
  "octocrab",
