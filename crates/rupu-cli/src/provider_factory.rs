@@ -93,11 +93,24 @@ async fn build_anthropic(
     // and shoved it into an ApiKey-mode client, which routed bearer tokens
     // through the api-key header and produced a confusing "invalid x-api-key"
     // 401 for every SSO request.
+    //
+    // For OAuth, also pull `account_uuid` out of the credential's `extra`
+    // map (captured at SSO login time from the token-exchange response)
+    // and thread it into the client so it lands in `metadata.user_id` and
+    // binds the request to the user's Pro/Max quota.
+    let account_uuid = match &creds {
+        rupu_providers::auth::AuthCredentials::OAuth { extra, .. } => extra
+            .get("account_uuid")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        _ => None,
+    };
     let auth = creds.into_anthropic_auth_method();
     let client = match std::env::var("RUPU_ANTHROPIC_BASE_URL_OVERRIDE") {
         Ok(url) => rupu_providers::anthropic::AnthropicClient::from_auth_with_url(auth, url),
         Err(_) => rupu_providers::anthropic::AnthropicClient::from_auth(auth),
-    };
+    }
+    .with_oauth_account_uuid(account_uuid);
     Ok(Box::new(client))
 }
 

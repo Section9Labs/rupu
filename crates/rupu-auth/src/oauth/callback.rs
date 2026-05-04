@@ -31,6 +31,26 @@ struct TokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
+    /// Anthropic-shaped account block (uuid, email, …). Optional — other
+    /// OAuth providers don't return this. We capture the uuid only; other
+    /// fields are intentionally ignored to avoid storing extra PII.
+    #[serde(default)]
+    account: Option<AccountInfo>,
+    /// Anthropic-shaped organization block (uuid, name). Same rationale.
+    #[serde(default)]
+    organization: Option<OrganizationInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountInfo {
+    #[serde(default)]
+    uuid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrganizationInfo {
+    #[serde(default)]
+    uuid: Option<String>,
 }
 
 fn random_state() -> String {
@@ -208,12 +228,23 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
 
     let expires_ms = expires_at.map(|d| d.timestamp_millis() as u64).unwrap_or(0);
 
+    // Persist account/organization UUIDs in `extra` so the Anthropic
+    // adapter can include `metadata.user_id.account_uuid` on each
+    // request, binding traffic to the user's Pro/Max quota pool.
+    let mut extra: std::collections::HashMap<String, serde_json::Value> = Default::default();
+    if let Some(uuid) = token.account.as_ref().and_then(|a| a.uuid.clone()) {
+        extra.insert("account_uuid".into(), serde_json::Value::String(uuid));
+    }
+    if let Some(uuid) = token.organization.as_ref().and_then(|o| o.uuid.clone()) {
+        extra.insert("organization_uuid".into(), serde_json::Value::String(uuid));
+    }
+
     Ok(StoredCredential {
         credentials: AuthCredentials::OAuth {
             access: token.access_token,
             refresh: token.refresh_token.clone().unwrap_or_default(),
             expires: expires_ms,
-            extra: Default::default(),
+            extra,
         },
         refresh_token: token.refresh_token,
         expires_at,
