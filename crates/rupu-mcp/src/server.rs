@@ -44,7 +44,7 @@ impl<T: Transport + 'static> McpServer<T> {
                 "tools/list" => Ok(json!({
                     "jsonrpc": "2.0",
                     "id": id,
-                    "result": { "tools": tool_catalog_placeholder() },
+                    "result": { "tools": crate::tools::tool_catalog() },
                 })),
                 "tools/call" => {
                     // Tool dispatch lands in Task 14 (ToolDispatcher).
@@ -76,14 +76,6 @@ impl<T: Transport + 'static> McpServer<T> {
             }
         }
     }
-}
-
-/// Placeholder tool list for Task 9 — Task 11+ replaces with the
-/// generated catalog. This empty array lets `tools/list` be a stable
-/// (if minimal) JSON-RPC method response while Tasks 10-13 build the
-/// real catalog.
-fn tool_catalog_placeholder() -> Value {
-    Value::Array(vec![])
 }
 
 pub struct ServeHandle {
