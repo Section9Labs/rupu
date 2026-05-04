@@ -39,6 +39,12 @@ struct Frontmatter {
     max_turns: Option<u32>,
     #[serde(default, rename = "permissionMode")]
     permission_mode: Option<String>,
+    /// Anthropic-specific opt-out for the canonical OAuth system-prompt
+    /// prefix on this agent. `None` (default) leaves the prefix on for
+    /// OAuth requests; `Some(false)` disables it. No effect when the
+    /// resolved provider/auth is not Anthropic OAuth.
+    #[serde(default, rename = "anthropicOauthPrefix")]
+    anthropic_oauth_prefix: Option<bool>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -52,6 +58,7 @@ pub struct AgentSpec {
     pub tools: Option<Vec<String>>,
     pub max_turns: Option<u32>,
     pub permission_mode: Option<String>,
+    pub anthropic_oauth_prefix: Option<bool>,
     pub system_prompt: String,
 }
 
@@ -82,6 +89,7 @@ impl AgentSpec {
             tools: fm.tools,
             max_turns: fm.max_turns,
             permission_mode: fm.permission_mode,
+            anthropic_oauth_prefix: fm.anthropic_oauth_prefix,
             system_prompt: body.to_string(),
         })
     }
