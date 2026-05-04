@@ -41,6 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # IDs / time
 ulid = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # HTTP / streaming (lifted phi-providers)
