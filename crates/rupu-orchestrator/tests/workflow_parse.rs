@@ -112,3 +112,167 @@ fn step_id_must_be_unique() {
         "expected duplicate-id error: {err}"
     );
 }
+
+#[test]
+fn defaults_to_manual_trigger_when_omitted() {
+    let s = "name: x
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+";
+    let wf = Workflow::parse(s).expect("parse");
+    assert_eq!(wf.trigger.on, rupu_orchestrator::TriggerKind::Manual);
+    assert!(wf.trigger.cron.is_none());
+    assert!(wf.trigger.event.is_none());
+}
+
+#[test]
+fn parses_cron_trigger_with_valid_expression() {
+    let s = "name: x
+trigger:
+  on: cron
+  cron: \"0 4 * * *\"
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+";
+    let wf = Workflow::parse(s).expect("parse");
+    assert_eq!(wf.trigger.on, rupu_orchestrator::TriggerKind::Cron);
+    assert_eq!(wf.trigger.cron.as_deref(), Some("0 4 * * *"));
+}
+
+#[test]
+fn rejects_cron_trigger_without_cron_field() {
+    let s = "name: x
+trigger:
+  on: cron
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+";
+    let err = format!("{}", Workflow::parse(s).unwrap_err());
+    assert!(
+        err.contains("cron") && err.contains("requires"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn rejects_cron_with_wrong_field_count() {
+    let s = "name: x
+trigger:
+  on: cron
+  cron: \"0 4 * *\"
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+";
+    let err = format!("{}", Workflow::parse(s).unwrap_err());
+    assert!(err.contains("5 fields"), "got: {err}");
+}
+
+#[test]
+fn rejects_cron_with_invalid_chars() {
+    let s = "name: x
+trigger:
+  on: cron
+  cron: \"0 4 * * ;\"
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+";
+    let err = format!("{}", Workflow::parse(s).unwrap_err());
+    assert!(err.contains("invalid characters"), "got: {err}");
+}
+
+#[test]
+fn parses_event_trigger_with_filter() {
+    let s = r#"name: x
+trigger:
+  on: event
+  event: github.pr.opened
+  filter: "{{event.repo.name == 'rupu'}}"
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+"#;
+    let wf = Workflow::parse(s).expect("parse");
+    assert_eq!(wf.trigger.on, rupu_orchestrator::TriggerKind::Event);
+    assert_eq!(wf.trigger.event.as_deref(), Some("github.pr.opened"));
+    assert!(wf.trigger.filter.is_some());
+}
+
+#[test]
+fn rejects_event_trigger_without_event_field() {
+    let s = "name: x
+trigger:
+  on: event
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+";
+    let err = format!("{}", Workflow::parse(s).unwrap_err());
+    assert!(
+        err.contains("event") && err.contains("requires"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn rejects_extraneous_fields_for_kind() {
+    // manual + cron field
+    let s = "name: x
+trigger:
+  on: manual
+  cron: \"0 4 * * *\"
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+";
+    let err = format!("{}", Workflow::parse(s).unwrap_err());
+    assert!(err.contains("manual") && err.contains("cron"), "got: {err}");
+    // cron + event field
+    let s = "name: x
+trigger:
+  on: cron
+  cron: \"0 4 * * *\"
+  event: x
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+";
+    let err = format!("{}", Workflow::parse(s).unwrap_err());
+    assert!(err.contains("cron") && err.contains("event"), "got: {err}");
+    // event + cron field
+    let s = "name: x
+trigger:
+  on: event
+  event: x
+  cron: \"0 4 * * *\"
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+";
+    let err = format!("{}", Workflow::parse(s).unwrap_err());
+    assert!(err.contains("event") && err.contains("cron"), "got: {err}");
+}
