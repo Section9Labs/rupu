@@ -33,6 +33,8 @@ async fn run_passes_all_six_default_tools_to_provider() {
         mode_str: "bypass".into(),
         no_stream: false,
         mcp_registry: None,
+        effort: None,
+        context_window: None,
     };
 
     run_agent(opts).await.unwrap();
@@ -103,6 +105,8 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         mode_str: "bypass".into(),
         no_stream: false,
         mcp_registry: None,
+        effort: None,
+        context_window: None,
     };
 
     run_agent(opts).await.unwrap();

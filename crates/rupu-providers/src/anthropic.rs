@@ -585,6 +585,7 @@ impl AnthropicClient {
         &self,
         builder: reqwest::RequestBuilder,
         _model: &str,
+        context_window: Option<crate::model_tier::ContextWindow>,
     ) -> reqwest::RequestBuilder {
         // Headers verbatim from MITM capture of real `claude --print`
         // against api.anthropic.com. Order is preserved to match the
@@ -609,7 +610,20 @@ impl AnthropicClient {
             b = b.header(*name, *value);
         }
         match &self.auth {
-            AuthMethod::ApiKey(key) => b.header("x-api-key", key),
+            AuthMethod::ApiKey(key) => {
+                let mut b = b.header("x-api-key", key);
+                // 1M context on the api-key path is gated on the
+                // `context-1m-2025-08-07` beta. OAuth path always sends
+                // it via the static beta CSV; the api-key path opts in
+                // per-request based on `LlmRequest.context_window`.
+                if matches!(
+                    context_window,
+                    Some(crate::model_tier::ContextWindow::OneMillion)
+                ) {
+                    b = b.header("anthropic-beta", "context-1m-2025-08-07");
+                }
+                b
+            }
             AuthMethod::OAuth { access_token, .. } => b
                 .header("Authorization", format!("Bearer {access_token}"))
                 .header("anthropic-beta", ANTHROPIC_BETA_CSV)
@@ -660,7 +674,7 @@ impl AnthropicClient {
         };
         let model_for_betas = "claude-sonnet-4-6";
         let req = self.client.get(&bootstrap_url);
-        let req = self.apply_auth_headers(req, model_for_betas);
+        let req = self.apply_auth_headers(req, model_for_betas, None);
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 debug!(url = %bootstrap_url, "bootstrap OK");
@@ -701,7 +715,7 @@ impl AnthropicClient {
                 .header("Content-Type", "application/json")
                 .json(&body);
             let response = self
-                .apply_auth_headers(builder, &request.model)
+                .apply_auth_headers(builder, &request.model, request.context_window)
                 .send()
                 .await?;
 
@@ -782,7 +796,7 @@ impl AnthropicClient {
                     .header("Content-Type", "application/json")
                     .json(&body);
                 let resp = self
-                    .apply_auth_headers(builder, &request.model)
+                    .apply_auth_headers(builder, &request.model, request.context_window)
                     .send()
                     .await?;
 
@@ -914,26 +928,37 @@ impl AnthropicClient {
             body["metadata"] = serde_json::json!({ "user_id": user_id.to_string() });
         }
 
-        // Thinking/extended thinking — Anthropic uses budget_tokens.
-        // Budget is clamped to max_tokens and must be >= 1024 (API minimum).
+        // Thinking/extended thinking. Anthropic accepts two shapes:
+        //   * `thinking.type: "adaptive"` — server picks the budget
+        //     (Opus/Sonnet 4 OAuth path).
+        //   * `thinking.type: "enabled"` + `budget_tokens: <n>` — fixed
+        //     budget. Must be >= 1024 (API minimum); we silently skip
+        //     thinking when the clamped budget falls below that.
         if let Some(level) = &request.thinking {
             use crate::model_tier::ThinkingLevel;
-            let raw_budget = match level {
-                ThinkingLevel::Minimal => 0,
-                ThinkingLevel::Low => 2000,
-                ThinkingLevel::Medium => 5000,
-                ThinkingLevel::High => 10000,
-                ThinkingLevel::Max => request.max_tokens.saturating_sub(2000),
-            };
-            if raw_budget > 0 {
-                let clamped = raw_budget.min(request.max_tokens);
-                if clamped >= 1024 {
-                    body["thinking"] = serde_json::json!({
-                        "type": "enabled",
-                        "budget_tokens": clamped,
-                    });
+            match level {
+                ThinkingLevel::Auto => {
+                    body["thinking"] = serde_json::json!({ "type": "adaptive" });
                 }
-                // If clamped < 1024, skip thinking silently (too small for API minimum)
+                _ => {
+                    let raw_budget = match level {
+                        ThinkingLevel::Minimal => 0,
+                        ThinkingLevel::Low => 2000,
+                        ThinkingLevel::Medium => 5000,
+                        ThinkingLevel::High => 10000,
+                        ThinkingLevel::Max => request.max_tokens.saturating_sub(2000),
+                        ThinkingLevel::Auto => unreachable!(),
+                    };
+                    if raw_budget > 0 {
+                        let clamped = raw_budget.min(request.max_tokens);
+                        if clamped >= 1024 {
+                            body["thinking"] = serde_json::json!({
+                                "type": "enabled",
+                                "budget_tokens": clamped,
+                            });
+                        }
+                    }
+                }
             }
         } else if self.auth.is_oauth() && model_supports_adaptive_thinking(&request.model) {
             // claude-cli always emits `thinking: {"type":"adaptive"}` on
@@ -1193,6 +1218,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1211,6 +1237,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1237,6 +1264,7 @@ mod tests {
             cell_id: Some("test-cell".into()),
             trace_id: Some("trace-123".into()),
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, true);
@@ -1272,6 +1300,7 @@ mod tests {
             cell_id: Some("cell-abc".into()),
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1301,6 +1330,7 @@ mod tests {
             cell_id: Some("cell-abc".into()),
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1326,6 +1356,7 @@ mod tests {
             cell_id: Some("cell-xyz".into()),
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1350,6 +1381,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1373,6 +1405,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         }
     }
@@ -1436,11 +1469,32 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::Low),
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 2000);
+    }
+
+    #[test]
+    fn test_build_request_body_thinking_auto_emits_adaptive() {
+        // Auto → `thinking.type: "adaptive"` regardless of auth mode.
+        let client = AnthropicClient::new("test-key".into());
+        let request = LlmRequest {
+            model: "claude-opus-4-7".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 8000,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: Some(crate::model_tier::ThinkingLevel::Auto),
+            context_window: None,
+            task_type: None,
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "adaptive" }));
     }
 
     #[test]
@@ -1455,6 +1509,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::Medium),
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1474,6 +1529,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::High),
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1493,6 +1549,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1511,6 +1568,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::Minimal),
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1529,6 +1587,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::Max),
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1548,6 +1607,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::High),
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);
@@ -1571,6 +1631,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::Low),
+            context_window: None,
             task_type: None,
         };
         let body = client.build_request_body(&request, false);

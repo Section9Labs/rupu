@@ -280,17 +280,22 @@ impl OpenAiCodexClient {
             body["tools"] = serde_json::json!(tools);
         }
 
-        // Reasoning effort for o-series and GPT-5.x
+        // Reasoning effort for o-series and GPT-5.x. `Auto` omits the
+        // field so the server picks; OpenAI doesn't accept "auto" as a
+        // value but treats absence as adaptive.
         if let Some(level) = &request.thinking {
             use crate::model_tier::ThinkingLevel;
             let effort = match level {
-                ThinkingLevel::Minimal => "minimal",
-                ThinkingLevel::Low => "low",
-                ThinkingLevel::Medium => "medium",
-                ThinkingLevel::High => "high",
-                ThinkingLevel::Max => "xhigh",
+                ThinkingLevel::Auto => None,
+                ThinkingLevel::Minimal => Some("minimal"),
+                ThinkingLevel::Low => Some("low"),
+                ThinkingLevel::Medium => Some("medium"),
+                ThinkingLevel::High => Some("high"),
+                ThinkingLevel::Max => Some("xhigh"),
             };
-            body["reasoning"] = serde_json::json!({"effort": effort});
+            if let Some(e) = effort {
+                body["reasoning"] = serde_json::json!({ "effort": e });
+            }
         }
 
         body
@@ -805,6 +810,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -837,6 +843,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -864,6 +871,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::High),
+            context_window: None,
             task_type: None,
         };
 
@@ -888,6 +896,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: Some(crate::model_tier::ThinkingLevel::Max),
+            context_window: None,
             task_type: None,
         };
 
@@ -1169,6 +1178,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -1198,6 +1208,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 
@@ -1243,6 +1254,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: None,
         };
 

@@ -28,6 +28,8 @@ fn opts(
         mode_str: "bypass".into(),
         no_stream: false,
         mcp_registry: None,
+        effort: None,
+        context_window: None,
     }
 }
 

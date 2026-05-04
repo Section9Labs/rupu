@@ -97,6 +97,14 @@ pub struct AgentRunOpts {
     /// `None` means MCP tools are unavailable for this run (test harness,
     /// pre-Task-19 CLI invocations, etc.).
     pub mcp_registry: Option<Arc<Registry>>,
+    /// Reasoning / thinking effort level for every turn. Provider-specific
+    /// translation (Anthropic `thinking.budget_tokens` / `thinking.type:adaptive`,
+    /// OpenAI/Copilot `reasoning.effort`, Gemini `thinkingBudget`).
+    pub effort: Option<rupu_providers::model_tier::ThinkingLevel>,
+    /// Desired context-window tier. Anthropic api-key path uses this to
+    /// gate the `context-1m-2025-08-07` beta header; other providers
+    /// currently ignore it.
+    pub context_window: Option<rupu_providers::model_tier::ContextWindow>,
 }
 
 /// Outcome of a finished run.
@@ -178,7 +186,8 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             tools: tool_defs.clone(),
             cell_id: None,
             trace_id: None,
-            thinking: None,
+            thinking: opts.effort,
+            context_window: opts.context_window,
             task_type: None,
         };
         let resp: LlmResponse = if opts.no_stream {

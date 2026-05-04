@@ -249,6 +249,8 @@ impl StepFactory for CliStepFactory {
                         max_turns: Some(50),
                         permission_mode: Some(self.mode_str.clone()),
                         anthropic_oauth_prefix: None,
+                        effort: None,
+                        context_window: None,
                         system_prompt: rendered_prompt.clone(),
                     }
                 });
@@ -290,6 +292,8 @@ impl StepFactory for CliStepFactory {
             mode_str: self.mode_str.clone(),
             no_stream: false,
             mcp_registry: Some(Arc::clone(&self.mcp_registry)),
+            effort: spec.effort,
+            context_window: spec.context_window,
         }
     }
 }

@@ -41,6 +41,8 @@ async fn mcp_registry_attaches_tools_to_run() {
         mode_str: "bypass".into(),
         no_stream: true,
         mcp_registry: Some(Arc::new(Registry::empty())),
+        effort: None,
+        context_window: None,
     };
 
     run_agent(opts).await.unwrap();

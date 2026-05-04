@@ -155,6 +155,8 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         mode_str: mode_str.to_string(),
         no_stream: args.no_stream,
         mcp_registry: Some(scm_registry),
+        effort: spec.effort,
+        context_window: spec.context_window,
     };
 
     let result = rupu_agent::run_agent(opts).await?;

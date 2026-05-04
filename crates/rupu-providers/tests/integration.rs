@@ -13,6 +13,7 @@ fn test_full_request_response_type_flow() {
         cell_id: None,
         trace_id: None,
         thinking: None,
+        context_window: None,
         task_type: None,
     };
     assert_eq!(request.messages.len(), 1);
@@ -52,6 +53,7 @@ fn test_tool_use_flow() {
         cell_id: Some("test-cell".into()),
         trace_id: Some("trace-abc".into()),
         thinking: None,
+        context_window: None,
         task_type: None,
     };
     assert_eq!(request.tools.len(), 1);
@@ -125,6 +127,7 @@ fn test_all_public_types_accessible() {
         cell_id: None,
         trace_id: None,
         thinking: None,
+        context_window: None,
         task_type: None,
     };
     let _role = Role::User;

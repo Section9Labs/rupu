@@ -194,6 +194,7 @@ async fn anthropic_factory_oauth_credential_uses_bearer_not_x_api_key() {
         cell_id: None,
         trace_id: None,
         thinking: None,
+        context_window: None,
         task_type: None,
     };
 

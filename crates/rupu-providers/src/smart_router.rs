@@ -493,6 +493,7 @@ mod tests {
             cell_id: None,
             trace_id: None,
             thinking: None,
+            context_window: None,
             task_type: Some(TaskType::Chat),
         }
     }
