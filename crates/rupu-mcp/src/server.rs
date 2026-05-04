@@ -131,8 +131,8 @@ mod tests {
         assert_eq!(resp["id"], 2);
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert!(
-            tools.len() >= 10,
-            "Task 11 adds 10 SCM tools; got {} entries",
+            tools.len() >= 17,
+            "Tasks 11-13 add 17 tools (10 SCM + 5 issues + 2 extras); got {} entries",
             tools.len()
         );
 
