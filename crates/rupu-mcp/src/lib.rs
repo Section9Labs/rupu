@@ -18,7 +18,9 @@ pub mod server;
 pub mod tools;
 pub mod transport;
 
+pub use dispatcher::ToolDispatcher;
 pub use error::McpError;
+pub use permission::McpPermission;
 pub use server::{serve_in_process, McpServer, ServeHandle};
 pub use tools::{tool_catalog, ToolKind, ToolSpec};
 pub use transport::{InProcessTransport, StdioTransport, Transport};
