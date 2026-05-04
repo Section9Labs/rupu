@@ -144,6 +144,11 @@ async fn build_anthropic(
     if let Some(enabled) = config.anthropic_oauth_system_prefix {
         client = client.with_oauth_system_prefix(enabled);
     }
+    // Best-effort: register the OAuth session with Anthropic's bootstrap
+    // endpoint before the first message lands. Mirrors what the reference
+    // Claude Code client does on startup; appears to pre-warm the
+    // OAuth-quota router. No-op on api-key clients.
+    client.bootstrap_oauth_session().await;
     Ok(Box::new(client))
 }
 

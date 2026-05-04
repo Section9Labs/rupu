@@ -24,6 +24,7 @@ futures-util.workspace = true
 chrono.workspace = true
 fs2.workspace = true
 toml.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

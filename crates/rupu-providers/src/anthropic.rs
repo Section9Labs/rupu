@@ -498,17 +498,95 @@ impl AnthropicClient {
     }
 
     /// Apply auth headers to a request builder based on auth method.
-    fn apply_auth_headers(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let builder = builder.header("User-Agent", RUPU_USER_AGENT);
+    ///
+    /// Both api-key and OAuth paths get a fresh `x-anthropic-api-request-id`
+    /// (UUID v4) on every call — claude-cli sets this whenever the request
+    /// targets `api.anthropic.com` and we mirror that behavior; the value
+    /// is also useful for support tickets when correlated with the
+    /// server-returned `request-id` header.
+    ///
+    /// The OAuth path's `anthropic-beta` is a CSV of feature flags, not a
+    /// single value. Reference clients always include `claude-code-20250219`
+    /// alongside `oauth-2025-04-20` on Sonnet/Opus models — sending only
+    /// `oauth-2025-04-20` (the previous behavior) is what an unaffiliated
+    /// OAuth integration would do, which is the opposite of the signal we
+    /// want for first-party-quota attribution. Haiku models drop the
+    /// `claude-code-` flag because the reference client gates that beta to
+    /// non-Haiku tiers.
+    fn apply_auth_headers(
+        &self,
+        builder: reqwest::RequestBuilder,
+        model: &str,
+    ) -> reqwest::RequestBuilder {
+        let builder = builder.header("User-Agent", RUPU_USER_AGENT).header(
+            "x-anthropic-api-request-id",
+            uuid::Uuid::new_v4().to_string(),
+        );
         match &self.auth {
             AuthMethod::ApiKey(key) => builder
                 .header("x-api-key", key)
                 .header("anthropic-version", ANTHROPIC_VERSION),
             AuthMethod::OAuth { access_token, .. } => builder
                 .header("Authorization", format!("Bearer {access_token}"))
-                .header("anthropic-beta", OAUTH_BETA_HEADER)
+                .header("anthropic-beta", oauth_beta_header_for_model(model))
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header("x-app", "cli"),
+        }
+    }
+}
+
+/// Build the CSV value for the `anthropic-beta` header on OAuth requests.
+///
+/// Always includes `oauth-2025-04-20`. For non-Haiku models also includes
+/// `claude-code-20250219` — the reference client gates this beta to the
+/// Sonnet/Opus tiers; sending it on Haiku produces a 400.
+fn oauth_beta_header_for_model(model: &str) -> String {
+    let mut betas: Vec<&str> = vec![OAUTH_BETA_HEADER];
+    if !model.contains("haiku") {
+        betas.push("claude-code-20250219");
+    }
+    betas.join(",")
+}
+
+impl AnthropicClient {
+    /// One-shot, best-effort GET to `/api/claude_cli/bootstrap`. The
+    /// reference Claude Code client makes this call once on session
+    /// startup; it appears to register the session with Anthropic's
+    /// session-management layer and pre-warm the OAuth-quota router. On
+    /// rupu we run it from the provider factory immediately after
+    /// constructing an OAuth client so the first user-visible
+    /// `messages.create` lands with the session already attributed.
+    ///
+    /// Failure is non-fatal: a warn-level log line is emitted and the
+    /// caller proceeds. The call is a no-op for api-key clients (the
+    /// bootstrap endpoint is OAuth-only).
+    pub async fn bootstrap_oauth_session(&self) {
+        if !self.auth.is_oauth() {
+            return;
+        }
+        // Derive the bootstrap URL from `api_url` so test seams
+        // (`RUPU_ANTHROPIC_BASE_URL_OVERRIDE`) point at the mock server
+        // rather than punching through to api.anthropic.com.
+        let bootstrap_url = match self.api_url.find("/v1/messages") {
+            Some(idx) => format!("{}/api/claude_cli/bootstrap", &self.api_url[..idx]),
+            None => "https://api.anthropic.com/api/claude_cli/bootstrap".to_string(),
+        };
+        let model_for_betas = "claude-sonnet-4-6";
+        let req = self.client.get(&bootstrap_url);
+        let req = self.apply_auth_headers(req, model_for_betas);
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                debug!(url = %bootstrap_url, "bootstrap OK");
+            }
+            Ok(resp) => {
+                warn!(
+                    status = resp.status().as_u16(),
+                    "bootstrap returned non-success; continuing"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "bootstrap request failed; continuing");
+            }
         }
     }
 
@@ -535,7 +613,10 @@ impl AnthropicClient {
                 .post(&self.api_url)
                 .header("Content-Type", "application/json")
                 .json(&body);
-            let response = self.apply_auth_headers(builder).send().await?;
+            let response = self
+                .apply_auth_headers(builder, &request.model)
+                .send()
+                .await?;
 
             let status = response.status();
             if status.as_u16() == 429 {
@@ -613,7 +694,10 @@ impl AnthropicClient {
                     .post(&self.api_url)
                     .header("Content-Type", "application/json")
                     .json(&body);
-                let resp = self.apply_auth_headers(builder).send().await?;
+                let resp = self
+                    .apply_auth_headers(builder, &request.model)
+                    .send()
+                    .await?;
 
                 let status = resp.status();
                 if status.as_u16() == 429 {
@@ -1241,6 +1325,26 @@ mod tests {
         assert_eq!(blocks.len(), 1, "expected just the prefix block");
         let text = blocks[0]["text"].as_str().expect("block text");
         assert!(text.starts_with(ANTHROPIC_OAUTH_SYSTEM_PREFIX_FIRST_LINE));
+    }
+
+    #[test]
+    fn oauth_beta_header_csv_includes_claude_code_for_non_haiku() {
+        let v = oauth_beta_header_for_model("claude-sonnet-4-6");
+        assert!(v.contains("oauth-2025-04-20"));
+        assert!(
+            v.contains("claude-code-20250219"),
+            "non-Haiku models should carry the claude-code beta: {v}"
+        );
+    }
+
+    #[test]
+    fn oauth_beta_header_csv_drops_claude_code_for_haiku() {
+        let v = oauth_beta_header_for_model("claude-haiku-4-5");
+        assert!(v.contains("oauth-2025-04-20"));
+        assert!(
+            !v.contains("claude-code-20250219"),
+            "Haiku tier must not carry claude-code beta: {v}"
+        );
     }
 
     #[test]
