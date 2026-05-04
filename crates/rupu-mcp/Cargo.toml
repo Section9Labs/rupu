@@ -29,3 +29,4 @@ rupu-config = { path = "../rupu-config" }
 tempfile.workspace = true
 jsonschema.workspace = true
 serde_json.workspace = true
+rupu-scm = { path = "../rupu-scm", features = ["test-helpers"] }

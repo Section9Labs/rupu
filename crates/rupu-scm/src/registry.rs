@@ -90,4 +90,13 @@ impl Registry {
     pub fn gitlab_extras(&self) -> Option<Arc<GitlabExtras>> {
         self.gitlab_extras.clone()
     }
+
+    /// Test-only: build a Registry with no connectors. Tools that
+    /// require a connector return McpError::NotWiredInV0 — they do
+    /// NOT panic. Honors the "no mock features" rule: the absence
+    /// of a connector is reported, not silently ignored.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn empty() -> Self {
+        Self::default()
+    }
 }

@@ -31,6 +31,10 @@ rupu-auth = { path = "../rupu-auth" }
 rupu-config = { path = "../rupu-config" }
 rupu-providers = { path = "../rupu-providers" }
 
+[features]
+default = []
+test-helpers = []
+
 [dev-dependencies]
 tempfile.workspace = true
 httpmock.workspace = true

@@ -19,4 +19,5 @@ pub mod tools;
 pub mod transport;
 
 pub use error::McpError;
+pub use server::{serve_in_process, McpServer, ServeHandle};
 pub use transport::{InProcessTransport, StdioTransport, Transport};
