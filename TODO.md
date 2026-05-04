@@ -2,6 +2,92 @@
 
 Items deferred from completed slices. Each entry should name **why deferred**, **prereqs**, and **what unblocks it**.
 
+## Workflow triggers — manual / cron / event-driven (multi-PR initiative)
+
+rupu workflows currently only run via `rupu workflow run <name>` (CLI manual trigger). Okesu supports rich trigger declarations that fire on schedule or on external events; that capability is what turns "agentic CLI" into "agentic platform". Designing this needs three independent PRs:
+
+**PR 1 — Trigger schema + manual baseline.** Add a `trigger:` block to workflow YAML:
+```yaml
+trigger:
+  on: manual                    # manual | cron | event
+  # cron-only:  cron: "0 4 * * *"
+  # event-only: event: github.pr.opened
+  #             filter: "{{event.repo.name == 'rupu'}}"
+```
+Manual is the existing default (no scheduler / receiver yet). All this PR does is parse + validate the block and document the surface; no runtime wiring beyond the existing manual path.
+
+**PR 2 — Cron runtime.** Three options for scheduling: (a) long-running rupu daemon keeping cron schedules in process and firing `rupu workflow run --trigger cron <name>`; (b) emit per-workflow systemd-timer / launchd-plist scaffolding via `rupu workflow install <name>`; (c) `rupu cron tick` invoked from system cron. Option (c) is the cheapest first step — system cron does the scheduling, rupu just exposes the firing entry point. (a) is the durable answer.
+
+**PR 3 — Event triggers** (the substantial one). Webhook receiver subcommand (`rupu webhook serve` or similar) listening on a configurable port, validating provider HMACs (GitHub `x-hub-signature-256`, GitLab `x-gitlab-token`), routing to workflows whose `trigger.on: event` + `event:` + optional `filter:` expression matches. Initial event vocabulary worth supporting:
+
+- **SCM events** (built atop the Slice B-2 connectors): `github.repo.cloned` (proxy: webhook on push to default branch + first-fetch detection), `github.issue.created` / `github.issue.updated` / `github.issue.closed`, `github.pr.opened` / `github.pr.review_requested` / `github.pr.merged`, `github.push`, plus GitLab equivalents.
+- **Issue-tracker queue events**: `issue.entered_queue:<queue>`, `issue.left_queue:<queue>`, `issue.state_changed:<from>-><to>` (e.g., `triage->ready`).
+
+Each event populates `{{event.*}}` template bindings (repo, issue number, author, body, …) usable in `when:` filters and step prompts. Polling is a fallback for IdPs without webhooks.
+
+**Why deferred (multi-PR):** the schema is bounded but the runtime is three different daemons (cron tick, webhook receiver, polling fallback) and each needs auth + replay-safety + idempotency design. Ship PR 1 alongside Tier 1 orchestration so users see the trigger surface; PR 2 + 3 follow.
+
+## Workflow Tier 2 — fan-out, panel steps, approval gates
+
+These add up to "platform-grade" orchestration but each is independently scoped.
+
+**Fan-out (`parallel:` / `for_each:`).** A single step dispatches the same agent across multiple inputs in parallel and aggregates results:
+
+```yaml
+- id: review_each
+  agent: code-reviewer
+  for_each: "{{inputs.changed_files}}"
+  prompt: "Review {{item}} ..."
+  # per-item results bound as steps.review_each.results[*] (list)
+
+- id: triage
+  parallel:
+    - { agent: security-reviewer,   prompt: "..." }
+    - { agent: perf-reviewer,       prompt: "..." }
+    - { agent: maintainability-reviewer, prompt: "..." }
+  # parallel results bound as steps.triage.results.<sub_id>
+```
+
+Concurrency cap (`max_parallel: N`) + result aggregation part of the schema. The single highest-leverage Tier 2 item — most non-trivial workflows want parallel agent dispatch.
+
+**Panel steps with gated review loop** (`kind: panel` — rupu's name; Okesu calls these "meeting steps"). A list of agents reviews/discusses something, emits structured findings, and the workflow loops with a fixer agent until the panel is satisfied:
+
+```yaml
+- id: code_review_panel
+  kind: panel
+  panelists:
+    - security-reviewer
+    - perf-reviewer
+    - maintainability-reviewer
+  subject: "{{inputs.diff}}"
+  gate:
+    until_no_findings_at_severity_or_above: HIGH    # loop while HIGH or CRITICAL findings exist
+    fix_with: developer                              # agent that addresses each round
+    max_iterations: 5                                # safety cap
+  # Output: steps.code_review_panel.findings (consolidated, deduped),
+  # .iterations (count), .resolved (bool)
+```
+
+Loop semantics: each iteration fans out the panelists in parallel, collects findings, classifies by severity. If any HIGH/CRITICAL, dispatch `fix_with` with the panel's findings as input; rerun panel on the fixed result; repeat until no HIGH/CRITICAL or `max_iterations` exhausted. Workflow proceeds when the gate clears (or fails with `unresolved_findings` if it doesn't). Distinctive feature; fits rupu's agent-builder pitch.
+
+**Approval gates (`approval: required`).** Step pauses, run state becomes `approval_required`, operator approves via `rupu workflow approve <run-id>` (CLI) or a future API. Useful for destructive steps (deploys, force-pushes, mass-rename refactors). Needs:
+- A persisted run-state model (today the runner is in-memory only)
+- The CLI surface for listing/approving paused runs
+- Optional approval timeout
+
+**Why deferred:** all three are bigger than a single PR's scope and Tier 1 (when / continue_on_error / inputs / defaults) closes the most painful gaps first.
+
+## Workflow output_config / context_management / speed (Anthropic feature flags)
+
+Body fields surfaced in claude-cli that rupu doesn't yet emit:
+- `output_config: { effort?, task_budget?, format? }` — output shape constraints
+- `context_management: { type: "tool_clearing", ... }` — automatic context pruning when conversation grows large
+- `speed: "fast"` — fast-mode toggle (account-gated)
+
+Anthropic-specific body fields the SDK emits when corresponding features are enabled. None affect rate-limit/quota; all are quality/perf tuning. Add as agent-frontmatter knobs (`outputFormat: json`, `contextManagement: tool_clearing`, `speed: fast`) once a real use case lands.
+
+**Why deferred:** lower-leverage than Tier 1 orchestration / triggers / panel steps; nobody has asked for these specific levers yet.
+
 ## Re-MITM and refresh the Anthropic OAuth wire-shape pins (when 429s return)
 
 The Anthropic OAuth path in `crates/rupu-providers/src/anthropic.rs` carries several **byte-equal pins** of upstream Claude Code values that gate Cloudflare/WAF/billing recognition. Captured 2026-05-04 from `claude --print "say hi"` MITM:

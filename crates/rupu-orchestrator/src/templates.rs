@@ -32,9 +32,22 @@ pub struct StepContext {
 
 /// The output record for a completed step, available as
 /// `steps.<step_id>.output` in subsequent templates.
+///
+/// `success` and `skipped` are added so downstream `when:` gates can
+/// branch on whether a prior step ran cleanly. The convention:
+/// - `success = true, skipped = false` → step ran and finished without
+///   error
+/// - `success = false, skipped = false` → step errored (and was
+///   tolerated via `continue_on_error`)
+/// - `success = false, skipped = true` → step was skipped because its
+///   own `when:` evaluated false
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct StepOutput {
     pub output: String,
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 impl StepContext {
@@ -59,6 +72,8 @@ impl StepContext {
             step_id.into(),
             StepOutput {
                 output: output.into(),
+                success: true,
+                skipped: false,
             },
         );
         self
@@ -78,4 +93,64 @@ pub fn render_step_prompt(template: &str, ctx: &StepContext) -> Result<String, R
     let value = MjValue::from_serialize(ctx);
     tmpl.render(value)
         .map_err(|e| RenderError::Template(e.to_string()))
+}
+
+/// Evaluate a `when:` expression against the step context and reduce
+/// it to a boolean. Renders the expression with the same minijinja
+/// environment as `render_step_prompt`, then trims and matches the
+/// result against falsy literals (case-insensitive: `false`, `0`, ``,
+/// `no`, `off`); anything else is truthy. This matches what most
+/// workflow engines do — and lets agents emit `success: true` /
+/// `success: false` JSON in their final assistant message and have
+/// downstream steps gate on it via `{{steps.foo.output | trim}}`.
+pub fn render_when_expression(template: &str, ctx: &StepContext) -> Result<bool, RenderError> {
+    let rendered = render_step_prompt(template, ctx)?;
+    Ok(is_truthy(&rendered))
+}
+
+fn is_truthy(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    !matches!(
+        t.to_ascii_lowercase().as_str(),
+        "false" | "0" | "no" | "off"
+    )
+}
+
+#[cfg(test)]
+mod when_tests {
+    use super::*;
+
+    #[test]
+    fn falsy_values_skip_step() {
+        for s in ["false", "FALSE", "0", "", "no", "OFF", "  false  "] {
+            assert!(!is_truthy(s), "{s:?} should be falsy");
+        }
+    }
+
+    #[test]
+    fn truthy_values_run_step() {
+        for s in ["true", "1", "yes", "on", "anything-else", "found-issues"] {
+            assert!(is_truthy(s), "{s:?} should be truthy");
+        }
+    }
+
+    #[test]
+    fn render_when_expression_evaluates_step_output() {
+        let mut ctx = StepContext::new();
+        ctx.steps.insert(
+            "review".into(),
+            StepOutput {
+                output: "false".into(),
+                success: true,
+                skipped: false,
+            },
+        );
+        let v = render_when_expression("{{ steps.review.output }}", &ctx).expect("render");
+        assert!(!v);
+        let v = render_when_expression("{{ steps.review.success }}", &ctx).expect("render");
+        assert!(v);
+    }
 }

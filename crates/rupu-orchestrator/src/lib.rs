@@ -17,5 +17,7 @@ pub use runner::{
     run_workflow, OrchestratorRunOpts, OrchestratorRunResult, RunWorkflowError, StepFactory,
     StepResult,
 };
-pub use templates::{render_step_prompt, RenderError, StepContext, StepOutput};
-pub use workflow::{Step, Workflow, WorkflowParseError};
+pub use templates::{
+    render_step_prompt, render_when_expression, RenderError, StepContext, StepOutput,
+};
+pub use workflow::{InputDef, InputType, Step, Workflow, WorkflowDefaults, WorkflowParseError};
