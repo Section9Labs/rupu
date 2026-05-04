@@ -91,6 +91,35 @@ fn split_namespace(path: &str) -> (String, String) {
     }
 }
 
+/// Encode a GitLab project ID for use in URL paths.
+///
+/// GitLab requires URL-encoded path segments. The only meaningful character
+/// in our project IDs is `/`, which encodes to `%2F`.
+fn encode_project_id(owner: &str, repo: &str) -> String {
+    let full = format!("{owner}/{repo}");
+    full.replace('/', "%2F")
+}
+
+fn translate_branch(v: &serde_json::Value) -> Result<Branch, ScmError> {
+    Ok(Branch {
+        name: v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        sha: v
+            .get("commit")
+            .and_then(|c| c.get("id"))
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        protected: v
+            .get("protected")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+    })
+}
+
 #[async_trait]
 impl RepoConnector for GitlabRepoConnector {
     fn platform(&self) -> Platform {
@@ -125,14 +154,24 @@ impl RepoConnector for GitlabRepoConnector {
         Ok(out)
     }
 
-    // get_repo / list_branches / create_branch / read_file / list_prs /
-    // get_pr / diff_pr / comment_pr / create_pr / clone_to land in
-    // subtasks 4b–4f below.
-    async fn get_repo(&self, _r: &RepoRef) -> Result<Repo, ScmError> {
-        unimplemented!("subtask 4b")
+    async fn get_repo(&self, r: &RepoRef) -> Result<Repo, ScmError> {
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&r.owner, &r.repo);
+        let body = self.client.get_json(&format!("/projects/{id}")).await?;
+        translate_project_to_repo(&body)
     }
-    async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
-        unimplemented!("subtask 4c")
+
+    async fn list_branches(&self, r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&r.owner, &r.repo);
+        let body = self
+            .client
+            .get_json(&format!("/projects/{id}/repository/branches"))
+            .await?;
+        let arr = body.as_array().ok_or_else(|| ScmError::BadRequest {
+            message: "expected array from /repository/branches".into(),
+        })?;
+        arr.iter().map(translate_branch).collect()
     }
     async fn create_branch(
         &self,
@@ -144,11 +183,25 @@ impl RepoConnector for GitlabRepoConnector {
     }
     async fn read_file(
         &self,
-        _r: &RepoRef,
-        _path: &str,
-        _ref_: Option<&str>,
+        r: &RepoRef,
+        path: &str,
+        ref_: Option<&str>,
     ) -> Result<FileContent, ScmError> {
-        unimplemented!("subtask 4c")
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&r.owner, &r.repo);
+        let path_encoded = path.replace('/', "%2F");
+        let resolved_ref = ref_.unwrap_or("HEAD").to_string();
+        let url = match ref_ {
+            Some(r) => format!("/projects/{id}/repository/files/{path_encoded}/raw?ref={r}"),
+            None => format!("/projects/{id}/repository/files/{path_encoded}/raw"),
+        };
+        let content = self.client.get_text(&url).await?;
+        Ok(FileContent {
+            path: path.to_string(),
+            ref_: resolved_ref,
+            content,
+            encoding: crate::types::FileEncoding::Utf8,
+        })
     }
     async fn list_prs(&self, _r: &RepoRef, _filter: PrFilter) -> Result<Vec<Pr>, ScmError> {
         unimplemented!("subtask 4d")

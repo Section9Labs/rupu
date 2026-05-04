@@ -47,3 +47,14 @@ fn nested_namespace_owner_includes_subgroup() {
         );
     } // else: no nested entry in this minimal fixture, skip silently
 }
+
+#[test]
+fn project_get_happy_translates() {
+    let raw = std::fs::read_to_string("tests/fixtures/gitlab/project_get_happy.json").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let r = translate_project_to_repo(&v).unwrap();
+    assert_eq!(r.r.owner, "section9labs");
+    assert_eq!(r.r.repo, "rupu-mirror");
+    assert_eq!(r.default_branch, "main");
+    assert!(r.private);
+}

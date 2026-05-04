@@ -39,3 +39,83 @@ async fn list_repos_paginates_until_empty() {
     let repos = conn.list_repos().await.unwrap();
     assert_eq!(repos.len(), 200, "two pages × 100 per page");
 }
+
+#[tokio::test]
+async fn get_repo_translates() {
+    let server = MockServer::start_async().await;
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/project_get_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/projects/section9labs%2Frupu-mirror");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let conn = common::gitlab_repo_connector_against(&server);
+    let r = conn
+        .get_repo(&rupu_scm::RepoRef {
+            platform: rupu_scm::Platform::Gitlab,
+            owner: "section9labs".into(),
+            repo: "rupu-mirror".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.r.repo, "rupu-mirror");
+    assert!(r.private);
+}
+
+#[tokio::test]
+async fn list_branches_translates() {
+    let server = MockServer::start_async().await;
+    let body = std::fs::read_to_string("tests/fixtures/gitlab/branches_list_happy.json").unwrap();
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/projects/section9labs%2Frupu/repository/branches");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(&body);
+    });
+    let conn = common::gitlab_repo_connector_against(&server);
+    let bs = conn
+        .list_branches(&rupu_scm::RepoRef {
+            platform: rupu_scm::Platform::Gitlab,
+            owner: "section9labs".into(),
+            repo: "rupu".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(bs.len(), 2);
+    assert_eq!(bs[0].name, "main");
+    assert!(bs[0].protected);
+    assert_eq!(bs[1].name, "feat/x");
+    assert!(!bs[1].protected);
+}
+
+#[tokio::test]
+async fn read_file_returns_raw_body() {
+    let server = MockServer::start_async().await;
+    let raw_body = "fn main() {\n    println!(\"hello rupu\");\n}\n";
+    server.mock(|when, then| {
+        when.method(GET)
+            .path("/projects/section9labs%2Frupu/repository/files/src%2Fmain.rs/raw");
+        then.status(200)
+            .header("content-type", "text/plain")
+            .body(raw_body);
+    });
+    let conn = common::gitlab_repo_connector_against(&server);
+    let f = conn
+        .read_file(
+            &rupu_scm::RepoRef {
+                platform: rupu_scm::Platform::Gitlab,
+                owner: "section9labs".into(),
+                repo: "rupu".into(),
+            },
+            "src/main.rs",
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.path, "src/main.rs");
+    assert_eq!(f.encoding, rupu_scm::types::FileEncoding::Utf8);
+    assert!(f.content.contains("println!"));
+}
