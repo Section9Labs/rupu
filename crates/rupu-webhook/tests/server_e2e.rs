@@ -12,12 +12,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 struct RecordingDispatcher {
-    calls: Mutex<Vec<String>>,
+    calls: Mutex<Vec<(String, serde_json::Value)>>,
 }
 #[async_trait]
 impl WorkflowDispatcher for RecordingDispatcher {
-    async fn dispatch(&self, name: &str) -> anyhow::Result<()> {
-        self.calls.lock().unwrap().push(name.to_string());
+    async fn dispatch(&self, name: &str, event: &serde_json::Value) -> anyhow::Result<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((name.to_string(), event.clone()));
         Ok(())
     }
 }
@@ -115,7 +118,12 @@ async fn signed_pr_opened_dispatches_matching_workflow() {
     assert_eq!(json["fired"][0]["fired"], true);
 
     let calls = dispatcher.calls.lock().unwrap().clone();
-    assert_eq!(calls, vec!["review-pr"]);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "review-pr");
+    // The dispatcher must receive the verbatim vendor JSON so step
+    // prompts and `when:` filters can resolve `{{event.*}}`.
+    assert_eq!(calls[0].1["pull_request"]["number"], 42);
+    assert_eq!(calls[0].1["repository"]["name"], "rupu");
     server.abort();
 }
 

@@ -25,9 +25,14 @@ pub enum DispatchError {
 /// Trait the receiver uses to actually run a workflow once the
 /// event matched. Production impl wraps `rupu_cli::cmd::workflow::run_by_name`;
 /// tests inject a stub.
+///
+/// `event` is the raw vendor JSON payload that triggered the match.
+/// The dispatcher forwards it to the orchestrator so step prompts
+/// and `when:` filters can reference `{{event.*}}` (e.g.
+/// `{{event.pull_request.number}}`).
 #[async_trait]
 pub trait WorkflowDispatcher: Send + Sync {
-    async fn dispatch(&self, workflow_name: &str) -> anyhow::Result<()>;
+    async fn dispatch(&self, workflow_name: &str, event: &Value) -> anyhow::Result<()>;
 }
 
 /// Result row from [`dispatch_event`]: which workflows matched and
@@ -80,7 +85,7 @@ pub async fn dispatch_event(
             }
         }
         info!(workflow = %name, event = %event_id, "dispatching");
-        match dispatcher.dispatch(name).await {
+        match dispatcher.dispatch(name, payload).await {
             Ok(()) => out.push(DispatchedWorkflow {
                 name: name.clone(),
                 fired: true,
@@ -136,7 +141,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct RecordingDispatcher {
-        calls: Mutex<Vec<String>>,
+        calls: Mutex<Vec<(String, Value)>>,
     }
     impl RecordingDispatcher {
         fn new() -> Self {
@@ -144,14 +149,25 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
             }
         }
-        fn calls(&self) -> Vec<String> {
+        fn names(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect()
+        }
+        fn calls(&self) -> Vec<(String, Value)> {
             self.calls.lock().unwrap().clone()
         }
     }
     #[async_trait]
     impl WorkflowDispatcher for RecordingDispatcher {
-        async fn dispatch(&self, name: &str) -> anyhow::Result<()> {
-            self.calls.lock().unwrap().push(name.to_string());
+        async fn dispatch(&self, name: &str, event: &Value) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), event.clone()));
             Ok(())
         }
     }
@@ -182,7 +198,19 @@ mod tests {
         .await;
         assert_eq!(results.len(), 1);
         assert!(results[0].fired);
-        assert_eq!(d.calls(), vec!["review-pr"]);
+        assert_eq!(d.names(), vec!["review-pr"]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_forwards_event_payload() {
+        let candidates = vec![wf("review-pr", "github.pr.opened", None)];
+        let d = RecordingDispatcher::new();
+        let payload = json!({ "pull_request": { "number": 7 } });
+        dispatch_event("github.pr.opened", &payload, &candidates, &d).await;
+        let calls = d.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "review-pr");
+        assert_eq!(calls[0].1, payload);
     }
 
     #[tokio::test]
@@ -232,7 +260,7 @@ mod tests {
         let d = RecordingDispatcher::new();
         let results = dispatch_event("github.pr.opened", &json!({}), &candidates, &d).await;
         assert_eq!(results.len(), 2);
-        let names: Vec<_> = d.calls().into_iter().collect();
+        let names = d.names();
         assert!(names.contains(&"review-pr".to_string()));
         assert!(names.contains(&"notify-slack".to_string()));
     }

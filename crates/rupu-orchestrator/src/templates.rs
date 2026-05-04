@@ -12,7 +12,7 @@
 //! render as empty strings. This is permissive but matches what
 //! Okesu does and keeps templates pleasant during iteration.
 
-use minijinja::{Environment, Value as MjValue};
+use minijinja::{Environment, UndefinedBehavior, Value as MjValue};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -24,10 +24,20 @@ pub enum RenderError {
 }
 
 /// Variable bag passed to the renderer.
+///
+/// `event` is populated when the workflow was kicked off by the
+/// webhook receiver (`trigger.on: event`). It carries the verbatim
+/// JSON payload the SCM vendor sent, so step prompts and `when:`
+/// expressions can reference `{{event.pull_request.number}}`,
+/// `{{event.repository.name}}`, etc. For manually-invoked or cron-
+/// triggered runs, `event` is `None` and references render as the
+/// minijinja default for missing values (empty string).
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct StepContext {
     pub inputs: BTreeMap<String, String>,
     pub steps: BTreeMap<String, StepOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<serde_json::Value>,
 }
 
 /// The output record for a completed step, available as
@@ -78,13 +88,26 @@ impl StepContext {
         );
         self
     }
+
+    /// Bind the event payload (builder style). For event-triggered
+    /// workflows; the same JSON the webhook receiver passed through
+    /// to the dispatcher.
+    pub fn with_event(mut self, event: serde_json::Value) -> Self {
+        self.event = Some(event);
+        self
+    }
 }
 
 /// Render `template` against `ctx`. Returns the rendered string or a
 /// `RenderError` for invalid syntax. Missing variables become empty
-/// strings (v0 default).
+/// strings (v0 default). We use [`UndefinedBehavior::Chainable`] so
+/// chained accesses through a missing root (e.g. `{{ event.pull_request.number }}`
+/// in a manually-triggered workflow where `event` is `None`) also
+/// render empty rather than erroring — matching the permissive
+/// philosophy stated in this module's docs.
 pub fn render_step_prompt(template: &str, ctx: &StepContext) -> Result<String, RenderError> {
     let mut env = Environment::new();
+    env.set_undefined_behavior(UndefinedBehavior::Chainable);
     env.add_template("step", template)
         .map_err(|e| RenderError::Template(e.to_string()))?;
     let tmpl = env
@@ -152,5 +175,48 @@ mod when_tests {
         assert!(!v);
         let v = render_when_expression("{{ steps.review.success }}", &ctx).expect("render");
         assert!(v);
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn event_fields_render_in_prompt() {
+        let ctx = StepContext::new().with_event(json!({
+            "pull_request": { "number": 42, "title": "Fix flaky test" },
+            "repository": { "name": "rupu", "full_name": "Section9Labs/rupu" }
+        }));
+        let out = render_step_prompt(
+            "PR #{{ event.pull_request.number }} in {{ event.repository.full_name }}: {{ event.pull_request.title }}",
+            &ctx,
+        )
+        .expect("render");
+        assert_eq!(out, "PR #42 in Section9Labs/rupu: Fix flaky test");
+    }
+
+    #[test]
+    fn missing_event_renders_empty_string() {
+        let ctx = StepContext::new();
+        let out =
+            render_step_prompt("repo={{ event.repository.name }}!", &ctx).expect("render");
+        assert_eq!(out, "repo=!");
+    }
+
+    #[test]
+    fn event_can_gate_when_expression() {
+        let ctx = StepContext::new().with_event(json!({
+            "pull_request": { "merged": true }
+        }));
+        let take = render_when_expression("{{ event.pull_request.merged }}", &ctx).expect("render");
+        assert!(take, "merged=true should be truthy");
+
+        let ctx2 = StepContext::new().with_event(json!({
+            "pull_request": { "merged": false }
+        }));
+        let take = render_when_expression("{{ event.pull_request.merged }}", &ctx2).expect("render");
+        assert!(!take, "merged=false should be falsy");
     }
 }
