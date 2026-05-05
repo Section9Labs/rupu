@@ -42,3 +42,34 @@ pub fn layout_canvas(node_ids: &[&str], edges: &[(String, String)]) -> BTreeMap<
     }
     out
 }
+
+/// Pre-order DFS yielding (step_id, indent_depth) for tree view.
+pub fn layout_tree(node_ids: &[&str], edges: &[(String, String)]) -> Vec<(String, u16)> {
+    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut has_parent: BTreeSet<&str> = BTreeSet::new();
+    for (p, c) in edges {
+        children.entry(p.as_str()).or_default().push(c.as_str());
+        has_parent.insert(c.as_str());
+    }
+    let roots: Vec<&str> = node_ids.iter().copied().filter(|id| !has_parent.contains(id)).collect();
+
+    let mut out = Vec::new();
+    fn dfs<'a>(
+        node: &'a str,
+        depth: u16,
+        children: &BTreeMap<&'a str, Vec<&'a str>>,
+        out: &mut Vec<(String, u16)>,
+    ) {
+        out.push((node.to_string(), depth));
+        if let Some(kids) = children.get(node) {
+            for kid in kids {
+                let next_depth = if kids.len() == 1 { depth } else { depth + 1 };
+                dfs(kid, next_depth, children, out);
+            }
+        }
+    }
+    for r in roots {
+        dfs(r, 0, &children, &mut out);
+    }
+    out
+}
