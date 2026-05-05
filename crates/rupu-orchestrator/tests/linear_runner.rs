@@ -241,8 +241,7 @@ async fn for_each_accepts_a_json_array_of_objects() {
     let fan = &res.step_results[0];
     assert_eq!(fan.items.len(), 2);
     assert!(fan.items[0].rendered_prompt.contains("review a.rs (rust)"));
-    assert!(fan
-        .items[1]
+    assert!(fan.items[1]
         .rendered_prompt
         .contains("review b.py (python)"));
 }
@@ -370,7 +369,10 @@ async fn for_each_continue_on_error_records_failures_and_keeps_going() {
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
     assert_eq!(fan.items.len(), 3);
-    assert!(!fan.success, "step success should be false when any item failed");
+    assert!(
+        !fan.success,
+        "step success should be false when any item failed"
+    );
     assert!(fan.items[0].success);
     assert!(!fan.items[1].success, "FAIL-2 should fail");
     assert!(fan.items[2].success);
@@ -470,8 +472,7 @@ async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
     // (asserted via the FakeFactory echo format).
     assert!(triage.items[0].output.contains("agent security-reviewer"));
     assert!(triage.items[1].output.contains("agent perf-reviewer"));
-    assert!(triage
-        .items[2]
+    assert!(triage.items[2]
         .output
         .contains("agent maintainability-reviewer"));
 

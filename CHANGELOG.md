@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.3.0 — Slice B-3: `rupu init` (2026-05-04)
+
+### Added
+
+- **`rupu init [PATH] [--with-samples] [--force] [--git]`** bootstraps a
+  project's `.rupu/` directory in one command.
+- **Curated template set** (`--with-samples`): 6 agent templates
+  (`review-diff`, `add-tests`, `fix-bug`, `scaffold`, `summarize-diff`,
+  `scm-pr-review`) plus one workflow (`investigate-then-fix`), embedded
+  via `include_str!` so `cargo install` users don't need network on
+  first run.
+- **`.gitignore`** auto-managed: `.rupu/transcripts/` is appended on
+  init (idempotent).
+- **`--git`** flag runs `git init` if the target isn't already in a
+  repo. Missing `git` on PATH is a warning, not a hard error.
+
+### Internal
+
+- New module `crates/rupu-cli/src/templates.rs` with the manifest;
+  bidirectional sync test ensures `templates/` and the manifest
+  never drift apart.
+- `rupu-cli` subcommand count: 9 → 10.
+
 ## v0.2.0 — Slice B-2: SCM + issue trackers (2026-05-04)
 
 ### Added
