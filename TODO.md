@@ -110,21 +110,7 @@ The Anthropic OAuth path in `crates/rupu-providers/src/anthropic.rs` carries sev
 
 **Special case — `cch=0ab17`:** the short trailing token may be a checksum of other request fields (UA, beta CSV, account UUID, …). We send it statically. If a fresh re-MITM shows the value rotating per request, **reverse-engineer the hash function** producing it. Likely candidates: a truncated HMAC over the access-token-derived account UUID + cc_version + a build-time secret. `0ab17` is hex-ish, 5 chars — likely 20-bit prefix of a longer digest. Start by capturing two requests in quick succession and seeing if `cch` differs; if same, it's not request-bound.
 
-**Why deferred (not fixed now):** today's pin works against the live API. Reverse-engineering `cch` is only worthwhile if the static value stops working — premature otherwise. The durable cure is the rupu-specific OAuth client registration (next item), which sidesteps the WAF fingerprinting entirely.
-
-## Register rupu-specific OAuth clients with each vendor (impersonation cleanup)
-
-Slice B-1's SSO flows currently impersonate first-party CLIs:
-- **Anthropic**: Claude Code's OAuth client `9d1c250a-e61b-44d9-88ed-5944d1962f5e`. Consent screen reads "Claude Code wants access ...". Request shape (URL, scopes, state-as-verifier, JSON token body) is mirrored from Claude Code/pi-mono so claude.ai's server accepts it.
-- **OpenAI**: Codex CLI's `app_EMoamEEZ73f0CkXaXp7hrann`. Required ports 1455/1457 are pinned by OpenAI's Hydra registration for that client.
-
-Long-term these should be rupu-specific OAuth clients so users see "rupu wants access ..." on the consent screen. Steps:
-1. Apply via the vendor's developer console (Anthropic: console.anthropic.com OAuth apps; OpenAI: platform.openai.com app registration; Google: GCP project OAuth credentials).
-2. Replace per-provider `client_id`, redirect URI, allowed ports, scopes in `crates/rupu-auth/src/oauth/providers.rs` with rupu's registration.
-3. Drop the comment block in that file's docstring acknowledging impersonation.
-4. Re-test all four providers' SSO flows end-to-end before release.
-
-**Why deferred:** vendors take days to weeks to approve OAuth client registrations, and matt's primary use case (paid Claude.ai subscribers running inference) works today via impersonation. Revisit once a clean release/branding window exists.
+**Why deferred (not fixed now):** today's pin works against the live API. Reverse-engineering `cch` is only worthwhile if the static value stops working — premature otherwise. Long-term the right cure would be rupu-specific OAuth client registrations, but the vendors don't currently approve third-party rupu-branded clients for paid-subscriber inference, so impersonation is the durable answer until that policy changes.
 
 ## Code-signing & keychain trust
 
