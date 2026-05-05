@@ -14,6 +14,10 @@ use crate::types::*;
 
 const GEMINI_CLI_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com";
 const ANTIGRAVITY_ENDPOINT: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
+/// AI Studio (api-key) endpoint. Distinct from the Cloud Code Assist
+/// endpoint above — different URL pattern, different request shape,
+/// different auth header.
+const AI_STUDIO_ENDPOINT: &str = "https://generativelanguage.googleapis.com";
 
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
@@ -27,20 +31,32 @@ const ANTIGRAVITY_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
 
-/// Which Google Cloud Code Assist variant to use.
+/// Which Google Gemini variant to use. The first two are Cloud Code
+/// Assist (OAuth, paid Gemini-CLI / Antigravity quotas); `AiStudio`
+/// is the public api-key endpoint at generativelanguage.googleapis.com
+/// for users with an AI Studio API key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeminiVariant {
-    /// Production: cloudcode-pa.googleapis.com
+    /// Production Cloud Code Assist: cloudcode-pa.googleapis.com (OAuth).
     GeminiCli,
-    /// Sandbox: daily-cloudcode-pa.sandbox.googleapis.com
+    /// Sandbox Cloud Code Assist: daily-cloudcode-pa.sandbox.googleapis.com (OAuth).
     Antigravity,
+    /// AI Studio public endpoint: generativelanguage.googleapis.com (api-key).
+    AiStudio,
 }
 
 impl GeminiVariant {
+    /// `true` when this variant uses an AI Studio api-key (no OAuth
+    /// refresh, different URL pattern, different request body shape).
+    fn is_api_key(&self) -> bool {
+        matches!(self, GeminiVariant::AiStudio)
+    }
+
     fn endpoint(&self) -> &'static str {
         match self {
             GeminiVariant::GeminiCli => GEMINI_CLI_ENDPOINT,
             GeminiVariant::Antigravity => ANTIGRAVITY_ENDPOINT,
+            GeminiVariant::AiStudio => AI_STUDIO_ENDPOINT,
         }
     }
 
@@ -48,6 +64,10 @@ impl GeminiVariant {
         match self {
             GeminiVariant::GeminiCli => GEMINI_CLI_CLIENT_ID,
             GeminiVariant::Antigravity => ANTIGRAVITY_CLIENT_ID,
+            // AI Studio doesn't use OAuth client credentials. Returning
+            // an empty &'static str keeps the impl total without
+            // forcing every caller to handle Option.
+            GeminiVariant::AiStudio => "",
         }
     }
 
@@ -55,6 +75,7 @@ impl GeminiVariant {
         match self {
             GeminiVariant::GeminiCli => GEMINI_CLI_CLIENT_SECRET,
             GeminiVariant::Antigravity => ANTIGRAVITY_CLIENT_SECRET,
+            GeminiVariant::AiStudio => "",
         }
     }
 
@@ -62,6 +83,11 @@ impl GeminiVariant {
         match self {
             GeminiVariant::GeminiCli => crate::provider_id::ProviderId::GoogleGeminiCli,
             GeminiVariant::Antigravity => crate::provider_id::ProviderId::GoogleAntigravity,
+            // AI Studio shares the GeminiCli provider id for now —
+            // they target the same Gemini models, just via different
+            // billing surfaces. Distinct ids would let us track
+            // usage separately; revisit when usage analytics demand it.
+            GeminiVariant::AiStudio => crate::provider_id::ProviderId::GoogleGeminiCli,
         }
     }
 
@@ -69,6 +95,7 @@ impl GeminiVariant {
         match self {
             GeminiVariant::GeminiCli => "google-cloud-sdk vscode_cloudshelleditor/0.1",
             GeminiVariant::Antigravity => "antigravity/1.18.4 darwin/arm64",
+            GeminiVariant::AiStudio => "rupu/0.3 (https://github.com/Section9Labs/rupu)",
         }
     }
 }
@@ -87,18 +114,29 @@ pub struct GoogleGeminiClient {
 
 impl GoogleGeminiClient {
     /// Create from resolved AuthCredentials + variant.
+    ///
+    /// Auth-mode rules:
+    /// - `GeminiCli` / `Antigravity` (Cloud Code Assist) require
+    ///   OAuth credentials with a `project_id` in `extra`. Bare
+    ///   api-key creds are rejected.
+    /// - `AiStudio` requires `ApiKey` credentials. The api-key is
+    ///   stored in `access_token` and `refresh_token` is empty so
+    ///   `ensure_valid_token` never tries to refresh.
     pub fn new(
         creds: AuthCredentials,
         variant: GeminiVariant,
         auth_json_path: Option<PathBuf>,
     ) -> Result<Self, ProviderError> {
-        match creds {
-            AuthCredentials::OAuth {
-                access,
-                refresh,
-                expires,
-                extra,
-            } => {
+        match (creds, variant) {
+            (
+                AuthCredentials::OAuth {
+                    access,
+                    refresh,
+                    expires,
+                    extra,
+                },
+                GeminiVariant::GeminiCli | GeminiVariant::Antigravity,
+            ) => {
                 let project_id = extra
                     .get("project_id")
                     .and_then(|v| v.as_str())
@@ -115,8 +153,24 @@ impl GoogleGeminiClient {
                     auth_json_path,
                 })
             }
-            AuthCredentials::ApiKey { .. } => Err(ProviderError::AuthConfig(
-                "Google Gemini requires OAuth authentication, not API key".into(),
+            (AuthCredentials::ApiKey { key, .. }, GeminiVariant::AiStudio) => Ok(Self {
+                client: Client::new(),
+                variant,
+                access_token: key,
+                refresh_token: String::new(),
+                expires_ms: 0,
+                project_id: String::new(),
+                auth_json_path: None,
+            }),
+            (AuthCredentials::ApiKey { .. }, _) => Err(ProviderError::AuthConfig(
+                "Google Cloud Code Assist (gemini-cli / antigravity) requires OAuth, \
+                 not API key. Use the AI Studio variant for api-key auth."
+                    .into(),
+            )),
+            (AuthCredentials::OAuth { .. }, GeminiVariant::AiStudio) => Err(ProviderError::AuthConfig(
+                "AI Studio requires API-key auth, not OAuth. Run `rupu auth login \
+                 --provider gemini --mode api-key`."
+                    .into(),
             )),
         }
     }
@@ -125,7 +179,7 @@ impl GoogleGeminiClient {
     pub async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
         self.ensure_valid_token().await?;
         let body = self.build_request_body(request);
-        let url = self.build_url();
+        let url = self.build_url(&request.model);
 
         let response = self
             .client
@@ -156,7 +210,7 @@ impl GoogleGeminiClient {
     ) -> Result<LlmResponse, ProviderError> {
         self.ensure_valid_token().await?;
         let body = self.build_request_body(request);
-        let url = self.build_stream_url();
+        let url = self.build_stream_url(&request.model);
 
         let response = self
             .client
@@ -192,25 +246,51 @@ impl GoogleGeminiClient {
             .ok_or(ProviderError::UnexpectedEndOfStream)
     }
 
-    fn build_url(&self) -> String {
-        format!("{}/v1internal:generateContent", self.variant.endpoint())
+    fn build_url(&self, model: &str) -> String {
+        match self.variant {
+            GeminiVariant::AiStudio => format!(
+                "{}/v1beta/models/{}:generateContent",
+                self.variant.endpoint(),
+                model
+            ),
+            _ => format!("{}/v1internal:generateContent", self.variant.endpoint()),
+        }
     }
 
-    fn build_stream_url(&self) -> String {
-        format!(
-            "{}/v1internal:streamGenerateContent?alt=sse",
-            self.variant.endpoint()
-        )
+    fn build_stream_url(&self, model: &str) -> String {
+        match self.variant {
+            GeminiVariant::AiStudio => format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.variant.endpoint(),
+                model
+            ),
+            _ => format!(
+                "{}/v1internal:streamGenerateContent?alt=sse",
+                self.variant.endpoint()
+            ),
+        }
     }
 
     fn build_headers(&self) -> Result<reqwest::header::HeaderMap, ProviderError> {
         let mut headers = reqwest::header::HeaderMap::new();
-        let auth_val = format!("Bearer {}", self.access_token)
-            .parse()
-            .map_err(|_| {
-                ProviderError::AuthConfig("access token contains invalid header characters".into())
-            })?;
-        headers.insert(reqwest::header::AUTHORIZATION, auth_val);
+        match self.variant {
+            GeminiVariant::AiStudio => {
+                let key_val = self.access_token.parse().map_err(|_| {
+                    ProviderError::AuthConfig("api key contains invalid header characters".into())
+                })?;
+                headers.insert("x-goog-api-key", key_val);
+            }
+            _ => {
+                let auth_val = format!("Bearer {}", self.access_token)
+                    .parse()
+                    .map_err(|_| {
+                        ProviderError::AuthConfig(
+                            "access token contains invalid header characters".into(),
+                        )
+                    })?;
+                headers.insert(reqwest::header::AUTHORIZATION, auth_val);
+            }
+        }
         headers.insert(
             reqwest::header::CONTENT_TYPE,
             "application/json".parse().unwrap(),
@@ -294,13 +374,17 @@ impl GoogleGeminiClient {
             inner_request["tools"] = serde_json::json!([{"functionDeclarations": declarations}]);
         }
 
-        // Wrap in outer envelope
+        // AI Studio's API takes the inner request directly. Cloud
+        // Code Assist wraps it in an envelope with project + model
+        // + userAgent + requestId routing fields.
+        if self.variant == GeminiVariant::AiStudio {
+            return inner_request;
+        }
         let user_agent = if self.variant == GeminiVariant::Antigravity {
             "antigravity"
         } else {
             "phi-coding-agent"
         };
-
         serde_json::json!({
             "project": self.project_id,
             "model": request.model,
@@ -311,6 +395,10 @@ impl GoogleGeminiClient {
     }
 
     async fn ensure_valid_token(&mut self) -> Result<(), ProviderError> {
+        // AI Studio uses a stable api-key — no refresh path.
+        if self.variant.is_api_key() {
+            return Ok(());
+        }
         if self.refresh_token.is_empty() || !is_token_expired(self.expires_ms) {
             return Ok(());
         }
@@ -1115,8 +1203,72 @@ mod tests {
     fn test_stream_url() {
         let client =
             GoogleGeminiClient::new(test_creds("proj"), GeminiVariant::GeminiCli, None).unwrap();
-        assert!(client.build_stream_url().contains("streamGenerateContent"));
-        assert!(client.build_stream_url().contains("alt=sse"));
+        assert!(client
+            .build_stream_url("gemini-2.5-pro")
+            .contains("streamGenerateContent"));
+        assert!(client
+            .build_stream_url("gemini-2.5-pro")
+            .contains("alt=sse"));
+    }
+
+    #[test]
+    fn ai_studio_url_uses_v1beta_with_model_in_path() {
+        let key_creds = AuthCredentials::ApiKey {
+            key: "AIzaSy-test".into(),
+        };
+        let client = GoogleGeminiClient::new(key_creds, GeminiVariant::AiStudio, None).unwrap();
+        let url = client.build_url("gemini-2.5-pro");
+        assert!(
+            url.contains("generativelanguage.googleapis.com")
+                && url.contains("v1beta/models/gemini-2.5-pro:generateContent"),
+            "got: {url}"
+        );
+        let stream_url = client.build_stream_url("gemini-2.5-pro");
+        assert!(stream_url.contains("streamGenerateContent") && stream_url.contains("alt=sse"));
+    }
+
+    #[test]
+    fn ai_studio_headers_use_x_goog_api_key_not_authorization() {
+        let key_creds = AuthCredentials::ApiKey {
+            key: "AIzaSy-key".into(),
+        };
+        let client = GoogleGeminiClient::new(key_creds, GeminiVariant::AiStudio, None).unwrap();
+        let headers = client.build_headers().unwrap();
+        assert_eq!(
+            headers.get("x-goog-api-key").unwrap().to_str().unwrap(),
+            "AIzaSy-key"
+        );
+        assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn ai_studio_rejects_oauth_credentials() {
+        let oauth_creds = AuthCredentials::OAuth {
+            access: "tok".into(),
+            refresh: "rtok".into(),
+            expires: 0,
+            extra: HashMap::new(),
+        };
+        let result = GoogleGeminiClient::new(oauth_creds, GeminiVariant::AiStudio, None);
+        let err = result.err().expect("AI Studio + OAuth should fail");
+        match err {
+            ProviderError::AuthConfig(msg) => {
+                assert!(
+                    msg.contains("AI Studio") && msg.contains("API-key"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            _ => panic!("expected AuthConfig error"),
+        }
+    }
+
+    #[test]
+    fn cloud_code_assist_still_rejects_api_key() {
+        let key_creds = AuthCredentials::ApiKey {
+            key: "k".into(),
+        };
+        let result = GoogleGeminiClient::new(key_creds, GeminiVariant::GeminiCli, None);
+        assert!(matches!(result, Err(ProviderError::AuthConfig(_))));
     }
 
     #[test]

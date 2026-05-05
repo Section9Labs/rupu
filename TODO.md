@@ -138,9 +138,9 @@ Status:
 
 Slice B-1 captures `Event::Usage` per response in JSONL transcripts. A `rupu usage` subcommand would aggregate across transcripts (per-day, per-agent, per-provider) for cost visibility. Deferred to Slice D so the same aggregator can also power the SaaS dashboard rather than building two implementations.
 
-## Gemini API-key support via AI Studio (deferred from Slice B-1 Plan 1 Task 13)
+## Gemini API-key support via AI Studio ✅ shipped
 
-The lifted `GoogleGeminiClient::new` rejects `AuthCredentials::ApiKey` — only the OAuth/Vertex path is implemented. AI Studio's API-key endpoint (`https://generativelanguage.googleapis.com/v1beta/...`) is a separate code path that's not yet wired. **Decision point for Plan 2:** add a dedicated `GoogleGeminiAiStudioClient` (separate constructor against AI Studio endpoint) OR rely entirely on Vertex SSO and document that Gemini API-key is a non-goal. Spec §4 currently implies API-key should work for all four providers, so the AI Studio path is the cleaner answer if cost is acceptable.
+Added `GeminiVariant::AiStudio` to the existing `GoogleGeminiClient` (rather than a separate `GoogleGeminiAiStudioClient`) so the OAuth and api-key paths share the body builder + response parser. Variant-specific branches handle the different URL pattern (`v1beta/models/{model}:generateContent`), `x-goog-api-key` header, request-body shape (no Cloud Code Assist `project` / `requestId` wrapping), and skipped token refresh. Wired through `provider_factory::build_gemini` so `rupu auth login --provider gemini --mode api-key --key AIzaSy...` followed by `rupu run --provider gemini ...` works end-to-end.
 
 ## Copilot `default_model` inconsistency (low-priority polish)
 

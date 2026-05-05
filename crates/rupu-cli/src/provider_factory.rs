@@ -162,15 +162,32 @@ async fn build_openai(
 }
 
 async fn build_gemini(
-    _creds: rupu_providers::auth::AuthCredentials,
+    creds: rupu_providers::auth::AuthCredentials,
     _model: &str,
 ) -> Result<Box<dyn LlmProvider>, FactoryError> {
-    // Gemini API-key path requires AI Studio endpoint; not yet implemented.
-    // OAuth/Vertex path can be wired here when SSO support is verified end-to-end.
-    Err(FactoryError::NotWiredInV0(
-        "gemini (AI Studio API-key endpoint not yet wired; SSO/Vertex pending verification)"
-            .to_string(),
-    ))
+    // Branch on credential shape:
+    // - `ApiKey` → AI Studio (`generativelanguage.googleapis.com`,
+    //   `x-goog-api-key` header).
+    // - `OAuth`  → Cloud Code Assist (Gemini-CLI / Antigravity
+    //   variants). Picking between the two is currently driven by
+    //   the `extra.variant` hint at SSO time, defaulting to the
+    //   production GeminiCli endpoint.
+    use rupu_providers::auth::AuthCredentials;
+    use rupu_providers::google_gemini::{GeminiVariant, GoogleGeminiClient};
+    let variant = match &creds {
+        AuthCredentials::ApiKey { .. } => GeminiVariant::AiStudio,
+        AuthCredentials::OAuth { extra, .. } => extra
+            .get("variant")
+            .and_then(|v| v.as_str())
+            .map(|s| match s {
+                "antigravity" => GeminiVariant::Antigravity,
+                _ => GeminiVariant::GeminiCli,
+            })
+            .unwrap_or(GeminiVariant::GeminiCli),
+    };
+    let client = GoogleGeminiClient::new(creds, variant, None)
+        .map_err(|e| FactoryError::Other(format!("gemini client init: {e}")))?;
+    Ok(Box::new(client))
 }
 
 async fn build_copilot(
@@ -255,27 +272,28 @@ mod build_gemini_tests {
     use rupu_providers::AuthMode;
 
     #[tokio::test]
-    async fn build_gemini_returns_not_wired_until_sso() {
-        // Plan 2 reality: Gemini's lifted client needs the AI Studio
-        // API-key endpoint (not yet implemented) or the Vertex/SSO path
-        // (pending verification). The factory must surface this constraint
-        // clearly rather than panic or silently succeed.
+    async fn build_gemini_with_api_key_returns_provider() {
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let resolver = InMemoryResolver::new();
-        // Insert a dummy credential so we exercise the NotWiredInV0 path,
-        // not the resolver-side missing-credential path.
         resolver
             .put(
                 ProviderId::Gemini,
                 AuthMode::ApiKey,
-                StoredCredential::api_key("dummy"),
+                StoredCredential::api_key("AIzaSy-test-key"),
             )
             .await;
         let result = build_for_provider("gemini", "gemini-2.5-pro", None, &resolver).await;
-        match result {
-            Err(FactoryError::NotWiredInV0(_)) => {}
-            Err(e) => panic!("expected NotWiredInV0, got Err({e})"),
-            Ok(_) => panic!("expected NotWiredInV0, got Ok(provider)"),
-        }
+        assert!(result.is_ok(), "expected Ok(provider), got error");
+    }
+
+    #[tokio::test]
+    async fn build_gemini_missing_credential_errors() {
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let resolver = InMemoryResolver::new();
+        let result = build_for_provider("gemini", "gemini-2.5-pro", None, &resolver).await;
+        assert!(matches!(
+            result,
+            Err(FactoryError::MissingCredential { .. })
+        ));
     }
 }
