@@ -23,7 +23,10 @@ fn rupu_init_with_samples_smoke() {
         ".rupu/agents/scm-pr-review.md",
         ".rupu/workflows/investigate-then-fix.yaml",
     ] {
-        assert!(stdout.contains(needle), "stdout missing {needle}:\n{stdout}");
+        assert!(
+            stdout.contains(needle),
+            "stdout missing {needle}:\n{stdout}"
+        );
     }
     assert!(
         stdout.contains("init: created"),
