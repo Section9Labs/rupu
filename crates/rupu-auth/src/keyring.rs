@@ -9,6 +9,9 @@
 use crate::backend::{AuthBackend, AuthError, ProviderId};
 use tracing::warn;
 
+#[allow(unused_imports)]
+use rupu_keychain_acl as _; // kept as a path dep so re-enabling L3 is one PR away
+
 /// Service name used as the keychain entry namespace. All rupu
 /// secrets share this service; the keychain entry username is the
 /// provider id (`anthropic`, `openai`, etc.).
@@ -20,18 +23,21 @@ use tracing::warn;
 pub(crate) const SERVICE: &str = "rupu";
 
 /// Best-effort: add the running rupu binary to the keychain item's ACL
-/// so subsequent reads from the same identity don't trigger the macOS
-/// "Always Allow" prompt. Failures here are non-fatal — the item is
-/// already written; the user just gets the legacy first-prompt
-/// fallback on next read. Logged at WARN so the operator can diagnose
-/// if every login is followed by a noisy fallback.
+/// so subsequent reads don't trigger the macOS "Always Allow" prompt.
 ///
-/// On non-macOS targets this is a no-op (the ACL crate's function is
-/// itself a no-op there).
-pub(crate) fn try_add_self_to_acl(account: &str) {
-    if let Err(e) = rupu_keychain_acl::add_self_to_keychain_acl(SERVICE, account) {
-        warn!(account, error = %e, "keychain ACL pre-population failed; first read will prompt");
-    }
+/// **Disabled in v0.3.x.** The legacy `SecAccess` approach in
+/// `rupu-keychain-acl` retrofits the ACL onto items that the modern
+/// `SecItemAdd` (used by the `keyring` crate) created with different
+/// semantics. The retrofit ITSELF prompts twice (Find for the item +
+/// SetAccess for the new ACL), so calling it actually made login go
+/// from 1 prompt to 3 in field testing. The proper fix is bypassing
+/// `keyring` on macOS and calling `SecItemAdd` directly with
+/// `kSecAttrAccess` pre-set — tracked separately in TODO.md.
+///
+/// Until then this is a no-op on every platform, restoring the
+/// pre-L3 behavior.
+pub(crate) fn try_add_self_to_acl(_account: &str) {
+    // Intentional no-op. See docstring.
 }
 
 /// Backend wrapping the OS keychain. Construct via [`Self::new`] or
