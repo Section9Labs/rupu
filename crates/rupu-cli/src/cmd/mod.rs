@@ -4,6 +4,7 @@ pub mod agent;
 pub mod auth;
 pub mod config;
 pub mod cron;
+pub mod init;
 pub mod mcp;
 pub mod models;
 pub mod repos;
