@@ -10,6 +10,7 @@
 pub mod action_protocol;
 pub mod cron_schedule;
 pub mod runner;
+pub mod runs;
 pub mod templates;
 pub mod workflow;
 
@@ -18,6 +19,7 @@ pub use runner::{
     run_workflow, ItemResult, OrchestratorRunOpts, OrchestratorRunResult, RunWorkflowError,
     StepFactory, StepResult,
 };
+pub use runs::{ItemResultRecord, RunRecord, RunStatus, RunStore, RunStoreError, StepResultRecord};
 pub use templates::{
     render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,
     SubResult,
