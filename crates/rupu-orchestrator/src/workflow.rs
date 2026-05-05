@@ -428,10 +428,7 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
     if let Some(subs) = &step.parallel {
         // `parallel:` block — top-level agent/prompt and for_each must
         // be absent.
-        if step.agent.is_some()
-            || step.prompt.is_some()
-            || step.for_each.is_some()
-        {
+        if step.agent.is_some() || step.prompt.is_some() || step.for_each.is_some() {
             return Err(WorkflowParseError::ParallelMutuallyExclusive {
                 step: step.id.clone(),
             });

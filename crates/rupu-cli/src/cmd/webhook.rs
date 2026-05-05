@@ -83,11 +83,7 @@ struct CliDispatcher;
 
 #[async_trait]
 impl WorkflowDispatcher for CliDispatcher {
-    async fn dispatch(
-        &self,
-        workflow_name: &str,
-        event: &serde_json::Value,
-    ) -> anyhow::Result<()> {
+    async fn dispatch(&self, workflow_name: &str, event: &serde_json::Value) -> anyhow::Result<()> {
         super::workflow::run_by_name(workflow_name, Vec::new(), None, Some(event.clone())).await
     }
 }

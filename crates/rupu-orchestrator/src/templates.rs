@@ -294,8 +294,7 @@ mod event_tests {
     #[test]
     fn missing_event_renders_empty_string() {
         let ctx = StepContext::new();
-        let out =
-            render_step_prompt("repo={{ event.repository.name }}!", &ctx).expect("render");
+        let out = render_step_prompt("repo={{ event.repository.name }}!", &ctx).expect("render");
         assert_eq!(out, "repo=!");
     }
 
@@ -310,7 +309,8 @@ mod event_tests {
         let ctx2 = StepContext::new().with_event(json!({
             "pull_request": { "merged": false }
         }));
-        let take = render_when_expression("{{ event.pull_request.merged }}", &ctx2).expect("render");
+        let take =
+            render_when_expression("{{ event.pull_request.merged }}", &ctx2).expect("render");
         assert!(!take, "merged=false should be falsy");
     }
 }

@@ -677,12 +677,11 @@ async fn run_parallel_step(
     let mut prepared: Vec<(usize, String, String, String, String, PathBuf)> =
         Vec::with_capacity(total);
     for (idx, sub) in subs.iter().enumerate() {
-        let rendered = render_step_prompt(&sub.prompt, ctx).map_err(|e| {
-            RunWorkflowError::Render {
+        let rendered =
+            render_step_prompt(&sub.prompt, ctx).map_err(|e| RunWorkflowError::Render {
                 step: format!("{}.{}", step.id, sub.id),
                 source: e,
-            }
-        })?;
+            })?;
         let run_id = format!("run_{}", Ulid::new());
         let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
         prepared.push((

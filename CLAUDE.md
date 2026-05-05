@@ -17,7 +17,7 @@
 ### Crates
 
 - **`rupu-agent`** — agent file format (`.md` + YAML frontmatter), agent loop, and permission resolver. Lifts spec/loader/permission/runner/tool_registry into one integration crate. Mock-provider tests use `MockProvider` + `BypassDecider` exposed from `runner`.
-- **`rupu-cli`** — the `rupu` binary. Thin clap dispatcher to the libraries. Nine subcommands: `run` / `agent` / `workflow` / `transcript` / `config` / `auth` / `models` / `repos` / `mcp`.
+- **`rupu-cli`** — the `rupu` binary. Thin clap dispatcher to the libraries. Ten subcommands: `init` / `run` / `agent` / `workflow` / `transcript` / `config` / `auth` / `models` / `repos` / `mcp`.
 - **`rupu-mcp`** — embedded MCP server. Two transports (in-process for the agent runtime, stdio for `rupu mcp serve`); single tool catalog backed by `rupu-scm`'s Registry. Permission gating mirrors the six-builtin model: per-tool allowlist + per-mode (`ask` / `bypass` / `readonly`).
 - **`rupu-orchestrator`** — workflow YAML parser + minijinja rendering + linear runner with pluggable `StepFactory`. Action-protocol allowlist validation lives here.
 - **`rupu-scm`** — SCM/issue-tracker connectors. `RepoConnector` + `IssueConnector` traits per spec §4c; per-platform impls under `connectors/<platform>/`. Plan 1 ships GitHub; Plan 2 adds GitLab + the embedded MCP server.

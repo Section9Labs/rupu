@@ -11,6 +11,7 @@ pub mod logging;
 pub mod paths;
 pub mod provider_factory;
 pub mod run_target;
+pub mod templates;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -61,6 +62,8 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::repos::Action,
     },
+    /// Bootstrap a new rupu project (`.rupu/agents`, `.rupu/workflows`, config).
+    Init(cmd::init::InitArgs),
     /// MCP server operations.
     Mcp {
         #[command(subcommand)]
@@ -101,6 +104,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Auth { action } => cmd::auth::handle(action).await,
         Cmd::Models { action } => cmd::models::handle(action).await,
         Cmd::Repos { action } => cmd::repos::handle(action).await,
+        Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Cron { action } => cmd::cron::handle(action).await,
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
