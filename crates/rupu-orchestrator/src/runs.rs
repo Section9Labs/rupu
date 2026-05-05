@@ -180,6 +180,36 @@ impl From<&ItemResult> for ItemResultRecord {
     }
 }
 
+impl From<&StepResultRecord> for StepResult {
+    fn from(rec: &StepResultRecord) -> Self {
+        Self {
+            step_id: rec.step_id.clone(),
+            rendered_prompt: rec.rendered_prompt.clone(),
+            run_id: rec.run_id.clone(),
+            transcript_path: rec.transcript_path.clone(),
+            output: rec.output.clone(),
+            success: rec.success,
+            skipped: rec.skipped,
+            items: rec.items.iter().map(ItemResult::from).collect(),
+        }
+    }
+}
+
+impl From<&ItemResultRecord> for ItemResult {
+    fn from(rec: &ItemResultRecord) -> Self {
+        Self {
+            index: rec.index,
+            item: rec.item.clone(),
+            sub_id: rec.sub_id.clone(),
+            rendered_prompt: rec.rendered_prompt.clone(),
+            run_id: rec.run_id.clone(),
+            transcript_path: rec.transcript_path.clone(),
+            output: rec.output.clone(),
+            success: rec.success,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RunStoreError {
     #[error("io: {0}")]

@@ -16,7 +16,7 @@ use crate::paths;
 use async_trait::async_trait;
 use clap::Subcommand;
 use rupu_orchestrator::Workflow;
-use rupu_webhook::{serve, WebhookConfig, WorkflowDispatcher};
+use rupu_webhook::{serve, DispatchOutcome, WebhookConfig, WorkflowDispatcher};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -87,8 +87,14 @@ impl WorkflowDispatcher for CliDispatcher {
         &self,
         workflow_name: &str,
         event: &serde_json::Value,
-    ) -> anyhow::Result<()> {
-        super::workflow::run_by_name(workflow_name, Vec::new(), None, Some(event.clone())).await
+    ) -> anyhow::Result<DispatchOutcome> {
+        let summary =
+            super::workflow::run_by_name(workflow_name, Vec::new(), None, Some(event.clone()))
+                .await?;
+        Ok(DispatchOutcome {
+            run_id: summary.run_id,
+            awaiting_step_id: summary.awaiting_step_id,
+        })
     }
 }
 

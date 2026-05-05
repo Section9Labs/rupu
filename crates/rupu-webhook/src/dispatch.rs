@@ -30,9 +30,30 @@ pub enum DispatchError {
 /// The dispatcher forwards it to the orchestrator so step prompts
 /// and `when:` filters can reference `{{event.*}}` (e.g.
 /// `{{event.pull_request.number}}`).
+///
+/// Returns a [`DispatchOutcome`] so the receiver can surface the
+/// run-id in the JSON response (and, for runs that paused at an
+/// approval gate, the `awaiting_step_id` so the operator knows what
+/// to approve).
 #[async_trait]
 pub trait WorkflowDispatcher: Send + Sync {
-    async fn dispatch(&self, workflow_name: &str, event: &Value) -> anyhow::Result<()>;
+    async fn dispatch(
+        &self,
+        workflow_name: &str,
+        event: &Value,
+    ) -> anyhow::Result<DispatchOutcome>;
+}
+
+/// What `WorkflowDispatcher::dispatch` produced for one matched
+/// workflow.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchOutcome {
+    /// `run_<ULID>` of the just-started run. Empty when the
+    /// dispatcher's runner doesn't emit a run-id (test stubs).
+    pub run_id: String,
+    /// `Some(step_id)` when the run paused at an approval gate
+    /// before completing.
+    pub awaiting_step_id: Option<String>,
 }
 
 /// Result row from [`dispatch_event`]: which workflows matched and
@@ -43,6 +64,12 @@ pub struct DispatchedWorkflow {
     pub name: String,
     pub fired: bool,
     pub error: Option<String>,
+    /// `run_<ULID>` if the dispatcher returned one. Lets operators
+    /// inspect / approve the run via the CLI (`rupu workflow show-run
+    /// <id>` / `rupu workflow approve <id>`).
+    pub run_id: String,
+    /// Set when the dispatched run paused at an approval gate.
+    pub awaiting_step_id: Option<String>,
 }
 
 /// Walk `candidates`, pick those whose `trigger.event:` equals
@@ -79,6 +106,8 @@ pub async fn dispatch_event(
                         name: name.clone(),
                         fired: false,
                         error: Some(format!("filter render: {e}")),
+                        run_id: String::new(),
+                        awaiting_step_id: None,
                     });
                     continue;
                 }
@@ -86,10 +115,12 @@ pub async fn dispatch_event(
         }
         info!(workflow = %name, event = %event_id, "dispatching");
         match dispatcher.dispatch(name, payload).await {
-            Ok(()) => out.push(DispatchedWorkflow {
+            Ok(outcome) => out.push(DispatchedWorkflow {
                 name: name.clone(),
                 fired: true,
                 error: None,
+                run_id: outcome.run_id,
+                awaiting_step_id: outcome.awaiting_step_id,
             }),
             Err(e) => {
                 warn!(workflow = %name, error = %e, "dispatch failed");
@@ -97,6 +128,8 @@ pub async fn dispatch_event(
                     name: name.clone(),
                     fired: false,
                     error: Some(e.to_string()),
+                    run_id: String::new(),
+                    awaiting_step_id: None,
                 });
             }
         }
@@ -163,12 +196,16 @@ mod tests {
     }
     #[async_trait]
     impl WorkflowDispatcher for RecordingDispatcher {
-        async fn dispatch(&self, name: &str, event: &Value) -> anyhow::Result<()> {
+        async fn dispatch(
+            &self,
+            name: &str,
+            event: &Value,
+        ) -> anyhow::Result<DispatchOutcome> {
             self.calls
                 .lock()
                 .unwrap()
                 .push((name.to_string(), event.clone()));
-            Ok(())
+            Ok(DispatchOutcome::default())
         }
     }
 

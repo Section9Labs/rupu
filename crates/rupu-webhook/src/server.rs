@@ -73,10 +73,20 @@ struct WebhookResponse {
 impl Serialize for DispatchedWorkflow {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut st = s.serialize_struct("DispatchedWorkflow", 3)?;
+        let mut st = s.serialize_struct("DispatchedWorkflow", 5)?;
         st.serialize_field("name", &self.name)?;
         st.serialize_field("fired", &self.fired)?;
         st.serialize_field("error", &self.error)?;
+        if !self.run_id.is_empty() {
+            st.serialize_field("run_id", &self.run_id)?;
+        } else {
+            st.skip_field("run_id")?;
+        }
+        if self.awaiting_step_id.is_some() {
+            st.serialize_field("awaiting_step_id", &self.awaiting_step_id)?;
+        } else {
+            st.skip_field("awaiting_step_id")?;
+        }
         st.end()
     }
 }

@@ -16,8 +16,8 @@ pub mod workflow;
 
 pub use action_protocol::{validate_actions, ActionValidationResult};
 pub use runner::{
-    run_workflow, ItemResult, OrchestratorRunOpts, OrchestratorRunResult, RunWorkflowError,
-    StepFactory, StepResult,
+    run_workflow, AwaitingInfo, ItemResult, OrchestratorRunOpts, OrchestratorRunResult,
+    ResumeState, RunWorkflowError, StepFactory, StepResult,
 };
 pub use runs::{ItemResultRecord, RunRecord, RunStatus, RunStore, RunStoreError, StepResultRecord};
 pub use templates::{
@@ -25,6 +25,6 @@ pub use templates::{
     SubResult,
 };
 pub use workflow::{
-    InputDef, InputType, Step, SubStep, Trigger, TriggerKind, Workflow, WorkflowDefaults,
-    WorkflowParseError,
+    Approval, InputDef, InputType, Step, SubStep, Trigger, TriggerKind, Workflow,
+    WorkflowDefaults, WorkflowParseError,
 };

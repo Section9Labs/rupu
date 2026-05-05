@@ -66,6 +66,24 @@ pub enum Action {
         /// `rupu workflow run`.
         run_id: String,
     },
+    /// Approve a paused run and resume execution from the awaited
+    /// step. The run must be in `awaiting_approval` status.
+    Approve {
+        run_id: String,
+        /// Override permission mode for the resumed run
+        /// (`ask` | `bypass` | `readonly`).
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    /// Reject a paused run. Marks it `rejected`; no further steps
+    /// dispatch.
+    Reject {
+        run_id: String,
+        /// Optional human-readable reason recorded in the run's
+        /// `error_message`.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {
@@ -87,6 +105,8 @@ pub async fn handle(action: Action) -> ExitCode {
         } => run(&name, target.as_deref(), input, mode.as_deref(), None).await,
         Action::Runs { limit, status } => runs(limit, status.as_deref()).await,
         Action::ShowRun { run_id } => show_run(&run_id).await,
+        Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
+        Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -249,6 +269,179 @@ async fn show_run(run_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    paths::ensure_dir(&global)?;
+    let runs_dir = global.join("runs");
+    let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+
+    let mut record = store
+        .load(run_id)
+        .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
+    if record.status != rupu_orchestrator::RunStatus::AwaitingApproval {
+        anyhow::bail!(
+            "run is `{}`, not `awaiting_approval` — only paused runs can be approved",
+            record.status.as_str()
+        );
+    }
+    let awaited_step_id = record
+        .awaiting_step_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("run has no awaiting_step_id; record may be corrupt"))?;
+
+    // Mutate the record back to Running BEFORE re-entering the
+    // loop. If the re-entered workflow pauses again at another
+    // approval gate, `run_workflow` will flip the status to
+    // AwaitingApproval again and refresh the awaiting_*
+    // fields.
+    record.status = rupu_orchestrator::RunStatus::Running;
+    record.awaiting_step_id = None;
+    record.approval_prompt = None;
+    record.error_message = None;
+    store
+        .update(&record)
+        .map_err(|e| anyhow::anyhow!("update run record: {e}"))?;
+
+    // Rebuild context from disk: workflow YAML snapshot + prior
+    // step results.
+    let body = store
+        .read_workflow_snapshot(run_id)
+        .map_err(|e| anyhow::anyhow!("read workflow snapshot: {e}"))?;
+    let workflow = Workflow::parse(&body)?;
+    let prior_records = store
+        .read_step_results(run_id)
+        .map_err(|e| anyhow::anyhow!("read step results: {e}"))?;
+    let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
+        .iter()
+        .map(rupu_orchestrator::StepResult::from)
+        .collect();
+
+    // Restore inputs, event, workspace path from the record.
+    let inputs_map: BTreeMap<String, String> = record.inputs.clone();
+    let event = record.event.clone();
+    let workspace_path = record.workspace_path.clone();
+    let transcripts = record.transcript_dir.clone();
+    paths::ensure_dir(&transcripts)?;
+
+    // Resolve project_root from the persisted workspace path so
+    // agent/config discovery picks up the same `.rupu/` dir the
+    // original run used.
+    let project_root = paths::project_root_for(&workspace_path)?;
+
+    // Standard wiring (mirrors `run` above; refactor candidate but
+    // keeping inline for now to avoid spreading the resume path
+    // across the CLI surface).
+    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+    let global_cfg_path = global.join("config.toml");
+    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+
+    let mode_str = mode.unwrap_or("ask").to_string();
+    let factory = Arc::new(CliStepFactory {
+        workflow: workflow.clone(),
+        global: global.clone(),
+        project_root: project_root.clone(),
+        resolver,
+        mode_str,
+        mcp_registry,
+        system_prompt_suffix: None,
+    });
+
+    let resume = rupu_orchestrator::ResumeState {
+        run_id: run_id.to_string(),
+        prior_step_results,
+        approved_step_id: awaited_step_id.clone(),
+    };
+    let opts = OrchestratorRunOpts {
+        workflow,
+        inputs: inputs_map,
+        workspace_id: record.workspace_id.clone(),
+        workspace_path,
+        transcript_dir: transcripts,
+        factory,
+        event,
+        run_store: Some(store),
+        workflow_yaml: Some(body),
+        resume_from: Some(resume),
+    };
+
+    let result = run_workflow(opts).await?;
+    println!(
+        "rupu: resumed run {} from step `{}`",
+        result.run_id, awaited_step_id
+    );
+    for sr in &result.step_results {
+        if sr.run_id.is_empty() {
+            continue;
+        }
+        // Only show the steps the resume actually dispatched —
+        // priors have run_id from a previous process and were
+        // already printed when the run originally started.
+        let was_prior = sr.transcript_path.exists() && sr.run_id.starts_with("run_");
+        if was_prior {
+            // Heuristic: the persisted prior steps will satisfy
+            // both conditions; `run_workflow` records the freshly
+            // dispatched ones too, but we don't have an easy way
+            // to distinguish from inside the result. Print both for
+            // now; future polish can dedupe via a stored boundary.
+        }
+        println!(
+            "rupu: step {} run {} -> {}",
+            sr.step_id,
+            sr.run_id,
+            sr.transcript_path.display()
+        );
+    }
+    match &result.awaiting {
+        Some(info) => {
+            println!();
+            println!(
+                "rupu: workflow paused again at step `{}` (run {})",
+                info.step_id, result.run_id
+            );
+            println!("      prompt: {}", info.prompt);
+            println!(
+                "      approve with: rupu workflow approve {}",
+                result.run_id
+            );
+        }
+        None => {
+            println!(
+                "rupu: workflow run {} finished (inspect with: rupu workflow show-run {})",
+                result.run_id, result.run_id
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let mut record = store
+        .load(run_id)
+        .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
+    if record.status != rupu_orchestrator::RunStatus::AwaitingApproval {
+        anyhow::bail!(
+            "run is `{}`, not `awaiting_approval` — only paused runs can be rejected",
+            record.status.as_str()
+        );
+    }
+    record.status = rupu_orchestrator::RunStatus::Rejected;
+    record.finished_at = Some(chrono::Utc::now());
+    record.error_message = Some(
+        reason
+            .map(str::to_string)
+            .unwrap_or_else(|| "rejected by operator".into()),
+    );
+    store
+        .update(&record)
+        .map_err(|e| anyhow::anyhow!("update run record: {e}"))?;
+    println!("rupu: run {run_id} marked rejected");
+    Ok(())
+}
+
 fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -266,6 +459,17 @@ fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
     Err(anyhow::anyhow!("workflow not found: {name}"))
 }
 
+/// Lightweight outcome surface for [`run_by_name`] callers (the
+/// webhook receiver in particular) that need to know the run-id and
+/// whether the run paused at an approval gate. The full per-step
+/// result list is intentionally excluded — it's heavy and the
+/// callers can fetch it via the run-store if they care.
+#[derive(Debug, Clone, Default)]
+pub struct RunOutcomeSummary {
+    pub run_id: String,
+    pub awaiting_step_id: Option<String>,
+}
+
 /// Public wrapper around the workflow-run pipeline so other
 /// subcommands (notably `rupu cron tick` and the webhook receiver)
 /// can invoke a workflow by name without going through the clap
@@ -278,8 +482,8 @@ pub async fn run_by_name(
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
     event: Option<serde_json::Value>,
-) -> anyhow::Result<()> {
-    run(name, None, inputs, mode, event).await
+) -> anyhow::Result<RunOutcomeSummary> {
+    run_with_outcome(name, None, inputs, mode, event).await
 }
 
 async fn run(
@@ -289,6 +493,19 @@ async fn run(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
+    run_with_outcome(name, target, inputs, mode, event).await.map(|_| ())
+}
+
+/// Same as [`run`] but returns a [`RunOutcomeSummary`] so non-CLI
+/// callers (the webhook receiver) can surface run-id + pause state.
+/// `run` itself thin-wraps this and discards the value.
+async fn run_with_outcome(
+    name: &str,
+    target: Option<&str>,
+    inputs: Vec<(String, String)>,
+    mode: Option<&str>,
+    event: Option<serde_json::Value>,
+) -> anyhow::Result<RunOutcomeSummary> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
     let workflow = Workflow::parse(&body)?;
@@ -408,10 +625,15 @@ async fn run(
         event,
         run_store: Some(run_store),
         workflow_yaml: Some(body.clone()),
+        resume_from: None,
     };
 
     let result = run_workflow(opts).await?;
     for sr in &result.step_results {
+        if sr.run_id.is_empty() {
+            // Skipped step (`when:` falsy) — no transcript path.
+            continue;
+        }
         println!(
             "rupu: step {} run {} -> {}",
             sr.step_id,
@@ -419,13 +641,35 @@ async fn run(
             sr.transcript_path.display()
         );
     }
-    if !result.run_id.is_empty() {
-        println!(
-            "rupu: workflow run {} (inspect with: rupu workflow show-run {})",
-            result.run_id, result.run_id
-        );
+    match (&result.run_id, &result.awaiting) {
+        (rid, Some(info)) if !rid.is_empty() => {
+            println!();
+            println!(
+                "rupu: workflow paused at step `{}` awaiting approval (run {})",
+                info.step_id, rid
+            );
+            println!("      prompt: {}", info.prompt);
+            println!(
+                "      approve with: rupu workflow approve {}",
+                rid
+            );
+            println!(
+                "      reject  with: rupu workflow reject {}",
+                rid
+            );
+        }
+        (rid, None) if !rid.is_empty() => {
+            println!(
+                "rupu: workflow run {} (inspect with: rupu workflow show-run {})",
+                rid, rid
+            );
+        }
+        _ => {}
     }
-    Ok(())
+    Ok(RunOutcomeSummary {
+        run_id: result.run_id,
+        awaiting_step_id: result.awaiting.map(|a| a.step_id),
+    })
 }
 
 /// `StepFactory` impl that resolves each step's `agent:` against

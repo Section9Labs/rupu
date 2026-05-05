@@ -130,8 +130,21 @@ async fn tick(dry_run: bool) -> anyhow::Result<()> {
         let inputs: Vec<(String, String)> = Vec::new();
         // Cron-triggered runs have no event payload, so `{{event.*}}`
         // bindings render as empty strings.
-        if let Err(e) = super::workflow::run_by_name(&w.name, inputs, None, None).await {
-            warn!(workflow = %w.name, error = %e, "workflow run failed");
+        match super::workflow::run_by_name(&w.name, inputs, None, None).await {
+            Ok(outcome) => {
+                if let Some(step) = outcome.awaiting_step_id {
+                    info!(
+                        workflow = %w.name,
+                        run_id = %outcome.run_id,
+                        step = %step,
+                        "workflow paused at approval gate; \
+                         resume with `rupu workflow approve <run-id>`"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(workflow = %w.name, error = %e, "workflow run failed");
+            }
         }
     }
     Ok(())

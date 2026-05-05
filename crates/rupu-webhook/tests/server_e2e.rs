@@ -5,7 +5,7 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use rupu_orchestrator::Workflow;
-use rupu_webhook::{serve, WebhookConfig, WorkflowDispatcher};
+use rupu_webhook::{serve, DispatchOutcome, WebhookConfig, WorkflowDispatcher};
 use sha2::Sha256;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
@@ -16,12 +16,16 @@ struct RecordingDispatcher {
 }
 #[async_trait]
 impl WorkflowDispatcher for RecordingDispatcher {
-    async fn dispatch(&self, name: &str, event: &serde_json::Value) -> anyhow::Result<()> {
+    async fn dispatch(
+        &self,
+        name: &str,
+        event: &serde_json::Value,
+    ) -> anyhow::Result<DispatchOutcome> {
         self.calls
             .lock()
             .unwrap()
             .push((name.to_string(), event.clone()));
-        Ok(())
+        Ok(DispatchOutcome::default())
     }
 }
 
