@@ -164,7 +164,9 @@ async fn show(name: &str) -> anyhow::Result<()> {
 async fn runs(limit: usize, status_filter: Option<&str>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    let all = store.list().map_err(|e| anyhow::anyhow!("run-store list failed: {e}"))?;
+    let all = store
+        .list()
+        .map_err(|e| anyhow::anyhow!("run-store list failed: {e}"))?;
     let filtered: Vec<_> = all
         .into_iter()
         .filter(|r| match status_filter {
@@ -215,8 +217,15 @@ async fn show_run(run_id: &str) -> anyhow::Result<()> {
     println!("Run        : {}", record.id);
     println!("Workflow   : {}", record.workflow_name);
     println!("Status     : {}", record.status.as_str());
-    println!("Workspace  : {} ({})", record.workspace_id, record.workspace_path.display());
-    println!("Started    : {}", record.started_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "Workspace  : {} ({})",
+        record.workspace_id,
+        record.workspace_path.display()
+    );
+    println!(
+        "Started    : {}",
+        record.started_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
     if let Some(fin) = record.finished_at {
         println!("Finished   : {}", fin.format("%Y-%m-%d %H:%M:%S UTC"));
     }
@@ -493,7 +502,9 @@ async fn run(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event).await.map(|_| ())
+    run_with_outcome(name, target, inputs, mode, event)
+        .await
+        .map(|_| ())
 }
 
 /// Same as [`run`] but returns a [`RunOutcomeSummary`] so non-CLI
@@ -649,14 +660,8 @@ async fn run_with_outcome(
                 info.step_id, rid
             );
             println!("      prompt: {}", info.prompt);
-            println!(
-                "      approve with: rupu workflow approve {}",
-                rid
-            );
-            println!(
-                "      reject  with: rupu workflow reject {}",
-                rid
-            );
+            println!("      approve with: rupu workflow approve {}", rid);
+            println!("      reject  with: rupu workflow reject {}", rid);
         }
         (rid, None) if !rid.is_empty() => {
             println!(

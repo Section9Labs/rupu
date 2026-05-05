@@ -37,11 +37,8 @@ pub enum DispatchError {
 /// to approve).
 #[async_trait]
 pub trait WorkflowDispatcher: Send + Sync {
-    async fn dispatch(
-        &self,
-        workflow_name: &str,
-        event: &Value,
-    ) -> anyhow::Result<DispatchOutcome>;
+    async fn dispatch(&self, workflow_name: &str, event: &Value)
+        -> anyhow::Result<DispatchOutcome>;
 }
 
 /// What `WorkflowDispatcher::dispatch` produced for one matched
@@ -196,11 +193,7 @@ mod tests {
     }
     #[async_trait]
     impl WorkflowDispatcher for RecordingDispatcher {
-        async fn dispatch(
-            &self,
-            name: &str,
-            event: &Value,
-        ) -> anyhow::Result<DispatchOutcome> {
+        async fn dispatch(&self, name: &str, event: &Value) -> anyhow::Result<DispatchOutcome> {
             self.calls
                 .lock()
                 .unwrap()
