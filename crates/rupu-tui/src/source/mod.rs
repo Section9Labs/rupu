@@ -3,6 +3,9 @@ use std::time::Duration;
 use rupu_orchestrator::RunRecord;
 use rupu_transcript::Event;
 
+mod jsonl_tail;
+pub use jsonl_tail::JsonlTailSource;
+
 mod replay;
 pub use replay::ReplaySource;
 

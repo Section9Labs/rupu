@@ -1,0 +1,150 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver};
+use std::time::Duration;
+
+use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
+use serde::Deserialize;
+use tracing::warn;
+
+use rupu_transcript::Event;
+
+use super::{EventSource, SourceEvent};
+use crate::err::TuiResult;
+
+/// On-disk envelope shape written by the TUI test fixture and future
+/// step-aware transcript writers.
+///
+/// # DISCREPANCY NOTE
+///
+/// The production `rupu-transcript` `JsonlWriter::write` emits bare
+/// `Event` objects serialised with `serde(tag = "type", content =
+/// "data")` — it does **not** wrap them in `{ts, step_id, event}`.
+/// `step_id` is only known from `step_results.jsonl` in the
+/// orchestrator's run directory, not from the per-event lines.
+///
+/// This means `JsonlTailSource` **cannot parse real production
+/// transcript files** using this `Envelope` struct. The envelope
+/// format is a spec-level contract for a future writer (see Task 24
+/// fixture) that hasn't been implemented yet. Task 8 (run.json
+/// polling) will read the orchestrator `step_results.jsonl` to
+/// correlate `step_id → transcript_path`; until that arrives, callers
+/// that want to parse live transcripts must handle the bare-`Event`
+/// format separately.
+#[derive(Debug, Deserialize)]
+struct Envelope {
+    step_id: String,
+    event: Event,
+}
+
+/// Watches a run directory and streams parsed transcript events as
+/// they're appended. Holds per-file byte offsets to handle truncated
+/// trailing lines (writer mid-flush).
+///
+/// `run_dir` is the orchestrator's `RunRecord.transcript_dir` parent
+/// (so we see both `transcripts/*.jsonl` and `run.json`).
+pub struct JsonlTailSource {
+    run_dir: PathBuf,
+    offsets: BTreeMap<PathBuf, u64>,
+    rx: Receiver<notify::Result<notify::Event>>,
+    _watcher: Box<dyn Watcher + Send + Sync>,
+}
+
+impl JsonlTailSource {
+    pub fn new(run_dir: PathBuf) -> TuiResult<Self> {
+        let (tx, rx) = channel();
+        let mut watcher = recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })?;
+        watcher.watch(&run_dir, RecursiveMode::Recursive)?;
+        Ok(Self {
+            run_dir,
+            offsets: BTreeMap::new(),
+            rx,
+            _watcher: Box::new(watcher),
+        })
+    }
+
+    /// Drain all transcript files (`transcripts/*.jsonl`) from their
+    /// last-known byte offset. Returns parsed StepEvents.
+    fn drain_transcripts(&mut self) -> Vec<SourceEvent> {
+        let transcripts = self.run_dir.join("transcripts");
+        let Ok(rd) = std::fs::read_dir(&transcripts) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            self.tail_file(&path, &mut out);
+        }
+        out
+    }
+
+    fn tail_file(&mut self, path: &std::path::Path, out: &mut Vec<SourceEvent>) {
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let last_offset = self.offsets.get(path).copied().unwrap_or(0) as usize;
+        if bytes.len() <= last_offset {
+            return;
+        }
+        let new_bytes = &bytes[last_offset..];
+        let mut consumed = 0_usize;
+        for line in new_bytes.split_inclusive(|&b| b == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
+            }
+            let s = match std::str::from_utf8(&line[..line.len() - 1]) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(?e, "non-utf8 transcript line; skipped");
+                    consumed += line.len();
+                    continue;
+                }
+            };
+            match serde_json::from_str::<Envelope>(s) {
+                Ok(env) => out.push(SourceEvent::StepEvent {
+                    step_id: env.step_id,
+                    event: env.event,
+                }),
+                Err(e) => warn!(error = %e, "malformed jsonl line; skipped"),
+            }
+            consumed += line.len();
+        }
+        let new_offset = last_offset + consumed;
+        self.offsets.insert(path.to_path_buf(), new_offset as u64);
+    }
+}
+
+impl EventSource for JsonlTailSource {
+    fn poll(&mut self) -> Vec<SourceEvent> {
+        let mut had_signal = false;
+        while let Ok(ev) = self.rx.try_recv() {
+            if let Ok(ev) = ev {
+                if matches!(ev.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                    had_signal = true;
+                }
+            }
+        }
+        if had_signal {
+            self.drain_transcripts()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn wait(&mut self, dur: Duration) -> Option<SourceEvent> {
+        let recv = self.rx.recv_timeout(dur).ok()?;
+        if recv.is_err() {
+            return None;
+        }
+        let out = self.drain_transcripts();
+        out.into_iter().next()
+    }
+}
+
+#[doc(hidden)]
+pub fn _coerce_send_sync<T: Send + Sync>(_: &T) {}
