@@ -68,6 +68,7 @@ clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
 minijinja = "2"
 dirs = "5"
+which = "6"
 
 # Auth
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }

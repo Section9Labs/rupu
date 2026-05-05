@@ -67,6 +67,35 @@ fn init_inner(args: InitArgs) -> anyhow::Result<()> {
         "init: created {}, skipped {}, overwrote {}",
         tally.created, tally.skipped, tally.overwrote
     );
+    if args.git {
+        maybe_git_init(root)?;
+    }
+    Ok(())
+}
+
+fn maybe_git_init(root: &Path) -> anyhow::Result<()> {
+    if which::which("git").is_err() {
+        eprintln!("init: --git requested but git not found on PATH; skipping");
+        return Ok(());
+    }
+    let inside = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(root)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .map(|o| o.status.success() && o.stdout.starts_with(b"true"))
+        .unwrap_or(false);
+    if inside {
+        return Ok(());
+    }
+    let status = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(root)
+        .status()?;
+    if !status.success() {
+        eprintln!("init: git init exited with status {status}; continuing");
+    }
     Ok(())
 }
 
