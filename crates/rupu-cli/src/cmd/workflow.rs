@@ -48,6 +48,24 @@ pub enum Action {
         #[arg(long)]
         mode: Option<String>,
     },
+    /// List recent workflow runs from the persistent run-store
+    /// (`<global>/runs/`). Newest first.
+    Runs {
+        /// Show only the N most recent runs.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Filter by status: `pending` / `running` / `completed` /
+        /// `failed` / `awaiting_approval` / `rejected`.
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Inspect one persisted run: status, inputs, per-step
+    /// transcript pointers.
+    ShowRun {
+        /// Full run id (`run_<ULID>`) as printed by
+        /// `rupu workflow run`.
+        run_id: String,
+    },
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {
@@ -67,6 +85,8 @@ pub async fn handle(action: Action) -> ExitCode {
             input,
             mode,
         } => run(&name, target.as_deref(), input, mode.as_deref(), None).await,
+        Action::Runs { limit, status } => runs(limit, status.as_deref()).await,
+        Action::ShowRun { run_id } => show_run(&run_id).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -118,6 +138,114 @@ async fn show(name: &str) -> anyhow::Result<()> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
     print!("{body}");
+    Ok(())
+}
+
+async fn runs(limit: usize, status_filter: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let all = store.list().map_err(|e| anyhow::anyhow!("run-store list failed: {e}"))?;
+    let filtered: Vec<_> = all
+        .into_iter()
+        .filter(|r| match status_filter {
+            None => true,
+            Some(s) => r.status.as_str() == s,
+        })
+        .take(limit)
+        .collect();
+
+    println!(
+        "{:<28} {:<20} {:<18} {:<24} WORKFLOW",
+        "RUN ID", "STATUS", "STARTED (UTC)", "DURATION"
+    );
+    for r in &filtered {
+        let started = r.started_at.format("%Y-%m-%d %H:%M:%S").to_string();
+        let duration = match r.finished_at {
+            Some(fin) => {
+                let secs = (fin - r.started_at).num_seconds();
+                format!("{}s", secs)
+            }
+            None => "(in flight)".into(),
+        };
+        println!(
+            "{:<28} {:<20} {:<18} {:<24} {}",
+            r.id,
+            r.status.as_str(),
+            started,
+            duration,
+            r.workflow_name
+        );
+    }
+    if filtered.is_empty() {
+        println!("(no runs yet — use `rupu workflow run <name>` to create one)");
+    }
+    Ok(())
+}
+
+async fn show_run(run_id: &str) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let record = store
+        .load(run_id)
+        .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
+    let rows = store
+        .read_step_results(run_id)
+        .map_err(|e| anyhow::anyhow!("read step results failed: {e}"))?;
+
+    println!("Run        : {}", record.id);
+    println!("Workflow   : {}", record.workflow_name);
+    println!("Status     : {}", record.status.as_str());
+    println!("Workspace  : {} ({})", record.workspace_id, record.workspace_path.display());
+    println!("Started    : {}", record.started_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    if let Some(fin) = record.finished_at {
+        println!("Finished   : {}", fin.format("%Y-%m-%d %H:%M:%S UTC"));
+    }
+    if !record.inputs.is_empty() {
+        println!("Inputs     :");
+        for (k, v) in &record.inputs {
+            println!("  {k} = {v}");
+        }
+    }
+    if let Some(err) = &record.error_message {
+        println!("Error      : {err}");
+    }
+    if let Some(step) = &record.awaiting_step_id {
+        println!("Awaiting   : {step}");
+    }
+
+    println!();
+    println!("STEPS ({}):", rows.len());
+    for row in &rows {
+        let chip = if row.skipped {
+            "skipped"
+        } else if row.success {
+            "ok"
+        } else {
+            "fail"
+        };
+        println!(
+            "  [{:<7}] {:<24} -> {}",
+            chip,
+            row.step_id,
+            row.transcript_path.display()
+        );
+        if !row.items.is_empty() {
+            for item in &row.items {
+                let chip = if item.success { "ok" } else { "fail" };
+                let label = if !item.sub_id.is_empty() {
+                    item.sub_id.clone()
+                } else {
+                    format!("[{}]", item.index)
+                };
+                println!(
+                    "     [{:<7}] {:<22} -> {}",
+                    chip,
+                    label,
+                    item.transcript_path.display()
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -267,6 +395,9 @@ async fn run(
     });
 
     let inputs_map: BTreeMap<String, String> = inputs.into_iter().collect();
+    let runs_dir = global.join("runs");
+    paths::ensure_dir(&runs_dir)?;
+    let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -275,6 +406,8 @@ async fn run(
         transcript_dir: transcripts,
         factory,
         event,
+        run_store: Some(run_store),
+        workflow_yaml: Some(body.clone()),
     };
 
     let result = run_workflow(opts).await?;
@@ -284,6 +417,12 @@ async fn run(
             sr.step_id,
             sr.run_id,
             sr.transcript_path.display()
+        );
+    }
+    if !result.run_id.is_empty() {
+        println!(
+            "rupu: workflow run {} (inspect with: rupu workflow show-run {})",
+            result.run_id, result.run_id
         );
     }
     Ok(())

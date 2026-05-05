@@ -115,6 +115,18 @@ pub struct OrchestratorRunOpts {
     /// runs. Bound as `{{event.*}}` in step prompts and `when:`
     /// expressions.
     pub event: Option<serde_json::Value>,
+    /// Optional persistent run-state store. When provided the runner
+    /// creates a `RunRecord` at start, appends one `StepResultRecord`
+    /// per completed step, and flips the record's status to
+    /// `Completed` / `Failed` at the end. When `None` (e.g. a unit
+    /// test wiring its own minimal harness) the runner skips
+    /// persistence entirely.
+    #[allow(clippy::missing_docs_in_private_items)]
+    pub run_store: Option<Arc<crate::runs::RunStore>>,
+    /// The workflow's YAML body, snapshotted into the run directory
+    /// at start. Required when `run_store` is `Some`; ignored
+    /// otherwise.
+    pub workflow_yaml: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +178,10 @@ pub struct ItemResult {
 #[derive(Debug, Clone)]
 pub struct OrchestratorRunResult {
     pub step_results: Vec<StepResult>,
+    /// `run_<ULID>` when a `run_store` was configured; empty
+    /// otherwise. Lets the CLI print "rupu workflow show-run <id>"
+    /// at the end of a run.
+    pub run_id: String,
 }
 
 pub async fn run_workflow(
@@ -175,11 +191,89 @@ pub async fn run_workflow(
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
     let workflow_default_continue = opts.workflow.defaults.continue_on_error.unwrap_or(false);
 
-    let mut step_results: Vec<StepResult> = Vec::new();
+    // Persistent run-state setup. When `run_store` is `Some` we
+    // create a `<global>/runs/<run-id>/` directory, snapshot the
+    // workflow YAML, and flip statuses as the run progresses. When
+    // `None` (e.g. a unit-test harness) we run in-memory only and
+    // emit an empty `run_id` in the result.
+    let run_id = if opts.run_store.is_some() {
+        format!("run_{}", Ulid::new())
+    } else {
+        String::new()
+    };
+    let mut run_record_opt = if let Some(store) = &opts.run_store {
+        let yaml = opts.workflow_yaml.as_deref().unwrap_or("");
+        let record = crate::runs::RunRecord {
+            id: run_id.clone(),
+            workflow_name: opts.workflow.name.clone(),
+            status: crate::runs::RunStatus::Running,
+            inputs: resolved_inputs.clone(),
+            event: opts.event.clone(),
+            workspace_id: opts.workspace_id.clone(),
+            workspace_path: opts.workspace_path.clone(),
+            transcript_dir: opts.transcript_dir.clone(),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting_step_id: None,
+            approval_prompt: None,
+        };
+        Some(store.create(record, yaml).map_err(map_run_store_err)?)
+    } else {
+        None
+    };
 
+    let mut step_results: Vec<StepResult> = Vec::new();
+    let outcome = run_steps_inner(
+        &opts,
+        &run_id,
+        &resolved_inputs,
+        workflow_default_continue,
+        &mut step_results,
+    )
+    .await;
+
+    // Flip the persisted status to its terminal value before
+    // returning. Even on error we want the record to reflect what
+    // actually happened so `rupu workflow show-run` is useful.
+    if let (Some(store), Some(record)) = (opts.run_store.as_ref(), run_record_opt.as_mut()) {
+        match &outcome {
+            Ok(()) => {
+                record.status = crate::runs::RunStatus::Completed;
+                record.finished_at = Some(chrono::Utc::now());
+            }
+            Err(e) => {
+                record.status = crate::runs::RunStatus::Failed;
+                record.finished_at = Some(chrono::Utc::now());
+                record.error_message = Some(e.to_string());
+            }
+        }
+        if let Err(persist_err) = store.update(record) {
+            warn!(error = %persist_err, "failed to persist terminal run state");
+        }
+    }
+
+    outcome?;
+    Ok(OrchestratorRunResult {
+        step_results,
+        run_id,
+    })
+}
+
+/// The actual per-step loop, factored out so the surrounding
+/// run-store bookkeeping (create-on-start / flip-on-end) can wrap
+/// it cleanly. `run_id` is empty when no run-store is configured
+/// (legacy in-memory mode); persistence helpers no-op in that case.
+async fn run_steps_inner(
+    opts: &OrchestratorRunOpts,
+    run_id: &str,
+    resolved_inputs: &BTreeMap<String, String>,
+    workflow_default_continue: bool,
+    step_results: &mut Vec<StepResult>,
+) -> Result<(), RunWorkflowError> {
     for step in &opts.workflow.steps {
         // Build template context from inputs + prior step outputs.
-        let ctx = base_context_for_step(&resolved_inputs, opts.event.as_ref(), &step_results);
+        let ctx = base_context_for_step(resolved_inputs, opts.event.as_ref(), step_results);
 
         // `when:` gate. Evaluated against the same context the prompt
         // sees; falsy result skips the step. The skipped step still
@@ -193,7 +287,7 @@ pub async fn run_workflow(
                 })?;
             if !take {
                 info!(step = %step.id, "skipping (when: expression is falsy)");
-                step_results.push(StepResult {
+                let result = StepResult {
                     step_id: step.id.clone(),
                     rendered_prompt: String::new(),
                     run_id: String::new(),
@@ -202,7 +296,9 @@ pub async fn run_workflow(
                     success: false,
                     skipped: true,
                     items: Vec::new(),
-                });
+                };
+                persist_step_result(opts, run_id, &result);
+                step_results.push(result);
                 continue;
             }
         }
@@ -211,16 +307,36 @@ pub async fn run_workflow(
             step.continue_on_error.unwrap_or(workflow_default_continue);
 
         let result = if step.parallel.is_some() {
-            run_parallel_step(step, &ctx, &opts, effective_continue_on_error).await?
+            run_parallel_step(step, &ctx, opts, effective_continue_on_error).await?
         } else if step.for_each.is_some() {
-            run_fanout_step(step, &ctx, &opts, effective_continue_on_error).await?
+            run_fanout_step(step, &ctx, opts, effective_continue_on_error).await?
         } else {
-            run_linear_step(step, &ctx, &opts, effective_continue_on_error).await?
+            run_linear_step(step, &ctx, opts, effective_continue_on_error).await?
         };
+        persist_step_result(opts, run_id, &result);
         step_results.push(result);
     }
+    Ok(())
+}
 
-    Ok(OrchestratorRunResult { step_results })
+/// Append one step's record to the run's `step_results.jsonl`. A
+/// failure to persist is logged but doesn't abort the in-memory run
+/// — the in-flight result still carries forward to the next step's
+/// template context. No-op when `run_store` is `None` or `run_id`
+/// is empty (in-memory mode).
+fn persist_step_result(opts: &OrchestratorRunOpts, run_id: &str, result: &StepResult) {
+    let Some(store) = &opts.run_store else { return };
+    if run_id.is_empty() {
+        return;
+    }
+    let record = crate::runs::StepResultRecord::from(result);
+    if let Err(e) = store.append_step_result(run_id, &record) {
+        warn!(step = %result.step_id, error = %e, "failed to append step record");
+    }
+}
+
+fn map_run_store_err(e: crate::runs::RunStoreError) -> RunWorkflowError {
+    RunWorkflowError::Io(std::io::Error::other(format!("run-store: {e}")))
 }
 
 /// Build the read-only template context that a (linear) step or

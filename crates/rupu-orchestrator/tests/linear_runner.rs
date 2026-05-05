@@ -83,6 +83,8 @@ async fn second_step_sees_first_step_output_via_template() {
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FakeFactory),
         event: None,
+        run_store: None,
+        workflow_yaml: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -122,6 +124,8 @@ async fn event_payload_is_visible_in_step_prompts() {
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FakeFactory),
         event: Some(event),
+        run_store: None,
+        workflow_yaml: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 1);
@@ -170,6 +174,8 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FakeFactory),
         event: None,
+        run_store: None,
+        workflow_yaml: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -224,6 +230,8 @@ async fn for_each_accepts_a_json_array_of_objects() {
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FakeFactory),
         event: None,
+        run_store: None,
+        workflow_yaml: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -260,6 +268,8 @@ async fn for_each_pulls_items_from_workflow_inputs_with_max_parallel_cap() {
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FakeFactory),
         event: None,
+        run_store: None,
+        workflow_yaml: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -348,6 +358,8 @@ async fn for_each_continue_on_error_records_failures_and_keeps_going() {
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FailingFactory),
         event: None,
+        run_store: None,
+        workflow_yaml: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -382,6 +394,8 @@ async fn for_each_without_continue_on_error_aborts_workflow_on_first_failure() {
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FailingFactory),
         event: None,
+        run_store: None,
+        workflow_yaml: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -432,6 +446,8 @@ async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FakeFactory),
         event: None,
+        run_store: None,
+        workflow_yaml: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -489,6 +505,8 @@ async fn parallel_continue_on_error_records_per_sub_step_failures() {
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FailingFactory),
         event: None,
+        run_store: None,
+        workflow_yaml: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let triage = &res.step_results[0];
@@ -526,6 +544,8 @@ async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message()
         transcript_dir: tmp.path().to_path_buf(),
         factory: Arc::new(FailingFactory),
         event: None,
+        run_store: None,
+        workflow_yaml: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -533,4 +553,136 @@ async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message()
         msg.contains("triage.bad") && msg.contains("simulated failure"),
         "expected triage.bad in error message, got: {msg}"
     );
+}
+
+// -- Persistent run state ---------------------------------------------------
+
+const WF_PERSIST: &str = r#"
+name: persist-me
+steps:
+  - id: a
+    agent: ag
+    actions: []
+    prompt: "hello a"
+  - id: b
+    agent: ag
+    actions: []
+    prompt: "hello b ({{ steps.a.output }})"
+"#;
+
+#[tokio::test]
+async fn run_store_records_run_metadata_and_per_step_rows() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let runs_root = tmp.path().join("runs");
+    let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root.clone()));
+    let wf = Workflow::parse(WF_PERSIST).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_persist".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(WF_PERSIST.to_string()),
+    };
+    let res = run_workflow(opts).await.unwrap();
+    assert!(!res.run_id.is_empty(), "run_id should be populated");
+
+    // run.json reflects the terminal Completed state.
+    let record = store.load(&res.run_id).expect("load run record");
+    assert_eq!(record.workflow_name, "persist-me");
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::Completed);
+    assert!(record.finished_at.is_some());
+    assert!(record.error_message.is_none());
+
+    // workflow.yaml round-trips.
+    let snap = store.read_workflow_snapshot(&res.run_id).unwrap();
+    assert_eq!(snap, WF_PERSIST);
+
+    // step_results.jsonl has one row per step in declared order.
+    let rows = store.read_step_results(&res.run_id).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].step_id, "a");
+    assert_eq!(rows[1].step_id, "b");
+    assert!(rows[0].success);
+    assert!(rows[1].success);
+    // The second step's persisted rendered_prompt shows `steps.a.output` resolved.
+    assert!(
+        rows[1].rendered_prompt.contains("hello b (step a agent ag echo: hello a)"),
+        "step b prompt should have rendered against step a's output, got: {}",
+        rows[1].rendered_prompt
+    );
+}
+
+const WF_PERSIST_FAIL: &str = r#"
+name: persist-fail
+steps:
+  - id: ok
+    agent: ag
+    actions: []
+    prompt: "ok"
+  - id: bad
+    agent: ag
+    actions: []
+    prompt: "FAIL on purpose"
+"#;
+
+#[tokio::test]
+async fn run_store_marks_run_failed_with_error_message() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let runs_root = tmp.path().join("runs");
+    let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root.clone()));
+    let wf = Workflow::parse(WF_PERSIST_FAIL).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_persist_fail".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FailingFactory),
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(WF_PERSIST_FAIL.to_string()),
+    };
+    let _ = run_workflow(opts).await.expect_err("workflow should fail");
+
+    // The Completed=>Failed transition must happen even though the
+    // top-level call returned an error. Walk the store to find the
+    // single run.
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), 1);
+    let rec = &listed[0];
+    assert_eq!(rec.status, rupu_orchestrator::RunStatus::Failed);
+    assert!(rec.finished_at.is_some());
+    assert!(rec
+        .error_message
+        .as_ref()
+        .is_some_and(|m| m.contains("simulated failure")));
+    // The successful first step's row should still be persisted —
+    // partial step rows are valuable for post-mortem inspection.
+    let rows = store.read_step_results(&rec.id).unwrap();
+    assert_eq!(rows.len(), 1, "only the successful row is appended; the failed step aborts before persist");
+    assert_eq!(rows[0].step_id, "ok");
+}
+
+#[tokio::test]
+async fn no_run_store_skips_persistence_and_emits_empty_run_id() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(WF_PERSIST).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_no_persist".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    assert!(res.run_id.is_empty(), "run_id should be empty when no run_store is wired");
+    assert_eq!(res.step_results.len(), 2);
 }
