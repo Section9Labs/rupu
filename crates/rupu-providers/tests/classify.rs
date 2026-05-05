@@ -84,3 +84,33 @@ fn classify_handles_multibyte_utf8_body_without_panic() {
         other => panic!("expected BadRequest, got {other:?}"),
     }
 }
+
+#[test]
+fn classify_handles_3byte_utf8_walks_back_to_char_boundary() {
+    // 3-byte chars (€ = U+20AC = 0xE2 0x82 0xAC). 250 of them = 750 bytes.
+    // The 500-byte truncate limit lands mid-char (500 % 3 == 2), so the
+    // is_char_boundary walk-back loop MUST decrement to 498 (a valid
+    // boundary) — exercising the path that the 4-byte 🦀 test above
+    // never reached because 500 % 4 == 0 happens to land on a boundary.
+    let body: String = "€".repeat(250);
+    let e = rupu_providers::classify::classify_openai(400, &body, None);
+    match e {
+        rupu_providers::error::ProviderError::BadRequest { message } => {
+            assert!(
+                message.ends_with('…'),
+                "expected ellipsis suffix, got: {message:?}"
+            );
+            // Strip the ellipsis and confirm the prefix is intact UTF-8
+            // (no half-char artifact from a wrong cut point).
+            let prefix = message.strip_suffix('…').unwrap();
+            assert!(
+                prefix.chars().all(|c| c == '€'),
+                "truncated body should contain only whole € chars, got: {prefix:?}"
+            );
+            // And that the truncation happened at the largest valid
+            // boundary at-or-below 500 bytes (498 = 166 chars × 3).
+            assert_eq!(prefix.len(), 498);
+        }
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+}
