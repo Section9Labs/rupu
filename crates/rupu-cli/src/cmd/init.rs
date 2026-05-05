@@ -55,21 +55,93 @@ fn init_inner(args: InitArgs) -> anyhow::Result<()> {
         anyhow::bail!("PATH exists but is not a directory: {}", root.display());
     }
 
-    create_skeleton(root)?;
+    let mut tally = WriteTally::default();
+    create_skeleton(root, &mut tally)?;
     ensure_gitignore_entry(root)?;
+
+    if args.with_samples {
+        write_manifest(root, args.force, &mut tally)?;
+    }
+
+    println!(
+        "init: created {}, skipped {}, overwrote {}",
+        tally.created, tally.skipped, tally.overwrote
+    );
     Ok(())
 }
 
-fn create_skeleton(root: &Path) -> anyhow::Result<()> {
+#[derive(Default)]
+struct WriteTally {
+    created: usize,
+    skipped: usize,
+    overwrote: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileAction {
+    Created,
+    Skipped,
+    Overwrote,
+}
+
+fn write_file(path: &Path, content: &str, force: bool) -> anyhow::Result<FileAction> {
+    if !path.exists() {
+        fs::write(path, content)?;
+        return Ok(FileAction::Created);
+    }
+    if force {
+        fs::write(path, content)?;
+        return Ok(FileAction::Overwrote);
+    }
+    Ok(FileAction::Skipped)
+}
+
+// config.toml does NOT honor --force — overwriting a customized config is
+// a worse footgun than re-seeding agent templates.
+fn create_skeleton(root: &Path, tally: &mut WriteTally) -> anyhow::Result<()> {
     fs::create_dir_all(root.join(".rupu/agents"))?;
     fs::create_dir_all(root.join(".rupu/workflows"))?;
 
     let cfg_path = root.join(".rupu/config.toml");
-    if !cfg_path.exists() {
-        fs::write(&cfg_path, CONFIG_SKELETON)?;
-        println!("CREATED {}", relpath(root, &cfg_path));
-    } else {
-        println!("SKIPPED {} (exists)", relpath(root, &cfg_path));
+    let action = write_file(&cfg_path, CONFIG_SKELETON, false)?;
+    match action {
+        FileAction::Created => {
+            println!("CREATED {}", relpath(root, &cfg_path));
+            tally.created += 1;
+        }
+        FileAction::Skipped => {
+            println!("SKIPPED {} (exists)", relpath(root, &cfg_path));
+            tally.skipped += 1;
+        }
+        FileAction::Overwrote => {
+            unreachable!("config.toml never gets force=true at this layer")
+        }
+    }
+    Ok(())
+}
+
+fn write_manifest(root: &Path, force: bool, tally: &mut WriteTally) -> anyhow::Result<()> {
+    use crate::templates::MANIFEST;
+    for t in MANIFEST {
+        let dest = root.join(t.target_relpath);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let action = write_file(&dest, t.content, force)?;
+        match action {
+            FileAction::Created => {
+                println!("CREATED {}", relpath(root, &dest));
+                tally.created += 1;
+            }
+            FileAction::Skipped => {
+                println!("SKIPPED {} (exists)", relpath(root, &dest));
+                tally.skipped += 1;
+            }
+            FileAction::Overwrote => {
+                println!("OVERWROTE {}", relpath(root, &dest));
+                tally.overwrote += 1;
+            }
+        }
     }
     Ok(())
 }
