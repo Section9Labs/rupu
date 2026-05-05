@@ -35,7 +35,26 @@ somewhere on your `$PATH`.
 
 ## Quick start
 
-### 1. Authenticate
+```bash
+# 1. Bootstrap a new project
+rupu init --with-samples --git
+
+# 2. Authenticate at least one provider
+rupu auth login --provider anthropic --mode sso
+
+# 3. Run an agent
+rupu run review-diff
+```
+
+`rupu init --with-samples` seeds six curated agent templates
+(`review-diff`, `add-tests`, `fix-bug`, `scaffold`, `summarize-diff`,
+`scm-pr-review`) plus one workflow (`investigate-then-fix`) under
+`.rupu/`. Re-running is a no-op; pass `--force` to overwrite local
+template customizations with the latest embedded versions.
+
+---
+
+### Authenticate
 
 rupu supports four providers; each works with API-key auth or SSO.
 
@@ -96,7 +115,7 @@ rupu mcp serve --transport stdio
 Linear and Jira issue trackers are designed-in but not shipped in this
 release; see [TODO.md](TODO.md) for the deferred-feature list.
 
-### 2. Run your first agent
+### Run your first agent
 
 The rupu repository ships sample agents in `.rupu/agents/`. If you run `rupu` from
 inside the rupu checkout, project-discovery picks them up automatically — the same
@@ -109,22 +128,14 @@ rupu run fix-bug "make the failing test pass"
 
 A JSONL transcript is written to `~/.rupu/transcripts/<run-id>.jsonl`.
 
-### 3. Use the samples in your own project
+### Use the samples in your own project
 
 ```sh
-mkdir -p ~/projects/your-repo/.rupu
-cp -r /path/to/rupu/.rupu/agents  ~/projects/your-repo/.rupu/agents
-cp -r /path/to/rupu/.rupu/workflows ~/projects/your-repo/.rupu/workflows
-```
-
-Then from inside `~/projects/your-repo`:
-
-```sh
-rupu run summarize-diff "summarize changes since main"
+cd ~/projects/your-repo
+rupu init --with-samples --git
 rupu run review-diff "look for bugs and missing tests"
+rupu run summarize-diff "summarize changes since main"
 ```
-
-> A `rupu init --with-samples` subcommand is on the Slice B roadmap.
 
 ---
 

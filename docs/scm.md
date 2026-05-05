@@ -20,6 +20,8 @@ PR, nested namespaces, rate-limit headers).
 
 ## Auth
 
+> New project? Run `rupu init --with-samples` to seed `.rupu/agents/scm-pr-review.md` and the rest of the curated templates.
+
 `rupu auth login --provider <github|gitlab> --mode <api-key|sso>` stores tokens
 in the OS keychain. Same flow as Slice B-1's LLM-provider auth; `rupu auth status`
 picks up SCM rows automatically.
