@@ -1,0 +1,18 @@
+name: investigate-then-fix
+description: Two-step bug fix — investigate, then propose minimal edit.
+steps:
+  - id: investigate
+    agent: fix-bug
+    actions: []
+    prompt: |
+      Investigate the bug described by:
+      {{ inputs.prompt }}
+
+      Stop without making edits. Report the root cause as text.
+  - id: propose
+    agent: fix-bug
+    actions: []
+    prompt: |
+      Based on this investigation:
+      {{ steps.investigate.output }}
+      Propose and apply the minimal fix.
