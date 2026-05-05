@@ -4,6 +4,7 @@
 
 #![doc(html_root_url = "https://docs.rs/rupu-tui")]
 
+pub mod control;
 pub mod err;
 pub mod source;
 pub mod state;
