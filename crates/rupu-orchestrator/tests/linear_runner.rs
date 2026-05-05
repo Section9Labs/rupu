@@ -622,7 +622,9 @@ async fn run_store_records_run_metadata_and_per_step_rows() {
     assert!(rows[1].success);
     // The second step's persisted rendered_prompt shows `steps.a.output` resolved.
     assert!(
-        rows[1].rendered_prompt.contains("hello b (step a agent ag echo: hello a)"),
+        rows[1]
+            .rendered_prompt
+            .contains("hello b (step a agent ag echo: hello a)"),
         "step b prompt should have rendered against step a's output, got: {}",
         rows[1].rendered_prompt
     );
@@ -676,7 +678,11 @@ async fn run_store_marks_run_failed_with_error_message() {
     // The successful first step's row should still be persisted —
     // partial step rows are valuable for post-mortem inspection.
     let rows = store.read_step_results(&rec.id).unwrap();
-    assert_eq!(rows.len(), 1, "only the successful row is appended; the failed step aborts before persist");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the successful row is appended; the failed step aborts before persist"
+    );
     assert_eq!(rows[0].step_id, "ok");
 }
 
@@ -697,7 +703,10 @@ async fn no_run_store_skips_persistence_and_emits_empty_run_id() {
         resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
-    assert!(res.run_id.is_empty(), "run_id should be empty when no run_store is wired");
+    assert!(
+        res.run_id.is_empty(),
+        "run_id should be empty when no run_store is wired"
+    );
     assert_eq!(res.step_results.len(), 2);
 }
 
@@ -756,14 +765,19 @@ async fn approval_gate_pauses_run_and_persists_awaiting_state() {
         awaiting.prompt
     );
     assert!(
-        awaiting.prompt.contains("prepared by step prepare agent ag echo"),
+        awaiting
+            .prompt
+            .contains("prepared by step prepare agent ag echo"),
         "approval prompt should see prior step output, got: {}",
         awaiting.prompt
     );
 
     // Persisted record reflects AwaitingApproval + the awaiting fields.
     let record = store.load(&res.run_id).unwrap();
-    assert_eq!(record.status, rupu_orchestrator::RunStatus::AwaitingApproval);
+    assert_eq!(
+        record.status,
+        rupu_orchestrator::RunStatus::AwaitingApproval
+    );
     assert_eq!(record.awaiting_step_id.as_deref(), Some("deploy"));
     assert!(record.approval_prompt.is_some());
     assert!(record.finished_at.is_none(), "paused runs aren't finished");
@@ -833,7 +847,11 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
 
     // Run completed this time.
     assert!(res.awaiting.is_none(), "resume should run to completion");
-    assert_eq!(res.step_results.len(), 3, "all three steps now in result list");
+    assert_eq!(
+        res.step_results.len(),
+        3,
+        "all three steps now in result list"
+    );
     let names: Vec<&str> = res
         .step_results
         .iter()

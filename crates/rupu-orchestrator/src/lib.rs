@@ -25,6 +25,6 @@ pub use templates::{
     SubResult,
 };
 pub use workflow::{
-    Approval, InputDef, InputType, Step, SubStep, Trigger, TriggerKind, Workflow,
-    WorkflowDefaults, WorkflowParseError,
+    Approval, InputDef, InputType, Step, SubStep, Trigger, TriggerKind, Workflow, WorkflowDefaults,
+    WorkflowParseError,
 };

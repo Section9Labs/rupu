@@ -262,7 +262,10 @@ impl RunStore {
         // Touch the step-results log so subsequent appends don't
         // need to create+open.
         File::create(self.step_results_log(&record.id))?;
-        write_atomic(&self.run_json(&record.id), &serde_json::to_vec_pretty(&record)?)?;
+        write_atomic(
+            &self.run_json(&record.id),
+            &serde_json::to_vec_pretty(&record)?,
+        )?;
         Ok(record)
     }
 
@@ -307,10 +310,7 @@ impl RunStore {
     }
 
     /// Read every step-result row for a run, in append order.
-    pub fn read_step_results(
-        &self,
-        run_id: &str,
-    ) -> Result<Vec<StepResultRecord>, RunStoreError> {
+    pub fn read_step_results(&self, run_id: &str) -> Result<Vec<StepResultRecord>, RunStoreError> {
         let path = self.step_results_log(run_id);
         if !path.is_file() {
             return Ok(Vec::new());
@@ -442,7 +442,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
         let rec = sample_record("run_02");
-        store.create(rec.clone(), "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n").unwrap();
+        store
+            .create(
+                rec.clone(),
+                "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n",
+            )
+            .unwrap();
 
         let mut updated = rec.clone();
         updated.status = RunStatus::Running;
@@ -463,10 +468,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
         let rec = sample_record("run_03");
-        store.create(rec.clone(), "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n").unwrap();
+        store
+            .create(
+                rec.clone(),
+                "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n",
+            )
+            .unwrap();
 
-        store.append_step_result(&rec.id, &sample_step_result("a")).unwrap();
-        store.append_step_result(&rec.id, &sample_step_result("b")).unwrap();
+        store
+            .append_step_result(&rec.id, &sample_step_result("a"))
+            .unwrap();
+        store
+            .append_step_result(&rec.id, &sample_step_result("b"))
+            .unwrap();
 
         let rows = store.read_step_results(&rec.id).unwrap();
         assert_eq!(rows.len(), 2);
