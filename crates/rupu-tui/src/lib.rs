@@ -5,5 +5,6 @@
 #![doc(html_root_url = "https://docs.rs/rupu-tui")]
 
 pub mod err;
+pub mod source;
 pub mod state;
 pub use err::{TuiError, TuiResult};
