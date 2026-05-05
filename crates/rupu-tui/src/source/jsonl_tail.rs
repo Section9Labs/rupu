@@ -4,45 +4,20 @@ use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
-use serde::Deserialize;
 use tracing::warn;
-
-use rupu_transcript::Event;
 
 use super::{EventSource, SourceEvent};
 use crate::err::TuiResult;
-
-/// On-disk envelope shape written by the TUI test fixture and future
-/// step-aware transcript writers.
-///
-/// # DISCREPANCY NOTE
-///
-/// The production `rupu-transcript` `JsonlWriter::write` emits bare
-/// `Event` objects serialised with `serde(tag = "type", content =
-/// "data")` — it does **not** wrap them in `{ts, step_id, event}`.
-/// `step_id` is only known from `step_results.jsonl` in the
-/// orchestrator's run directory, not from the per-event lines.
-///
-/// This means `JsonlTailSource` **cannot parse real production
-/// transcript files** using this `Envelope` struct. The envelope
-/// format is a spec-level contract for a future writer (see Task 24
-/// fixture) that hasn't been implemented yet. Task 8 (run.json
-/// polling) will read the orchestrator `step_results.jsonl` to
-/// correlate `step_id → transcript_path`; until that arrives, callers
-/// that want to parse live transcripts must handle the bare-`Event`
-/// format separately.
-#[derive(Debug, Deserialize)]
-struct Envelope {
-    step_id: String,
-    event: Event,
-}
 
 /// Watches a run directory and streams parsed transcript events as
 /// they're appended. Holds per-file byte offsets to handle truncated
 /// trailing lines (writer mid-flush).
 ///
-/// `run_dir` is the orchestrator's `RunRecord.transcript_dir` parent
-/// (so we see both `transcripts/*.jsonl` and `run.json`).
+/// Each event's `step_id` is derived from the transcript filename
+/// stem (e.g. `run_01KQQNWH….jsonl` → `run_01KQQNWH…`). For v0
+/// single-agent runs this is the right identifier. Workflow-run
+/// step-id resolution (file → workflow step) happens at the App
+/// layer, which can read `step_results.jsonl` to translate.
 pub struct JsonlTailSource {
     run_dir: PathBuf,
     offsets: BTreeMap<PathBuf, u64>,
@@ -84,6 +59,12 @@ impl JsonlTailSource {
     }
 
     fn tail_file(&mut self, path: &std::path::Path, out: &mut Vec<SourceEvent>) {
+        let step_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
         let Ok(bytes) = std::fs::read(path) else {
             return;
         };
@@ -105,10 +86,10 @@ impl JsonlTailSource {
                     continue;
                 }
             };
-            match serde_json::from_str::<Envelope>(s) {
-                Ok(env) => out.push(SourceEvent::StepEvent {
-                    step_id: env.step_id,
-                    event: env.event,
+            match serde_json::from_str::<rupu_transcript::Event>(s) {
+                Ok(event) => out.push(SourceEvent::StepEvent {
+                    step_id: step_id.clone(),
+                    event,
                 }),
                 Err(e) => warn!(error = %e, "malformed jsonl line; skipped"),
             }

@@ -7,17 +7,17 @@ use rupu_tui::source::{EventSource, JsonlTailSource, SourceEvent};
 use tempfile::tempdir;
 
 #[test]
-fn tail_emits_events_appended_to_step_jsonl() {
+fn tail_emits_events_with_filename_stem_step_id() {
     let dir = tempdir().unwrap();
     let transcripts = dir.path().join("transcripts");
     std::fs::create_dir_all(&transcripts).unwrap();
 
     let mut src = JsonlTailSource::new(dir.path().to_path_buf()).unwrap();
 
-    let path = transcripts.join("step_a_run_001.jsonl");
+    let path = transcripts.join("run_01KX.jsonl");
     let mut f = std::fs::File::create(&path).unwrap();
     let ev = Event::RunStart {
-        run_id: "run_001".into(),
+        run_id: "run_01KX".into(),
         workspace_id: "ws".into(),
         agent: "a".into(),
         provider: "anthropic".into(),
@@ -25,16 +25,16 @@ fn tail_emits_events_appended_to_step_jsonl() {
         started_at: Utc::now(),
         mode: RunMode::Ask,
     };
-    let envelope = serde_json::json!({
-        "ts": Utc::now(), "step_id": "step-a", "event": ev,
-    });
-    writeln!(f, "{}", serde_json::to_string(&envelope).unwrap()).unwrap();
+    writeln!(f, "{}", serde_json::to_string(&ev).unwrap()).unwrap();
     f.sync_all().unwrap();
 
     let drained = wait_for_events(&mut src, Duration::from_secs(2));
     assert!(
-        drained.iter().any(|e| matches!(e, SourceEvent::StepEvent { step_id, .. } if step_id == "step-a")),
-        "expected step-a StepEvent, got {drained:?}"
+        drained.iter().any(|e| matches!(
+            e,
+            SourceEvent::StepEvent { step_id, .. } if step_id == "run_01KX"
+        )),
+        "expected StepEvent with step_id derived from filename stem; got {drained:?}"
     );
 }
 
