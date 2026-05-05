@@ -34,7 +34,11 @@ if [[ ! -x "$binary" ]]; then
 fi
 
 # Confirm hardened runtime is set (notarization requires it).
-if ! codesign --display --verbose=2 "$binary" 2>&1 | grep -q "flags=.*runtime"; then
+# Capture full output first to dodge a `set -o pipefail` + `grep -q`
+# race where grep closes the pipe early and codesign exits with
+# SIGPIPE, making the whole pipeline non-zero.
+codesign_out="$(codesign --display --verbose=2 "$binary" 2>&1 || true)"
+if ! grep -q "flags=.*runtime" <<<"$codesign_out"; then
   cat >&2 <<EOF
 scripts/notarize-release.sh: $binary lacks hardened runtime.
 Re-sign first:
