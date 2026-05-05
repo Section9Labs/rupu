@@ -91,7 +91,7 @@ pub struct LoopInfo {
 ///   `steps.<id>.sub_results.<sub_id>` (only populated for
 ///   `parallel:`),
 /// - `success` is true iff every unit finished without error.
-#[derive(Debug, Default, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct StepOutput {
     pub output: String,
     #[serde(default)]
@@ -107,6 +107,67 @@ pub struct StepOutput {
     /// `steps.<id>.sub_results.<sub_id>.{output,success}`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sub_results: BTreeMap<String, SubResult>,
+    /// Aggregated findings for `panel:` steps. Empty for non-panel
+    /// steps. Bound as `steps.<id>.findings[*]` and
+    /// `steps.<id>.max_severity` ("critical" / "high" / "medium" /
+    /// "low" / "" when there are no findings).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<FindingView>,
+    /// Highest severity in `findings`. Empty string when no
+    /// findings. Convenient for `when:` gates: e.g.
+    /// `when: "{{ steps.panel.max_severity == 'critical' }}"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub max_severity: String,
+    /// Iteration count for panel steps with a `gate:` loop. `0` for
+    /// non-panel steps and panel steps without a gate (which run a
+    /// single iteration).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub iterations: u32,
+    /// `true` when a panel step's gate cleared (or no gate was set).
+    /// `false` when `max_iterations` was hit with findings still
+    /// above the threshold. Always `true` for non-panel steps.
+    #[serde(skip_serializing_if = "is_true")]
+    pub resolved: bool,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+/// Template-facing view of a single finding. Same shape as the
+/// runtime [`crate::runner::Finding`] but lives in this module so
+/// `StepOutput` can render cleanly without pulling the runner type
+/// into the template surface.
+#[derive(Debug, Clone, Serialize)]
+pub struct FindingView {
+    /// Panelist agent that emitted this finding.
+    pub source: String,
+    /// "low" / "medium" / "high" / "critical".
+    pub severity: String,
+    pub title: String,
+    pub body: String,
+}
+
+impl Default for StepOutput {
+    fn default() -> Self {
+        Self {
+            output: String::new(),
+            success: false,
+            skipped: false,
+            results: Vec::new(),
+            sub_results: BTreeMap::new(),
+            findings: Vec::new(),
+            max_severity: String::new(),
+            iterations: 0,
+            // Non-panel steps that complete normally are "resolved";
+            // panel steps overwrite this when they decide.
+            resolved: true,
+        }
+    }
 }
 
 /// One sub-step's published output for `parallel:` steps. Carries
@@ -144,6 +205,7 @@ impl StepContext {
                 skipped: false,
                 results: Vec::new(),
                 sub_results: BTreeMap::new(),
+                ..Default::default()
             },
         );
         self
@@ -166,6 +228,7 @@ impl StepContext {
                 skipped: false,
                 results,
                 sub_results: BTreeMap::new(),
+                ..Default::default()
             },
         );
         self
@@ -263,6 +326,7 @@ mod when_tests {
                 skipped: false,
                 results: Vec::new(),
                 sub_results: BTreeMap::new(),
+                ..Default::default()
             },
         );
         let v = render_when_expression("{{ steps.review.output }}", &ctx).expect("render");

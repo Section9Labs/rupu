@@ -134,7 +134,39 @@ pub struct StepResultRecord {
     /// Per-unit records for fan-out steps. Empty for linear steps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<ItemResultRecord>,
+    /// Aggregated panel findings. Empty for non-panel steps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<FindingRecord>,
+    /// Iteration count for panel `gate:` loops. `0` for non-panel
+    /// steps and panel steps without a gate.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub iterations: u32,
+    /// `true` when the panel step's gate cleared (or no gate). True
+    /// for non-panel steps.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub resolved: bool,
     pub finished_at: DateTime<Utc>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+fn is_true(b: &bool) -> bool {
+    *b
+}
+fn default_true() -> bool {
+    true
+}
+
+/// Persisted form of a [`crate::runner::Finding`]. Severity is
+/// stringified so the on-disk format is stable across enum
+/// variant additions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindingRecord {
+    pub source: String,
+    pub severity: String,
+    pub title: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +192,18 @@ impl From<&StepResult> for StepResultRecord {
             skipped: sr.skipped,
             rendered_prompt: sr.rendered_prompt.clone(),
             items: sr.items.iter().map(ItemResultRecord::from).collect(),
+            findings: sr
+                .findings
+                .iter()
+                .map(|f| FindingRecord {
+                    source: f.source.clone(),
+                    severity: f.severity.as_str().to_string(),
+                    title: f.title.clone(),
+                    body: f.body.clone(),
+                })
+                .collect(),
+            iterations: sr.iterations,
+            resolved: sr.resolved,
             finished_at: Utc::now(),
         }
     }
@@ -191,6 +235,18 @@ impl From<&StepResultRecord> for StepResult {
             success: rec.success,
             skipped: rec.skipped,
             items: rec.items.iter().map(ItemResult::from).collect(),
+            findings: rec
+                .findings
+                .iter()
+                .map(|f| crate::runner::Finding {
+                    source: f.source.clone(),
+                    severity: crate::workflow::Severity::parse_lossy(&f.severity),
+                    title: f.title.clone(),
+                    body: f.body.clone(),
+                })
+                .collect(),
+            iterations: rec.iterations,
+            resolved: rec.resolved,
         }
     }
 }
@@ -414,6 +470,9 @@ mod tests {
             skipped: false,
             rendered_prompt: format!("prompt for {step_id}"),
             items: Vec::new(),
+            findings: Vec::new(),
+            iterations: 0,
+            resolved: true,
             finished_at: Utc::now(),
         }
     }

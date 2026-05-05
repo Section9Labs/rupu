@@ -147,7 +147,10 @@ pub struct StepResult {
     /// is the JSON-serialized array of per-item outputs.
     pub output: String,
     /// True when the step ran and finished without an agent error.
-    /// For fan-out steps, true iff every item succeeded.
+    /// For fan-out steps, true iff every item succeeded. For panel
+    /// steps, true iff every panelist (and the fixer agent, if any)
+    /// finished without an agent error — independent of whether the
+    /// gate cleared (see `resolved`).
     pub success: bool,
     /// True when the step was skipped because its `when:` expression
     /// evaluated falsy. `success` is false in that case.
@@ -155,6 +158,51 @@ pub struct StepResult {
     /// Per-item records for fan-out steps. Empty for non-fan-out
     /// steps (and for skipped fan-out steps).
     pub items: Vec<ItemResult>,
+    /// Aggregated findings for `panel:` steps. Empty for non-panel
+    /// steps. Persisted into `StepOutput.findings` for downstream
+    /// templates.
+    pub findings: Vec<Finding>,
+    /// Iteration count for panel steps with a `gate:` loop. `0` for
+    /// non-panel steps and panel steps without a gate.
+    pub iterations: u32,
+    /// `true` when a panel step's gate cleared (or no gate was set).
+    /// `false` when `max_iterations` was hit with findings still
+    /// above the severity threshold. Always `true` for non-panel
+    /// steps.
+    pub resolved: bool,
+}
+
+/// Runtime form of one finding emitted by a panelist. Aggregated
+/// across panelists into [`StepResult::findings`] and exposed to
+/// downstream templates as `steps.<id>.findings[*]`.
+#[derive(Debug, Clone)]
+pub struct Finding {
+    /// Panelist agent name that emitted this finding.
+    pub source: String,
+    pub severity: crate::workflow::Severity,
+    pub title: String,
+    pub body: String,
+}
+
+impl Default for StepResult {
+    fn default() -> Self {
+        Self {
+            step_id: String::new(),
+            rendered_prompt: String::new(),
+            run_id: String::new(),
+            transcript_path: PathBuf::new(),
+            output: String::new(),
+            success: false,
+            skipped: false,
+            items: Vec::new(),
+            findings: Vec::new(),
+            iterations: 0,
+            // Non-panel steps that complete normally are "resolved";
+            // panel-step constructors overwrite this when they
+            // decide.
+            resolved: true,
+        }
+    }
 }
 
 /// One row per unit in a fan-out step — either a `for_each:` item or
@@ -409,6 +457,7 @@ async fn run_steps_inner(
                     success: false,
                     skipped: true,
                     items: Vec::new(),
+                    ..Default::default()
                 };
                 persist_step_result(opts, run_id, &result);
                 step_results.push(result);
@@ -446,7 +495,9 @@ async fn run_steps_inner(
         let effective_continue_on_error =
             step.continue_on_error.unwrap_or(workflow_default_continue);
 
-        let result = if step.parallel.is_some() {
+        let result = if step.panel.is_some() {
+            run_panel_step(step, &ctx, opts, effective_continue_on_error).await?
+        } else if step.parallel.is_some() {
             run_parallel_step(step, &ctx, opts, effective_continue_on_error).await?
         } else if step.for_each.is_some() {
             run_fanout_step(step, &ctx, opts, effective_continue_on_error).await?
@@ -515,6 +566,25 @@ fn base_context_for_step(
                 skipped: sr.skipped,
                 results,
                 sub_results,
+                findings: sr
+                    .findings
+                    .iter()
+                    .map(|f| crate::templates::FindingView {
+                        source: f.source.clone(),
+                        severity: f.severity.as_str().to_string(),
+                        title: f.title.clone(),
+                        body: f.body.clone(),
+                    })
+                    .collect(),
+                max_severity: sr
+                    .findings
+                    .iter()
+                    .map(|f| f.severity)
+                    .max()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_default(),
+                iterations: sr.iterations,
+                resolved: sr.resolved,
             },
         );
     }
@@ -586,6 +656,7 @@ async fn run_linear_step(
         success,
         skipped: false,
         items: Vec::new(),
+        ..Default::default()
     })
 }
 
@@ -623,6 +694,7 @@ async fn run_fanout_step(
             success: true,
             skipped: false,
             items: Vec::new(),
+            ..Default::default()
         });
     }
 
@@ -788,6 +860,7 @@ async fn run_fanout_step(
         success,
         skipped: false,
         items: items_vec,
+        ..Default::default()
     })
 }
 
@@ -948,6 +1021,7 @@ async fn run_parallel_step(
         success,
         skipped: false,
         items: items_vec,
+        ..Default::default()
     })
 }
 
@@ -1145,4 +1219,349 @@ fn resolve_inputs(
     }
 
     Ok(effective)
+}
+
+// -- Panel step (kind: panel) -----------------------------------------------
+
+/// Panel step. Dispatches every panelist in parallel against a shared
+/// rendered subject, parses each panelist's findings JSON from its
+/// final assistant text, aggregates by source, and (if a `gate:`
+/// loop is configured) iterates with a fixer agent until the gate
+/// clears or `max_iterations` is reached.
+///
+/// The runtime contract for a panelist's final assistant message:
+///
+///   ```json
+///   { "findings": [
+///       { "severity": "high", "title": "<short>", "body": "<details>" },
+///       ...
+///   ] }
+///   ```
+///
+/// Surrounding prose is allowed — the parser scans for the first
+/// `{ ... "findings": [...] ... }` JSON object that decodes cleanly.
+/// Panelists that emit no parseable findings contribute zero findings
+/// and a warning is logged.
+async fn run_panel_step(
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    continue_on_error: bool,
+) -> Result<StepResult, RunWorkflowError> {
+    let panel = step
+        .panel
+        .as_ref()
+        .expect("run_panel_step called for a non-panel step");
+
+    // Render the subject once against the parent context. Each
+    // panelist sees the same rendered text — that's the whole
+    // point of "the panel reviews X".
+    let subject = render_step_prompt(&panel.subject, ctx).map_err(|e| RunWorkflowError::Render {
+        step: format!("{}.subject", step.id),
+        source: e,
+    })?;
+
+    let max_parallel = panel.max_parallel.unwrap_or(1).max(1) as usize;
+    let total = panel.panelists.len();
+
+    // Each panelist's prompt is either the per-step `prompt:`
+    // template (rendered against the parent context plus a `subject`
+    // binding) or — when omitted — the rendered subject verbatim.
+    let mut prepared: Vec<(usize, String, String, String, PathBuf)> = Vec::with_capacity(total);
+    for (idx, panelist) in panel.panelists.iter().enumerate() {
+        let mut item_ctx = ctx.clone();
+        item_ctx
+            .inputs
+            .insert("subject".to_string(), subject.clone());
+        let rendered = match &panel.prompt {
+            Some(template) => {
+                render_step_prompt(template, &item_ctx).map_err(|e| RunWorkflowError::Render {
+                    step: format!("{}.{}", step.id, panelist),
+                    source: e,
+                })?
+            }
+            None => subject.clone(),
+        };
+        let run_id = format!("run_{}", Ulid::new());
+        let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+        prepared.push((idx, panelist.clone(), rendered, run_id, transcript_path));
+    }
+
+    // Spawn each panelist with the concurrency cap.
+    let semaphore = Arc::new(Semaphore::new(max_parallel));
+    let mut handles = Vec::with_capacity(total);
+    for (idx, agent_name, rendered, run_id, transcript_path) in prepared {
+        let permit_sem = semaphore.clone();
+        let factory = Arc::clone(&opts.factory);
+        let parent_step_id = step.id.clone();
+        let workspace_id = opts.workspace_id.clone();
+        let workspace_path = opts.workspace_path.clone();
+        let rendered_clone = rendered.clone();
+        let run_id_clone = run_id.clone();
+        let transcript_clone = transcript_path.clone();
+        let agent_name_clone = agent_name.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = permit_sem
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed");
+            let outcome = dispatch_one(
+                &factory,
+                &parent_step_id,
+                &agent_name_clone,
+                rendered_clone.clone(),
+                run_id_clone.clone(),
+                workspace_id,
+                workspace_path,
+                transcript_clone.clone(),
+            )
+            .await;
+            let (success, _err_str, raw_error) = match outcome {
+                Ok(()) => (true, None, None),
+                Err(e) => (false, Some(e.to_string()), Some(e)),
+            };
+            let output =
+                read_final_assistant_text(&transcript_clone, success, &run_id_clone, &parent_step_id);
+            PanelOutcome {
+                idx,
+                source: agent_name,
+                rendered_prompt: rendered,
+                run_id,
+                transcript_path,
+                output,
+                success,
+                raw_error,
+            }
+        }));
+    }
+
+    let mut outcomes: Vec<PanelOutcome> = Vec::with_capacity(total);
+    for handle in handles {
+        match handle.await {
+            Ok(o) => outcomes.push(o),
+            Err(join_err) => {
+                return Err(RunWorkflowError::FanoutJoin {
+                    step: step.id.clone(),
+                    source: join_err,
+                });
+            }
+        }
+    }
+    outcomes.sort_by_key(|o| o.idx);
+
+    // Surface a per-panelist agent error iff continue_on_error is
+    // not set. Same semantics as parallel:.
+    if !continue_on_error {
+        if let Some(failed) = outcomes.iter_mut().find(|o| !o.success) {
+            if let Some(err) = failed.raw_error.take() {
+                return Err(RunWorkflowError::Agent {
+                    step: format!("{}.{}", step.id, failed.source),
+                    source: err,
+                });
+            }
+        }
+    }
+
+    // Parse findings out of every panelist's final assistant text.
+    // Failed panelists contribute zero findings.
+    let mut findings: Vec<Finding> = Vec::new();
+    for o in &outcomes {
+        if !o.success {
+            continue;
+        }
+        match parse_findings(&o.output) {
+            Ok(parsed) => {
+                for p in parsed {
+                    findings.push(Finding {
+                        source: o.source.clone(),
+                        severity: p.severity,
+                        title: p.title,
+                        body: p.body,
+                    });
+                }
+            }
+            Err(e) => {
+                warn!(panelist = %o.source, error = %e, "failed to parse findings JSON; counting as zero");
+            }
+        }
+    }
+
+    let items_vec: Vec<ItemResult> = outcomes
+        .iter()
+        .map(|o| ItemResult {
+            index: o.idx,
+            item: serde_json::Value::Null,
+            sub_id: o.source.clone(),
+            rendered_prompt: o.rendered_prompt.clone(),
+            run_id: o.run_id.clone(),
+            transcript_path: o.transcript_path.clone(),
+            output: o.output.clone(),
+            success: o.success,
+        })
+        .collect();
+    let success = items_vec.iter().all(|i| i.success);
+    let aggregate_output = serde_json::to_string(
+        &findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "source": f.source,
+                    "severity": f.severity.as_str(),
+                    "title": f.title,
+                    "body": f.body,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".into());
+
+    if !success {
+        warn!(
+            step = %step.id,
+            failed = items_vec.iter().filter(|i| !i.success).count(),
+            total,
+            "panel completed with failed panelists (continue_on_error tolerated)"
+        );
+    }
+
+    // Gate-loop is wired in commit 2; this commit always reports
+    // `iterations: 1, resolved: true` for the single-pass case.
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        rendered_prompt: subject,
+        run_id: String::new(),
+        transcript_path: PathBuf::new(),
+        output: aggregate_output,
+        success,
+        skipped: false,
+        items: items_vec,
+        findings,
+        iterations: 1,
+        resolved: true,
+    })
+}
+
+/// Internal panel-task return type.
+struct PanelOutcome {
+    idx: usize,
+    source: String,
+    rendered_prompt: String,
+    run_id: String,
+    transcript_path: PathBuf,
+    output: String,
+    success: bool,
+    raw_error: Option<RunError>,
+}
+
+/// One parsed finding. Lives only inside this module — the public
+/// `Finding` struct adds the `source` (panelist agent name) on top.
+struct ParsedFinding {
+    severity: crate::workflow::Severity,
+    title: String,
+    body: String,
+}
+
+/// Extract findings from a panelist's final assistant text. Tries
+/// strict-JSON first (the contract), then falls back to scanning
+/// for a `{ "findings": [...] }` substring (so panelists can wrap
+/// the JSON in narrative prose). Returns an empty vector if no
+/// findings could be parsed — that's a legitimate "panelist saw
+/// nothing problematic" outcome.
+fn parse_findings(text: &str) -> Result<Vec<ParsedFinding>, ParseFindingsError> {
+    let trimmed = text.trim();
+    // Strict path: the entire output is one JSON object with a
+    // `findings` array.
+    if let Ok(parsed) = serde_json::from_str::<RawFindingsBag>(trimmed) {
+        return Ok(parsed.into_findings());
+    }
+    // Loose path: scan for a `{...}` chunk that decodes. Matches
+    // common LLM behavior of wrapping JSON in code fences or prose.
+    if let Some(obj) = scan_for_json_object(trimmed) {
+        if let Ok(parsed) = serde_json::from_str::<RawFindingsBag>(obj) {
+            return Ok(parsed.into_findings());
+        }
+    }
+    // No parseable findings — return empty rather than erroring.
+    // Emit a debug log so authors can see during iteration.
+    info!("no parseable findings JSON in panelist output");
+    Ok(Vec::new())
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ParseFindingsError {
+    #[error("findings JSON: {0}")]
+    #[allow(dead_code)]
+    Json(String),
+}
+
+#[derive(serde::Deserialize)]
+struct RawFindingsBag {
+    #[serde(default)]
+    findings: Vec<RawFinding>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawFinding {
+    #[serde(default)]
+    severity: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+impl RawFindingsBag {
+    fn into_findings(self) -> Vec<ParsedFinding> {
+        self.findings
+            .into_iter()
+            .map(|f| ParsedFinding {
+                severity: crate::workflow::Severity::parse_lossy(&f.severity),
+                title: f.title,
+                body: f.body,
+            })
+            .collect()
+    }
+}
+
+/// Walk `s` and return the first balanced-brace JSON object substring.
+/// Bare-bones: counts `{` / `}` while tracking string-escape state.
+/// Good enough for the LLM-prose-wrapping case we actually hit.
+fn scan_for_json_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut start = None;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s0) = start {
+                        return Some(&s[s0..=i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
