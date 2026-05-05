@@ -36,6 +36,10 @@ async fn happy_path_one_turn_no_tools() {
         mcp_registry: None,
         effort: None,
         context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
     };
 
     let res = run_agent(opts).await.unwrap();

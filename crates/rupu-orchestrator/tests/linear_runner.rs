@@ -67,6 +67,10 @@ impl StepFactory for FakeFactory {
             mcp_registry: None,
             effort: None,
             context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         }
     }
 }
@@ -332,6 +336,10 @@ impl StepFactory for FailingFactory {
             mcp_registry: None,
             effort: None,
             context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         }
     }
 }
@@ -995,6 +1003,10 @@ impl StepFactory for PanelFactory {
             mcp_registry: None,
             effort: None,
             context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         }
     }
 }
@@ -1206,6 +1218,10 @@ impl StepFactory for LoopingPanelFactory {
             mcp_registry: None,
             effort: None,
             context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         }
     }
 }

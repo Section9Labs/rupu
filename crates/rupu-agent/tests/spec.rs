@@ -70,3 +70,57 @@ fn unknown_frontmatter_field_errors() {
     let s = "---\nname: x\npermision_mode: ask\n---\nbody\n";
     assert!(AgentSpec::parse(s).is_err());
 }
+
+#[test]
+fn parses_anthropic_feature_flags() {
+    let s = r#"---
+name: deploy-bot
+provider: anthropic
+model: claude-sonnet-4-6
+outputFormat: json
+anthropicTaskBudget: 4000
+anthropicContextManagement: tool_clearing
+anthropicSpeed: fast
+---
+body
+"#;
+    let spec = AgentSpec::parse(s).unwrap();
+    assert_eq!(
+        spec.output_format,
+        Some(rupu_providers::types::OutputFormat::Json)
+    );
+    assert_eq!(spec.anthropic_task_budget, Some(4000));
+    assert_eq!(
+        spec.anthropic_context_management,
+        Some(rupu_providers::types::ContextManagement::ToolClearing)
+    );
+    assert_eq!(
+        spec.anthropic_speed,
+        Some(rupu_providers::types::Speed::Fast)
+    );
+}
+
+#[test]
+fn anthropic_feature_flags_default_to_none_when_omitted() {
+    let s = "---\nname: hello\n---\nbody\n";
+    let spec = AgentSpec::parse(s).unwrap();
+    assert!(spec.output_format.is_none());
+    assert!(spec.anthropic_task_budget.is_none());
+    assert!(spec.anthropic_context_management.is_none());
+    assert!(spec.anthropic_speed.is_none());
+}
+
+#[test]
+fn rejects_invalid_output_format() {
+    let s = "---\nname: x\noutputFormat: yaml\n---\nbody\n";
+    assert!(
+        AgentSpec::parse(s).is_err(),
+        "outputFormat: yaml should reject; only text|json"
+    );
+}
+
+#[test]
+fn rejects_invalid_speed() {
+    let s = "---\nname: x\nanthropicSpeed: turbo\n---\nbody\n";
+    assert!(AgentSpec::parse(s).is_err(), "only `fast` is accepted");
+}

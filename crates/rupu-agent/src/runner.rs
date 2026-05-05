@@ -105,6 +105,20 @@ pub struct AgentRunOpts {
     /// gate the `context-1m-2025-08-07` beta header; other providers
     /// currently ignore it.
     pub context_window: Option<rupu_providers::model_tier::ContextWindow>,
+    /// Cross-provider output-format hint. Anthropic emits as
+    /// `output_config.format`; OpenAI emits as `response_format.type`;
+    /// other providers ignore.
+    pub output_format: Option<rupu_providers::types::OutputFormat>,
+    /// Anthropic-only soft cap on output tokens (model self-paces).
+    /// Distinct from `max_turns` (hard ceiling). Ignored by other
+    /// providers.
+    pub anthropic_task_budget: Option<u32>,
+    /// Anthropic-only auto context-pruning strategy. Ignored by
+    /// other providers.
+    pub anthropic_context_management: Option<rupu_providers::types::ContextManagement>,
+    /// Anthropic-only fast-mode toggle (account-gated). Ignored by
+    /// other providers.
+    pub anthropic_speed: Option<rupu_providers::types::Speed>,
 }
 
 /// Outcome of a finished run.
@@ -177,7 +191,6 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             break RunStatus::Error;
         }
         writer.write(&Event::TurnStart { turn_idx })?;
-        // LlmRequest does not derive Default — construct explicitly.
         let req = LlmRequest {
             model: opts.model.clone(),
             system: Some(opts.agent_system_prompt.clone()),
@@ -189,6 +202,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             thinking: opts.effort,
             context_window: opts.context_window,
             task_type: None,
+            output_format: opts.output_format,
+            anthropic_task_budget: opts.anthropic_task_budget,
+            anthropic_context_management: opts.anthropic_context_management,
+            anthropic_speed: opts.anthropic_speed,
         };
         let resp: LlmResponse = if opts.no_stream {
             match opts.provider.send(&req).await {

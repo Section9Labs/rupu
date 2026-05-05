@@ -35,6 +35,10 @@ async fn run_passes_all_six_default_tools_to_provider() {
         mcp_registry: None,
         effort: None,
         context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
     };
 
     run_agent(opts).await.unwrap();
@@ -107,6 +111,10 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         mcp_registry: None,
         effort: None,
         context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
     };
 
     run_agent(opts).await.unwrap();
