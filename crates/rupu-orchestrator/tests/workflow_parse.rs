@@ -418,3 +418,113 @@ steps:
     let err = format!("{}", Workflow::parse(s).unwrap_err());
     assert!(err.contains("event") && err.contains("cron"), "got: {err}");
 }
+
+#[test]
+fn accepts_panel_step() {
+    let s = r#"
+name: x
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - perf-reviewer
+      subject: "{{ inputs.diff }}"
+      max_parallel: 2
+"#;
+    let wf = Workflow::parse(s).expect("panel: should parse");
+    let panel = wf.steps[0].panel.as_ref().unwrap();
+    assert_eq!(panel.panelists.len(), 2);
+    assert_eq!(panel.subject, "{{ inputs.diff }}");
+    assert_eq!(panel.max_parallel, Some(2));
+    assert!(panel.gate.is_none());
+    assert!(wf.steps[0].agent.is_none());
+    assert!(wf.steps[0].prompt.is_none());
+}
+
+#[test]
+fn accepts_panel_with_gate() {
+    let s = r#"
+name: x
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists:
+        - reviewer-a
+      subject: "review me"
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: developer
+        max_iterations: 3
+"#;
+    let wf = Workflow::parse(s).unwrap();
+    let gate = wf.steps[0].panel.as_ref().unwrap().gate.as_ref().unwrap();
+    assert_eq!(
+        gate.until_no_findings_at_severity_or_above,
+        rupu_orchestrator::Severity::High
+    );
+    assert_eq!(gate.fix_with, "developer");
+    assert_eq!(gate.max_iterations, 3);
+}
+
+#[test]
+fn rejects_panel_with_top_level_agent() {
+    let s = r#"
+name: x
+steps:
+  - id: panel
+    agent: a
+    prompt: hi
+    actions: []
+    panel:
+      panelists: [reviewer-a]
+      subject: "x"
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("mutually exclusive"),
+        "expected panel mutually-exclusive error, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_panel_with_empty_panelists() {
+    let s = r#"
+name: x
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists: []
+      subject: "x"
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("at least one agent"),
+        "expected panel-empty error, got: {err}"
+    );
+}
+
+#[test]
+fn rejects_panel_gate_max_iterations_zero() {
+    let s = r#"
+name: x
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists: [reviewer-a]
+      subject: "x"
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: developer
+        max_iterations: 0
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("max_iterations") && err.contains("at least 1"),
+        "expected max_iterations error, got: {err}"
+    );
+}

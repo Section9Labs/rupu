@@ -59,6 +59,14 @@ pub enum WorkflowParseError {
         "step `{step}`: missing required field `{field}` (linear and `for_each:` steps need `agent:` and `prompt:`)"
     )]
     MissingStepField { step: String, field: &'static str },
+    #[error(
+        "step `{step}`: `panel:` is mutually exclusive with `for_each:`, `parallel:`, and the top-level `agent`/`prompt`"
+    )]
+    PanelMutuallyExclusive { step: String },
+    #[error("step `{step}`: `panel.panelists` must contain at least one agent")]
+    PanelEmpty { step: String },
+    #[error("step `{step}`: `panel.gate.max_iterations` must be at least 1, got {value}")]
+    PanelMaxIterationsInvalid { step: String, value: u32 },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -158,6 +166,119 @@ impl InputDef {
     fn default_type() -> InputType {
         InputType::String
     }
+}
+
+/// Severity ordering for panel-step findings. Compares as
+/// `Low < Medium < High < Critical`. The gate threshold compares
+/// against the *maximum* severity in the aggregated findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl Severity {
+    /// Parse a case-insensitive severity from JSON / agent output.
+    /// Unknown values default to `Low` rather than failing — agent
+    /// outputs are messy and a permissive parse keeps the gate
+    /// loop from crashing on a typo.
+    pub fn parse_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "critical" | "crit" => Self::Critical,
+            "high" => Self::High,
+            "medium" | "med" => Self::Medium,
+            _ => Self::Low,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+/// Panel-step block. The runner dispatches every panelist in
+/// parallel against the rendered `subject:` (think: the diff /
+/// proposal under review), collects each panelist's findings JSON
+/// from their final assistant message, and aggregates them. Each
+/// panelist must emit, in its final assistant text, a JSON object
+/// of the shape:
+///
+/// ```text
+/// { "findings": [
+///     { "severity": "high|medium|low|critical",
+///       "title": "<short>",
+///       "body":  "<details>" },
+///     ...
+/// ] }
+/// ```
+///
+/// The runner extracts the first JSON object that parses cleanly
+/// (so panelists may include surrounding prose). Panelists that
+/// emit malformed JSON contribute zero findings and a warning is
+/// logged.
+///
+/// When a `gate:` is present, the runner re-dispatches the panel
+/// after a fixer agent addresses the findings, and loops until
+/// the maximum severity drops below the threshold or
+/// `max_iterations` is hit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Panel {
+    /// One agent name per panelist. They run in parallel against
+    /// the same rendered subject.
+    pub panelists: Vec<String>,
+    /// minijinja template that renders to the input every panelist
+    /// reviews. Bound as `{{ subject }}` inside the panelist's
+    /// rendered prompt; also passed through verbatim if the
+    /// panelist agent has no prompt template (less common).
+    pub subject: String,
+    /// Optional per-panelist prompt template. When omitted, the
+    /// runner sends `subject:` as the user message verbatim — the
+    /// panelist's agent file's `system_prompt` carries the
+    /// review instructions.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Cap on concurrent in-flight panelist runs. Same semantics
+    /// as `Step.max_parallel:`. Defaults to 1 (serial) when `None`.
+    #[serde(default)]
+    pub max_parallel: Option<u32>,
+    /// Optional gate that drives a fix-loop. When present, after
+    /// each panel iteration the runner classifies findings by
+    /// severity; if the max severity is `>=
+    /// until_no_findings_at_severity_or_above`, the runner
+    /// dispatches `fix_with` (with the aggregated findings as
+    /// input) and re-runs the panel. Loops until the gate clears
+    /// or `max_iterations` runs out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<PanelGate>,
+}
+
+/// Loop-termination policy for a panel step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PanelGate {
+    /// Loop while the max-severity finding is at or above this
+    /// threshold. Once the panel emits zero findings at that
+    /// threshold (or higher), the gate clears and the workflow
+    /// proceeds.
+    pub until_no_findings_at_severity_or_above: Severity,
+    /// Agent name dispatched between panel iterations to address
+    /// the findings. Receives the aggregated findings as the user
+    /// message; its final assistant text becomes the next
+    /// iteration's `subject`.
+    pub fix_with: String,
+    /// Safety cap. The loop exits with `resolved=false` when the
+    /// gate hasn't cleared after this many iterations. Required;
+    /// no implicit default — authors should think about it.
+    pub max_iterations: u32,
 }
 
 /// Optional approval gate on a step. When present and `required:
@@ -275,6 +396,10 @@ pub struct Step {
     /// dispatching this step. See [`Approval`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<Approval>,
+    /// Panel step block. Mutually exclusive with `for_each:`,
+    /// `parallel:`, and the linear `agent`/`prompt`. See [`Panel`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel: Option<Panel>,
 }
 
 /// One sub-step inside a `parallel:` block. Same surface as a linear
@@ -315,18 +440,10 @@ impl Workflow {
     /// Parse a YAML string. Validates step-id uniqueness and input
     /// defaults / enum constraints; returns clear errors on failure.
     pub fn parse(s: &str) -> Result<Self, WorkflowParseError> {
-        // Pre-scan for keys that are still deferred (panel steps +
-        // approval gates). `when:`, `continue_on_error:`, `for_each:`,
-        // and `parallel:` are now supported; do NOT include them in
-        // the unsupported list.
-        for key in ["panelists", "gates"] {
-            for line in s.lines() {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with(&format!("{key}:")) {
-                    return Err(WorkflowParseError::UnsupportedKey { key: leak(key) });
-                }
-            }
-        }
+        // No deferred-key pre-scan anymore — every workflow keyword
+        // documented in TODO.md is now wired up. Unknown fields are
+        // caught by `#[serde(deny_unknown_fields)]` on the Step /
+        // Workflow / Panel types instead.
 
         let wf: Workflow = serde_yaml::from_str(s)?;
         if wf.steps.is_empty() {
@@ -460,13 +577,36 @@ fn validate_cron_expression(expr: &str) -> Result<(), WorkflowParseError> {
     Ok(())
 }
 
-/// Validate per-step shape constraints: `parallel:` is mutually
-/// exclusive with `for_each:` and with the linear `agent`/`prompt`
-/// fields, and linear / `for_each:` steps must declare both `agent:`
-/// and `prompt:`. Sub-step ids inside a `parallel:` block must be
-/// unique within that block.
+/// Validate per-step shape constraints. The four shapes (linear,
+/// `for_each:`, `parallel:`, `panel:`) are mutually exclusive, and
+/// each carries its own set of required fields.
 fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
-    if let Some(subs) = &step.parallel {
+    if let Some(panel) = &step.panel {
+        // Panel step — top-level agent/prompt, for_each, and parallel
+        // must all be absent.
+        if step.agent.is_some()
+            || step.prompt.is_some()
+            || step.for_each.is_some()
+            || step.parallel.is_some()
+        {
+            return Err(WorkflowParseError::PanelMutuallyExclusive {
+                step: step.id.clone(),
+            });
+        }
+        if panel.panelists.is_empty() {
+            return Err(WorkflowParseError::PanelEmpty {
+                step: step.id.clone(),
+            });
+        }
+        if let Some(gate) = &panel.gate {
+            if gate.max_iterations < 1 {
+                return Err(WorkflowParseError::PanelMaxIterationsInvalid {
+                    step: step.id.clone(),
+                    value: gate.max_iterations,
+                });
+            }
+        }
+    } else if let Some(subs) = &step.parallel {
         // `parallel:` block — top-level agent/prompt and for_each must
         // be absent.
         if step.agent.is_some() || step.prompt.is_some() || step.for_each.is_some() {
@@ -568,11 +708,3 @@ pub(crate) fn yaml_scalar_to_string(v: &serde_yaml::Value) -> String {
     }
 }
 
-/// Leak a short literal key name to `&'static str`.
-fn leak(key: &str) -> &'static str {
-    match key {
-        "panelists" => "panelists",
-        "gates" => "gates",
-        _ => "unknown",
-    }
-}

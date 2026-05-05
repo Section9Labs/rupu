@@ -915,3 +915,442 @@ steps:
     assert_eq!(res.step_results.len(), 1);
     assert!(res.step_results[0].success);
 }
+
+// -- Panel steps (commit 1: parallel + findings aggregation) ----------------
+
+const WF_PANEL: &str = r#"
+name: code-panel
+inputs:
+  diff: { type: string, default: "+ added line" }
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - perf-reviewer
+      subject: "{{ inputs.diff }}"
+      max_parallel: 2
+"#;
+
+/// Test factory whose response depends on the agent name. For
+/// panel-step tests we want each panelist to emit findings JSON
+/// in their final assistant text (the runtime contract). The
+/// FakeFactory above echoes the prompt; here we override per-
+/// panelist behavior.
+struct PanelFactory;
+
+#[async_trait]
+impl StepFactory for PanelFactory {
+    async fn build_opts_for_step(
+        &self,
+        step_id: &str,
+        agent_name: &str,
+        rendered_prompt: String,
+        run_id: String,
+        workspace_id: String,
+        workspace_path: std::path::PathBuf,
+        transcript_path: std::path::PathBuf,
+    ) -> AgentRunOpts {
+        // Hand-built JSON keyed by agent name. security-reviewer
+        // emits one HIGH; perf-reviewer emits one MEDIUM with
+        // surrounding prose (tests the loose-parser fallback);
+        // any other agent emits no findings.
+        let body = match agent_name {
+            "security-reviewer" => {
+                "{\"findings\":[{\"severity\":\"HIGH\",\"title\":\"hardcoded secret\",\"body\":\"...\"}]}"
+                    .to_string()
+            }
+            "perf-reviewer" => {
+                "Here's my review:\n\n```json\n{\"findings\":[{\"severity\":\"medium\",\"title\":\"O(n^2) loop\",\"body\":\"...\"}]}\n```\n\nThanks!"
+                    .to_string()
+            }
+            "no-issues-reviewer" => "{\"findings\": []}".to_string(),
+            "fixer" => "diff applied; please re-review".to_string(),
+            _ => format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+        };
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: body,
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        AgentRunOpts {
+            agent_name: format!("ag-{agent_name}"),
+            agent_system_prompt: "review".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id,
+            workspace_id,
+            workspace_path,
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: ToolContext::default(),
+            user_message: rendered_prompt,
+            mode_str: "bypass".into(),
+            no_stream: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn panel_step_runs_panelists_in_parallel_and_aggregates_findings() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(WF_PANEL).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_panel".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(PanelFactory),
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let panel = &res.step_results[0];
+    assert!(panel.success);
+    assert_eq!(panel.items.len(), 2, "two panelist sub-runs");
+    assert_eq!(panel.findings.len(), 2, "one finding per panelist");
+
+    // Findings carry the source panelist + parsed severity.
+    let sec = panel
+        .findings
+        .iter()
+        .find(|f| f.source == "security-reviewer")
+        .unwrap();
+    assert_eq!(sec.severity, rupu_orchestrator::Severity::High);
+    assert_eq!(sec.title, "hardcoded secret");
+    let perf = panel
+        .findings
+        .iter()
+        .find(|f| f.source == "perf-reviewer")
+        .unwrap();
+    assert_eq!(perf.severity, rupu_orchestrator::Severity::Medium);
+    assert_eq!(perf.title, "O(n^2) loop");
+
+    // Single-pass (no gate) reports iterations=1, resolved=true.
+    assert_eq!(panel.iterations, 1);
+    assert!(panel.resolved);
+}
+
+#[tokio::test]
+async fn panel_findings_visible_to_subsequent_steps() {
+    let s = r#"
+name: panel-then-summarize
+inputs:
+  diff: { type: string, default: "+ x" }
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - perf-reviewer
+      subject: "{{ inputs.diff }}"
+  - id: summarize
+    agent: writer
+    actions: []
+    prompt: |
+      max_severity={{ steps.panel.max_severity }}
+      count={{ steps.panel.findings | length }}
+      first={{ steps.panel.findings[0].title }} ({{ steps.panel.findings[0].source }})
+"#;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(s).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_panel_seq".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(PanelFactory),
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let summary_prompt = &res.step_results[1].rendered_prompt;
+    assert!(
+        summary_prompt.contains("max_severity=high"),
+        "max_severity should be 'high' (=HIGH > MEDIUM), got: {summary_prompt}"
+    );
+    assert!(
+        summary_prompt.contains("count=2"),
+        "findings.length should be 2, got: {summary_prompt}"
+    );
+    assert!(
+        summary_prompt.contains("first=hardcoded secret (security-reviewer)"),
+        "first finding should be addressable, got: {summary_prompt}"
+    );
+}
+
+#[tokio::test]
+async fn panel_with_unparseable_panelist_records_zero_findings_for_that_panelist() {
+    let s = r#"
+name: panel-broken
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - garbage-reviewer
+      subject: "{{ inputs.diff | default('x') }}"
+"#;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(s).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_panel_garbage".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(PanelFactory),
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let panel = &res.step_results[0];
+    assert_eq!(panel.items.len(), 2);
+    // garbage-reviewer's output isn't JSON; only security's finding should appear.
+    assert_eq!(panel.findings.len(), 1);
+    assert_eq!(panel.findings[0].source, "security-reviewer");
+}
+
+// -- Panel gate loop (commit 2) ---------------------------------------------
+
+/// Factory whose panelist behavior changes by iteration count. We
+/// track per-agent invocation counts and key the response on the
+/// invocation index — first call returns findings, second call
+/// returns empty findings (gate cleared).
+struct LoopingPanelFactory {
+    calls: Arc<std::sync::Mutex<std::collections::BTreeMap<String, u32>>>,
+}
+
+impl LoopingPanelFactory {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl StepFactory for LoopingPanelFactory {
+    async fn build_opts_for_step(
+        &self,
+        step_id: &str,
+        agent_name: &str,
+        rendered_prompt: String,
+        run_id: String,
+        workspace_id: String,
+        workspace_path: std::path::PathBuf,
+        transcript_path: std::path::PathBuf,
+    ) -> AgentRunOpts {
+        let invocation = {
+            let mut map = self.calls.lock().unwrap();
+            let n = map.entry(agent_name.to_string()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let body = match (agent_name, invocation) {
+            ("security-reviewer", 1) => {
+                "{\"findings\":[{\"severity\":\"high\",\"title\":\"sql injection\",\"body\":\"...\"}]}"
+                    .to_string()
+            }
+            // Second iteration: panel sees zero findings → gate clears.
+            ("security-reviewer", _) => "{\"findings\":[]}".to_string(),
+            ("fixer", _) => "diff applied; sql injection patched".to_string(),
+            ("stubborn-reviewer", _) => {
+                // Always emits a HIGH — used in the "max_iterations exhausted" test.
+                "{\"findings\":[{\"severity\":\"critical\",\"title\":\"unfixable\",\"body\":\"...\"}]}"
+                    .to_string()
+            }
+            _ => format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+        };
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: body,
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        AgentRunOpts {
+            agent_name: format!("ag-{agent_name}"),
+            agent_system_prompt: "x".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id,
+            workspace_id,
+            workspace_path,
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: ToolContext::default(),
+            user_message: rendered_prompt,
+            mode_str: "bypass".into(),
+            no_stream: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+        }
+    }
+}
+
+const WF_PANEL_GATE: &str = r#"
+name: panel-with-gate
+inputs:
+  diff: { type: string, default: "+ buggy line" }
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+      subject: "{{ inputs.diff }}"
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: fixer
+        max_iterations: 3
+"#;
+
+#[tokio::test]
+async fn panel_gate_loops_with_fixer_until_severity_clears() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let factory = Arc::new(LoopingPanelFactory::new());
+    let wf = Workflow::parse(WF_PANEL_GATE).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_gate".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::clone(&factory) as Arc<dyn StepFactory>,
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let panel = &res.step_results[0];
+    // First iteration produced 1 HIGH finding; fixer ran; second
+    // iteration produced 0 findings → gate cleared.
+    assert!(panel.resolved);
+    assert_eq!(panel.iterations, 2);
+    // The persisted findings are the *final* iteration's findings
+    // (which is empty since the gate cleared).
+    assert!(panel.findings.is_empty());
+
+    // Verify panelist was invoked exactly twice and fixer once.
+    let calls = factory.calls.lock().unwrap().clone();
+    assert_eq!(calls.get("security-reviewer").copied(), Some(2));
+    assert_eq!(calls.get("fixer").copied(), Some(1));
+}
+
+const WF_PANEL_GATE_EXHAUSTED: &str = r#"
+name: panel-stubborn
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists:
+        - stubborn-reviewer
+      subject: "anything"
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: fixer
+        max_iterations: 2
+"#;
+
+#[tokio::test]
+async fn panel_gate_marks_unresolved_when_max_iterations_exhausted() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let factory = Arc::new(LoopingPanelFactory::new());
+    let wf = Workflow::parse(WF_PANEL_GATE_EXHAUSTED).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_stubborn".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::clone(&factory) as Arc<dyn StepFactory>,
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let panel = &res.step_results[0];
+    assert!(!panel.resolved, "max_iterations exhausted → unresolved");
+    assert_eq!(panel.iterations, 2);
+    // Findings from the final iteration are preserved so downstream
+    // steps (or operators) can still see what's outstanding.
+    assert_eq!(panel.findings.len(), 1);
+    assert_eq!(panel.findings[0].title, "unfixable");
+    assert_eq!(panel.findings[0].severity, rupu_orchestrator::Severity::Critical);
+
+    // Fixer ran (max_iterations - 1) times before the final pass.
+    let calls = factory.calls.lock().unwrap().clone();
+    assert_eq!(calls.get("stubborn-reviewer").copied(), Some(2));
+    assert_eq!(calls.get("fixer").copied(), Some(1));
+}
+
+#[tokio::test]
+async fn panel_gate_clears_immediately_when_first_pass_below_threshold() {
+    // Threshold is "critical"; security-reviewer's first pass emits
+    // HIGH which is below "critical", so the gate clears on the
+    // first iteration without ever calling the fixer.
+    let s = r#"
+name: panel-medium-tolerance
+steps:
+  - id: panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+      subject: "x"
+      gate:
+        until_no_findings_at_severity_or_above: critical
+        fix_with: fixer
+        max_iterations: 3
+"#;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let factory = Arc::new(LoopingPanelFactory::new());
+    let wf = Workflow::parse(s).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_low".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::clone(&factory) as Arc<dyn StepFactory>,
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let panel = &res.step_results[0];
+    assert!(panel.resolved);
+    assert_eq!(panel.iterations, 1);
+    // Findings under the threshold are still surfaced.
+    assert_eq!(panel.findings.len(), 1);
+    assert_eq!(panel.findings[0].severity, rupu_orchestrator::Severity::High);
+
+    let calls = factory.calls.lock().unwrap().clone();
+    assert_eq!(calls.get("security-reviewer").copied(), Some(1));
+    assert_eq!(calls.get("fixer").copied(), None, "fixer should not have run");
+}

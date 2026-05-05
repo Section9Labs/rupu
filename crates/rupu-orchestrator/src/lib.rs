@@ -16,15 +16,18 @@ pub mod workflow;
 
 pub use action_protocol::{validate_actions, ActionValidationResult};
 pub use runner::{
-    run_workflow, AwaitingInfo, ItemResult, OrchestratorRunOpts, OrchestratorRunResult,
-    ResumeState, RunWorkflowError, StepFactory, StepResult,
+    run_workflow, AwaitingInfo, Finding, ItemResult, OrchestratorRunOpts,
+    OrchestratorRunResult, ResumeState, RunWorkflowError, StepFactory, StepResult,
 };
-pub use runs::{ItemResultRecord, RunRecord, RunStatus, RunStore, RunStoreError, StepResultRecord};
+pub use runs::{
+    FindingRecord, ItemResultRecord, RunRecord, RunStatus, RunStore, RunStoreError,
+    StepResultRecord,
+};
 pub use templates::{
     render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,
     SubResult,
 };
 pub use workflow::{
-    Approval, InputDef, InputType, Step, SubStep, Trigger, TriggerKind, Workflow, WorkflowDefaults,
-    WorkflowParseError,
+    Approval, InputDef, InputType, Panel, PanelGate, Severity, Step, SubStep, Trigger,
+    TriggerKind, Workflow, WorkflowDefaults, WorkflowParseError,
 };

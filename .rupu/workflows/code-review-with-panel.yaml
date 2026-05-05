@@ -1,0 +1,50 @@
+name: code-review-with-panel
+description: |
+  Three specialist reviewers panel a diff in parallel and emit
+  structured findings. A fixer agent addresses any HIGH or
+  CRITICAL findings; the loop runs until the panel is satisfied
+  or `max_iterations` is hit.
+
+  Each panelist's agent file should instruct the model to emit a
+  final assistant message of the shape:
+
+      { "findings": [
+          { "severity": "high",
+            "title": "<short>",
+            "body":  "<details>" } ] }
+
+  Surrounding prose is allowed — the parser scans for the first
+  parseable JSON object containing a `findings` array.
+
+inputs:
+  diff:
+    type: string
+    required: true
+
+steps:
+  - id: review_panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - perf-reviewer
+        - maintainability-reviewer
+      subject: "{{ inputs.diff }}"
+      max_parallel: 3
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: developer
+        max_iterations: 5
+
+  - id: announce
+    agent: writer
+    actions: []
+    prompt: |
+      Review complete after {{ steps.review_panel.iterations }} iteration(s).
+      Resolved: {{ steps.review_panel.resolved }}
+      Highest remaining severity: {{ steps.review_panel.max_severity }}
+
+      Outstanding findings ({{ steps.review_panel.findings | length }}):
+      {% for f in steps.review_panel.findings %}
+        - [{{ f.severity }}] {{ f.title }} (from {{ f.source }})
+      {% endfor %}
