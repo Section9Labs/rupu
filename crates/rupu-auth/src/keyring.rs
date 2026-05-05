@@ -17,7 +17,22 @@ use tracing::warn;
 /// `rupu-dev` and `rupu-prod` namespaces) is deferred to Slice C
 /// where it ties into workspace/profile config. Until then, all rupu
 /// installs on the same machine share keychain entries.
-const SERVICE: &str = "rupu";
+pub(crate) const SERVICE: &str = "rupu";
+
+/// Best-effort: add the running rupu binary to the keychain item's ACL
+/// so subsequent reads from the same identity don't trigger the macOS
+/// "Always Allow" prompt. Failures here are non-fatal — the item is
+/// already written; the user just gets the legacy first-prompt
+/// fallback on next read. Logged at WARN so the operator can diagnose
+/// if every login is followed by a noisy fallback.
+///
+/// On non-macOS targets this is a no-op (the ACL crate's function is
+/// itself a no-op there).
+pub(crate) fn try_add_self_to_acl(account: &str) {
+    if let Err(e) = rupu_keychain_acl::add_self_to_keychain_acl(SERVICE, account) {
+        warn!(account, error = %e, "keychain ACL pre-population failed; first read will prompt");
+    }
+}
 
 /// Backend wrapping the OS keychain. Construct via [`Self::new`] or
 /// `Default::default()`.
@@ -56,6 +71,7 @@ impl KeyringBackend {
 impl AuthBackend for KeyringBackend {
     fn store(&self, p: ProviderId, secret: &str) -> Result<(), AuthError> {
         self.entry(p)?.set_password(secret)?;
+        try_add_self_to_acl(p.as_str());
         Ok(())
     }
 

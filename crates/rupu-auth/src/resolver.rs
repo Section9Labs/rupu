@@ -65,6 +65,10 @@ impl KeychainResolver {
         entry
             .set_password(&json)
             .map_err(|e| anyhow::anyhow!("keychain set: {e}"))?;
+        // Best-effort: pre-populate the keychain ACL with rupu's identity
+        // so the first subsequent read doesn't trigger an "Always Allow"
+        // prompt. Non-fatal on failure; warning-logged inside the helper.
+        crate::keyring::try_add_self_to_acl(&key.account);
         Ok(())
     }
 
