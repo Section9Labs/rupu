@@ -7,4 +7,5 @@
 pub mod err;
 pub mod source;
 pub mod state;
+pub mod view;
 pub use err::{TuiError, TuiResult};
