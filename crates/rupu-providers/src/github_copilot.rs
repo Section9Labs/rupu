@@ -427,14 +427,14 @@ impl crate::provider::LlmProvider for GithubCopilotClient {
         // Slice B-1 spec §6a: ship a baked-in list. Users who have access
         // to additional models register them as custom entries in
         // ~/.rupu/config.toml.
-        ["gpt-4o", "gpt-4o-mini", "claude-sonnet-4", "o4-mini"]
+        ["gpt-4o", "gpt-4o-mini", "claude-sonnet-4-6", "o4-mini"]
             .into_iter()
             .map(make_model_info)
             .collect()
     }
 
     fn default_model(&self) -> &str {
-        "claude-sonnet-4"
+        "claude-sonnet-4-6"
     }
 
     fn provider_id(&self) -> crate::provider_id::ProviderId {
