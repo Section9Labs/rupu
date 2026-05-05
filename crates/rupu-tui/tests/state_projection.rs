@@ -13,7 +13,7 @@ use chrono::Utc;
 use rupu_transcript::Event;
 use rupu_tui::state::RunModel;
 
-fn run_start(step_id: &str, agent: &str) -> Event {
+fn run_start(_step_id: &str, agent: &str) -> Event {
     Event::RunStart {
         run_id: "run_test".into(),
         workspace_id: "ws_test".into(),

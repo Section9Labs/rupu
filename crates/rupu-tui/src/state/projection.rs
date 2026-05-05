@@ -2,6 +2,14 @@ use rupu_transcript::{Event, RunStatus as TranscriptRunStatus};
 
 use super::node::{LastAction, NodeState, NodeStatus};
 
+/// How many leading lines of an AssistantMessage to keep in the
+/// node's transcript_tail. The focused-node panel renders this many.
+const TRANSCRIPT_LINES_PER_ASSISTANT_MESSAGE: usize = 3;
+
+/// How many characters of a tool's input to keep in `LastAction.summary`.
+/// Matches the focused-node panel's display width budget.
+const TOOL_INPUT_SUMMARY_LEN: usize = 60;
+
 pub(super) fn apply(node: &mut NodeState, ev: &Event) {
     match ev {
         Event::RunStart { agent, .. } => {
@@ -15,7 +23,7 @@ pub(super) fn apply(node: &mut NodeState, ev: &Event) {
             node.turn_idx = node.turn_idx.saturating_add(1);
         }
         Event::AssistantMessage { content, .. } => {
-            for line in content.lines().take(3) {
+            for line in content.lines().take(TRANSCRIPT_LINES_PER_ASSISTANT_MESSAGE) {
                 node.push_transcript_line(line.to_string());
             }
         }
@@ -82,10 +90,10 @@ pub(super) fn apply(node: &mut NodeState, ev: &Event) {
 
 fn summarize_input(v: &serde_json::Value) -> String {
     if let Some(cmd) = v.get("command").and_then(|x| x.as_str()) {
-        return cmd.chars().take(60).collect();
+        return cmd.chars().take(TOOL_INPUT_SUMMARY_LEN).collect();
     }
     if let Some(path) = v.get("path").and_then(|x| x.as_str()) {
         return path.to_string();
     }
-    v.to_string().chars().take(60).collect()
+    v.to_string().chars().take(TOOL_INPUT_SUMMARY_LEN).collect()
 }
