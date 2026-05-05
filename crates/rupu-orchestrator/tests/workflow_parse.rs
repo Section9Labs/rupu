@@ -117,6 +117,37 @@ fn rejects_linear_step_without_agent() {
 }
 
 #[test]
+fn accepts_approval_block_on_step() {
+    let s = r#"
+name: x
+steps:
+  - id: deploy
+    agent: deployer
+    actions: []
+    approval:
+      required: true
+      prompt: "About to deploy {{ inputs.tag }}. Approve?"
+      timeout_seconds: 3600
+    prompt: "go"
+"#;
+    let wf = Workflow::parse(s).expect("approval: should parse");
+    let approval = wf.steps[0].approval.as_ref().unwrap();
+    assert!(approval.required);
+    assert_eq!(
+        approval.prompt.as_deref(),
+        Some("About to deploy {{ inputs.tag }}. Approve?")
+    );
+    assert_eq!(approval.timeout_seconds, Some(3600));
+}
+
+#[test]
+fn approval_block_omitted_means_no_gate() {
+    let s = "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
+    let wf = Workflow::parse(s).unwrap();
+    assert!(wf.steps[0].approval.is_none());
+}
+
+#[test]
 fn accepts_when_expression() {
     let s = "name: x\nsteps:\n  - id: a\n    agent: a\n    when: \"{{ inputs.go }}\"\n    actions: []\n    prompt: hi\n";
     let wf = Workflow::parse(s).expect("when: should parse");

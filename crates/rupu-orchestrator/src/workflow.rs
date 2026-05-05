@@ -160,6 +160,42 @@ impl InputDef {
     }
 }
 
+/// Optional approval gate on a step. When present and `required:
+/// true`, the runner persists `RunStatus::AwaitingApproval` and exits
+/// cleanly *before* dispatching the step. The operator approves with
+/// `rupu workflow approve <run-id>`, which mutates the persisted
+/// state and resumes execution from the awaited step.
+///
+/// Approval is checked AFTER the `when:` gate — a step skipped
+/// because of `when:` doesn't ask for approval. Approval pauses
+/// regardless of fan-out shape (linear / `for_each:` / `parallel:`)
+/// since pausing happens before any dispatch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Approval {
+    /// When `true`, the runner pauses before dispatching this step.
+    /// `false` (or the field absent) is a no-op — the step runs
+    /// normally. Authors can flip this with a minijinja-rendered
+    /// expression too, but for parse-time clarity we accept a plain
+    /// bool here; conditional gating is best expressed via `when:`.
+    #[serde(default)]
+    pub required: bool,
+    /// Optional human-readable prompt the operator sees when
+    /// approving. Rendered with the same template engine and
+    /// context as `prompt:`, so authors can include
+    /// `{{ inputs.tag }}` etc.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Optional timeout. When set and the run hasn't been
+    /// approved/rejected within this window, the next interaction
+    /// (`rupu workflow runs` / `approve` / `reject`) marks the run
+    /// `Failed` with an `expired` error message rather than
+    /// resuming. v0 evaluates the timeout lazily on operator
+    /// interaction; a future ticker daemon could enforce it eagerly.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
 /// Workflow-level defaults inherited by every step. A step's own
 /// override (when present) wins over the default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,6 +270,11 @@ pub struct Step {
     /// `parallel:` steps (each sub-step carries its own prompt).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Optional approval gate. When `required: true`, the runner
+    /// persists the run as `awaiting_approval` and exits before
+    /// dispatching this step. See [`Approval`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<Approval>,
 }
 
 /// One sub-step inside a `parallel:` block. Same surface as a linear

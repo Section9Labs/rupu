@@ -127,6 +127,12 @@ pub struct OrchestratorRunOpts {
     /// at start. Required when `run_store` is `Some`; ignored
     /// otherwise.
     pub workflow_yaml: Option<String>,
+    /// When `Some`, this is a resume of a previously-paused run.
+    /// The runner picks up where the original run left off rather
+    /// than creating a new run record. Caller is responsible for
+    /// populating this from the persisted `step_results.jsonl` +
+    /// `run.json`.
+    pub resume_from: Option<ResumeState>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +188,35 @@ pub struct OrchestratorRunResult {
     /// otherwise. Lets the CLI print "rupu workflow show-run <id>"
     /// at the end of a run.
     pub run_id: String,
+    /// `Some` when the run paused at an approval gate.
+    /// `None` when it ran to completion (or to a hard failure
+    /// surfaced as `Err` from `run_workflow`).
+    pub awaiting: Option<AwaitingInfo>,
+}
+
+/// Snapshot of the state a paused run is waiting for. Returned to
+/// the caller so the CLI can print the right hint and operators can
+/// see what they're approving.
+#[derive(Debug, Clone)]
+pub struct AwaitingInfo {
+    pub step_id: String,
+    pub prompt: String,
+}
+
+/// Caller-supplied resume context. When `OrchestratorRunOpts.resume_from`
+/// is `Some`, the runner skips run-record creation, treats every
+/// step in `prior_step_results` as already done (replays their
+/// outputs into the context), and dispatches the awaited step
+/// without re-asking for approval.
+#[derive(Debug, Clone)]
+pub struct ResumeState {
+    pub run_id: String,
+    pub prior_step_results: Vec<StepResult>,
+    /// The step that was awaiting approval (and is now approved).
+    /// The approval check is suppressed for this exact step id —
+    /// every other approval gate in the workflow still fires
+    /// normally.
+    pub approved_step_id: String,
 }
 
 pub async fn run_workflow(
@@ -191,56 +226,100 @@ pub async fn run_workflow(
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
     let workflow_default_continue = opts.workflow.defaults.continue_on_error.unwrap_or(false);
 
-    // Persistent run-state setup. When `run_store` is `Some` we
-    // create a `<global>/runs/<run-id>/` directory, snapshot the
-    // workflow YAML, and flip statuses as the run progresses. When
-    // `None` (e.g. a unit-test harness) we run in-memory only and
-    // emit an empty `run_id` in the result.
-    let run_id = if opts.run_store.is_some() {
-        format!("run_{}", Ulid::new())
-    } else {
-        String::new()
-    };
-    let mut run_record_opt = if let Some(store) = &opts.run_store {
-        let yaml = opts.workflow_yaml.as_deref().unwrap_or("");
-        let record = crate::runs::RunRecord {
-            id: run_id.clone(),
-            workflow_name: opts.workflow.name.clone(),
-            status: crate::runs::RunStatus::Running,
-            inputs: resolved_inputs.clone(),
-            event: opts.event.clone(),
-            workspace_id: opts.workspace_id.clone(),
-            workspace_path: opts.workspace_path.clone(),
-            transcript_dir: opts.transcript_dir.clone(),
-            started_at: chrono::Utc::now(),
-            finished_at: None,
-            error_message: None,
-            awaiting_step_id: None,
-            approval_prompt: None,
+    // Persistent run-state setup. Two paths:
+    //
+    // - Fresh run: `run_store: Some` and `resume_from: None`. We
+    //   create a new RunRecord in `<global>/runs/<run-id>/` and
+    //   start with an empty step-results list.
+    // - Resume: `resume_from: Some`. We reuse the prior run id,
+    //   load no new record (the on-disk one is mutated in place),
+    //   and seed `step_results` from the persisted history.
+    // - In-memory (no run store): an empty `run_id`; persistence
+    //   helpers no-op.
+    let (run_id, mut step_results, approved_step_id) =
+        if let Some(resume) = opts.resume_from.clone() {
+            (
+                resume.run_id,
+                resume.prior_step_results,
+                Some(resume.approved_step_id),
+            )
+        } else if opts.run_store.is_some() {
+            (format!("run_{}", Ulid::new()), Vec::new(), None)
+        } else {
+            (String::new(), Vec::new(), None)
         };
-        Some(store.create(record, yaml).map_err(map_run_store_err)?)
+
+    // Create the on-disk record only on a fresh run. On resume the
+    // record already exists and is mutated by the CLI's approve
+    // path before we re-enter the loop.
+    let mut run_record_opt = if opts.resume_from.is_none() {
+        if let Some(store) = &opts.run_store {
+            let yaml = opts.workflow_yaml.as_deref().unwrap_or("");
+            let record = crate::runs::RunRecord {
+                id: run_id.clone(),
+                workflow_name: opts.workflow.name.clone(),
+                status: crate::runs::RunStatus::Running,
+                inputs: resolved_inputs.clone(),
+                event: opts.event.clone(),
+                workspace_id: opts.workspace_id.clone(),
+                workspace_path: opts.workspace_path.clone(),
+                transcript_dir: opts.transcript_dir.clone(),
+                started_at: chrono::Utc::now(),
+                finished_at: None,
+                error_message: None,
+                awaiting_step_id: None,
+                approval_prompt: None,
+            };
+            Some(store.create(record, yaml).map_err(map_run_store_err)?)
+        } else {
+            None
+        }
+    } else if let Some(store) = &opts.run_store {
+        // Resume path: load the existing record so the terminal-flip
+        // block at the bottom of the function can update it.
+        match store.load(&run_id) {
+            Ok(rec) => Some(rec),
+            Err(e) => {
+                warn!(error = %e, "failed to load resumed run record");
+                None
+            }
+        }
     } else {
         None
     };
 
-    let mut step_results: Vec<StepResult> = Vec::new();
     let outcome = run_steps_inner(
         &opts,
         &run_id,
         &resolved_inputs,
         workflow_default_continue,
+        approved_step_id.as_deref(),
         &mut step_results,
     )
     .await;
 
-    // Flip the persisted status to its terminal value before
-    // returning. Even on error we want the record to reflect what
-    // actually happened so `rupu workflow show-run` is useful.
+    // Map the inner outcome onto the persisted terminal status.
+    // Paused = `AwaitingApproval` and the record carries the
+    // awaiting_step_id + approval_prompt; Done = `Completed`;
+    // Error = `Failed`.
+    let mut awaiting: Option<AwaitingInfo> = None;
     if let (Some(store), Some(record)) = (opts.run_store.as_ref(), run_record_opt.as_mut()) {
         match &outcome {
-            Ok(()) => {
+            Ok(InnerOutcome::Done) => {
                 record.status = crate::runs::RunStatus::Completed;
                 record.finished_at = Some(chrono::Utc::now());
+                record.awaiting_step_id = None;
+                record.approval_prompt = None;
+            }
+            Ok(InnerOutcome::Paused { step_id, prompt }) => {
+                record.status = crate::runs::RunStatus::AwaitingApproval;
+                record.awaiting_step_id = Some(step_id.clone());
+                record.approval_prompt = Some(prompt.clone());
+                // Don't set finished_at — the run hasn't ended.
+                awaiting = Some(AwaitingInfo {
+                    step_id: step_id.clone(),
+                    prompt: prompt.clone(),
+                });
             }
             Err(e) => {
                 record.status = crate::runs::RunStatus::Failed;
@@ -251,27 +330,61 @@ pub async fn run_workflow(
         if let Err(persist_err) = store.update(record) {
             warn!(error = %persist_err, "failed to persist terminal run state");
         }
+    } else if let Ok(InnerOutcome::Paused { step_id, prompt }) = &outcome {
+        // No store but the workflow asked for approval — surface
+        // the paused state to the caller anyway.
+        awaiting = Some(AwaitingInfo {
+            step_id: step_id.clone(),
+            prompt: prompt.clone(),
+        });
     }
 
     outcome?;
     Ok(OrchestratorRunResult {
         step_results,
         run_id,
+        awaiting,
     })
+}
+
+/// Inner loop's terminal state. Distinguishes "ran to completion"
+/// from "paused at an approval gate" without forcing the caller to
+/// inspect persisted state.
+enum InnerOutcome {
+    Done,
+    Paused { step_id: String, prompt: String },
 }
 
 /// The actual per-step loop, factored out so the surrounding
 /// run-store bookkeeping (create-on-start / flip-on-end) can wrap
-/// it cleanly. `run_id` is empty when no run-store is configured
-/// (legacy in-memory mode); persistence helpers no-op in that case.
+/// it cleanly.
+///
+/// - `run_id` is empty when no run-store is configured (legacy
+///   in-memory mode); persistence helpers no-op in that case.
+/// - `approved_step_id` is set on a resume — the step with that id
+///   skips its `approval:` gate (the operator already approved).
+///   All other approval gates in the workflow still fire normally.
+/// - `step_results` may be pre-seeded on resume; in that case the
+///   loop skips any step whose id already appears (replaying their
+///   outputs into the context for `{{ steps.<id>.output }}`).
 async fn run_steps_inner(
     opts: &OrchestratorRunOpts,
     run_id: &str,
     resolved_inputs: &BTreeMap<String, String>,
     workflow_default_continue: bool,
+    approved_step_id: Option<&str>,
     step_results: &mut Vec<StepResult>,
-) -> Result<(), RunWorkflowError> {
+) -> Result<InnerOutcome, RunWorkflowError> {
+    let already_done: std::collections::BTreeSet<String> =
+        step_results.iter().map(|sr| sr.step_id.clone()).collect();
+
     for step in &opts.workflow.steps {
+        // Resume: skip steps that already ran in the prior process.
+        if already_done.contains(&step.id) {
+            info!(step = %step.id, "resume: skipping already-completed step");
+            continue;
+        }
+
         // Build template context from inputs + prior step outputs.
         let ctx = base_context_for_step(resolved_inputs, opts.event.as_ref(), step_results);
 
@@ -303,6 +416,33 @@ async fn run_steps_inner(
             }
         }
 
+        // Approval gate: pause BEFORE dispatching the step. The
+        // outer `run_workflow` flips the persisted RunRecord to
+        // AwaitingApproval and exits cleanly. On resume the step's
+        // id matches `approved_step_id`, so we skip the gate this
+        // pass.
+        if let Some(approval) = &step.approval {
+            if approval.required && approved_step_id != Some(step.id.as_str()) {
+                let prompt = match &approval.prompt {
+                    Some(template) => render_step_prompt(template, &ctx).map_err(|e| {
+                        RunWorkflowError::Render {
+                            step: step.id.clone(),
+                            source: e,
+                        }
+                    })?,
+                    None => format!(
+                        "Approve step `{}` of workflow `{}`?",
+                        step.id, opts.workflow.name
+                    ),
+                };
+                info!(step = %step.id, "pausing for approval");
+                return Ok(InnerOutcome::Paused {
+                    step_id: step.id.clone(),
+                    prompt,
+                });
+            }
+        }
+
         let effective_continue_on_error =
             step.continue_on_error.unwrap_or(workflow_default_continue);
 
@@ -316,7 +456,7 @@ async fn run_steps_inner(
         persist_step_result(opts, run_id, &result);
         step_results.push(result);
     }
-    Ok(())
+    Ok(InnerOutcome::Done)
 }
 
 /// Append one step's record to the run's `step_results.jsonl`. A

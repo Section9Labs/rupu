@@ -53,7 +53,7 @@ Concurrency cap (`max_parallel: N`) + result aggregation part of the schema. The
 Both shapes shipped:
 - `for_each:` (data fan-out) — `Step.for_each` + `max_parallel:`, results bound as `steps.<id>.results[*]` (list of strings).
 - `parallel:` (agent fan-out) — `Step.parallel` (list of `SubStep`s, each with `id`/`agent`/`prompt`), results bound as `steps.<id>.sub_results.<sub_id>.{output,success}` (named map) and `steps.<id>.results[*]` (positional list).
-Per-unit failures honor `continue_on_error:`. Approval gates are the next slice.
+Per-unit failures honor `continue_on_error:`. Approval gates shipped via the persistent run-state foundation (see below).
 
 **Panel steps with gated review loop** (`kind: panel` — rupu's name; Okesu calls these "meeting steps"). A list of agents reviews/discusses something, emits structured findings, and the workflow loops with a fixer agent until the panel is satisfied:
 
@@ -75,10 +75,7 @@ Per-unit failures honor `continue_on_error:`. Approval gates are the next slice.
 
 Loop semantics: each iteration fans out the panelists in parallel, collects findings, classifies by severity. If any HIGH/CRITICAL, dispatch `fix_with` with the panel's findings as input; rerun panel on the fixed result; repeat until no HIGH/CRITICAL or `max_iterations` exhausted. Workflow proceeds when the gate clears (or fails with `unresolved_findings` if it doesn't). Distinctive feature; fits rupu's agent-builder pitch.
 
-**Approval gates (`approval: required`).** Step pauses, run state becomes `approval_required`, operator approves via `rupu workflow approve <run-id>` (CLI) or a future API. Useful for destructive steps (deploys, force-pushes, mass-rename refactors). Needs:
-- A persisted run-state model (today the runner is in-memory only)
-- The CLI surface for listing/approving paused runs
-- Optional approval timeout
+**Approval gates (`approval: required`).** ✅ shipped (PR 1: persistent run state in `<global>/runs/<id>/`; PR 2: schema + runner pause/resume + `rupu workflow approve` / `reject`). Webhook + cron callers report paused runs (run-id in JSON response / log). `timeout_seconds:` is parsed but enforcement is deferred — a future ticker daemon could expire stale paused runs.
 
 **Why deferred:** all three are bigger than a single PR's scope and Tier 1 (when / continue_on_error / inputs / defaults) closes the most painful gaps first.
 

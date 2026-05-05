@@ -85,6 +85,7 @@ async fn second_step_sees_first_step_output_via_template() {
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -126,6 +127,7 @@ async fn event_payload_is_visible_in_step_prompts() {
         event: Some(event),
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 1);
@@ -176,6 +178,7 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -232,6 +235,7 @@ async fn for_each_accepts_a_json_array_of_objects() {
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -269,6 +273,7 @@ async fn for_each_pulls_items_from_workflow_inputs_with_max_parallel_cap() {
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -359,6 +364,7 @@ async fn for_each_continue_on_error_records_failures_and_keeps_going() {
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -398,6 +404,7 @@ async fn for_each_without_continue_on_error_aborts_workflow_on_first_failure() {
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -450,6 +457,7 @@ async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -508,6 +516,7 @@ async fn parallel_continue_on_error_records_per_sub_step_failures() {
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let triage = &res.step_results[0];
@@ -547,6 +556,7 @@ async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message()
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -587,6 +597,7 @@ async fn run_store_records_run_metadata_and_per_step_rows() {
         event: None,
         run_store: Some(std::sync::Arc::clone(&store)),
         workflow_yaml: Some(WF_PERSIST.to_string()),
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(!res.run_id.is_empty(), "run_id should be populated");
@@ -646,6 +657,7 @@ async fn run_store_marks_run_failed_with_error_message() {
         event: None,
         run_store: Some(std::sync::Arc::clone(&store)),
         workflow_yaml: Some(WF_PERSIST_FAIL.to_string()),
+        resume_from: None,
     };
     let _ = run_workflow(opts).await.expect_err("workflow should fail");
 
@@ -682,8 +694,206 @@ async fn no_run_store_skips_persistence_and_emits_empty_run_id() {
         event: None,
         run_store: None,
         workflow_yaml: None,
+        resume_from: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(res.run_id.is_empty(), "run_id should be empty when no run_store is wired");
     assert_eq!(res.step_results.len(), 2);
+}
+
+// -- Approval gates ---------------------------------------------------------
+
+const WF_APPROVAL: &str = r#"
+name: deploy-with-approval
+inputs:
+  tag: { type: string, default: "v1.2.3" }
+steps:
+  - id: prepare
+    agent: ag
+    actions: []
+    prompt: "preparing {{ inputs.tag }}"
+  - id: deploy
+    agent: ag
+    actions: []
+    approval:
+      required: true
+      prompt: "About to deploy {{ inputs.tag }} (prepared by {{ steps.prepare.output }}). Approve?"
+    prompt: "deploying {{ inputs.tag }}"
+  - id: notify
+    agent: ag
+    actions: []
+    prompt: "deployed: {{ steps.deploy.output }}"
+"#;
+
+#[tokio::test]
+async fn approval_gate_pauses_run_and_persists_awaiting_state() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let runs_root = tmp.path().join("runs");
+    let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
+    let wf = Workflow::parse(WF_APPROVAL).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_appr".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(WF_APPROVAL.to_string()),
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+
+    // The first step ran; the second step (with `approval: required`)
+    // paused the run before dispatch.
+    assert!(res.awaiting.is_some(), "run should have paused");
+    let awaiting = res.awaiting.unwrap();
+    assert_eq!(awaiting.step_id, "deploy");
+    assert!(
+        awaiting.prompt.contains("About to deploy v1.2.3"),
+        "approval prompt should render against context, got: {}",
+        awaiting.prompt
+    );
+    assert!(
+        awaiting.prompt.contains("prepared by step prepare agent ag echo"),
+        "approval prompt should see prior step output, got: {}",
+        awaiting.prompt
+    );
+
+    // Persisted record reflects AwaitingApproval + the awaiting fields.
+    let record = store.load(&res.run_id).unwrap();
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::AwaitingApproval);
+    assert_eq!(record.awaiting_step_id.as_deref(), Some("deploy"));
+    assert!(record.approval_prompt.is_some());
+    assert!(record.finished_at.is_none(), "paused runs aren't finished");
+
+    // Only the prepare step ran; deploy / notify did not.
+    let rows = store.read_step_results(&res.run_id).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].step_id, "prepare");
+}
+
+#[tokio::test]
+async fn resume_from_approval_picks_up_at_awaited_step() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let runs_root = tmp.path().join("runs");
+    let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
+    let wf = Workflow::parse(WF_APPROVAL).unwrap();
+
+    // First pass — pause at the deploy step.
+    let opts = OrchestratorRunOpts {
+        workflow: wf.clone(),
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_resume".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(WF_APPROVAL.to_string()),
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let run_id = res.run_id.clone();
+    assert!(res.awaiting.is_some());
+
+    // Operator approves (mutate persisted record back to Running, clear awaiting).
+    let mut record = store.load(&run_id).unwrap();
+    record.status = rupu_orchestrator::RunStatus::Running;
+    record.awaiting_step_id = None;
+    record.approval_prompt = None;
+    store.update(&record).unwrap();
+
+    // Build the resume opts from persisted state.
+    let prior_records = store.read_step_results(&run_id).unwrap();
+    let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
+        .iter()
+        .map(rupu_orchestrator::StepResult::from)
+        .collect();
+    let body = store.read_workflow_snapshot(&run_id).unwrap();
+
+    let opts = OrchestratorRunOpts {
+        workflow: Workflow::parse(&body).unwrap(),
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: record.workspace_id.clone(),
+        workspace_path: record.workspace_path.clone(),
+        transcript_dir: record.transcript_dir.clone(),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(body.clone()),
+        resume_from: Some(rupu_orchestrator::ResumeState {
+            run_id: run_id.clone(),
+            prior_step_results,
+            approved_step_id: "deploy".into(),
+        }),
+    };
+    let res = run_workflow(opts).await.unwrap();
+
+    // Run completed this time.
+    assert!(res.awaiting.is_none(), "resume should run to completion");
+    assert_eq!(res.step_results.len(), 3, "all three steps now in result list");
+    let names: Vec<&str> = res
+        .step_results
+        .iter()
+        .map(|sr| sr.step_id.as_str())
+        .collect();
+    assert_eq!(names, vec!["prepare", "deploy", "notify"]);
+
+    // Persisted record is Completed.
+    let record = store.load(&run_id).unwrap();
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::Completed);
+    assert!(record.awaiting_step_id.is_none());
+    assert!(record.finished_at.is_some());
+
+    // step_results.jsonl now has all three rows. The first was
+    // appended on the original run; deploy + notify on resume.
+    let rows = store.read_step_results(&run_id).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].step_id, "prepare");
+    assert_eq!(rows[1].step_id, "deploy");
+    assert_eq!(rows[2].step_id, "notify");
+
+    // The notify step's prompt rendered against the *resumed* deploy
+    // step's output, proving context flowed correctly across processes.
+    assert!(
+        rows[2]
+            .rendered_prompt
+            .contains("deployed: step deploy agent ag echo: deploying v1.2.3"),
+        "notify should see resumed deploy output, got: {}",
+        rows[2].rendered_prompt
+    );
+}
+
+#[tokio::test]
+async fn approval_required_false_does_not_pause() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: ag
+    actions: []
+    approval:
+      required: false
+    prompt: "hi"
+"#;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(s).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_no_pause".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    assert!(res.awaiting.is_none());
+    assert_eq!(res.step_results.len(), 1);
+    assert!(res.step_results[0].success);
 }
