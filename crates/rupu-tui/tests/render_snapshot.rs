@@ -1,6 +1,7 @@
 use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 use rupu_tui::state::{NodeStatus, RunModel};
 use rupu_tui::view::canvas::render_canvas;
+use rupu_tui::view::panel::render_panel;
 use rupu_tui::view::tree::render_tree;
 
 fn buffer_to_string(b: &Buffer) -> String {
@@ -43,4 +44,22 @@ fn fanout_tree_render() {
     term.draw(|f| render_tree(f, f.area(), &model, &edges, "a")).unwrap();
 
     insta::assert_snapshot!("tree_fanout", buffer_to_string(&term.backend().buffer().clone()));
+}
+
+#[test]
+fn panel_shows_status_tools_tokens() {
+    let mut model = RunModel::new();
+    let n = model.upsert_node("code-agent", "claude-sonnet-4-6");
+    n.status = NodeStatus::Working;
+    n.tokens.input = 1902;
+    n.tokens.output = 311;
+    n.tools_used.insert("bash".into(), 3);
+    n.tools_used.insert("read".into(), 8);
+    n.tools_used.insert("edit".into(), 1);
+
+    let backend = TestBackend::new(40, 12);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| render_panel(f, f.area(), &model, "code-agent")).unwrap();
+
+    insta::assert_snapshot!("panel_focused", buffer_to_string(&term.backend().buffer().clone()));
 }
