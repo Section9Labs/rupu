@@ -1253,26 +1253,215 @@ async fn run_panel_step(
         .as_ref()
         .expect("run_panel_step called for a non-panel step");
 
-    // Render the subject once against the parent context. Each
-    // panelist sees the same rendered text — that's the whole
-    // point of "the panel reviews X".
-    let subject = render_step_prompt(&panel.subject, ctx).map_err(|e| RunWorkflowError::Render {
-        step: format!("{}.subject", step.id),
-        source: e,
-    })?;
+    // Render the initial subject once against the parent context.
+    // When a `gate:` loop is configured, subsequent iterations
+    // re-bind the subject to the fixer agent's output.
+    let initial_subject =
+        render_step_prompt(&panel.subject, ctx).map_err(|e| RunWorkflowError::Render {
+            step: format!("{}.subject", step.id),
+            source: e,
+        })?;
 
+    // No gate → run a single panel pass and return.
+    let Some(gate) = &panel.gate else {
+        return run_panel_iteration(step, panel, ctx, opts, continue_on_error, &initial_subject)
+            .await
+            .map(|p| p.into_step_result(step, &initial_subject, 1, true));
+    };
+
+    // Gate loop. Each iteration:
+    //   1. Run the panel against the current subject.
+    //   2. If max severity < threshold, exit (resolved=true).
+    //   3. If iterations >= max_iterations, exit (resolved=false,
+    //      keep accumulated findings + items).
+    //   4. Otherwise dispatch `fix_with` against the findings; the
+    //      fixer's output becomes the next iteration's subject.
+    let mut subject = initial_subject.clone();
+    let mut iterations = 0u32;
+    let (final_pass, resolved) = loop {
+        iterations += 1;
+        let pass =
+            run_panel_iteration(step, panel, ctx, opts, continue_on_error, &subject).await?;
+        let max_sev = pass.max_severity();
+        let cleared = match max_sev {
+            None => true,
+            Some(s) => s < gate.until_no_findings_at_severity_or_above,
+        };
+        if cleared {
+            info!(step = %step.id, iterations, "panel gate cleared");
+            break (pass, true);
+        }
+        if iterations >= gate.max_iterations {
+            warn!(
+                step = %step.id,
+                iterations,
+                threshold = %gate.until_no_findings_at_severity_or_above.as_str(),
+                "panel gate did not clear within max_iterations"
+            );
+            break (pass, false);
+        }
+        // Dispatch the fixer with the findings as input. Its output
+        // becomes the next iteration's subject.
+        let fixer_subject = render_fixer_input(&subject, &pass.findings);
+        let fixer_outcome = dispatch_fixer(step, &gate.fix_with, &fixer_subject, opts).await?;
+        match fixer_outcome {
+            FixerOutcome::Ok { output } => {
+                subject = output;
+                // Loop continues; pass is dropped — its findings are
+                // about to be addressed by the fixer.
+            }
+            FixerOutcome::Failed(e) if !continue_on_error => {
+                return Err(RunWorkflowError::Agent {
+                    step: format!("{}.fixer({})", step.id, gate.fix_with),
+                    source: e,
+                });
+            }
+            FixerOutcome::Failed(e) => {
+                warn!(step = %step.id, error = %e, "fixer agent failed; tolerating via continue_on_error");
+                break (pass, false);
+            }
+        }
+    };
+
+    Ok(final_pass.into_step_result(step, &initial_subject, iterations, resolved))
+}
+
+/// Result of one panel iteration. Used both for the single-pass
+/// (no-gate) path and as the loop body for the gate-loop path.
+struct PanelPass {
+    findings: Vec<Finding>,
+    items: Vec<ItemResult>,
+    success: bool,
+}
+
+impl PanelPass {
+    /// Highest severity in `findings`, or `None` when empty.
+    fn max_severity(&self) -> Option<crate::workflow::Severity> {
+        self.findings.iter().map(|f| f.severity).max()
+    }
+
+    fn into_step_result(
+        self,
+        step: &Step,
+        rendered_subject: &str,
+        iterations: u32,
+        resolved: bool,
+    ) -> StepResult {
+        let aggregate_output = serde_json::to_string(
+            &self
+                .findings
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "source": f.source,
+                        "severity": f.severity.as_str(),
+                        "title": f.title,
+                        "body": f.body,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".into());
+        StepResult {
+            step_id: step.id.clone(),
+            rendered_prompt: rendered_subject.to_string(),
+            run_id: String::new(),
+            transcript_path: PathBuf::new(),
+            output: aggregate_output,
+            success: self.success,
+            skipped: false,
+            items: self.items,
+            findings: self.findings,
+            iterations,
+            resolved,
+        }
+    }
+}
+
+/// Outcome of one fixer-agent dispatch in the gate loop.
+enum FixerOutcome {
+    Ok { output: String },
+    Failed(RunError),
+}
+
+/// Render a structured prompt for the fixer agent given the current
+/// subject + the findings it should address. Format: original
+/// subject, then a JSON-encoded `findings` array. The fixer agent's
+/// system prompt should describe how to consume this.
+fn render_fixer_input(subject: &str, findings: &[Finding]) -> String {
+    let findings_json = serde_json::to_string_pretty(
+        &findings
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "source": f.source,
+                    "severity": f.severity.as_str(),
+                    "title": f.title,
+                    "body": f.body,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".into());
+    format!(
+        "Subject under review:\n{subject}\n\n\
+         Panel findings to address:\n{findings_json}\n\n\
+         Address every finding above and emit the revised subject."
+    )
+}
+
+async fn dispatch_fixer(
+    step: &Step,
+    fixer_agent: &str,
+    rendered_prompt: &str,
+    opts: &OrchestratorRunOpts,
+) -> Result<FixerOutcome, RunWorkflowError> {
+    let run_id = format!("run_{}", Ulid::new());
+    let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+    let outcome = dispatch_one(
+        &opts.factory,
+        &step.id,
+        fixer_agent,
+        rendered_prompt.to_string(),
+        run_id.clone(),
+        opts.workspace_id.clone(),
+        opts.workspace_path.clone(),
+        transcript_path.clone(),
+    )
+    .await;
+    match outcome {
+        Ok(()) => {
+            let output =
+                read_final_assistant_text(&transcript_path, true, &run_id, &step.id);
+            Ok(FixerOutcome::Ok { output })
+        }
+        Err(e) => Ok(FixerOutcome::Failed(e)),
+    }
+}
+
+/// Run one panel iteration: dispatch all panelists in parallel
+/// against `current_subject` and aggregate findings. Used by both
+/// the single-pass and gate-loop paths.
+async fn run_panel_iteration(
+    step: &Step,
+    panel: &crate::workflow::Panel,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    continue_on_error: bool,
+    current_subject: &str,
+) -> Result<PanelPass, RunWorkflowError> {
     let max_parallel = panel.max_parallel.unwrap_or(1).max(1) as usize;
     let total = panel.panelists.len();
 
     // Each panelist's prompt is either the per-step `prompt:`
     // template (rendered against the parent context plus a `subject`
-    // binding) or — when omitted — the rendered subject verbatim.
+    // binding) or — when omitted — the current subject verbatim.
     let mut prepared: Vec<(usize, String, String, String, PathBuf)> = Vec::with_capacity(total);
     for (idx, panelist) in panel.panelists.iter().enumerate() {
         let mut item_ctx = ctx.clone();
         item_ctx
             .inputs
-            .insert("subject".to_string(), subject.clone());
+            .insert("subject".to_string(), current_subject.to_string());
         let rendered = match &panel.prompt {
             Some(template) => {
                 render_step_prompt(template, &item_ctx).map_err(|e| RunWorkflowError::Render {
@@ -1280,7 +1469,7 @@ async fn run_panel_step(
                     source: e,
                 })?
             }
-            None => subject.clone(),
+            None => current_subject.to_string(),
         };
         let run_id = format!("run_{}", Ulid::new());
         let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
@@ -1401,20 +1590,6 @@ async fn run_panel_step(
         })
         .collect();
     let success = items_vec.iter().all(|i| i.success);
-    let aggregate_output = serde_json::to_string(
-        &findings
-            .iter()
-            .map(|f| {
-                serde_json::json!({
-                    "source": f.source,
-                    "severity": f.severity.as_str(),
-                    "title": f.title,
-                    "body": f.body,
-                })
-            })
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or_else(|_| "[]".into());
 
     if !success {
         warn!(
@@ -1425,20 +1600,10 @@ async fn run_panel_step(
         );
     }
 
-    // Gate-loop is wired in commit 2; this commit always reports
-    // `iterations: 1, resolved: true` for the single-pass case.
-    Ok(StepResult {
-        step_id: step.id.clone(),
-        rendered_prompt: subject,
-        run_id: String::new(),
-        transcript_path: PathBuf::new(),
-        output: aggregate_output,
-        success,
-        skipped: false,
-        items: items_vec,
+    Ok(PanelPass {
         findings,
-        iterations: 1,
-        resolved: true,
+        items: items_vec,
+        success,
     })
 }
 

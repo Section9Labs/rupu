@@ -75,6 +75,8 @@ Per-unit failures honor `continue_on_error:`. Approval gates shipped via the per
 
 Loop semantics: each iteration fans out the panelists in parallel, collects findings, classifies by severity. If any HIGH/CRITICAL, dispatch `fix_with` with the panel's findings as input; rerun panel on the fixed result; repeat until no HIGH/CRITICAL or `max_iterations` exhausted. Workflow proceeds when the gate clears (or fails with `unresolved_findings` if it doesn't). Distinctive feature; fits rupu's agent-builder pitch.
 
+✅ **Shipped** (commits in feat/orchestrator-panel-steps): the `panel:` schema + parallel panelist dispatch + structured-findings parsing + gate loop with `fix_with`. Note rupu uses `panel:` as a sub-block on a Step (not `kind: panel` — keeps the Step shape consistent with the other fan-out kinds).
+
 **Approval gates (`approval: required`).** ✅ shipped (PR 1: persistent run state in `<global>/runs/<id>/`; PR 2: schema + runner pause/resume + `rupu workflow approve` / `reject`). Webhook + cron callers report paused runs (run-id in JSON response / log). `timeout_seconds:` is parsed but enforcement is deferred — a future ticker daemon could expire stale paused runs.
 
 **Why deferred:** all three are bigger than a single PR's scope and Tier 1 (when / continue_on_error / inputs / defaults) closes the most painful gaps first.
