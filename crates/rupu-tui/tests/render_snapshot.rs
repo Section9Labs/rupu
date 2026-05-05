@@ -1,6 +1,7 @@
 use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 use rupu_tui::state::{NodeStatus, RunModel};
 use rupu_tui::view::canvas::render_canvas;
+use rupu_tui::view::tree::render_tree;
 
 fn buffer_to_string(b: &Buffer) -> String {
     let mut s = String::new();
@@ -27,4 +28,19 @@ fn linear_three_node_canvas() {
 
     let buf = term.backend().buffer().clone();
     insta::assert_snapshot!("canvas_linear", buffer_to_string(&buf));
+}
+
+#[test]
+fn fanout_tree_render() {
+    let mut model = RunModel::new();
+    model.upsert_node("a", "spec").status = NodeStatus::Complete;
+    model.upsert_node("b", "test").status = NodeStatus::Waiting;
+    model.upsert_node("c", "sec").status = NodeStatus::Waiting;
+
+    let edges = vec![("a".into(), "b".into()), ("a".into(), "c".into())];
+    let backend = TestBackend::new(40, 8);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| render_tree(f, f.area(), &model, &edges, "a")).unwrap();
+
+    insta::assert_snapshot!("tree_fanout", buffer_to_string(&term.backend().buffer().clone()));
 }

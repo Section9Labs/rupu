@@ -1,0 +1,8 @@
+---
+source: crates/rupu-tui/tests/render_snapshot.rs
+assertion_line: 45
+expression: buffer_to_string(&term.backend().buffer().clone())
+---
+> ✓ a                                   
+    ○ b                                 
+    ○ c
