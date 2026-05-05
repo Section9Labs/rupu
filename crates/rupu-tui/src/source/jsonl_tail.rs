@@ -41,21 +41,36 @@ impl JsonlTailSource {
     }
 
     /// Drain all transcript files (`transcripts/*.jsonl`) from their
-    /// last-known byte offset. Returns parsed StepEvents.
+    /// last-known byte offset, and also check `run.json` for changes.
     fn drain_transcripts(&mut self) -> Vec<SourceEvent> {
-        let transcripts = self.run_dir.join("transcripts");
-        let Ok(rd) = std::fs::read_dir(&transcripts) else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
+        self.drain_run_json(&mut out);
+        let transcripts = self.run_dir.join("transcripts");
+        if let Ok(rd) = std::fs::read_dir(&transcripts) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                self.tail_file(&path, &mut out);
             }
-            self.tail_file(&path, &mut out);
         }
         out
+    }
+
+    fn drain_run_json(&mut self, out: &mut Vec<SourceEvent>) {
+        let path = self.run_dir.join("run.json");
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        // Compare against last-known mtime via a sentinel offset (file size).
+        let last_size = self.offsets.get(&path).copied().unwrap_or(u64::MAX);
+        if last_size == bytes.len() as u64 {
+            return;
+        }
+        self.offsets.insert(path.clone(), bytes.len() as u64);
+        match serde_json::from_slice::<rupu_orchestrator::RunRecord>(&bytes) {
+            Ok(rec) => out.push(SourceEvent::RunUpdate(rec)),
+            Err(e) => warn!(error = %e, "malformed run.json; skipped"),
+        }
     }
 
     fn tail_file(&mut self, path: &std::path::Path, out: &mut Vec<SourceEvent>) {
