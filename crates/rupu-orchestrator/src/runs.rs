@@ -108,12 +108,23 @@ pub struct RunRecord {
     /// Set in `Failed` status; the runner's error message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
-    /// PR 2: id of the step the run is paused at, if any.
+    /// id of the step the run is paused at, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub awaiting_step_id: Option<String>,
-    /// PR 2: rendered approval prompt the operator sees.
+    /// Rendered approval prompt the operator sees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_prompt: Option<String>,
+    /// When the run paused for approval. Set alongside
+    /// `awaiting_step_id`. Used as the anchor for `expires_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_since: Option<DateTime<Utc>>,
+    /// When the pending approval expires. `None` when the awaited
+    /// step has no `timeout_seconds:` set. After this instant, an
+    /// approve/reject attempt will fail and `rupu workflow runs`
+    /// surfaces the run as expired (status flipped to `Failed`
+    /// with `error_message` set on first observation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with
@@ -422,6 +433,43 @@ impl RunStore {
         out.sort_by_key(|r| std::cmp::Reverse(r.started_at));
         Ok(out)
     }
+
+    /// If `record` is in `AwaitingApproval` and its `expires_at`
+    /// (when set) is in the past relative to `now`, transition the
+    /// record to `Failed` with an "expired" error message and
+    /// persist. Returns `Ok(true)` when a transition happened,
+    /// `Ok(false)` otherwise. Used by the CLI's `approve` /
+    /// `reject` / `runs` paths to enforce the timeout lazily — no
+    /// daemon needed.
+    pub fn expire_if_overdue(
+        &self,
+        record: &mut RunRecord,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RunStoreError> {
+        if record.status != RunStatus::AwaitingApproval {
+            return Ok(false);
+        }
+        let Some(expires_at) = record.expires_at else {
+            return Ok(false);
+        };
+        if now <= expires_at {
+            return Ok(false);
+        }
+        let waited = expires_at - record.awaiting_since.unwrap_or(record.started_at);
+        record.status = RunStatus::Failed;
+        record.finished_at = Some(now);
+        record.error_message = Some(format!(
+            "approval expired: paused at step `{}` waited longer than {}s without approval",
+            record.awaiting_step_id.as_deref().unwrap_or("?"),
+            waited.num_seconds()
+        ));
+        // Keep awaiting_step_id / approval_prompt around so
+        // post-mortem inspection can see what was missed; clear
+        // expires_at so subsequent reads don't re-expire.
+        record.expires_at = None;
+        self.update(record)?;
+        Ok(true)
+    }
 }
 
 /// Atomic write: write to `path.tmp`, then rename. POSIX rename is
@@ -457,6 +505,8 @@ mod tests {
             error_message: None,
             awaiting_step_id: None,
             approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
         }
     }
 
@@ -589,5 +639,95 @@ mod tests {
         let store = RunStore::new(tmp.path().to_path_buf());
         let err = store.load("does_not_exist").unwrap_err();
         assert!(matches!(err, RunStoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn expire_if_overdue_does_nothing_when_not_paused() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_a");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), "x").unwrap();
+        let mut loaded = rec;
+        let flipped = store.expire_if_overdue(&mut loaded, Utc::now()).unwrap();
+        assert!(!flipped);
+        assert_eq!(loaded.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn expire_if_overdue_does_nothing_when_no_expires_at() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_a");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.awaiting_since = Some(Utc::now() - chrono::Duration::days(30));
+        // expires_at intentionally None: timeout not configured.
+        store.create(rec.clone(), "x").unwrap();
+        let mut loaded = rec;
+        let flipped = store.expire_if_overdue(&mut loaded, Utc::now()).unwrap();
+        assert!(!flipped, "no timeout configured → never expires");
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+    }
+
+    #[test]
+    fn expire_if_overdue_does_nothing_when_within_window() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_a");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.awaiting_since = Some(now);
+        rec.expires_at = Some(now + chrono::Duration::seconds(60));
+        store.create(rec.clone(), "x").unwrap();
+        let mut loaded = rec;
+        let flipped = store.expire_if_overdue(&mut loaded, now).unwrap();
+        assert!(!flipped);
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+    }
+
+    #[test]
+    fn expire_if_overdue_flips_status_and_persists_when_past_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_a");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.awaiting_since = Some(now - chrono::Duration::seconds(120));
+        rec.expires_at = Some(now - chrono::Duration::seconds(30));
+        store.create(rec.clone(), "x").unwrap();
+
+        let mut loaded = rec;
+        let flipped = store.expire_if_overdue(&mut loaded, now).unwrap();
+        assert!(flipped);
+        assert_eq!(loaded.status, RunStatus::Failed);
+        assert!(loaded.finished_at.is_some());
+        let msg = loaded.error_message.as_deref().unwrap();
+        assert!(msg.contains("approval expired"));
+        assert!(msg.contains("deploy"));
+        assert!(loaded.expires_at.is_none(), "cleared after flip");
+        // Persisted to disk too.
+        let reloaded = store.load("run_a").unwrap();
+        assert_eq!(reloaded.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn expire_if_overdue_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_a");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.expires_at = Some(now - chrono::Duration::seconds(30));
+        store.create(rec.clone(), "x").unwrap();
+
+        let mut loaded = rec;
+        assert!(store.expire_if_overdue(&mut loaded, now).unwrap());
+        // Second call should be a no-op since status is no longer
+        // AwaitingApproval.
+        assert!(!store.expire_if_overdue(&mut loaded, now).unwrap());
     }
 }

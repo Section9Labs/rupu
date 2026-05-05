@@ -249,6 +249,9 @@ pub struct OrchestratorRunResult {
 pub struct AwaitingInfo {
     pub step_id: String,
     pub prompt: String,
+    /// When the pending approval expires. `None` when the awaited
+    /// step has no `timeout_seconds:` set.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Caller-supplied resume context. When `OrchestratorRunOpts.resume_from`
@@ -317,6 +320,8 @@ pub async fn run_workflow(
                 error_message: None,
                 awaiting_step_id: None,
                 approval_prompt: None,
+                awaiting_since: None,
+                expires_at: None,
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {
@@ -358,15 +363,26 @@ pub async fn run_workflow(
                 record.finished_at = Some(chrono::Utc::now());
                 record.awaiting_step_id = None;
                 record.approval_prompt = None;
+                record.awaiting_since = None;
+                record.expires_at = None;
             }
-            Ok(InnerOutcome::Paused { step_id, prompt }) => {
+            Ok(InnerOutcome::Paused {
+                step_id,
+                prompt,
+                timeout_seconds,
+            }) => {
+                let now = chrono::Utc::now();
                 record.status = crate::runs::RunStatus::AwaitingApproval;
                 record.awaiting_step_id = Some(step_id.clone());
                 record.approval_prompt = Some(prompt.clone());
+                record.awaiting_since = Some(now);
+                record.expires_at = timeout_seconds
+                    .map(|secs| now + chrono::Duration::seconds(secs as i64));
                 // Don't set finished_at — the run hasn't ended.
                 awaiting = Some(AwaitingInfo {
                     step_id: step_id.clone(),
                     prompt: prompt.clone(),
+                    expires_at: record.expires_at,
                 });
             }
             Err(e) => {
@@ -378,12 +394,21 @@ pub async fn run_workflow(
         if let Err(persist_err) = store.update(record) {
             warn!(error = %persist_err, "failed to persist terminal run state");
         }
-    } else if let Ok(InnerOutcome::Paused { step_id, prompt }) = &outcome {
+    } else if let Ok(InnerOutcome::Paused {
+        step_id,
+        prompt,
+        timeout_seconds,
+    }) = &outcome
+    {
         // No store but the workflow asked for approval — surface
         // the paused state to the caller anyway.
+        let expires_at = timeout_seconds.map(|secs| {
+            chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
+        });
         awaiting = Some(AwaitingInfo {
             step_id: step_id.clone(),
             prompt: prompt.clone(),
+            expires_at,
         });
     }
 
@@ -400,7 +425,15 @@ pub async fn run_workflow(
 /// inspect persisted state.
 enum InnerOutcome {
     Done,
-    Paused { step_id: String, prompt: String },
+    Paused {
+        step_id: String,
+        prompt: String,
+        /// Optional `timeout_seconds:` from the awaited step's
+        /// `approval:` block. When `Some`, the runner persists
+        /// `expires_at = now() + timeout` so subsequent
+        /// `rupu workflow approve` / `runs` can honor it.
+        timeout_seconds: Option<u64>,
+    },
 }
 
 /// The actual per-step loop, factored out so the surrounding
@@ -488,6 +521,7 @@ async fn run_steps_inner(
                 return Ok(InnerOutcome::Paused {
                     step_id: step.id.clone(),
                     prompt,
+                    timeout_seconds: approval.timeout_seconds,
                 });
             }
         }

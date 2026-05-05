@@ -77,7 +77,7 @@ Loop semantics: each iteration fans out the panelists in parallel, collects find
 
 ✅ **Shipped** (commits in feat/orchestrator-panel-steps): the `panel:` schema + parallel panelist dispatch + structured-findings parsing + gate loop with `fix_with`. Note rupu uses `panel:` as a sub-block on a Step (not `kind: panel` — keeps the Step shape consistent with the other fan-out kinds).
 
-**Approval gates (`approval: required`).** ✅ shipped (PR 1: persistent run state in `<global>/runs/<id>/`; PR 2: schema + runner pause/resume + `rupu workflow approve` / `reject`). Webhook + cron callers report paused runs (run-id in JSON response / log). `timeout_seconds:` is parsed but enforcement is deferred — a future ticker daemon could expire stale paused runs.
+**Approval gates (`approval: required`).** ✅ shipped (PR 1: persistent run state in `<global>/runs/<id>/`; PR 2: schema + runner pause/resume + `rupu workflow approve` / `reject`; PR 3: `timeout_seconds:` enforcement). Webhook + cron callers report paused runs (run-id in JSON response / log). Timeout enforcement is **lazy** — checked on next operator interaction (`rupu workflow runs` / `approve` / `reject`); past-deadline paused runs flip to `Failed` with an "approval expired" error. A native ticker daemon would enforce eagerly but isn't needed for v1.
 
 **Why deferred:** all three are bigger than a single PR's scope and Tier 1 (when / continue_on_error / inputs / defaults) closes the most painful gaps first.
 
