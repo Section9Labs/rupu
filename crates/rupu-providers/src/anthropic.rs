@@ -969,6 +969,59 @@ impl AnthropicClient {
             body["thinking"] = serde_json::json!({ "type": "adaptive" });
         }
 
+        // ── Optional output-shape / context / speed knobs ──────────────
+        // Each block is emitted only when the corresponding agent-
+        // frontmatter field was set, so we keep the wire payload
+        // minimal for agents that don't opt in. Field shapes track
+        // what the official `@anthropic-ai/sdk` emits when the
+        // matching SDK option is enabled.
+
+        // `output_config` carries `format` (and, in the future,
+        // `effort` / a redundant `task_budget`). For now we
+        // populate it with whichever fields the request specifies.
+        let mut output_config = serde_json::Map::new();
+        if let Some(format) = request.output_format {
+            output_config.insert(
+                "format".to_string(),
+                serde_json::Value::String(
+                    match format {
+                        crate::types::OutputFormat::Json => "json",
+                        crate::types::OutputFormat::Text => "text",
+                    }
+                    .to_string(),
+                ),
+            );
+        }
+        if let Some(budget) = request.anthropic_task_budget {
+            output_config.insert(
+                "task_budget".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(budget)),
+            );
+        }
+        if !output_config.is_empty() {
+            body["output_config"] = serde_json::Value::Object(output_config);
+        }
+
+        // `context_management.type: "tool_clearing"` lets the server
+        // transparently drop earlier `tool_use` / `tool_result`
+        // blocks when the conversation would otherwise overflow.
+        if let Some(strat) = request.anthropic_context_management {
+            let strat_str = match strat {
+                crate::types::ContextManagement::ToolClearing => "tool_clearing",
+            };
+            body["context_management"] = serde_json::json!({ "type": strat_str });
+        }
+
+        // Top-level `speed: "fast"` toggle — account-gated. Sending
+        // from an account without the feature returns 400, so we
+        // only emit when the agent explicitly opted in.
+        if let Some(speed) = request.anthropic_speed {
+            let speed_str = match speed {
+                crate::types::Speed::Fast => "fast",
+            };
+            body["speed"] = serde_json::Value::String(speed_str.to_string());
+        }
+
         body
     }
 
@@ -2062,5 +2115,95 @@ mod tests {
         assert_eq!(resp.usage.cached_tokens, 200);
         assert_eq!(resp.usage.input_tokens, 10);
         assert_eq!(resp.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn build_body_emits_output_config_format_json() {
+        let client = AnthropicClient::new("k".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            output_format: Some(crate::types::OutputFormat::Json),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["output_config"]["format"], "json");
+    }
+
+    #[test]
+    fn build_body_emits_output_config_task_budget() {
+        let client = AnthropicClient::new("k".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            anthropic_task_budget: Some(2048),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["output_config"]["task_budget"], 2048);
+    }
+
+    #[test]
+    fn build_body_emits_context_management_tool_clearing() {
+        let client = AnthropicClient::new("k".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            anthropic_context_management: Some(crate::types::ContextManagement::ToolClearing),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["context_management"]["type"], "tool_clearing");
+    }
+
+    #[test]
+    fn build_body_emits_speed_fast() {
+        let client = AnthropicClient::new("k".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            anthropic_speed: Some(crate::types::Speed::Fast),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["speed"], "fast");
+    }
+
+    #[test]
+    fn build_body_omits_optional_fields_when_none() {
+        let client = AnthropicClient::new("k".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert!(
+            body.get("output_config").is_none(),
+            "no output_format/task_budget set → no output_config"
+        );
+        assert!(body.get("context_management").is_none());
+        assert!(body.get("speed").is_none());
+    }
+
+    #[test]
+    fn build_body_combines_format_and_task_budget_into_one_output_config() {
+        let client = AnthropicClient::new("k".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            output_format: Some(crate::types::OutputFormat::Json),
+            anthropic_task_budget: Some(1500),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["output_config"]["format"], "json");
+        assert_eq!(body["output_config"]["task_budget"], 1500);
     }
 }

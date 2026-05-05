@@ -81,16 +81,15 @@ Loop semantics: each iteration fans out the panelists in parallel, collects find
 
 **Why deferred:** all three are bigger than a single PR's scope and Tier 1 (when / continue_on_error / inputs / defaults) closes the most painful gaps first.
 
-## Workflow output_config / context_management / speed (Anthropic feature flags)
+## Anthropic feature flags ✅ shipped
 
-Body fields surfaced in claude-cli that rupu doesn't yet emit:
-- `output_config: { effort?, task_budget?, format? }` — output shape constraints
-- `context_management: { type: "tool_clearing", ... }` — automatic context pruning when conversation grows large
-- `speed: "fast"` — fast-mode toggle (account-gated)
+Four agent-frontmatter knobs flow through to the Anthropic / OpenAI request body:
+- `outputFormat: text | json` — cross-provider. Anthropic emits `output_config.format`; OpenAI emits `text.format.type: json_object`. Other providers ignore.
+- `anthropicTaskBudget: <u32>` — Anthropic-only soft cap on output tokens (model self-paces). Distinct from `maxTurns` (hard ceiling). Emitted as `output_config.task_budget`.
+- `anthropicContextManagement: tool_clearing` — Anthropic-only auto context-pruning. Server transparently drops earlier `tool_use`/`tool_result` blocks when conversation would overflow. Emitted as `context_management: { type: "tool_clearing" }`.
+- `anthropicSpeed: fast` — Anthropic-only fast-mode toggle. Account-gated. Emitted as top-level `speed: "fast"`.
 
-Anthropic-specific body fields the SDK emits when corresponding features are enabled. None affect rate-limit/quota; all are quality/perf tuning. Add as agent-frontmatter knobs (`outputFormat: json`, `contextManagement: tool_clearing`, `speed: fast`) once a real use case lands.
-
-**Why deferred:** lower-leverage than Tier 1 orchestration / triggers / panel steps; nobody has asked for these specific levers yet.
+Pipeline: AgentSpec → AgentRunOpts → LlmRequest → Anthropic/OpenAI client body builder. Optional fields are only emitted on the wire when explicitly set, keeping the payload identical to pre-feature for agents that don't opt in.
 
 ## Re-MITM and refresh the Anthropic OAuth wire-shape pins (when 429s return)
 
