@@ -79,6 +79,8 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::webhook::Action,
     },
+    /// Aggregate token spend across persisted transcripts.
+    Usage(cmd::usage::UsageArgs),
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -108,5 +110,6 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Cron { action } => cmd::cron::handle(action).await,
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
+        Cmd::Usage(args) => cmd::usage::handle(args).await,
     }
 }
