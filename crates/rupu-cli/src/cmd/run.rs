@@ -231,6 +231,10 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         mcp_registry: Some(scm_registry),
         effort: spec.effort,
         context_window: spec.context_window,
+        output_format: spec.output_format,
+        anthropic_task_budget: spec.anthropic_task_budget,
+        anthropic_context_management: spec.anthropic_context_management,
+        anthropic_speed: spec.anthropic_speed,
     };
 
     let result = rupu_agent::run_agent(opts).await?;

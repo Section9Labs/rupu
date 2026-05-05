@@ -207,6 +207,10 @@ impl TaskClassifier {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
 
         let result = tokio::time::timeout(CLASSIFIER_TIMEOUT, async {
@@ -347,6 +351,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
         let result = classifier.classify(&request, None).await;
         assert_eq!(result, TaskType::Research);
@@ -366,6 +374,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: Some(TaskType::Plan),
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
         let result = classifier.classify(&request, None).await;
         assert_eq!(result, TaskType::Plan);
@@ -385,6 +397,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
         let result = classifier.classify(&request, None).await;
         assert_eq!(result, TaskType::Chat);

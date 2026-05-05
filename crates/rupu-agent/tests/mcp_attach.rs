@@ -43,6 +43,10 @@ async fn mcp_registry_attaches_tools_to_run() {
         mcp_registry: Some(Arc::new(Registry::empty())),
         effort: None,
         context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
     };
 
     run_agent(opts).await.unwrap();

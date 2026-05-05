@@ -267,6 +267,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
         let body = provider.build_openai_request(&request);
         assert_eq!(body["model"], "phi-local");
@@ -300,6 +304,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
         let body = provider.build_openai_request(&request);
         let messages = body["messages"]

@@ -298,6 +298,15 @@ impl OpenAiCodexClient {
             }
         }
 
+        // Cross-provider `output_format` mapping for OpenAI's
+        // Responses API. We only know how to express the JSON
+        // variant — `text` is the implicit default and emitting it
+        // explicitly adds no value (and could conflict if OpenAI
+        // ever introduces a stricter "free-form text" mode).
+        if let Some(crate::types::OutputFormat::Json) = request.output_format {
+            body["text"] = serde_json::json!({ "format": { "type": "json_object" } });
+        }
+
         body
     }
 
@@ -812,6 +821,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
 
         let body = client.build_request_body(&request, true);
@@ -845,6 +858,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -873,6 +890,10 @@ mod tests {
             thinking: Some(crate::model_tier::ThinkingLevel::High),
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -898,6 +919,10 @@ mod tests {
             thinking: Some(crate::model_tier::ThinkingLevel::Max),
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -1180,6 +1205,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -1210,6 +1239,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -1256,6 +1289,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
 
         let body = client.build_request_body(&request, true);
@@ -1347,5 +1384,46 @@ mod tests {
             <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
         assert!(models.iter().any(|m| m.id == "gpt-5"));
         assert!(models.iter().any(|m| m.id == "gpt-4o"));
+    }
+
+    #[test]
+    fn build_body_emits_response_format_when_output_format_json() {
+        use crate::types::Message;
+        let client = OpenAiCodexClient::new(
+            crate::auth::AuthCredentials::ApiKey { key: "k".into() },
+            None,
+        )
+        .unwrap();
+        let request = LlmRequest {
+            model: "gpt-5".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            output_format: Some(crate::types::OutputFormat::Json),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(body["text"]["format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn build_body_omits_response_format_when_output_format_text() {
+        // We treat `text` as the implicit default and intentionally
+        // do not emit it — keeps the wire payload identical to the
+        // pre-feature shape for the common case.
+        use crate::types::Message;
+        let client = OpenAiCodexClient::new(
+            crate::auth::AuthCredentials::ApiKey { key: "k".into() },
+            None,
+        )
+        .unwrap();
+        let request = LlmRequest {
+            model: "gpt-5".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 100,
+            output_format: Some(crate::types::OutputFormat::Text),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&request, false);
+        assert!(body.get("text").is_none());
     }
 }

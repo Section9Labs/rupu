@@ -65,6 +65,10 @@ impl From<LlmRequestWire> for LlmRequest {
             thinking: w.thinking,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         }
     }
 }
@@ -187,6 +191,10 @@ mod tests {
             thinking: None,
             context_window: None,
             task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
         };
         let wire = LlmRequestWire::from(&request);
         assert_eq!(wire.model, request.model);

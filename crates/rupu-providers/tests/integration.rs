@@ -15,6 +15,10 @@ fn test_full_request_response_type_flow() {
         thinking: None,
         context_window: None,
         task_type: None,
+        output_format: None,
+        anthropic_task_budget: None,
+        anthropic_context_management: None,
+        anthropic_speed: None,
     };
     assert_eq!(request.messages.len(), 1);
     assert_eq!(request.model, "claude-sonnet-4-6");
@@ -55,6 +59,10 @@ fn test_tool_use_flow() {
         thinking: None,
         context_window: None,
         task_type: None,
+        output_format: None,
+        anthropic_task_budget: None,
+        anthropic_context_management: None,
+        anthropic_speed: None,
     };
     assert_eq!(request.tools.len(), 1);
 
@@ -129,6 +137,10 @@ fn test_all_public_types_accessible() {
         thinking: None,
         context_window: None,
         task_type: None,
+        output_format: None,
+        anthropic_task_budget: None,
+        anthropic_context_management: None,
+        anthropic_speed: None,
     };
     let _role = Role::User;
     let _stop = StopReason::EndTurn;

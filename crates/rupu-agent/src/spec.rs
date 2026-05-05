@@ -7,6 +7,7 @@
 //! time so typos like `permision_mode` surface as errors.
 
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
+use rupu_providers::types::{ContextManagement, OutputFormat, Speed};
 use rupu_providers::AuthMode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -63,6 +64,33 @@ struct Frontmatter {
     /// Other providers ignore this for now.
     #[serde(default, rename = "contextWindow")]
     context_window: Option<ContextWindow>,
+    /// Output-format hint. `text` (default) leaves the model free
+    /// to choose; `json` constrains the response to parse as JSON.
+    /// Anthropic emits as `output_config.format`; OpenAI emits as
+    /// `response_format.type: "json_object"`. Other providers
+    /// currently ignore this.
+    #[serde(default, rename = "outputFormat")]
+    output_format: Option<OutputFormat>,
+    /// Anthropic-only soft cap on output tokens. The model
+    /// self-paces toward this budget — distinct from `maxTurns`,
+    /// which is a hard ceiling. Emitted as
+    /// `output_config.task_budget`. Ignored by other providers.
+    #[serde(default, rename = "anthropicTaskBudget")]
+    anthropic_task_budget: Option<u32>,
+    /// Anthropic-only auto context-management strategy. When set,
+    /// the server transparently drops earlier `tool_use` /
+    /// `tool_result` blocks if the conversation would otherwise
+    /// overflow. Emitted as
+    /// `context_management: { type: "tool_clearing" }`. Ignored by
+    /// other providers.
+    #[serde(default, rename = "anthropicContextManagement")]
+    anthropic_context_management: Option<ContextManagement>,
+    /// Anthropic-only fast-mode toggle. Account-gated; sending
+    /// `fast` from an account without the feature returns 400.
+    /// Emitted as the top-level `speed: "fast"` body field.
+    /// Ignored by other providers.
+    #[serde(default, rename = "anthropicSpeed")]
+    anthropic_speed: Option<Speed>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -79,6 +107,10 @@ pub struct AgentSpec {
     pub anthropic_oauth_prefix: Option<bool>,
     pub effort: Option<ThinkingLevel>,
     pub context_window: Option<ContextWindow>,
+    pub output_format: Option<OutputFormat>,
+    pub anthropic_task_budget: Option<u32>,
+    pub anthropic_context_management: Option<ContextManagement>,
+    pub anthropic_speed: Option<Speed>,
     pub system_prompt: String,
 }
 
@@ -112,6 +144,10 @@ impl AgentSpec {
             anthropic_oauth_prefix: fm.anthropic_oauth_prefix,
             effort: fm.effort,
             context_window: fm.context_window,
+            output_format: fm.output_format,
+            anthropic_task_budget: fm.anthropic_task_budget,
+            anthropic_context_management: fm.anthropic_context_management,
+            anthropic_speed: fm.anthropic_speed,
             system_prompt: body.to_string(),
         })
     }

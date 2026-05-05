@@ -801,6 +801,10 @@ impl StepFactory for CliStepFactory {
                         anthropic_oauth_prefix: None,
                         effort: None,
                         context_window: None,
+                        output_format: None,
+                        anthropic_task_budget: None,
+                        anthropic_context_management: None,
+                        anthropic_speed: None,
                         system_prompt: rendered_prompt.clone(),
                     }
                 });
@@ -849,6 +853,10 @@ impl StepFactory for CliStepFactory {
             mcp_registry: Some(Arc::clone(&self.mcp_registry)),
             effort: spec.effort,
             context_window: spec.context_window,
+            output_format: spec.output_format,
+            anthropic_task_budget: spec.anthropic_task_budget,
+            anthropic_context_management: spec.anthropic_context_management,
+            anthropic_speed: spec.anthropic_speed,
         }
     }
 }

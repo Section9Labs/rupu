@@ -97,7 +97,15 @@ pub struct Usage {
 }
 
 /// A request to an LLM provider.
-#[derive(Debug, Clone)]
+///
+/// `Default` is derived so callers can use `..Default::default()`
+/// to fill in fields they don't care about (especially the
+/// optional reasoning / context / output-format / fast-mode
+/// knobs). The `model` field defaults to an empty string — that's
+/// not a valid send target, but no production path constructs
+/// `LlmRequest::default()` and sends it; the derive is purely an
+/// ergonomic convenience for partial literals and tests.
+#[derive(Debug, Clone, Default)]
 pub struct LlmRequest {
     pub model: String,
     pub system: Option<String>,
@@ -119,6 +127,57 @@ pub struct LlmRequest {
     pub context_window: Option<crate::model_tier::ContextWindow>,
     /// Task type for smart routing. Set by TaskClassifier or explicitly by caller.
     pub task_type: Option<crate::task_classifier::TaskType>,
+    /// Cross-provider output-format hint. Anthropic emits as
+    /// `output_config.format`; OpenAI emits as `response_format.type`
+    /// (with the right shape per their schema). `None` leaves the
+    /// model free to choose. Other providers currently ignore this.
+    pub output_format: Option<OutputFormat>,
+    /// Anthropic-only soft cap on output tokens. Distinct from
+    /// `max_tokens` (hard ceiling): the model self-paces toward this
+    /// budget. Emitted as `output_config.task_budget`. Ignored by
+    /// other providers.
+    pub anthropic_task_budget: Option<u32>,
+    /// Anthropic-only auto context-management strategy. Emitted as
+    /// `context_management: { type: "tool_clearing", ... }`. Lets
+    /// the server transparently drop earlier `tool_use` /
+    /// `tool_result` blocks when the conversation would otherwise
+    /// overflow. Ignored by other providers.
+    pub anthropic_context_management: Option<ContextManagement>,
+    /// Anthropic-only fast-mode toggle. Account-gated; sending
+    /// `Speed::Fast` from an account that doesn't have the feature
+    /// enabled returns 400. Emitted as the top-level `speed: "fast"`
+    /// body field. Ignored by other providers.
+    pub anthropic_speed: Option<Speed>,
+}
+
+/// Output-format hint passed to providers that support structured
+/// outputs. Anthropic and OpenAI map this onto their respective
+/// body fields; other providers ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
+
+/// Anthropic auto context-management strategy. Today the server
+/// supports `tool_clearing`; the enum is open to keep room for
+/// future strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextManagement {
+    /// Drop earlier `tool_use` / `tool_result` blocks when the
+    /// conversation would otherwise overflow. Latest tool calls and
+    /// the assistant's final reasoning are preserved.
+    ToolClearing,
+}
+
+/// Anthropic fast-mode toggle. Currently a single-variant enum
+/// because that's all the server accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Speed {
+    Fast,
 }
 
 /// A complete response from an LLM provider.

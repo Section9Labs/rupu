@@ -196,6 +196,10 @@ async fn anthropic_factory_oauth_credential_uses_bearer_not_x_api_key() {
         thinking: None,
         context_window: None,
         task_type: None,
+        output_format: None,
+        anthropic_task_budget: None,
+        anthropic_context_management: None,
+        anthropic_speed: None,
     };
 
     let result = provider.send(&request).await;
