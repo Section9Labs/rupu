@@ -11,6 +11,7 @@ pub mod logging;
 pub mod paths;
 pub mod provider_factory;
 pub mod run_target;
+pub mod templates;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
