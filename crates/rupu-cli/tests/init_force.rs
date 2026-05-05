@@ -24,5 +24,8 @@ fn force_overwrites_existing_templates() {
         .unwrap()
         .content;
     let body = std::fs::read_to_string(&target).unwrap();
-    assert_eq!(body, expected, "--force must overwrite with template content");
+    assert_eq!(
+        body, expected,
+        "--force must overwrite with template content"
+    );
 }
