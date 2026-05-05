@@ -8,6 +8,7 @@ members = [
     "crates/rupu-providers",
     "crates/rupu-scm",
     "crates/rupu-tools",
+    "crates/rupu-tui",
     "crates/rupu-agent",
     "crates/rupu-orchestrator",
     "crates/rupu-mcp",
