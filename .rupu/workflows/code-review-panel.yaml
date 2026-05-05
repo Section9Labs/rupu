@@ -1,0 +1,47 @@
+name: code-review-panel
+description: |
+  Dispatch three specialist reviewers over the same diff in parallel,
+  then aggregate. Showcases `parallel:` (agent fan-out) and
+  `steps.<id>.sub_results.<sub_id>` named-map access.
+
+inputs:
+  diff:
+    type: string
+    required: true
+
+steps:
+  - id: panel
+    actions: []
+    max_parallel: 3
+    parallel:
+      - id: security
+        agent: security-reviewer
+        prompt: |
+          Review for security issues. Diff:
+          {{ inputs.diff }}
+      - id: performance
+        agent: perf-reviewer
+        prompt: |
+          Review for performance issues. Diff:
+          {{ inputs.diff }}
+      - id: maintainability
+        agent: maintainability-reviewer
+        prompt: |
+          Review for maintainability issues. Diff:
+          {{ inputs.diff }}
+
+  - id: aggregate
+    agent: code-reviewer
+    actions: []
+    prompt: |
+      Aggregate findings from the three reviewers below into a single
+      prioritized list of issues.
+
+      Security findings:
+      {{ steps.panel.sub_results.security.output }}
+
+      Performance findings:
+      {{ steps.panel.sub_results.performance.output }}
+
+      Maintainability findings:
+      {{ steps.panel.sub_results.maintainability.output }}

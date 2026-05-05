@@ -1,0 +1,34 @@
+name: review-each-file
+description: |
+  Fan out a code-reviewer agent across each file passed in via
+  `--input files=...` (newline-separated). Demonstrates `for_each:`,
+  `max_parallel:`, and per-item context bindings (`{{item}}`,
+  `{{loop.index}}`).
+
+inputs:
+  files:
+    type: string
+    required: true
+    # Example: rupu workflow run review-each-file --input files=$'src/a.rs\nsrc/b.rs'
+
+steps:
+  - id: review_each
+    agent: code-reviewer
+    actions: []
+    for_each: "{{ inputs.files }}"
+    max_parallel: 3
+    prompt: |
+      Review file: {{ item }} ({{ loop.index }} of {{ loop.length }}).
+      Report findings as a short bulleted list. Be concise.
+
+  - id: summarize
+    agent: code-reviewer
+    actions: []
+    prompt: |
+      Aggregate the per-file findings into one summary.
+
+      File reviews:
+      {% for r in steps.review_each.results %}
+      ---
+      {{ r }}
+      {% endfor %}

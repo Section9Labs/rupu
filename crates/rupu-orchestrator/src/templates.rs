@@ -32,12 +32,40 @@ pub enum RenderError {
 /// `{{event.repository.name}}`, etc. For manually-invoked or cron-
 /// triggered runs, `event` is `None` and references render as the
 /// minijinja default for missing values (empty string).
+///
+/// `item` and `loop_info` are populated only inside a fan-out
+/// (`for_each:`) iteration — the per-item prompt template can read
+/// `{{item}}` and `{{loop.index}}` (1-based). They're absent for
+/// linear steps; chained access on the missing root is safe under
+/// the chainable undefined behavior.
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct StepContext {
     pub inputs: BTreeMap<String, String>,
     pub steps: BTreeMap<String, StepOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<serde_json::Value>,
+    /// Renamed to `loop` in the serialized form so templates can
+    /// reference `{{ loop.index }}` (Jinja convention). The Rust
+    /// field name avoids the keyword.
+    #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_info: Option<LoopInfo>,
+}
+
+/// Per-iteration metadata exposed to fan-out item prompts.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct LoopInfo {
+    /// 1-based index of the current item.
+    pub index: usize,
+    /// 0-based index — useful for templates that prefer it.
+    pub index0: usize,
+    /// Total number of items in the fan-out.
+    pub length: usize,
+    /// True on the first item.
+    pub first: bool,
+    /// True on the last item.
+    pub last: bool,
 }
 
 /// The output record for a completed step, available as
@@ -51,6 +79,18 @@ pub struct StepContext {
 ///   tolerated via `continue_on_error`)
 /// - `success = false, skipped = true` → step was skipped because its
 ///   own `when:` evaluated false
+///
+/// For fan-out steps (`for_each:` / `parallel:`):
+/// - `output` is the JSON array of per-unit outputs (so legacy
+///   templates that read `steps.foo.output` still see something
+///   structured),
+/// - `results` is the per-unit list of strings bound as
+///   `steps.<id>.results[*]` (in declared order — items for
+///   `for_each:`, sub-steps for `parallel:`),
+/// - `sub_results` is the per-sub-step name-keyed map bound as
+///   `steps.<id>.sub_results.<sub_id>` (only populated for
+///   `parallel:`),
+/// - `success` is true iff every unit finished without error.
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct StepOutput {
     pub output: String,
@@ -58,6 +98,24 @@ pub struct StepOutput {
     pub success: bool,
     #[serde(default)]
     pub skipped: bool,
+    /// Per-unit outputs (strings) for fan-out steps. Empty for
+    /// non-fan-out steps. Bound as `steps.<id>.results[*]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub results: Vec<String>,
+    /// Per-sub-step map for `parallel:` steps. Empty for `for_each:`
+    /// and linear steps. Bound as
+    /// `steps.<id>.sub_results.<sub_id>.{output,success}`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sub_results: BTreeMap<String, SubResult>,
+}
+
+/// One sub-step's published output for `parallel:` steps. Carries
+/// enough surface for `when:` chains to branch on and for downstream
+/// prompts to quote.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct SubResult {
+    pub output: String,
+    pub success: bool,
 }
 
 impl StepContext {
@@ -84,6 +142,30 @@ impl StepContext {
                 output: output.into(),
                 success: true,
                 skipped: false,
+                results: Vec::new(),
+                sub_results: BTreeMap::new(),
+            },
+        );
+        self
+    }
+
+    /// Record a prior fan-out step's per-item results (builder style).
+    /// `output` is the aggregate JSON array; `results` is the list
+    /// bound as `steps.<id>.results[*]`.
+    pub fn with_step_results(
+        mut self,
+        step_id: impl Into<String>,
+        output: impl Into<String>,
+        results: Vec<String>,
+    ) -> Self {
+        self.steps.insert(
+            step_id.into(),
+            StepOutput {
+                output: output.into(),
+                success: true,
+                skipped: false,
+                results,
+                sub_results: BTreeMap::new(),
             },
         );
         self
@@ -94,6 +176,16 @@ impl StepContext {
     /// to the dispatcher.
     pub fn with_event(mut self, event: serde_json::Value) -> Self {
         self.event = Some(event);
+        self
+    }
+
+    /// Bind a fan-out item + loop metadata into the context. The
+    /// orchestrator clones the parent context per item and calls
+    /// this so the item-prompt template can reference `{{item}}` /
+    /// `{{loop.index}}`.
+    pub fn with_item(mut self, item: serde_json::Value, loop_info: LoopInfo) -> Self {
+        self.item = Some(item);
+        self.loop_info = Some(loop_info);
         self
     }
 }
@@ -169,6 +261,8 @@ mod when_tests {
                 output: "false".into(),
                 success: true,
                 skipped: false,
+                results: Vec::new(),
+                sub_results: BTreeMap::new(),
             },
         );
         let v = render_when_expression("{{ steps.review.output }}", &ctx).expect("render");

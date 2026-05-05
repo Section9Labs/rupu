@@ -2,11 +2,12 @@
 //!
 //! Supports linear orchestrations with conditional step execution
 //! (`when:`), per-step / workflow-level error tolerance
-//! (`continue_on_error`), typed workflow inputs (`inputs:`), and
-//! a `trigger:` declaration (manual / cron / event). The cron
-//! runtime and event-webhook receiver are deferred (this PR only
-//! parses + validates the declaration; manual is the existing
-//! behavior). Parallel steps + panel steps also deferred — see
+//! (`continue_on_error`), typed workflow inputs (`inputs:`), a
+//! `trigger:` declaration (manual / cron / event), data fan-out
+//! (`for_each:`) — one agent across N items, results in
+//! `steps.<id>.results[*]` — and agent fan-out (`parallel:`) — N
+//! distinct sub-steps over the same input, results in
+//! `steps.<id>.results.<sub_id>`. Panel steps still deferred — see
 //! TODO.md.
 
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,20 @@ pub enum WorkflowParseError {
         kind: &'static str,
         field: &'static str,
     },
+    #[error("step `{step}`: `max_parallel` must be at least 1, got {value}")]
+    InvalidMaxParallel { step: String, value: i64 },
+    #[error(
+        "step `{step}`: `parallel:` is mutually exclusive with `for_each:` and with the top-level `agent`/`prompt`"
+    )]
+    ParallelMutuallyExclusive { step: String },
+    #[error("step `{step}`: `parallel:` block must contain at least one sub-step")]
+    ParallelEmpty { step: String },
+    #[error("step `{step}`: duplicate sub-step id `{sub}` inside `parallel:`")]
+    ParallelDuplicateSubId { step: String, sub: String },
+    #[error(
+        "step `{step}`: missing required field `{field}` (linear and `for_each:` steps need `agent:` and `prompt:`)"
+    )]
+    MissingStepField { step: String, field: &'static str },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -162,7 +177,11 @@ pub struct WorkflowDefaults {
 #[serde(deny_unknown_fields)]
 pub struct Step {
     pub id: String,
-    pub agent: String,
+    /// Required for linear and `for_each:` steps; absent for
+    /// `parallel:` steps (which carry their own per-sub-step `agent`).
+    /// Validation enforces presence in the right shapes.
+    #[serde(default)]
+    pub agent: Option<String>,
     #[serde(default)]
     pub actions: Vec<String>,
     /// Optional minijinja expression rendered against the step
@@ -173,9 +192,58 @@ pub struct Step {
     pub when: Option<String>,
     /// When `Some(true)`, a failure in this step is logged and the
     /// workflow continues to the next step. Overrides
-    /// `WorkflowDefaults.continue_on_error`.
+    /// `WorkflowDefaults.continue_on_error`. For fan-out steps,
+    /// applies per-item / per-sub-step: a failed unit is recorded
+    /// with `success=false` and the remaining units still dispatch.
     #[serde(default)]
     pub continue_on_error: Option<bool>,
+    /// Optional minijinja expression that, when rendered against the
+    /// step context, yields a list of items to fan out across. Each
+    /// item is dispatched to the same `agent:` with the same
+    /// `prompt:` template, except the prompt also binds `{{item}}`
+    /// (the current value) and `{{loop.index}}` (1-based).
+    ///
+    /// The renderer accepts:
+    /// - a YAML / JSON array (parsed when the rendered string starts
+    ///   with `[`),
+    /// - one item per non-empty line otherwise.
+    ///
+    /// Per-item results are bound as `steps.<id>.results[*]` (a list
+    /// of strings — each item's final assistant text) and
+    /// `steps.<id>.output` is the JSON array of those strings, so
+    /// existing template paths still see *something* useful.
+    /// Mutually exclusive with `parallel:`.
+    #[serde(default)]
+    pub for_each: Option<String>,
+    /// Optional list of sub-steps to dispatch in parallel. Each
+    /// sub-step gets its own `id`, `agent`, and `prompt`. Mutually
+    /// exclusive with `for_each:` and with the step-level
+    /// `agent`/`prompt`. Per-sub-step results are bound as
+    /// `steps.<id>.results.<sub_id>.output` (and `.success`) plus the
+    /// list-form `steps.<id>.results[*]` for compatibility with
+    /// `for_each:`-style consumers (entries appear in declared order).
+    #[serde(default)]
+    pub parallel: Option<Vec<SubStep>>,
+    /// Cap on concurrent in-flight unit runs for a fan-out step
+    /// (`for_each:` items or `parallel:` sub-steps). `None` (the
+    /// default) is treated as 1 — units dispatch serially in declared
+    /// order. Ignored for non-fan-out steps. Must be >= 1.
+    #[serde(default)]
+    pub max_parallel: Option<u32>,
+    /// Required for linear and `for_each:` steps; absent for
+    /// `parallel:` steps (each sub-step carries its own prompt).
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// One sub-step inside a `parallel:` block. Same surface as a linear
+/// step except `actions:` and `continue_on_error:` are not allowed —
+/// the parent step controls those for the whole block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubStep {
+    pub id: String,
+    pub agent: String,
     pub prompt: String,
 }
 
@@ -206,11 +274,11 @@ impl Workflow {
     /// Parse a YAML string. Validates step-id uniqueness and input
     /// defaults / enum constraints; returns clear errors on failure.
     pub fn parse(s: &str) -> Result<Self, WorkflowParseError> {
-        // Pre-scan for keys that are still deferred (panel steps,
-        // explicit parallelism, gates). `when:` and
-        // `continue_on_error:` are now supported; do NOT include them
-        // in the unsupported list.
-        for key in ["parallel", "for_each", "panelists", "gates"] {
+        // Pre-scan for keys that are still deferred (panel steps +
+        // approval gates). `when:`, `continue_on_error:`, `for_each:`,
+        // and `parallel:` are now supported; do NOT include them in
+        // the unsupported list.
+        for key in ["panelists", "gates"] {
             for line in s.lines() {
                 let trimmed = line.trim_start();
                 if trimmed.starts_with(&format!("{key}:")) {
@@ -228,6 +296,15 @@ impl Workflow {
             if !seen.insert(step.id.clone()) {
                 return Err(WorkflowParseError::DuplicateStep(step.id.clone()));
             }
+            if let Some(mp) = step.max_parallel {
+                if mp < 1 {
+                    return Err(WorkflowParseError::InvalidMaxParallel {
+                        step: step.id.clone(),
+                        value: mp as i64,
+                    });
+                }
+            }
+            validate_step_shape(step)?;
         }
         for (name, def) in &wf.inputs {
             validate_input_def(name, def)?;
@@ -342,6 +419,55 @@ fn validate_cron_expression(expr: &str) -> Result<(), WorkflowParseError> {
     Ok(())
 }
 
+/// Validate per-step shape constraints: `parallel:` is mutually
+/// exclusive with `for_each:` and with the linear `agent`/`prompt`
+/// fields, and linear / `for_each:` steps must declare both `agent:`
+/// and `prompt:`. Sub-step ids inside a `parallel:` block must be
+/// unique within that block.
+fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
+    if let Some(subs) = &step.parallel {
+        // `parallel:` block — top-level agent/prompt and for_each must
+        // be absent.
+        if step.agent.is_some()
+            || step.prompt.is_some()
+            || step.for_each.is_some()
+        {
+            return Err(WorkflowParseError::ParallelMutuallyExclusive {
+                step: step.id.clone(),
+            });
+        }
+        if subs.is_empty() {
+            return Err(WorkflowParseError::ParallelEmpty {
+                step: step.id.clone(),
+            });
+        }
+        let mut seen_sub = BTreeSet::new();
+        for sub in subs {
+            if !seen_sub.insert(sub.id.clone()) {
+                return Err(WorkflowParseError::ParallelDuplicateSubId {
+                    step: step.id.clone(),
+                    sub: sub.id.clone(),
+                });
+            }
+        }
+    } else {
+        // Linear / for_each step — agent + prompt are required.
+        if step.agent.is_none() {
+            return Err(WorkflowParseError::MissingStepField {
+                step: step.id.clone(),
+                field: "agent",
+            });
+        }
+        if step.prompt.is_none() {
+            return Err(WorkflowParseError::MissingStepField {
+                step: step.id.clone(),
+                field: "prompt",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Validate that an input declaration is internally consistent: the
 /// `default` (if any) coerces to the declared `type`, and the `enum`
 /// (if any) contains the default.
@@ -407,8 +533,6 @@ pub(crate) fn yaml_scalar_to_string(v: &serde_yaml::Value) -> String {
 /// Leak a short literal key name to `&'static str`.
 fn leak(key: &str) -> &'static str {
     match key {
-        "parallel" => "parallel",
-        "for_each" => "for_each",
         "panelists" => "panelists",
         "gates" => "gates",
         _ => "unknown",

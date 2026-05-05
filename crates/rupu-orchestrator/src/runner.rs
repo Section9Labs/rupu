@@ -10,18 +10,26 @@
 //!    step's `output` and feed it forward to the next step's context.
 //! 4. On step failure (provider error, agent abort), abort the
 //!    workflow with the underlying error.
+//!
+//! Fan-out (`for_each:`) replaces step 2-3 with: render the for_each
+//! expression to obtain a list of items, then dispatch the same
+//! agent + prompt template per item with `{{item}}` and
+//! `{{loop.*}}` bindings. Concurrency is capped by `max_parallel:`
+//! (default 1, i.e. serial in declared order). Per-item results are
+//! collected into `steps.<id>.results[*]`.
 
 use crate::templates::{
-    render_step_prompt, render_when_expression, RenderError, StepContext, StepOutput,
+    render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,
 };
-use crate::workflow::{yaml_scalar_to_string, InputType, Workflow, WorkflowParseError};
+use crate::workflow::{yaml_scalar_to_string, InputType, Step, Workflow, WorkflowParseError};
 use async_trait::async_trait;
 use rupu_agent::{run_agent, AgentRunOpts, RunError};
 use rupu_transcript::{Event, JsonlReader};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -59,16 +67,33 @@ pub enum RunWorkflowError {
     UndeclaredInput { name: String },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("fan-out item task in step `{step}` panicked or was cancelled: {source}")]
+    FanoutJoin {
+        step: String,
+        #[source]
+        source: tokio::task::JoinError,
+    },
 }
 
-/// Trait the orchestrator uses to construct per-step [`AgentRunOpts`].
+/// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
 /// Production impl wires real providers + the default tool registry;
 /// tests inject mock providers.
+///
+/// `step_id` is the parent step id (used by the production impl to
+/// look up step-level config); `agent_name` is the agent to load and
+/// is the *sub-step's* agent for `parallel:` steps. For linear and
+/// `for_each:` steps `agent_name` matches the parent step's `agent:`.
 #[async_trait]
 pub trait StepFactory: Send + Sync {
+    // The signature is intentionally wide — every piece of context the
+    // factory needs to load an agent + build its run opts. Wrapping
+    // these in a struct adds friction for every test impl, so allow
+    // the lint at the trait boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn build_opts_for_step(
         &self,
         step_id: &str,
+        agent_name: &str,
         rendered_prompt: String,
         run_id: String,
         workspace_id: String,
@@ -100,15 +125,45 @@ pub struct StepResult {
     pub transcript_path: PathBuf,
     /// Final assistant text from this step (used as input for the
     /// next step's template). Empty for skipped steps and for steps
-    /// that errored before producing output.
+    /// that errored before producing output. For fan-out steps, this
+    /// is the JSON-serialized array of per-item outputs.
     pub output: String,
     /// True when the step ran and finished without an agent error.
+    /// For fan-out steps, true iff every item succeeded.
     pub success: bool,
     /// True when the step was skipped because its `when:` expression
     /// evaluated falsy. `success` is false in that case.
     pub skipped: bool,
+    /// Per-item records for fan-out steps. Empty for non-fan-out
+    /// steps (and for skipped fan-out steps).
+    pub items: Vec<ItemResult>,
 }
 
+/// One row per unit in a fan-out step — either a `for_each:` item or
+/// a `parallel:` sub-step. Carries the same transcript pointer +
+/// final-output information as a top-level step so callers (the CLI
+/// summary, audit views) can drill into a specific unit's run.
+#[derive(Debug, Clone)]
+pub struct ItemResult {
+    /// 0-based position in the rendered fan-out list (for both shapes,
+    /// in declared order).
+    pub index: usize,
+    /// For `for_each:`: the item value as bound to `{{item}}`. For
+    /// `parallel:`: `serde_json::Value::Null` (sub-steps don't have
+    /// per-unit data; see `sub_id` instead).
+    pub item: serde_json::Value,
+    /// For `parallel:`: the sub-step's declared id. Empty for
+    /// `for_each:`. When non-empty, this becomes the key in
+    /// `steps.<id>.sub_results.<sub_id>`.
+    pub sub_id: String,
+    pub rendered_prompt: String,
+    pub run_id: String,
+    pub transcript_path: PathBuf,
+    pub output: String,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct OrchestratorRunResult {
     pub step_results: Vec<StepResult>,
 }
@@ -124,19 +179,7 @@ pub async fn run_workflow(
 
     for step in &opts.workflow.steps {
         // Build template context from inputs + prior step outputs.
-        let mut ctx = StepContext::new();
-        ctx.inputs = resolved_inputs.clone();
-        ctx.event = opts.event.clone();
-        for prior in &step_results {
-            ctx.steps.insert(
-                prior.step_id.clone(),
-                StepOutput {
-                    output: prior.output.clone(),
-                    success: prior.success,
-                    skipped: prior.skipped,
-                },
-            );
-        }
+        let ctx = base_context_for_step(&resolved_inputs, opts.event.as_ref(), &step_results);
 
         // `when:` gate. Evaluated against the same context the prompt
         // sees; falsy result skips the step. The skipped step still
@@ -158,86 +201,615 @@ pub async fn run_workflow(
                     output: String::new(),
                     success: false,
                     skipped: true,
+                    items: Vec::new(),
                 });
                 continue;
             }
         }
 
-        let rendered =
-            render_step_prompt(&step.prompt, &ctx).map_err(|e| RunWorkflowError::Render {
-                step: step.id.clone(),
-                source: e,
-            })?;
-
-        let run_id = format!("run_{}", Ulid::new());
-        let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
-        let agent_opts = opts
-            .factory
-            .build_opts_for_step(
-                &step.id,
-                rendered.clone(),
-                run_id.clone(),
-                opts.workspace_id.clone(),
-                opts.workspace_path.clone(),
-                transcript_path.clone(),
-            )
-            .await;
-
         let effective_continue_on_error =
             step.continue_on_error.unwrap_or(workflow_default_continue);
 
-        let run_outcome = run_agent(agent_opts).await;
-        let success = match run_outcome {
-            Ok(_) => true,
-            Err(source) => {
-                if effective_continue_on_error {
-                    warn!(
-                        step = %step.id,
-                        error = %source,
-                        "step failed but continue_on_error is set; proceeding"
-                    );
-                    false
-                } else {
-                    return Err(RunWorkflowError::Agent {
-                        step: step.id.clone(),
-                        source,
-                    });
-                }
-            }
+        let result = if step.parallel.is_some() {
+            run_parallel_step(step, &ctx, &opts, effective_continue_on_error).await?
+        } else if step.for_each.is_some() {
+            run_fanout_step(step, &ctx, &opts, effective_continue_on_error).await?
+        } else {
+            run_linear_step(step, &ctx, &opts, effective_continue_on_error).await?
         };
-
-        // Read the just-finished transcript to extract the final
-        // assistant text. The reader silently skips truncated lines,
-        // so this is robust against half-written transcripts. We do
-        // this even on failure so partial output is observable to
-        // downstream `when:` gates.
-        let mut output = String::new();
-        if let Ok(iter) = JsonlReader::iter(&transcript_path) {
-            for ev in iter.flatten() {
-                if let Event::AssistantMessage { content, .. } = ev {
-                    output = content;
-                }
-            }
-        } else if success {
-            warn!(
-                run_id = %run_id,
-                "transcript missing after step {}; using empty output",
-                step.id
-            );
-        }
-
-        step_results.push(StepResult {
-            step_id: step.id.clone(),
-            rendered_prompt: rendered,
-            run_id,
-            transcript_path,
-            output,
-            success,
-            skipped: false,
-        });
+        step_results.push(result);
     }
 
     Ok(OrchestratorRunResult { step_results })
+}
+
+/// Build the read-only template context that a (linear) step or
+/// fan-out unit sees: workflow inputs + event payload + every prior
+/// step's published output (including per-unit `results[*]` and the
+/// `sub_results.<sub_id>` map for `parallel:` steps).
+fn base_context_for_step(
+    inputs: &BTreeMap<String, String>,
+    event: Option<&serde_json::Value>,
+    prior: &[StepResult],
+) -> StepContext {
+    let mut ctx = StepContext::new();
+    ctx.inputs = inputs.clone();
+    ctx.event = event.cloned();
+    for sr in prior {
+        let results: Vec<String> = sr.items.iter().map(|i| i.output.clone()).collect();
+        let sub_results: std::collections::BTreeMap<String, crate::templates::SubResult> = sr
+            .items
+            .iter()
+            .filter(|i| !i.sub_id.is_empty())
+            .map(|i| {
+                (
+                    i.sub_id.clone(),
+                    crate::templates::SubResult {
+                        output: i.output.clone(),
+                        success: i.success,
+                    },
+                )
+            })
+            .collect();
+        ctx.steps.insert(
+            sr.step_id.clone(),
+            StepOutput {
+                output: sr.output.clone(),
+                success: sr.success,
+                skipped: sr.skipped,
+                results,
+                sub_results,
+            },
+        );
+    }
+    ctx
+}
+
+/// Single-shot linear step: render the prompt, build agent opts via
+/// the factory, run the agent, capture final assistant text, return
+/// a `StepResult`.
+async fn run_linear_step(
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    continue_on_error: bool,
+) -> Result<StepResult, RunWorkflowError> {
+    let prompt = step
+        .prompt
+        .as_deref()
+        .expect("validate_step_shape guarantees prompt for linear steps");
+    let agent_name = step
+        .agent
+        .as_deref()
+        .expect("validate_step_shape guarantees agent for linear steps");
+    let rendered = render_step_prompt(prompt, ctx).map_err(|e| RunWorkflowError::Render {
+        step: step.id.clone(),
+        source: e,
+    })?;
+    let run_id = format!("run_{}", Ulid::new());
+    let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+
+    let outcome = dispatch_one(
+        &opts.factory,
+        &step.id,
+        agent_name,
+        rendered.clone(),
+        run_id.clone(),
+        opts.workspace_id.clone(),
+        opts.workspace_path.clone(),
+        transcript_path.clone(),
+    )
+    .await;
+
+    let success = match outcome {
+        Ok(_) => true,
+        Err(source) => {
+            if continue_on_error {
+                warn!(
+                    step = %step.id,
+                    error = %source,
+                    "step failed but continue_on_error is set; proceeding"
+                );
+                false
+            } else {
+                return Err(RunWorkflowError::Agent {
+                    step: step.id.clone(),
+                    source,
+                });
+            }
+        }
+    };
+
+    let output = read_final_assistant_text(&transcript_path, success, &run_id, &step.id);
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        rendered_prompt: rendered,
+        run_id,
+        transcript_path,
+        output,
+        success,
+        skipped: false,
+        items: Vec::new(),
+    })
+}
+
+/// Fan-out step: render `for_each:` to a list, then dispatch the
+/// step's agent + prompt template per item. Items run with up to
+/// `max_parallel` concurrency (default 1). Per-item failures honor
+/// `continue_on_error`: when set, failed items are recorded with
+/// `success=false` and the rest still run; otherwise the first
+/// failed item aborts the workflow.
+async fn run_fanout_step(
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    continue_on_error: bool,
+) -> Result<StepResult, RunWorkflowError> {
+    let for_each_expr = step
+        .for_each
+        .as_ref()
+        .expect("run_fanout_step called for a non-fan-out step");
+    let rendered_list =
+        render_step_prompt(for_each_expr, ctx).map_err(|e| RunWorkflowError::Render {
+            step: step.id.clone(),
+            source: e,
+        })?;
+    let items = parse_fanout_items(&rendered_list);
+
+    if items.is_empty() {
+        info!(step = %step.id, "for_each rendered to an empty list; recording as success with no items");
+        return Ok(StepResult {
+            step_id: step.id.clone(),
+            rendered_prompt: String::new(),
+            run_id: String::new(),
+            transcript_path: PathBuf::new(),
+            output: "[]".into(),
+            success: true,
+            skipped: false,
+            items: Vec::new(),
+        });
+    }
+
+    let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
+    let semaphore = Arc::new(Semaphore::new(max_parallel));
+    let total = items.len();
+
+    // Render each item's prompt up front so a per-item template
+    // error is reported before any agent dispatches. Each item gets
+    // its own clone of the parent context with `item` + `loop` bound.
+    let mut prepared: Vec<(usize, serde_json::Value, String, String, PathBuf)> =
+        Vec::with_capacity(total);
+    for (idx, item) in items.iter().enumerate() {
+        let item_ctx = ctx.clone().with_item(
+            item.clone(),
+            LoopInfo {
+                index: idx + 1,
+                index0: idx,
+                length: total,
+                first: idx == 0,
+                last: idx + 1 == total,
+            },
+        );
+        let item_prompt = step
+            .prompt
+            .as_deref()
+            .expect("validate_step_shape guarantees prompt for for_each steps");
+        let rendered =
+            render_step_prompt(item_prompt, &item_ctx).map_err(|e| RunWorkflowError::Render {
+                step: format!("{}[{}]", step.id, idx),
+                source: e,
+            })?;
+        let run_id = format!("run_{}", Ulid::new());
+        let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+        prepared.push((idx, item.clone(), rendered, run_id, transcript_path));
+    }
+
+    // Spawn each item with the concurrency cap. We want declared
+    // ordering of results regardless of finish order, so we collect
+    // (idx, ItemResult) and sort by idx at the end.
+    let agent_name_root = step
+        .agent
+        .as_deref()
+        .expect("validate_step_shape guarantees agent for for_each steps")
+        .to_string();
+    let mut handles = Vec::with_capacity(total);
+    for (idx, item_value, rendered, run_id, transcript_path) in prepared {
+        let permit_sem = semaphore.clone();
+        let factory = Arc::clone(&opts.factory);
+        let step_id = step.id.clone();
+        let agent_name = agent_name_root.clone();
+        let workspace_id = opts.workspace_id.clone();
+        let workspace_path = opts.workspace_path.clone();
+        let rendered_clone = rendered.clone();
+        let run_id_clone = run_id.clone();
+        let transcript_clone = transcript_path.clone();
+
+        handles.push(tokio::spawn(async move {
+            // Held for the duration of this item's run; dropping it
+            // releases a slot back to the pool.
+            let _permit = permit_sem
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed");
+            let outcome = dispatch_one(
+                &factory,
+                &step_id,
+                &agent_name,
+                rendered_clone.clone(),
+                run_id_clone.clone(),
+                workspace_id,
+                workspace_path,
+                transcript_clone.clone(),
+            )
+            .await;
+            let (success, error_str, raw_error) = match outcome {
+                Ok(()) => (true, None, None),
+                Err(e) => (false, Some(e.to_string()), Some(e)),
+            };
+            let output =
+                read_final_assistant_text(&transcript_clone, success, &run_id_clone, &step_id);
+            FanoutItemOutcome {
+                idx,
+                item: item_value,
+                rendered_prompt: rendered,
+                run_id,
+                transcript_path,
+                output,
+                success,
+                error: error_str,
+                raw_error,
+            }
+        }));
+    }
+
+    let mut item_outcomes: Vec<FanoutItemOutcome> = Vec::with_capacity(total);
+    for handle in handles {
+        match handle.await {
+            Ok(o) => item_outcomes.push(o),
+            Err(join_err) => {
+                // Task panic or cancellation. Surface as a typed
+                // workflow error regardless of continue_on_error —
+                // a panicked task means we don't have an agent
+                // RunError to report, so the orchestrator-level
+                // tolerance flag doesn't apply.
+                return Err(RunWorkflowError::FanoutJoin {
+                    step: step.id.clone(),
+                    source: join_err,
+                });
+            }
+        }
+    }
+    item_outcomes.sort_by_key(|o| o.idx);
+
+    // Apply `continue_on_error`: if not set, the first failed item
+    // aborts the workflow. We surface the original RunError.
+    if !continue_on_error {
+        if let Some(failed) = item_outcomes.iter_mut().find(|o| !o.success) {
+            if let Some(err) = failed.raw_error.take() {
+                return Err(RunWorkflowError::Agent {
+                    step: format!("{}[{}]", step.id, failed.idx),
+                    source: err,
+                });
+            }
+        }
+    }
+
+    let items_vec: Vec<ItemResult> = item_outcomes
+        .iter()
+        .map(|o| ItemResult {
+            index: o.idx,
+            item: o.item.clone(),
+            sub_id: String::new(),
+            rendered_prompt: o.rendered_prompt.clone(),
+            run_id: o.run_id.clone(),
+            transcript_path: o.transcript_path.clone(),
+            output: o.output.clone(),
+            success: o.success,
+        })
+        .collect();
+    let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
+    let aggregate_output = serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".into());
+    let success = items_vec.iter().all(|i| i.success);
+
+    if !success {
+        warn!(
+            step = %step.id,
+            failed = items_vec.iter().filter(|i| !i.success).count(),
+            total,
+            "fan-out completed with failed items (continue_on_error tolerated)"
+        );
+    }
+
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        // The for_each-rendered list of items doubles as the
+        // top-level "rendered prompt" for audit purposes; per-item
+        // prompts live on each ItemResult.
+        rendered_prompt: rendered_list,
+        run_id: String::new(),
+        transcript_path: PathBuf::new(),
+        output: aggregate_output,
+        success,
+        skipped: false,
+        items: items_vec,
+    })
+}
+
+/// Parallel step: render each sub-step's prompt against the same
+/// shared context, then dispatch all sub-steps with the configured
+/// `max_parallel:` cap. Sub-steps run independently — there's no
+/// shared per-unit binding (no `{{item}}`); each sub-step's prompt
+/// is just rendered against the parent context. Per-sub-step
+/// results land in both `steps.<id>.results[*]` (positional, in
+/// declared order) and `steps.<id>.sub_results.<sub_id>` (named).
+async fn run_parallel_step(
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    continue_on_error: bool,
+) -> Result<StepResult, RunWorkflowError> {
+    let subs = step
+        .parallel
+        .as_ref()
+        .expect("run_parallel_step called for a non-parallel step");
+    let total = subs.len();
+    let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
+    let semaphore = Arc::new(Semaphore::new(max_parallel));
+
+    // Render all sub-step prompts up front so a per-sub template
+    // error reports cleanly before any agent dispatches.
+    let mut prepared: Vec<(usize, String, String, String, String, PathBuf)> =
+        Vec::with_capacity(total);
+    for (idx, sub) in subs.iter().enumerate() {
+        let rendered = render_step_prompt(&sub.prompt, ctx).map_err(|e| {
+            RunWorkflowError::Render {
+                step: format!("{}.{}", step.id, sub.id),
+                source: e,
+            }
+        })?;
+        let run_id = format!("run_{}", Ulid::new());
+        let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+        prepared.push((
+            idx,
+            sub.id.clone(),
+            sub.agent.clone(),
+            rendered,
+            run_id,
+            transcript_path,
+        ));
+    }
+
+    let mut handles = Vec::with_capacity(total);
+    for (idx, sub_id, sub_agent_name, rendered, run_id, transcript_path) in prepared {
+        let permit_sem = semaphore.clone();
+        let factory = Arc::clone(&opts.factory);
+        let workspace_id = opts.workspace_id.clone();
+        let workspace_path = opts.workspace_path.clone();
+        let rendered_clone = rendered.clone();
+        let run_id_clone = run_id.clone();
+        let transcript_clone = transcript_path.clone();
+        let parent_step_id = step.id.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = permit_sem
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed");
+            let outcome = dispatch_one(
+                &factory,
+                // Parent step id (for the factory's step lookup)
+                // plus the sub-step's resolved agent name (which is
+                // what actually loads + runs).
+                &parent_step_id,
+                &sub_agent_name,
+                rendered_clone.clone(),
+                run_id_clone.clone(),
+                workspace_id,
+                workspace_path,
+                transcript_clone.clone(),
+            )
+            .await;
+            let (success, error_str, raw_error) = match outcome {
+                Ok(()) => (true, None, None),
+                Err(e) => (false, Some(e.to_string()), Some(e)),
+            };
+            let output = read_final_assistant_text(
+                &transcript_clone,
+                success,
+                &run_id_clone,
+                &parent_step_id,
+            );
+            ParallelSubOutcome {
+                idx,
+                sub_id,
+                rendered_prompt: rendered,
+                run_id,
+                transcript_path,
+                output,
+                success,
+                error: error_str,
+                raw_error,
+            }
+        }));
+    }
+
+    let mut outcomes: Vec<ParallelSubOutcome> = Vec::with_capacity(total);
+    for handle in handles {
+        match handle.await {
+            Ok(o) => outcomes.push(o),
+            Err(join_err) => {
+                return Err(RunWorkflowError::FanoutJoin {
+                    step: step.id.clone(),
+                    source: join_err,
+                });
+            }
+        }
+    }
+    outcomes.sort_by_key(|o| o.idx);
+
+    if !continue_on_error {
+        if let Some(failed) = outcomes.iter_mut().find(|o| !o.success) {
+            if let Some(err) = failed.raw_error.take() {
+                return Err(RunWorkflowError::Agent {
+                    step: format!("{}.{}", step.id, failed.sub_id),
+                    source: err,
+                });
+            }
+        }
+    }
+
+    let items_vec: Vec<ItemResult> = outcomes
+        .iter()
+        .map(|o| ItemResult {
+            index: o.idx,
+            item: serde_json::Value::Null,
+            sub_id: o.sub_id.clone(),
+            rendered_prompt: o.rendered_prompt.clone(),
+            run_id: o.run_id.clone(),
+            transcript_path: o.transcript_path.clone(),
+            output: o.output.clone(),
+            success: o.success,
+        })
+        .collect();
+    let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
+    let aggregate_output = serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".into());
+    let success = items_vec.iter().all(|i| i.success);
+
+    if !success {
+        warn!(
+            step = %step.id,
+            failed = items_vec.iter().filter(|i| !i.success).count(),
+            total,
+            "parallel completed with failed sub-steps (continue_on_error tolerated)"
+        );
+    }
+
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        rendered_prompt: String::new(),
+        run_id: String::new(),
+        transcript_path: PathBuf::new(),
+        output: aggregate_output,
+        success,
+        skipped: false,
+        items: items_vec,
+    })
+}
+
+struct ParallelSubOutcome {
+    idx: usize,
+    sub_id: String,
+    rendered_prompt: String,
+    run_id: String,
+    transcript_path: PathBuf,
+    output: String,
+    success: bool,
+    #[allow(dead_code)]
+    error: Option<String>,
+    raw_error: Option<RunError>,
+}
+
+/// Internal fan-out task return type. Carries the typed `RunError`
+/// separately from its display string so we can re-raise the original
+/// error when `continue_on_error` isn't set.
+struct FanoutItemOutcome {
+    idx: usize,
+    item: serde_json::Value,
+    rendered_prompt: String,
+    run_id: String,
+    transcript_path: PathBuf,
+    output: String,
+    success: bool,
+    /// String form, currently unused but kept for future structured
+    /// per-item error reporting in `ItemResult`.
+    #[allow(dead_code)]
+    error: Option<String>,
+    raw_error: Option<RunError>,
+}
+
+/// Build the agent opts via the factory and dispatch one agent run.
+/// Shared by the linear and fan-out paths.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_one(
+    factory: &Arc<dyn StepFactory>,
+    step_id: &str,
+    agent_name: &str,
+    rendered_prompt: String,
+    run_id: String,
+    workspace_id: String,
+    workspace_path: PathBuf,
+    transcript_path: PathBuf,
+) -> Result<(), RunError> {
+    let agent_opts = factory
+        .build_opts_for_step(
+            step_id,
+            agent_name,
+            rendered_prompt,
+            run_id,
+            workspace_id,
+            workspace_path,
+            transcript_path,
+        )
+        .await;
+    run_agent(agent_opts).await.map(|_| ())
+}
+
+/// Read the just-finished transcript to extract the final assistant
+/// text. The JSONL reader silently skips truncated lines, so this is
+/// robust against half-written transcripts. We do this even on
+/// failure so partial output is observable to downstream `when:`
+/// gates.
+fn read_final_assistant_text(
+    transcript_path: &Path,
+    success: bool,
+    run_id: &str,
+    step_id: &str,
+) -> String {
+    let mut output = String::new();
+    if let Ok(iter) = JsonlReader::iter(transcript_path) {
+        for ev in iter.flatten() {
+            if let Event::AssistantMessage { content, .. } = ev {
+                output = content;
+            }
+        }
+    } else if success {
+        warn!(
+            run_id = %run_id,
+            "transcript missing after step {}; using empty output",
+            step_id
+        );
+    }
+    output
+}
+
+/// Parse the rendered `for_each:` string into a list of items. We
+/// support two shapes:
+/// - JSON array (string starts with `[`): parsed via serde_json.
+///   Items can be strings, numbers, bools, or objects — whatever
+///   shape the workflow author provides — and are passed through to
+///   `{{item}}` verbatim.
+/// - One non-empty line per item otherwise. Lines are trimmed; blank
+///   lines are skipped. This is the shape produced by minijinja's
+///   `for x in xs` loops or by simple comma-less newline lists.
+fn parse_fanout_items(rendered: &str) -> Vec<serde_json::Value> {
+    let trimmed = rendered.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if trimmed.starts_with('[') {
+        if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(trimmed) {
+            return arr;
+        }
+        // Fall through to line-mode if the string starts with `[`
+        // but isn't valid JSON — better to dispatch one item ("[bad")
+        // than swallow the value silently.
+    }
+    trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| serde_json::Value::String(s.to_string()))
+        .collect()
 }
 
 /// Validate user-provided `inputs` against the workflow's declared

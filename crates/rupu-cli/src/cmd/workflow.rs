@@ -313,13 +313,18 @@ impl StepFactory for CliStepFactory {
     async fn build_opts_for_step(
         &self,
         step_id: &str,
+        agent_name: &str,
         rendered_prompt: String,
         run_id: String,
         workspace_id: String,
         workspace_path: PathBuf,
         transcript_path: PathBuf,
     ) -> AgentRunOpts {
-        let step = self
+        // We still verify the parent step exists in the workflow so
+        // unknown step ids surface clearly, but we drive the agent
+        // load off `agent_name` (which differs from the parent's
+        // `agent:` for `parallel:` sub-steps).
+        let _step = self
             .workflow
             .steps
             .iter()
@@ -331,7 +336,7 @@ impl StepFactory for CliStepFactory {
         // `<global>` directly (which already contains `agents/`).
         let project_agents_parent = self.project_root.as_ref().map(|p| p.join(".rupu"));
         let spec =
-            rupu_agent::load_agent(&self.global, project_agents_parent.as_deref(), &step.agent)
+            rupu_agent::load_agent(&self.global, project_agents_parent.as_deref(), agent_name)
                 .unwrap_or_else(|_| {
                     // Fallback: synthesize a minimal AgentSpec with the
                     // rendered prompt as system prompt so the factory contract
@@ -339,7 +344,7 @@ impl StepFactory for CliStepFactory {
                     // agent loop will surface the failure via run_complete{
                     // status: Error}.
                     rupu_agent::AgentSpec {
-                        name: step.agent.clone(),
+                        name: agent_name.to_string(),
                         description: None,
                         provider: Some("anthropic".to_string()),
                         model: Some("claude-sonnet-4-6".to_string()),
