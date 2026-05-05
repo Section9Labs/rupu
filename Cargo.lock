@@ -2917,6 +2917,7 @@ dependencies = [
  "predicates",
  "rand 0.8.6",
  "reqwest",
+ "rupu-keychain-acl",
  "rupu-providers",
  "serde",
  "serde_json",
@@ -2975,6 +2976,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "rupu-keychain-acl"
+version = "0.3.0"
+dependencies = [
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

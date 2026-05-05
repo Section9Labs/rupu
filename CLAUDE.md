@@ -21,6 +21,7 @@
 - **`rupu-mcp`** — embedded MCP server. Two transports (in-process for the agent runtime, stdio for `rupu mcp serve`); single tool catalog backed by `rupu-scm`'s Registry. Permission gating mirrors the six-builtin model: per-tool allowlist + per-mode (`ask` / `bypass` / `readonly`).
 - **`rupu-orchestrator`** — workflow YAML parser + minijinja rendering + linear runner with pluggable `StepFactory`. Action-protocol allowlist validation lives here.
 - **`rupu-scm`** — SCM/issue-tracker connectors. `RepoConnector` + `IssueConnector` traits per spec §4c; per-platform impls under `connectors/<platform>/`. Plan 1 ships GitHub; Plan 2 adds GitLab + the embedded MCP server.
+- **`rupu-keychain-acl`** — macOS-only Security.framework FFI shim that pre-populates new keychain items' ACL with rupu's signing identity, eliminating the "Always Allow" first-prompt. Only crate in the workspace exempt from `unsafe_code = "forbid"`; FFI module opts in via `#![allow(unsafe_code)]`. No-op on non-macOS.
 
 **Run-time samples:** live at `<repo>/.rupu/agents/` and `<repo>/.rupu/workflows/`. Running `rupu` from inside the rupu checkout exercises the same project-discovery code path end-users use in their own repos.
 

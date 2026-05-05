@@ -12,6 +12,7 @@ members = [
     "crates/rupu-orchestrator",
     "crates/rupu-mcp",
     "crates/rupu-webhook",
+    "crates/rupu-keychain-acl",
     "crates/rupu-cli",
 ]
 
