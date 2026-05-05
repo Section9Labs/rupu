@@ -102,3 +102,29 @@ fn run_complete_with_ok_flips_to_complete() {
     });
     assert_eq!(m.node("step-1").unwrap().status, NodeStatus::Complete);
 }
+
+use rupu_orchestrator::Workflow;
+use rupu_tui::state::derive_edges;
+
+#[test]
+fn linear_workflow_yields_chain_edges() {
+    let yaml = r#"
+name: linear
+steps:
+  - id: a
+    agent: x
+    prompt: "step a"
+  - id: b
+    agent: y
+    prompt: "step b"
+  - id: c
+    agent: z
+    prompt: "step c"
+"#;
+    let wf = Workflow::parse(yaml).expect("parse");
+    let edges = derive_edges(&wf);
+    assert_eq!(edges, vec![
+        ("a".to_string(), "b".to_string()),
+        ("b".to_string(), "c".to_string()),
+    ]);
+}

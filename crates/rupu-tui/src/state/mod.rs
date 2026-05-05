@@ -7,6 +7,8 @@ use rupu_orchestrator::RunRecord;
 use rupu_transcript::Event;
 
 mod projection;
+mod edges;
+pub use edges::derive_edges;
 
 #[derive(Debug, Clone, Default)]
 pub struct RunModel {
