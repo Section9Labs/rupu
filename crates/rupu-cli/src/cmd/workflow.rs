@@ -164,9 +164,19 @@ async fn show(name: &str) -> anyhow::Result<()> {
 async fn runs(limit: usize, status_filter: Option<&str>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    let all = store
+    let mut all = store
         .list()
         .map_err(|e| anyhow::anyhow!("run-store list failed: {e}"))?;
+
+    // Lazy expiry: any AwaitingApproval row whose expires_at is in
+    // the past gets transitioned to Failed and persisted before we
+    // render. Operators learn about expired runs the next time they
+    // look at the list.
+    let now = chrono::Utc::now();
+    for r in &mut all {
+        let _ = store.expire_if_overdue(r, now);
+    }
+
     let filtered: Vec<_> = all
         .into_iter()
         .filter(|r| match status_filter {
@@ -177,24 +187,33 @@ async fn runs(limit: usize, status_filter: Option<&str>) -> anyhow::Result<()> {
         .collect();
 
     println!(
-        "{:<28} {:<20} {:<18} {:<24} WORKFLOW",
-        "RUN ID", "STATUS", "STARTED (UTC)", "DURATION"
+        "{:<28} {:<20} {:<18} {:<24} {:<22} WORKFLOW",
+        "RUN ID", "STATUS", "STARTED (UTC)", "DURATION", "EXPIRES"
     );
     for r in &filtered {
         let started = r.started_at.format("%Y-%m-%d %H:%M:%S").to_string();
         let duration = match r.finished_at {
-            Some(fin) => {
-                let secs = (fin - r.started_at).num_seconds();
-                format!("{}s", secs)
-            }
+            Some(fin) => format!("{}s", (fin - r.started_at).num_seconds()),
             None => "(in flight)".into(),
         };
+        let expires = match r.expires_at {
+            Some(ex) => {
+                let delta = (ex - now).num_seconds();
+                if delta >= 0 {
+                    format!("in {}s", delta)
+                } else {
+                    format!("{}s ago", -delta)
+                }
+            }
+            None => String::new(),
+        };
         println!(
-            "{:<28} {:<20} {:<18} {:<24} {}",
+            "{:<28} {:<20} {:<18} {:<24} {:<22} {}",
             r.id,
             r.status.as_str(),
             started,
             duration,
+            expires,
             r.workflow_name
         );
     }
@@ -240,6 +259,15 @@ async fn show_run(run_id: &str) -> anyhow::Result<()> {
     }
     if let Some(step) = &record.awaiting_step_id {
         println!("Awaiting   : {step}");
+    }
+    if let Some(since) = &record.awaiting_since {
+        println!(
+            "Paused at  : {}",
+            since.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+    }
+    if let Some(ex) = &record.expires_at {
+        println!("Expires    : {}", ex.format("%Y-%m-%d %H:%M:%S UTC"));
     }
 
     println!();
@@ -287,6 +315,19 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
     let mut record = store
         .load(run_id)
         .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
+    // Expire stale paused runs lazily — no ticker daemon needed for v1.
+    if store
+        .expire_if_overdue(&mut record, chrono::Utc::now())
+        .map_err(|e| anyhow::anyhow!("expire check: {e}"))?
+    {
+        anyhow::bail!(
+            "approval expired before it was acted on — {}",
+            record
+                .error_message
+                .as_deref()
+                .unwrap_or("paused run timed out")
+        );
+    }
     if record.status != rupu_orchestrator::RunStatus::AwaitingApproval {
         anyhow::bail!(
             "run is `{}`, not `awaiting_approval` — only paused runs can be approved",
@@ -306,6 +347,8 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
     record.status = rupu_orchestrator::RunStatus::Running;
     record.awaiting_step_id = None;
     record.approval_prompt = None;
+    record.awaiting_since = None;
+    record.expires_at = None;
     record.error_message = None;
     store
         .update(&record)
@@ -431,6 +474,18 @@ async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
     let mut record = store
         .load(run_id)
         .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
+    if store
+        .expire_if_overdue(&mut record, chrono::Utc::now())
+        .map_err(|e| anyhow::anyhow!("expire check: {e}"))?
+    {
+        anyhow::bail!(
+            "approval expired before it was acted on — {}",
+            record
+                .error_message
+                .as_deref()
+                .unwrap_or("paused run timed out")
+        );
+    }
     if record.status != rupu_orchestrator::RunStatus::AwaitingApproval {
         anyhow::bail!(
             "run is `{}`, not `awaiting_approval` — only paused runs can be rejected",
@@ -660,6 +715,9 @@ async fn run_with_outcome(
                 info.step_id, rid
             );
             println!("      prompt: {}", info.prompt);
+            if let Some(ex) = info.expires_at {
+                println!("      expires: {}", ex.format("%Y-%m-%d %H:%M:%S UTC"));
+            }
             println!("      approve with: rupu workflow approve {}", rid);
             println!("      reject  with: rupu workflow reject {}", rid);
         }

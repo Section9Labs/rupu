@@ -1354,3 +1354,100 @@ steps:
     assert_eq!(calls.get("security-reviewer").copied(), Some(1));
     assert_eq!(calls.get("fixer").copied(), None, "fixer should not have run");
 }
+
+// -- Approval timeout (PR2: timeout_seconds wiring) -------------------------
+
+const WF_APPROVAL_WITH_TIMEOUT: &str = r#"
+name: approval-with-timeout
+inputs:
+  tag: { type: string, default: "v1.0" }
+steps:
+  - id: prepare
+    agent: ag
+    actions: []
+    prompt: "preparing {{ inputs.tag }}"
+  - id: deploy
+    agent: ag
+    actions: []
+    approval:
+      required: true
+      prompt: "Approve deploy of {{ inputs.tag }}?"
+      timeout_seconds: 60
+    prompt: "deploying"
+"#;
+
+#[tokio::test]
+async fn approval_with_timeout_seconds_persists_awaiting_since_and_expires_at() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let runs_root = tmp.path().join("runs");
+    let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
+    let wf = Workflow::parse(WF_APPROVAL_WITH_TIMEOUT).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_to".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(WF_APPROVAL_WITH_TIMEOUT.to_string()),
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let info = res.awaiting.expect("workflow should pause");
+    let expires_at = info
+        .expires_at
+        .expect("AwaitingInfo.expires_at should be populated when timeout_seconds is set");
+
+    let record = store.load(&res.run_id).unwrap();
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::AwaitingApproval);
+    let since = record.awaiting_since.expect("awaiting_since should be set");
+    let on_disk_expires = record.expires_at.expect("expires_at should be set");
+    // expires_at == awaiting_since + 60s, with allowance for clock
+    // drift between AwaitingInfo construction and disk persistence.
+    let drift = (on_disk_expires - (since + chrono::Duration::seconds(60)))
+        .num_seconds()
+        .abs();
+    assert!(drift < 2, "expires_at drift too large: {drift}s");
+    // AwaitingInfo's expires_at should match the persisted one
+    // closely (constructed from the same `now`).
+    let info_drift = (expires_at - on_disk_expires).num_seconds().abs();
+    assert!(info_drift < 2, "info vs disk drift: {info_drift}s");
+}
+
+#[tokio::test]
+async fn approval_without_timeout_seconds_leaves_expires_at_unset() {
+    let s = r#"
+name: no-timeout
+steps:
+  - id: deploy
+    agent: ag
+    actions: []
+    approval:
+      required: true
+    prompt: "x"
+"#;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let runs_root = tmp.path().join("runs");
+    let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
+    let wf = Workflow::parse(s).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_no_to".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(s.to_string()),
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let info = res.awaiting.unwrap();
+    assert!(info.expires_at.is_none());
+    let record = store.load(&res.run_id).unwrap();
+    assert!(record.awaiting_since.is_some(), "awaiting_since always set on pause");
+    assert!(record.expires_at.is_none(), "no timeout → no expires_at");
+}
