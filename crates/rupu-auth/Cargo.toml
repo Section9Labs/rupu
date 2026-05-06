@@ -26,6 +26,7 @@ reqwest.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 chrono.workspace = true
+dirs.workspace = true
 rupu-providers = { path = "../rupu-providers" }
 rupu-keychain-acl = { path = "../rupu-keychain-acl" }
 

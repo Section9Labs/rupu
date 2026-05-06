@@ -79,14 +79,36 @@ impl ProbeCache {
     }
 }
 
+/// Environment variable that, when set to `file` or `keyring`,
+/// overrides the cached probe result and forces the named backend.
+/// Lets users escape the macOS-keychain "prompts on every signed-
+/// binary update" UX without flipping a config flag (and lets CI /
+/// headless contexts bypass the keychain probe entirely).
+///
+/// Unrecognized values are ignored with a `tracing::warn!`, so a
+/// typo (`RUPU_AUTH_BACKEND=files`) doesn't silently degrade.
+pub const ENV_BACKEND_OVERRIDE: &str = "RUPU_AUTH_BACKEND";
+
 /// Probe the OS keychain (or read the cached choice if present) and
 /// return a boxed `AuthBackend` ready for use.
 ///
-/// On a fresh probe the keychain is preferred; if [`KeyringBackend::probe`]
-/// fails, falls back to a [`JsonFileBackend`] at `fallback_path` with a
-/// `tracing::warn!` explaining the fallback. The choice is cached at
-/// `cache.path` so subsequent invocations skip the probe.
+/// Selection order:
+///   1. **Env override** (`RUPU_AUTH_BACKEND=file|keyring`) — the
+///      escape hatch for users whose macOS keychain rejects ACL
+///      reads after a signed-binary update. Wins over cache + probe.
+///   2. **Cached choice** at `cache.path` — set by the previous
+///      probe; lets typical invocations skip the probe entirely.
+///   3. **Fresh probe** — prefers the keychain; if [`KeyringBackend::probe`]
+///      fails, falls back to a [`JsonFileBackend`] at
+///      `fallback_path` with a `tracing::warn!` explaining why.
+///
+/// The chosen backend is cached for next time unless overridden by
+/// the env var (which is intentionally session-scoped).
 pub fn select_backend(cache: &ProbeCache, fallback_path: PathBuf) -> Box<dyn AuthBackend> {
+    if let Some(override_choice) = read_env_override() {
+        return materialize(override_choice, fallback_path);
+    }
+
     let choice = cache.read().unwrap_or_else(|| {
         let chosen = match KeyringBackend::probe() {
             Ok(()) => BackendChoice::Keyring,
@@ -109,6 +131,31 @@ pub fn select_backend(cache: &ProbeCache, fallback_path: PathBuf) -> Box<dyn Aut
         chosen
     });
 
+    materialize(choice, fallback_path)
+}
+
+/// Parse the `RUPU_AUTH_BACKEND` env var if set. Returns `None`
+/// (with a `tracing::warn!`) for an unrecognized value rather than
+/// silently picking one — typos shouldn't auth-bypass the keychain.
+fn read_env_override() -> Option<BackendChoice> {
+    let raw = std::env::var(ENV_BACKEND_OVERRIDE).ok()?;
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "file" | "json" | "json-file" | "json_file" => Some(BackendChoice::JsonFile),
+        "keyring" | "keychain" | "os" | "os-keychain" => Some(BackendChoice::Keyring),
+        "" => None,
+        other => {
+            warn!(
+                env = ENV_BACKEND_OVERRIDE,
+                value = %other,
+                "unrecognized backend override; using cached / probed choice instead",
+            );
+            None
+        }
+    }
+}
+
+fn materialize(choice: BackendChoice, fallback_path: PathBuf) -> Box<dyn AuthBackend> {
     match choice {
         BackendChoice::Keyring => Box::new(KeyringBackend::new()),
         BackendChoice::JsonFile => Box::new(JsonFileBackend {
