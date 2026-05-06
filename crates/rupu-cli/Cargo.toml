@@ -28,6 +28,7 @@ toml.workspace = true
 ulid.workspace = true
 dirs.workspace = true
 which.workspace = true
+whoami.workspace = true
 
 # In-workspace
 rupu-agent = { path = "../rupu-agent" }
@@ -41,6 +42,7 @@ rupu-mcp = { path = "../rupu-mcp" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-webhook = { path = "../rupu-webhook" }
+rupu-tui = { path = "../rupu-tui" }
 comfy-table.workspace = true
 tempfile.workspace = true
 

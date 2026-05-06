@@ -311,48 +311,36 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
     let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+    let approver = whoami::username();
 
-    let mut record = store
+    // Library call replaces inline load + expire-check + status check
+    // + mutate + update. Re-entering run_workflow stays in the CLI
+    // because the TUI uses a different resume model.
+    let awaited_step_id = match store.approve(run_id, &approver, chrono::Utc::now()) {
+        Ok(rupu_orchestrator::ApprovalDecision::Approved { step_id, .. }) => step_id,
+        Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
+            anyhow::bail!("approval expired before it was acted on — {msg}");
+        }
+        Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
+            anyhow::bail!(
+                "run is `{s}`, not `awaiting_approval` — only paused runs can be approved",
+            );
+        }
+        Err(rupu_orchestrator::ApprovalError::NoAwaitingStep) => {
+            anyhow::bail!("run has no awaiting_step_id; record may be corrupt");
+        }
+        Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
+            anyhow::bail!("run not found: {id}");
+        }
+        Err(e) => return Err(anyhow::anyhow!("approve: {e}")),
+        Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
+    };
+    // Reload the record from disk to get inputs, event, workspace path
+    // for the run_workflow re-entry. The library call already persisted
+    // the status flip to Running, so the record is coherent.
+    let record = store
         .load(run_id)
-        .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
-    // Expire stale paused runs lazily — no ticker daemon needed for v1.
-    if store
-        .expire_if_overdue(&mut record, chrono::Utc::now())
-        .map_err(|e| anyhow::anyhow!("expire check: {e}"))?
-    {
-        anyhow::bail!(
-            "approval expired before it was acted on — {}",
-            record
-                .error_message
-                .as_deref()
-                .unwrap_or("paused run timed out")
-        );
-    }
-    if record.status != rupu_orchestrator::RunStatus::AwaitingApproval {
-        anyhow::bail!(
-            "run is `{}`, not `awaiting_approval` — only paused runs can be approved",
-            record.status.as_str()
-        );
-    }
-    let awaited_step_id = record
-        .awaiting_step_id
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("run has no awaiting_step_id; record may be corrupt"))?;
-
-    // Mutate the record back to Running BEFORE re-entering the
-    // loop. If the re-entered workflow pauses again at another
-    // approval gate, `run_workflow` will flip the status to
-    // AwaitingApproval again and refresh the awaiting_*
-    // fields.
-    record.status = rupu_orchestrator::RunStatus::Running;
-    record.awaiting_step_id = None;
-    record.approval_prompt = None;
-    record.awaiting_since = None;
-    record.expires_at = None;
-    record.error_message = None;
-    store
-        .update(&record)
-        .map_err(|e| anyhow::anyhow!("update run record: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("reload run record: {e}"))?;
 
     // Rebuild context from disk: workflow YAML snapshot + prior
     // step results.
@@ -471,37 +459,27 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
 async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    let mut record = store
-        .load(run_id)
-        .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
-    if store
-        .expire_if_overdue(&mut record, chrono::Utc::now())
-        .map_err(|e| anyhow::anyhow!("expire check: {e}"))?
-    {
-        anyhow::bail!(
-            "approval expired before it was acted on — {}",
-            record
-                .error_message
-                .as_deref()
-                .unwrap_or("paused run timed out")
-        );
+    let approver = whoami::username();
+    let reason_str = reason.unwrap_or("rejected by operator");
+
+    // Library call replaces inline load + expire-check + status check
+    // + mutate + update.
+    match store.reject(run_id, &approver, reason_str, chrono::Utc::now()) {
+        Ok(rupu_orchestrator::ApprovalDecision::Rejected { .. }) => {}
+        Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
+            anyhow::bail!("approval expired before it was acted on — {msg}");
+        }
+        Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
+            anyhow::bail!(
+                "run is `{s}`, not `awaiting_approval` — only paused runs can be rejected",
+            );
+        }
+        Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
+            anyhow::bail!("run not found: {id}");
+        }
+        Err(e) => return Err(anyhow::anyhow!("reject: {e}")),
+        Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
     }
-    if record.status != rupu_orchestrator::RunStatus::AwaitingApproval {
-        anyhow::bail!(
-            "run is `{}`, not `awaiting_approval` — only paused runs can be rejected",
-            record.status.as_str()
-        );
-    }
-    record.status = rupu_orchestrator::RunStatus::Rejected;
-    record.finished_at = Some(chrono::Utc::now());
-    record.error_message = Some(
-        reason
-            .map(str::to_string)
-            .unwrap_or_else(|| "rejected by operator".into()),
-    );
-    store
-        .update(&record)
-        .map_err(|e| anyhow::anyhow!("update run record: {e}"))?;
     println!("rupu: run {run_id} marked rejected");
     Ok(())
 }
@@ -547,7 +525,7 @@ pub async fn run_by_name(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event).await
+    run_with_outcome(name, None, inputs, mode, event, false).await
 }
 
 async fn run(
@@ -557,7 +535,7 @@ async fn run(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event)
+    run_with_outcome(name, target, inputs, mode, event, true)
         .await
         .map(|_| ())
 }
@@ -571,6 +549,7 @@ async fn run_with_outcome(
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
     event: Option<serde_json::Value>,
+    attach_tui: bool,
 ) -> anyhow::Result<RunOutcomeSummary> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
@@ -680,7 +659,7 @@ async fn run_with_outcome(
     let inputs_map: BTreeMap<String, String> = inputs.into_iter().collect();
     let runs_dir = global.join("runs");
     paths::ensure_dir(&runs_dir)?;
-    let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+    let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir.clone()));
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -694,7 +673,48 @@ async fn run_with_outcome(
         resume_from: None,
     };
 
-    let result = run_workflow(opts).await?;
+    // When `attach_tui` is set (CLI-interactive path), spawn the workflow
+    // runner in the background, wait for the run directory to appear on
+    // disk (the orchestrator writes it before dispatching any step), then
+    // attach the TUI in the foreground. Pressing `q` exits the TUI while
+    // the runner keeps going (spec §4 — quitting never cancels a run).
+    //
+    // Non-interactive callers (webhook receiver, cron tick) pass
+    // `attach_tui = false` and keep the original inline-await path so
+    // they can capture and forward the result without a terminal.
+    let result = if attach_tui {
+        // Snapshot the run dir entries that exist *before* the spawn so
+        // we can detect the new one the orchestrator creates.
+        let existing_run_ids: std::collections::BTreeSet<String> =
+            list_run_dir_entries(&runs_dir);
+
+        // Spawn the workflow runner. `opts` is moved into the task;
+        // `_clone_guard` keeps the tmpdir alive through the scope.
+        let runner_task = tokio::spawn(run_workflow(opts));
+
+        // Poll for the new run directory (created synchronously by the
+        // orchestrator before any step work begins). 2 s upper bound;
+        // in practice this is microseconds.
+        let run_id = wait_for_new_run_dir(&runs_dir, &existing_run_ids, 2_000).await;
+
+        if let Some(run_id) = run_id {
+            // TUI blocks until the user presses `q` or the run finishes.
+            // Ignore TUI errors (e.g. non-TTY) — the runner is still going.
+            if let Err(e) = rupu_tui::run_attached(run_id, runs_dir) {
+                eprintln!("rupu: TUI exited early: {e}");
+            }
+        }
+
+        // Await the background runner to get results for the post-run
+        // text summary and to propagate any workflow error.
+        runner_task
+            .await
+            .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
+            .map_err(anyhow::Error::from)?
+    } else {
+        run_workflow(opts).await?
+    };
+
     for sr in &result.step_results {
         if sr.run_id.is_empty() {
             // Skipped step (`when:` falsy) — no transcript path.
@@ -733,6 +753,51 @@ async fn run_with_outcome(
         run_id: result.run_id,
         awaiting_step_id: result.awaiting.map(|a| a.step_id),
     })
+}
+
+/// Collect the names of all `run_<ULID>` subdirectories currently
+/// present in `runs_dir`. Used to diff before/after spawning the
+/// workflow runner so we can identify the new run's directory.
+fn list_run_dir_entries(runs_dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let Ok(rd) = std::fs::read_dir(runs_dir) else {
+        return std::collections::BTreeSet::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            if name.starts_with("run_") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Poll `runs_dir` until a subdirectory appears that was not in
+/// `before`. Returns the new run id or `None` if `timeout_ms` expires
+/// before anything shows up.
+async fn wait_for_new_run_dir(
+    runs_dir: &std::path::Path,
+    before: &std::collections::BTreeSet<String>,
+    timeout_ms: u64,
+) -> Option<String> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if let Ok(rd) = std::fs::read_dir(runs_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().into_string().unwrap_or_default();
+                if name.starts_with("run_") && !before.contains(&name) {
+                    return Some(name);
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// `StepFactory` impl that resolves each step's `agent:` against

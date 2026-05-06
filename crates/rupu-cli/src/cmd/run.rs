@@ -3,6 +3,8 @@
 //! Wires together: paths → agent loader → config layering → permission
 //! resolution → workspace upsert → auth backend → provider factory →
 //! `rupu_agent::run_agent`. Prints a one-line summary on success.
+//!
+// TUI attach for single-agent runs deferred — see slice-c spec §4 v0.1
 
 use crate::paths;
 use crate::provider_factory;

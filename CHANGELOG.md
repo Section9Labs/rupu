@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.4.0 — Slice C: TUI (2026-05-XX)
+
+### Added
+- New `rupu-tui` crate: live + replay terminal viewer for runs.
+- New `rupu watch <run_id>` subcommand (eleventh top-level command).
+  - `--replay [--pace=N]` to replay a finished run.
+- Canvas view (Okesu-mirror, horizontal LTR) + Tree view (vertical TTB),
+  toggle with `v`. Default depends on terminal width.
+- Inline approval flow: focus the `⏸` node and press `a` to approve or
+  `r` to reject with a reason. Same `RunStore` library functions the CLI
+  uses, no race with `rupu workflow approve` from another shell.
+- Status glyph palette: `●  ◐  ✓  ✗  !  ○  ↺  ⏸  ⊘` with status-colored
+  edges.
+- `NO_COLOR=1` and `RUPU_TUI_DEFAULT_VIEW=tree|canvas` env-var support.
+
+### Changed
+- `rupu workflow run` opens the TUI by default. To get the old
+  text-progress output, use the `--no-attach` flag (if implemented) or
+  read the JSONL transcript directly.
+
+### Deferred
+- Single-agent `rupu run` TUI attach (per-run dir layout mismatch).
+
+### Internal
+- `RunStore::approve` / `RunStore::reject` library functions factored
+  out of `cli::cmd::workflow` (used by both the CLI text wrappers and
+  the TUI inline approve/reject).
+
 ## v0.3.0 — Slice B-3: `rupu init` (2026-05-04)
 
 ### Added

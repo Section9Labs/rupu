@@ -1,0 +1,17 @@
+---
+source: crates/rupu-tui/tests/render_snapshot.rs
+assertion_line: 64
+expression: buffer_to_string(&term.backend().buffer().clone())
+---
+┌focus─────────────────────────────────┐
+│◐ code-agent  claude-sonnet-4-6       │
+│tokens: 1902 in / 311 out / 0 cached  │
+│tools used:                           │
+│  bash · 3                            │
+│  edit · 1                            │
+│  read · 8                            │
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+└──────────────────────────────────────┘

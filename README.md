@@ -54,6 +54,16 @@ template customizations with the latest embedded versions.
 
 ---
 
+## TUI
+
+`rupu workflow run` opens a live terminal canvas of the in-flight run.
+See `docs/tui.md` for full key bindings and surfaces.
+
+`rupu watch <run_id>` re-attaches to any historic run. Add `--replay
+--pace=20` to replay a finished run for review.
+
+---
+
 ### Authenticate
 
 rupu supports four providers; each works with API-key auth or SSO.

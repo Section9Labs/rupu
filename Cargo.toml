@@ -8,6 +8,7 @@ members = [
     "crates/rupu-providers",
     "crates/rupu-scm",
     "crates/rupu-tools",
+    "crates/rupu-tui",
     "crates/rupu-agent",
     "crates/rupu-orchestrator",
     "crates/rupu-mcp",
@@ -67,9 +68,18 @@ lru = "0.12"
 # CLI / templating (used in Plan 2 but pinned now for cohesion)
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
+
+# TUI (Slice C)
+ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", default-features = false, features = ["events"] }
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+insta = { version = "1", features = ["yaml"] }
+
 minijinja = "2"
 dirs = "5"
+walkdir = "2"
 which = "6"
+whoami = "1"
 
 # Auth
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }

@@ -472,6 +472,102 @@ impl RunStore {
     }
 }
 
+/// Outcome of an approve/reject library call. Returned to callers
+/// (CLI text wrapper or TUI toast) so they decide how to display it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approved { run_id: String, step_id: String },
+    Rejected { run_id: String, step_id: String, reason: String },
+    Expired { run_id: String, step_id: String, error: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApprovalError {
+    #[error("run not found: {0}")]
+    NotFound(String),
+    #[error("run is `{0}`, not `awaiting_approval`")]
+    NotAwaiting(String),
+    #[error("approval expired: {0}")]
+    Expired(String),
+    #[error("missing awaiting_step_id in record")]
+    NoAwaitingStep,
+    #[error("store: {0}")]
+    Store(#[from] RunStoreError),
+}
+
+impl RunStore {
+    /// Library-level approve flow: load → expire-check → mutate
+    /// status → persist. Caller is responsible for re-entering
+    /// `run_workflow` (CLI does this via the existing path; TUI
+    /// optimistically updates the local model and waits for the next
+    /// RunUpdate from disk).
+    pub fn approve(
+        &self,
+        run_id: &str,
+        approver: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        let mut record = self.load(run_id).map_err(|e| match e {
+            RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
+            other => ApprovalError::Store(other),
+        })?;
+        if self.expire_if_overdue(&mut record, now)? {
+            return Err(ApprovalError::Expired(
+                record.error_message.clone().unwrap_or_else(|| "paused run timed out".into()),
+            ));
+        }
+        if record.status != RunStatus::AwaitingApproval {
+            return Err(ApprovalError::NotAwaiting(record.status.as_str().to_string()));
+        }
+        let step_id = record.awaiting_step_id.clone().ok_or(ApprovalError::NoAwaitingStep)?;
+        let _ = approver; // identity recorded in transcript via runner re-entry
+        record.status = RunStatus::Running;
+        record.awaiting_step_id = None;
+        record.approval_prompt = None;
+        record.awaiting_since = None;
+        record.expires_at = None;
+        record.error_message = None;
+        self.update(&record)?;
+        Ok(ApprovalDecision::Approved { run_id: run_id.to_string(), step_id })
+    }
+
+    pub fn reject(
+        &self,
+        run_id: &str,
+        approver: &str,
+        reason: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        let mut record = self.load(run_id).map_err(|e| match e {
+            RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
+            other => ApprovalError::Store(other),
+        })?;
+        if self.expire_if_overdue(&mut record, now)? {
+            return Err(ApprovalError::Expired(
+                record.error_message.clone().unwrap_or_else(|| "paused run timed out".into()),
+            ));
+        }
+        if record.status != RunStatus::AwaitingApproval {
+            return Err(ApprovalError::NotAwaiting(record.status.as_str().to_string()));
+        }
+        let step_id = record.awaiting_step_id.clone().ok_or(ApprovalError::NoAwaitingStep)?;
+        let _ = approver;
+        record.status = RunStatus::Rejected;
+        record.error_message = Some(format!("rejected: {reason}"));
+        record.finished_at = Some(now);
+        record.awaiting_step_id = None;
+        record.approval_prompt = None;
+        record.awaiting_since = None;
+        record.expires_at = None;
+        self.update(&record)?;
+        Ok(ApprovalDecision::Rejected {
+            run_id: run_id.to_string(),
+            step_id,
+            reason: reason.to_string(),
+        })
+    }
+}
+
 /// Atomic write: write to `path.tmp`, then rename. POSIX rename is
 /// atomic within a directory, so a crash mid-write leaves either the
 /// previous coherent file or no `.tmp` (which a future write
@@ -729,5 +825,42 @@ mod tests {
         // Second call should be a no-op since status is no longer
         // AwaitingApproval.
         assert!(!store.expire_if_overdue(&mut loaded, now).unwrap());
+    }
+
+    const SAMPLE_YAML: &str = "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
+
+    #[test]
+    fn approve_flips_running_and_clears_pause_fields() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_appr_test");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.approval_prompt = Some("ok?".into());
+        rec.awaiting_since = Some(Utc::now());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let decision = store.approve(&rec.id, "matt", Utc::now()).unwrap();
+        assert!(matches!(decision, ApprovalDecision::Approved { .. }));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Running);
+        assert!(reloaded.awaiting_step_id.is_none());
+        assert!(reloaded.approval_prompt.is_none());
+    }
+
+    #[test]
+    fn reject_flips_to_rejected_and_records_reason() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_rej_test");
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let decision = store.reject(&rec.id, "matt", "looks risky", Utc::now()).unwrap();
+        assert!(matches!(decision, ApprovalDecision::Rejected { .. }));
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+        assert!(reloaded.error_message.unwrap().contains("looks risky"));
     }
 }
