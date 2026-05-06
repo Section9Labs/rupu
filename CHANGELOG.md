@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.4.8 — line-stream UI rebuild + Anthropic tool-name sanitizer (2026-05-06)
+
+### Fixed
+- **Anthropic API rejects MCP tool names with `.`** — same root cause as
+  the OpenAI bug fixed in PR #60. Anthropic's `/v1/messages` validates
+  custom tool names against `^[a-zA-Z0-9_-]{1,128}$`, which rejects all
+  rupu MCP tools (`scm.repos.list`, `issues.create`, `github.workflows_dispatch`,
+  etc.). Applied the same `__dot__` escape symmetrically: sanitize on
+  outbound tool definitions and tool_use blocks in conversation history,
+  desanitize on inbound tool_use events so the dispatcher receives the
+  canonical name.
+- **Spinner animation broke the line-stream output** — the previous
+  `\x1b[s` / `\x1b[u` cursor-save spinner thread fought with the print
+  thread for the cursor, causing assistant text and tool calls to land
+  in the wrong place. Removed the animation entirely. The step header
+  now prints a static `◐` glyph; the step footer (`✓` / `✗`) is the
+  visual cue of completion. `SpinnerHandle` is kept as a no-op shim for
+  caller compatibility.
+- **Panel steps showed nothing in the UI** — panel steps emit no
+  top-level transcript (each panelist has its own), so the prior printer
+  rendered an empty block. The printer now detects panel steps via
+  their `items[]` array, opens with a `◐ <step> (panel · N panelists)`
+  header, and renders one child line per panelist
+  (`├─ ✓ <agent>  · N findings`) with the aggregated tally in the
+  footer.
+- **`[v] view findings` was always empty** — the previous loader filtered
+  for findings whose `step_id` matched the awaiting (gate) step, but
+  findings live on the *upstream* panel step. Now aggregates from every
+  prior step's `step_results.jsonl` entry that has findings.
+- **`> ` prompt looked like a typed-input cue** — the user thought
+  they had to type the letter and press Enter. Replaced with the
+  affordance-explicit `[a/r/v/q]: ` marker.
+- **`│` rail broke through blank lines** — assistant chunks containing
+  empty lines used `chunk.lines()` which silently dropped them. Now
+  uses `chunk.split('\n')` and emits a rail-only line for each empty
+  segment so the visual column stays continuous.
+
+### Added
+- `LineStreamPrinter::panel_start` / `panel_done` / `panelist_line`
+  for surfacing panel structure in the timeline.
+- `print_findings(&[(step_id, Vec<FindingRecord>)])` now takes grouped
+  input. Renders a `─── N findings ───` header, then per-finding
+  badge + bold title + dim source line + wrapped body.
+- Workspace-wide `sanitize_anthropic_tool_name` /
+  `desanitize_anthropic_tool_name` helpers + 5 unit tests covering
+  round-trip identity and message-history rewriting.
+
+### Changed
+- `phase_separator` no longer prints a leading rail line — `step_done`
+  already emits one, so the doubled `│` was visual noise.
+
 ## v0.4.7 — clean missing-credential error + OpenAI models listing fix (2026-05-06)
 
 Rolls forward v0.4.6 to include two fixes that landed after the v0.4.6 tag:
