@@ -1337,6 +1337,101 @@ impl crate::provider::LlmProvider for AnthropicClient {
     fn provider_id(&self) -> ProviderId {
         ProviderId::Anthropic
     }
+
+    /// List available models via the public `/v1/models` endpoint.
+    /// Works on both api-key (`x-api-key`) and OAuth (`Authorization:
+    /// Bearer`) auth — the discovery endpoint accepts either.
+    /// Returns an empty vec on transport / auth / parse failure
+    /// rather than propagating, so the CLI's "show what we got"
+    /// fallback still renders the baked-in list.
+    async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
+        // Strip the `/v1/messages` (and optional `?beta=true`) suffix
+        // off `api_url` to get the API root, then append `/v1/models`.
+        // We can't reuse `apply_auth_headers` because it injects
+        // `X-Stainless-*` + `X-Claude-Code-Session-Id` plus a per-
+        // request beta CSV — none of which the discovery endpoint
+        // wants (some of them get the request rejected here).
+        let base = self
+            .api_url
+            .split('?')
+            .next()
+            .unwrap_or(&self.api_url)
+            .trim_end_matches("/v1/messages")
+            .trim_end_matches('/');
+        let url = format!("{base}/v1/models");
+
+        let mut req = self
+            .client
+            .get(&url)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("Accept", "application/json");
+        match &self.auth {
+            AuthMethod::ApiKey(key) => {
+                req = req.header("x-api-key", key);
+            }
+            AuthMethod::OAuth { access_token, .. } => {
+                req = req
+                    .header("Authorization", format!("Bearer {access_token}"))
+                    // The `oauth-2025-04-20` beta is what the
+                    // first-party Claude client sends on every
+                    // OAuth request; the discovery endpoint accepts
+                    // it and (in some quotas) requires it.
+                    .header("anthropic-beta", "oauth-2025-04-20");
+            }
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "anthropic list_models: HTTP error");
+                return Vec::new();
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body_preview = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>();
+            tracing::warn!(
+                status = status.as_u16(),
+                body = %body_preview,
+                "anthropic list_models: non-2xx response",
+            );
+            return Vec::new();
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ListResp {
+            data: Vec<ModelEntry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ModelEntry {
+            id: String,
+        }
+        match resp.json::<ListResp>().await {
+            Ok(body) => body
+                .data
+                .into_iter()
+                .map(|e| crate::model_pool::ModelInfo {
+                    id: e.id,
+                    provider: ProviderId::Anthropic,
+                    context_window: 0,
+                    max_output_tokens: 0,
+                    capabilities: Vec::new(),
+                    cost: crate::model_pool::ModelCost::default(),
+                    status: crate::model_pool::ModelStatus::default(),
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "anthropic list_models: JSON parse failed");
+                Vec::new()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2337,5 +2432,59 @@ mod tests {
         let body = client.build_request_body(&request, false);
         assert_eq!(body["output_config"]["format"], "json");
         assert_eq!(body["output_config"]["task_budget"], 1500);
+    }
+
+    #[tokio::test]
+    async fn list_models_api_key_path_parses_v1_models() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .header("x-api-key", "sk-ant-test")
+                .header("anthropic-version", ANTHROPIC_VERSION);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "data": [
+                        { "id": "claude-opus-4-1-20250805", "type": "model" },
+                        { "id": "claude-sonnet-4-6", "type": "model" }
+                    ],
+                    "first_id": "claude-opus-4-1-20250805",
+                    "last_id": "claude-sonnet-4-6",
+                    "has_more": false
+                }));
+        });
+        // Override the api_url to point at the mock. Real production
+        // URL is `/v1/messages?beta=true`; the discovery impl strips
+        // both the path and the query string.
+        let client = AnthropicClient::with_url(
+            "sk-ant-test".into(),
+            format!("{}/v1/messages?beta=true", server.url("")),
+        );
+        let models =
+            <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
+        assert!(models.iter().any(|m| m.id == "claude-opus-4-1-20250805"));
+        assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
+        assert!(models.iter().all(|m| m.provider == ProviderId::Anthropic));
+    }
+
+    #[tokio::test]
+    async fn list_models_returns_empty_on_non_2xx() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(401)
+                .header("content-type", "application/json")
+                .body(r#"{"error":{"type":"authentication_error"}}"#);
+        });
+        let client = AnthropicClient::with_url(
+            "bad-key".into(),
+            format!("{}/v1/messages", server.url("")),
+        );
+        let models =
+            <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
+        assert!(models.is_empty());
     }
 }

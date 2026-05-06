@@ -82,6 +82,15 @@ async fn refresh(filter: Option<String>) -> anyhow::Result<()> {
             }
         }
         match populate_live(&registry, &resolver, p).await {
+            Ok(0) => {
+                // Provider returned no models — almost always a
+                // silently-swallowed HTTP error (401 / 404 / etc.).
+                // Tell the operator to enable `RUST_LOG=warn` so the
+                // provider client's tracing logs surface.
+                eprintln!(
+                    "rupu: refreshed {p} (0 models — re-run with `RUST_LOG=warn` to see why)"
+                );
+            }
             Ok(n) => println!("rupu: refreshed {p} ({n} models)"),
             Err(e) => eprintln!("rupu: skip {p}: {e}"),
         }
@@ -102,11 +111,14 @@ async fn populate_live(
     // Sync constraint that async_trait imposes on &self methods.
     let models = match provider {
         "anthropic" => {
-            let key = match creds {
-                rupu_providers::AuthCredentials::ApiKey { key } => key,
-                rupu_providers::AuthCredentials::OAuth { access, .. } => access,
-            };
-            rupu_providers::AnthropicClient::new(key)
+            // Important: route OAuth tokens through `from_auth(OAuth)`
+            // so the discovery endpoint receives `Authorization:
+            // Bearer <token>` + the OAuth beta. Stuffing the OAuth
+            // access token into `AnthropicClient::new(key)` builds an
+            // api-key client that sends `x-api-key: <bearer>`,
+            // which the server rejects with 401 "invalid x-api-key".
+            let auth_method = creds.into_anthropic_auth_method();
+            rupu_providers::AnthropicClient::from_auth(auth_method)
                 .list_models()
                 .await
         }
