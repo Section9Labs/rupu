@@ -63,3 +63,16 @@ fn panel_shows_status_tools_tokens() {
 
     insta::assert_snapshot!("panel_focused", buffer_to_string(&term.backend().buffer().clone()));
 }
+
+#[test]
+fn too_narrow_terminal_renders_warning() {
+    use rupu_tui::view::canvas::render_canvas_with_warning;
+    let mut model = RunModel::new();
+    model.upsert_node("a", "x").status = NodeStatus::Working;
+    let edges = vec![];
+    let backend = TestBackend::new(38, 4);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| render_canvas_with_warning(f, f.area(), &model, &edges, "a")).unwrap();
+    let s = buffer_to_string(&term.backend().buffer().clone());
+    assert!(s.contains("canvas truncated"), "got:\n{s}");
+}

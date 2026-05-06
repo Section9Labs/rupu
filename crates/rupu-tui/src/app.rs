@@ -18,7 +18,7 @@ use rupu_orchestrator::{RunStore, Workflow};
 use crate::control::{dispatch, Action};
 use crate::source::{EventSource, SourceEvent};
 use crate::state::{derive_edges, RunModel};
-use crate::view::{canvas::render_canvas, panel::render_panel, tree::render_tree};
+use crate::view::{canvas::render_canvas_with_warning, panel::render_panel, tree::render_tree};
 use crate::TuiResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +101,7 @@ impl App {
                     .constraints([Constraint::Min(40), Constraint::Length(40)])
                     .split(f.area());
                 match self.view {
-                    View::Canvas => render_canvas(f, chunks[0], &self.model, &self.edges, &self.focus),
+                    View::Canvas => render_canvas_with_warning(f, chunks[0], &self.model, &self.edges, &self.focus),
                     View::Tree => render_tree(f, chunks[0], &self.model, &self.edges, &self.focus),
                 }
                 render_panel(f, chunks[1], &self.model, &self.focus);

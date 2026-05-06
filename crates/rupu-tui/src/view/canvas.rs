@@ -13,6 +13,7 @@ const CARD_W: u16 = 16;
 const CARD_H: u16 = 3;
 const COL_GAP: u16 = 4;
 const ROW_GAP: u16 = 1;
+const MIN_USEFUL_WIDTH: u16 = 40;
 
 pub fn render_canvas(
     frame: &mut Frame,
@@ -50,4 +51,20 @@ fn trim(s: &str, max: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+}
+
+pub fn render_canvas_with_warning(
+    frame: &mut Frame,
+    area: Rect,
+    model: &RunModel,
+    edges: &[(String, String)],
+    focused: &str,
+) {
+    if area.width < MIN_USEFUL_WIDTH {
+        let text = "(canvas truncated — press v for tree view)";
+        let para = Paragraph::new(text).style(Style::default().fg(ratatui::style::Color::Yellow));
+        frame.render_widget(para, area);
+        return;
+    }
+    render_canvas(frame, area, model, edges, focused);
 }
