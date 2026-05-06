@@ -19,4 +19,9 @@ pub enum SourceEvent {
 pub trait EventSource: Send {
     fn poll(&mut self) -> Vec<SourceEvent>;
     fn wait(&mut self, dur: Duration) -> Option<SourceEvent>;
+    /// Replay sources signal completion via this; live sources return
+    /// false. Default is `false` so existing impls don't break.
+    fn is_drained(&self) -> bool {
+        false
+    }
 }

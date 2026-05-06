@@ -18,6 +18,10 @@ pub enum Action {
 }
 
 pub fn dispatch(ev: KeyEvent) -> Action {
+    use crossterm::event::KeyModifiers;
+    if ev.modifiers.contains(KeyModifiers::CONTROL) && matches!(ev.code, KeyCode::Char('c')) {
+        return Action::Quit;
+    }
     match ev.code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Tab => Action::FocusNext,

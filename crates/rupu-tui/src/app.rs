@@ -53,6 +53,10 @@ pub struct App {
     /// When Some(buffer), App is in reject-reason input mode and
     /// keystrokes append to the buffer instead of dispatching.
     reject_buffer: Option<String>,
+    /// True when no workflow spec was provided; enables events-only degraded banner.
+    degraded: bool,
+    /// True once a ReplaySource has exhausted its queue.
+    replay_complete: bool,
 }
 
 impl App {
@@ -71,6 +75,7 @@ impl App {
             edges = derive_edges(wf);
         }
         let focus = model.nodes.keys().next().cloned().unwrap_or_default();
+        let degraded = workflow.is_none();
         Self {
             model,
             edges,
@@ -82,6 +87,8 @@ impl App {
             toast: None,
             last_user_focus: None,
             reject_buffer: None,
+            degraded,
+            replay_complete: false,
         }
     }
 
@@ -96,6 +103,9 @@ impl App {
         loop {
             for ev in self.source.poll() {
                 self.apply(ev);
+            }
+            if self.source.is_drained() {
+                self.replay_complete = true;
             }
             if cev::poll(Duration::from_millis(33))? {
                 if let CtEvent::Key(k) = cev::read()? {
@@ -132,19 +142,35 @@ impl App {
                 }
             }
             terminal.draw(|f| {
-                let chunks = Layout::default()
+                let outer = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
+                        Constraint::Length(if self.degraded || self.replay_complete { 1 } else { 0 }),
                         Constraint::Min(1),
                         Constraint::Length(
                             if self.toast.is_some() || self.reject_buffer.is_some() { 2 } else { 0 },
                         ),
                     ])
                     .split(f.area());
+
+                if self.degraded {
+                    let p = ratatui::widgets::Paragraph::new(
+                        "\u{26a0} workflow spec not found; rendering events-only",
+                    )
+                    .style(ratatui::style::Style::default().fg(ratatui::style::Color::Yellow));
+                    f.render_widget(p, outer[0]);
+                } else if self.replay_complete {
+                    let p = ratatui::widgets::Paragraph::new(
+                        "replay complete \u{2014} press q to quit",
+                    )
+                    .style(ratatui::style::Style::default().fg(ratatui::style::Color::Green));
+                    f.render_widget(p, outer[0]);
+                }
+
                 let main = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Min(40), Constraint::Length(40)])
-                    .split(chunks[0]);
+                    .split(outer[1]);
                 match self.view {
                     View::Canvas => render_canvas_with_warning(
                         f, main[0], &self.model, &self.edges, &self.focus,
@@ -155,9 +181,9 @@ impl App {
                 if let Some(buf) = &self.reject_buffer {
                     let para = ratatui::widgets::Paragraph::new(format!("reject reason: {buf}_"))
                         .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red));
-                    f.render_widget(para, chunks[1]);
+                    f.render_widget(para, outer[2]);
                 } else if let Some(toast) = &self.toast {
-                    render_toast(f, chunks[1], toast);
+                    render_toast(f, outer[2], toast);
                 }
             })?;
 

@@ -48,4 +48,8 @@ impl EventSource for ReplaySource {
         self.next_at += self.pace;
         Some(SourceEvent::StepEvent { step_id, event })
     }
+
+    fn is_drained(&self) -> bool {
+        self.queue.is_empty()
+    }
 }

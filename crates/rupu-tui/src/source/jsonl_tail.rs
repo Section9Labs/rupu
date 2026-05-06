@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
-use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
+use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher, WatcherKind};
 use tracing::warn;
 
 use super::{EventSource, SourceEvent};
@@ -28,15 +28,30 @@ pub struct JsonlTailSource {
 impl JsonlTailSource {
     pub fn new(run_dir: PathBuf) -> TuiResult<Self> {
         let (tx, rx) = channel();
-        let mut watcher = recommended_watcher(move |res| {
-            let _ = tx.send(res);
-        })?;
-        watcher.watch(&run_dir, RecursiveMode::Recursive)?;
+        let watcher: Box<dyn Watcher + Send + Sync> = match recommended_watcher({
+            let tx = tx.clone();
+            move |res| {
+                let _ = tx.send(res);
+            }
+        }) {
+            Ok(mut w) => {
+                if w.watch(&run_dir, RecursiveMode::Recursive).is_ok() {
+                    Box::new(w)
+                } else {
+                    tracing::info!("notify watch failed; falling back to mtime polling");
+                    Box::new(MtimePoller::new(run_dir.clone(), tx))
+                }
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "notify init failed; falling back to mtime polling");
+                Box::new(MtimePoller::new(run_dir.clone(), tx))
+            }
+        };
         Ok(Self {
             run_dir,
             offsets: BTreeMap::new(),
             rx,
-            _watcher: Box::new(watcher),
+            _watcher: watcher,
         })
     }
 
@@ -139,6 +154,80 @@ impl EventSource for JsonlTailSource {
         }
         let out = self.drain_transcripts();
         out.into_iter().next()
+    }
+}
+
+/// Fallback when notify can't watch the FS (NFS, sandboxes). Polls
+/// every 250ms; sends a synthetic event when any file under run_dir
+/// has a newer mtime than the last poll.
+struct MtimePoller {
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl MtimePoller {
+    fn new(
+        run_dir: PathBuf,
+        tx: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
+    ) -> Self {
+        let handle = std::thread::spawn(move || {
+            let mut last: BTreeMap<PathBuf, std::time::SystemTime> = BTreeMap::new();
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                let mut signaled = false;
+                for entry in walkdir::WalkDir::new(&run_dir)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                {
+                    let p = entry.path().to_path_buf();
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(mtime) = meta.modified() {
+                            if last.get(&p).is_none_or(|t| *t < mtime) {
+                                last.insert(p, mtime);
+                                signaled = true;
+                            }
+                        }
+                    }
+                }
+                if signaled && tx.send(Ok(notify::Event::default())).is_err() {
+                    // Receiver dropped; stop polling.
+                    return;
+                }
+            }
+        });
+        Self { _handle: handle }
+    }
+}
+
+impl Watcher for MtimePoller {
+    fn new<F: notify::EventHandler>(
+        _event_handler: F,
+        _config: notify::Config,
+    ) -> notify::Result<Self> {
+        // MtimePoller is only ever constructed via MtimePoller::new directly;
+        // the trait's new() is required but never called.
+        Err(notify::Error::generic(
+            "MtimePoller::new via Watcher trait not supported; use MtimePoller::new directly",
+        ))
+    }
+
+    fn watch(
+        &mut self,
+        _path: &std::path::Path,
+        _recursive_mode: RecursiveMode,
+    ) -> notify::Result<()> {
+        Ok(())
+    }
+
+    fn unwatch(&mut self, _path: &std::path::Path) -> notify::Result<()> {
+        Ok(())
+    }
+
+    fn configure(&mut self, _option: notify::Config) -> notify::Result<bool> {
+        Ok(true)
+    }
+
+    fn kind() -> WatcherKind {
+        WatcherKind::PollWatcher
     }
 }
 
