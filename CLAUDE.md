@@ -4,9 +4,11 @@
 - Slice A spec: `docs/superpowers/specs/2026-05-01-rupu-slice-a-design.md`
 - Slice B-1 spec: `docs/superpowers/specs/2026-05-02-rupu-slice-b1-multi-provider-design.md`
 - Slice B-2 spec: `docs/superpowers/specs/2026-05-03-rupu-slice-b2-scm-design.md`
+- Slice C spec: `docs/superpowers/specs/2026-05-05-rupu-slice-c-tui-design.md`
 - Plan 1 (foundation + GitHub connector, complete): `docs/superpowers/plans/2026-05-03-rupu-slice-b2-plan-1-foundation-and-github.md`
 - Plan 2 (GitLab + MCP server, complete): `docs/superpowers/plans/2026-05-03-rupu-slice-b2-plan-2-gitlab-and-mcp.md`
 - Plan 3 (CLI run-target + docs + nightly, complete): `docs/superpowers/plans/2026-05-03-rupu-slice-b2-plan-3-cli-and-docs.md`
+- Slice C plan: `docs/superpowers/plans/2026-05-05-rupu-slice-c-tui-plan.md`
 
 ## Architecture rules (enforced)
 1. **Hexagonal separation.** `rupu-providers`, `rupu-tools`, `rupu-auth` define traits (ports). The agent runtime in `rupu-agent` only knows traits.
@@ -17,11 +19,12 @@
 ### Crates
 
 - **`rupu-agent`** — agent file format (`.md` + YAML frontmatter), agent loop, and permission resolver. Lifts spec/loader/permission/runner/tool_registry into one integration crate. Mock-provider tests use `MockProvider` + `BypassDecider` exposed from `runner`.
-- **`rupu-cli`** — the `rupu` binary. Thin clap dispatcher to the libraries. Ten subcommands: `init` / `run` / `agent` / `workflow` / `transcript` / `config` / `auth` / `models` / `repos` / `mcp`.
+- **`rupu-cli`** — the `rupu` binary. Thin clap dispatcher to the libraries. Eleven subcommands: `init` / `run` / `agent` / `workflow` / `transcript` / `config` / `auth` / `models` / `repos` / `mcp` / `watch`.
 - **`rupu-mcp`** — embedded MCP server. Two transports (in-process for the agent runtime, stdio for `rupu mcp serve`); single tool catalog backed by `rupu-scm`'s Registry. Permission gating mirrors the six-builtin model: per-tool allowlist + per-mode (`ask` / `bypass` / `readonly`).
 - **`rupu-orchestrator`** — workflow YAML parser + minijinja rendering + linear runner with pluggable `StepFactory`. Action-protocol allowlist validation lives here.
 - **`rupu-scm`** — SCM/issue-tracker connectors. `RepoConnector` + `IssueConnector` traits per spec §4c; per-platform impls under `connectors/<platform>/`. Plan 1 ships GitHub; Plan 2 adds GitLab + the embedded MCP server.
 - **`rupu-keychain-acl`** — macOS-only Security.framework FFI shim that pre-populates new keychain items' ACL with rupu's signing identity, eliminating the "Always Allow" first-prompt. Only crate in the workspace exempt from `unsafe_code = "forbid"`; FFI module opts in via `#![allow(unsafe_code)]`. No-op on non-macOS.
+- **`rupu-tui`** — live + replay terminal viewer for runs. Consumes JSONL transcripts + `RunRecord`; renders a DAG canvas (Canvas/Tree views toggleable with `v`) using `ratatui`. Inline approval (`a`/`r`). Reattach via `rupu watch <run_id>`.
 
 **Run-time samples:** live at `<repo>/.rupu/agents/` and `<repo>/.rupu/workflows/`. Running `rupu` from inside the rupu checkout exercises the same project-discovery code path end-users use in their own repos.
 
