@@ -17,7 +17,8 @@
 //! `approval_prompt` method and then calls back into the run-store to
 //! approve or reject based on the user's response.
 
-use super::{printer::LineStreamPrinter, TranscriptTailer};
+use super::{SpinnerHandle, TranscriptTailer, printer::LineStreamPrinter};
+use rupu_orchestrator::{FindingRecord, StepResultRecord};
 use rupu_transcript::Event as TxEvent;
 use std::collections::BTreeSet;
 use std::io;
@@ -38,6 +39,8 @@ struct StepState {
     agent: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    /// Spinner handle for the running glyph. Dropped when the step ends.
+    spinner: Option<SpinnerHandle>,
 }
 
 /// Drive `printer` from a live or recently-finished workflow run.
@@ -93,6 +96,8 @@ pub fn attach_and_print(
     let mut seen_step_results: usize = 0;
     let mut steps: Vec<StepState> = Vec::new();
     let mut total_tokens: u64 = 0;
+    // Print a phase separator before the second and later steps.
+    let mut step_count: usize = 0;
 
     // Track which step transcript paths we've opened tailers for.
     let mut opened: BTreeSet<PathBuf> = BTreeSet::new();
@@ -107,6 +112,7 @@ pub fn attach_and_print(
             &mut opened,
             &mut steps,
             printer,
+            &mut step_count,
         );
 
         // ── 2. Drain events from all open tailers ──
@@ -142,53 +148,62 @@ pub fn attach_and_print(
                     .unwrap_or("Approve this step?")
                     .to_string();
 
-                let ch = printer
-                    .approval_prompt(&step_id, &prompt)
-                    .unwrap_or('q');
+                // Keep a loop so 'v' can show findings and re-prompt.
+                loop {
+                    let ch = printer
+                        .approval_prompt(&step_id, &prompt)
+                        .unwrap_or('q');
 
-                match ch {
-                    'a' | 'A' => {
-                        let approver = whoami::username();
-                        match run_store.approve(run_id, &approver, chrono::Utc::now()) {
-                            Ok(_) => {
-                                // Print approval confirmation inline.
-                                printer.step_done(&step_id, Duration::ZERO, 0);
-                                // The orchestrator is waiting for the
-                                // process-external approve. We can't resume
-                                // it from here; the user must run
-                                // `rupu workflow approve <run_id>` in a new
-                                // process. Surface this as a note and exit.
-                                println!();
-                                println!("Run paused. Resume with:");
-                                println!("  rupu workflow approve {run_id}");
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                eprintln!("rupu: approve failed: {e}");
-                                return Err(io::Error::other(e.to_string()));
+                    match ch {
+                        'v' | 'V' => {
+                            // Load findings for the awaiting step from
+                            // step_results.jsonl and display them.
+                            let findings =
+                                load_step_findings(&step_results_log, &step_id);
+                            printer.print_findings(&findings);
+                            // Loop back to re-show the prompt.
+                        }
+                        'a' | 'A' => {
+                            let approver = whoami::username();
+                            match run_store.approve(run_id, &approver, chrono::Utc::now()) {
+                                Ok(_) => {
+                                    printer.step_done(&step_id, Duration::ZERO, 0);
+                                    println!();
+                                    println!("Run paused. Resume with:");
+                                    println!("  rupu workflow approve {run_id}");
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    eprintln!("rupu: approve failed: {e}");
+                                    return Err(io::Error::other(e.to_string()));
+                                }
                             }
                         }
-                    }
-                    'r' | 'R' => {
-                        let reason = printer.reject_reason_prompt().unwrap_or_default();
-                        let reason = if reason.is_empty() {
-                            "rejected by operator"
-                        } else {
-                            &reason
-                        };
-                        let approver = whoami::username();
-                        let _ =
-                            run_store.reject(run_id, &approver, reason, chrono::Utc::now());
-                        println!("Run rejected.");
-                        return Ok(());
-                    }
-                    _ => {
-                        // q or anything else: abort print loop; run keeps
-                        // going in background (spawned by workflow.rs).
-                        println!();
-                        println!("Detached from run. It is still running.");
-                        println!("Re-attach with: rupu watch {run_id}");
-                        return Ok(());
+                        'r' | 'R' => {
+                            let reason = printer.reject_reason_prompt().unwrap_or_default();
+                            let reason = if reason.is_empty() {
+                                "rejected by operator"
+                            } else {
+                                &reason
+                            };
+                            let approver = whoami::username();
+                            let _ = run_store.reject(
+                                run_id,
+                                &approver,
+                                reason,
+                                chrono::Utc::now(),
+                            );
+                            println!("Run rejected.");
+                            return Ok(());
+                        }
+                        _ => {
+                            // q or anything else: abort print loop; run keeps
+                            // going in background (spawned by workflow.rs).
+                            println!();
+                            println!("Detached from run. It is still running.");
+                            println!("Re-attach with: rupu watch {run_id}");
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -202,6 +217,7 @@ pub fn attach_and_print(
                     &mut opened,
                     &mut steps,
                     printer,
+                    &mut step_count,
                 );
                 flush_all_tailers(&mut steps, printer, &mut total_tokens);
 
@@ -243,8 +259,28 @@ fn load_run_record(run_json: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// Load findings for a specific step from `step_results.jsonl`.
+/// Returns the findings from the *last* record for that step (in case of
+/// retries / multiple iterations).
+fn load_step_findings(log: &Path, step_id: &str) -> Vec<FindingRecord> {
+    let Ok(bytes) = std::fs::read(log) else {
+        return Vec::new();
+    };
+    let mut findings: Vec<FindingRecord> = Vec::new();
+    for line in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
+        let Ok(rec): Result<StepResultRecord, _> = serde_json::from_slice(line) else {
+            continue;
+        };
+        if rec.step_id == step_id {
+            findings = rec.findings;
+        }
+    }
+    findings
+}
+
 /// Read newly-appended lines from `step_results.jsonl`, open tailers
 /// for new transcript files, and start the step block in the printer.
+#[allow(clippy::too_many_arguments)]
 fn drain_step_results(
     log: &Path,
     transcript_dir: &Path,
@@ -252,6 +288,7 @@ fn drain_step_results(
     opened: &mut BTreeSet<PathBuf>,
     steps: &mut Vec<StepState>,
     printer: &mut LineStreamPrinter,
+    step_count: &mut usize,
 ) {
     let Ok(bytes) = std::fs::read(log) else {
         return;
@@ -283,16 +320,22 @@ fn drain_step_results(
         }
         opened.insert(transcript_path.clone());
         let tailer = TranscriptTailer::new(&transcript_path);
-        // The step_start is printed here (we'll override the metadata
-        // when we see the RunStart event from the JSONL file, but we
-        // print a placeholder so the user sees progress immediately).
-        printer.step_start(&step_id, None, None, None);
+
+        // Print a phase separator between steps for visual rhythm.
+        if *step_count > 0 {
+            printer.phase_separator();
+        }
+        *step_count += 1;
+
+        // Start the step header with an animated spinner glyph.
+        let spinner = printer.step_start(&step_id, None, None, None);
         steps.push(StepState {
             tailer,
             step_id,
             agent: None,
             provider: None,
             model: None,
+            spinner: Some(spinner),
         });
     }
     let _ = transcript_dir; // used by the caller for resolution; unused here
@@ -332,6 +375,10 @@ fn process_event(
             error,
             ..
         } => {
+            // Stop the spinner before printing the completion line.
+            if let Some(spinner) = step.spinner.take() {
+                spinner.stop();
+            }
             *total_tokens += tokens;
             let dur = Duration::from_millis(duration_ms);
             match status {
@@ -359,6 +406,10 @@ fn flush_all_tailers(
         let events = step.tailer.drain();
         for ev in events {
             process_event(ev, step, printer, total_tokens);
+        }
+        // Stop any still-running spinners when we flush at end-of-run.
+        if let Some(spinner) = step.spinner.take() {
+            spinner.stop();
         }
     }
 }

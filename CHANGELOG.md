@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.4.6 — interactive prompt + spinner + design polish (2026-05-06)
+
+### Fixed
+- **Single-key approval prompt (Bug 1)**: `approval_prompt` now uses
+  `crossterm::terminal::enable_raw_mode()` + `crossterm::event::read()` so the
+  user presses a single key (`a`, `r`, `v`, `q`) without needing Enter.
+  Ctrl-C and Esc both map to `q` (detach). Raw mode is disabled immediately
+  after the keypress so stdout continues streaming normally.
+- **`[v] view findings` now works (Bug 2)**: pressing `v` at the approval gate
+  reads the panel step's `FindingRecord`s from `step_results.jsonl` and
+  pretty-prints them with severity-colored chip badges
+  (`[ critical ]`, `[ high ]`, etc.) before re-showing the prompt. The loop
+  repeats until the user presses `a`, `r`, or `q`.
+- **Reject path prompts for reason**: pressing `r` now correctly prompts
+  `"Reason (optional, Enter to skip):"` via line-buffered stdin (the one place
+  where Enter is right), then calls `RunStore::reject`.
+
+### Added
+- **Animated spinner during streaming (Bug 3 + 4)**: `crates/rupu-cli/src/output/spinner.rs`
+  — a new `Spinner` type that cycles `◐ ◓ ◑ ◒` every 125 ms via a background
+  `std::thread`. `step_start` now saves the ANSI cursor position (`\x1b[s`)
+  before the glyph and returns a `SpinnerHandle`; the spinner restores to that
+  position on each tick so the glyph animates in-place while text streams
+  below. Degrades to a no-op on non-TTY streams (pipes, CI runners).
+- **Phase separator between workflow steps**: a dim `──────────────────────`
+  line is inserted between each major step block for visual rhythm.
+- `palette::write_bold_colored` — bold + colored variant for status glyphs and
+  key identifiers.
+- `BRAND_300` (#a78bfa) and `SEPARATOR` (#475569) palette entries.
+
+### Changed
+- **Hierarchy polish**: workflow name is now brand-500 bold in the header;
+  step completion glyphs (`✓`, `✗`) and step IDs are bold+green/bold+red for
+  clear terminal hierarchy.
+- **Indent guides**: the `│` tree pipes are now brand-300 (#a78bfa) for a
+  subtle warm purple thread through the run rather than plain gray.
+- **Token + duration footer**: `✓ step  · 0.0s · 2997 tokens` — the `·`
+  separator stays; tokens now shows as `N tokens` instead of `Nt` for clarity.
+- **Workflow done/failed headers**: prepend a blank line before the footer so
+  it's visually separated from the last step block.
+- `crossterm` added to `rupu-cli` workspace dep declarations.
+
 ## v0.4.5 — line-stream output by default (canvas opt-in via --canvas) (2026-05-06)
 
 ### Also includes (PRs merged alongside)

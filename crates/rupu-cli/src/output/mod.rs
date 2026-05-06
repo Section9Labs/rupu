@@ -9,7 +9,9 @@
 pub mod jsonl_reader;
 pub mod palette;
 pub mod printer;
+pub mod spinner;
 pub mod workflow_printer;
 
 pub use jsonl_reader::TranscriptTailer;
 pub use printer::LineStreamPrinter;
+pub use spinner::SpinnerHandle;
