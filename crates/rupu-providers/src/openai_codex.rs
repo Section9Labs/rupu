@@ -550,29 +550,80 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
     }
 
     async fn list_models(&self) -> Vec<crate::model_pool::ModelInfo> {
-        // Strip the `/v1/responses` suffix (this client targets the Responses API
-        // for `send`/`stream`) and append `/v1/models` for the listing endpoint.
-        let base = self
-            .api_url
-            .trim_end_matches("/v1/responses")
-            .trim_end_matches('/');
-        let url = format!("{base}/v1/models");
-        let resp = self
-            .client
-            .get(&url)
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", self.access_token),
+        // Two backends, two listing-endpoint shapes:
+        // - api-key path: `https://api.openai.com/v1/responses` →
+        //   strip `/v1/responses`, append `/v1/models`. Standard
+        //   OpenAI listing endpoint, returns `{ "data": [...] }`.
+        // - ChatGPT OAuth path: `https://chatgpt.com/backend-api/
+        //   codex/responses` → swap `/responses` for `/models`. The
+        //   chatgpt.com backend doesn't expose `/v1/models`; the
+        //   Codex CLI uses the per-product `/codex/models` route.
+        // ChatGPT-backend URLs end in `/backend-api/codex/responses`;
+        // standard OpenAI URLs end in `/v1/responses`. Distinguish by
+        // path suffix, not host — that way tests with localhost mocks
+        // hit the same branch as the chatgpt.com production URL.
+        let url = if self.api_url.contains("/backend-api/codex/responses") {
+            // The chatgpt.com `/codex/models` endpoint validates a
+            // mandatory `client_version` query string — without it
+            // the server returns 400 with
+            // `{'type': 'missing', 'loc': ('query', 'client_version')}`.
+            // Any non-empty value is accepted; we send a stable
+            // Codex-CLI-shaped version string so the request still
+            // fingerprints as the impersonated CLI.
+            format!(
+                "{}?client_version=0.50.0",
+                self.api_url.replace("/responses", "/models")
             )
-            .send()
-            .await;
-        let resp = match resp {
-            Ok(r) if r.status().is_success() => r,
-            _ => return Vec::new(),
+        } else {
+            let base = self
+                .api_url
+                .trim_end_matches("/v1/responses")
+                .trim_end_matches('/');
+            format!("{base}/v1/models")
         };
+        let mut req = self.client.get(&url).header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", self.access_token),
+        );
+        // ChatGPT backend requires the chatgpt-account-id header on
+        // every request; without it /models returns 401 even with a
+        // valid bearer token.
+        if !self.account_id.is_empty() {
+            req = req.header("chatgpt-account-id", &self.account_id);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, url = %url, "openai list_models: HTTP error");
+                return Vec::new();
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body_preview = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect::<String>();
+            tracing::warn!(
+                status = status.as_u16(),
+                url = %url,
+                body = %body_preview,
+                "openai list_models: non-2xx response",
+            );
+            return Vec::new();
+        }
+        // Both endpoints return a `data` array of `{id: "..."}`
+        // objects (chatgpt.com's includes more metadata we don't
+        // need here).
         #[derive(serde::Deserialize)]
         struct ListResp {
+            #[serde(default)]
             data: Vec<ModelEntry>,
+            #[serde(default)]
+            models: Vec<ModelEntry>,
         }
         #[derive(serde::Deserialize)]
         struct ModelEntry {
@@ -580,9 +631,15 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
         }
         let body: ListResp = match resp.json().await {
             Ok(b) => b,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(error = %e, "openai list_models: JSON parse failed");
+                return Vec::new();
+            }
         };
-        body.data
+        // Some chatgpt.com responses use `models` instead of `data`;
+        // accept either.
+        let entries = if body.data.is_empty() { body.models } else { body.data };
+        entries
             .into_iter()
             .map(|e| make_model_info(e.id, crate::provider_id::ProviderId::OpenaiCodex))
             .collect()
@@ -1485,6 +1542,64 @@ mod tests {
             <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
         assert!(models.iter().any(|m| m.id == "gpt-5"));
         assert!(models.iter().any(|m| m.id == "gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn list_models_chatgpt_oauth_path_swaps_responses_for_models() {
+        use httpmock::prelude::*;
+        // The ChatGPT backend doesn't have /v1/models — Codex CLI
+        // uses the per-product /codex/models route instead.
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .header("chatgpt-account-id", "acct_1");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "data": [
+                        { "id": "gpt-5-2025-08-07" },
+                        { "id": "gpt-5-mini" }
+                    ]
+                }));
+        });
+        let creds = AuthCredentials::ApiKey {
+            key: "sk-test".into(),
+        };
+        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        // Mimic the ChatGPT-OAuth state: backend URL + non-empty
+        // account_id. The list_models impl branches on the URL.
+        client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
+        client.account_id = "acct_1".into();
+        let models =
+            <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
+        assert!(models.iter().any(|m| m.id == "gpt-5-2025-08-07"));
+        assert!(models.iter().any(|m| m.id == "gpt-5-mini"));
+    }
+
+    #[tokio::test]
+    async fn list_models_handles_models_field_alternative() {
+        use httpmock::prelude::*;
+        // Some chatgpt.com responses use `models` instead of `data`;
+        // the parser accepts either.
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "models": [{ "id": "gpt-5" }]
+                }));
+        });
+        let creds = AuthCredentials::ApiKey {
+            key: "sk-test".into(),
+        };
+        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
+        let models =
+            <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-5");
     }
 
     #[test]
