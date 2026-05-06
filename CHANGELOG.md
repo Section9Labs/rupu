@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.4.0 — Slice C: TUI (2026-05-XX)
+## v0.4.0 — Slice C: TUI (2026-05-05)
 
 ### Added
 - New `rupu-tui` crate: live + replay terminal viewer for runs.
