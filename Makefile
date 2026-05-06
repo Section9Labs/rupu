@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install fmt lint test gates clean help
+.PHONY: build release sign-dev sign-release run install fmt lint test gates tui-smoke clean help
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -43,6 +43,14 @@ gates: fmt lint test
 clean:
 	cargo clean
 
+tui-smoke:
+	@cargo build --release -p rupu-cli
+	@if [ ! -d crates/rupu-tui/tests/fixtures/run_smoke ]; then \
+		echo "fixture missing — see crates/rupu-tui/tests/fixtures/README.md"; exit 1; \
+	fi
+	@sh -c 'RUPU_TUI_DEFAULT_VIEW=tree ./target/release/rupu watch run_smoke --replay --pace=5 & PID=$$; sleep 5; kill $$PID 2>/dev/null || true; wait $$PID 2>/dev/null' || true
+	@echo "tui-smoke OK"
+
 help:
 	@echo "rupu Makefile targets:"
 	@echo ""
@@ -56,6 +64,7 @@ help:
 	@echo "  lint           cargo clippy --workspace --all-targets -D warnings"
 	@echo "  test           cargo test --workspace"
 	@echo "  gates          fmt + lint + test (same as the release-ready check)"
+	@echo "  tui-smoke      headless 5-second TUI smoke against bundled fixture"
 	@echo "  clean          cargo clean"
 	@echo ""
 	@echo "Override the signing identity with RUPU_SIGNING_IDENTITY=<sha1-or-cn>"

@@ -1,0 +1,11 @@
+{
+  "id": "run_smoke",
+  "workflow_name": "smoke",
+  "status": "completed",
+  "inputs": {},
+  "workspace_id": "ws_smoke",
+  "workspace_path": "/tmp/smoke",
+  "transcript_dir": "crates/rupu-tui/tests/fixtures/run_smoke/transcripts",
+  "started_at": "2026-05-05T19:00:00Z",
+  "finished_at": "2026-05-05T19:00:30Z"
+}
