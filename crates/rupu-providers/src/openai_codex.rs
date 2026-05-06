@@ -564,14 +564,18 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
         // hit the same branch as the chatgpt.com production URL.
         let url = if self.api_url.contains("/backend-api/codex/responses") {
             // The chatgpt.com `/codex/models` endpoint validates a
-            // mandatory `client_version` query string — without it
-            // the server returns 400 with
-            // `{'type': 'missing', 'loc': ('query', 'client_version')}`.
-            // Any non-empty value is accepted; we send a stable
-            // Codex-CLI-shaped version string so the request still
-            // fingerprints as the impersonated CLI.
+            // mandatory `client_version` query string. The server
+            // ALSO filters the returned model list against each
+            // entry's `minimal_client_version`: a request claiming
+            // an old client only sees models that supported that
+            // client. Send a high pretend version (well above any
+            // current `minimal_client_version` we've observed in
+            // the wild) so users see every model their plan
+            // actually has access to. The 400-on-missing check
+            // doesn't validate the value's format, so anything
+            // sortable as a version works.
             format!(
-                "{}?client_version=0.50.0",
+                "{}?client_version=999.0.0",
                 self.api_url.replace("/responses", "/models")
             )
         } else {
@@ -635,6 +639,28 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
             }
         };
         let ids = extract_model_ids(&parsed);
+        // Surface entry-count diagnostics at trace level so users can
+        // verify the API returned what they expected: the
+        // chatgpt.com `/codex/models` endpoint filters by ChatGPT
+        // plan + `client_version`, so a Codex CLI plan may legitimately
+        // see only a handful of models even when the broader API
+        // surface has many more.
+        let array_len = parsed
+            .pointer("/models")
+            .or_else(|| parsed.pointer("/data"))
+            .and_then(|v| v.as_array().map(|a| a.len()))
+            .or_else(|| parsed.as_array().map(|a| a.len()))
+            .unwrap_or(0);
+        if array_len != ids.len() {
+            // Some entries had no extractable id — interesting enough
+            // to surface at debug. Common cause: future schema drift
+            // adds entries without `id`/`slug`/`display_name`/`name`.
+            tracing::debug!(
+                array_len,
+                extracted = ids.len(),
+                "openai list_models: not every entry had an extractable id"
+            );
+        }
         if ids.is_empty() {
             // No recognizable shape — log a fat preview + the
             // top-level object's keys so we can teach the parser
