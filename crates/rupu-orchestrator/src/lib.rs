@@ -20,8 +20,8 @@ pub use runner::{
     OrchestratorRunResult, ResumeState, RunWorkflowError, StepFactory, StepResult,
 };
 pub use runs::{
-    FindingRecord, ItemResultRecord, RunRecord, RunStatus, RunStore, RunStoreError,
-    StepResultRecord,
+    ApprovalDecision, ApprovalError, FindingRecord, ItemResultRecord, RunRecord, RunStatus,
+    RunStore, RunStoreError, StepResultRecord,
 };
 pub use templates::{
     render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,

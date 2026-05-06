@@ -311,48 +311,36 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
     let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+    let approver = whoami::username();
 
-    let mut record = store
+    // Library call replaces inline load + expire-check + status check
+    // + mutate + update. Re-entering run_workflow stays in the CLI
+    // because the TUI uses a different resume model.
+    let awaited_step_id = match store.approve(run_id, &approver, chrono::Utc::now()) {
+        Ok(rupu_orchestrator::ApprovalDecision::Approved { step_id, .. }) => step_id,
+        Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
+            anyhow::bail!("approval expired before it was acted on — {msg}");
+        }
+        Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
+            anyhow::bail!(
+                "run is `{s}`, not `awaiting_approval` — only paused runs can be approved",
+            );
+        }
+        Err(rupu_orchestrator::ApprovalError::NoAwaitingStep) => {
+            anyhow::bail!("run has no awaiting_step_id; record may be corrupt");
+        }
+        Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
+            anyhow::bail!("run not found: {id}");
+        }
+        Err(e) => return Err(anyhow::anyhow!("approve: {e}")),
+        Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
+    };
+    // Reload the record from disk to get inputs, event, workspace path
+    // for the run_workflow re-entry. The library call already persisted
+    // the status flip to Running, so the record is coherent.
+    let record = store
         .load(run_id)
-        .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
-    // Expire stale paused runs lazily — no ticker daemon needed for v1.
-    if store
-        .expire_if_overdue(&mut record, chrono::Utc::now())
-        .map_err(|e| anyhow::anyhow!("expire check: {e}"))?
-    {
-        anyhow::bail!(
-            "approval expired before it was acted on — {}",
-            record
-                .error_message
-                .as_deref()
-                .unwrap_or("paused run timed out")
-        );
-    }
-    if record.status != rupu_orchestrator::RunStatus::AwaitingApproval {
-        anyhow::bail!(
-            "run is `{}`, not `awaiting_approval` — only paused runs can be approved",
-            record.status.as_str()
-        );
-    }
-    let awaited_step_id = record
-        .awaiting_step_id
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("run has no awaiting_step_id; record may be corrupt"))?;
-
-    // Mutate the record back to Running BEFORE re-entering the
-    // loop. If the re-entered workflow pauses again at another
-    // approval gate, `run_workflow` will flip the status to
-    // AwaitingApproval again and refresh the awaiting_*
-    // fields.
-    record.status = rupu_orchestrator::RunStatus::Running;
-    record.awaiting_step_id = None;
-    record.approval_prompt = None;
-    record.awaiting_since = None;
-    record.expires_at = None;
-    record.error_message = None;
-    store
-        .update(&record)
-        .map_err(|e| anyhow::anyhow!("update run record: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("reload run record: {e}"))?;
 
     // Rebuild context from disk: workflow YAML snapshot + prior
     // step results.
@@ -471,37 +459,27 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
 async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    let mut record = store
-        .load(run_id)
-        .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
-    if store
-        .expire_if_overdue(&mut record, chrono::Utc::now())
-        .map_err(|e| anyhow::anyhow!("expire check: {e}"))?
-    {
-        anyhow::bail!(
-            "approval expired before it was acted on — {}",
-            record
-                .error_message
-                .as_deref()
-                .unwrap_or("paused run timed out")
-        );
+    let approver = whoami::username();
+    let reason_str = reason.unwrap_or("rejected by operator");
+
+    // Library call replaces inline load + expire-check + status check
+    // + mutate + update.
+    match store.reject(run_id, &approver, reason_str, chrono::Utc::now()) {
+        Ok(rupu_orchestrator::ApprovalDecision::Rejected { .. }) => {}
+        Err(rupu_orchestrator::ApprovalError::Expired(msg)) => {
+            anyhow::bail!("approval expired before it was acted on — {msg}");
+        }
+        Err(rupu_orchestrator::ApprovalError::NotAwaiting(s)) => {
+            anyhow::bail!(
+                "run is `{s}`, not `awaiting_approval` — only paused runs can be rejected",
+            );
+        }
+        Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
+            anyhow::bail!("run not found: {id}");
+        }
+        Err(e) => return Err(anyhow::anyhow!("reject: {e}")),
+        Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
     }
-    if record.status != rupu_orchestrator::RunStatus::AwaitingApproval {
-        anyhow::bail!(
-            "run is `{}`, not `awaiting_approval` — only paused runs can be rejected",
-            record.status.as_str()
-        );
-    }
-    record.status = rupu_orchestrator::RunStatus::Rejected;
-    record.finished_at = Some(chrono::Utc::now());
-    record.error_message = Some(
-        reason
-            .map(str::to_string)
-            .unwrap_or_else(|| "rejected by operator".into()),
-    );
-    store
-        .update(&record)
-        .map_err(|e| anyhow::anyhow!("update run record: {e}"))?;
     println!("rupu: run {run_id} marked rejected");
     Ok(())
 }

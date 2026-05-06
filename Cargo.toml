@@ -78,6 +78,7 @@ insta = { version = "1", features = ["yaml"] }
 minijinja = "2"
 dirs = "5"
 which = "6"
+whoami = "1"
 
 # Auth
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
