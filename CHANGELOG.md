@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.4.7 — clean missing-credential error + OpenAI models listing fix (2026-05-06)
+
+Rolls forward v0.4.6 to include two fixes that landed after the v0.4.6 tag:
+
+### Fixed
+- **No more panic on missing credentials (PR #65)**: `StepFactory` previously
+  `.expect()`-ed when no credential was present for the requested provider/mode,
+  killing `rupu workflow run` with a backtrace. It now constructs a stub
+  `LlmProvider` that returns a `ProviderError::AuthConfig` carrying the exact
+  `rupu auth login --provider <p> --mode <m>` invocation to fix it. The error
+  surfaces through the line-stream UI as a normal step failure with hint.
+- **OpenAI `rupu models list` shows live models again (PR #66)**: the
+  `chatgpt.com/backend-api/codex/models` response uses `slug` as the model
+  identifier, not `id`. Replaced the strict `serde` deserializer with a lenient
+  `extract_model_ids` walker that probes `id` / `slug` / `display_name` / `name`
+  in order, and accepts arrays of strings or arrays of objects under
+  `data` / `models` / a top-level array. Diagnostic logging now dumps top-level
+  keys + first-entry keys + 2000-char preview when zero models parse, so
+  future shape drift is self-debugging.
+
+(All v0.4.6 changes below are also included.)
+
 ## v0.4.6 — interactive prompt + spinner + design polish (2026-05-06)
 
 ### Fixed
