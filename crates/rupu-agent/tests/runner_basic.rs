@@ -33,6 +33,7 @@ async fn happy_path_one_turn_no_tools() {
         user_message: "say hi".into(),
         mode_str: "bypass".into(),
         no_stream: false,
+        suppress_stream_stdout: false,
         mcp_registry: None,
         effort: None,
         context_window: None,

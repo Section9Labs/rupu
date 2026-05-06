@@ -230,6 +230,10 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         user_message,
         mode_str: mode_str.to_string(),
         no_stream: args.no_stream,
+        // Single-agent `rupu run` keeps the legacy line-stream UI
+        // for v0; the TUI attach for this command was deferred to
+        // a future slice. Workflow runs flip this to true.
+        suppress_stream_stdout: false,
         mcp_registry: Some(scm_registry),
         effort: spec.effort,
         context_window: spec.context_window,

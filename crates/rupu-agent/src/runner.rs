@@ -92,6 +92,13 @@ pub struct AgentRunOpts {
     /// If true, skip token streaming and use `provider.send` for one-shot
     /// completions. Default is false (streaming). Used by --no-stream.
     pub no_stream: bool,
+    /// If true, suppress stdout writes from the streaming code path.
+    /// The provider's text deltas still flow into the JSONL transcript
+    /// writer; only the `print!`/`println!` calls used by the legacy
+    /// line-stream UI are skipped. The TUI sets this to `true` because
+    /// it owns the alt-screen — any stdout write corrupts the canvas.
+    /// Default false (preserves the line-stream UI for `rupu run`).
+    pub suppress_stream_stdout: bool,
     /// SCM/issue registry. When `Some`, the runner spins up an in-process
     /// MCP server before the first turn and tears it down before returning.
     /// `None` means MCP tools are unavailable for this run (test harness,
@@ -223,7 +230,11 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 }
             }
         } else {
+            let suppress = opts.suppress_stream_stdout;
             let mut on_event = |ev: StreamEvent| {
+                if suppress {
+                    return;
+                }
                 if let StreamEvent::TextDelta(chunk) = ev {
                     use std::io::Write;
                     print!("{chunk}");
@@ -232,7 +243,9 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             };
             match opts.provider.stream(&req, &mut on_event).await {
                 Ok(r) => {
-                    println!();
+                    if !suppress {
+                        println!();
+                    }
                     r
                 }
                 Err(e) => {

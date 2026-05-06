@@ -915,6 +915,11 @@ impl StepFactory for CliStepFactory {
             user_message: rendered_prompt,
             mode_str: self.mode_str.clone(),
             no_stream: false,
+            // Workflow runs always feed into the TUI; the TUI tails
+            // the JSONL transcript for tokens. Suppress the legacy
+            // line-stream stdout writes so they don't corrupt the
+            // alt-screen canvas.
+            suppress_stream_stdout: true,
             mcp_registry: Some(Arc::clone(&self.mcp_registry)),
             effort: spec.effort,
             context_window: spec.context_window,

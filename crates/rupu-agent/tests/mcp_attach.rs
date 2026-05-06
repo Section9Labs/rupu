@@ -40,6 +40,7 @@ async fn mcp_registry_attaches_tools_to_run() {
         user_message: "list repos".into(),
         mode_str: "bypass".into(),
         no_stream: true,
+        suppress_stream_stdout: false,
         mcp_registry: Some(Arc::new(Registry::empty())),
         effort: None,
         context_window: None,

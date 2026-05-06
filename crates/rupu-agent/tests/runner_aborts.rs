@@ -27,6 +27,7 @@ fn opts(
         user_message: "go".into(),
         mode_str: "bypass".into(),
         no_stream: false,
+        suppress_stream_stdout: false,
         mcp_registry: None,
         effort: None,
         context_window: None,
