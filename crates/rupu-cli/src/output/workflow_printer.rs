@@ -4,12 +4,13 @@
 //! it polls `step_results.jsonl` for new completed steps and tails each
 //! step's JSONL transcript file as events arrive.
 //!
-//! **Layout assumption** (matches the orchestrator's on-disk format):
+//! Layout assumption (matches the orchestrator's on-disk format):
 //! - `runs_dir/<run_id>/run.json` — status + metadata.
-//! - `runs_dir/<run_id>/step_results.jsonl` — one line per completed step;
-//!   each line carries `transcript_path` pointing to the JSONL transcript.
-//! - Individual step transcripts live at `transcript_path` (absolute path
-//!   stored in `step_results.jsonl`).
+//! - `runs_dir/<run_id>/step_results.jsonl` — one line per completed step.
+//!   Each line carries `transcript_path` (or empty for panel steps) plus
+//!   per-panelist `items[]` for panels.
+//! - Individual step / panelist transcripts live at the absolute paths
+//!   referenced from those records.
 //!
 //! The poller also reads `run.json` to detect when the run transitions
 //! to a terminal state (`completed` / `failed`) or an approval gate
@@ -32,25 +33,17 @@ const RUN_DIR_TIMEOUT_MS: u64 = 5_000;
 /// How long to keep polling after RunComplete before declaring done.
 const DRAIN_EXTRA_MS: u64 = 200;
 
-/// Per-step printer state.
+/// Per-step printer state for a non-panel (linear) step.
 struct StepState {
     tailer: TranscriptTailer,
     step_id: String,
     agent: Option<String>,
     provider: Option<String>,
     model: Option<String>,
-    /// Spinner handle for the running glyph. Dropped when the step ends.
     spinner: Option<SpinnerHandle>,
 }
 
 /// Drive `printer` from a live or recently-finished workflow run.
-///
-/// `run_id` — the workflow run id (e.g. `run_01…`).
-/// `runs_dir` — `<global>/runs/`.
-/// `printer` — the `LineStreamPrinter` to write to.
-/// `run_store` — the `RunStore` for approve/reject callbacks.
-///
-/// Returns `Ok(())` when the run reaches a terminal state.
 pub fn attach_and_print(
     workflow_name: &str,
     run_id: &str,
@@ -63,8 +56,7 @@ pub fn attach_and_print(
     let run_json = run_dir.join("run.json");
     let step_results_log = run_dir.join("step_results.jsonl");
 
-    // Wait for run.json to exist (the orchestrator creates the run dir
-    // synchronously before dispatching any steps).
+    // Wait for run.json to exist.
     let deadline = Instant::now() + Duration::from_millis(RUN_DIR_TIMEOUT_MS);
     loop {
         if run_json.is_file() {
@@ -79,7 +71,7 @@ pub fn attach_and_print(
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Print the workflow header from run.json.
+    // Workflow header.
     let started_at = {
         let bytes = std::fs::read(&run_json)?;
         let rec: serde_json::Value =
@@ -91,20 +83,14 @@ pub fn attach_and_print(
     };
     printer.workflow_header(workflow_name, run_id, started_at);
 
-    // Step-printer state: ordered by position in step_results.jsonl
-    // (which is append-only).
     let mut seen_step_results: usize = 0;
     let mut steps: Vec<StepState> = Vec::new();
     let mut total_tokens: u64 = 0;
-    // Print a phase separator before the second and later steps.
     let mut step_count: usize = 0;
 
-    // Track which step transcript paths we've opened tailers for.
     let mut opened: BTreeSet<PathBuf> = BTreeSet::new();
 
-    // Main polling loop.
     loop {
-        // ── 1. Drain any newly completed steps from step_results.jsonl ──
         drain_step_results(
             &step_results_log,
             transcript_dir,
@@ -115,7 +101,6 @@ pub fn attach_and_print(
             &mut step_count,
         );
 
-        // ── 2. Drain events from all open tailers ──
         for step in &mut steps {
             let events = step.tailer.drain();
             for ev in events {
@@ -123,7 +108,6 @@ pub fn attach_and_print(
             }
         }
 
-        // ── 3. Check run.json for status transitions ──
         let record = match load_run_record(&run_json) {
             Some(r) => r,
             None => {
@@ -135,8 +119,6 @@ pub fn attach_and_print(
         let status = record["status"].as_str().unwrap_or("unknown");
         match status {
             "awaiting_approval" => {
-                // The orchestrator has paused. Drain any remaining events
-                // then present the approval prompt.
                 flush_all_tailers(&mut steps, printer, &mut total_tokens);
 
                 let step_id = record["awaiting_step_id"]
@@ -148,7 +130,6 @@ pub fn attach_and_print(
                     .unwrap_or("Approve this step?")
                     .to_string();
 
-                // Keep a loop so 'v' can show findings and re-prompt.
                 loop {
                     let ch = printer
                         .approval_prompt(&step_id, &prompt)
@@ -156,12 +137,9 @@ pub fn attach_and_print(
 
                     match ch {
                         'v' | 'V' => {
-                            // Load findings for the awaiting step from
-                            // step_results.jsonl and display them.
-                            let findings =
-                                load_step_findings(&step_results_log, &step_id);
-                            printer.print_findings(&findings);
-                            // Loop back to re-show the prompt.
+                            let groups =
+                                load_findings_groups(&step_results_log, &step_id);
+                            printer.print_findings(&groups);
                         }
                         'a' | 'A' => {
                             let approver = whoami::username();
@@ -197,8 +175,6 @@ pub fn attach_and_print(
                             return Ok(());
                         }
                         _ => {
-                            // q or anything else: abort print loop; run keeps
-                            // going in background (spawned by workflow.rs).
                             println!();
                             println!("Detached from run. It is still running.");
                             println!("Re-attach with: rupu watch {run_id}");
@@ -208,7 +184,6 @@ pub fn attach_and_print(
                 }
             }
             "completed" => {
-                // Drain remaining events then print footer.
                 std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
                 drain_step_results(
                     &step_results_log,
@@ -235,7 +210,6 @@ pub fn attach_and_print(
                 return Ok(());
             }
             "failed" | "rejected" => {
-                // Drain remaining events then print failure footer.
                 std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
                 flush_all_tailers(&mut steps, printer, &mut total_tokens);
 
@@ -259,27 +233,36 @@ fn load_run_record(run_json: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Load findings for a specific step from `step_results.jsonl`.
-/// Returns the findings from the *last* record for that step (in case of
-/// retries / multiple iterations).
-fn load_step_findings(log: &Path, step_id: &str) -> Vec<FindingRecord> {
+/// Walk `step_results.jsonl` and return findings grouped by source step,
+/// excluding the awaiting (gate) step itself. Order matches the JSONL file.
+/// Falls back to a single empty group if the file is unreadable.
+fn load_findings_groups(
+    log: &Path,
+    awaiting_step_id: &str,
+) -> Vec<(String, Vec<FindingRecord>)> {
     let Ok(bytes) = std::fs::read(log) else {
         return Vec::new();
     };
-    let mut findings: Vec<FindingRecord> = Vec::new();
+    let mut out: Vec<(String, Vec<FindingRecord>)> = Vec::new();
     for line in bytes.split(|&b| b == b'\n').filter(|l| !l.is_empty()) {
         let Ok(rec): Result<StepResultRecord, _> = serde_json::from_slice(line) else {
             continue;
         };
-        if rec.step_id == step_id {
-            findings = rec.findings;
+        if rec.step_id == awaiting_step_id {
+            continue;
         }
+        if rec.findings.is_empty() {
+            continue;
+        }
+        out.push((rec.step_id.clone(), rec.findings));
     }
-    findings
+    out
 }
 
-/// Read newly-appended lines from `step_results.jsonl`, open tailers
-/// for new transcript files, and start the step block in the printer.
+/// Read newly-appended lines from `step_results.jsonl`. For non-panel steps
+/// we open a transcript tailer for live event streaming. For panel steps
+/// (`items.len() > 0` and `transcript_path` empty) we render the panelist
+/// summary inline — there's nothing to tail.
 #[allow(clippy::too_many_arguments)]
 fn drain_step_results(
     log: &Path,
@@ -298,47 +281,75 @@ fn drain_step_results(
         .filter(|l| !l.is_empty())
         .collect();
 
-    // Only process lines we haven't seen yet.
     for line in lines.iter().skip(*seen) {
         *seen += 1;
-        let Ok(rec): Result<serde_json::Value, _> = serde_json::from_slice(line) else {
+        // Decode as the typed record so we get items + findings cleanly.
+        let Ok(rec): Result<StepResultRecord, _> = serde_json::from_slice(line) else {
             continue;
         };
-        let step_id = rec["step_id"].as_str().unwrap_or("?").to_string();
-        let skipped = rec["skipped"].as_bool().unwrap_or(false);
-        if skipped {
-            // Silently skip; the step had `when:` = false.
+        if rec.skipped {
             continue;
         }
-        let transcript_path_str = rec["transcript_path"].as_str().unwrap_or("");
-        if transcript_path_str.is_empty() {
-            continue;
-        }
-        let transcript_path = PathBuf::from(transcript_path_str);
-        if opened.contains(&transcript_path) {
-            continue;
-        }
-        opened.insert(transcript_path.clone());
-        let tailer = TranscriptTailer::new(&transcript_path);
 
-        // Print a phase separator between steps for visual rhythm.
+        let is_panel = !rec.items.is_empty();
+
         if *step_count > 0 {
             printer.phase_separator();
         }
         *step_count += 1;
 
-        // Start the step header with an animated spinner glyph.
-        let spinner = printer.step_start(&step_id, None, None, None);
-        steps.push(StepState {
-            tailer,
-            step_id,
-            agent: None,
-            provider: None,
-            model: None,
-            spinner: Some(spinner),
-        });
+        if is_panel {
+            // Open the panel header, then immediately render each panelist
+            // summary line. Panel steps don't have a top-level transcript;
+            // their events live in each panelist's transcript.
+            let spinner = printer.panel_start(&rec.step_id, rec.items.len());
+            for item in &rec.items {
+                let count = rec
+                    .findings
+                    .iter()
+                    .filter(|f| f.source == item.sub_id)
+                    .count();
+                printer.panelist_line(&item.sub_id, item.success, count);
+            }
+            spinner.stop();
+            printer.panel_done(
+                &rec.step_id,
+                rec.success,
+                rec.findings.len(),
+                Duration::ZERO,
+            );
+        } else {
+            // Linear step — open a tailer if we have a transcript.
+            if rec.transcript_path.as_os_str().is_empty()
+                || !rec.transcript_path.exists()
+            {
+                // Header + immediate footer (nothing to stream).
+                let spinner = printer.step_start(&rec.step_id, None, None, None);
+                spinner.stop();
+                if rec.success {
+                    printer.step_done(&rec.step_id, Duration::ZERO, 0);
+                } else {
+                    printer.step_failed(&rec.step_id, "no transcript");
+                }
+                continue;
+            }
+            if opened.contains(&rec.transcript_path) {
+                continue;
+            }
+            opened.insert(rec.transcript_path.clone());
+            let tailer = TranscriptTailer::new(&rec.transcript_path);
+            let spinner = printer.step_start(&rec.step_id, None, None, None);
+            steps.push(StepState {
+                tailer,
+                step_id: rec.step_id.clone(),
+                agent: None,
+                provider: None,
+                model: None,
+                spinner: Some(spinner),
+            });
+        }
     }
-    let _ = transcript_dir; // used by the caller for resolution; unused here
+    let _ = transcript_dir;
 }
 
 fn process_event(
@@ -354,9 +365,6 @@ fn process_event(
             model,
             ..
         } => {
-            // We already printed step_start with no metadata; we can't
-            // retroactively update it (it's already on screen). The metadata
-            // is visible in the transcript for drill-down.
             step.agent = Some(agent);
             step.provider = Some(provider);
             step.model = Some(model);
@@ -375,7 +383,6 @@ fn process_event(
             error,
             ..
         } => {
-            // Stop the spinner before printing the completion line.
             if let Some(spinner) = step.spinner.take() {
                 spinner.stop();
             }
@@ -391,8 +398,6 @@ fn process_event(
                 }
             }
         }
-        // Ignore TurnStart/TurnEnd/Usage/FileEdit/CommandRun/ActionEmitted/GateRequested
-        // for the MVP line-stream view.
         _ => {}
     }
 }
@@ -407,15 +412,13 @@ fn flush_all_tailers(
         for ev in events {
             process_event(ev, step, printer, total_tokens);
         }
-        // Stop any still-running spinners when we flush at end-of-run.
         if let Some(spinner) = step.spinner.take() {
             spinner.stop();
         }
     }
 }
 
-/// Produce a short summary string for a tool call to show in the timeline.
-/// Exposed as `pub` for the watch command's replay mode.
+/// Produce a short summary for a tool call to show in the timeline.
 pub fn tool_summary(tool: &str, input: &serde_json::Value) -> String {
     summarize_tool_input(tool, input)
 }
@@ -445,7 +448,6 @@ fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
             .unwrap_or("")
             .to_string(),
         _ => {
-            // For MCP tools, show the first string field if any.
             if let Some(obj) = input.as_object() {
                 for (_, v) in obj.iter().take(1) {
                     if let Some(s) = v.as_str() {

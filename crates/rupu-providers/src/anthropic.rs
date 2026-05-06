@@ -14,6 +14,62 @@ use crate::sse::SseParser;
 use crate::types::*;
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages?beta=true";
+
+// ── Tool-name sanitization (mirrors openai_codex.rs) ─────────────────────────
+//
+// Anthropic's `/v1/messages` endpoint validates each custom tool's `name`
+// against `^[a-zA-Z0-9_-]{1,128}$` and rejects anything containing `.`.
+// Our MCP tool catalog (and any user MCP tools) uses dot-separated names
+// like `scm.repos.list` and `issues.create`. We escape `.` → `__dot__` at
+// the wire boundary and reverse the substitution on the way back so the
+// dispatcher sees the canonical name. The escape is round-trip safe: the
+// 7-char marker is illegal as part of a real tool name (no double
+// underscore + literal `dot` followed by double underscore would clash
+// in practice).
+
+const ANTHROPIC_TOOL_NAME_DOT_ESCAPE: &str = "__dot__";
+
+fn sanitize_anthropic_tool_name(name: &str) -> String {
+    name.replace('.', ANTHROPIC_TOOL_NAME_DOT_ESCAPE)
+}
+
+fn desanitize_anthropic_tool_name(name: &str) -> String {
+    name.replace(ANTHROPIC_TOOL_NAME_DOT_ESCAPE, ".")
+}
+
+/// Walk a serialized `messages` JSON array and rewrite every
+/// `tool_use` block's `name` field through `sanitize_anthropic_tool_name`.
+/// Used by `build_request_body` to ensure echoed conversation history
+/// also uses the wire-safe form.
+fn sanitize_messages_tool_names(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(arr) = value.as_array_mut() {
+        for msg in arr.iter_mut() {
+            if let Some(content) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                for block in content.iter_mut() {
+                    let is_tool_use = block
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s == "tool_use")
+                        .unwrap_or(false);
+                    if !is_tool_use {
+                        continue;
+                    }
+                    let Some(name_str) = block
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    block["name"] = serde_json::Value::String(
+                        sanitize_anthropic_tool_name(&name_str),
+                    );
+                }
+            }
+        }
+    }
+    value
+}
 /// Anthropic API version. Update when new SSE event types or features are needed.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 // ─────────────────────────────────────────────────────────────────────
@@ -939,10 +995,18 @@ impl AnthropicClient {
     }
 
     fn build_request_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
+        // Walk the conversation history once, sanitizing every ToolUse
+        // block's `name` to its wire-safe form. Internal state still uses
+        // the canonical "scm.repos.list" form; only the wire payload sees
+        // the escaped variant.
+        let messages_value: serde_json::Value = serde_json::to_value(&request.messages)
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let messages_value = sanitize_messages_tool_names(messages_value);
+
         let mut body = serde_json::json!({
             "model": request.model,
             "max_tokens": request.max_tokens,
-            "messages": request.messages,
+            "messages": messages_value,
             "stream": stream,
         });
 
@@ -985,7 +1049,20 @@ impl AnthropicClient {
         }
 
         if !request.tools.is_empty() {
-            body["tools"] = serde_json::json!(request.tools);
+            // Sanitize each tool's name on the wire. Description and
+            // input_schema are unaffected.
+            let tools_array: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": sanitize_anthropic_tool_name(&t.name),
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::Value::Array(tools_array);
         }
 
         // OAuth-scope parity with the first-party Claude client: carry a
@@ -1158,11 +1235,15 @@ impl AnthropicClient {
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string();
-                        let name = block
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
+                        // Wire-form names may carry the __dot__ escape from
+                        // build_request_body's sanitization. Reverse it before
+                        // surfacing to the dispatcher / accumulator.
+                        let name = desanitize_anthropic_tool_name(
+                            block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default(),
+                        );
                         acc.current_tool_id = Some(id.clone());
                         acc.current_tool_name = Some(name.clone());
                         acc.current_tool_input.clear();
@@ -1437,6 +1518,105 @@ impl crate::provider::LlmProvider for AnthropicClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_anthropic_tool_name_escapes_dots() {
+        assert_eq!(
+            sanitize_anthropic_tool_name("scm.repos.list"),
+            "scm__dot__repos__dot__list"
+        );
+        assert_eq!(sanitize_anthropic_tool_name("issues.create"), "issues__dot__create");
+    }
+
+    #[test]
+    fn sanitize_anthropic_tool_name_passes_through_safe_names() {
+        assert_eq!(sanitize_anthropic_tool_name("read_file"), "read_file");
+        assert_eq!(sanitize_anthropic_tool_name("bash"), "bash");
+        assert_eq!(sanitize_anthropic_tool_name("write-file"), "write-file");
+    }
+
+    #[test]
+    fn anthropic_tool_name_round_trip() {
+        for name in [
+            "scm.repos.list",
+            "scm.branches.list",
+            "issues.create",
+            "github.workflows_dispatch",
+            "read_file",
+            "bash",
+        ] {
+            let escaped = sanitize_anthropic_tool_name(name);
+            let unescaped = desanitize_anthropic_tool_name(&escaped);
+            assert_eq!(unescaped, name, "round-trip failed for {name}");
+        }
+    }
+
+    #[test]
+    fn sanitize_messages_tool_names_rewrites_tool_use_blocks() {
+        let input = serde_json::json!([
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hi"}]
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "let me check"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "scm.repos.list",
+                        "input": {"platform": "github"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+                ]
+            }
+        ]);
+        let out = sanitize_messages_tool_names(input);
+        // Assistant tool_use name was rewritten.
+        assert_eq!(
+            out[1]["content"][1]["name"].as_str().unwrap(),
+            "scm__dot__repos__dot__list"
+        );
+        // Other fields untouched.
+        assert_eq!(out[0]["content"][0]["text"], "hi");
+        assert_eq!(out[2]["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn build_request_body_sanitizes_tool_names() {
+        let client = AnthropicClient::new("test-key".into());
+        let request = LlmRequest {
+            model: "claude-sonnet-4-6".into(),
+            messages: vec![Message::user("hi")],
+            system: None,
+            tools: vec![ToolDefinition {
+                name: "scm.repos.list".into(),
+                description: "list repos".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            max_tokens: 1024,
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        };
+        let body = client.build_request_body(&request, false);
+        assert_eq!(
+            body["tools"][0]["name"].as_str().unwrap(),
+            "scm__dot__repos__dot__list"
+        );
+    }
 
     #[test]
     fn beta_csv_omits_context_1m_for_default_model() {
