@@ -615,35 +615,111 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
             );
             return Vec::new();
         }
-        // Both endpoints return a `data` array of `{id: "..."}`
-        // objects (chatgpt.com's includes more metadata we don't
-        // need here).
-        #[derive(serde::Deserialize)]
-        struct ListResp {
-            #[serde(default)]
-            data: Vec<ModelEntry>,
-            #[serde(default)]
-            models: Vec<ModelEntry>,
-        }
-        #[derive(serde::Deserialize)]
-        struct ModelEntry {
-            id: String,
-        }
-        let body: ListResp = match resp.json().await {
-            Ok(b) => b,
+        // Read the body as text first so a parse failure can log a
+        // preview — without that we just see "error decoding response
+        // body" with no clue about the actual shape, which is the
+        // exact debugging story we hit shipping #62.
+        let body_text = match resp.text().await {
+            Ok(t) => t,
             Err(e) => {
-                tracing::warn!(error = %e, "openai list_models: JSON parse failed");
+                tracing::warn!(error = %e, "openai list_models: read body failed");
                 return Vec::new();
             }
         };
-        // Some chatgpt.com responses use `models` instead of `data`;
-        // accept either.
-        let entries = if body.data.is_empty() { body.models } else { body.data };
-        entries
-            .into_iter()
-            .map(|e| make_model_info(e.id, crate::provider_id::ProviderId::OpenaiCodex))
+        let parsed: serde_json::Value = match serde_json::from_str(&body_text) {
+            Ok(v) => v,
+            Err(e) => {
+                let preview: String = body_text.chars().take(200).collect();
+                tracing::warn!(error = %e, body = %preview, "openai list_models: JSON parse failed");
+                return Vec::new();
+            }
+        };
+        let ids = extract_model_ids(&parsed);
+        if ids.is_empty() {
+            // No recognizable shape — log a fat preview + the
+            // top-level object's keys so we can teach the parser
+            // the next variant we encounter without another round
+            // of debugging.
+            let preview: String = body_text.chars().take(2000).collect();
+            let top_keys: Vec<String> = parsed
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            let first_entry_keys: Vec<String> = parsed
+                .pointer("/models/0")
+                .or_else(|| parsed.pointer("/data/0"))
+                .and_then(|v| v.as_object())
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default();
+            tracing::warn!(
+                top_keys = ?top_keys,
+                first_entry_keys = ?first_entry_keys,
+                body = %preview,
+                "openai list_models: response had no recognizable model list"
+            );
+        }
+        ids.into_iter()
+            .map(|id| make_model_info(id, crate::provider_id::ProviderId::OpenaiCodex))
             .collect()
     }
+}
+
+/// Lenient model-id extractor for the assorted shapes OpenAI's
+/// listing endpoints return. Handles all the variants we've seen:
+///
+/// - `{ "data":   [{"id":"gpt-5"}, ...] }` — api.openai.com /v1/models.
+/// - `{ "models": [{"slug":"gpt-5","display_name":"...", ...}, ...] }`
+///   — chatgpt.com `/backend-api/codex/models` (current production
+///   shape, observed 2026-05). The objects carry rich metadata
+///   per-model (context window, supported reasoning levels, etc.);
+///   we only need the model id, which lives in `slug`.
+/// - `{ "models": [{"id":"gpt-5"}, ...] }` — chatgpt.com's older
+///   shape, kept for forward-compat with rollouts that revert.
+/// - `{ "models": ["gpt-5", ...] }` — defensive: array of strings.
+/// - `[ "gpt-5", ... ]` / `[{"id":"gpt-5"}, ...]` — defensive:
+///   bare top-level array.
+///
+/// Object entries probe `id` first (legacy / api-key path), then
+/// `slug` (current chatgpt.com), then `display_name` as a last
+/// resort. Strings are taken as-is.
+///
+/// Free function so the unit tests below can exercise it directly
+/// without spinning up an HTTP mock.
+pub(crate) fn extract_model_ids(parsed: &serde_json::Value) -> Vec<String> {
+    fn id_from_object(v: &serde_json::Value) -> Option<String> {
+        for key in ["id", "slug", "display_name", "name"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn entries_from_array(arr: &[serde_json::Value]) -> Vec<String> {
+        arr.iter()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(_) => id_from_object(v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    if let serde_json::Value::Array(arr) = parsed {
+        return entries_from_array(arr);
+    }
+    if let Some(arr) = parsed.get("data").and_then(|v| v.as_array()) {
+        let ids = entries_from_array(arr);
+        if !ids.is_empty() {
+            return ids;
+        }
+    }
+    if let Some(arr) = parsed.get("models").and_then(|v| v.as_array()) {
+        return entries_from_array(arr);
+    }
+    Vec::new()
 }
 
 // ── model_pool helper ────────────────────────────────────────────────
@@ -1600,6 +1676,78 @@ mod tests {
             <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-5");
+    }
+
+    #[tokio::test]
+    async fn list_models_handles_chatgpt_codex_slug_shape() {
+        // Production shape (observed live 2026-05): chatgpt.com's
+        // `/backend-api/codex/models` returns a `models` array of
+        // rich objects keyed on `slug`, not `id`. Each entry has
+        // dozens of metadata fields (context window, supported
+        // reasoning levels, etc.); we only need the slug.
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "models": [
+                        {
+                            "slug": "gpt-5.2",
+                            "display_name": "gpt-5.2",
+                            "context_window": 272000,
+                            "default_reasoning_level": "medium"
+                        },
+                        {
+                            "slug": "gpt-5-mini",
+                            "display_name": "gpt-5-mini",
+                            "context_window": 128000
+                        }
+                    ]
+                }));
+        });
+        let creds = AuthCredentials::ApiKey {
+            key: "sk-test".into(),
+        };
+        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        client.api_url = format!("{}/backend-api/codex/responses", server.url(""));
+        let models =
+            <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["gpt-5.2", "gpt-5-mini"]);
+    }
+
+    #[test]
+    fn extract_model_ids_handles_all_known_shapes() {
+        // Top-level array of strings.
+        let v = serde_json::json!(["gpt-5", "gpt-5-mini"]);
+        assert_eq!(extract_model_ids(&v), vec!["gpt-5", "gpt-5-mini"]);
+
+        // Top-level array of objects with `id`.
+        let v = serde_json::json!([{"id":"gpt-5"}, {"id":"gpt-5-mini"}]);
+        assert_eq!(extract_model_ids(&v), vec!["gpt-5", "gpt-5-mini"]);
+
+        // `data` array (api.openai.com shape).
+        let v = serde_json::json!({"data":[{"id":"gpt-5"},{"id":"gpt-4o"}]});
+        assert_eq!(extract_model_ids(&v), vec!["gpt-5", "gpt-4o"]);
+
+        // `models` array of slug-keyed objects (chatgpt.com 2026-05).
+        let v = serde_json::json!({"models":[{"slug":"gpt-5.2"},{"slug":"gpt-5-mini"}]});
+        assert_eq!(extract_model_ids(&v), vec!["gpt-5.2", "gpt-5-mini"]);
+
+        // `models` array of strings (defensive).
+        let v = serde_json::json!({"models":["gpt-5","gpt-5-mini"]});
+        assert_eq!(extract_model_ids(&v), vec!["gpt-5", "gpt-5-mini"]);
+
+        // `id` wins over `slug` when both are present.
+        let v = serde_json::json!([{"id":"the-id","slug":"the-slug"}]);
+        assert_eq!(extract_model_ids(&v), vec!["the-id"]);
+
+        // Empty / unrecognized shapes return empty.
+        assert!(extract_model_ids(&serde_json::json!({})).is_empty());
+        assert!(extract_model_ids(&serde_json::json!({"weird":[1,2]})).is_empty());
+        assert!(extract_model_ids(&serde_json::json!(null)).is_empty());
     }
 
     #[test]
