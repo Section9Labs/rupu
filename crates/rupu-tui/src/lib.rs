@@ -26,6 +26,10 @@ pub fn run_watch(run_id: String, runs_dir: PathBuf) -> TuiResult<()> {
     app::App::new(run_id, source, store, workflow).run()
 }
 
+pub fn run_attached(run_id: String, runs_dir: PathBuf) -> TuiResult<()> {
+    run_watch(run_id, runs_dir)
+}
+
 pub fn run_replay(run_id: String, runs_dir: PathBuf, pace_us: u64) -> TuiResult<()> {
     let store = RunStore::new(runs_dir.clone());
     let workflow = match store.read_workflow_snapshot(&run_id) {

@@ -3239,6 +3239,7 @@ dependencies = [
  "rupu-scm",
  "rupu-tools",
  "rupu-transcript",
+ "rupu-tui",
  "rupu-webhook",
  "rupu-workspace",
  "serde",

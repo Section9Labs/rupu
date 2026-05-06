@@ -525,7 +525,7 @@ pub async fn run_by_name(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event).await
+    run_with_outcome(name, None, inputs, mode, event, false).await
 }
 
 async fn run(
@@ -535,7 +535,7 @@ async fn run(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event)
+    run_with_outcome(name, target, inputs, mode, event, true)
         .await
         .map(|_| ())
 }
@@ -549,6 +549,7 @@ async fn run_with_outcome(
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
     event: Option<serde_json::Value>,
+    attach_tui: bool,
 ) -> anyhow::Result<RunOutcomeSummary> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
@@ -658,7 +659,7 @@ async fn run_with_outcome(
     let inputs_map: BTreeMap<String, String> = inputs.into_iter().collect();
     let runs_dir = global.join("runs");
     paths::ensure_dir(&runs_dir)?;
-    let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+    let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir.clone()));
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -672,7 +673,48 @@ async fn run_with_outcome(
         resume_from: None,
     };
 
-    let result = run_workflow(opts).await?;
+    // When `attach_tui` is set (CLI-interactive path), spawn the workflow
+    // runner in the background, wait for the run directory to appear on
+    // disk (the orchestrator writes it before dispatching any step), then
+    // attach the TUI in the foreground. Pressing `q` exits the TUI while
+    // the runner keeps going (spec §4 — quitting never cancels a run).
+    //
+    // Non-interactive callers (webhook receiver, cron tick) pass
+    // `attach_tui = false` and keep the original inline-await path so
+    // they can capture and forward the result without a terminal.
+    let result = if attach_tui {
+        // Snapshot the run dir entries that exist *before* the spawn so
+        // we can detect the new one the orchestrator creates.
+        let existing_run_ids: std::collections::BTreeSet<String> =
+            list_run_dir_entries(&runs_dir);
+
+        // Spawn the workflow runner. `opts` is moved into the task;
+        // `_clone_guard` keeps the tmpdir alive through the scope.
+        let runner_task = tokio::spawn(run_workflow(opts));
+
+        // Poll for the new run directory (created synchronously by the
+        // orchestrator before any step work begins). 2 s upper bound;
+        // in practice this is microseconds.
+        let run_id = wait_for_new_run_dir(&runs_dir, &existing_run_ids, 2_000).await;
+
+        if let Some(run_id) = run_id {
+            // TUI blocks until the user presses `q` or the run finishes.
+            // Ignore TUI errors (e.g. non-TTY) — the runner is still going.
+            if let Err(e) = rupu_tui::run_attached(run_id, runs_dir) {
+                eprintln!("rupu: TUI exited early: {e}");
+            }
+        }
+
+        // Await the background runner to get results for the post-run
+        // text summary and to propagate any workflow error.
+        runner_task
+            .await
+            .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
+            .map_err(anyhow::Error::from)?
+    } else {
+        run_workflow(opts).await?
+    };
+
     for sr in &result.step_results {
         if sr.run_id.is_empty() {
             // Skipped step (`when:` falsy) — no transcript path.
@@ -711,6 +753,51 @@ async fn run_with_outcome(
         run_id: result.run_id,
         awaiting_step_id: result.awaiting.map(|a| a.step_id),
     })
+}
+
+/// Collect the names of all `run_<ULID>` subdirectories currently
+/// present in `runs_dir`. Used to diff before/after spawning the
+/// workflow runner so we can identify the new run's directory.
+fn list_run_dir_entries(runs_dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let Ok(rd) = std::fs::read_dir(runs_dir) else {
+        return std::collections::BTreeSet::new();
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            if name.starts_with("run_") {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Poll `runs_dir` until a subdirectory appears that was not in
+/// `before`. Returns the new run id or `None` if `timeout_ms` expires
+/// before anything shows up.
+async fn wait_for_new_run_dir(
+    runs_dir: &std::path::Path,
+    before: &std::collections::BTreeSet<String>,
+    timeout_ms: u64,
+) -> Option<String> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if let Ok(rd) = std::fs::read_dir(runs_dir) {
+            for entry in rd.flatten() {
+                let name = entry.file_name().into_string().unwrap_or_default();
+                if name.starts_with("run_") && !before.contains(&name) {
+                    return Some(name);
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// `StepFactory` impl that resolves each step's `agent:` against
