@@ -10,6 +10,13 @@ const TRANSCRIPT_LINES_PER_ASSISTANT_MESSAGE: usize = 3;
 /// Matches the focused-node panel's display width budget.
 const TOOL_INPUT_SUMMARY_LEN: usize = 60;
 
+/// Per-line cap for transcript_tail entries. Panelist agents emit
+/// large JSON blobs as their final assistant message; without a cap,
+/// a single 1000-char JSON line spreads across the panel and
+/// destroys the layout. The panel area is ~38 cols; we cap at 80 so
+/// the panel still wraps cleanly without horizontal blow-up.
+const TRANSCRIPT_TAIL_LINE_CHAR_BUDGET: usize = 80;
+
 pub(super) fn apply(node: &mut NodeState, ev: &Event) {
     match ev {
         Event::RunStart { agent, .. } => {
@@ -24,7 +31,22 @@ pub(super) fn apply(node: &mut NodeState, ev: &Event) {
         }
         Event::AssistantMessage { content, .. } => {
             for line in content.lines().take(TRANSCRIPT_LINES_PER_ASSISTANT_MESSAGE) {
-                node.push_transcript_line(line.to_string());
+                // Hard-truncate per-line so a 5000-character JSON
+                // payload doesn't blow up the focused-node panel.
+                // Width budget is conservative (panel border + 2-col
+                // padding + ellipsis); the panel renderer wraps to
+                // its own width too, but trimming here keeps the
+                // ring-buffer cheap.
+                let trimmed: String = line
+                    .chars()
+                    .take(TRANSCRIPT_TAIL_LINE_CHAR_BUDGET)
+                    .collect();
+                let final_line = if line.chars().count() > TRANSCRIPT_TAIL_LINE_CHAR_BUDGET {
+                    format!("{trimmed}…")
+                } else {
+                    trimmed
+                };
+                node.push_transcript_line(final_line);
             }
         }
         Event::ToolCall { tool, input, .. } => {
