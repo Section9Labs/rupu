@@ -12,12 +12,17 @@ pub mod state;
 pub mod view;
 pub use err::{TuiError, TuiResult};
 
-use std::path::PathBuf;
 use rupu_orchestrator::RunStore;
+use std::path::PathBuf;
 
 pub fn run_watch(run_id: String, runs_dir: PathBuf) -> TuiResult<()> {
     let store = RunStore::new(runs_dir.clone());
-    let _record = store.load(&run_id)?;
+    let _record = store.load(&run_id).map_err(|e| match e {
+        rupu_orchestrator::RunStoreError::NotFound(_) => {
+            TuiError::RunNotFound(run_id.clone(), runs_dir.clone())
+        }
+        other => TuiError::Orchestrator(other),
+    })?;
     let workflow = match store.read_workflow_snapshot(&run_id) {
         Ok(s) => rupu_orchestrator::Workflow::parse(&s).ok(),
         Err(_) => None,
@@ -32,6 +37,13 @@ pub fn run_attached(run_id: String, runs_dir: PathBuf) -> TuiResult<()> {
 
 pub fn run_replay(run_id: String, runs_dir: PathBuf, pace_us: u64) -> TuiResult<()> {
     let store = RunStore::new(runs_dir.clone());
+    // Validate the run exists before proceeding.
+    store.load(&run_id).map_err(|e| match e {
+        rupu_orchestrator::RunStoreError::NotFound(_) => {
+            TuiError::RunNotFound(run_id.clone(), runs_dir.clone())
+        }
+        other => TuiError::Orchestrator(other),
+    })?;
     let workflow = match store.read_workflow_snapshot(&run_id) {
         Ok(s) => rupu_orchestrator::Workflow::parse(&s).ok(),
         Err(_) => None,
@@ -44,7 +56,9 @@ pub fn run_replay(run_id: String, runs_dir: PathBuf, pace_us: u64) -> TuiResult<
 fn collect_scripted(run_dir: &std::path::Path) -> TuiResult<Vec<(String, rupu_transcript::Event)>> {
     let mut out = Vec::new();
     let transcripts = run_dir.join("transcripts");
-    let Ok(rd) = std::fs::read_dir(&transcripts) else { return Ok(out) };
+    let Ok(rd) = std::fs::read_dir(&transcripts) else {
+        return Ok(out);
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -57,7 +71,9 @@ fn collect_scripted(run_dir: &std::path::Path) -> TuiResult<Vec<(String, rupu_tr
             .unwrap_or("")
             .to_string();
         for line in bytes.split(|&b| b == b'\n') {
-            if line.is_empty() { continue }
+            if line.is_empty() {
+                continue;
+            }
             if let Ok(event) = serde_json::from_slice::<rupu_transcript::Event>(line) {
                 out.push((step_id.clone(), event));
             }

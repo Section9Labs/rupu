@@ -8,12 +8,6 @@ pub enum TuiError {
     #[error("run `{0}` not found in {1}")]
     RunNotFound(String, PathBuf),
 
-    #[error("workflow spec not found for run `{0}` (degraded mode)")]
-    WorkflowSpecMissing(String),
-
-    #[error("terminal too narrow (need at least {min} cols, have {have})")]
-    TerminalTooNarrow { min: u16, have: u16 },
-
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 

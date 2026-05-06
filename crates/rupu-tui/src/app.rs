@@ -2,7 +2,7 @@ use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{self as cev, DisableMouseCapture, EnableMouseCapture, Event as CtEvent},
+    event::{self as cev, Event as CtEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -18,8 +18,8 @@ use crate::control::{dispatch, Action};
 use crate::source::{EventSource, SourceEvent};
 use crate::state::{derive_edges, RunModel};
 use crate::view::{
-    canvas::render_canvas_with_warning, panel::render_panel, toast::render_toast,
-    toast::Toast, tree::render_tree,
+    canvas::render_canvas_with_warning, panel::render_panel, toast::render_toast, toast::Toast,
+    tree::render_tree,
 };
 use crate::TuiResult;
 
@@ -111,9 +111,13 @@ impl App {
                 if let CtEvent::Key(k) = cev::read()? {
                     if let Some(buf) = self.reject_buffer.as_mut() {
                         match k.code {
-                            cev::KeyCode::Esc => { self.reject_buffer = None; }
+                            cev::KeyCode::Esc => {
+                                self.reject_buffer = None;
+                            }
                             cev::KeyCode::Enter => self.finish_reject(),
-                            cev::KeyCode::Backspace => { buf.pop(); }
+                            cev::KeyCode::Backspace => {
+                                buf.pop();
+                            }
                             cev::KeyCode::Char(c) if buf.len() < 200 => buf.push(c),
                             _ => {}
                         }
@@ -145,10 +149,18 @@ impl App {
                 let outer = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(if self.degraded || self.replay_complete { 1 } else { 0 }),
+                        Constraint::Length(if self.degraded || self.replay_complete {
+                            1
+                        } else {
+                            0
+                        }),
                         Constraint::Min(1),
                         Constraint::Length(
-                            if self.toast.is_some() || self.reject_buffer.is_some() { 2 } else { 0 },
+                            if self.toast.is_some() || self.reject_buffer.is_some() {
+                                2
+                            } else {
+                                0
+                            },
                         ),
                     ])
                     .split(f.area());
@@ -173,7 +185,11 @@ impl App {
                     .split(outer[1]);
                 match self.view {
                     View::Canvas => render_canvas_with_warning(
-                        f, main[0], &self.model, &self.edges, &self.focus,
+                        f,
+                        main[0],
+                        &self.model,
+                        &self.edges,
+                        &self.focus,
                     ),
                     View::Tree => render_tree(f, main[0], &self.model, &self.edges, &self.focus),
                 }
@@ -239,7 +255,9 @@ impl App {
 
     fn approve_focused_now(&mut self) {
         if !self.focused_is_awaiting() {
-            self.toast = Some(Toast::warn("not awaiting approval \u{2014} focus a \u{23f8} node"));
+            self.toast = Some(Toast::warn(
+                "not awaiting approval \u{2014} focus a \u{23f8} node",
+            ));
             return;
         }
         let approver = whoami::username();
@@ -256,14 +274,18 @@ impl App {
 
     fn begin_reject(&mut self) {
         if !self.focused_is_awaiting() {
-            self.toast = Some(Toast::warn("not awaiting approval \u{2014} focus a \u{23f8} node"));
+            self.toast = Some(Toast::warn(
+                "not awaiting approval \u{2014} focus a \u{23f8} node",
+            ));
             return;
         }
         self.reject_buffer = Some(String::new());
     }
 
     fn finish_reject(&mut self) {
-        let Some(reason) = self.reject_buffer.take() else { return };
+        let Some(reason) = self.reject_buffer.take() else {
+            return;
+        };
         let approver = whoami::username();
         match crate::control::approval::reject_focused(
             &self.store,
@@ -285,7 +307,7 @@ impl App {
 fn setup_terminal() -> TuiResult<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(out, EnterAlternateScreen)?;
     let term = Terminal::new(CrosstermBackend::new(out))?;
     install_panic_hook();
     Ok(term)
@@ -293,7 +315,7 @@ fn setup_terminal() -> TuiResult<Terminal<CrosstermBackend<Stdout>>> {
 
 fn teardown_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> TuiResult<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -302,7 +324,7 @@ fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
         original(info);
     }));
 }

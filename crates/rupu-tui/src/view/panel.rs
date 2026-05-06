@@ -9,7 +9,9 @@ use crate::state::RunModel;
 use crate::view::palette::{color_for, glyph_for};
 
 pub fn render_panel(frame: &mut Frame, area: Rect, model: &RunModel, focused: &str) {
-    let Some(node) = model.node(focused) else { return };
+    let Some(node) = model.node(focused) else {
+        return;
+    };
     let mut lines: Vec<Line> = Vec::new();
     let glyph = glyph_for(node.status);
     let style = ratatui::style::Style::default().fg(color_for(node.status));
@@ -26,6 +28,14 @@ pub fn render_panel(frame: &mut Frame, area: Rect, model: &RunModel, focused: &s
         lines.push(Line::raw("tools used:"));
         for (tool, n) in &node.tools_used {
             lines.push(Line::raw(format!("  {tool} · {n}")));
+        }
+    }
+    if !node.transcript_tail.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::raw("transcript:"));
+        for tl in &node.transcript_tail {
+            let truncated: String = tl.chars().take(36).collect();
+            lines.push(Line::raw(format!("  {truncated}")));
         }
     }
     if let Some(la) = &node.last_action {

@@ -17,22 +17,35 @@ pub struct WatchArgs {
 }
 
 pub async fn handle(args: WatchArgs) -> ExitCode {
-    match handle_inner(args) {
-        Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("rupu watch: {e}");
-            ExitCode::from(1)
-        }
-    }
+    handle_inner(args)
 }
 
-fn handle_inner(args: WatchArgs) -> anyhow::Result<()> {
-    let runs_dir = paths::global_dir()?.join("runs");
-    if args.replay {
+fn handle_inner(args: WatchArgs) -> ExitCode {
+    let runs_dir = match paths::global_dir() {
+        Ok(d) => d.join("runs"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let result = if args.replay {
         let pace_us = (1_000_000.0 / args.pace.max(0.1)) as u64;
         rupu_tui::run_replay(args.run_id, runs_dir, pace_us)
-            .map_err(|e| anyhow::anyhow!("tui: {e}"))
     } else {
-        rupu_tui::run_watch(args.run_id, runs_dir).map_err(|e| anyhow::anyhow!("tui: {e}"))
+        rupu_tui::run_watch(args.run_id, runs_dir)
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(rupu_tui::TuiError::RunNotFound(id, dir)) => {
+            eprintln!(
+                "error: run \"{id}\" not found in {}/. Suggest `rupu workflow runs`",
+                dir.display()
+            );
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("rupu watch: tui: {e}");
+            ExitCode::from(1)
+        }
     }
 }
