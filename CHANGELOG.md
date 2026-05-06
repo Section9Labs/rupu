@@ -6,7 +6,14 @@
 - Tracing on stderr punched through the alt-screen and corrupted
   the canvas (`WARN`/`INFO` lines bleeding through, color reset
   state clobbered). TUI commands now route logs to
-  `~/.rupu/cache/rupu.log`; non-TUI commands keep stderr.
+  `~/Library/Caches/rupu/rupu.log` (or `$XDG_CACHE_HOME/rupu/`);
+  non-TUI commands keep stderr.
+- LLM token-stream chunks were `print!()`ed to stdout from the
+  agent runner even when the TUI owned the terminal — visible as
+  the panelist JSON dump bleeding into the canvas. The workflow
+  StepFactory now sets `suppress_stream_stdout: true`; the TUI
+  reads tokens from the JSONL transcript instead. Single-agent
+  `rupu run` keeps the stream (its TUI attach is deferred).
 - Long `AssistantMessage` lines (panelist agents emit 2000+ char
   JSON) overflowed the focused-node panel as raw text. Per-line
   truncated at 80 chars with `…` indicator.
