@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.3 — fix: OpenAI rejects tool names with `.` (2026-05-06)
+
+### Fixed
+- OpenAI's Responses API rejects tool names that don't match
+  `^[a-zA-Z0-9_-]+$` with HTTP 400. The MCP catalog uses dotted names
+  like `scm.repos.list_owned`; every workflow whose agent inherits the
+  default tool set + uses `provider: openai` was unrunnable. Now
+  encodes `.` as `__dot__` on send, decodes on receive — round-trip
+  invisible to the rest of the agent runtime, which keeps using
+  canonical (dotted) names.
+
 ## v0.4.2 — fix: github/gitlab credentials now actually readable (2026-05-06)
 
 ### Fixed
