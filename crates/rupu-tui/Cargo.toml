@@ -21,6 +21,7 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+whoami.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
