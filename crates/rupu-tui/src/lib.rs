@@ -25,3 +25,39 @@ pub fn run_watch(run_id: String, runs_dir: PathBuf) -> TuiResult<()> {
     let source = Box::new(source::JsonlTailSource::new(runs_dir.join(&run_id))?);
     app::App::new(run_id, source, store, workflow).run()
 }
+
+pub fn run_replay(run_id: String, runs_dir: PathBuf, pace_us: u64) -> TuiResult<()> {
+    let store = RunStore::new(runs_dir.clone());
+    let workflow = match store.read_workflow_snapshot(&run_id) {
+        Ok(s) => rupu_orchestrator::Workflow::parse(&s).ok(),
+        Err(_) => None,
+    };
+    let scripted = collect_scripted(&runs_dir.join(&run_id))?;
+    let source = Box::new(source::ReplaySource::new(scripted, pace_us));
+    app::App::new(run_id, source, store, workflow).run()
+}
+
+fn collect_scripted(run_dir: &std::path::Path) -> TuiResult<Vec<(String, rupu_transcript::Event)>> {
+    let mut out = Vec::new();
+    let transcripts = run_dir.join("transcripts");
+    let Ok(rd) = std::fs::read_dir(&transcripts) else { return Ok(out) };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let bytes = std::fs::read(&path)?;
+        let step_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        for line in bytes.split(|&b| b == b'\n') {
+            if line.is_empty() { continue }
+            if let Ok(event) = serde_json::from_slice::<rupu_transcript::Event>(line) {
+                out.push((step_id.clone(), event));
+            }
+        }
+    }
+    Ok(out)
+}
