@@ -261,7 +261,7 @@ async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
         (Some(v), _) => format!("env-var override: {v}"),
         (None, Some(rupu_auth::BackendChoice::Keyring)) => "cached: keychain".into(),
         (None, Some(rupu_auth::BackendChoice::JsonFile)) => "cached: file".into(),
-        (None, None) => "default (probe at next call)".into(),
+        (None, None) => "default: file (chmod-600 ~/.rupu/auth.json)".into(),
     };
     println!("Active backend : {active}");
     println!("Cache file     : {}", cache_path.display());

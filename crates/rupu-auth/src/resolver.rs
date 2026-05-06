@@ -59,13 +59,26 @@ enum Storage {
     JsonFile { path: PathBuf },
 }
 
-/// Resolve `~/.rupu/auth.json` (or whatever HOME → `.rupu/auth.json`
-/// expands to) for the file-backend path. Falls back to a current-dir
-/// relative path if HOME is somehow unavailable; logs a warning so
-/// operators see why.
+/// Resolve the global rupu directory, honoring `$RUPU_HOME` (set by
+/// integration tests + by users who want a non-default location)
+/// before falling back to `~/.rupu/`. Mirrors what
+/// `rupu_cli::paths::global_dir()` does, kept in sync to avoid the
+/// resolver and CLI looking at different directories.
+fn rupu_home_dir() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("RUPU_HOME") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::home_dir().map(|h| h.join(".rupu"))
+}
+
+/// Default file path for the JSON-file backend's credentials.
+/// Follows the same `RUPU_HOME` override as the rest of rupu, so
+/// integration tests that redirect HOME also redirect the auth
+/// store. Falls back to `./auth.json` only if HOME isn't resolvable
+/// at all (extraordinary).
 fn default_auth_json_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".rupu").join("auth.json");
+    if let Some(home) = rupu_home_dir() {
+        return home.join("auth.json");
     }
     tracing::warn!("HOME not set; storing auth.json in current directory");
     PathBuf::from("./auth.json")
@@ -78,12 +91,22 @@ impl KeychainResolver {
 
     pub fn with_service(service: &str) -> Self {
         // Backend selection priority:
-        //   1. `RUPU_AUTH_BACKEND` env var — session escape hatch for
-        //      users whose macOS keychain is dropping credentials
-        //      between signed-binary updates.
-        //   2. Probe cache at `<global>/cache/auth-backend.json` —
-        //      persistent choice, set via `rupu auth backend --use`.
-        //   3. Default = keyring (matches pre-fix behavior).
+        //   1. `RUPU_AUTH_BACKEND` env var — session override for
+        //      users who explicitly want the OS keychain (or for
+        //      tests that need to swap out at runtime).
+        //   2. Probe cache at `<HOME>/.rupu/cache/auth-backend.json`
+        //      — persistent choice, set via `rupu auth backend --use`.
+        //   3. Default = file (chmod-600 JSON at `~/.rupu/auth.json`).
+        //      This matches what `gh`, `aws`, `gcloud`, `claude-cli`,
+        //      `kubectl`, `terraform`, and most CLI peers do — none
+        //      of them hit the OS keychain by default. The keychain
+        //      is great for `.app` bundles whose designated
+        //      requirement is bundle-ID-based (any binary signed
+        //      under that bundle ID + Team ID matches), but for
+        //      bare CLI binaries the requirement is cdhash-bound
+        //      and breaks on every rebuild — leading to the
+        //      "credentials vanished after update" UX rupu hit
+        //      repeatedly.
         let env_choice = std::env::var(crate::ENV_BACKEND_OVERRIDE)
             .ok()
             .map(|s| s.trim().to_ascii_lowercase());
@@ -94,17 +117,18 @@ impl KeychainResolver {
             _ => None,
         }
         .or_else(|| {
-            // Cache lives at `<HOME>/.rupu/cache/auth-backend.json` —
-            // same layout the CLI's `rupu auth backend` writes to.
-            let cache_path = dirs::home_dir()?
-                .join(".rupu")
+            // Cache lives at `<RUPU_HOME>/cache/auth-backend.json` —
+            // same layout the CLI's `rupu auth backend` writes to,
+            // and honors the same `RUPU_HOME` test override.
+            let cache_path = rupu_home_dir()?
                 .join("cache")
                 .join("auth-backend.json");
             let text = std::fs::read_to_string(&cache_path).ok()?;
             let choice: crate::BackendChoice = serde_json::from_str(&text).ok()?;
             Some(matches!(choice, crate::BackendChoice::JsonFile))
         })
-        .unwrap_or(false);
+        // Default to file when no env override and no cache.
+        .unwrap_or(true);
 
         let storage = if want_file {
             let path = std::env::var("RUPU_AUTH_FILE")

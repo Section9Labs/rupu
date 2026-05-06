@@ -89,48 +89,31 @@ impl ProbeCache {
 /// typo (`RUPU_AUTH_BACKEND=files`) doesn't silently degrade.
 pub const ENV_BACKEND_OVERRIDE: &str = "RUPU_AUTH_BACKEND";
 
-/// Probe the OS keychain (or read the cached choice if present) and
-/// return a boxed `AuthBackend` ready for use.
+/// Resolve which credential backend to use and return a boxed
+/// `AuthBackend` ready for use.
 ///
-/// Selection order:
-///   1. **Env override** (`RUPU_AUTH_BACKEND=file|keyring`) — the
-///      escape hatch for users whose macOS keychain rejects ACL
-///      reads after a signed-binary update. Wins over cache + probe.
-///   2. **Cached choice** at `cache.path` — set by the previous
-///      probe; lets typical invocations skip the probe entirely.
-///   3. **Fresh probe** — prefers the keychain; if [`KeyringBackend::probe`]
-///      fails, falls back to a [`JsonFileBackend`] at
-///      `fallback_path` with a `tracing::warn!` explaining why.
+/// Selection order (matches [`crate::resolver::KeychainResolver`]):
+///   1. **Env override** (`RUPU_AUTH_BACKEND=file|keyring`) —
+///      session-scoped opt-in, wins over cache.
+///   2. **Cached choice** at `cache.path` — persistent choice set
+///      by `rupu auth backend --use ...`.
+///   3. **Default = `JsonFile`** at `fallback_path`.
 ///
-/// The chosen backend is cached for next time unless overridden by
-/// the env var (which is intentionally session-scoped).
+/// The default flipped from `Keyring` → `JsonFile` to address the
+/// macOS-keychain "credentials vanish after binary update" UX:
+/// the keychain ACL pins each trusted-app entry to the binary's
+/// cdhash, which changes on every rebuild. Most CLI peers (`gh`,
+/// `aws`, `gcloud`, `claude-cli`, etc.) don't use the OS keychain
+/// for the same reason; the file backend at chmod-600 is the
+/// industry-standard answer. Users who specifically want
+/// OS-managed encryption can opt in via
+/// `rupu auth backend --use keychain`.
 pub fn select_backend(cache: &ProbeCache, fallback_path: PathBuf) -> Box<dyn AuthBackend> {
     if let Some(override_choice) = read_env_override() {
         return materialize(override_choice, fallback_path);
     }
 
-    let choice = cache.read().unwrap_or_else(|| {
-        let chosen = match KeyringBackend::probe() {
-            Ok(()) => BackendChoice::Keyring,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    fallback = %fallback_path.display(),
-                    "OS keychain unavailable; falling back to chmod-600 JSON file"
-                );
-                BackendChoice::JsonFile
-            }
-        };
-        if let Err(e) = cache.write(chosen) {
-            warn!(
-                error = %e,
-                cache = %cache.path().display(),
-                "failed to write probe cache; will re-probe next run"
-            );
-        }
-        chosen
-    });
-
+    let choice = cache.read().unwrap_or(BackendChoice::JsonFile);
     materialize(choice, fallback_path)
 }
 

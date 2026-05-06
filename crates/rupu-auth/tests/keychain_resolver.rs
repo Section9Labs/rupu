@@ -8,8 +8,18 @@ use rupu_auth::stored::StoredCredential;
 use rupu_providers::AuthMode;
 
 #[tokio::test]
+#[ignore = "touches the real OS keychain — opt-in backend; run with `--ignored`"]
 async fn keychain_resolver_roundtrip_api_key() {
-    // Use a unique service name so parallel test runs don't collide.
+    // The keychain is now an opt-in backend, not the default. This
+    // test exercises that opt-in path end-to-end against the real
+    // system keychain. It's `#[ignore]` because cargo test running
+    // it on macOS would either trigger an "Always Allow" GUI prompt
+    // (interactive) or hang (non-interactive CI). Run manually with
+    // `cargo test -p rupu-auth -- --ignored`.
+    //
+    // Force the keychain backend via env var since the default
+    // resolver now uses the file backend.
+    std::env::set_var("RUPU_AUTH_BACKEND", "keychain");
     let unique = format!("rupu-test-{}", uuid_like());
     let r = KeychainResolver::with_service(&unique);
     r.store(
@@ -49,6 +59,8 @@ async fn keychain_resolver_roundtrip_api_key() {
         .await
         .expect("forget");
     assert!(r.get("anthropic", Some(AuthMode::ApiKey)).await.is_err());
+
+    std::env::remove_var("RUPU_AUTH_BACKEND");
 }
 
 fn uuid_like() -> String {
