@@ -110,6 +110,8 @@ impl KeychainResolver {
             "openai" => Ok(ProviderId::Openai),
             "gemini" => Ok(ProviderId::Gemini),
             "copilot" => Ok(ProviderId::Copilot),
+            "github" => Ok(ProviderId::Github),
+            "gitlab" => Ok(ProviderId::Gitlab),
             "local" => Ok(ProviderId::Local),
             other => anyhow::bail!("unknown provider: {other}"),
         }
@@ -121,10 +123,15 @@ impl KeychainResolver {
     }
 
     /// Returns a human-readable expiry string for an SSO token, or `None`
-    /// if no SSO credential exists for the provider.
+    /// if no SSO credential exists for the provider. When a credential
+    /// is stored but has no `expires_at` (e.g. GitHub device-code grants
+    /// that never carry an explicit expiry), returns `Some("no expiry")`
+    /// so the status row still renders ✓.
     pub async fn peek_sso(&self, p: ProviderId) -> Option<String> {
         let sc = self.read(p, AuthMode::Sso).ok().flatten()?;
-        let exp = sc.expires_at?;
+        let Some(exp) = sc.expires_at else {
+            return Some("no expiry".into());
+        };
         let now = chrono::Utc::now();
         let dur = exp.signed_duration_since(now);
         if dur.num_seconds() <= 0 {
@@ -315,6 +322,21 @@ mod parse_stored_credential_tests {
         assert!(
             msg.contains("StoredCredential"),
             "expected typed error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_provider_recognizes_github_and_gitlab() {
+        // Regression: rupu repos list calls resolver.get("github", None);
+        // pre-fix this errored "unknown provider: github" and silently
+        // bubbled up to the SCM Registry as "no credentials configured".
+        assert_eq!(
+            KeychainResolver::parse_provider("github").unwrap(),
+            ProviderId::Github,
+        );
+        assert_eq!(
+            KeychainResolver::parse_provider("gitlab").unwrap(),
+            ProviderId::Gitlab,
         );
     }
 }
