@@ -105,7 +105,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
     };
-    let (resolved_auth, provider) = provider_factory::build_for_provider_with_config(
+    let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
         &provider_name,
         &model,
         auth_hint,
@@ -114,16 +114,29 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     )
     .await?;
 
-    println!(
-        "agent: {}  provider: {}/{}  model: {}",
-        spec.name, provider_name, resolved_auth, model,
-    );
+    // Print the agent header via the line-stream printer.
+    // The run_id isn't known yet; we'll use a placeholder.
+    let agent_header_name = spec.name.clone();
+    let agent_header_provider = provider_name.clone();
+    let agent_header_model = model.clone();
+    // (printed after run_id is set below)
 
     // Transcript path.
     let run_id = format!("run_{}", Ulid::new());
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
+
+    // Print the agent header now that the run_id is known.
+    {
+        let mut printer = crate::output::LineStreamPrinter::new();
+        printer.agent_header(
+            &agent_header_name,
+            &agent_header_provider,
+            &agent_header_model,
+            &run_id,
+        );
+    }
 
     // Tool context config (the path is filled in after target resolution below).
     let bash_timeout = cfg.bash.timeout_secs.unwrap_or(120);
@@ -230,10 +243,11 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         user_message,
         mode_str: mode_str.to_string(),
         no_stream: args.no_stream,
-        // Single-agent `rupu run` keeps the legacy line-stream UI
-        // for v0; the TUI attach for this command was deferred to
-        // a future slice. Workflow runs flip this to true.
-        suppress_stream_stdout: false,
+        // Suppress the agent runner's inline stdout writes; the CLI's
+        // line-stream printer reads tokens from the JSONL transcript
+        // instead. This prevents duplicate output when the printer is
+        // active and ensures clean output when stdout is piped.
+        suppress_stream_stdout: true,
         mcp_registry: Some(scm_registry),
         effort: spec.effort,
         context_window: spec.context_window,
@@ -243,17 +257,104 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         anthropic_speed: spec.anthropic_speed,
     };
 
-    let result = rupu_agent::run_agent(opts).await?;
+    // Spawn the agent in a background task and tail the transcript with
+    // the line-stream printer while it runs.
+    let transcript_path_for_printer = transcript_path.clone();
+    let run_id_for_printer = run_id.clone();
+    let spec_name_for_printer = spec.name.clone();
+
+    // Run the agent. The printer reads from the JSONL transcript file;
+    // since the agent is async and the printer is sync, we run the
+    // printer in a background thread that polls the transcript while
+    // the tokio task drives the agent.
+    let agent_task = tokio::spawn(rupu_agent::run_agent(opts));
+
+    // Tail the transcript in this thread.
+    {
+        let mut printer = crate::output::LineStreamPrinter::new();
+        printer.step_start(&spec_name_for_printer, None, None, None);
+        let mut tailer =
+            crate::output::TranscriptTailer::new(&transcript_path_for_printer);
+        let mut total_tokens = 0u64;
+
+        loop {
+            let events = tailer.drain();
+            for ev in events {
+                match &ev {
+                    rupu_transcript::Event::AssistantMessage { content, .. }
+                        if !content.trim().is_empty() =>
+                    {
+                        printer.assistant_chunk(content);
+                    }
+                    rupu_transcript::Event::ToolCall { tool, input, .. } => {
+                        let summary =
+                            crate::output::workflow_printer::tool_summary(tool, input);
+                        printer.tool_call(tool, &summary);
+                    }
+                    rupu_transcript::Event::RunComplete {
+                        status,
+                        total_tokens: tokens,
+                        duration_ms,
+                        error,
+                        ..
+                    } => {
+                        total_tokens = *tokens;
+                        let dur = std::time::Duration::from_millis(*duration_ms);
+                        match status {
+                            rupu_transcript::RunStatus::Ok => {
+                                printer.step_done(&run_id_for_printer, dur, *tokens);
+                            }
+                            _ => {
+                                let reason = error.as_deref().unwrap_or("unknown");
+                                printer.step_failed(&run_id_for_printer, reason);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Once we see RunComplete, we can stop tailing.
+                if matches!(ev, rupu_transcript::Event::RunComplete { .. }) {
+                    break;
+                }
+            }
+
+            // Check if the agent task has finished.
+            if agent_task.is_finished() {
+                // Drain any remaining events.
+                let tail_events = tailer.drain();
+                for ev in tail_events {
+                    if let rupu_transcript::Event::AssistantMessage { content, .. } = &ev {
+                        if !content.trim().is_empty() {
+                            printer.assistant_chunk(content);
+                        }
+                    }
+                }
+                if total_tokens == 0 {
+                    // RunComplete wasn't seen yet; print a plain done.
+                    printer.step_done(
+                        &run_id_for_printer,
+                        std::time::Duration::ZERO,
+                        0,
+                    );
+                }
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    // Await the agent task to propagate any error.
+    let result = agent_task
+        .await
+        .map_err(|e| anyhow::anyhow!("agent task panicked: {e}"))??;
+
+    // Print a brief footer.
     println!(
-        "Total: {} input / {} output tokens",
-        result.total_tokens_in, result.total_tokens_out
-    );
-    println!(
-        "rupu: run {} complete in {} turn(s); transcript: {}",
-        run_id,
-        result.turns,
+        "transcript: {}",
         transcript_path.display()
     );
+    let _ = result;
     Ok(())
 }
 

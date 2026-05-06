@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.4.5 — line-stream output by default (canvas opt-in via --canvas)
+
+### Changed
+- `rupu run`, `rupu workflow run`, and `rupu watch` now default to a
+  **streaming vertical timeline** printed line-by-line to stdout — no
+  alt-screen takeover. Works in any terminal, pipe, or CI runner.
+  Pass `--canvas` to get the full ratatui TUI.
+- New `crates/rupu-cli/src/output/` module: `LineStreamPrinter` (Okesu
+  palette, auto-degrades on `NO_COLOR`/pipes), `TranscriptTailer`
+  (incremental JSONL byte-offset reader), and `workflow_printer`
+  (polling loop that drives the printer from live or finished runs).
+- `rupu watch` gains `--follow` (tail a live run) and `--replay` (pace
+  through a finished run). Both default to line-stream; `--canvas`
+  routes to rupu-tui for the alt-screen experience.
+- Agent runner `suppress_stream_stdout` is now `true` for `rupu run`
+  — the line-stream printer is the sole source of stdout, preventing
+  duplicate output when piped.
+
 ## v0.4.4 — TUI canvas: stripe + rounded cards + connectors (2026-05-06)
 
 ### Fixed

@@ -8,6 +8,7 @@
 pub mod cmd;
 pub mod crash;
 pub mod logging;
+pub mod output;
 pub mod paths;
 pub mod provider_factory;
 pub mod run_target;
@@ -99,11 +100,11 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         }
     };
 
-    // TUI commands take over the terminal via crossterm's alt-screen.
-    // Tracing on stderr would punch through that and corrupt the
-    // canvas (the v0.4.x dump bug). Route logs to ~/.rupu/cache/rupu.log
-    // for those; everything else stays on stderr.
-    let is_tui_cmd = matches!(
+    // Run / Workflow Run / Watch write to stdout (either line-stream or
+    // alt-screen TUI canvas). Either way, tracing on stderr would bleed
+    // through and corrupt the output. Route logs to the rupu log file
+    // for all three commands; everything else keeps stderr.
+    let is_output_cmd = matches!(
         cli.command,
         Cmd::Run(_)
             | Cmd::Watch(_)
@@ -111,7 +112,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
                 action: cmd::workflow::Action::Run { .. }
             }
     );
-    if is_tui_cmd {
+    if is_output_cmd {
         logging::init_to_file();
     } else {
         logging::init();
