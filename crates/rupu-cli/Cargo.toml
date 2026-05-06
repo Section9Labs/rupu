@@ -45,6 +45,7 @@ rupu-webhook = { path = "../rupu-webhook" }
 rupu-tui = { path = "../rupu-tui" }
 comfy-table.workspace = true
 owo-colors.workspace = true
+crossterm.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
