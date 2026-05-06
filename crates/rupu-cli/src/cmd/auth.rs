@@ -9,7 +9,7 @@ use std::process::ExitCode;
 pub enum Action {
     /// Store credentials for a provider.
     Login {
-        /// Provider name (anthropic | openai | gemini | copilot | local).
+        /// Provider name (anthropic | openai | gemini | copilot | github | gitlab | local).
         #[arg(long)]
         provider: String,
         /// Authentication mode.
@@ -93,6 +93,8 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
         "openai" => Ok(ProviderId::Openai),
         "gemini" => Ok(ProviderId::Gemini),
         "copilot" => Ok(ProviderId::Copilot),
+        "github" => Ok(ProviderId::Github),
+        "gitlab" => Ok(ProviderId::Gitlab),
         "local" => Ok(ProviderId::Local),
         _ => Err(anyhow::anyhow!("unknown provider: {s}")),
     }
@@ -162,6 +164,8 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
             ProviderId::Openai,
             ProviderId::Gemini,
             ProviderId::Copilot,
+            ProviderId::Github,
+            ProviderId::Gitlab,
             ProviderId::Local,
         ] {
             for m in [
@@ -201,6 +205,8 @@ async fn status() -> anyhow::Result<()> {
         ("openai", ProviderId::Openai),
         ("gemini", ProviderId::Gemini),
         ("copilot", ProviderId::Copilot),
+        ("github", ProviderId::Github),
+        ("gitlab", ProviderId::Gitlab),
     ] {
         let api = if resolver.peek(pid, rupu_providers::AuthMode::ApiKey).await {
             "✓"
@@ -221,11 +227,14 @@ mod parse_provider_tests {
     use super::*;
 
     #[test]
-    fn recognizes_all_four_providers() {
+    fn recognizes_all_providers() {
         assert_eq!(parse_provider("anthropic").unwrap(), ProviderId::Anthropic);
         assert_eq!(parse_provider("openai").unwrap(), ProviderId::Openai);
         assert_eq!(parse_provider("gemini").unwrap(), ProviderId::Gemini);
         assert_eq!(parse_provider("copilot").unwrap(), ProviderId::Copilot);
+        assert_eq!(parse_provider("github").unwrap(), ProviderId::Github);
+        assert_eq!(parse_provider("gitlab").unwrap(), ProviderId::Gitlab);
+        assert_eq!(parse_provider("local").unwrap(), ProviderId::Local);
     }
 
     #[test]
