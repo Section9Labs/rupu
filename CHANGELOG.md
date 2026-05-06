@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.4.2 — fix: github/gitlab credentials now actually readable (2026-05-06)
+
+### Fixed
+- `rupu repos list` could not see github/gitlab credentials stored by
+  v0.4.1's `rupu auth login` because `KeychainResolver`'s internal
+  provider whitelist (separate from the CLI's clap whitelist) didn't
+  know about github/gitlab. The resolver now recognizes both.
+- `rupu auth status` showed `-` for the github SSO column even after a
+  successful login, because GitHub device-code grants don't carry an
+  `expires_at` and `peek_sso` was returning `None`. Now renders
+  `✓ (no expiry)`.
+
 ## v0.4.1 — github / gitlab in `rupu auth login` (2026-05-05)
 
 ### Added
