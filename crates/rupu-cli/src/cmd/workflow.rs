@@ -877,14 +877,28 @@ impl StepFactory for CliStepFactory {
             .clone()
             .unwrap_or_else(|| "claude-sonnet-4-6".into());
         let auth_hint = spec.auth;
-        let (_resolved_auth, provider) = provider_factory::build_for_provider(
-            &provider_name,
-            &model,
-            auth_hint,
-            self.resolver.as_ref(),
-        )
-        .await
-        .expect("provider build failed in step factory");
+        // Build the provider; on failure (missing credential, bad
+        // auth config, etc.) substitute a stub provider that returns
+        // the same error on first call. The runner's existing
+        // `RunComplete { status: Error }` path then surfaces it as a
+        // clean `✗ <step_id>` line via the line printer — no panic,
+        // no crash log. (See `provider_build_error_stub` below.)
+        let provider: Box<dyn rupu_providers::LlmProvider> =
+            match provider_factory::build_for_provider(
+                &provider_name,
+                &model,
+                auth_hint,
+                self.resolver.as_ref(),
+            )
+            .await
+            {
+                Ok((_resolved_auth, p)) => p,
+                Err(e) => Box::new(provider_build_error_stub(
+                    provider_name.clone(),
+                    model.clone(),
+                    e.to_string(),
+                )),
+            };
 
         let agent_system_prompt = match self.system_prompt_suffix.as_deref() {
             Some(suffix) => format!("{}\n\n## Run target\n\n{}", spec.system_prompt, suffix),
@@ -925,5 +939,112 @@ impl StepFactory for CliStepFactory {
             anthropic_context_management: spec.anthropic_context_management,
             anthropic_speed: spec.anthropic_speed,
         }
+    }
+}
+
+/// Stub `LlmProvider` that errors on first call. Used when the real
+/// provider build fails inside the StepFactory (e.g. missing
+/// credential): instead of panicking and writing a crash log, we
+/// hand the runner a provider that returns the build error from its
+/// first `send`/`stream` call. The runner's normal error path then
+/// emits `Event::RunComplete { status: Error, error: ... }`, which
+/// the line printer renders as `✗ <step_id> <error>` — the user
+/// sees a clean, actionable message.
+fn provider_build_error_stub(
+    provider_name: String,
+    model: String,
+    error: String,
+) -> ProviderBuildErrorStub {
+    ProviderBuildErrorStub {
+        provider_name,
+        model,
+        error,
+    }
+}
+
+struct ProviderBuildErrorStub {
+    provider_name: String,
+    model: String,
+    error: String,
+}
+
+#[async_trait::async_trait]
+impl rupu_providers::LlmProvider for ProviderBuildErrorStub {
+    async fn send(
+        &mut self,
+        _request: &rupu_providers::LlmRequest,
+    ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+        Err(rupu_providers::ProviderError::AuthConfig(format!(
+            "{}: {}\n  Run: rupu auth login --provider {} --mode <api-key|sso>",
+            self.provider_name, self.error, self.provider_name,
+        )))
+    }
+
+    async fn stream(
+        &mut self,
+        _request: &rupu_providers::LlmRequest,
+        _on_event: &mut (dyn FnMut(rupu_providers::StreamEvent) + Send),
+    ) -> Result<rupu_providers::LlmResponse, rupu_providers::ProviderError> {
+        Err(rupu_providers::ProviderError::AuthConfig(format!(
+            "{}: {}\n  Run: rupu auth login --provider {} --mode <api-key|sso>",
+            self.provider_name, self.error, self.provider_name,
+        )))
+    }
+
+    fn default_model(&self) -> &str {
+        &self.model
+    }
+
+    fn provider_id(&self) -> rupu_providers::ProviderId {
+        // Pick a stable variant; only used for log attribution.
+        rupu_providers::ProviderId::Anthropic
+    }
+}
+
+#[cfg(test)]
+mod provider_build_error_stub_tests {
+    use super::*;
+    use rupu_providers::{LlmProvider, LlmRequest, ProviderError};
+
+    fn empty_request() -> LlmRequest {
+        LlmRequest {
+            model: "test-model".into(),
+            system: None,
+            messages: vec![],
+            max_tokens: 1,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_returns_authconfig_with_login_hint() {
+        // Regression for the v0.4.5 panic: when the StepFactory's
+        // build_for_provider() failed (missing credential, etc.) the
+        // `.expect()` panicked and a crash log was written. The stub
+        // routes the same error through the runner's normal failure
+        // path so the line printer can render it cleanly.
+        let mut stub = provider_build_error_stub(
+            "openai".to_string(),
+            "gpt-5".to_string(),
+            "no credentials configured for openai".to_string(),
+        );
+        let err = stub.send(&empty_request()).await.expect_err("must error");
+        let ProviderError::AuthConfig(msg) = err else {
+            panic!("expected AuthConfig variant, got {err:?}");
+        };
+        assert!(msg.contains("openai"), "missing provider name: {msg}");
+        assert!(
+            msg.contains("rupu auth login --provider openai"),
+            "missing actionable login hint: {msg}",
+        );
     }
 }
