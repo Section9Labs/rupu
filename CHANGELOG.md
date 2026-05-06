@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.4.1 — github / gitlab in `rupu auth login` (2026-05-05)
+
+### Added
+- `rupu auth login --provider github` and `--provider gitlab` are now accepted
+  (the library plumbing already shipped in Slice B-2; only the CLI whitelist
+  was gating it). Both providers also appear in `rupu auth status` and are
+  cleared by `rupu auth logout --all`.
+
+  Login modes:
+  - `--mode sso` — device-code OAuth (GitHub) or PKCE callback (GitLab).
+    GitLab SSO needs a real OAuth client_id; PAT path works today.
+  - `--mode api-key` — personal access token (read from stdin or `--key`).
+
+  Unblocks `rupu repos list` for both platforms.
+
 ## v0.4.0 — Slice C: TUI (2026-05-05)
 
 ### Added
