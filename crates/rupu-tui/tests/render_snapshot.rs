@@ -32,6 +32,56 @@ fn linear_three_node_canvas() {
 }
 
 #[test]
+fn fanout_canvas_renders_drop_connectors() {
+    // Regression for the v0.4.x "no canvas connectors" complaint:
+    // parent → 2 children should drop vertically and turn into each
+    // child with `┬│└─▶` glyphs, not just bare boxes.
+    let mut model = RunModel::new();
+    model.upsert_node("a", "spec").status = NodeStatus::Complete;
+    model.upsert_node("b", "test").status = NodeStatus::Waiting;
+    model.upsert_node("c", "sec").status = NodeStatus::Waiting;
+    let edges = vec![("a".into(), "b".into()), ("a".into(), "c".into())];
+    let backend = TestBackend::new(80, 14);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| render_canvas(f, f.area(), &model, &edges, "a")).unwrap();
+    insta::assert_snapshot!(
+        "canvas_fanout",
+        buffer_to_string(&term.backend().buffer().clone())
+    );
+}
+
+#[test]
+fn long_assistant_message_does_not_blow_up_transcript_tail() {
+    // Regression for the v0.4.x "JSON dumped across the panel" bug:
+    // panelist agents emit big JSON blobs and a single 1000-char
+    // line was rendered raw into the panel. Per-line truncation caps
+    // each transcript_tail entry at ~80 chars + an ellipsis.
+    use chrono::Utc;
+    use rupu_transcript::Event;
+    let mut model = RunModel::new();
+    let huge = "{\"findings\":[".to_string()
+        + &"x".repeat(2000)
+        + "]}\nshorter line";
+    model.upsert_node("panelist", "tour-security-reviewer");
+    model.apply_event(
+        "panelist",
+        &Event::AssistantMessage {
+            content: huge,
+            thinking: None,
+        },
+    );
+    let n = model.node("panelist").unwrap();
+    for line in &n.transcript_tail {
+        assert!(
+            line.chars().count() <= 81,
+            "transcript_tail line over budget: {} chars",
+            line.chars().count()
+        );
+    }
+    let _ = Utc::now(); // silence import lint
+}
+
+#[test]
 fn fanout_tree_render() {
     let mut model = RunModel::new();
     model.upsert_node("a", "spec").status = NodeStatus::Complete;

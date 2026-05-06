@@ -88,7 +88,6 @@ pub enum Cmd {
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
 /// dispatches, and returns an `ExitCode`. Tests pass synthetic argv.
 pub async fn run(args: Vec<String>) -> ExitCode {
-    logging::init();
     crash::install_panic_hook();
 
     let cli = match Cli::try_parse_from(args) {
@@ -99,6 +98,25 @@ pub async fn run(args: Vec<String>) -> ExitCode {
             e.exit();
         }
     };
+
+    // TUI commands take over the terminal via crossterm's alt-screen.
+    // Tracing on stderr would punch through that and corrupt the
+    // canvas (the v0.4.x dump bug). Route logs to ~/.rupu/cache/rupu.log
+    // for those; everything else stays on stderr.
+    let is_tui_cmd = matches!(
+        cli.command,
+        Cmd::Run(_)
+            | Cmd::Watch(_)
+            | Cmd::Workflow {
+                action: cmd::workflow::Action::Run { .. }
+            }
+    );
+    if is_tui_cmd {
+        logging::init_to_file();
+    } else {
+        logging::init();
+    }
+
     match cli.command {
         Cmd::Run(args) => cmd::run::handle(args).await,
         Cmd::Agent { action } => cmd::agent::handle(action).await,
