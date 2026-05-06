@@ -15,6 +15,23 @@ const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
+/// OpenAI's Responses API enforces `^[a-zA-Z0-9_-]+$` on tool names
+/// and rejects the request with HTTP 400 when any tool's name
+/// contains a disallowed character. The MCP catalog uses dotted
+/// names like `scm.repos.list_owned`, so we encode every `.` as
+/// `__dot__` (a token no real tool name uses) on the way out and
+/// decode it on the way back. The escape is reversible so the rest
+/// of the agent runtime keeps using canonical (dotted) names.
+const TOOL_NAME_DOT_ESCAPE: &str = "__dot__";
+
+fn sanitize_openai_tool_name(name: &str) -> String {
+    name.replace('.', TOOL_NAME_DOT_ESCAPE)
+}
+
+fn desanitize_openai_tool_name(name: &str) -> String {
+    name.replace(TOOL_NAME_DOT_ESCAPE, ".")
+}
+
 /// OpenAI Codex client using the Responses API.
 /// Translates LlmRequest/LlmResponse to/from OpenAI's Responses API format.
 pub struct OpenAiCodexClient {
@@ -216,7 +233,7 @@ impl OpenAiCodexClient {
                         input.push(serde_json::json!({
                             "type": "function_call",
                             "call_id": normalize_tool_call_id(id),
-                            "name": name,
+                            "name": sanitize_openai_tool_name(name),
                             "arguments": tool_input.to_string(),
                         }));
                     }
@@ -271,7 +288,7 @@ impl OpenAiCodexClient {
                 .map(|t| {
                     serde_json::json!({
                         "type": "function",
-                        "name": t.name,
+                        "name": sanitize_openai_tool_name(&t.name),
                         "description": t.description,
                         "parameters": t.input_schema,
                     })
@@ -346,7 +363,8 @@ impl OpenAiCodexClient {
             "response.output_item.added" => {
                 if let Some(item) = data.get("item") {
                     if item["type"].as_str() == Some("function_call") {
-                        let name = item["name"].as_str().unwrap_or("").to_string();
+                        let name =
+                            desanitize_openai_tool_name(item["name"].as_str().unwrap_or(""));
                         let call_id = item["call_id"].as_str().unwrap_or("").to_string();
                         acc.current_tool_name = Some(name.clone());
                         acc.current_tool_id = Some(call_id.clone());
@@ -668,7 +686,7 @@ fn parse_response(json: &serde_json::Value) -> Result<LlmResponse, ProviderError
                 }
                 Some("function_call") => {
                     let call_id = item["call_id"].as_str().unwrap_or("").to_string();
-                    let name = item["name"].as_str().unwrap_or("").to_string();
+                    let name = desanitize_openai_tool_name(item["name"].as_str().unwrap_or(""));
                     let args_str = item["arguments"].as_str().unwrap_or("{}");
                     let input: serde_json::Value = serde_json::from_str(args_str).map_err(|e| {
                         ProviderError::Json(format!("malformed tool arguments for '{}': {e}", name))
@@ -795,6 +813,89 @@ mod llm_provider_impl_tests {
         let boxed: Box<dyn LlmProvider> = Box::new(client);
         assert_eq!(boxed.provider_id(), ProviderId::OpenaiCodex);
         assert!(!boxed.default_model().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tool_name_sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_replaces_dots_with_escape() {
+        assert_eq!(
+            sanitize_openai_tool_name("scm.repos.list_owned"),
+            "scm__dot__repos__dot__list_owned",
+        );
+    }
+
+    #[test]
+    fn sanitize_is_a_noop_for_clean_names() {
+        assert_eq!(sanitize_openai_tool_name("read_file"), "read_file");
+        assert_eq!(sanitize_openai_tool_name("write-file"), "write-file");
+    }
+
+    #[test]
+    fn round_trip_is_identity() {
+        for name in [
+            "read_file",
+            "scm.repos.list_owned",
+            "issues.update",
+            "github.workflows_dispatch",
+            "weird-but-valid-name",
+        ] {
+            let escaped = sanitize_openai_tool_name(name);
+            assert_eq!(desanitize_openai_tool_name(&escaped), name, "round-trip");
+        }
+    }
+
+    #[test]
+    fn sanitized_names_pass_openai_regex() {
+        // OpenAI rejects tool names not matching ^[a-zA-Z0-9_-]+$.
+        // Confirm the escape produces compliant strings for every
+        // dotted name in the live MCP catalog shape.
+        let allowed = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        for input in [
+            "scm.repos.list_owned",
+            "scm.branches.list",
+            "scm.files.read",
+            "scm.prs.create",
+            "issues.list_open",
+            "github.workflows_dispatch",
+            "gitlab.pipeline_trigger",
+        ] {
+            let out = sanitize_openai_tool_name(input);
+            assert!(out.chars().all(allowed), "non-compliant char in {out}");
+        }
+    }
+
+    #[test]
+    fn build_request_body_emits_sanitized_tool_name() {
+        let creds = AuthCredentials::ApiKey { key: "sk-test".into() };
+        let client = OpenAiCodexClient::new(creds, None).expect("new");
+        let req = LlmRequest {
+            model: "gpt-5".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            max_tokens: 10,
+            tools: vec![ToolDefinition {
+                name: "scm.repos.list_owned".into(),
+                description: "list owned repos".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        };
+        let body = client.build_request_body(&req, false);
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "scm__dot__repos__dot__list_owned");
     }
 }
 
