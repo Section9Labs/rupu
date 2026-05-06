@@ -23,7 +23,7 @@ fn linear_three_node_canvas() {
     model.upsert_node("c", "code-agent").status = NodeStatus::Working;
 
     let edges = vec![("a".into(), "b".into()), ("b".into(), "c".into())];
-    let backend = TestBackend::new(80, 12);
+    let backend = TestBackend::new(100, 14);
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| render_canvas(f, f.area(), &model, &edges, "c")).unwrap();
 
@@ -35,13 +35,13 @@ fn linear_three_node_canvas() {
 fn fanout_canvas_renders_drop_connectors() {
     // Regression for the v0.4.x "no canvas connectors" complaint:
     // parent → 2 children should drop vertically and turn into each
-    // child with `┬│└─▶` glyphs, not just bare boxes.
+    // child with `╠║╚═▶` glyphs, not just bare boxes.
     let mut model = RunModel::new();
     model.upsert_node("a", "spec").status = NodeStatus::Complete;
     model.upsert_node("b", "test").status = NodeStatus::Waiting;
     model.upsert_node("c", "sec").status = NodeStatus::Waiting;
     let edges = vec![("a".into(), "b".into()), ("a".into(), "c".into())];
-    let backend = TestBackend::new(80, 14);
+    let backend = TestBackend::new(100, 16);
     let mut term = Terminal::new(backend).unwrap();
     term.draw(|f| render_canvas(f, f.area(), &model, &edges, "a")).unwrap();
     insta::assert_snapshot!(
