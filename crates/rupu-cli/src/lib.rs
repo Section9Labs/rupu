@@ -81,6 +81,8 @@ pub enum Cmd {
     },
     /// Aggregate token spend across persisted transcripts.
     Usage(cmd::usage::UsageArgs),
+    /// Re-attach TUI to an existing run.
+    Watch(cmd::watch::WatchArgs),
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -111,5 +113,6 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Cron { action } => cmd::cron::handle(action).await,
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
         Cmd::Usage(args) => cmd::usage::handle(args).await,
+        Cmd::Watch(args) => cmd::watch::handle(args).await,
     }
 }

@@ -42,6 +42,7 @@ rupu-mcp = { path = "../rupu-mcp" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-webhook = { path = "../rupu-webhook" }
+rupu-tui = { path = "../rupu-tui" }
 comfy-table.workspace = true
 tempfile.workspace = true
 

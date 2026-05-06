@@ -11,5 +11,6 @@ pub mod repos;
 pub mod run;
 pub mod transcript;
 pub mod usage;
+pub mod watch;
 pub mod webhook;
 pub mod workflow;
