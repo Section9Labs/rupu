@@ -47,6 +47,11 @@ pub enum Action {
         /// Override permission mode (`ask` | `bypass` | `readonly`).
         #[arg(long)]
         mode: Option<String>,
+        /// Use the alt-screen TUI canvas instead of the default line-stream
+        /// output. The canvas offers a DAG view and live status glyphs but
+        /// requires an interactive terminal.
+        #[arg(long)]
+        canvas: bool,
     },
     /// List recent workflow runs from the persistent run-store
     /// (`<global>/runs/`). Newest first.
@@ -102,7 +107,8 @@ pub async fn handle(action: Action) -> ExitCode {
             target,
             input,
             mode,
-        } => run(&name, target.as_deref(), input, mode.as_deref(), None).await,
+            canvas,
+        } => run(&name, target.as_deref(), input, mode.as_deref(), None, canvas).await,
         Action::Runs { limit, status } => runs(limit, status.as_deref()).await,
         Action::ShowRun { run_id } => show_run(&run_id).await,
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
@@ -525,7 +531,7 @@ pub async fn run_by_name(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event, false).await
+    run_with_outcome(name, None, inputs, mode, event, false, false).await
 }
 
 async fn run(
@@ -534,8 +540,9 @@ async fn run(
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
     event: Option<serde_json::Value>,
+    use_canvas: bool,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event, true)
+    run_with_outcome(name, target, inputs, mode, event, true, use_canvas)
         .await
         .map(|_| ())
 }
@@ -549,7 +556,8 @@ async fn run_with_outcome(
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
     event: Option<serde_json::Value>,
-    attach_tui: bool,
+    attach_ui: bool,
+    use_canvas: bool,
 ) -> anyhow::Result<RunOutcomeSummary> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
@@ -645,6 +653,9 @@ async fn run_with_outcome(
     let mode_str = mode.unwrap_or("ask").to_string();
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
+    // Capture transcript dir before it's moved into opts (used by the
+    // line-stream printer to locate step JSONL files).
+    let transcripts_dir_snapshot = transcripts.clone();
 
     let factory = Arc::new(CliStepFactory {
         workflow: workflow.clone(),
@@ -673,20 +684,20 @@ async fn run_with_outcome(
         resume_from: None,
     };
 
-    // When `attach_tui` is set (CLI-interactive path), spawn the workflow
-    // runner in the background, wait for the run directory to appear on
-    // disk (the orchestrator writes it before dispatching any step), then
-    // attach the TUI in the foreground. Pressing `q` exits the TUI while
-    // the runner keeps going (spec §4 — quitting never cancels a run).
-    //
     // Non-interactive callers (webhook receiver, cron tick) pass
-    // `attach_tui = false` and keep the original inline-await path so
+    // `attach_ui = false` and keep the original inline-await path so
     // they can capture and forward the result without a terminal.
-    let result = if attach_tui {
+    //
+    // Interactive callers get a live UI. Default: line-stream printer
+    // (works in any terminal, pipe, or CI runner). `--canvas` opt-in
+    // keeps the alt-screen TUI canvas.
+    let result = if attach_ui {
         // Snapshot the run dir entries that exist *before* the spawn so
         // we can detect the new one the orchestrator creates.
         let existing_run_ids: std::collections::BTreeSet<String> =
             list_run_dir_entries(&runs_dir);
+
+        // transcript_dir_snapshot was captured before opts was constructed.
 
         // Spawn the workflow runner. `opts` is moved into the task;
         // `_clone_guard` keeps the tmpdir alive through the scope.
@@ -695,13 +706,33 @@ async fn run_with_outcome(
         // Poll for the new run directory (created synchronously by the
         // orchestrator before any step work begins). 2 s upper bound;
         // in practice this is microseconds.
-        let run_id = wait_for_new_run_dir(&runs_dir, &existing_run_ids, 2_000).await;
+        let new_run_id = wait_for_new_run_dir(&runs_dir, &existing_run_ids, 2_000).await;
 
-        if let Some(run_id) = run_id {
-            // TUI blocks until the user presses `q` or the run finishes.
-            // Ignore TUI errors (e.g. non-TTY) — the runner is still going.
-            if let Err(e) = rupu_tui::run_attached(run_id, runs_dir) {
-                eprintln!("rupu: TUI exited early: {e}");
+        if let Some(ref rid) = new_run_id {
+            if use_canvas {
+                // Alt-screen TUI canvas (opt-in via --canvas).
+                // Blocks until the user presses `q` or the run finishes.
+                // Ignore TUI errors (e.g. non-TTY) — the runner is still going.
+                if let Err(e) = rupu_tui::run_attached(rid.clone(), runs_dir.clone()) {
+                    eprintln!("rupu: TUI exited early: {e}");
+                }
+            } else {
+                // Line-stream printer (default). Runs in the calling
+                // thread; blocks until the run reaches a terminal state
+                // or the user detaches.
+                let run_store_for_printer =
+                    rupu_orchestrator::RunStore::new(runs_dir.clone());
+                let mut printer = crate::output::LineStreamPrinter::new();
+                if let Err(e) = crate::output::workflow_printer::attach_and_print(
+                    name,
+                    rid,
+                    &runs_dir,
+                    &transcripts_dir_snapshot,
+                    &mut printer,
+                    &run_store_for_printer,
+                ) {
+                    eprintln!("rupu: printer error: {e}");
+                }
             }
         }
 
@@ -715,40 +746,6 @@ async fn run_with_outcome(
         run_workflow(opts).await?
     };
 
-    for sr in &result.step_results {
-        if sr.run_id.is_empty() {
-            // Skipped step (`when:` falsy) — no transcript path.
-            continue;
-        }
-        println!(
-            "rupu: step {} run {} -> {}",
-            sr.step_id,
-            sr.run_id,
-            sr.transcript_path.display()
-        );
-    }
-    match (&result.run_id, &result.awaiting) {
-        (rid, Some(info)) if !rid.is_empty() => {
-            println!();
-            println!(
-                "rupu: workflow paused at step `{}` awaiting approval (run {})",
-                info.step_id, rid
-            );
-            println!("      prompt: {}", info.prompt);
-            if let Some(ex) = info.expires_at {
-                println!("      expires: {}", ex.format("%Y-%m-%d %H:%M:%S UTC"));
-            }
-            println!("      approve with: rupu workflow approve {}", rid);
-            println!("      reject  with: rupu workflow reject {}", rid);
-        }
-        (rid, None) if !rid.is_empty() => {
-            println!(
-                "rupu: workflow run {} (inspect with: rupu workflow show-run {})",
-                rid, rid
-            );
-        }
-        _ => {}
-    }
     Ok(RunOutcomeSummary {
         run_id: result.run_id,
         awaiting_step_id: result.awaiting.map(|a| a.step_id),
