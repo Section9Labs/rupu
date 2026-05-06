@@ -1,6 +1,10 @@
 # Changelog
 
-## v0.4.5 — line-stream output by default (canvas opt-in via --canvas)
+## v0.4.5 — line-stream output by default (canvas opt-in via --canvas) (2026-05-06)
+
+### Also includes (PRs merged alongside)
+- Stable credentials across signed-binary updates via file backend (PR #62 / #63)
+- `rupu auth login` defaults to file backend; keychain becomes opt-in
 
 ### Changed
 - `rupu run`, `rupu workflow run`, and `rupu watch` now default to a
