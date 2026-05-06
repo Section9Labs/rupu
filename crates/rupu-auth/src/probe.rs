@@ -79,36 +79,66 @@ impl ProbeCache {
     }
 }
 
-/// Probe the OS keychain (or read the cached choice if present) and
-/// return a boxed `AuthBackend` ready for use.
+/// Environment variable that, when set to `file` or `keyring`,
+/// overrides the cached probe result and forces the named backend.
+/// Lets users escape the macOS-keychain "prompts on every signed-
+/// binary update" UX without flipping a config flag (and lets CI /
+/// headless contexts bypass the keychain probe entirely).
 ///
-/// On a fresh probe the keychain is preferred; if [`KeyringBackend::probe`]
-/// fails, falls back to a [`JsonFileBackend`] at `fallback_path` with a
-/// `tracing::warn!` explaining the fallback. The choice is cached at
-/// `cache.path` so subsequent invocations skip the probe.
-pub fn select_backend(cache: &ProbeCache, fallback_path: PathBuf) -> Box<dyn AuthBackend> {
-    let choice = cache.read().unwrap_or_else(|| {
-        let chosen = match KeyringBackend::probe() {
-            Ok(()) => BackendChoice::Keyring,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    fallback = %fallback_path.display(),
-                    "OS keychain unavailable; falling back to chmod-600 JSON file"
-                );
-                BackendChoice::JsonFile
-            }
-        };
-        if let Err(e) = cache.write(chosen) {
-            warn!(
-                error = %e,
-                cache = %cache.path().display(),
-                "failed to write probe cache; will re-probe next run"
-            );
-        }
-        chosen
-    });
+/// Unrecognized values are ignored with a `tracing::warn!`, so a
+/// typo (`RUPU_AUTH_BACKEND=files`) doesn't silently degrade.
+pub const ENV_BACKEND_OVERRIDE: &str = "RUPU_AUTH_BACKEND";
 
+/// Resolve which credential backend to use and return a boxed
+/// `AuthBackend` ready for use.
+///
+/// Selection order (matches [`crate::resolver::KeychainResolver`]):
+///   1. **Env override** (`RUPU_AUTH_BACKEND=file|keyring`) —
+///      session-scoped opt-in, wins over cache.
+///   2. **Cached choice** at `cache.path` — persistent choice set
+///      by `rupu auth backend --use ...`.
+///   3. **Default = `JsonFile`** at `fallback_path`.
+///
+/// The default flipped from `Keyring` → `JsonFile` to address the
+/// macOS-keychain "credentials vanish after binary update" UX:
+/// the keychain ACL pins each trusted-app entry to the binary's
+/// cdhash, which changes on every rebuild. Most CLI peers (`gh`,
+/// `aws`, `gcloud`, `claude-cli`, etc.) don't use the OS keychain
+/// for the same reason; the file backend at chmod-600 is the
+/// industry-standard answer. Users who specifically want
+/// OS-managed encryption can opt in via
+/// `rupu auth backend --use keychain`.
+pub fn select_backend(cache: &ProbeCache, fallback_path: PathBuf) -> Box<dyn AuthBackend> {
+    if let Some(override_choice) = read_env_override() {
+        return materialize(override_choice, fallback_path);
+    }
+
+    let choice = cache.read().unwrap_or(BackendChoice::JsonFile);
+    materialize(choice, fallback_path)
+}
+
+/// Parse the `RUPU_AUTH_BACKEND` env var if set. Returns `None`
+/// (with a `tracing::warn!`) for an unrecognized value rather than
+/// silently picking one — typos shouldn't auth-bypass the keychain.
+fn read_env_override() -> Option<BackendChoice> {
+    let raw = std::env::var(ENV_BACKEND_OVERRIDE).ok()?;
+    let value = raw.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "file" | "json" | "json-file" | "json_file" => Some(BackendChoice::JsonFile),
+        "keyring" | "keychain" | "os" | "os-keychain" => Some(BackendChoice::Keyring),
+        "" => None,
+        other => {
+            warn!(
+                env = ENV_BACKEND_OVERRIDE,
+                value = %other,
+                "unrecognized backend override; using cached / probed choice instead",
+            );
+            None
+        }
+    }
+}
+
+fn materialize(choice: BackendChoice, fallback_path: PathBuf) -> Box<dyn AuthBackend> {
     match choice {
         BackendChoice::Keyring => Box::new(KeyringBackend::new()),
         BackendChoice::JsonFile => Box::new(JsonFileBackend {

@@ -39,4 +39,4 @@ pub use resolver::{CredentialResolver, KeychainResolver};
 pub use backend::{AuthBackend, AuthError, ProviderId};
 pub use json_file::JsonFileBackend;
 pub use keyring::KeyringBackend;
-pub use probe::{select_backend, BackendChoice, ProbeCache};
+pub use probe::{select_backend, BackendChoice, ProbeCache, ENV_BACKEND_OVERRIDE};

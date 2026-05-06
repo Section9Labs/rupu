@@ -37,6 +37,18 @@ pub enum Action {
     },
     /// Show configured providers + backend.
     Status,
+    /// Inspect or change the credential storage backend (OS keychain
+    /// vs chmod-600 JSON file). Use `--use file` if the macOS
+    /// keychain is dropping credentials between signed-binary
+    /// updates.
+    Backend {
+        /// `keychain` (default on macOS / Linux with secret-service /
+        /// Windows) or `file` (chmod-600 `~/.rupu/auth.json`).
+        /// Omit to print the current choice + active source
+        /// (env-var, cache, or default probe).
+        #[arg(long, value_name = "KIND")]
+        r#use: Option<String>,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -77,6 +89,7 @@ pub async fn handle(action: Action) -> ExitCode {
             .await
         }
         Action::Status => status().await,
+        Action::Backend { r#use } => backend(r#use.as_deref()).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -194,6 +207,71 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
         resolver.forget(pid, m).await?;
     }
     println!("rupu: forgot credential(s) for {provider}");
+    Ok(())
+}
+
+async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
+    // Persist the user's choice via a tiny shell-rc-friendly env-export
+    // hint rather than writing to the cache directly: the env var
+    // lives at the session boundary, and any in-process change here
+    // wouldn't outlive `rupu auth backend` itself. The cache file is
+    // still updated below for cases where probe behavior matters.
+    let global = crate::paths::global_dir()?;
+    let cache_path = global.join("cache/auth-backend.json");
+    let cache = rupu_auth::ProbeCache::new(cache_path.clone());
+
+    if let Some(target) = r#use {
+        let target_norm = target.trim().to_ascii_lowercase();
+        let choice = match target_norm.as_str() {
+            "file" | "json" | "json-file" | "json_file" => rupu_auth::BackendChoice::JsonFile,
+            "keyring" | "keychain" | "os" | "os-keychain" => rupu_auth::BackendChoice::Keyring,
+            other => anyhow::bail!(
+                "unknown backend `{other}` — expected one of: file | keychain"
+            ),
+        };
+        // Update the cache so future invocations without the env var
+        // pick the same backend.
+        if let Err(e) = cache.write(choice) {
+            tracing::warn!(error = %e, "failed to write probe cache");
+        }
+        let env_value = match choice {
+            rupu_auth::BackendChoice::JsonFile => "file",
+            rupu_auth::BackendChoice::Keyring => "keychain",
+        };
+        println!("rupu: persisted backend choice = {env_value} (cache: {})", cache_path.display());
+        println!();
+        println!("To override per-shell session (e.g. while debugging):");
+        println!("  export RUPU_AUTH_BACKEND={env_value}");
+        if matches!(choice, rupu_auth::BackendChoice::JsonFile) {
+            let auth_path = global.join("auth.json");
+            println!();
+            println!("Credentials will be stored at:");
+            println!("  {}", auth_path.display());
+            println!("  (chmod 600 enforced on every write)");
+            println!();
+            println!("Re-run `rupu auth login --provider <name>` to populate the file.");
+        }
+        return Ok(());
+    }
+
+    // Show current state.
+    let env_override = std::env::var(rupu_auth::ENV_BACKEND_OVERRIDE).ok();
+    let cached = cache.read();
+    let active = match (env_override.as_deref(), cached) {
+        (Some(v), _) => format!("env-var override: {v}"),
+        (None, Some(rupu_auth::BackendChoice::Keyring)) => "cached: keychain".into(),
+        (None, Some(rupu_auth::BackendChoice::JsonFile)) => "cached: file".into(),
+        (None, None) => "default: file (chmod-600 ~/.rupu/auth.json)".into(),
+    };
+    println!("Active backend : {active}");
+    println!("Cache file     : {}", cache_path.display());
+    println!();
+    println!("To switch persistently:");
+    println!("  rupu auth backend --use file       # store in ~/.rupu/auth.json (chmod 600)");
+    println!("  rupu auth backend --use keychain   # store in OS keychain");
+    println!();
+    println!("To override per-shell session:");
+    println!("  export RUPU_AUTH_BACKEND=file      # or `keychain`");
     Ok(())
 }
 

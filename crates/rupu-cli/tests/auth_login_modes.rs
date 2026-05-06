@@ -3,8 +3,17 @@ use predicates::prelude::*;
 
 #[test]
 fn login_api_key_with_inline_key_succeeds() {
+    // Default credential backend is now the chmod-600 JSON file —
+    // point it at a per-test temp file so this test doesn't write
+    // to the developer's real `~/.rupu/auth.json` and doesn't
+    // trigger the macOS keychain (which would hang `cargo test` on
+    // an "Always Allow" prompt).
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let auth_file = tmp.path().join("auth.json");
     Command::cargo_bin("rupu")
         .unwrap()
+        .env("RUPU_AUTH_BACKEND", "file")
+        .env("RUPU_AUTH_FILE", &auth_file)
         .args([
             "auth",
             "login",
