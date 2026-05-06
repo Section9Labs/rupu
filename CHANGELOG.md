@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.4.4 — TUI canvas: stripe + rounded cards + connectors (2026-05-06)
+
+### Fixed
+- Tracing on stderr punched through the alt-screen and corrupted
+  the canvas (`WARN`/`INFO` lines bleeding through, color reset
+  state clobbered). TUI commands now route logs to
+  `~/.rupu/cache/rupu.log`; non-TUI commands keep stderr.
+- Long `AssistantMessage` lines (panelist agents emit 2000+ char
+  JSON) overflowed the focused-node panel as raw text. Per-line
+  truncated at 80 chars with `…` indicator.
+- Canvas drew bordered cards with no connector lines between
+  them. Added `═══▶` for same-row hops, `║`/`╠`/`╚` for fan-out
+  drops, all colored by upstream-node status.
+
+### Changed
+- Canvas redesigned to mirror the Okesu visual language: status
+  stripe (`█` row colored by status) at the top of each card,
+  rounded corners (`╭╮╰╯`), multi-row cards (5×22) showing
+  step_id + glyph on row 1 and a status-derived secondary line
+  (`done`, `running · agent`, `awaiting approval`, `done · 412t`)
+  on row 2, dotted (`·`) backdrop. Bold-pulse on running/awaiting
+  via wall-clock toggle.
+
 ## v0.4.3 — fix: OpenAI rejects tool names with `.` (2026-05-06)
 
 ### Fixed
