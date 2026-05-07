@@ -49,6 +49,7 @@ owo-colors.workspace = true
 crossterm.workspace = true
 tempfile.workspace = true
 syntect.workspace = true
+minijinja.workspace = true
 
 [dev-dependencies]
 assert_fs.workspace = true

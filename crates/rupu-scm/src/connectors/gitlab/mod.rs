@@ -1,11 +1,13 @@
 //! GitLab connector — implements RepoConnector + IssueConnector.
 
 pub mod client;
+pub mod events;
 pub mod extras;
 pub mod issues;
 pub mod repo;
 
 pub use client::GitlabClient;
+pub use events::GitlabEventConnector;
 pub use extras::GitlabExtras;
 pub use issues::GitlabIssueConnector;
 pub use repo::GitlabRepoConnector;

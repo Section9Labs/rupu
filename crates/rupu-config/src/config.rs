@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider_config::ProviderConfig;
 use crate::scm_config::{IssuesSection, ScmSection};
+use crate::triggers_config::TriggersConfig;
 
 /// Top-level rupu configuration. Loaded from `~/.rupu/config.toml`
 /// (global) and optionally overridden by `<repo>/.rupu/config.toml`
@@ -31,6 +32,8 @@ pub struct Config {
     pub issues: IssuesSection,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub triggers: TriggersConfig,
 }
 
 /// Terminal-output rendering preferences. Consumed by

@@ -594,6 +594,7 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         run_store: Some(store),
         workflow_yaml: Some(body),
         resume_from: Some(resume),
+        run_id_override: None,
     };
 
     let result = run_workflow(opts).await?;
@@ -715,7 +716,23 @@ pub async fn run_by_name(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event, false, false).await
+    run_with_outcome(name, None, inputs, mode, event, false, false, None).await
+}
+
+/// Variant of [`run_by_name`] that pins the run-id. Used by the
+/// `rupu cron tick` polled-events tier, which derives a deterministic
+/// id (`evt-<workflow>-<vendor>-<delivery>`) so re-delivered or
+/// re-polled events don't double-fire. On collision, the underlying
+/// `RunStore::create` returns `AlreadyExists`; this wrapper surfaces
+/// that as `Err(...)` and the caller logs + skips.
+pub async fn run_by_name_with_run_id(
+    name: &str,
+    inputs: Vec<(String, String)>,
+    mode: Option<&str>,
+    event: Option<serde_json::Value>,
+    run_id: String,
+) -> anyhow::Result<RunOutcomeSummary> {
+    run_with_outcome(name, None, inputs, mode, event, false, false, Some(run_id)).await
 }
 
 /// Public wrapper for `rupu issues run <name> <ref>` and similar
@@ -739,7 +756,7 @@ async fn run(
     event: Option<serde_json::Value>,
     use_canvas: bool,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event, true, use_canvas)
+    run_with_outcome(name, target, inputs, mode, event, true, use_canvas, None)
         .await
         .map(|_| ())
 }
@@ -747,6 +764,7 @@ async fn run(
 /// Same as [`run`] but returns a [`RunOutcomeSummary`] so non-CLI
 /// callers (the webhook receiver) can surface run-id + pause state.
 /// `run` itself thin-wraps this and discards the value.
+#[allow(clippy::too_many_arguments)]
 async fn run_with_outcome(
     name: &str,
     target: Option<&str>,
@@ -755,6 +773,7 @@ async fn run_with_outcome(
     event: Option<serde_json::Value>,
     attach_ui: bool,
     use_canvas: bool,
+    run_id_override: Option<String>,
 ) -> anyhow::Result<RunOutcomeSummary> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
@@ -947,6 +966,7 @@ async fn run_with_outcome(
         run_store: Some(run_store),
         workflow_yaml: Some(body.clone()),
         resume_from: None,
+        run_id_override,
     };
 
     // Non-interactive callers (webhook receiver, cron tick) pass
@@ -1057,6 +1077,7 @@ async fn run_with_outcome(
                                 run_store: Some(Arc::clone(&run_store_for_resume)),
                                 workflow_yaml: Some(body_for_resume.clone()),
                                 resume_from: Some(resume),
+                                run_id_override: None,
                             };
                             current_runner = tokio::spawn(run_workflow(resume_opts));
                             attach_opts = crate::output::workflow_printer::AttachOpts {

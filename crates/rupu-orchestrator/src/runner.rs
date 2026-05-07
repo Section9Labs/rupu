@@ -143,6 +143,13 @@ pub struct OrchestratorRunOpts {
     /// populating this from the persisted `step_results.jsonl` +
     /// `run.json`.
     pub resume_from: Option<ResumeState>,
+    /// Caller-supplied run-id used for idempotent dispatch (cron tick
+    /// polled-events tier). `None` for normal manual runs, where the
+    /// runner generates `run_<ULID>` instead. When `Some`, the runner
+    /// passes the id straight to `RunStore::create`; if the run
+    /// already exists, `RunStoreError::AlreadyExists` surfaces and
+    /// the caller is expected to log + skip.
+    pub run_id_override: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,7 +312,13 @@ pub async fn run_workflow(
                 Some(resume.approved_step_id),
             )
         } else if opts.run_store.is_some() {
-            (format!("run_{}", Ulid::new()), Vec::new(), None)
+            // Caller-supplied id (cron-tick polled tier) wins; otherwise
+            // generate a fresh ULID-suffixed id.
+            let id = opts
+                .run_id_override
+                .clone()
+                .unwrap_or_else(|| format!("run_{}", Ulid::new()));
+            (id, Vec::new(), None)
         } else {
             (String::new(), Vec::new(), None)
         };

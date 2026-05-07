@@ -10,12 +10,14 @@
 
 pub mod connectors;
 pub mod error;
+pub mod event_connector;
 pub mod platform;
 pub mod registry;
 pub mod types;
 
 pub use connectors::{IssueConnector, RepoConnector};
 pub use error::{classify_scm_error, ScmError};
+pub use event_connector::{EventConnector, EventPollResult, PolledEvent};
 pub use platform::{IssueTracker, Platform};
 pub use registry::Registry;
 pub use types::{

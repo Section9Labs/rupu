@@ -11,6 +11,7 @@ use rupu_config::Config;
 use crate::connectors::github::extras::GithubExtras;
 use crate::connectors::gitlab::extras::GitlabExtras;
 use crate::connectors::{IssueConnector, RepoConnector};
+use crate::event_connector::EventConnector;
 use crate::platform::{IssueTracker, Platform};
 
 /// Registry that builds connectors from configured credentials.
@@ -22,6 +23,7 @@ use crate::platform::{IssueTracker, Platform};
 pub struct Registry {
     repo_connectors: HashMap<Platform, Arc<dyn RepoConnector>>,
     issue_connectors: HashMap<IssueTracker, Arc<dyn IssueConnector>>,
+    event_connectors: HashMap<Platform, Arc<dyn EventConnector>>,
     github_extras: Option<Arc<GithubExtras>>,
     gitlab_extras: Option<Arc<GitlabExtras>>,
 }
@@ -49,6 +51,19 @@ impl Registry {
             }
         }
 
+        // GitHub events (separate path because it uses reqwest directly
+        // rather than octocrab; same credential resolver). No-op when
+        // GitHub credentials are absent.
+        match crate::connectors::github::events::try_build(resolver, cfg).await {
+            Ok(Some(c)) => {
+                reg.event_connectors.insert(Platform::Github, c);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "github events: connector build failed; skipping");
+            }
+        }
+
         // GitLab
         match crate::connectors::gitlab::try_build(resolver, cfg).await {
             Ok(Some((repo, issues, extras))) => {
@@ -61,6 +76,17 @@ impl Registry {
             }
             Err(e) => {
                 warn!(error = %e, "gitlab: connector build failed; skipping");
+            }
+        }
+
+        // GitLab events.
+        match crate::connectors::gitlab::events::try_build(resolver, cfg).await {
+            Ok(Some(c)) => {
+                reg.event_connectors.insert(Platform::Gitlab, c);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "gitlab events: connector build failed; skipping");
             }
         }
 
@@ -77,6 +103,20 @@ impl Registry {
     /// registered. Clones the Arc so the caller owns a reference.
     pub fn issues(&self, t: IssueTracker) -> Option<Arc<dyn IssueConnector>> {
         self.issue_connectors.get(&t).cloned()
+    }
+
+    /// Retrieve the EventConnector for a given platform, if one is
+    /// registered. Used by `rupu cron tick`'s polled-events tier.
+    pub fn events(&self, p: Platform) -> Option<Arc<dyn EventConnector>> {
+        self.event_connectors.get(&p).cloned()
+    }
+
+    /// Test/internal: register an `EventConnector` directly.
+    /// Discovery wires the GitHub + GitLab impls from
+    /// `connectors::github::events::build` /
+    /// `connectors::gitlab::events::build` once those land.
+    pub fn insert_event_connector(&mut self, p: Platform, c: Arc<dyn EventConnector>) {
+        self.event_connectors.insert(p, c);
     }
 
     /// Returns the per-platform extras handle for GitHub actions, if
