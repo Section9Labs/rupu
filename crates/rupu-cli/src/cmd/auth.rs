@@ -93,10 +93,7 @@ pub async fn handle(action: Action) -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("rupu auth: {e}");
-            ExitCode::from(1)
-        }
+        Err(e) => crate::output::diag::fail(e)
     }
 }
 
@@ -289,7 +286,11 @@ async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
 
 async fn status() -> anyhow::Result<()> {
     let resolver = rupu_auth::resolver::KeychainResolver::new();
-    println!("{:<10} {:<10} SSO", "PROVIDER", "API-KEY");
+    let prefs = crate::output::diag::prefs_for_diag(false);
+
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["PROVIDER", "API-KEY", "SSO"]);
+
     for (label, pid) in [
         ("anthropic", ProviderId::Anthropic),
         ("openai", ProviderId::Openai),
@@ -298,18 +299,52 @@ async fn status() -> anyhow::Result<()> {
         ("github", ProviderId::Github),
         ("gitlab", ProviderId::Gitlab),
     ] {
-        let api = if resolver.peek(pid, rupu_providers::AuthMode::ApiKey).await {
-            "✓"
+        let api_present = resolver.peek(pid, rupu_providers::AuthMode::ApiKey).await;
+        let api_cell = if api_present {
+            comfy_table::Cell::new("✓").fg(
+                crate::output::tables::status_color("completed", &prefs)
+                    .unwrap_or(comfy_table::Color::Reset),
+            )
         } else {
-            "-"
+            comfy_table::Cell::new("—").fg(comfy_table::Color::DarkGrey)
         };
-        let sso = match resolver.peek_sso(pid).await {
-            Some(expiry_repr) => format!("✓ ({expiry_repr})"),
-            None => "-".to_string(),
+
+        let sso_cell = match resolver.peek_sso(pid).await {
+            Some(expiry_repr) => {
+                let lower = expiry_repr.to_ascii_lowercase();
+                let color = if lower.contains("expired") {
+                    comfy_table::Color::Red
+                } else if lower.contains("expires in") && is_soon(&expiry_repr) {
+                    comfy_table::Color::Yellow
+                } else {
+                    crate::output::tables::status_color("completed", &prefs)
+                        .unwrap_or(comfy_table::Color::Reset)
+                };
+                let glyph = if lower.contains("expired") { "✗" } else { "✓" };
+                comfy_table::Cell::new(format!("{glyph} {expiry_repr}")).fg(color)
+            }
+            None => comfy_table::Cell::new("—").fg(comfy_table::Color::DarkGrey),
         };
-        println!("{:<10} {:<10} {}", label, api, sso);
+
+        table.add_row(vec![comfy_table::Cell::new(label), api_cell, sso_cell]);
     }
+    println!("{table}");
     Ok(())
+}
+
+/// Heuristic: SSO expiry strings like `expires in 8d` / `expires in 47h`
+/// count as "soon" when the duration is under 7 days. Keeps the
+/// renderer free of full date parsing — the source `expiry_repr` is
+/// already a human-friendly relative form built by the resolver.
+fn is_soon(repr: &str) -> bool {
+    let trimmed = repr.trim_start_matches("expires in ").trim();
+    if let Some(num) = trimmed.strip_suffix('d') {
+        return num.parse::<u32>().map(|d| d < 7).unwrap_or(false);
+    }
+    if trimmed.ends_with('h') || trimmed.ends_with('m') || trimmed.ends_with('s') {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

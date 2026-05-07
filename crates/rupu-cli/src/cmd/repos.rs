@@ -28,10 +28,7 @@ pub async fn handle(action: Action) -> ExitCode {
     match action {
         Action::List(args) => match list_inner(args).await {
             Ok(()) => ExitCode::from(0),
-            Err(e) => {
-                eprintln!("rupu repos list: {e}");
-                ExitCode::from(1)
-            }
+            Err(e) => crate::output::diag::fail(e)
         },
     }
 }
@@ -67,7 +64,12 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
     let mut any_skipped = false;
     for p in platforms {
         let Some(conn) = registry.repo(p) else {
-            eprintln!("(skipped {p}: no credential — run `rupu auth login --provider {p}`)");
+            crate::output::diag::skip(
+                &prefs,
+                p.to_string(),
+                "no credential",
+                format!("rupu auth login --provider {p}"),
+            );
             any_skipped = true;
             continue;
         };

@@ -22,17 +22,11 @@ pub async fn handle(action: Action) -> ExitCode {
                 println!("{v}");
                 ExitCode::from(0)
             }
-            Err(e) => {
-                eprintln!("rupu config get: {e}");
-                ExitCode::from(1)
-            }
+            Err(e) => crate::output::diag::fail(e)
         },
         Action::Set { key, value } => match set(&key, &value).await {
             Ok(()) => ExitCode::from(0),
-            Err(e) => {
-                eprintln!("rupu config set: {e}");
-                ExitCode::from(1)
-            }
+            Err(e) => crate::output::diag::fail(e)
         },
     }
 }

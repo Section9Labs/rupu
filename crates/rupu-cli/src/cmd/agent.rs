@@ -58,10 +58,7 @@ pub async fn handle(action: Action) -> ExitCode {
     match action {
         Action::List { no_color } => match list(no_color).await {
             Ok(()) => ExitCode::from(0),
-            Err(e) => {
-                eprintln!("rupu agent list: {e}");
-                ExitCode::from(1)
-            }
+            Err(e) => crate::output::diag::fail(e)
         },
         Action::Show {
             name,
@@ -79,10 +76,7 @@ pub async fn handle(action: Action) -> ExitCode {
             };
             match show(&name, no_color, theme.as_deref(), pager_flag).await {
                 Ok(()) => ExitCode::from(0),
-                Err(e) => {
-                    eprintln!("rupu agent show: {e}");
-                    ExitCode::from(1)
-                }
+                Err(e) => crate::output::diag::fail(e)
             }
         }
         Action::Edit {
@@ -91,10 +85,7 @@ pub async fn handle(action: Action) -> ExitCode {
             editor,
         } => match edit(&name, scope.as_deref(), editor.as_deref()).await {
             Ok(()) => ExitCode::from(0),
-            Err(e) => {
-                eprintln!("rupu agent edit: {e}");
-                ExitCode::from(1)
-            }
+            Err(e) => crate::output::diag::fail(e)
         },
     }
 }

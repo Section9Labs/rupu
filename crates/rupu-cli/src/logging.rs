@@ -14,7 +14,14 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// Stderr-writing init for non-TUI commands. Idempotent — safe to
 /// call multiple times in the same process (tests rely on this).
 pub fn init() {
-    let filter = EnvFilter::try_from_env("RUPU_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    // Default to WARN so internal observability (`credential backend = ...`,
+    // `github: no credentials configured; skipping connector`) doesn't
+    // leak into the user's terminal as if it were CLI output. Users
+    // who want to see INFO/DEBUG opt in via `RUPU_LOG=info` /
+    // `RUPU_LOG=debug` (or any standard `tracing-subscriber` directive
+    // like `RUPU_LOG=rupu_scm=debug,info`). User-facing status / error
+    // messages go through `output::diag` instead.
+    let filter = EnvFilter::try_from_env("RUPU_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer().with_target(false).with_writer(std::io::stderr))
@@ -50,7 +57,14 @@ pub fn init_to_file() -> Option<PathBuf> {
         init();
         return None;
     };
-    let filter = EnvFilter::try_from_env("RUPU_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
+    // Default to WARN so internal observability (`credential backend = ...`,
+    // `github: no credentials configured; skipping connector`) doesn't
+    // leak into the user's terminal as if it were CLI output. Users
+    // who want to see INFO/DEBUG opt in via `RUPU_LOG=info` /
+    // `RUPU_LOG=debug` (or any standard `tracing-subscriber` directive
+    // like `RUPU_LOG=rupu_scm=debug,info`). User-facing status / error
+    // messages go through `output::diag` instead.
+    let filter = EnvFilter::try_from_env("RUPU_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(
