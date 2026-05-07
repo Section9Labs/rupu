@@ -528,3 +528,25 @@ steps:
         "expected max_iterations error, got: {err}"
     );
 }
+
+#[test]
+fn parses_notify_issue_field() {
+    let s = r#"
+name: x
+notifyIssue: true
+steps:
+  - id: a
+    agent: ag
+    actions: []
+    prompt: hi
+"#;
+    let wf = Workflow::parse(s).expect("notifyIssue should parse");
+    assert!(wf.notify_issue);
+}
+
+#[test]
+fn notify_issue_defaults_to_false() {
+    let s = "name: x\nsteps:\n  - id: a\n    agent: ag\n    actions: []\n    prompt: hi\n";
+    let wf = Workflow::parse(s).unwrap();
+    assert!(!wf.notify_issue);
+}
