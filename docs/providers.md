@@ -8,10 +8,10 @@ Slice B-1 adds four LLM providers, each supporting two authentication modes. Thi
 | --------- | :-----: | :--: | ---------------- | ------------------------------------------------------------------ |
 | anthropic |   ✓     |  ✓   | Browser callback | Console API key OR Claude.ai SSO.                                  |
 | openai    |   ✓     |  ✓   | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.   |
-| gemini    |   —     |  ✓   | Browser callback | API-key path via AI Studio is deferred (see `TODO.md`). SSO via Vertex/CLI works. |
+| gemini    |   ✓     |  ✓   | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO via Vertex / CLI also supported. |
 | copilot   |   ✓     |  ✓   | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot. |
 
-Anthropic remains the most exercised provider; Copilot's API-key path is most reliable for users who already have `gh auth login` configured. Gemini API-key support is queued for a follow-up release.
+Anthropic remains the most exercised provider; Copilot's API-key path is most reliable for users who already have `gh auth login` configured.
 
 ## Auth flows
 

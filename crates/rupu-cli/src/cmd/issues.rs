@@ -105,7 +105,13 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
     let issues = conn.list_issues(&project, filter).await?;
 
     if issues.is_empty() {
-        eprintln!("no issues match (state={}, labels={:?})", args.state, args.labels);
+        // Empty results go to stdout so `rupu issues list ... | wc -l`
+        // and similar pipelines see a clean "(none)" line rather than
+        // a stderr-only message that doesn't make it through.
+        println!(
+            "(no issues match — state={}, labels={:?})",
+            args.state, args.labels
+        );
         return Ok(());
     }
 

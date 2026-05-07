@@ -67,10 +67,12 @@ pub enum Action {
         /// Workflow name (filename stem under `workflows/`).
         #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
-        /// Optional target reference, e.g. `github:owner/repo#42`.
-        /// See `docs/scm.md#target-syntax` for the full grammar.
-        /// Distinguished from other positionals by parsing as a RunTarget.
-        /// Per-step propagation via StepFactory is wired in Plan 3 Task 3.
+        /// Optional run-target. Accepts repo (`github:owner/repo`,
+        /// `gitlab:group/proj`), PR (`github:owner/repo#42`), or
+        /// issue (`github:owner/repo/issues/42`). Repo / PR targets
+        /// clone to a tmpdir for the run; issue targets pre-fetch
+        /// the issue payload and bind it as `{{ issue.* }}` in step
+        /// prompts.
         target: Option<String>,
         /// `KEY=VALUE` template inputs (repeatable).
         #[arg(long, value_parser = parse_kv)]
@@ -372,6 +374,19 @@ async fn runs(
         .take(limit)
         .collect();
 
+// Empty results print the explanation alone — no header — so users
+    // don't see a column header followed by nothing.
+    if filtered.is_empty() {
+        let scope = match (status_filter, issue_filter_canonical.as_deref()) {
+            (None, None) => "(no runs yet — use `rupu workflow run <name>` to create one)".into(),
+            (Some(s), None) => format!("(no runs match status={s})"),
+            (None, Some(i)) => format!("(no runs match issue={i})"),
+            (Some(s), Some(i)) => format!("(no runs match status={s}, issue={i})"),
+        };
+        println!("{scope}");
+        return Ok(());
+    }
+
     println!(
         "{:<28} {:<20} {:<18} {:<24} {:<22} WORKFLOW",
         "RUN ID", "STATUS", "STARTED (UTC)", "DURATION", "EXPIRES"
@@ -403,9 +418,6 @@ async fn runs(
             r.workflow_name
         );
     }
-    if filtered.is_empty() {
-        println!("(no runs yet — use `rupu workflow run <name>` to create one)");
-    }
     Ok(())
 }
 
@@ -414,7 +426,12 @@ async fn show_run(run_id: &str) -> anyhow::Result<()> {
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let record = store
         .load(run_id)
-        .map_err(|e| anyhow::anyhow!("run not found: {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "run not found: {e}\n  hint: list runs with `rupu workflow runs` \
+                 or start one with `rupu workflow run <name>`"
+            )
+        })?;
     let rows = store
         .read_step_results(run_id)
         .map_err(|e| anyhow::anyhow!("read step results failed: {e}"))?;
@@ -516,7 +533,10 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
             anyhow::bail!("run has no awaiting_step_id; record may be corrupt");
         }
         Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
-            anyhow::bail!("run not found: {id}");
+            anyhow::bail!(
+                "run not found: {id}\n  hint: \
+                 list paused runs with `rupu workflow runs --status awaiting_approval`"
+            );
         }
         Err(e) => return Err(anyhow::anyhow!("approve: {e}")),
         Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
@@ -666,7 +686,10 @@ async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
             );
         }
         Err(rupu_orchestrator::ApprovalError::NotFound(id)) => {
-            anyhow::bail!("run not found: {id}");
+            anyhow::bail!(
+                "run not found: {id}\n  hint: \
+                 list paused runs with `rupu workflow runs --status awaiting_approval`"
+            );
         }
         Err(e) => return Err(anyhow::anyhow!("reject: {e}")),
         Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
