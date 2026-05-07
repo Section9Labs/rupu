@@ -25,6 +25,7 @@ use crate::paths;
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use rupu_orchestrator::cron_schedule::{next_fire_after, parse_schedule, should_fire};
+use rupu_orchestrator::event_matches;
 use rupu_orchestrator::{TriggerKind, Workflow};
 use rupu_scm::{Platform, RepoRef};
 use std::collections::BTreeMap;
@@ -257,7 +258,7 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
 
         for event in &result.events {
             for wf in &event_workflows {
-                if wf.event != event.id {
+                if !event_matches(&wf.event, &event.id) {
                     continue;
                 }
                 let event_payload = build_event_payload(event, platform);

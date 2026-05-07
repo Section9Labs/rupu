@@ -11,7 +11,7 @@
 //! `rupu_cli::cmd::workflow::run_by_name`.
 
 use async_trait::async_trait;
-use rupu_orchestrator::{TriggerKind, Workflow};
+use rupu_orchestrator::{event_matches, TriggerKind, Workflow};
 use serde_json::Value;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -87,8 +87,9 @@ pub async fn dispatch_event(
         if wf.trigger.on != TriggerKind::Event {
             continue;
         }
-        if wf.trigger.event.as_deref() != Some(event_id) {
-            continue;
+        match wf.trigger.event.as_deref() {
+            Some(pattern) if event_matches(pattern, event_id) => {}
+            _ => continue,
         }
         if let Some(filter_expr) = &wf.trigger.filter {
             match render_filter(filter_expr, payload) {

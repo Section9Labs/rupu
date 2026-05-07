@@ -9,12 +9,14 @@
 
 pub mod action_protocol;
 pub mod cron_schedule;
+pub mod event_match;
 pub mod runner;
 pub mod runs;
 pub mod templates;
 pub mod workflow;
 
 pub use action_protocol::{validate_actions, ActionValidationResult};
+pub use event_match::event_matches;
 pub use runner::{
     run_workflow, AwaitingInfo, Finding, ItemResult, OrchestratorRunOpts,
     OrchestratorRunResult, ResumeState, RunWorkflowError, StepFactory, StepResult,

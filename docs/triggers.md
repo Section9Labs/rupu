@@ -135,20 +135,71 @@ The same `rupu cron tick` that fires `cron`-triggered workflows also polls event
 
 ### What you can match against
 
-The polled connector lifts events from each vendor's events API and maps them onto the rupu vocabulary:
+The polled connector lifts events from each vendor's events API and maps them onto the rupu vocabulary. Glob wildcards (`*`) work in `trigger.event:` — see the next section.
 
-| Event id | GitHub | GitLab |
-|---|:-:|:-:|
-| `github.issue.opened` / `github.issue.closed` / `github.issue.reopened` | ✓ | — |
-| `github.issue.commented` | ✓ | — |
-| `github.pr.opened` / `github.pr.closed` / `github.pr.merged` / `github.pr.reopened` | ✓ | — |
-| `github.push` | ✓ | — |
-| `gitlab.issue.opened` / `gitlab.issue.closed` / `gitlab.issue.reopened` | — | ✓ |
-| `gitlab.mr.opened` / `gitlab.mr.closed` / `gitlab.mr.merged` / `gitlab.mr.reopened` | — | ✓ |
-| `gitlab.comment` | — | ✓ |
-| `gitlab.push` | — | ✓ |
+**GitHub (polled tier covers all of these):**
 
-Events that depend on webhook-only signal (e.g. `github.pr.review_requested`, `github.issue.labeled`, `github.issue.assigned`) are **not** delivered by the polled tier. Use webhook-serve for those — see below.
+| Category | Event ids |
+|---|---|
+| Issue lifecycle | `github.issue.opened` / `github.issue.closed` / `github.issue.reopened` / `github.issue.edited` |
+| Issue queue (label/assign/milestone) | `github.issue.labeled` / `github.issue.unlabeled` / `github.issue.assigned` / `github.issue.unassigned` / `github.issue.milestoned` / `github.issue.demilestoned` |
+| Issue comments | `github.issue.commented` / `github.issue.comment_edited` |
+| PR lifecycle | `github.pr.opened` / `github.pr.closed` / `github.pr.merged` / `github.pr.reopened` / `github.pr.edited` / `github.pr.updated` / `github.pr.ready_for_review` |
+| PR review | `github.pr.labeled` / `github.pr.unlabeled` / `github.pr.assigned` / `github.pr.unassigned` / `github.pr.review_requested` / `github.pr.review_submitted` |
+| Push | `github.push` |
+
+**GitLab (polled tier covers a subset; webhook tier covers more):**
+
+| Category | Event ids |
+|---|---|
+| Issue lifecycle | `gitlab.issue.opened` / `gitlab.issue.closed` / `gitlab.issue.reopened` |
+| MR lifecycle | `gitlab.mr.opened` / `gitlab.mr.closed` / `gitlab.mr.merged` / `gitlab.mr.reopened` |
+| Comments | `gitlab.comment` |
+| Push | `gitlab.push` |
+
+Some GitLab events (label changes, assignment changes) aren't surfaced as discrete entries by GitLab's events API — use webhook-serve for those, or write a workflow against `gitlab.issue.opened` and inspect `event.payload.labels` in `trigger.filter:`.
+
+### Glob matching on `trigger.event:`
+
+`*` matches any (possibly empty) sequence of characters. Useful when:
+
+- You want one workflow to react to **all** events of a kind: `trigger.event: github.issue.*`
+- You want to react cross-vendor: `trigger.event: "*.pr.merged"` matches both `github.pr.merged` and (when GitLab MR-merge support lands in the polled tier) `gitlab.mr.merged`. Note vendor differences — `*.mr.merged` matches GitLab; `*.pr.merged` matches GitHub.
+- You want a "wake on anything" workflow: `trigger.event: "*"`
+
+`*` is greedy and does not special-case `.` boundaries — `github.*` matches the entire suffix.
+
+### Queue patterns
+
+GitHub Issues doesn't have first-class "queue" semantics (Linear / Jira do). The convention on GitHub is to use **labels as queue indicators** (e.g. `triage`, `ready`, `in-review`). Compose those with the existing label events + a filter expression:
+
+```yaml
+# .rupu/workflows/triage-on-label.yaml
+name: triage-on-label
+trigger:
+  on: event
+  event: github.issue.labeled
+  filter: "{{ event.payload.label.name == 'triage' }}"
+
+steps:
+  - id: classify
+    agent: triage-classifier
+    prompt: |
+      Issue {{ event.repo.full_name }}#{{ event.payload.issue.number }}
+      just entered the triage queue.
+
+      Title: {{ event.payload.issue.title }}
+      Body: {{ event.payload.issue.body }}
+```
+
+Variations:
+
+- **"Issue moved between queues."** Listen on `github.issue.labeled` AND `github.issue.unlabeled`. Glob: `trigger.event: github.issue.*labeled`. Filter on the specific label name.
+- **"PR awaiting review."** `trigger.event: github.pr.review_requested`. The reviewer is at `event.payload.requested_reviewer.login`.
+- **"PR moved out of draft."** `trigger.event: github.pr.ready_for_review`.
+- **"Issue assigned to me."** `trigger.event: github.issue.assigned` + `filter: "{{ event.payload.assignee.login == 'matt' }}"`.
+
+Native `entered_queue:<queue>` / `left_queue:<queue>` event sugar (per design spec §6.3) is deferred until rupu ships a Linear or Jira connector that natively models board columns. Until then, label-based composition is the GitHub idiom.
 
 ### Coverage caveats
 
