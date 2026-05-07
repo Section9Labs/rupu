@@ -2,7 +2,6 @@
 
 use clap::Subcommand;
 use rupu_auth::ProviderId;
-use std::io::Read;
 use std::process::ExitCode;
 
 #[derive(Subcommand, Debug)]
@@ -118,11 +117,7 @@ async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::
         AuthModeArg::ApiKey => {
             let secret = match key {
                 Some(k) => k.to_string(),
-                None => {
-                    let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
-                    buf.trim().to_string()
-                }
+                None => read_api_key_from_stdin(provider, pid)?,
             };
             if secret.is_empty() {
                 anyhow::bail!("empty API key");
@@ -147,6 +142,53 @@ async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::
         }
     }
     Ok(())
+}
+
+/// Read an API key from stdin with proper UI feedback. Two paths:
+///
+/// - **stdin is a tty**: prompt the user with a one-line message
+///   telling them what to paste and how to terminate the input
+///   (`Ctrl-D` on Unix, `Ctrl-Z, Enter` on Windows). Without this
+///   prompt, `rupu auth login --provider <p>` blocked silently on
+///   `read_to_string` waiting for EOF — the symptom users hit was
+///   "the command stalls and nothing happens."
+///
+/// - **stdin is NOT a tty** (pipe / heredoc / CI): silently slurp
+///   the buffered input. This preserves the documented
+///   `echo $KEY | rupu auth login --provider …` flow.
+///
+/// Also surfaces the SSO alternative when the provider has one —
+/// users typing `rupu auth login --provider github` mostly want the
+/// SSO/device-code flow, not a paste-your-PAT prompt.
+fn read_api_key_from_stdin(provider: &str, pid: ProviderId) -> anyhow::Result<String> {
+    use std::io::{IsTerminal, Read, Write};
+
+    let prefs = crate::output::diag::prefs_for_diag(false);
+
+    if std::io::stdin().is_terminal() {
+        let has_sso = rupu_auth::oauth::providers::provider_oauth(pid).is_some();
+        let sso_hint = if has_sso {
+            format!(
+                " (or rerun with `--mode sso` to authenticate via the {provider} browser flow)"
+            )
+        } else {
+            String::new()
+        };
+        // Stderr so the prompt doesn't pollute a piped stdout.
+        eprintln!("rupu auth login: paste your {provider} API key, then press Ctrl-D to submit{sso_hint}.");
+        // Flush in case stderr is line-buffered and the prompt would
+        // otherwise lag behind the user's first paste.
+        let _ = std::io::stderr().flush();
+    } else {
+        // Non-tty: silently read whatever was piped in. If the pipe is
+        // empty (`< /dev/null`), `read_to_string` returns 0 bytes and
+        // we fall through to the empty-secret check in the caller.
+        let _ = &prefs;
+    }
+
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf.trim().to_string())
 }
 
 struct LogoutOpts {
