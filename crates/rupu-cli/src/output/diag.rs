@@ -138,7 +138,6 @@ pub fn warn(prefs: &UiPrefs, msg: impl Display) {
     diag(Severity::Warn, prefs, msg);
 }
 
-#[allow(dead_code)]
 pub fn warn_with_hint(prefs: &UiPrefs, msg: impl Display, hint: impl Display) {
     diag_with_hint(Severity::Warn, prefs, msg, hint);
 }

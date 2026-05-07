@@ -62,6 +62,7 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
 
     let mut any_listed = false;
     let mut any_skipped = false;
+    let mut any_private = false;
     for p in platforms {
         let Some(conn) = registry.repo(p) else {
             crate::output::diag::skip(
@@ -75,6 +76,9 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
         };
         let repos = conn.list_repos().await?;
         for r in repos {
+            if r.private {
+                any_private = true;
+            }
             // Visibility coloring: private → dim (slate), public → green
             // (mirrors GitHub's "open" green for the not-locked case).
             // When no_color is set, both render plain.
@@ -102,5 +106,45 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("{table}");
+
+    // GitHub-specific scope diagnostic: if no private repos came back
+    // AND the user expected some, the most common cause is that the
+    // stored token doesn't carry the `repo` scope. Probe the GitHub
+    // token's scopes via `GET /user`'s `X-OAuth-Scopes` header and
+    // emit an actionable warn when the scope is missing. Skipped
+    // entirely when GitHub credentials aren't configured (no
+    // `github_extras`) or the probe call fails (unknown scope set —
+    // we'd rather say nothing than yell).
+    if !any_private {
+        if let Some(extras) = registry.github_extras() {
+            if let Some(scopes) = extras.fetch_token_scopes().await {
+                let has_repo = scopes.iter().any(|s| s == "repo");
+                let has_public_only = scopes.iter().any(|s| s == "public_repo");
+                if !has_repo {
+                    let detail = if has_public_only {
+                        "your stored github token only has the `public_repo` scope; \
+                         private repos require the `repo` scope."
+                    } else {
+                        "your stored github token does not have the `repo` scope, \
+                         which is needed to list private repos."
+                    };
+                    crate::output::diag::warn_with_hint(
+                        &prefs,
+                        format!(
+                            "no private github repos shown — {detail} \
+                             (current scopes: {})",
+                            if scopes.is_empty() {
+                                "(none)".into()
+                            } else {
+                                scopes.join(", ")
+                            }
+                        ),
+                        "rupu auth logout --provider github && rupu auth login --provider github --mode sso",
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }

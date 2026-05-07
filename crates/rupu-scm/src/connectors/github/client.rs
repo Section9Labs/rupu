@@ -90,6 +90,42 @@ impl GithubClient {
         }
     }
 
+    /// Fetch the comma-separated list of OAuth scopes that GitHub
+    /// reports for the current token. Reads `X-OAuth-Scopes` from a
+    /// cheap `GET /user` call (one round-trip; the response body is
+    /// discarded). Returns `None` on network / 4xx / parse failure
+    /// — diagnostics built on top of this should treat absence as
+    /// "unknown" rather than "definitely missing scopes".
+    ///
+    /// Used by `rupu repos list` to surface a missing-`repo`-scope
+    /// warning when private repos are unexpectedly absent. octocrab's
+    /// typed builder API doesn't expose response headers cleanly, so
+    /// this goes through reqwest directly.
+    pub async fn fetch_token_scopes(&self) -> Option<Vec<String>> {
+        let http = reqwest::Client::builder().build().ok()?;
+        let resp = http
+            .get("https://api.github.com/user")
+            .header(reqwest::header::USER_AGENT, "rupu/0")
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", self.token),
+            )
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let raw = resp.headers().get("X-OAuth-Scopes")?.to_str().ok()?;
+        Some(
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    }
+
     /// Run `f` with retry-with-backoff. Recoverable RateLimited /
     /// Transient errors are retried up to MAX_RETRIES with exponential
     /// jitter (cap 60s). Unrecoverable errors abort immediately.

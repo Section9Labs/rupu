@@ -15,6 +15,14 @@ impl GithubExtras {
         Self { client }
     }
 
+    /// Diagnostic helper — exposes [`GithubClient::fetch_token_scopes`]
+    /// without making the whole client `pub`. Used by `rupu repos list`
+    /// to surface a missing-`repo`-scope warning when private repos
+    /// are unexpectedly absent.
+    pub async fn fetch_token_scopes(&self) -> Option<Vec<String>> {
+        self.client.fetch_token_scopes().await
+    }
+
     pub async fn workflows_dispatch(
         &self,
         r: &RepoRef,
