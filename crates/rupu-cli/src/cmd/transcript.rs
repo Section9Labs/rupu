@@ -30,10 +30,7 @@ pub async fn handle(action: Action) -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("rupu transcript: {e}");
-            ExitCode::from(1)
-        }
+        Err(e) => crate::output::diag::fail(e)
     }
 }
 

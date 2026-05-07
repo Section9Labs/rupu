@@ -31,10 +31,7 @@ pub async fn handle(action: Action) -> ExitCode {
     match action {
         Action::Serve(args) => match serve_inner(args).await {
             Ok(()) => ExitCode::from(0),
-            Err(e) => {
-                eprintln!("rupu mcp serve: {e}");
-                ExitCode::from(1)
-            }
+            Err(e) => crate::output::diag::fail(e)
         },
     }
 }

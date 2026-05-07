@@ -33,10 +33,7 @@ pub struct InitArgs {
 pub async fn handle(args: InitArgs) -> ExitCode {
     match init_inner(args) {
         Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("rupu init: {e}");
-            ExitCode::from(1)
-        }
+        Err(e) => crate::output::diag::fail(e)
     }
 }
 

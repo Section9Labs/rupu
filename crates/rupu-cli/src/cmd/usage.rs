@@ -35,10 +35,7 @@ pub async fn handle(args: UsageArgs) -> ExitCode {
     let result = run(args).await;
     match result {
         Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("rupu usage: {e}");
-            ExitCode::from(1)
-        }
+        Err(e) => crate::output::diag::fail(e)
     }
 }
 

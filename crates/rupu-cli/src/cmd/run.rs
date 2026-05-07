@@ -38,10 +38,7 @@ pub struct Args {
 pub async fn handle(args: Args) -> ExitCode {
     match run_inner(args).await {
         Ok(()) => ExitCode::from(0),
-        Err(e) => {
-            eprintln!("rupu run: {e}");
-            ExitCode::from(1)
-        }
+        Err(e) => crate::output::diag::fail(e)
     }
 }
 
