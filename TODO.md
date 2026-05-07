@@ -2,30 +2,17 @@
 
 Items deferred from completed slices. Each entry should name **why deferred**, **prereqs**, and **what unblocks it**.
 
-## Workflow triggers — manual / cron / event-driven (multi-PR initiative)
+## Workflow triggers — manual / cron / event-driven
 
-rupu workflows currently only run via `rupu workflow run <name>` (CLI manual trigger). Okesu supports rich trigger declarations that fire on schedule or on external events; that capability is what turns "agentic CLI" into "agentic platform". Designing this needs three independent PRs:
+Has its own design spec: [`docs/superpowers/specs/2026-05-07-rupu-workflow-triggers-design.md`](docs/superpowers/specs/2026-05-07-rupu-workflow-triggers-design.md). That doc is the source of truth for the architecture (three tiers: cron-tick polled, webhook-serve, rupu.cloud relay), the schema, the event vocabulary, and the Slice E hand-off contract.
 
-**PR 1 — Trigger schema + manual baseline.** Add a `trigger:` block to workflow YAML:
-```yaml
-trigger:
-  on: manual                    # manual | cron | event
-  # cron-only:  cron: "0 4 * * *"
-  # event-only: event: github.pr.opened
-  #             filter: "{{event.repo.name == 'rupu'}}"
-```
-Manual is the existing default (no scheduler / receiver yet). All this PR does is parse + validate the block and document the surface; no runtime wiring beyond the existing manual path.
-
-**PR 2 — Cron runtime.** Three options for scheduling: (a) long-running rupu daemon keeping cron schedules in process and firing `rupu workflow run --trigger cron <name>`; (b) emit per-workflow systemd-timer / launchd-plist scaffolding via `rupu workflow install <name>`; (c) `rupu cron tick` invoked from system cron. Option (c) is the cheapest first step — system cron does the scheduling, rupu just exposes the firing entry point. (a) is the durable answer.
-
-**PR 3 — Event triggers** (the substantial one). Webhook receiver subcommand (`rupu webhook serve` or similar) listening on a configurable port, validating provider HMACs (GitHub `x-hub-signature-256`, GitLab `x-gitlab-token`), routing to workflows whose `trigger.on: event` + `event:` + optional `filter:` expression matches. Initial event vocabulary worth supporting:
-
-- **SCM events** (built atop the Slice B-2 connectors): `github.repo.cloned` (proxy: webhook on push to default branch + first-fetch detection), `github.issue.created` / `github.issue.updated` / `github.issue.closed`, `github.pr.opened` / `github.pr.review_requested` / `github.pr.merged`, `github.push`, plus GitLab equivalents.
-- **Issue-tracker queue events**: `issue.entered_queue:<queue>`, `issue.left_queue:<queue>`, `issue.state_changed:<from>-><to>` (e.g., `triage->ready`).
-
-Each event populates `{{event.*}}` template bindings (repo, issue number, author, body, …) usable in `when:` filters and step prompts. Polling is a fallback for IdPs without webhooks.
-
-**Why deferred (multi-PR):** the schema is bounded but the runtime is three different daemons (cron tick, webhook receiver, polling fallback) and each needs auth + replay-safety + idempotency design. Ship PR 1 alongside Tier 1 orchestration so users see the trigger surface; PR 2 + 3 follow.
+**Status:**
+- ✅ Trigger schema (`trigger.on: manual|cron|event`) parses + validates.
+- ✅ `rupu cron tick` fires `trigger.on: cron` workflows from system cron / launchd. Idempotent.
+- ✅ `rupu webhook serve` (long-running HTTP receiver, HMAC-validated) fires `trigger.on: event` workflows.
+- ⏳ **Plan 1 — polled events on cron tick** ([plan](docs/superpowers/plans/2026-05-07-rupu-workflow-triggers-plan-1-polled-events.md)). The piece that lets users WITHOUT a server use event triggers — `rupu cron tick` polls SCM connectors for events between ticks and fires matching workflows.
+- ⏳ Plan 2 (future) — glob matching on `trigger.event:` (`github.issue.*`), extended event vocab (issue-tracker queue events).
+- ⏳ Plan 3 (future, Slice E) — rupu.cloud webhook relay; cloud-as-connector or cloud-as-stream consumption.
 
 ## Workflow Tier 2 — fan-out, panel steps, approval gates
 

@@ -9,6 +9,8 @@
 - Plan 2 (GitLab + MCP server, complete): `docs/superpowers/plans/2026-05-03-rupu-slice-b2-plan-2-gitlab-and-mcp.md`
 - Plan 3 (CLI run-target + docs + nightly, complete): `docs/superpowers/plans/2026-05-03-rupu-slice-b2-plan-3-cli-and-docs.md`
 - Slice C plan: `docs/superpowers/plans/2026-05-05-rupu-slice-c-tui-plan.md`
+- Workflow triggers spec: `docs/superpowers/specs/2026-05-07-rupu-workflow-triggers-design.md`
+- Workflow triggers Plan 1 (polled events on cron tick): `docs/superpowers/plans/2026-05-07-rupu-workflow-triggers-plan-1-polled-events.md`
 
 ## Architecture rules (enforced)
 1. **Hexagonal separation.** `rupu-providers`, `rupu-tools`, `rupu-auth` define traits (ports). The agent runtime in `rupu-agent` only knows traits.
