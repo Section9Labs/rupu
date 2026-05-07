@@ -20,6 +20,8 @@ fn paused_record(dir: &std::path::Path) -> RunRecord {
         approval_prompt: Some("ok?".into()),
         awaiting_since: Some(Utc::now()),
         expires_at: None,
+        issue_ref: None,
+        issue: None,
     }
 }
 

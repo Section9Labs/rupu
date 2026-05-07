@@ -61,6 +61,8 @@ fn tail_emits_run_update_when_run_json_changes() {
         approval_prompt: None,
         awaiting_since: None,
         expires_at: None,
+        issue_ref: None,
+        issue: None,
     };
     std::fs::write(dir.path().join("run.json"), serde_json::to_vec(&rec).unwrap()).unwrap();
 
