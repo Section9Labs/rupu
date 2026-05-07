@@ -35,7 +35,7 @@ pub async fn handle(args: UsageArgs) -> ExitCode {
     let result = run(args).await;
     match result {
         Ok(()) => ExitCode::from(0),
-        Err(e) => crate::output::diag::fail(e)
+        Err(e) => crate::output::diag::fail(e),
     }
 }
 

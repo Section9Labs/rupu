@@ -22,11 +22,11 @@ pub async fn handle(action: Action) -> ExitCode {
                 println!("{v}");
                 ExitCode::from(0)
             }
-            Err(e) => crate::output::diag::fail(e)
+            Err(e) => crate::output::diag::fail(e),
         },
         Action::Set { key, value } => match set(&key, &value).await {
             Ok(()) => ExitCode::from(0),
-            Err(e) => crate::output::diag::fail(e)
+            Err(e) => crate::output::diag::fail(e),
         },
     }
 }

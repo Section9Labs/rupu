@@ -38,7 +38,7 @@ pub struct Args {
 pub async fn handle(args: Args) -> ExitCode {
     match run_inner(args).await {
         Ok(()) => ExitCode::from(0),
-        Err(e) => crate::output::diag::fail(e)
+        Err(e) => crate::output::diag::fail(e),
     }
 }
 
