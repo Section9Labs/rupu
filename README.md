@@ -1,19 +1,30 @@
 # rupu
 
-**Status:** Slice A — local CLI
+**Status:** local CLI feature-complete (Slices A + B + C shipped)
 
 ---
 
 ## What is rupu?
 
-`rupu` is "Okesu, but for code development in an agentic engineering world": a CLI for
-orchestrating coding agents across repositories, triggered by issues from any tracker,
-with sandboxed sessions that can be saved and resumed. The full vision spans SaaS,
-native desktop, and multi-SCM connectors. **Slice A** — what you have now — is the
-local-only foundation: a single Rust binary that loads agent definitions from your
-project, drives a real LLM provider, and writes a JSONL transcript on every run.
-Slice B adds SCM connectors and issue-tracker triggers; Slice C adds the control plane,
-remote sandboxes, and session persistence.
+`rupu` is a CLI for orchestrating coding agents across repositories — driven by
+issue-tracker events, gated by human approvals when you want them, with a JSONL
+transcript on every run. A single Rust binary that:
+
+- Drives any of four LLM providers (Anthropic, OpenAI, Gemini, GitHub Copilot)
+  via API key OR SSO, with credentials kept in the OS keychain or a chmod-600 file.
+- Loads agent + workflow definitions from `.rupu/` in your project (or globally
+  from `~/.rupu/`); ships a curated starter set via `rupu init --with-samples`.
+- Talks to GitHub and GitLab through a single embedded MCP server (so the same
+  surface works inside rupu and inside Claude Desktop / Cursor / any MCP host).
+- Fires workflows on cron schedules OR external SCM events (GitHub / GitLab),
+  via either a system-cron poll loop (no daemon) or a user-managed
+  `rupu webhook serve` long-running process.
+- Renders runs as a live terminal canvas (`rupu workflow run`) or a streaming
+  line view, with `rupu watch <run_id>` to re-attach to anything in flight.
+
+What's NOT in this binary yet: the SaaS dashboard, the remote sandbox runtime,
+and the native desktop app — those are slices D + E. See [TODO.md](TODO.md) for
+deferred items in already-shipped slices.
 
 ---
 
@@ -86,9 +97,10 @@ rupu auth login --provider anthropic --mode sso
 rupu auth status
 ```
 
-Credentials are stored in the OS keychain at `rupu/<provider>/<api-key|sso>`.
-SSO entries auto-refresh near expiry; failure surfaces an actionable error
-pointing at `rupu auth login --mode sso`.
+Credentials are stored at `~/.rupu/auth.json` (chmod-600 file, the default —
+matches `gh`, `aws`, `gcloud`). To use the OS keychain instead:
+`rupu auth backend --use keychain`. SSO entries auto-refresh near expiry;
+failure surfaces an actionable error pointing at `rupu auth login --mode sso`.
 
 See `docs/providers.md` for the full reference and `docs/providers/<name>.md`
 for per-provider walkthroughs.
@@ -121,9 +133,39 @@ rupu mcp serve --transport stdio
 | Issues                 |   ✅   |   ✅   |
 | Workflows / pipelines  |   ✅   |   ✅   |
 | Clone to local         |   ✅   |   ✅   |
+| Polled event triggers  |   ✅   |   ✅   |
+| Webhook event triggers |   ✅   |   ✅   |
 
 Linear and Jira issue trackers are designed-in but not shipped in this
 release; see [TODO.md](TODO.md) for the deferred-feature list.
+
+### Workflow triggers
+
+A workflow can fire on a cron schedule or in response to an SCM event
+(issue opened, PR merged, issue labeled, …). Three runtime tiers — pick
+whichever matches your environment:
+
+| Tier | When it fires | Where it lives |
+|---|---|---|
+| Cron polling | system cron / launchd → `rupu cron tick` | every install (no daemon) |
+| Webhook serve | inbound HTTP from GitHub / GitLab | user-managed long-running process |
+| Cloud relay | rupu.cloud receives webhooks, CLI consumes | Slice E (future) |
+
+```yaml
+# .rupu/workflows/triage-on-label.yaml
+name: triage-on-label
+trigger:
+  on: event
+  event: github.issue.labeled
+  filter: "{{ event.payload.label.name == 'triage' }}"
+steps:
+  - id: classify
+    agent: triage-classifier
+    prompt: "Classify {{ event.repo.full_name }}#{{ event.payload.issue.number }}"
+```
+
+See [`docs/triggers.md`](docs/triggers.md) for the full vocabulary, glob-pattern
+matching (`github.issue.*`), and label-as-queue patterns.
 
 ### Run your first agent
 
@@ -196,20 +238,30 @@ coverage gaps.
 ## Subcommands
 
 ```
-rupu run <agent> [prompt]          Run an agent from the project's .rupu/agents/
-rupu agent list                    List available agents
-rupu agent show <name>             Print agent definition
-rupu workflow list                 List available workflows
-rupu workflow show <name>          Print workflow definition
-rupu workflow run <name> [prompt]  Run a multi-step workflow
-rupu transcript list               List past run transcripts
-rupu transcript show <id>          Stream a transcript to stdout
-rupu config get [key]              Read global config
-rupu config set <key> <value>      Write global config
-rupu auth login --provider <p>     Store a provider credential
-rupu auth logout --provider <p>    Remove a provider credential
-rupu auth status                   Show stored credentials
+rupu init [--with-samples] [--git]    Bootstrap .rupu/ in the current dir
+rupu run <agent> [prompt]             Run an agent from the project's .rupu/agents/
+rupu agent {list, show, edit}         Manage agents (list / inspect / open in $EDITOR)
+rupu workflow {list, show, edit}      Manage workflows
+rupu workflow run <name> [target]     Run a workflow (target: repo, PR, or issue ref)
+rupu workflow runs                    List recent persisted runs
+rupu workflow {approve, reject} <id>  Resume / cancel a paused-for-approval run
+rupu watch <run_id> [--replay]        Re-attach the TUI to any past or in-flight run
+rupu transcript {list, show}          Browse JSONL transcripts
+rupu issues {list, show, run}         Issue-tracker surface (auto-detects from cwd)
+rupu repos list                       List configured-platform repositories
+rupu cron {list, tick, events}        Cron + polled-event trigger runtime
+rupu webhook serve [--addr]           Long-lived webhook receiver for GitHub / GitLab
+rupu mcp serve [--transport]          Expose rupu's tools to MCP clients
+rupu auth {login, logout, status}     Provider credential management
+rupu models {list, refresh}           Browse / refresh discovered model lists
+rupu config {get, set}                Read / write rupu configuration
+rupu completions {print, install}     Shell-completion scripts (with dynamic agent names)
+rupu usage                            Aggregate token spend across transcripts
 ```
+
+Run `rupu <subcommand> --help` for the full surface of any one. Tab completion
+covers every flag and dynamically lists agent / workflow names for the
+positional slots.
 
 ---
 

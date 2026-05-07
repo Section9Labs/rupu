@@ -1,6 +1,9 @@
 //! GitlabIssueConnector — implements rupu_scm::IssueConnector.
 
 use async_trait::async_trait;
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::connectors::IssueConnector;
 use crate::error::ScmError;
@@ -9,13 +12,77 @@ use crate::types::{Comment, CreateIssue, Issue, IssueFilter, IssueRef, IssueStat
 
 use super::client::GitlabClient;
 
+/// TTL on the per-project label-color cache. Matches the
+/// `GitlabClient` body cache to keep the freshness story uniform.
+const LABEL_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Per-label name → hex color (no leading `#`).
+type LabelColors = BTreeMap<String, String>;
+
+/// Cache entry: when the snapshot was taken + the snapshot itself.
+type LabelCacheEntry = (Instant, LabelColors);
+
 pub struct GitlabIssueConnector {
     client: GitlabClient,
+    /// Per-project label-color cache. We hold the lock briefly
+    /// (insert / read), never across the HTTP fetch.
+    label_cache: Mutex<BTreeMap<String, LabelCacheEntry>>,
 }
 
 impl GitlabIssueConnector {
     pub fn new(client: GitlabClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            label_cache: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Resolve the name → hex map for `project`, fetching from
+    /// `/projects/:id/labels` on cache miss. The TTL means a list
+    /// invocation that follows another list within 5 min reuses the
+    /// snapshot — fine for color rendering, which is decorative.
+    async fn project_label_colors(&self, project: &str) -> LabelColors {
+        // Hit cache first.
+        if let Ok(guard) = self.label_cache.lock() {
+            if let Some((at, map)) = guard.get(project) {
+                if at.elapsed() < LABEL_CACHE_TTL {
+                    return map.clone();
+                }
+            }
+        }
+
+        // Cache miss — fetch. Failures here are non-fatal (the chip
+        // renderer falls back to the hash-based palette), so map any
+        // error to an empty map and move on.
+        let id = match encode_project_id(project) {
+            Ok(s) => s,
+            Err(_) => return LabelColors::new(),
+        };
+        // GitLab paginates labels at 20/page by default; per_page=100
+        // covers the long tail of "label-heavy" projects in one call.
+        let path = format!("/projects/{id}/labels?per_page=100");
+        let body = match self.client.get_json(&path).await {
+            Ok(v) => v,
+            Err(_) => return LabelColors::new(),
+        };
+        let mut map = LabelColors::new();
+        if let Some(arr) = body.as_array() {
+            for entry in arr {
+                let name = entry.get("name").and_then(|v| v.as_str());
+                let color = entry.get("color").and_then(|v| v.as_str());
+                if let (Some(n), Some(c)) = (name, color) {
+                    // GitLab serves colors as `#xxxxxx`; strip the
+                    // leading `#` so the renderer's hex parser
+                    // (six-digit, no prefix) accepts the value.
+                    let stripped = c.strip_prefix('#').unwrap_or(c).to_string();
+                    map.insert(n.to_string(), stripped);
+                }
+            }
+        }
+        if let Ok(mut guard) = self.label_cache.lock() {
+            guard.insert(project.to_string(), (Instant::now(), map.clone()));
+        }
+        map
     }
 }
 
@@ -53,8 +120,14 @@ impl IssueConnector for GitlabIssueConnector {
         let arr = body.as_array().ok_or_else(|| ScmError::BadRequest {
             message: "expected array from /issues".into(),
         })?;
+        // Fetch project label colors once per list invocation; enrich
+        // each Issue's `label_colors` with the matching subset.
+        let colors = self.project_label_colors(project).await;
         arr.iter()
-            .map(|v| translate_issue(project.to_string(), v))
+            .map(|v| translate_issue(project.to_string(), v).map(|mut iss| {
+                attach_label_colors(&mut iss, &colors);
+                iss
+            }))
             .collect()
     }
 
@@ -65,7 +138,10 @@ impl IssueConnector for GitlabIssueConnector {
             .client
             .get_json(&format!("/projects/{id}/issues/{}", i.number))
             .await?;
-        translate_issue(i.project.clone(), &body)
+        let mut issue = translate_issue(i.project.clone(), &body)?;
+        let colors = self.project_label_colors(&i.project).await;
+        attach_label_colors(&mut issue, &colors);
+        Ok(issue)
     }
 
     async fn comment_issue(&self, i: &IssueRef, body: &str) -> Result<Comment, ScmError> {
@@ -119,6 +195,18 @@ impl IssueConnector for GitlabIssueConnector {
             )
             .await?;
         Ok(())
+    }
+}
+
+/// Copy the relevant subset of a project's name→hex map onto an
+/// Issue's `label_colors`. Labels in `issue.labels` that aren't in
+/// `colors` are silently skipped — the chip renderer falls back to
+/// the hash-based palette for those.
+fn attach_label_colors(issue: &mut Issue, colors: &LabelColors) {
+    for name in &issue.labels {
+        if let Some(hex) = colors.get(name) {
+            issue.label_colors.insert(name.clone(), hex.clone());
+        }
     }
 }
 
