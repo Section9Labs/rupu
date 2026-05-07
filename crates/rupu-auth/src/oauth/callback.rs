@@ -24,6 +24,10 @@ use crate::stored::StoredCredential;
 
 const CALLBACK_TIMEOUT_SECS: u64 = 300;
 
+/// Branded post-callback landing page served once the redirect lands.
+/// Inlined at compile time so the OAuth flow has no external file deps.
+const LANDING_PAGE: &str = include_str!("landing.html");
+
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -171,12 +175,14 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
                 .map(|(_, v)| v.into_owned())
                 .ok_or_else(|| anyhow!("no `state` in redirect"))?;
 
-            let resp = tiny_http::Response::from_string(
-                "<html><body>Authentication complete — return to your terminal.</body></html>",
-            )
-            .with_header(
-                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..]).unwrap(),
-            );
+            let resp = tiny_http::Response::from_string(LANDING_PAGE)
+                .with_header(
+                    tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        &b"text/html; charset=utf-8"[..],
+                    )
+                    .unwrap(),
+                );
             let _ = req.respond(resp);
             return Ok((code, got_state));
         }
