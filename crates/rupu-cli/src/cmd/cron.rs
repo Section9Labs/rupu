@@ -118,10 +118,7 @@ async fn list(no_color: bool) -> anyhow::Result<()> {
                     crate::output::tables::relative_time_cell(delta, &prefs),
                 )
             }
-            None => (
-                "<unschedulable>".to_string(),
-                comfy_table::Cell::new(""),
-            ),
+            None => ("<unschedulable>".to_string(), comfy_table::Cell::new("")),
         };
         table.add_row(vec![
             comfy_table::Cell::new(&w.name),
@@ -142,7 +139,9 @@ fn ui_prefs(no_color: bool) -> anyhow::Result<crate::cmd::ui::UiPrefs> {
     let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg =
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
-    Ok(crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None))
+    Ok(crate::cmd::ui::UiPrefs::resolve(
+        &cfg.ui, no_color, None, None,
+    ))
 }
 
 async fn tick(dry_run: bool, skip_events: bool, only_events: bool) -> anyhow::Result<()> {

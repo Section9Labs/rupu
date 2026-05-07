@@ -70,7 +70,9 @@ pub(super) fn apply(node: &mut NodeState, ev: &Event) {
                 duration_ms: None,
             });
         }
-        Event::CommandRun { argv, exit_code, .. } => {
+        Event::CommandRun {
+            argv, exit_code, ..
+        } => {
             *node.tools_used.entry("bash".into()).or_insert(0) += 1;
             node.last_action = Some(LastAction {
                 tool: "bash".into(),
@@ -88,7 +90,11 @@ pub(super) fn apply(node: &mut NodeState, ev: &Event) {
             node.status = NodeStatus::Awaiting;
             node.gate_prompt = Some(prompt.clone());
         }
-        Event::TurnEnd { tokens_in, tokens_out, .. } => {
+        Event::TurnEnd {
+            tokens_in,
+            tokens_out,
+            ..
+        } => {
             if let Some(t) = tokens_in {
                 node.tokens.input = node.tokens.input.saturating_add(*t);
             }
@@ -96,7 +102,12 @@ pub(super) fn apply(node: &mut NodeState, ev: &Event) {
                 node.tokens.output = node.tokens.output.saturating_add(*t);
             }
         }
-        Event::Usage { input_tokens, output_tokens, cached_tokens, .. } => {
+        Event::Usage {
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+            ..
+        } => {
             node.tokens.input = node.tokens.input.saturating_add(u64::from(*input_tokens));
             node.tokens.output = node.tokens.output.saturating_add(u64::from(*output_tokens));
             node.tokens.cached = node.tokens.cached.saturating_add(u64::from(*cached_tokens));

@@ -120,9 +120,7 @@ impl KeychainResolver {
             // Cache lives at `<RUPU_HOME>/cache/auth-backend.json` —
             // same layout the CLI's `rupu auth backend` writes to,
             // and honors the same `RUPU_HOME` test override.
-            let cache_path = rupu_home_dir()?
-                .join("cache")
-                .join("auth-backend.json");
+            let cache_path = rupu_home_dir()?.join("cache").join("auth-backend.json");
             let text = std::fs::read_to_string(&cache_path).ok()?;
             let choice: crate::BackendChoice = serde_json::from_str(&text).ok()?;
             Some(matches!(choice, crate::BackendChoice::JsonFile))
@@ -167,8 +165,7 @@ impl KeychainResolver {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
             Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
         };
-        serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))
     }
 
     fn write_file_map(
@@ -179,10 +176,9 @@ impl KeychainResolver {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow::anyhow!("mkdir {}: {e}", parent.display()))?;
         }
-        let body = serde_json::to_string_pretty(map)
-            .map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
-        std::fs::write(path, body)
-            .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
+        let body =
+            serde_json::to_string_pretty(map).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+        std::fs::write(path, body).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
         // Enforce 0600 on every write so a previous loose-mode file
         // gets tightened up next time the user logs in.
         #[cfg(unix)]

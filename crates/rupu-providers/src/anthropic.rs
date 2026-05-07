@@ -61,9 +61,8 @@ fn sanitize_messages_tool_names(mut value: serde_json::Value) -> serde_json::Val
                     else {
                         continue;
                     };
-                    block["name"] = serde_json::Value::String(
-                        sanitize_anthropic_tool_name(&name_str),
-                    );
+                    block["name"] =
+                        serde_json::Value::String(sanitize_anthropic_tool_name(&name_str));
                 }
             }
         }
@@ -999,8 +998,8 @@ impl AnthropicClient {
         // block's `name` to its wire-safe form. Internal state still uses
         // the canonical "scm.repos.list" form; only the wire payload sees
         // the escaped variant.
-        let messages_value: serde_json::Value = serde_json::to_value(&request.messages)
-            .unwrap_or_else(|_| serde_json::json!([]));
+        let messages_value: serde_json::Value =
+            serde_json::to_value(&request.messages).unwrap_or_else(|_| serde_json::json!([]));
         let messages_value = sanitize_messages_tool_names(messages_value);
 
         let mut body = serde_json::json!({
@@ -1525,7 +1524,10 @@ mod tests {
             sanitize_anthropic_tool_name("scm.repos.list"),
             "scm__dot__repos__dot__list"
         );
-        assert_eq!(sanitize_anthropic_tool_name("issues.create"), "issues__dot__create");
+        assert_eq!(
+            sanitize_anthropic_tool_name("issues.create"),
+            "issues__dot__create"
+        );
     }
 
     #[test]
@@ -2642,8 +2644,7 @@ mod tests {
             "sk-ant-test".into(),
             format!("{}/v1/messages?beta=true", server.url("")),
         );
-        let models =
-            <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
+        let models = <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
         assert!(models.iter().any(|m| m.id == "claude-opus-4-1-20250805"));
         assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
         assert!(models.iter().all(|m| m.provider == ProviderId::Anthropic));
@@ -2659,12 +2660,9 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(r#"{"error":{"type":"authentication_error"}}"#);
         });
-        let client = AnthropicClient::with_url(
-            "bad-key".into(),
-            format!("{}/v1/messages", server.url("")),
-        );
-        let models =
-            <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
+        let client =
+            AnthropicClient::with_url("bad-key".into(), format!("{}/v1/messages", server.url("")));
+        let models = <AnthropicClient as crate::provider::LlmProvider>::list_models(&client).await;
         assert!(models.is_empty());
     }
 }

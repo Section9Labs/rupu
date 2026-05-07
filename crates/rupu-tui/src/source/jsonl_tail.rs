@@ -75,7 +75,9 @@ impl JsonlTailSource {
 
     fn drain_run_json(&mut self, out: &mut Vec<SourceEvent>) {
         let path = self.run_dir.join("run.json");
-        let Ok(bytes) = std::fs::read(&path) else { return };
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
         // Compare against last-known mtime via a sentinel offset (file size).
         let last_size = self.offsets.get(&path).copied().unwrap_or(u64::MAX);
         if last_size == bytes.len() as u64 {
@@ -165,10 +167,7 @@ struct MtimePoller {
 }
 
 impl MtimePoller {
-    fn new(
-        run_dir: PathBuf,
-        tx: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
-    ) -> Self {
+    fn new(run_dir: PathBuf, tx: std::sync::mpsc::Sender<notify::Result<notify::Event>>) -> Self {
         let handle = std::thread::spawn(move || {
             let mut last: BTreeMap<PathBuf, std::time::SystemTime> = BTreeMap::new();
             loop {

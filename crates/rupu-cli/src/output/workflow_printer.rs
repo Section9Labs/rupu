@@ -18,7 +18,7 @@
 //! `approval_prompt` method and then calls back into the run-store to
 //! approve or reject based on the user's response.
 
-use super::{SpinnerHandle, TranscriptTailer, printer::LineStreamPrinter};
+use super::{printer::LineStreamPrinter, SpinnerHandle, TranscriptTailer};
 use rupu_orchestrator::{FindingRecord, StepResultRecord};
 use rupu_transcript::Event as TxEvent;
 use std::collections::BTreeSet;
@@ -132,8 +132,7 @@ pub fn attach_and_print_with(
     // referenced from the same anchor.
     let started_at = {
         let bytes = std::fs::read(&run_json)?;
-        let rec: serde_json::Value =
-            serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        let rec: serde_json::Value = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         let started_at_str = rec["started_at"].as_str().unwrap_or("");
         chrono::DateTime::parse_from_rfc3339(started_at_str)
             .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -193,14 +192,11 @@ pub fn attach_and_print_with(
                     .to_string();
 
                 loop {
-                    let ch = printer
-                        .approval_prompt(&step_id, &prompt)
-                        .unwrap_or('q');
+                    let ch = printer.approval_prompt(&step_id, &prompt).unwrap_or('q');
 
                     match ch {
                         'v' | 'V' => {
-                            let groups =
-                                load_findings_groups(&step_results_log, &step_id);
+                            let groups = load_findings_groups(&step_results_log, &step_id);
                             printer.print_findings(&groups);
                         }
                         'a' | 'A' => {
@@ -229,12 +225,7 @@ pub fn attach_and_print_with(
                                 &reason
                             };
                             let approver = whoami::username();
-                            let _ = run_store.reject(
-                                run_id,
-                                &approver,
-                                reason,
-                                chrono::Utc::now(),
-                            );
+                            let _ = run_store.reject(run_id, &approver, reason, chrono::Utc::now());
                             println!("Run rejected.");
                             return Ok(AttachOutcome::Rejected);
                         }
@@ -277,9 +268,7 @@ pub fn attach_and_print_with(
                 std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
                 flush_all_tailers(&mut steps, printer, &mut total_tokens);
 
-                let err = record["error_message"]
-                    .as_str()
-                    .unwrap_or("unknown error");
+                let err = record["error_message"].as_str().unwrap_or("unknown error");
                 printer.workflow_failed(workflow_name, run_id, err);
                 return Ok(AttachOutcome::Done);
             }
@@ -300,10 +289,7 @@ fn load_run_record(run_json: &Path) -> Option<serde_json::Value> {
 /// Walk `step_results.jsonl` and return findings grouped by source step,
 /// excluding the awaiting (gate) step itself. Order matches the JSONL file.
 /// Falls back to a single empty group if the file is unreadable.
-fn load_findings_groups(
-    log: &Path,
-    awaiting_step_id: &str,
-) -> Vec<(String, Vec<FindingRecord>)> {
+fn load_findings_groups(log: &Path, awaiting_step_id: &str) -> Vec<(String, Vec<FindingRecord>)> {
     let Ok(bytes) = std::fs::read(log) else {
         return Vec::new();
     };
@@ -384,9 +370,7 @@ fn drain_step_results(
             );
         } else {
             // Linear step — open a tailer if we have a transcript.
-            if rec.transcript_path.as_os_str().is_empty()
-                || !rec.transcript_path.exists()
-            {
+            if rec.transcript_path.as_os_str().is_empty() || !rec.transcript_path.exists() {
                 // Header + immediate footer (nothing to stream).
                 let spinner = printer.step_start(&rec.step_id, None, None, None);
                 spinner.stop();

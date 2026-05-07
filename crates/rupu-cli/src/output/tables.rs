@@ -82,9 +82,7 @@ pub fn colored_label_chip(name: &str, prefs: &UiPrefs) -> String {
     let (r, g, b) = label_palette_color(name);
     let (fr, fg, fb) = pick_fg_for_bg(r, g, b);
     // padding: leading + trailing space gives the chip room to breathe.
-    format!(
-        "\x1b[48;2;{r};{g};{b}m\x1b[38;2;{fr};{fg};{fb}m {name} \x1b[0m"
-    )
+    format!("\x1b[48;2;{r};{g};{b}m\x1b[38;2;{fr};{fg};{fb}m {name} \x1b[0m")
 }
 
 /// Render a join of label chips, separated by a single space. Empty
@@ -276,14 +274,32 @@ mod tests {
     #[test]
     fn status_color_known_buckets() {
         let p = prefs_color_always();
-        assert!(matches!(status_color("running", &p), Some(TableColor::Blue)));
-        assert!(matches!(status_color("completed", &p), Some(TableColor::Green)));
+        assert!(matches!(
+            status_color("running", &p),
+            Some(TableColor::Blue)
+        ));
+        assert!(matches!(
+            status_color("completed", &p),
+            Some(TableColor::Green)
+        ));
         assert!(matches!(status_color("failed", &p), Some(TableColor::Red)));
-        assert!(matches!(status_color("awaiting_approval", &p), Some(TableColor::Yellow)));
-        assert!(matches!(status_color("rejected", &p), Some(TableColor::Magenta)));
+        assert!(matches!(
+            status_color("awaiting_approval", &p),
+            Some(TableColor::Yellow)
+        ));
+        assert!(matches!(
+            status_color("rejected", &p),
+            Some(TableColor::Magenta)
+        ));
         assert!(matches!(status_color("open", &p), Some(TableColor::Green)));
-        assert!(matches!(status_color("closed", &p), Some(TableColor::Magenta)));
-        assert!(matches!(status_color("project", &p), Some(TableColor::Cyan)));
+        assert!(matches!(
+            status_color("closed", &p),
+            Some(TableColor::Magenta)
+        ));
+        assert!(matches!(
+            status_color("project", &p),
+            Some(TableColor::Cyan)
+        ));
     }
 
     #[test]

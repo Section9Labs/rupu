@@ -28,7 +28,10 @@ pub fn layout_canvas(node_ids: &[&str], edges: &[(String, String)]) -> BTreeMap<
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     for id in node_ids {
         if seen.insert(id) {
-            by_col.entry(*depth.get(id).unwrap_or(&0)).or_default().push(id);
+            by_col
+                .entry(*depth.get(id).unwrap_or(&0))
+                .or_default()
+                .push(id);
         }
     }
 
@@ -37,7 +40,13 @@ pub fn layout_canvas(node_ids: &[&str], edges: &[(String, String)]) -> BTreeMap<
         for (row, id) in ids.into_iter().enumerate() {
             #[allow(clippy::cast_possible_truncation)]
             // Upper bound: workflows with >65535 fan-out children is impossible
-            out.insert(id.to_string(), Position { col, row: row as u16 });
+            out.insert(
+                id.to_string(),
+                Position {
+                    col,
+                    row: row as u16,
+                },
+            );
         }
     }
     out
@@ -51,7 +60,11 @@ pub fn layout_tree(node_ids: &[&str], edges: &[(String, String)]) -> Vec<(String
         children.entry(p.as_str()).or_default().push(c.as_str());
         has_parent.insert(c.as_str());
     }
-    let roots: Vec<&str> = node_ids.iter().copied().filter(|id| !has_parent.contains(id)).collect();
+    let roots: Vec<&str> = node_ids
+        .iter()
+        .copied()
+        .filter(|id| !has_parent.contains(id))
+        .collect();
 
     let mut out = Vec::new();
     fn dfs<'a>(

@@ -46,7 +46,10 @@ pub enum AclError {
 
     /// macOS Security.framework returned a non-zero status code.
     #[error("Security.framework returned status {status} from {operation}")]
-    OsStatus { operation: &'static str, status: i32 },
+    OsStatus {
+        operation: &'static str,
+        status: i32,
+    },
 
     /// Keychain item with the given service+account doesn't exist yet.
     /// Caller should ensure the item is written before calling this.
@@ -113,10 +116,7 @@ mod macos {
             itemRef: *mut SecKeychainItemRef,
         ) -> OSStatus;
 
-        fn SecKeychainItemFreeContent(
-            attrList: *mut c_void,
-            data: *mut c_void,
-        ) -> OSStatus;
+        fn SecKeychainItemFreeContent(attrList: *mut c_void, data: *mut c_void) -> OSStatus;
 
         fn SecTrustedApplicationCreateFromPath(
             path: *const c_char,
@@ -129,10 +129,7 @@ mod macos {
             accessRef: *mut SecAccessRef,
         ) -> OSStatus;
 
-        fn SecKeychainItemSetAccess(
-            itemRef: SecKeychainItemRef,
-            access: SecAccessRef,
-        ) -> OSStatus;
+        fn SecKeychainItemSetAccess(itemRef: SecKeychainItemRef, access: SecAccessRef) -> OSStatus;
     }
 
     pub fn add_self_to_keychain_acl(service: &str, account: &str) -> Result<(), AclError> {
@@ -203,7 +200,8 @@ mod macos {
 
         // SAFETY: path_c is a valid C-string for the duration of the call.
         let mut trusted_app: SecTrustedApplicationRef = std::ptr::null_mut();
-        let status = unsafe { SecTrustedApplicationCreateFromPath(path_c.as_ptr(), &mut trusted_app) };
+        let status =
+            unsafe { SecTrustedApplicationCreateFromPath(path_c.as_ptr(), &mut trusted_app) };
         if status != ERR_SEC_SUCCESS || trusted_app.is_null() {
             // SAFETY: item_ref is a valid CF type from Find above.
             unsafe { CFRelease(item_ref as CFTypeRef) };
@@ -225,9 +223,7 @@ mod macos {
         // SAFETY: trusted_apps_ref + descriptor_ref are valid for this call;
         // the out parameter receives the new SecAccessRef.
         let mut access_ref: SecAccessRef = std::ptr::null_mut();
-        let status = unsafe {
-            SecAccessCreate(descriptor_ref, trusted_apps_ref, &mut access_ref)
-        };
+        let status = unsafe { SecAccessCreate(descriptor_ref, trusted_apps_ref, &mut access_ref) };
 
         // SAFETY: trusted_app's ownership was transferred to the array
         // via from_copyable's copy semantics — release our local ref.

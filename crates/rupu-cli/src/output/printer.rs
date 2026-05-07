@@ -11,12 +11,12 @@
 //! conveyed by what we print at the time of the transition (header
 //! line for "started", footer line for "done").
 
+#[cfg(test)]
+use super::palette::Status;
 use super::palette::{
     self, AWAITING, BRAND, BRAND_300, COMPLETE, DIM, FAILED, RUNNING, SEPARATOR, TOOL_ARROW,
 };
 use super::spinner::{Spinner, SpinnerHandle};
-#[cfg(test)]
-use super::palette::Status;
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal;
@@ -80,13 +80,7 @@ impl LineStreamPrinter {
     }
 
     /// `▶ <agent_name>  (<provider> · <model>)  <run_id>`
-    pub fn agent_header(
-        &mut self,
-        agent_name: &str,
-        provider: &str,
-        model: &str,
-        run_id: &str,
-    ) {
+    pub fn agent_header(&mut self, agent_name: &str, provider: &str, model: &str, run_id: &str) {
         let mut buf = String::new();
         let _ = palette::write_colored(&mut buf, "▶", BRAND);
         buf.push(' ');
@@ -121,10 +115,7 @@ impl LineStreamPrinter {
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, step_id, RUNNING);
 
-        let parts: Vec<&str> = [agent, provider, model]
-            .iter()
-            .filter_map(|o| *o)
-            .collect();
+        let parts: Vec<&str> = [agent, provider, model].iter().filter_map(|o| *o).collect();
         if !parts.is_empty() {
             let meta = format!("  ({})", parts.join(" · "));
             let _ = palette::write_colored(&mut buf, &meta, DIM);
@@ -158,12 +149,7 @@ impl LineStreamPrinter {
 
     /// Render one panelist child line under a panel step: status glyph,
     /// agent name, optional one-line summary, and findings count.
-    pub fn panelist_line(
-        &mut self,
-        agent: &str,
-        success: bool,
-        findings_count: usize,
-    ) {
+    pub fn panelist_line(&mut self, agent: &str, success: bool, findings_count: usize) {
         let mut buf = String::new();
         // Indent under parent step using the rail.
         self.push_indent_pipes(&mut buf);
@@ -424,7 +410,8 @@ impl LineStreamPrinter {
                     let _ = palette::write_colored(&mut b, &badge, sev_color);
                 }
                 b.push_str("  ");
-                let _ = palette::write_bold_colored(&mut b, &f.title, palette::Status::Active.color());
+                let _ =
+                    palette::write_bold_colored(&mut b, &f.title, palette::Status::Active.color());
                 println!("{b}");
 
                 // Source.
@@ -553,10 +540,10 @@ pub fn format_duration(d: Duration) -> String {
 fn severity_color(severity: &str) -> (owo_colors::Rgb, bool) {
     match severity.to_ascii_lowercase().as_str() {
         "critical" => (palette::SEV_CRITICAL, true),
-        "high"     => (palette::SEV_HIGH, true),
-        "medium"   => (palette::SEV_MEDIUM, false),
-        "low"      => (palette::SEV_LOW, false),
-        _          => (palette::SEV_INFO, false),
+        "high" => (palette::SEV_HIGH, true),
+        "medium" => (palette::SEV_MEDIUM, false),
+        "low" => (palette::SEV_LOW, false),
+        _ => (palette::SEV_INFO, false),
     }
 }
 

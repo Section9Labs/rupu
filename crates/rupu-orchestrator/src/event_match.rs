@@ -113,7 +113,10 @@ mod tests {
 
     #[test]
     fn no_match_when_literal_diverges() {
-        assert!(!event_matches("github.issue.opened", "github.issue.opened.extra"));
+        assert!(!event_matches(
+            "github.issue.opened",
+            "github.issue.opened.extra"
+        ));
         assert!(!event_matches("github.pr.*", "github.issue.opened"));
     }
 }

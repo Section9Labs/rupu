@@ -401,8 +401,8 @@ pub async fn run_workflow(
                 record.awaiting_step_id = Some(step_id.clone());
                 record.approval_prompt = Some(prompt.clone());
                 record.awaiting_since = Some(now);
-                record.expires_at = timeout_seconds
-                    .map(|secs| now + chrono::Duration::seconds(secs as i64));
+                record.expires_at =
+                    timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
                 // Don't set finished_at — the run hasn't ended.
                 awaiting = Some(AwaitingInfo {
                     step_id: step_id.clone(),
@@ -427,9 +427,8 @@ pub async fn run_workflow(
     {
         // No store but the workflow asked for approval — surface
         // the paused state to the caller anyway.
-        let expires_at = timeout_seconds.map(|secs| {
-            chrono::Utc::now() + chrono::Duration::seconds(secs as i64)
-        });
+        let expires_at =
+            timeout_seconds.map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
         awaiting = Some(AwaitingInfo {
             step_id: step_id.clone(),
             prompt: prompt.clone(),
@@ -1346,8 +1345,7 @@ async fn run_panel_step(
     let mut iterations = 0u32;
     let (final_pass, resolved) = loop {
         iterations += 1;
-        let pass =
-            run_panel_iteration(step, panel, ctx, opts, continue_on_error, &subject).await?;
+        let pass = run_panel_iteration(step, panel, ctx, opts, continue_on_error, &subject).await?;
         let max_sev = pass.max_severity();
         let cleared = match max_sev {
             None => true,
@@ -1497,8 +1495,7 @@ async fn dispatch_fixer(
     .await;
     match outcome {
         Ok(()) => {
-            let output =
-                read_final_assistant_text(&transcript_path, true, &run_id, &step.id);
+            let output = read_final_assistant_text(&transcript_path, true, &run_id, &step.id);
             Ok(FixerOutcome::Ok { output })
         }
         Err(e) => Ok(FixerOutcome::Failed(e)),
@@ -1576,8 +1573,12 @@ async fn run_panel_iteration(
                 Ok(()) => (true, None, None),
                 Err(e) => (false, Some(e.to_string()), Some(e)),
             };
-            let output =
-                read_final_assistant_text(&transcript_clone, success, &run_id_clone, &parent_step_id);
+            let output = read_final_assistant_text(
+                &transcript_clone,
+                success,
+                &run_id_clone,
+                &parent_step_id,
+            );
             PanelOutcome {
                 idx,
                 source: agent_name,

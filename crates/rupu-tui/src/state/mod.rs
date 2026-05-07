@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use rupu_orchestrator::RunRecord;
 use rupu_transcript::Event;
 
-mod projection;
 mod edges;
+mod projection;
 pub use edges::derive_edges;
 
 #[derive(Debug, Clone, Default)]

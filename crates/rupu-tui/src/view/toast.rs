@@ -41,7 +41,12 @@ impl Toast {
     }
 
     fn new(text: impl Into<String>, kind: ToastKind, ttl: Duration) -> Self {
-        Self { text: text.into(), kind, created_at: Instant::now(), ttl }
+        Self {
+            text: text.into(),
+            kind,
+            created_at: Instant::now(),
+            ttl,
+        }
     }
 
     pub fn expired(&self, now: Instant) -> bool {
@@ -51,10 +56,10 @@ impl Toast {
 
 pub fn render_toast(frame: &mut Frame, area: Rect, toast: &Toast) {
     let color = match toast.kind {
-        ToastKind::Info       => Color::Cyan,
-        ToastKind::Ok         => Color::Green,
-        ToastKind::Warn       => Color::Yellow,
-        ToastKind::Err        => Color::Red,
+        ToastKind::Info => Color::Cyan,
+        ToastKind::Ok => Color::Green,
+        ToastKind::Warn => Color::Yellow,
+        ToastKind::Err => Color::Red,
         ToastKind::GatePrompt => Color::LightYellow,
     };
     let mut style = Style::default().fg(color);
@@ -66,5 +71,8 @@ pub fn render_toast(frame: &mut Frame, area: Rect, toast: &Toast) {
         }
     }
     let block = Block::default().borders(Borders::TOP);
-    frame.render_widget(Paragraph::new(toast.text.clone()).style(style).block(block), area);
+    frame.render_widget(
+        Paragraph::new(toast.text.clone()).style(style).block(block),
+        area,
+    );
 }

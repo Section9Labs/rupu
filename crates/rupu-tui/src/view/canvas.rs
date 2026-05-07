@@ -64,7 +64,9 @@ fn draw_card(
     focused: bool,
     pulse: bool,
 ) {
-    let Some((x, y)) = card_origin(area, pos) else { return };
+    let Some((x, y)) = card_origin(area, pos) else {
+        return;
+    };
     let rect = Rect {
         x,
         y,
@@ -217,8 +219,12 @@ fn draw_edges(
 
     let buf = frame.buffer_mut();
     for (parent_id, children) in by_parent {
-        let Some(parent_pos) = positions.get(parent_id) else { continue };
-        let Some((px, py)) = card_origin(area, *parent_pos) else { continue };
+        let Some(parent_pos) = positions.get(parent_id) else {
+            continue;
+        };
+        let Some((px, py)) = card_origin(area, *parent_pos) else {
+            continue;
+        };
         let parent_status = model
             .node(parent_id)
             .map(|n| n.status)
@@ -258,7 +264,11 @@ fn draw_edges(
                 if x >= area.x + area.width {
                     break;
                 }
-                let symbol = if x == cx.saturating_sub(1) { "▶" } else { "═" };
+                let symbol = if x == cx.saturating_sub(1) {
+                    "▶"
+                } else {
+                    "═"
+                };
                 buf[(x, exit_y)].set_symbol(symbol).set_style(style);
             }
         }
@@ -293,16 +303,11 @@ fn draw_edges(
                     buf[(cx - 1, mid_y)].set_symbol("▶").set_style(style);
                 }
                 if drop_x < area.x + area.width && mid_y < area.y + area.height {
-                    let is_last_child = other_row_children
-                        .iter()
-                        .all(|other| {
-                            let other_y = positions
-                                .get(**other)
-                                .map(|p| p.row)
-                                .unwrap_or(0);
-                            let this_y = child_pos.row;
-                            other_y <= this_y
-                        });
+                    let is_last_child = other_row_children.iter().all(|other| {
+                        let other_y = positions.get(**other).map(|p| p.row).unwrap_or(0);
+                        let this_y = child_pos.row;
+                        other_y <= this_y
+                    });
                     let symbol = if is_last_child { "╚" } else { "╠" };
                     buf[(drop_x, mid_y)].set_symbol(symbol).set_style(style);
                 }

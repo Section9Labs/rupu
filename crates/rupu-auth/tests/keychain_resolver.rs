@@ -99,11 +99,7 @@ async fn file_backend_round_trip_via_env_override() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&auth_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
+        let mode = std::fs::metadata(&auth_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "auth.json must be chmod 600, got {mode:o}");
     }
 
@@ -135,7 +131,7 @@ async fn file_backend_round_trip_via_env_override() {
 /// auth-bypass the OS keychain).
 #[tokio::test]
 async fn unrecognized_env_value_falls_through_to_keychain() {
-    std::env::set_var("RUPU_AUTH_BACKEND", "files");  // typo
+    std::env::set_var("RUPU_AUTH_BACKEND", "files"); // typo
     let _r = KeychainResolver::new();
     // We can't directly inspect the storage variant from outside,
     // but we can confirm the resolver constructed without panic.

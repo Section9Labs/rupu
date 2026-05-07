@@ -363,8 +363,7 @@ impl OpenAiCodexClient {
             "response.output_item.added" => {
                 if let Some(item) = data.get("item") {
                     if item["type"].as_str() == Some("function_call") {
-                        let name =
-                            desanitize_openai_tool_name(item["name"].as_str().unwrap_or(""));
+                        let name = desanitize_openai_tool_name(item["name"].as_str().unwrap_or(""));
                         let call_id = item["call_id"].as_str().unwrap_or("").to_string();
                         acc.current_tool_name = Some(name.clone());
                         acc.current_tool_id = Some(call_id.clone());
@@ -1003,7 +1002,9 @@ mod tool_name_sanitize_tests {
 
     #[test]
     fn build_request_body_emits_sanitized_tool_name() {
-        let creds = AuthCredentials::ApiKey { key: "sk-test".into() };
+        let creds = AuthCredentials::ApiKey {
+            key: "sk-test".into(),
+        };
         let client = OpenAiCodexClient::new(creds, None).expect("new");
         let req = LlmRequest {
             model: "gpt-5".into(),

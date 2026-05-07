@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.5.0 — issue-tracker integration + workflow triggers + UI polish (2026-05-07)
+
+A larger release: full issue-tracker integration in the CLI, workflow event triggers (cron-polled + webhook), syntax-highlighted output, shell completion, and a comprehensive UI pass on the listing commands.
+
+### Added
+- **Issue-tracker CLI surface** — `rupu issues list | show | run`. Auto-detects the target repo from the cwd's git remote (mirrors `gh issue list`); supports `--label foo` (repeatable, AND match) and `--labels foo,bar` (CSV form).
+- **Issue context binding** — when the run-target resolves to an issue (`rupu workflow run <wf> github:owner/repo/issues/42`), the orchestrator pre-fetches the issue payload and binds it as `{{ issue.* }}` in every step's prompt + `when:` filter. The textual ref is persisted on `RunRecord.issue_ref` so `rupu workflow runs --issue <ref>` can filter back.
+- **`notifyIssue: true` workflow flag** — auto-comments on the targeted issue at run completion with the run id + outcome.
+- **Workflow triggers spec + Plan 1 + Plan 2** — `docs/superpowers/specs/2026-05-07-rupu-workflow-triggers-design.md` + `…-plan-1-polled-events.md`.
+  - **Plan 1: polled events on cron tick.** `rupu cron tick` now also polls SCM connectors for events between ticks. New `[triggers].poll_sources` config, deterministic `evt-<wf>-<vendor>-<delivery>` run-ids for idempotency, new `--skip-events` / `--only-events` flags, new `rupu cron events` inspection command. Lets users without a server use event triggers from a one-line crontab entry.
+  - **Plan 2: glob matching + extended vocab.** `trigger.event: github.issue.*` syntax. Polled GitHub vocabulary brought to webhook-tier parity (label / assign / edit / review_requested / review_submitted / ready_for_review / synchronize variants).
+- **`rupu agent edit` / `rupu workflow edit`** — shell-out to `$VISUAL` / `$EDITOR` (or `--editor "code --wait"`). Project shadow wins by default; `--scope global|project` overrides. Post-edit frontmatter / YAML re-validation (warn-only).
+- **`rupu completions` subcommand** — bash / zsh / fish / powershell. Two modes: dynamic bootstrap (default) calls back into rupu at completion time so agent + workflow names are filled from `.rupu/{agents,workflows}/` plus the global counterparts; static (`--static`) prints a self-contained `clap_complete::generate` script. `install` writes to canonical paths.
+- **syntect-driven syntax highlighting + pager** for `rupu agent show` and `rupu workflow show`. Frontmatter highlighted as YAML, body as Markdown. New `[ui]` section in `config.toml` (`color` / `theme` / `pager`); `--no-color`, `--theme`, `--pager` / `--no-pager` flags; `NO_COLOR` env var honored.
+- **Colored table output** across `*-list` commands (`issues list`, `workflow runs`, `agent list`, `cron list`, `cron events`, `repos list`). Status cells get semantic colors; label cells render as colored chips.
+- **Real label colors** — GitHub via `octocrab::models::Label.color`; GitLab via a per-project `/projects/:id/labels` cache (TTL 5 min). New `Issue.label_colors` field. Falls back to a deterministic hash-based palette when upstream colors are absent.
+- **Branded OAuth callback page** — replaces the bare "Authentication complete — return to your terminal." with a centered, full-viewport page (#0a0a0a bg, large `∞` glyph, "Don't code it, rupu it." tagline).
+
+### Fixed
+- `rupu issues list` empty-state on stdout (was `eprintln!` — broke piping).
+- `rupu auth logout --all` no longer hangs on `read_line` in non-tty (CI / scripts).
+- `rupu workflow runs` empty results print before the column header instead of after.
+- `rupu cron events` empty-state gives actionable guidance + warns when `[triggers].poll_sources` is empty.
+- `run not found` errors carry hint lines pointing at `rupu workflow runs` (or `--status awaiting_approval` for approve / reject).
+
+### Changed
+- `RunStore::create` now returns `RunStoreError::AlreadyExists` on duplicate id (used by the polled-events tier for idempotent dispatch). Manual `run_<ULID>` ids never collide so the existing path is unaffected.
+- `rupu agent show` / `rupu workflow show` now print the raw file with highlighting (was a structured field-by-field render). `rupu agent list` still provides the table view.
+- README modernized — current subcommand surface, accurate Slice status (A + B + C shipped; D + E deferred), new "Workflow triggers" subsection.
+- `docs/providers.md` — Gemini API-key path marked shipped (was deferred).
+
+### Internal
+- New `EventConnector` trait in `rupu-scm` with GitHub + GitLab impls (Etag fast-path on GitHub; per-project label cache on GitLab).
+- New `cmd/completers.rs` with cheap basename-walk over global + project agent/workflow dirs for tab completion.
+- Workspace deps: `clap_complete = { version = "4", features = ["unstable-dynamic"] }`, `syntect = { version = "5", features = ["default-fancy"] }` (pure-Rust, no `onig` C dep).
+
 ## v0.4.9 — auto-resume after approval (2026-05-06)
 
 ### Fixed

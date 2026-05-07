@@ -26,8 +26,13 @@ pub fn render_tree(
         let prefix = if id == focused { "> " } else { "  " };
         let indent = "  ".repeat(*depth as usize);
         let glyph = glyph_for(node.status);
-        let style = Style::default().fg(color_for(node.status))
-            .add_modifier(if id == focused { Modifier::BOLD } else { Modifier::empty() });
+        let style = Style::default()
+            .fg(color_for(node.status))
+            .add_modifier(if id == focused {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
         text_lines.push(Line::from(vec![
             Span::raw(prefix),
             Span::raw(indent),

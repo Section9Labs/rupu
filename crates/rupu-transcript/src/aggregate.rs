@@ -329,16 +329,14 @@ mod tests {
         let now = Utc::now();
         let mut early = run_start("a", "anthropic", "m");
         if let Event::RunStart {
-            ref mut started_at,
-            ..
+            ref mut started_at, ..
         } = early
         {
             *started_at = now - chrono::Duration::days(7);
         }
         let mut late = run_start("a", "anthropic", "m");
         if let Event::RunStart {
-            ref mut started_at,
-            ..
+            ref mut started_at, ..
         } = late
         {
             *started_at = now;
