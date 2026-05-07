@@ -115,6 +115,16 @@ pub struct OrchestratorRunOpts {
     /// runs. Bound as `{{event.*}}` in step prompts and `when:`
     /// expressions.
     pub event: Option<serde_json::Value>,
+    /// Pre-fetched issue payload, if the run-target resolved to an
+    /// issue. Bound as `{{issue.*}}` in step prompts and `when:`
+    /// expressions. The CLI calls `IssueConnector::get_issue` once
+    /// at run-start and serializes the result here.
+    pub issue: Option<serde_json::Value>,
+    /// Stable text reference for the issue (`<tracker>:<project>/issues/<N>`),
+    /// persisted on `RunRecord.issue_ref` so
+    /// `rupu workflow runs --issue <ref>` can filter back. `None`
+    /// for runs without an issue target.
+    pub issue_ref: Option<String>,
     /// Optional persistent run-state store. When provided the runner
     /// creates a `RunRecord` at start, appends one `StepResultRecord`
     /// per completed step, and flips the record's status to
@@ -322,6 +332,8 @@ pub async fn run_workflow(
                 approval_prompt: None,
                 awaiting_since: None,
                 expires_at: None,
+                issue_ref: opts.issue_ref.clone(),
+                issue: opts.issue.clone(),
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {
@@ -467,7 +479,12 @@ async fn run_steps_inner(
         }
 
         // Build template context from inputs + prior step outputs.
-        let ctx = base_context_for_step(resolved_inputs, opts.event.as_ref(), step_results);
+        let ctx = base_context_for_step(
+            resolved_inputs,
+            opts.event.as_ref(),
+            opts.issue.as_ref(),
+            step_results,
+        );
 
         // `when:` gate. Evaluated against the same context the prompt
         // sees; falsy result skips the step. The skipped step still
@@ -571,11 +588,13 @@ fn map_run_store_err(e: crate::runs::RunStoreError) -> RunWorkflowError {
 fn base_context_for_step(
     inputs: &BTreeMap<String, String>,
     event: Option<&serde_json::Value>,
+    issue: Option<&serde_json::Value>,
     prior: &[StepResult],
 ) -> StepContext {
     let mut ctx = StepContext::new();
     ctx.inputs = inputs.clone();
     ctx.event = event.cloned();
+    ctx.issue = issue.cloned();
     for sr in prior {
         let results: Vec<String> = sr.items.iter().map(|i| i.output.clone()).collect();
         let sub_results: std::collections::BTreeMap<String, crate::templates::SubResult> = sr

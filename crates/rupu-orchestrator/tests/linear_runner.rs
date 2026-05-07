@@ -91,6 +91,8 @@ async fn second_step_sees_first_step_output_via_template() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -133,6 +135,8 @@ async fn event_payload_is_visible_in_step_prompts() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 1);
@@ -141,6 +145,65 @@ async fn event_payload_is_visible_in_step_prompts() {
         prompt.contains("PR #99") && prompt.contains("Section9Labs/rupu"),
         "step prompt should bind {{event.*}} fields, got: {prompt}"
     );
+}
+
+const WF_ISSUE: &str = r#"
+name: issue-aware
+steps:
+  - id: read
+    agent: ag
+    actions: []
+    prompt: |
+      Reviewing issue #{{ issue.number }} on {{ issue.r.project }}: {{ issue.title }}
+      Labels: {{ issue.labels | join(", ") }}
+  - id: gate
+    agent: ag
+    actions: []
+    when: "{{ 'bug' in issue.labels }}"
+    prompt: "Triage as bug"
+"#;
+
+#[tokio::test]
+async fn issue_payload_is_visible_in_step_prompts_and_when_filters() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let wf = Workflow::parse(WF_ISSUE).unwrap();
+    // Shape mirrors `rupu_scm::Issue` after serde_json::to_value.
+    let issue = serde_json::json!({
+        "r": { "tracker": "github", "project": "Section9Labs/rupu", "number": 42 },
+        "title": "Cron tick crashes on empty workflows dir",
+        "body": "When `<global>/workflows/` doesn't exist...",
+        "state": "open",
+        "labels": ["bug", "cron"],
+        "author": "matt",
+        "number": 42
+    });
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_orch_issue".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        issue: Some(issue),
+        issue_ref: Some("github:Section9Labs/rupu/issues/42".into()),
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    assert_eq!(res.step_results.len(), 2);
+    let read_prompt = &res.step_results[0].rendered_prompt;
+    assert!(
+        read_prompt.contains("issue #42")
+            && read_prompt.contains("Section9Labs/rupu")
+            && read_prompt.contains("Cron tick crashes")
+            && read_prompt.contains("bug, cron"),
+        "issue.* fields should bind: {read_prompt}"
+    );
+    // The `when:` filter on step 2 evaluates `'bug' in issue.labels`
+    // → truthy → step ran (skipped == false).
+    assert!(!res.step_results[1].skipped, "bug-label gate should fire");
 }
 
 // -- Fan-out (`for_each:`) --------------------------------------------------
@@ -184,6 +247,8 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -241,6 +306,8 @@ async fn for_each_accepts_a_json_array_of_objects() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -279,6 +346,8 @@ async fn for_each_pulls_items_from_workflow_inputs_with_max_parallel_cap() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -375,6 +444,8 @@ async fn for_each_continue_on_error_records_failures_and_keeps_going() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -415,6 +486,8 @@ async fn for_each_without_continue_on_error_aborts_workflow_on_first_failure() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -468,6 +541,8 @@ async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -527,6 +602,8 @@ async fn parallel_continue_on_error_records_per_sub_step_failures() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let triage = &res.step_results[0];
@@ -567,6 +644,8 @@ async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message()
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -608,6 +687,8 @@ async fn run_store_records_run_metadata_and_per_step_rows() {
         run_store: Some(std::sync::Arc::clone(&store)),
         workflow_yaml: Some(WF_PERSIST.to_string()),
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(!res.run_id.is_empty(), "run_id should be populated");
@@ -670,6 +751,8 @@ async fn run_store_marks_run_failed_with_error_message() {
         run_store: Some(std::sync::Arc::clone(&store)),
         workflow_yaml: Some(WF_PERSIST_FAIL.to_string()),
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let _ = run_workflow(opts).await.expect_err("workflow should fail");
 
@@ -711,6 +794,8 @@ async fn no_run_store_skips_persistence_and_emits_empty_run_id() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(
@@ -761,6 +846,8 @@ async fn approval_gate_pauses_run_and_persists_awaiting_state() {
         run_store: Some(std::sync::Arc::clone(&store)),
         workflow_yaml: Some(WF_APPROVAL.to_string()),
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
 
@@ -817,6 +904,8 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         run_store: Some(std::sync::Arc::clone(&store)),
         workflow_yaml: Some(WF_APPROVAL.to_string()),
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let run_id = res.run_id.clone();
@@ -847,6 +936,8 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         event: None,
         run_store: Some(std::sync::Arc::clone(&store)),
         workflow_yaml: Some(body.clone()),
+        issue: None,
+        issue_ref: None,
         resume_from: Some(rupu_orchestrator::ResumeState {
             run_id: run_id.clone(),
             prior_step_results,
@@ -919,6 +1010,8 @@ steps:
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(res.awaiting.is_none());
@@ -1029,6 +1122,8 @@ async fn panel_step_runs_panelists_in_parallel_and_aggregates_findings() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1092,6 +1187,8 @@ steps:
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let summary_prompt = &res.step_results[1].rendered_prompt;
@@ -1135,6 +1232,8 @@ steps:
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1263,6 +1362,8 @@ async fn panel_gate_loops_with_fixer_until_severity_clears() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1311,6 +1412,8 @@ async fn panel_gate_marks_unresolved_when_max_iterations_exhausted() {
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1361,6 +1464,8 @@ steps:
         run_store: None,
         workflow_yaml: None,
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1413,6 +1518,8 @@ async fn approval_with_timeout_seconds_persists_awaiting_since_and_expires_at() 
         run_store: Some(std::sync::Arc::clone(&store)),
         workflow_yaml: Some(WF_APPROVAL_WITH_TIMEOUT.to_string()),
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let info = res.awaiting.expect("workflow should pause");
@@ -1463,6 +1570,8 @@ steps:
         run_store: Some(std::sync::Arc::clone(&store)),
         workflow_yaml: Some(s.to_string()),
         resume_from: None,
+        issue: None,
+        issue_ref: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let info = res.awaiting.unwrap();

@@ -362,9 +362,11 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         .map(rupu_orchestrator::StepResult::from)
         .collect();
 
-    // Restore inputs, event, workspace path from the record.
+    // Restore inputs, event, issue, workspace path from the record.
     let inputs_map: BTreeMap<String, String> = record.inputs.clone();
     let event = record.event.clone();
+    let issue_payload = record.issue.clone();
+    let issue_ref_text = record.issue_ref.clone();
     let workspace_path = record.workspace_path.clone();
     let transcripts = record.transcript_dir.clone();
     paths::ensure_dir(&transcripts)?;
@@ -407,6 +409,8 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         transcript_dir: transcripts,
         factory,
         event,
+        issue: issue_payload,
+        issue_ref: issue_ref_text,
         run_store: Some(store),
         workflow_yaml: Some(body),
         resume_from: Some(resume),
@@ -595,6 +599,12 @@ async fn run_with_outcome(
     let _clone_guard: Option<tempfile::TempDir>;
     let workspace_path: std::path::PathBuf;
     let system_prompt_suffix: Option<String>;
+    // Issue context — populated when run-target resolves to an issue.
+    // The orchestrator's StepContext binds this as `{{issue.*}}` in
+    // step prompts + `when:` expressions; RunRecord persists the
+    // textual ref so `rupu workflow runs --issue <ref>` can filter.
+    let mut issue_payload: Option<serde_json::Value> = None;
+    let mut issue_ref_text: Option<String> = None;
     match target {
         None => {
             _clone_guard = None;
@@ -641,7 +651,43 @@ async fn run_with_outcome(
                         let p = tmp.path().to_path_buf();
                         (Some(tmp), p)
                     }
-                    _ => (None, pwd.clone()),
+                    crate::run_target::RunTarget::Issue {
+                        tracker,
+                        project,
+                        number,
+                    } => {
+                        // Pre-fetch the issue once at run-start so step
+                        // prompts can reference `{{issue.title}}` /
+                        // `{{issue.body}}` / `{{issue.labels}}` etc.
+                        // without each step having to call the
+                        // IssueConnector.
+                        let i = rupu_scm::IssueRef {
+                            tracker: *tracker,
+                            project: project.clone(),
+                            number: *number,
+                        };
+                        let conn = mcp_registry.issues(*tracker).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "no {} credential — run `rupu auth login --provider {}`",
+                                tracker,
+                                tracker
+                            )
+                        })?;
+                        match conn.get_issue(&i).await {
+                            Ok(issue) => {
+                                issue_payload = serde_json::to_value(&issue).ok();
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "failed to fetch issue at run-start; {{issue.*}} will be empty"
+                                );
+                            }
+                        }
+                        issue_ref_text =
+                            Some(format!("{}:{}/issues/{}", tracker, project, number));
+                        (None, pwd.clone())
+                    }
                 };
                 _clone_guard = guard;
                 workspace_path = path;
@@ -679,6 +725,8 @@ async fn run_with_outcome(
         transcript_dir: transcripts,
         factory,
         event,
+        issue: issue_payload,
+        issue_ref: issue_ref_text,
         run_store: Some(run_store),
         workflow_yaml: Some(body.clone()),
         resume_from: None,

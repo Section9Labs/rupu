@@ -125,6 +125,20 @@ pub struct RunRecord {
     /// with `error_message` set on first observation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Stable text reference to the issue this run targets, when
+    /// applicable. Format: `<tracker>:<project>/issues/<number>`
+    /// (e.g. `github:Section9Labs/rupu/issues/42`). Stored as a
+    /// string rather than a typed `IssueRef` so `runs.rs` stays
+    /// independent of `rupu-scm`. The CLI's `rupu workflow runs
+    /// --issue <ref>` filter compares against this verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_ref: Option<String>,
+    /// Full pre-fetched issue JSON, when applicable. Persisted so
+    /// the resume path (`rupu workflow approve <run-id>`) can
+    /// rebind `{{issue.*}}` without making another network call to
+    /// the issue tracker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<serde_json::Value>,
 }
 
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with
@@ -603,6 +617,8 @@ mod tests {
             approval_prompt: None,
             awaiting_since: None,
             expires_at: None,
+            issue_ref: None,
+            issue: None,
         }
     }
 

@@ -38,6 +38,14 @@ pub enum RenderError {
 /// `{{item}}` and `{{loop.index}}` (1-based). They're absent for
 /// linear steps; chained access on the missing root is safe under
 /// the chainable undefined behavior.
+///
+/// `issue` is populated when the run was kicked off with an issue
+/// run-target (e.g. `rupu workflow run triage --target
+/// github:owner/repo/issues/42`). It carries the fetched issue
+/// payload — `{{issue.title}}`, `{{issue.body}}`, `{{issue.labels}}`,
+/// `{{issue.number}}`, `{{issue.author}}`, `{{issue.state}}`. For
+/// runs without an issue target it's `None` and chained access
+/// renders empty under the chainable undefined behavior.
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct StepContext {
     pub inputs: BTreeMap<String, String>,
@@ -46,6 +54,10 @@ pub struct StepContext {
     pub event: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item: Option<serde_json::Value>,
+    /// Pre-fetched issue payload bound at run-start when the
+    /// run-target is an issue. See struct-level docs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issue: Option<serde_json::Value>,
     /// Renamed to `loop` in the serialized form so templates can
     /// reference `{{ loop.index }}` (Jinja convention). The Rust
     /// field name avoids the keyword.
@@ -239,6 +251,15 @@ impl StepContext {
     /// to the dispatcher.
     pub fn with_event(mut self, event: serde_json::Value) -> Self {
         self.event = Some(event);
+        self
+    }
+
+    /// Bind the issue payload (builder style). For runs whose
+    /// run-target resolved to an issue (`<platform>:<owner>/<repo>/issues/<N>`);
+    /// the orchestrator pre-fetches via `IssueConnector::get_issue`
+    /// and serializes the result into JSON.
+    pub fn with_issue(mut self, issue: serde_json::Value) -> Self {
+        self.issue = Some(issue);
         self
     }
 
