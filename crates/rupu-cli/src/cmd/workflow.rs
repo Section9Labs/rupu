@@ -10,10 +10,12 @@
 //! The factory carries a clone of the parsed [`Workflow`] so each
 //! step's `agent:` field is honored (no hardcoded agent name).
 
+use crate::cmd::completers::workflow_names;
 use crate::paths;
 use crate::provider_factory;
 use async_trait::async_trait;
 use clap::Subcommand;
+use clap_complete::ArgValueCompleter;
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::Workflow;
@@ -30,11 +32,13 @@ pub enum Action {
     /// Print a workflow's YAML body.
     Show {
         /// Workflow name (filename stem under `workflows/`).
+        #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
     },
     /// Run a workflow.
     Run {
         /// Workflow name (filename stem under `workflows/`).
+        #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
         /// Optional target reference, e.g. `github:owner/repo#42`.
         /// See `docs/scm.md#target-syntax` for the full grammar.

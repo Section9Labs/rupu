@@ -14,7 +14,7 @@ pub mod provider_factory;
 pub mod run_target;
 pub mod templates;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::process::ExitCode;
 
 #[derive(Parser, Debug)]
@@ -89,11 +89,23 @@ pub enum Cmd {
     Usage(cmd::usage::UsageArgs),
     /// Re-attach TUI to an existing run.
     Watch(cmd::watch::WatchArgs),
+    /// Generate or install shell-completion scripts.
+    Completions {
+        #[command(subcommand)]
+        action: cmd::completions::Action,
+    },
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
 /// dispatches, and returns an `ExitCode`. Tests pass synthetic argv.
 pub async fn run(args: Vec<String>) -> ExitCode {
+    // Dynamic shell-completion entrypoint. When the `COMPLETE` env var
+    // is set (the protocol used by the bootstrap script that
+    // `rupu completions` installs), `complete()` prints the candidate
+    // list or registration script and exits before any normal CLI
+    // processing. No-op when the env var is unset.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
     crash::install_panic_hook();
 
     let cli = match Cli::try_parse_from(args) {
@@ -139,5 +151,6 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
         Cmd::Usage(args) => cmd::usage::handle(args).await,
         Cmd::Watch(args) => cmd::watch::handle(args).await,
+        Cmd::Completions { action } => cmd::completions::handle(action).await,
     }
 }
