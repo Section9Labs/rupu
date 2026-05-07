@@ -245,12 +245,36 @@ fn map_github_event(ev: &Value) -> Option<String> {
     Some(
         match (kind, action) {
             ("PushEvent", _) => "github.push",
+            // Issue lifecycle.
             ("IssuesEvent", Some("opened")) => "github.issue.opened",
             ("IssuesEvent", Some("closed")) => "github.issue.closed",
             ("IssuesEvent", Some("reopened")) => "github.issue.reopened",
+            ("IssuesEvent", Some("edited")) => "github.issue.edited",
+            // Issue queue / categorization (the GitHub-Issues-as-queue surface).
+            // Workflow authors filter by label name with `trigger.filter:
+            // "{{ event.payload.label.name == 'triage' }}"`.
+            ("IssuesEvent", Some("labeled")) => "github.issue.labeled",
+            ("IssuesEvent", Some("unlabeled")) => "github.issue.unlabeled",
+            ("IssuesEvent", Some("assigned")) => "github.issue.assigned",
+            ("IssuesEvent", Some("unassigned")) => "github.issue.unassigned",
+            ("IssuesEvent", Some("milestoned")) => "github.issue.milestoned",
+            ("IssuesEvent", Some("demilestoned")) => "github.issue.demilestoned",
+            // Comments.
             ("IssueCommentEvent", Some("created")) => "github.issue.commented",
+            ("IssueCommentEvent", Some("edited")) => "github.issue.comment_edited",
+            // PR lifecycle.
             ("PullRequestEvent", Some("opened")) => "github.pr.opened",
             ("PullRequestEvent", Some("reopened")) => "github.pr.reopened",
+            ("PullRequestEvent", Some("edited")) => "github.pr.edited",
+            ("PullRequestEvent", Some("synchronize")) => "github.pr.updated",
+            ("PullRequestEvent", Some("ready_for_review")) => "github.pr.ready_for_review",
+            // PR queue / review.
+            ("PullRequestEvent", Some("labeled")) => "github.pr.labeled",
+            ("PullRequestEvent", Some("unlabeled")) => "github.pr.unlabeled",
+            ("PullRequestEvent", Some("assigned")) => "github.pr.assigned",
+            ("PullRequestEvent", Some("unassigned")) => "github.pr.unassigned",
+            ("PullRequestEvent", Some("review_requested")) => "github.pr.review_requested",
+            ("PullRequestReviewEvent", Some("created")) => "github.pr.review_submitted",
             ("PullRequestEvent", Some("closed")) => {
                 let merged = payload
                     .and_then(|p| p.get("pull_request"))
@@ -359,6 +383,49 @@ mod tests {
 
         let unknown = json!({"type":"WatchEvent","payload":{"action":"started"}});
         assert!(map_github_event(&unknown).is_none());
+    }
+
+    #[test]
+    fn map_event_handles_label_and_assign_actions() {
+        use serde_json::json;
+        let labeled = json!({
+            "type":"IssuesEvent",
+            "payload":{"action":"labeled","label":{"name":"triage"}}
+        });
+        assert_eq!(
+            map_github_event(&labeled).as_deref(),
+            Some("github.issue.labeled")
+        );
+
+        let unlabeled = json!({"type":"IssuesEvent","payload":{"action":"unlabeled"}});
+        assert_eq!(
+            map_github_event(&unlabeled).as_deref(),
+            Some("github.issue.unlabeled")
+        );
+
+        let assigned = json!({"type":"IssuesEvent","payload":{"action":"assigned"}});
+        assert_eq!(
+            map_github_event(&assigned).as_deref(),
+            Some("github.issue.assigned")
+        );
+
+        let pr_review_requested = json!({
+            "type":"PullRequestEvent",
+            "payload":{"action":"review_requested"}
+        });
+        assert_eq!(
+            map_github_event(&pr_review_requested).as_deref(),
+            Some("github.pr.review_requested")
+        );
+
+        let pr_ready = json!({
+            "type":"PullRequestEvent",
+            "payload":{"action":"ready_for_review"}
+        });
+        assert_eq!(
+            map_github_event(&pr_ready).as_deref(),
+            Some("github.pr.ready_for_review")
+        );
     }
 
     #[tokio::test]
