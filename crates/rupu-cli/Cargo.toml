@@ -48,6 +48,7 @@ comfy-table.workspace = true
 owo-colors.workspace = true
 crossterm.workspace = true
 tempfile.workspace = true
+syntect.workspace = true
 
 [dev-dependencies]
 assert_fs.workspace = true

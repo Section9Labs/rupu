@@ -29,6 +29,24 @@ pub struct Config {
     pub scm: ScmSection,
     #[serde(default)]
     pub issues: IssuesSection,
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// Terminal-output rendering preferences. Consumed by
+/// `rupu agent show` / `rupu workflow show` (and any future
+/// commands that print syntax-highlighted output).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    /// `auto` (default — color when stdout is a tty and `NO_COLOR`
+    /// is unset), `always`, or `never`.
+    pub color: Option<String>,
+    /// syntect theme name. Defaults to `base16-ocean.dark`.
+    pub theme: Option<String>,
+    /// `auto` (default — page when stdout is a tty and the output
+    /// exceeds one screen), `always`, or `never`.
+    pub pager: Option<String>,
 }
 
 /// Bash tool configuration.

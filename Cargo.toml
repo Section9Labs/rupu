@@ -71,6 +71,10 @@ clap_complete = { version = "4", features = ["unstable-dynamic"] }
 comfy-table = "7"
 owo-colors = { version = "4", features = ["supports-colors"] }
 
+# Syntax highlighting for `rupu agent show` / `rupu workflow show`.
+# `default-fancy` swaps onig's C dep for fancy-regex (pure Rust).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
 # TUI (Slice C)
 ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events"] }

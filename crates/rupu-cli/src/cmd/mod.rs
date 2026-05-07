@@ -14,6 +14,7 @@ pub mod models;
 pub mod repos;
 pub mod run;
 pub mod transcript;
+pub mod ui;
 pub mod usage;
 pub mod watch;
 pub mod webhook;

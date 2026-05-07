@@ -2,10 +2,11 @@
 
 use crate::cmd::completers::agent_names;
 use crate::cmd::editor;
+use crate::cmd::ui::{self, UiPrefs};
 use crate::paths;
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
-use rupu_agent::{load_agent, load_agents, AgentSpec};
+use rupu_agent::{load_agents, AgentSpec};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -18,6 +19,18 @@ pub enum Action {
         /// Name of the agent.
         #[arg(add = ArgValueCompleter::new(agent_names))]
         name: String,
+        /// Disable colored output (also honored: `NO_COLOR` env var).
+        #[arg(long)]
+        no_color: bool,
+        /// syntect theme name. Default: `base16-ocean.dark`.
+        #[arg(long)]
+        theme: Option<String>,
+        /// Force pager. Default: page when stdout is a tty.
+        #[arg(long, conflicts_with = "no_pager")]
+        pager: bool,
+        /// Disable pager.
+        #[arg(long)]
+        no_pager: bool,
     },
     /// Open an agent file in `$VISUAL` / `$EDITOR`. Validates the
     /// frontmatter on save (warn-only).
@@ -45,13 +58,28 @@ pub async fn handle(action: Action) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Action::Show { name } => match show(&name).await {
-            Ok(()) => ExitCode::from(0),
-            Err(e) => {
-                eprintln!("rupu agent show: {e}");
-                ExitCode::from(1)
+        Action::Show {
+            name,
+            no_color,
+            theme,
+            pager,
+            no_pager,
+        } => {
+            let pager_flag = if pager {
+                Some(true)
+            } else if no_pager {
+                Some(false)
+            } else {
+                None
+            };
+            match show(&name, no_color, theme.as_deref(), pager_flag).await {
+                Ok(()) => ExitCode::from(0),
+                Err(e) => {
+                    eprintln!("rupu agent show: {e}");
+                    ExitCode::from(1)
+                }
             }
-        },
+        }
         Action::Edit {
             name,
             scope,
@@ -82,33 +110,25 @@ async fn list() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn show(name: &str) -> anyhow::Result<()> {
+async fn show(
+    name: &str,
+    no_color: bool,
+    theme: Option<&str>,
+    pager_flag: Option<bool>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
-    let spec = load_agent(&global, project_agents_parent.as_deref(), name)?;
-    println!("name:        {}", spec.name);
-    if let Some(d) = &spec.description {
-        println!("description: {d}");
-    }
-    if let Some(p) = &spec.provider {
-        println!("provider:    {p}");
-    }
-    if let Some(m) = &spec.model {
-        println!("model:       {m}");
-    }
-    if let Some(t) = &spec.tools {
-        println!("tools:       {}", t.join(", "));
-    }
-    if let Some(mt) = spec.max_turns {
-        println!("maxTurns:    {mt}");
-    }
-    if let Some(pm) = &spec.permission_mode {
-        println!("mode:        {pm}");
-    }
-    println!("\n--- system prompt ---");
-    print!("{}", spec.system_prompt);
+
+    let path = locate_agent_file(name, &global, project_agents_parent.as_deref())?;
+    let body = std::fs::read_to_string(&path)?;
+
+    let cfg = layered_config(&global, project_root.as_deref());
+    let prefs = UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag);
+
+    let rendered = ui::highlight_agent_file(&body, &prefs);
+    ui::paginate(&rendered, &prefs)?;
     Ok(())
 }
 
@@ -138,6 +158,36 @@ async fn edit(name: &str, scope: Option<&str>, editor_override: Option<&str>) ->
             Ok(())
         }
     }
+}
+
+fn locate_agent_file(
+    name: &str,
+    global: &std::path::Path,
+    project_parent: Option<&std::path::Path>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(p) = project_parent {
+        let candidate = p.join("agents").join(format!("{name}.md"));
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    let candidate = global.join("agents").join(format!("{name}.md"));
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    Err(anyhow::anyhow!(
+        "agent `{name}` not found in project or global agents dir"
+    ))
+}
+
+fn layered_config(
+    global: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+) -> rupu_config::Config {
+    let global_cfg_path = global.join("config.toml");
+    let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
+    rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())
+        .unwrap_or_default()
 }
 
 /// Pick the on-disk file to edit. With `--scope` set we honor it
