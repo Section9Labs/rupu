@@ -38,7 +38,12 @@ use tracing::{debug, info, warn};
 pub enum Action {
     /// List every cron-triggered workflow + its schedule + next-fire
     /// time. Read-only; doesn't update state.
-    List,
+    List {
+        /// Disable colored output (also honored: `NO_COLOR` env,
+        /// `[ui].color = "never"` in config).
+        #[arg(long)]
+        no_color: bool,
+    },
     /// Walk all workflows, fire any whose schedule matches between
     /// the persisted `last_fired` and now. Designed to run from
     /// system cron at 1-minute granularity.
@@ -61,18 +66,22 @@ pub enum Action {
     /// each workflow's name, target event id, sources from
     /// `[triggers].poll_sources`, and the most recent persisted
     /// cursor across those sources.
-    Events,
+    Events {
+        /// Disable colored output.
+        #[arg(long)]
+        no_color: bool,
+    },
 }
 
 pub async fn handle(action: Action) -> ExitCode {
     let result = match action {
-        Action::List => list().await,
+        Action::List { no_color } => list(no_color).await,
         Action::Tick {
             dry_run,
             skip_events,
             only_events,
         } => tick(dry_run, skip_events, only_events).await,
-        Action::Events => events().await,
+        Action::Events { no_color } => events(no_color).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -83,20 +92,57 @@ pub async fn handle(action: Action) -> ExitCode {
     }
 }
 
-async fn list() -> anyhow::Result<()> {
+async fn list(no_color: bool) -> anyhow::Result<()> {
     let workflows = collect_cron_workflows()?;
-    println!("{:<28} {:<24} NEXT (UTC)", "NAME", "SCHEDULE");
+    if workflows.is_empty() {
+        println!(
+            "(no cron-triggered workflows found)\n\nAdd `trigger.on: cron` to a workflow under \
+             `.rupu/workflows/` and configure a schedule (e.g. `cron: \"0 4 * * *\"`)."
+        );
+        return Ok(());
+    }
     let now = Utc::now();
+    let prefs = ui_prefs(no_color)?;
+
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["NAME", "SCHEDULE", "NEXT (UTC)", "IN"]);
     for w in &workflows {
         let next = parse_schedule(&w.schedule)
             .ok()
             .and_then(|s| next_fire_after(&s, now));
-        let next_str = next
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "<unschedulable>".to_string());
-        println!("{:<28} {:<24} {}", w.name, w.schedule, next_str);
+        let (next_str, until_cell) = match next {
+            Some(t) => {
+                let delta = (t - now).num_seconds();
+                (
+                    t.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    crate::output::tables::relative_time_cell(delta, &prefs),
+                )
+            }
+            None => (
+                "<unschedulable>".to_string(),
+                comfy_table::Cell::new(""),
+            ),
+        };
+        table.add_row(vec![
+            comfy_table::Cell::new(&w.name),
+            comfy_table::Cell::new(&w.schedule),
+            comfy_table::Cell::new(next_str),
+            until_cell,
+        ]);
     }
+    println!("{table}");
     Ok(())
+}
+
+fn ui_prefs(no_color: bool) -> anyhow::Result<crate::cmd::ui::UiPrefs> {
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let global_cfg = global.join("config.toml");
+    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    let cfg =
+        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
+    Ok(crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None))
 }
 
 async fn tick(dry_run: bool, skip_events: bool, only_events: bool) -> anyhow::Result<()> {
@@ -348,7 +394,7 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
 
 /// `rupu cron events` — read-only inspection of event-triggered
 /// workflows + which sources they cover + most recent cursor.
-async fn events() -> anyhow::Result<()> {
+async fn events(no_color: bool) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -362,23 +408,24 @@ async fn events() -> anyhow::Result<()> {
 
     if workflows.is_empty() {
         println!(
-            "(no event-triggered workflows found)\n\n\
-             To add one, drop a workflow YAML under `.rupu/workflows/` with:\n  \
-             trigger:\n    on: event\n    event: github.issue.opened\n\
-             Then configure poll sources in `[triggers].poll_sources` of your\n\
-             `config.toml`. See `docs/triggers.md` for details."
+            "(no event-triggered workflows found)\n\nDrop a workflow YAML under `.rupu/workflows/` \
+             with `trigger.on: event` (e.g. `event: github.issue.opened`) and configure \
+             `[triggers].poll_sources` in `config.toml`. See `docs/triggers.md` for details."
         );
         return Ok(());
     }
     if cfg.triggers.poll_sources.is_empty() {
         println!(
-            "(workflows configured, but `[triggers].poll_sources` is empty in\n \
-             config.toml — `rupu cron tick` will not poll any sources until\n \
-             you add at least one entry like `github:owner/repo`.)\n"
+            "(workflows configured, but `[triggers].poll_sources` is empty in config.toml — \
+             `rupu cron tick` will not poll any sources until you add at least one entry like \
+             `github:owner/repo`.)\n"
         );
     }
-    println!("{:<28} {:<32} {:<40} CURSOR", "NAME", "EVENT", "SOURCES");
 
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
+
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["NAME", "EVENT", "SOURCES", "CURSOR"]);
     for wf in &workflows {
         let sources = cfg.triggers.poll_sources.join(",");
         // Best-effort: print the cursor of the *first* configured source.
@@ -392,19 +439,24 @@ async fn events() -> anyhow::Result<()> {
                 read_cursor(&path).ok()
             })
             .unwrap_or_else(|| "(none)".into());
-
-        println!(
-            "{:<28} {:<32} {:<40} {}",
-            wf.name,
-            wf.event,
-            if sources.is_empty() {
+        let event_cell = comfy_table::Cell::new(&wf.event)
+            .fg(crate::output::tables::status_color("running", &prefs)
+                .unwrap_or(comfy_table::Color::Reset));
+        // The "running" color (blue) is reused for event-id cells so
+        // the column is visually anchored without inventing a new
+        // semantic bucket. Falls back to default when colors are off.
+        table.add_row(vec![
+            comfy_table::Cell::new(&wf.name),
+            event_cell,
+            comfy_table::Cell::new(if sources.is_empty() {
                 "(none configured)".into()
             } else {
-                sources.clone()
-            },
-            truncate(&cursor_repr, 60),
-        );
+                sources
+            }),
+            comfy_table::Cell::new(truncate(&cursor_repr, 60)),
+        ]);
     }
+    println!("{table}");
     Ok(())
 }
 

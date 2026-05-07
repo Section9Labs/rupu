@@ -98,12 +98,15 @@ pub enum Action {
         status: Option<String>,
         /// Filter by issue ref (full or shorthand). Matches the
         /// textual `RunRecord.issue_ref` persisted at run start.
-        /// Accepts:
-        ///   - `<platform>:<owner>/<repo>/issues/<N>` (full),
-        ///   - `<owner>/<repo>#<N>` (GitHub shorthand),
-        ///   - bare `<N>` (autodetects from cwd's git remote).
+        /// Accepts `<platform>:<owner>/<repo>/issues/<N>` (full),
+        /// `<owner>/<repo>#<N>` (GitHub shorthand), or bare `<N>`
+        /// (autodetects from cwd's git remote).
         #[arg(long)]
         issue: Option<String>,
+        /// Disable colored output (also honored: `NO_COLOR` env,
+        /// `[ui].color = "never"` in config).
+        #[arg(long)]
+        no_color: bool,
     },
     /// Inspect one persisted run: status, inputs, per-step
     /// transcript pointers.
@@ -174,7 +177,8 @@ pub async fn handle(action: Action) -> ExitCode {
             limit,
             status,
             issue,
-        } => runs(limit, status.as_deref(), issue.as_deref()).await,
+            no_color,
+        } => runs(limit, status.as_deref(), issue.as_deref(), no_color).await,
         Action::ShowRun { run_id } => show_run(&run_id).await,
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
@@ -336,6 +340,7 @@ async fn runs(
     limit: usize,
     status_filter: Option<&str>,
     issue_filter: Option<&str>,
+    no_color: bool,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
@@ -374,8 +379,6 @@ async fn runs(
         .take(limit)
         .collect();
 
-// Empty results print the explanation alone — no header — so users
-    // don't see a column header followed by nothing.
     if filtered.is_empty() {
         let scope = match (status_filter, issue_filter_canonical.as_deref()) {
             (None, None) => "(no runs yet — use `rupu workflow run <name>` to create one)".into(),
@@ -387,38 +390,54 @@ async fn runs(
         return Ok(());
     }
 
-    println!(
-        "{:<28} {:<20} {:<18} {:<24} {:<22} WORKFLOW",
-        "RUN ID", "STATUS", "STARTED (UTC)", "DURATION", "EXPIRES"
-    );
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let cfg = layered_config_workflow(&global, project_root.as_deref());
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
+
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec![
+        "RUN ID",
+        "STATUS",
+        "STARTED (UTC)",
+        "DURATION",
+        "EXPIRES",
+        "WORKFLOW",
+    ]);
     for r in &filtered {
         let started = r.started_at.format("%Y-%m-%d %H:%M:%S").to_string();
         let duration = match r.finished_at {
             Some(fin) => format!("{}s", (fin - r.started_at).num_seconds()),
             None => "(in flight)".into(),
         };
-        let expires = match r.expires_at {
+        let expires_cell = match r.expires_at {
             Some(ex) => {
                 let delta = (ex - now).num_seconds();
-                if delta >= 0 {
-                    format!("in {}s", delta)
-                } else {
-                    format!("{}s ago", -delta)
-                }
+                crate::output::tables::relative_time_cell(delta, &prefs)
             }
-            None => String::new(),
+            None => comfy_table::Cell::new(""),
         };
-        println!(
-            "{:<28} {:<20} {:<18} {:<24} {:<22} {}",
-            r.id,
-            r.status.as_str(),
-            started,
-            duration,
-            expires,
-            r.workflow_name
-        );
+        table.add_row(vec![
+            comfy_table::Cell::new(&r.id),
+            crate::output::tables::status_cell(r.status.as_str(), &prefs),
+            comfy_table::Cell::new(started),
+            comfy_table::Cell::new(duration),
+            expires_cell,
+            comfy_table::Cell::new(&r.workflow_name),
+        ]);
     }
+    println!("{table}");
     Ok(())
+}
+
+fn layered_config_workflow(
+    global: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+) -> rupu_config::Config {
+    let global_cfg_path = global.join("config.toml");
+    let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
+    rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())
+        .unwrap_or_default()
 }
 
 async fn show_run(run_id: &str) -> anyhow::Result<()> {

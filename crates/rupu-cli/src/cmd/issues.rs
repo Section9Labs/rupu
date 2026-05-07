@@ -10,7 +10,7 @@ use crate::cmd::completers::workflow_names;
 use crate::paths;
 use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::Cell;
 use rupu_scm::{IssueFilter, IssueRef, IssueState, IssueTracker, Platform, Registry, RepoRef};
 use std::path::Path;
 use std::process::ExitCode;
@@ -42,9 +42,17 @@ pub struct ListArgs {
     /// Filter by label. Repeatable; matched as AND.
     #[arg(long = "label")]
     pub labels: Vec<String>,
+    /// Comma-separated label list (alternative to repeating --label).
+    /// AND semantics — all listed labels must be present.
+    #[arg(long = "labels")]
+    pub labels_csv: Option<String>,
     /// Cap on returned issues. Default: 50.
     #[arg(long, default_value_t = 50)]
     pub limit: u32,
+    /// Disable colored output (also honored: `NO_COLOR` env var,
+    /// `[ui].color = "never"` in config).
+    #[arg(long)]
+    pub no_color: bool,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -86,7 +94,7 @@ pub async fn handle(action: Action) -> ExitCode {
 }
 
 async fn list(args: ListArgs) -> anyhow::Result<()> {
-    let (registry, _global, _project_root) = build_registry().await?;
+    let (registry, global, project_root) = build_registry().await?;
     let repo = resolve_repo_or_autodetect(args.repo.as_deref())?;
     let tracker = repo_to_issue_tracker(repo.platform);
     let conn = registry.issues(tracker).ok_or_else(|| {
@@ -95,9 +103,21 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
         )
     })?;
 
+    // Merge --label (repeatable) and --labels foo,bar (csv) into a
+    // single label set. AND match — all listed labels must be present.
+    let mut all_labels: Vec<String> = args.labels.clone();
+    if let Some(csv) = &args.labels_csv {
+        for piece in csv.split(',') {
+            let trimmed = piece.trim();
+            if !trimmed.is_empty() && !all_labels.iter().any(|l| l == trimmed) {
+                all_labels.push(trimmed.to_string());
+            }
+        }
+    }
+
     let filter = IssueFilter {
         state: parse_state_filter(&args.state)?,
-        labels: args.labels.clone(),
+        labels: all_labels.clone(),
         limit: Some(args.limit),
         ..Default::default()
     };
@@ -106,42 +126,51 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
 
     if issues.is_empty() {
         // Empty results go to stdout so `rupu issues list ... | wc -l`
-        // and similar pipelines see a clean "(none)" line rather than
-        // a stderr-only message that doesn't make it through.
+        // and similar pipelines see a clean "(none)" line. Echoing
+        // `all_labels` (the merged --label + --labels set) tells the
+        // user exactly what filter ran.
         println!(
             "(no issues match — state={}, labels={:?})",
-            args.state, args.labels
+            args.state, all_labels
         );
         return Ok(());
     }
 
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+    let cfg = layered_config(&global, project_root.as_deref());
+    let prefs =
+        crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None);
+
+    let mut table = crate::output::tables::new_table();
     table.set_header(vec!["#", "STATE", "LABELS", "AUTHOR", "TITLE"]);
     for i in &issues {
         let state = match i.state {
             IssueState::Open => "open",
             IssueState::Closed => "closed",
         };
-        let labels = if i.labels.is_empty() {
-            "-".to_string()
-        } else {
-            i.labels.join(",")
-        };
         // Truncate long titles so the table stays one-row-per-issue
         // in narrow terminals. `comfy_table` Dynamic arrangement
         // handles soft-wrap but a hard cap reads cleaner here.
         let title = truncate(&i.title, 80);
         table.add_row(vec![
-            i.r.number.to_string(),
-            state.into(),
-            labels,
-            i.author.clone(),
-            title,
+            Cell::new(i.r.number.to_string()),
+            crate::output::tables::status_cell(state, &prefs),
+            Cell::new(crate::output::tables::label_chips(&i.labels, &prefs)),
+            Cell::new(i.author.clone()),
+            Cell::new(title),
         ]);
     }
     println!("{table}");
     Ok(())
+}
+
+fn layered_config(
+    global: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+) -> rupu_config::Config {
+    let global_cfg_path = global.join("config.toml");
+    let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
+    rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())
+        .unwrap_or_default()
 }
 
 async fn show(args: ShowArgs) -> anyhow::Result<()> {

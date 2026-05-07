@@ -2,7 +2,7 @@
 
 use crate::paths;
 use clap::{Args as ClapArgs, Subcommand};
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::Cell;
 use rupu_scm::{Platform, Registry};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -18,6 +18,10 @@ pub struct ListArgs {
     /// Filter to one platform (`github` | `gitlab`). Default: all.
     #[arg(long)]
     pub platform: Option<String>,
+    /// Disable colored output (also honored: `NO_COLOR` env,
+    /// `[ui].color = "never"` in config).
+    #[arg(long)]
+    pub no_color: bool,
 }
 
 pub async fn handle(action: Action) -> ExitCode {
@@ -49,8 +53,9 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
         None => vec![Platform::Github, Platform::Gitlab],
     };
 
-    let mut table = Table::new();
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None);
+
+    let mut table = crate::output::tables::new_table();
     table.set_header(vec![
         "Platform",
         "Owner/Repo",
@@ -68,22 +73,31 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
         };
         let repos = conn.list_repos().await?;
         for r in repos {
+            // Visibility coloring: private → dim (slate), public → green
+            // (mirrors GitHub's "open" green for the not-locked case).
+            // When no_color is set, both render plain.
+            let visibility_cell = if !prefs.use_color() {
+                Cell::new(if r.private { "private" } else { "public" })
+            } else if r.private {
+                Cell::new("private").fg(comfy_table::Color::DarkGrey)
+            } else {
+                Cell::new("public").fg(
+                    crate::output::tables::status_color("open", &prefs)
+                        .unwrap_or(comfy_table::Color::Reset),
+                )
+            };
             table.add_row(vec![
-                p.to_string(),
-                format!("{}/{}", r.r.owner, r.r.repo),
-                r.default_branch,
-                if r.private {
-                    "private".into()
-                } else {
-                    "public".into()
-                },
+                Cell::new(p.to_string()),
+                Cell::new(format!("{}/{}", r.r.owner, r.r.repo)),
+                Cell::new(&r.default_branch),
+                visibility_cell,
             ]);
             any_listed = true;
         }
     }
     if !any_listed {
         if !any_skipped {
-            eprintln!("No repos to list across configured platforms.");
+            println!("No repos to list across configured platforms.");
         }
         return Ok(());
     }
