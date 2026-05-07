@@ -31,10 +31,10 @@ fn opts(
         mcp_registry: None,
         effort: None,
         context_window: None,
-            output_format: None,
-            anthropic_task_budget: None,
-            anthropic_context_management: None,
-            anthropic_speed: None,
+        output_format: None,
+        anthropic_task_budget: None,
+        anthropic_context_management: None,
+        anthropic_speed: None,
     }
 }
 

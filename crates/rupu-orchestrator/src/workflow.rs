@@ -715,4 +715,3 @@ pub(crate) fn yaml_scalar_to_string(v: &serde_yaml::Value) -> String {
             .into(),
     }
 }
-

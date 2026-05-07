@@ -167,11 +167,13 @@ impl GoogleGeminiClient {
                  not API key. Use the AI Studio variant for api-key auth."
                     .into(),
             )),
-            (AuthCredentials::OAuth { .. }, GeminiVariant::AiStudio) => Err(ProviderError::AuthConfig(
-                "AI Studio requires API-key auth, not OAuth. Run `rupu auth login \
+            (AuthCredentials::OAuth { .. }, GeminiVariant::AiStudio) => {
+                Err(ProviderError::AuthConfig(
+                    "AI Studio requires API-key auth, not OAuth. Run `rupu auth login \
                  --provider gemini --mode api-key`."
-                    .into(),
-            )),
+                        .into(),
+                ))
+            }
         }
     }
 
@@ -1284,9 +1286,7 @@ mod tests {
 
     #[test]
     fn cloud_code_assist_still_rejects_api_key() {
-        let key_creds = AuthCredentials::ApiKey {
-            key: "k".into(),
-        };
+        let key_creds = AuthCredentials::ApiKey { key: "k".into() };
         let result = GoogleGeminiClient::new(key_creds, GeminiVariant::GeminiCli, None);
         assert!(matches!(result, Err(ProviderError::AuthConfig(_))));
     }

@@ -172,7 +172,17 @@ pub async fn handle(action: Action) -> ExitCode {
             input,
             mode,
             canvas,
-        } => run(&name, target.as_deref(), input, mode.as_deref(), None, canvas).await,
+        } => {
+            run(
+                &name,
+                target.as_deref(),
+                input,
+                mode.as_deref(),
+                None,
+                canvas,
+            )
+            .await
+        }
         Action::Runs {
             limit,
             status,
@@ -252,7 +262,11 @@ async fn show(
     Ok(())
 }
 
-async fn edit(name: &str, scope: Option<&str>, editor_override: Option<&str>) -> anyhow::Result<()> {
+async fn edit(
+    name: &str,
+    scope: Option<&str>,
+    editor_override: Option<&str>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -298,9 +312,8 @@ fn resolve_workflow_path(
     let project_dir = project_root.map(|p| p.join(".rupu").join("workflows"));
     let global_dir = global.join("workflows");
 
-    let pick = |dir: PathBuf| -> Option<PathBuf> {
-        candidates_for(dir).into_iter().find(|p| p.exists())
-    };
+    let pick =
+        |dir: PathBuf| -> Option<PathBuf> { candidates_for(dir).into_iter().find(|p| p.exists()) };
 
     match scope {
         Some("project") => match project_dir {
@@ -443,14 +456,12 @@ fn layered_config_workflow(
 async fn show_run(run_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    let record = store
-        .load(run_id)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "run not found: {e}\n  hint: list runs with `rupu workflow runs` \
+    let record = store.load(run_id).map_err(|e| {
+        anyhow::anyhow!(
+            "run not found: {e}\n  hint: list runs with `rupu workflow runs` \
                  or start one with `rupu workflow run <name>`"
-            )
-        })?;
+        )
+    })?;
     let rows = store
         .read_step_results(run_id)
         .map_err(|e| anyhow::anyhow!("read step results failed: {e}"))?;
@@ -483,10 +494,7 @@ async fn show_run(run_id: &str) -> anyhow::Result<()> {
         println!("Awaiting   : {step}");
     }
     if let Some(since) = &record.awaiting_since {
-        println!(
-            "Paused at  : {}",
-            since.format("%Y-%m-%d %H:%M:%S UTC")
-        );
+        println!("Paused at  : {}", since.format("%Y-%m-%d %H:%M:%S UTC"));
     }
     if let Some(ex) = &record.expires_at {
         println!("Expires    : {}", ex.format("%Y-%m-%d %H:%M:%S UTC"));
@@ -782,11 +790,7 @@ pub async fn run_by_name_with_run_id(
 /// run-target string. Same UI semantics as `rupu workflow run`
 /// (interactive line-stream by default) so the issue-targeted run
 /// looks identical to the user.
-pub async fn run_by_target(
-    name: &str,
-    target: &str,
-    mode: Option<&str>,
-) -> anyhow::Result<()> {
+pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyhow::Result<()> {
     run(name, Some(target), Vec::new(), mode, None, false).await
 }
 
@@ -938,8 +942,7 @@ async fn run_with_outcome(
                                 );
                             }
                         }
-                        issue_ref_text =
-                            Some(format!("{}:{}/issues/{}", tracker, project, number));
+                        issue_ref_text = Some(format!("{}:{}/issues/{}", tracker, project, number));
                         (None, pwd.clone())
                     }
                 };
@@ -1021,8 +1024,7 @@ async fn run_with_outcome(
     let result = if attach_ui {
         // Snapshot the run dir entries that exist *before* the spawn so
         // we can detect the new one the orchestrator creates.
-        let existing_run_ids: std::collections::BTreeSet<String> =
-            list_run_dir_entries(&runs_dir);
+        let existing_run_ids: std::collections::BTreeSet<String> = list_run_dir_entries(&runs_dir);
 
         // transcript_dir_snapshot was captured before opts was constructed.
 
@@ -1050,8 +1052,7 @@ async fn run_with_outcome(
                 // Line-stream printer (default). Loops over Approved
                 // outcomes, transparently spinning a resumed runner each
                 // time the user presses `a` at a gate.
-                let printer_store =
-                    rupu_orchestrator::RunStore::new(runs_dir.clone());
+                let printer_store = rupu_orchestrator::RunStore::new(runs_dir.clone());
                 let mut printer = crate::output::LineStreamPrinter::new();
 
                 let mut attach_opts = crate::output::workflow_printer::AttachOpts::default();
@@ -1082,15 +1083,14 @@ async fn run_with_outcome(
 
                     use crate::output::workflow_printer::AttachOutcome;
                     match outcome {
-                        AttachOutcome::Done
-                        | AttachOutcome::Detached
-                        | AttachOutcome::Rejected => break result,
+                        AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
+                            break result
+                        }
                         AttachOutcome::Approved { awaited_step_id } => {
                             // Spin a resumed run with the same id and
                             // re-attach the printer in skip-header mode.
-                            let prior_records = run_store_for_resume
-                                .read_step_results(rid)
-                                .map_err(|e| {
+                            let prior_records =
+                                run_store_for_resume.read_step_results(rid).map_err(|e| {
                                     anyhow::anyhow!("read step results for resume: {e}")
                                 })?;
                             let prior_count = prior_records.len();
@@ -1155,7 +1155,9 @@ async fn run_with_outcome(
     // run. We skip silently when `notifyIssue` is off OR when the
     // run-target wasn't an issue.
     if notify_issue_enabled {
-        if let (Some(ref_text), Some(payload)) = (&issue_ref_text_for_notify, &issue_payload_for_notify) {
+        if let (Some(ref_text), Some(payload)) =
+            (&issue_ref_text_for_notify, &issue_payload_for_notify)
+        {
             post_run_summary_to_issue(
                 &registry_for_notify,
                 ref_text,
@@ -1282,8 +1284,7 @@ async fn wait_for_new_run_dir(
     before: &std::collections::BTreeSet<String>,
     timeout_ms: u64,
 ) -> Option<String> {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
         if let Ok(rd) = std::fs::read_dir(runs_dir) {
             for entry in rd.flatten() {

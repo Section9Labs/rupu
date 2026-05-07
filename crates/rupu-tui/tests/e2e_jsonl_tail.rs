@@ -64,18 +64,28 @@ fn tail_emits_run_update_when_run_json_changes() {
         issue_ref: None,
         issue: None,
     };
-    std::fs::write(dir.path().join("run.json"), serde_json::to_vec(&rec).unwrap()).unwrap();
+    std::fs::write(
+        dir.path().join("run.json"),
+        serde_json::to_vec(&rec).unwrap(),
+    )
+    .unwrap();
 
     let mut src = JsonlTailSource::new(dir.path().to_path_buf()).unwrap();
 
     // Touch run.json with a status change.
     let mut updated = rec;
     updated.status = RunStatus::AwaitingApproval;
-    std::fs::write(dir.path().join("run.json"), serde_json::to_vec(&updated).unwrap()).unwrap();
+    std::fs::write(
+        dir.path().join("run.json"),
+        serde_json::to_vec(&updated).unwrap(),
+    )
+    .unwrap();
 
     let drained = wait_for_events(&mut src, Duration::from_secs(2));
     assert!(
-        drained.iter().any(|e| matches!(e, SourceEvent::RunUpdate(r) if r.status == RunStatus::AwaitingApproval)),
+        drained.iter().any(
+            |e| matches!(e, SourceEvent::RunUpdate(r) if r.status == RunStatus::AwaitingApproval)
+        ),
         "expected RunUpdate(AwaitingApproval), got {drained:?}"
     );
 }

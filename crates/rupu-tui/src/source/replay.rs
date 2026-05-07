@@ -29,7 +29,9 @@ impl EventSource for ReplaySource {
         let now = Instant::now();
         let mut out = Vec::new();
         while now >= self.next_at {
-            let Some((step_id, event)) = self.queue.pop_front() else { break };
+            let Some((step_id, event)) = self.queue.pop_front() else {
+                break;
+            };
             out.push(SourceEvent::StepEvent { step_id, event });
             self.next_at += self.pace;
         }

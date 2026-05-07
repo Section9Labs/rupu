@@ -98,9 +98,7 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
     let repo = resolve_repo_or_autodetect(args.repo.as_deref())?;
     let tracker = repo_to_issue_tracker(repo.platform);
     let conn = registry.issues(tracker).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no {tracker} credential — run `rupu auth login --provider {tracker}`"
-        )
+        anyhow::anyhow!("no {tracker} credential — run `rupu auth login --provider {tracker}`")
     })?;
 
     // Merge --label (repeatable) and --labels foo,bar (csv) into a
@@ -137,8 +135,7 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
     }
 
     let cfg = layered_config(&global, project_root.as_deref());
-    let prefs =
-        crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None);
 
     let mut table = crate::output::tables::new_table();
     table.set_header(vec!["#", "STATE", "LABELS", "AUTHOR", "TITLE"]);
@@ -204,8 +201,14 @@ async fn show(args: ShowArgs) -> anyhow::Result<()> {
             issue.labels.join(", ")
         }
     );
-    println!("Created : {}", issue.created_at.format("%Y-%m-%d %H:%M:%S UTC"));
-    println!("Updated : {}", issue.updated_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "Created : {}",
+        issue.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    println!(
+        "Updated : {}",
+        issue.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
     println!();
     if issue.body.trim().is_empty() {
         println!("(no body)");
@@ -286,7 +289,9 @@ fn resolve_repo_or_autodetect(repo_arg: Option<&str>) -> anyhow::Result<RepoRef>
                 owner,
                 repo,
             }),
-            crate::run_target::RunTarget::Issue { tracker, project, .. } => {
+            crate::run_target::RunTarget::Issue {
+                tracker, project, ..
+            } => {
                 let (owner, repo) = project.split_once('/').ok_or_else(|| {
                     anyhow::anyhow!("issue project `{project}` is not `<owner>/<repo>`")
                 })?;
@@ -387,8 +392,9 @@ fn autodetect_repo_from_cwd() -> anyhow::Result<RepoRef> {
         anyhow::anyhow!("not in a git checkout — pass --repo <platform>:<owner>/<repo>")
     })?;
     let url = read_origin_url(&git_config)?;
-    parse_remote_url(&url)
-        .ok_or_else(|| anyhow::anyhow!("could not parse origin url `{url}` to <platform>:<owner>/<repo>"))
+    parse_remote_url(&url).ok_or_else(|| {
+        anyhow::anyhow!("could not parse origin url `{url}` to <platform>:<owner>/<repo>")
+    })
 }
 
 fn find_git_config(start: &Path) -> Option<std::path::PathBuf> {

@@ -147,7 +147,10 @@ fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
 fn highlight_with_extension(text: &str, ext: &str, prefs: &UiPrefs) -> Option<String> {
     let ss = SyntaxSet::load_defaults_newlines();
     let ts = ThemeSet::load_defaults();
-    let theme: &Theme = ts.themes.get(&prefs.theme).or_else(|| ts.themes.get(DEFAULT_THEME))?;
+    let theme: &Theme = ts
+        .themes
+        .get(&prefs.theme)
+        .or_else(|| ts.themes.get(DEFAULT_THEME))?;
     let syntax = ss.find_syntax_by_extension(ext)?;
     let mut hl = HighlightLines::new(syntax, theme);
     let mut out = String::with_capacity(text.len() + 32);
@@ -172,10 +175,7 @@ pub fn paginate(body: &str, prefs: &UiPrefs) -> anyhow::Result<()> {
     }
 
     let (cmd, args) = pager_command();
-    let spawn_result = Command::new(&cmd)
-        .args(&args)
-        .stdin(Stdio::piped())
-        .spawn();
+    let spawn_result = Command::new(&cmd).args(&args).stdin(Stdio::piped()).spawn();
     let mut child = match spawn_result {
         Ok(c) => c,
         Err(_) => {

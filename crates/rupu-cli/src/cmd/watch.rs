@@ -90,8 +90,13 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
 
     if args.replay {
         // Replay: dump the already-written transcripts through the printer.
-        let result =
-            replay_with_printer(&workflow_name, &run_id, &runs_dir, &transcript_dir, args.pace);
+        let result = replay_with_printer(
+            &workflow_name,
+            &run_id,
+            &runs_dir,
+            &transcript_dir,
+            args.pace,
+        );
         match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -110,9 +115,7 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
             &mut printer,
             &store,
         ) {
-            Ok(crate::output::workflow_printer::AttachOutcome::Approved {
-                awaited_step_id,
-            }) => {
+            Ok(crate::output::workflow_printer::AttachOutcome::Approved { awaited_step_id }) => {
                 // We persisted the approval, but `rupu watch` doesn't have
                 // the workflow YAML / factory needed to spin a resume run
                 // inline. Surface the next step to the operator.
@@ -146,8 +149,7 @@ fn replay_with_printer(
     let step_results_log = run_dir.join("step_results.jsonl");
     let run_json = run_dir.join("run.json");
 
-    let pace_delay =
-        std::time::Duration::from_micros((1_000_000.0 / pace.max(0.1)) as u64);
+    let pace_delay = std::time::Duration::from_micros((1_000_000.0 / pace.max(0.1)) as u64);
 
     // Load run record for the header.
     let started_at = load_run_started_at(&run_json).unwrap_or_else(chrono::Utc::now);

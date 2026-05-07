@@ -75,7 +75,8 @@ fn run_line_stream_token_count_in_footer() {
     make_agent(dir.path(), "token-agent");
 
     // 30 input + 5 output = 35 total.
-    let script = r#"[{"AssistantText":{"text":"x","stop":"end_turn","input_tokens":30,"output_tokens":5}}]"#;
+    let script =
+        r#"[{"AssistantText":{"text":"x","stop":"end_turn","input_tokens":30,"output_tokens":5}}]"#;
 
     Command::cargo_bin("rupu")
         .unwrap()

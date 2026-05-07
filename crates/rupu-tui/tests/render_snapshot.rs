@@ -25,7 +25,8 @@ fn linear_three_node_canvas() {
     let edges = vec![("a".into(), "b".into()), ("b".into(), "c".into())];
     let backend = TestBackend::new(100, 14);
     let mut term = Terminal::new(backend).unwrap();
-    term.draw(|f| render_canvas(f, f.area(), &model, &edges, "c")).unwrap();
+    term.draw(|f| render_canvas(f, f.area(), &model, &edges, "c"))
+        .unwrap();
 
     let buf = term.backend().buffer().clone();
     insta::assert_snapshot!("canvas_linear", buffer_to_string(&buf));
@@ -43,7 +44,8 @@ fn fanout_canvas_renders_drop_connectors() {
     let edges = vec![("a".into(), "b".into()), ("a".into(), "c".into())];
     let backend = TestBackend::new(100, 16);
     let mut term = Terminal::new(backend).unwrap();
-    term.draw(|f| render_canvas(f, f.area(), &model, &edges, "a")).unwrap();
+    term.draw(|f| render_canvas(f, f.area(), &model, &edges, "a"))
+        .unwrap();
     insta::assert_snapshot!(
         "canvas_fanout",
         buffer_to_string(&term.backend().buffer().clone())
@@ -59,9 +61,7 @@ fn long_assistant_message_does_not_blow_up_transcript_tail() {
     use chrono::Utc;
     use rupu_transcript::Event;
     let mut model = RunModel::new();
-    let huge = "{\"findings\":[".to_string()
-        + &"x".repeat(2000)
-        + "]}\nshorter line";
+    let huge = "{\"findings\":[".to_string() + &"x".repeat(2000) + "]}\nshorter line";
     model.upsert_node("panelist", "tour-security-reviewer");
     model.apply_event(
         "panelist",
@@ -91,9 +91,13 @@ fn fanout_tree_render() {
     let edges = vec![("a".into(), "b".into()), ("a".into(), "c".into())];
     let backend = TestBackend::new(40, 8);
     let mut term = Terminal::new(backend).unwrap();
-    term.draw(|f| render_tree(f, f.area(), &model, &edges, "a")).unwrap();
+    term.draw(|f| render_tree(f, f.area(), &model, &edges, "a"))
+        .unwrap();
 
-    insta::assert_snapshot!("tree_fanout", buffer_to_string(&term.backend().buffer().clone()));
+    insta::assert_snapshot!(
+        "tree_fanout",
+        buffer_to_string(&term.backend().buffer().clone())
+    );
 }
 
 #[test]
@@ -109,9 +113,13 @@ fn panel_shows_status_tools_tokens() {
 
     let backend = TestBackend::new(40, 12);
     let mut term = Terminal::new(backend).unwrap();
-    term.draw(|f| render_panel(f, f.area(), &model, "code-agent")).unwrap();
+    term.draw(|f| render_panel(f, f.area(), &model, "code-agent"))
+        .unwrap();
 
-    insta::assert_snapshot!("panel_focused", buffer_to_string(&term.backend().buffer().clone()));
+    insta::assert_snapshot!(
+        "panel_focused",
+        buffer_to_string(&term.backend().buffer().clone())
+    );
 }
 
 #[test]
@@ -122,7 +130,8 @@ fn too_narrow_terminal_renders_warning() {
     let edges = vec![];
     let backend = TestBackend::new(38, 4);
     let mut term = Terminal::new(backend).unwrap();
-    term.draw(|f| render_canvas_with_warning(f, f.area(), &model, &edges, "a")).unwrap();
+    term.draw(|f| render_canvas_with_warning(f, f.area(), &model, &edges, "a"))
+        .unwrap();
     let s = buffer_to_string(&term.backend().buffer().clone());
     assert!(s.contains("canvas truncated"), "got:\n{s}");
 }

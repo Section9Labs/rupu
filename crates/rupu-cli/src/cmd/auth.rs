@@ -236,9 +236,7 @@ async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
         let choice = match target_norm.as_str() {
             "file" | "json" | "json-file" | "json_file" => rupu_auth::BackendChoice::JsonFile,
             "keyring" | "keychain" | "os" | "os-keychain" => rupu_auth::BackendChoice::Keyring,
-            other => anyhow::bail!(
-                "unknown backend `{other}` — expected one of: file | keychain"
-            ),
+            other => anyhow::bail!("unknown backend `{other}` — expected one of: file | keychain"),
         };
         // Update the cache so future invocations without the env var
         // pick the same backend.
@@ -249,7 +247,10 @@ async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
             rupu_auth::BackendChoice::JsonFile => "file",
             rupu_auth::BackendChoice::Keyring => "keychain",
         };
-        println!("rupu: persisted backend choice = {env_value} (cache: {})", cache_path.display());
+        println!(
+            "rupu: persisted backend choice = {env_value} (cache: {})",
+            cache_path.display()
+        );
         println!();
         println!("To override per-shell session (e.g. while debugging):");
         println!("  export RUPU_AUTH_BACKEND={env_value}");

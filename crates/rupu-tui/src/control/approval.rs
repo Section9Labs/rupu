@@ -19,7 +19,9 @@ pub fn approve_focused(
     let now = chrono::Utc::now();
     match store.approve(run_id, approver, now)? {
         ApprovalDecision::Approved { step_id, .. } => Ok(ApprovalOutcome::Approved { step_id }),
-        other => Ok(ApprovalOutcome::Error(format!("unexpected decision: {other:?}"))),
+        other => Ok(ApprovalOutcome::Error(format!(
+            "unexpected decision: {other:?}"
+        ))),
     }
 }
 
@@ -31,9 +33,11 @@ pub fn reject_focused(
 ) -> Result<ApprovalOutcome, ApprovalError> {
     let now = chrono::Utc::now();
     match store.reject(run_id, approver, reason, now)? {
-        ApprovalDecision::Rejected { step_id, reason, .. } => {
-            Ok(ApprovalOutcome::Rejected { step_id, reason })
-        }
-        other => Ok(ApprovalOutcome::Error(format!("unexpected decision: {other:?}"))),
+        ApprovalDecision::Rejected {
+            step_id, reason, ..
+        } => Ok(ApprovalOutcome::Rejected { step_id, reason }),
+        other => Ok(ApprovalOutcome::Error(format!(
+            "unexpected decision: {other:?}"
+        ))),
     }
 }

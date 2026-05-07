@@ -273,8 +273,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     {
         let mut printer = crate::output::LineStreamPrinter::new();
         printer.step_start(&spec_name_for_printer, None, None, None);
-        let mut tailer =
-            crate::output::TranscriptTailer::new(&transcript_path_for_printer);
+        let mut tailer = crate::output::TranscriptTailer::new(&transcript_path_for_printer);
         let mut total_tokens = 0u64;
 
         loop {
@@ -287,8 +286,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
                         printer.assistant_chunk(content);
                     }
                     rupu_transcript::Event::ToolCall { tool, input, .. } => {
-                        let summary =
-                            crate::output::workflow_printer::tool_summary(tool, input);
+                        let summary = crate::output::workflow_printer::tool_summary(tool, input);
                         printer.tool_call(tool, &summary);
                     }
                     rupu_transcript::Event::RunComplete {
@@ -331,11 +329,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
                 }
                 if total_tokens == 0 {
                     // RunComplete wasn't seen yet; print a plain done.
-                    printer.step_done(
-                        &run_id_for_printer,
-                        std::time::Duration::ZERO,
-                        0,
-                    );
+                    printer.step_done(&run_id_for_printer, std::time::Duration::ZERO, 0);
                 }
                 break;
             }
@@ -350,10 +344,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("agent task panicked: {e}"))??;
 
     // Print a brief footer.
-    println!(
-        "transcript: {}",
-        transcript_path.display()
-    );
+    println!("transcript: {}", transcript_path.display());
     let _ = result;
     Ok(())
 }

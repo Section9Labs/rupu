@@ -505,9 +505,20 @@ impl RunStore {
 /// (CLI text wrapper or TUI toast) so they decide how to display it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
-    Approved { run_id: String, step_id: String },
-    Rejected { run_id: String, step_id: String, reason: String },
-    Expired { run_id: String, step_id: String, error: String },
+    Approved {
+        run_id: String,
+        step_id: String,
+    },
+    Rejected {
+        run_id: String,
+        step_id: String,
+        reason: String,
+    },
+    Expired {
+        run_id: String,
+        step_id: String,
+        error: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -542,13 +553,21 @@ impl RunStore {
         })?;
         if self.expire_if_overdue(&mut record, now)? {
             return Err(ApprovalError::Expired(
-                record.error_message.clone().unwrap_or_else(|| "paused run timed out".into()),
+                record
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "paused run timed out".into()),
             ));
         }
         if record.status != RunStatus::AwaitingApproval {
-            return Err(ApprovalError::NotAwaiting(record.status.as_str().to_string()));
+            return Err(ApprovalError::NotAwaiting(
+                record.status.as_str().to_string(),
+            ));
         }
-        let step_id = record.awaiting_step_id.clone().ok_or(ApprovalError::NoAwaitingStep)?;
+        let step_id = record
+            .awaiting_step_id
+            .clone()
+            .ok_or(ApprovalError::NoAwaitingStep)?;
         let _ = approver; // identity recorded in transcript via runner re-entry
         record.status = RunStatus::Running;
         record.awaiting_step_id = None;
@@ -557,7 +576,10 @@ impl RunStore {
         record.expires_at = None;
         record.error_message = None;
         self.update(&record)?;
-        Ok(ApprovalDecision::Approved { run_id: run_id.to_string(), step_id })
+        Ok(ApprovalDecision::Approved {
+            run_id: run_id.to_string(),
+            step_id,
+        })
     }
 
     pub fn reject(
@@ -573,13 +595,21 @@ impl RunStore {
         })?;
         if self.expire_if_overdue(&mut record, now)? {
             return Err(ApprovalError::Expired(
-                record.error_message.clone().unwrap_or_else(|| "paused run timed out".into()),
+                record
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "paused run timed out".into()),
             ));
         }
         if record.status != RunStatus::AwaitingApproval {
-            return Err(ApprovalError::NotAwaiting(record.status.as_str().to_string()));
+            return Err(ApprovalError::NotAwaiting(
+                record.status.as_str().to_string(),
+            ));
         }
-        let step_id = record.awaiting_step_id.clone().ok_or(ApprovalError::NoAwaitingStep)?;
+        let step_id = record
+            .awaiting_step_id
+            .clone()
+            .ok_or(ApprovalError::NoAwaitingStep)?;
         let _ = approver;
         record.status = RunStatus::Rejected;
         record.error_message = Some(format!("rejected: {reason}"));
@@ -872,7 +902,8 @@ mod tests {
         assert!(!store.expire_if_overdue(&mut loaded, now).unwrap());
     }
 
-    const SAMPLE_YAML: &str = "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
+    const SAMPLE_YAML: &str =
+        "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
 
     #[test]
     fn approve_flips_running_and_clears_pause_fields() {
@@ -902,7 +933,9 @@ mod tests {
         rec.awaiting_step_id = Some("deploy".into());
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
-        let decision = store.reject(&rec.id, "matt", "looks risky", Utc::now()).unwrap();
+        let decision = store
+            .reject(&rec.id, "matt", "looks risky", Utc::now())
+            .unwrap();
         assert!(matches!(decision, ApprovalDecision::Rejected { .. }));
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(reloaded.status, RunStatus::Rejected);

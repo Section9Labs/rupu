@@ -81,10 +81,8 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
             } else if r.private {
                 Cell::new("private").fg(comfy_table::Color::DarkGrey)
             } else {
-                Cell::new("public").fg(
-                    crate::output::tables::status_color("open", &prefs)
-                        .unwrap_or(comfy_table::Color::Reset),
-                )
+                Cell::new("public").fg(crate::output::tables::status_color("open", &prefs)
+                    .unwrap_or(comfy_table::Color::Reset))
             };
             table.add_row(vec![
                 Cell::new(p.to_string()),

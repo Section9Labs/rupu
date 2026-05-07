@@ -1446,7 +1446,10 @@ async fn panel_gate_marks_unresolved_when_max_iterations_exhausted() {
     // steps (or operators) can still see what's outstanding.
     assert_eq!(panel.findings.len(), 1);
     assert_eq!(panel.findings[0].title, "unfixable");
-    assert_eq!(panel.findings[0].severity, rupu_orchestrator::Severity::Critical);
+    assert_eq!(
+        panel.findings[0].severity,
+        rupu_orchestrator::Severity::Critical
+    );
 
     // Fixer ran (max_iterations - 1) times before the final pass.
     let calls = factory.calls.lock().unwrap().clone();
@@ -1497,11 +1500,18 @@ steps:
     assert_eq!(panel.iterations, 1);
     // Findings under the threshold are still surfaced.
     assert_eq!(panel.findings.len(), 1);
-    assert_eq!(panel.findings[0].severity, rupu_orchestrator::Severity::High);
+    assert_eq!(
+        panel.findings[0].severity,
+        rupu_orchestrator::Severity::High
+    );
 
     let calls = factory.calls.lock().unwrap().clone();
     assert_eq!(calls.get("security-reviewer").copied(), Some(1));
-    assert_eq!(calls.get("fixer").copied(), None, "fixer should not have run");
+    assert_eq!(
+        calls.get("fixer").copied(),
+        None,
+        "fixer should not have run"
+    );
 }
 
 // -- Approval timeout (PR2: timeout_seconds wiring) -------------------------
@@ -1553,7 +1563,10 @@ async fn approval_with_timeout_seconds_persists_awaiting_since_and_expires_at() 
         .expect("AwaitingInfo.expires_at should be populated when timeout_seconds is set");
 
     let record = store.load(&res.run_id).unwrap();
-    assert_eq!(record.status, rupu_orchestrator::RunStatus::AwaitingApproval);
+    assert_eq!(
+        record.status,
+        rupu_orchestrator::RunStatus::AwaitingApproval
+    );
     let since = record.awaiting_since.expect("awaiting_since should be set");
     let on_disk_expires = record.expires_at.expect("expires_at should be set");
     // expires_at == awaiting_since + 60s, with allowance for clock
@@ -1603,6 +1616,9 @@ steps:
     let info = res.awaiting.unwrap();
     assert!(info.expires_at.is_none());
     let record = store.load(&res.run_id).unwrap();
-    assert!(record.awaiting_since.is_some(), "awaiting_since always set on pause");
+    assert!(
+        record.awaiting_since.is_some(),
+        "awaiting_since always set on pause"
+    );
     assert!(record.expires_at.is_none(), "no timeout → no expires_at");
 }

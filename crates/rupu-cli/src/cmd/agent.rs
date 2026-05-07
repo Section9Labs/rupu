@@ -154,19 +154,22 @@ async fn show(
     Ok(())
 }
 
-async fn edit(name: &str, scope: Option<&str>, editor_override: Option<&str>) -> anyhow::Result<()> {
+async fn edit(
+    name: &str,
+    scope: Option<&str>,
+    editor_override: Option<&str>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
 
-    let target = resolve_agent_path(
-        name,
-        scope,
-        &global,
-        project_agents_parent.as_deref(),
-    )?;
-    println!("editing {} ({})", target.display(), describe_scope(&target, &global));
+    let target = resolve_agent_path(name, scope, &global, project_agents_parent.as_deref())?;
+    println!(
+        "editing {} ({})",
+        target.display(),
+        describe_scope(&target, &global)
+    );
 
     editor::open_for_edit(editor_override, &target)?;
 

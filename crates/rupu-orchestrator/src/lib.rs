@@ -18,8 +18,8 @@ pub mod workflow;
 pub use action_protocol::{validate_actions, ActionValidationResult};
 pub use event_match::event_matches;
 pub use runner::{
-    run_workflow, AwaitingInfo, Finding, ItemResult, OrchestratorRunOpts,
-    OrchestratorRunResult, ResumeState, RunWorkflowError, StepFactory, StepResult,
+    run_workflow, AwaitingInfo, Finding, ItemResult, OrchestratorRunOpts, OrchestratorRunResult,
+    ResumeState, RunWorkflowError, StepFactory, StepResult,
 };
 pub use runs::{
     ApprovalDecision, ApprovalError, FindingRecord, ItemResultRecord, RunRecord, RunStatus,
@@ -30,6 +30,6 @@ pub use templates::{
     SubResult,
 };
 pub use workflow::{
-    Approval, InputDef, InputType, Panel, PanelGate, Severity, Step, SubStep, Trigger,
-    TriggerKind, Workflow, WorkflowDefaults, WorkflowParseError,
+    Approval, InputDef, InputType, Panel, PanelGate, Severity, Step, SubStep, Trigger, TriggerKind,
+    Workflow, WorkflowDefaults, WorkflowParseError,
 };

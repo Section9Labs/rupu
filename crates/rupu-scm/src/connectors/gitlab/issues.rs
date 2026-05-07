@@ -124,10 +124,12 @@ impl IssueConnector for GitlabIssueConnector {
         // each Issue's `label_colors` with the matching subset.
         let colors = self.project_label_colors(project).await;
         arr.iter()
-            .map(|v| translate_issue(project.to_string(), v).map(|mut iss| {
-                attach_label_colors(&mut iss, &colors);
-                iss
-            }))
+            .map(|v| {
+                translate_issue(project.to_string(), v).map(|mut iss| {
+                    attach_label_colors(&mut iss, &colors);
+                    iss
+                })
+            })
             .collect()
     }
 

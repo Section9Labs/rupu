@@ -175,14 +175,13 @@ pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
                 .map(|(_, v)| v.into_owned())
                 .ok_or_else(|| anyhow!("no `state` in redirect"))?;
 
-            let resp = tiny_http::Response::from_string(LANDING_PAGE)
-                .with_header(
-                    tiny_http::Header::from_bytes(
-                        &b"Content-Type"[..],
-                        &b"text/html; charset=utf-8"[..],
-                    )
-                    .unwrap(),
-                );
+            let resp = tiny_http::Response::from_string(LANDING_PAGE).with_header(
+                tiny_http::Header::from_bytes(
+                    &b"Content-Type"[..],
+                    &b"text/html; charset=utf-8"[..],
+                )
+                .unwrap(),
+            );
             let _ = req.respond(resp);
             return Ok((code, got_state));
         }

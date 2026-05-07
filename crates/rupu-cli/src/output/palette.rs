@@ -108,11 +108,7 @@ impl Status {
 
 /// Write `text` to `f` using the given Okesu RGB color, or plain if
 /// `supports-colors` says the stream does not support colors.
-pub fn write_colored(
-    f: &mut dyn fmt::Write,
-    text: &str,
-    color: owo_colors::Rgb,
-) -> fmt::Result {
+pub fn write_colored(f: &mut dyn fmt::Write, text: &str, color: owo_colors::Rgb) -> fmt::Result {
     // owo_colors' if_supports_color checks both NO_COLOR and the stream.
     // We use Stdout as the stream sentinel — the printer always writes to
     // stdout so this is accurate.
