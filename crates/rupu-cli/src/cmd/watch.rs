@@ -59,7 +59,7 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
                 );
                 ExitCode::from(2)
             }
-            Err(e) => crate::output::diag::fail(e)
+            Err(e) => crate::output::diag::fail(e),
         };
     }
 
@@ -96,7 +96,7 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
         );
         match result {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => crate::output::diag::fail(e)
+            Err(e) => crate::output::diag::fail(e),
         }
     } else {
         // Live watch (same logic as workflow attach_and_print).
@@ -122,7 +122,7 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Ok(_) => ExitCode::SUCCESS,
-            Err(e) => crate::output::diag::fail(e)
+            Err(e) => crate::output::diag::fail(e),
         }
     }
 }

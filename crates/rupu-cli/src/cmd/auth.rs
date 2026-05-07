@@ -92,7 +92,7 @@ pub async fn handle(action: Action) -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::from(0),
-        Err(e) => crate::output::diag::fail(e)
+        Err(e) => crate::output::diag::fail(e),
     }
 }
 
@@ -168,9 +168,7 @@ fn read_api_key_from_stdin(provider: &str, pid: ProviderId) -> anyhow::Result<St
     if std::io::stdin().is_terminal() {
         let has_sso = rupu_auth::oauth::providers::provider_oauth(pid).is_some();
         let sso_hint = if has_sso {
-            format!(
-                " (or rerun with `--mode sso` to authenticate via the {provider} browser flow)"
-            )
+            format!(" (or rerun with `--mode sso` to authenticate via the {provider} browser flow)")
         } else {
             String::new()
         };
@@ -343,10 +341,8 @@ async fn status() -> anyhow::Result<()> {
     ] {
         let api_present = resolver.peek(pid, rupu_providers::AuthMode::ApiKey).await;
         let api_cell = if api_present {
-            comfy_table::Cell::new("✓").fg(
-                crate::output::tables::status_color("completed", &prefs)
-                    .unwrap_or(comfy_table::Color::Reset),
-            )
+            comfy_table::Cell::new("✓").fg(crate::output::tables::status_color("completed", &prefs)
+                .unwrap_or(comfy_table::Color::Reset))
         } else {
             comfy_table::Cell::new("—").fg(comfy_table::Color::DarkGrey)
         };
@@ -362,7 +358,11 @@ async fn status() -> anyhow::Result<()> {
                     crate::output::tables::status_color("completed", &prefs)
                         .unwrap_or(comfy_table::Color::Reset)
                 };
-                let glyph = if lower.contains("expired") { "✗" } else { "✓" };
+                let glyph = if lower.contains("expired") {
+                    "✗"
+                } else {
+                    "✓"
+                };
                 comfy_table::Cell::new(format!("{glyph} {expiry_repr}")).fg(color)
             }
             None => comfy_table::Cell::new("—").fg(comfy_table::Color::DarkGrey),

@@ -28,7 +28,7 @@ pub async fn handle(action: Action) -> ExitCode {
     match action {
         Action::List(args) => match list_inner(args).await {
             Ok(()) => ExitCode::from(0),
-            Err(e) => crate::output::diag::fail(e)
+            Err(e) => crate::output::diag::fail(e),
         },
     }
 }

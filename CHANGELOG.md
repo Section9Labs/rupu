@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.1 — friendlier diagnostics + auth-login stall fix (2026-05-07)
+
+### Added
+- **`output::diag` canonical diagnostic surface.** New `error / warn / info / success / skip / fail` helpers across the CLI replace ad-hoc `eprintln!("rupu <subcmd>: {e}")` patterns at 19 sites. Visual: glyphs (`✗ ⚠ ℹ ✓ ⊘`) + semantic colors that reuse the Okesu palette already shared by the line-stream printer + TUI. Honors `NO_COLOR`, `--no-color`, and `[ui].color = "never"`; falls back to bracketed labels (`[error]`, `[skipped]`) when color is off.
+- **`rupu auth status` colored table.** Green ✓ valid, yellow ✓ expiring soon (under 7d), red ✗ expired with the re-login hint inline, dim — for not configured.
+
+### Fixed
+- **`rupu auth login --provider <p>` no longer stalls silently.** The default `--mode api-key` path used to read from stdin via `read_to_string` until EOF — without a piped key or `--key`, the command appeared to hang forever. Now: in tty, prints a one-line prompt asking the user to paste + Ctrl-D (and surfaces the `--mode sso` alternative inline when the provider has one); in pipe / heredoc / CI, silent slurp behavior is preserved.
+
+### Changed
+- **Default tracing level → `WARN`.** Internal observability (`credential backend = file …`, `github: no credentials configured; skipping connector`) no longer leaks into the user's terminal as if it were CLI output. Opt back in via `RUPU_LOG=info` / `RUPU_LOG=debug` (or any standard `tracing-subscriber` filter directive). User-facing equivalents now route through `output::diag`.
+- **`rupu repos list` skip pattern.** `(skipped github: no credential — run …)` parens-style → two-line glyph + indented hint shape via `diag::skip`.
+
 ## v0.5.0 — issue-tracker integration + workflow triggers + UI polish (2026-05-07)
 
 A larger release: full issue-tracker integration in the CLI, workflow event triggers (cron-polled + webhook), syntax-highlighted output, shell completion, and a comprehensive UI pass on the listing commands.

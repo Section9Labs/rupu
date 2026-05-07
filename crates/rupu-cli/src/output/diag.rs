@@ -111,12 +111,7 @@ pub fn diag(severity: Severity, prefs: &UiPrefs, msg: impl Display) {
 /// Two-line diagnostic with a "→ run: ..." hint indented under the
 /// main line. Used for `error` / `warn` / `skip` cases where the
 /// fix is a concrete command.
-pub fn diag_with_hint(
-    severity: Severity,
-    prefs: &UiPrefs,
-    msg: impl Display,
-    hint: impl Display,
-) {
+pub fn diag_with_hint(severity: Severity, prefs: &UiPrefs, msg: impl Display, hint: impl Display) {
     diag(severity, prefs, msg);
     if prefs.use_color() {
         eprintln!(
@@ -164,12 +159,7 @@ pub fn success(prefs: &UiPrefs, msg: impl Display) {
 pub fn skip(prefs: &UiPrefs, subject: impl Display, reason: impl Display, hint: impl Display) {
     // Body is just "<subject> — <reason>"; the Severity::Skip label
     // ("skipped:") supplies the verb so we don't repeat it.
-    diag_with_hint(
-        Severity::Skip,
-        prefs,
-        format!("{subject} — {reason}"),
-        hint,
-    );
+    diag_with_hint(Severity::Skip, prefs, format!("{subject} — {reason}"), hint);
 }
 
 /// Print an `error:` diag and return [`ExitCode::FAILURE`]. Used as
@@ -242,7 +232,11 @@ mod tests {
         let mut sorted = glyphs.clone();
         sorted.sort();
         sorted.dedup();
-        assert_eq!(glyphs.len(), sorted.len(), "duplicate glyph in severity table");
+        assert_eq!(
+            glyphs.len(),
+            sorted.len(),
+            "duplicate glyph in severity table"
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub struct InitArgs {
 pub async fn handle(args: InitArgs) -> ExitCode {
     match init_inner(args) {
         Ok(()) => ExitCode::from(0),
-        Err(e) => crate::output::diag::fail(e)
+        Err(e) => crate::output::diag::fail(e),
     }
 }
 
