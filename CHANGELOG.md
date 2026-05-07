@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.4.9 — auto-resume after approval (2026-05-06)
+
+### Fixed
+- **Pressing `a` at an approval gate now resumes the run inline.** Previously
+  the printer recorded the approval, printed a misleading "Run paused. Resume
+  with: rupu workflow approve <run_id>" message, and detached. The user then
+  had to invoke `rupu workflow approve` themselves to actually run the
+  downstream step. Now `attach_and_print` returns an `AttachOutcome` enum;
+  on `Approved` the CLI rebuilds `OrchestratorRunOpts` with `resume_from`
+  set, spawns a fresh runner task, and re-attaches the same `LineStreamPrinter`
+  in skip-header mode so the resumed steps slot right under the gate
+  without re-printing the workflow header or prior step blocks.
+- Misleading "Run paused" message replaced with the actual downstream step
+  rendering live in the same terminal session.
+
+### Added
+- `AttachOutcome` enum (`Done` / `Detached` / `Approved { awaited_step_id }` /
+  `Rejected`) and a new `attach_and_print_with(opts)` variant taking
+  `AttachOpts { skip_header, skip_count }` for the resume re-attach.
+- `rupu watch` now prints a clear "Step approved — run `rupu workflow
+  approve <run_id>`" message when `a` is pressed in watch mode (the watcher
+  process doesn't have the workflow YAML / factory needed to spin a resume
+  itself).
+
 ## v0.4.8 — line-stream UI rebuild + Anthropic tool-name sanitizer (2026-05-06)
 
 ### Fixed

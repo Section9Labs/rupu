@@ -717,6 +717,20 @@ async fn run_with_outcome(
     let runs_dir = global.join("runs");
     paths::ensure_dir(&runs_dir)?;
     let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir.clone()));
+
+    // Snapshot the cloneable pieces so we can rebuild `OrchestratorRunOpts`
+    // for each resume iteration. `factory`, `run_store`, and `workflow`
+    // are Arc/Clone-cheap.
+    let workflow_for_resume = workflow.clone();
+    let workspace_path_for_resume = workspace_path.clone();
+    let transcripts_for_resume = transcripts.clone();
+    let event_for_resume = event.clone();
+    let workspace_id_for_resume = ws.id.clone();
+    let factory_for_resume = Arc::clone(&factory);
+    let run_store_for_resume = Arc::clone(&run_store);
+    let body_for_resume = body.clone();
+    let inputs_for_resume = inputs_map.clone();
+
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -756,40 +770,113 @@ async fn run_with_outcome(
         // in practice this is microseconds.
         let new_run_id = wait_for_new_run_dir(&runs_dir, &existing_run_ids, 2_000).await;
 
-        if let Some(ref rid) = new_run_id {
+        // First-attach result we'll merge with any resumed run.
+        let first_result = if let Some(ref rid) = new_run_id {
             if use_canvas {
                 // Alt-screen TUI canvas (opt-in via --canvas).
-                // Blocks until the user presses `q` or the run finishes.
-                // Ignore TUI errors (e.g. non-TTY) — the runner is still going.
                 if let Err(e) = rupu_tui::run_attached(rid.clone(), runs_dir.clone()) {
                     eprintln!("rupu: TUI exited early: {e}");
                 }
+                runner_task
+                    .await
+                    .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
+                    .map_err(anyhow::Error::from)?
             } else {
-                // Line-stream printer (default). Runs in the calling
-                // thread; blocks until the run reaches a terminal state
-                // or the user detaches.
-                let run_store_for_printer =
+                // Line-stream printer (default). Loops over Approved
+                // outcomes, transparently spinning a resumed runner each
+                // time the user presses `a` at a gate.
+                let printer_store =
                     rupu_orchestrator::RunStore::new(runs_dir.clone());
                 let mut printer = crate::output::LineStreamPrinter::new();
-                if let Err(e) = crate::output::workflow_printer::attach_and_print(
-                    name,
-                    rid,
-                    &runs_dir,
-                    &transcripts_dir_snapshot,
-                    &mut printer,
-                    &run_store_for_printer,
-                ) {
-                    eprintln!("rupu: printer error: {e}");
-                }
-            }
-        }
 
-        // Await the background runner to get results for the post-run
-        // text summary and to propagate any workflow error.
-        runner_task
-            .await
-            .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-            .map_err(anyhow::Error::from)?
+                let mut attach_opts = crate::output::workflow_printer::AttachOpts::default();
+                let mut current_runner = runner_task;
+
+                let last_result: rupu_orchestrator::OrchestratorRunResult = loop {
+                    let outcome = match crate::output::workflow_printer::attach_and_print_with(
+                        name,
+                        rid,
+                        &runs_dir,
+                        &transcripts_dir_snapshot,
+                        &mut printer,
+                        &printer_store,
+                        attach_opts,
+                    ) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            eprintln!("rupu: printer error: {e}");
+                            crate::output::workflow_printer::AttachOutcome::Detached
+                        }
+                    };
+
+                    // Drain the runner that produced this attach's events.
+                    let result = current_runner
+                        .await
+                        .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
+                        .map_err(anyhow::Error::from)?;
+
+                    use crate::output::workflow_printer::AttachOutcome;
+                    match outcome {
+                        AttachOutcome::Done
+                        | AttachOutcome::Detached
+                        | AttachOutcome::Rejected => break result,
+                        AttachOutcome::Approved { awaited_step_id } => {
+                            // Spin a resumed run with the same id and
+                            // re-attach the printer in skip-header mode.
+                            let prior_records = run_store_for_resume
+                                .read_step_results(rid)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("read step results for resume: {e}")
+                                })?;
+                            let prior_count = prior_records.len();
+                            let prior_step_results: Vec<rupu_orchestrator::StepResult> =
+                                prior_records
+                                    .iter()
+                                    .map(rupu_orchestrator::StepResult::from)
+                                    .collect();
+                            let resume = rupu_orchestrator::ResumeState {
+                                run_id: rid.clone(),
+                                prior_step_results,
+                                approved_step_id: awaited_step_id,
+                            };
+                            let factory_dyn: Arc<dyn rupu_orchestrator::StepFactory> =
+                                factory_for_resume.clone();
+                            let resume_opts = OrchestratorRunOpts {
+                                workflow: workflow_for_resume.clone(),
+                                inputs: inputs_for_resume.clone(),
+                                workspace_id: workspace_id_for_resume.clone(),
+                                workspace_path: workspace_path_for_resume.clone(),
+                                transcript_dir: transcripts_for_resume.clone(),
+                                factory: factory_dyn,
+                                event: event_for_resume.clone(),
+                                run_store: Some(Arc::clone(&run_store_for_resume)),
+                                workflow_yaml: Some(body_for_resume.clone()),
+                                resume_from: Some(resume),
+                            };
+                            current_runner = tokio::spawn(run_workflow(resume_opts));
+                            attach_opts = crate::output::workflow_printer::AttachOpts {
+                                skip_header: true,
+                                skip_count: prior_count,
+                            };
+                            // Loop back: re-attach the same printer. We
+                            // intentionally drop the just-finished result —
+                            // the resumed run will produce a fresh one.
+                            let _ = result;
+                        }
+                    }
+                };
+
+                last_result
+            }
+        } else {
+            // No new run directory appeared — propagate the runner's error.
+            runner_task
+                .await
+                .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
+                .map_err(anyhow::Error::from)?
+        };
+
+        first_result
     } else {
         run_workflow(opts).await?
     };

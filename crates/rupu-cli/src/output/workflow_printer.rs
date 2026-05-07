@@ -43,6 +43,40 @@ struct StepState {
     spinner: Option<SpinnerHandle>,
 }
 
+/// What `attach_and_print` returned. The caller decides what to do next:
+/// `Done` and `Detached` and `Rejected` are terminal; `Approved` carries
+/// the `awaited_step_id` so the caller can spin a resume run and re-attach
+/// the printer to it.
+#[derive(Debug, Clone)]
+pub enum AttachOutcome {
+    /// Run reached `completed` or `failed` while the printer was attached.
+    Done,
+    /// User pressed `q` (or unrecognized key) at an approval gate. The run
+    /// itself is still in `awaiting_approval` on disk; the user can re-attach
+    /// later via `rupu watch <run_id>`.
+    Detached,
+    /// User pressed `a`. The approval was persisted via `RunStore::approve`
+    /// (status flipped to `Running`); the caller should now spawn a resumed
+    /// run via `OrchestratorRunOpts::resume_from` and reattach the printer.
+    Approved { awaited_step_id: String },
+    /// User pressed `r`. The rejection was persisted; nothing more to run.
+    Rejected,
+}
+
+/// Optional knobs for `attach_and_print`. Defaults preserve the
+/// pre-resume behavior (print header, start from the first step record).
+#[derive(Default, Clone, Copy)]
+pub struct AttachOpts {
+    /// When `true`, skip printing the workflow header. Used on resume
+    /// attaches where the header is already on screen from the original
+    /// invocation.
+    pub skip_header: bool,
+    /// Skip this many records from the start of `step_results.jsonl`
+    /// before rendering. Used on resume to avoid re-printing prior steps
+    /// that the user already saw.
+    pub skip_count: usize,
+}
+
 /// Drive `printer` from a live or recently-finished workflow run.
 pub fn attach_and_print(
     workflow_name: &str,
@@ -51,7 +85,28 @@ pub fn attach_and_print(
     transcript_dir: &Path,
     printer: &mut LineStreamPrinter,
     run_store: &rupu_orchestrator::RunStore,
-) -> io::Result<()> {
+) -> io::Result<AttachOutcome> {
+    attach_and_print_with(
+        workflow_name,
+        run_id,
+        runs_dir,
+        transcript_dir,
+        printer,
+        run_store,
+        AttachOpts::default(),
+    )
+}
+
+/// `attach_and_print` with extra knobs (resume support).
+pub fn attach_and_print_with(
+    workflow_name: &str,
+    run_id: &str,
+    runs_dir: &Path,
+    transcript_dir: &Path,
+    printer: &mut LineStreamPrinter,
+    run_store: &rupu_orchestrator::RunStore,
+    opts: AttachOpts,
+) -> io::Result<AttachOutcome> {
     let run_dir = runs_dir.join(run_id);
     let run_json = run_dir.join("run.json");
     let step_results_log = run_dir.join("step_results.jsonl");
@@ -71,7 +126,10 @@ pub fn attach_and_print(
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Workflow header.
+    // Read `started_at` from run.json (used for the header and the
+    // workflow_done duration calc). On resume the header itself is
+    // suppressed but the value is still useful to keep the duration
+    // referenced from the same anchor.
     let started_at = {
         let bytes = std::fs::read(&run_json)?;
         let rec: serde_json::Value =
@@ -81,12 +139,16 @@ pub fn attach_and_print(
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now())
     };
-    printer.workflow_header(workflow_name, run_id, started_at);
+    if !opts.skip_header {
+        printer.workflow_header(workflow_name, run_id, started_at);
+    }
 
-    let mut seen_step_results: usize = 0;
+    let mut seen_step_results: usize = opts.skip_count;
     let mut steps: Vec<StepState> = Vec::new();
     let mut total_tokens: u64 = 0;
-    let mut step_count: usize = 0;
+    // For the rendered phase separators: start at the same count so
+    // resumed steps don't get an extra leading separator.
+    let mut step_count: usize = opts.skip_count;
 
     let mut opened: BTreeSet<PathBuf> = BTreeSet::new();
 
@@ -145,11 +207,13 @@ pub fn attach_and_print(
                             let approver = whoami::username();
                             match run_store.approve(run_id, &approver, chrono::Utc::now()) {
                                 Ok(_) => {
-                                    printer.step_done(&step_id, Duration::ZERO, 0);
-                                    println!();
-                                    println!("Run paused. Resume with:");
-                                    println!("  rupu workflow approve {run_id}");
-                                    return Ok(());
+                                    // Don't print step_done — the resumed run
+                                    // will dispatch the same step's agent and
+                                    // emit a real footer. Hand control back to
+                                    // the caller so it can spawn the resume.
+                                    return Ok(AttachOutcome::Approved {
+                                        awaited_step_id: step_id,
+                                    });
                                 }
                                 Err(e) => {
                                     eprintln!("rupu: approve failed: {e}");
@@ -172,13 +236,13 @@ pub fn attach_and_print(
                                 chrono::Utc::now(),
                             );
                             println!("Run rejected.");
-                            return Ok(());
+                            return Ok(AttachOutcome::Rejected);
                         }
                         _ => {
                             println!();
                             println!("Detached from run. It is still running.");
                             println!("Re-attach with: rupu watch {run_id}");
-                            return Ok(());
+                            return Ok(AttachOutcome::Detached);
                         }
                     }
                 }
@@ -207,7 +271,7 @@ pub fn attach_and_print(
                     .unwrap_or(0);
                 let dur = Duration::from_millis(duration_ms);
                 printer.workflow_done(workflow_name, run_id, dur, total_tokens);
-                return Ok(());
+                return Ok(AttachOutcome::Done);
             }
             "failed" | "rejected" => {
                 std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
@@ -217,7 +281,7 @@ pub fn attach_and_print(
                     .as_str()
                     .unwrap_or("unknown error");
                 printer.workflow_failed(workflow_name, run_id, err);
-                return Ok(());
+                return Ok(AttachOutcome::Done);
             }
             _ => {}
         }
