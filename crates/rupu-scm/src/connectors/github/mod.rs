@@ -10,11 +10,13 @@ use rupu_config::Config;
 use crate::connectors::{IssueConnector, RepoConnector};
 
 mod client;
+pub mod events;
 pub mod extras;
 pub mod issues;
 pub mod repo;
 
 pub use client::{classify_octocrab_error, GithubClient};
+pub use events::GithubEventConnector;
 pub use extras::GithubExtras;
 pub use issues::GithubIssueConnector;
 pub use repo::GithubRepoConnector;

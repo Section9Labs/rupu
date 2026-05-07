@@ -1,0 +1,215 @@
+# Workflow triggers
+
+Workflows in rupu can fire on three trigger paths:
+
+| Trigger | When it fires | Where it lives |
+|---|---|---|
+| `manual` (default) | `rupu workflow run <name>` | every install |
+| `cron` | system cron / launchd invokes `rupu cron tick` | every install |
+| `event` | matching events appear in either `rupu cron tick` (polled) or `rupu webhook serve` (live) | polled tier ships in this PR |
+
+For the architectural background, see
+[`docs/superpowers/specs/2026-05-07-rupu-workflow-triggers-design.md`](./superpowers/specs/2026-05-07-rupu-workflow-triggers-design.md).
+
+---
+
+## Schema
+
+Add a top-level `trigger:` block to any `.rupu/workflows/<name>.yaml`:
+
+```yaml
+trigger:
+  on: manual | cron | event       # default: manual
+  cron: "0 4 * * *"                # required when on: cron (5-field UTC)
+  event: github.issue.opened       # required when on: event
+  filter: "{{ event.repo.full_name == 'foo/bar' }}"
+                                    # optional, only when on: event
+```
+
+Cross-field rules (validated at parse):
+- `cron:` only allowed when `on: cron`.
+- `event:` and `filter:` only allowed when `on: event`.
+- Missing `on:` defaults to `manual`.
+
+---
+
+## Cron-scheduled triggers
+
+```yaml
+# .rupu/workflows/nightly-audit.yaml
+name: nightly-audit
+trigger:
+  on: cron
+  cron: "0 4 * * *"   # every day at 04:00 UTC
+
+steps:
+  - id: scan
+    agent: security-reviewer
+    actions: [bash, read_file]
+    prompt: |
+      Audit the repo for newly-added secrets in the last 24h.
+```
+
+Install one entry in your crontab / launchd plist:
+
+```
+* * * * *  /usr/local/bin/rupu cron tick
+```
+
+`rupu cron tick` walks all cron-triggered workflows, fires those whose schedule matched between the persisted `last_fired` timestamp and now. Idempotent at 1-minute granularity. Use `--dry-run` to verify a crontab line without actually firing anything.
+
+`rupu cron list` is read-only — prints every cron-triggered workflow + its next firing time. Use it before adding the cron entry.
+
+---
+
+## Event-triggered workflows (polled)
+
+The polled tier is the **CLI-native** way to react to SCM events without running a server. `rupu cron tick` calls each configured connector for new events between ticks; matched workflows fire with the event payload bound as `{{event.*}}`.
+
+### 1. Configure the sources you want polled
+
+In `~/.rupu/config.toml` (global) or `<project>/.rupu/config.toml` (project shadows global):
+
+```toml
+[triggers]
+poll_sources = [
+  "github:Section9Labs/rupu",
+  "gitlab:my-org/my-repo",
+]
+
+# Optional: cap events processed per source per tick. Default 50.
+# Prevents a backlog from chewing the rate-limit budget.
+max_events_per_tick = 50
+```
+
+Empty by default — rupu doesn't poll anything until you ask it to.
+
+### 2. Write the workflow
+
+```yaml
+# .rupu/workflows/triage-incoming-issues.yaml
+name: triage-incoming-issues
+trigger:
+  on: event
+  event: github.issue.opened
+  filter: "{{ event.repo.full_name == 'Section9Labs/rupu' }}"
+
+steps:
+  - id: classify
+    panel:
+      panelists:
+        - security-reviewer
+        - perf-reviewer
+        - maintainability-reviewer
+      subject: |
+        Issue #{{ event.payload.issue.number }}
+        Title: {{ event.payload.issue.title }}
+
+        {{ event.payload.issue.body }}
+
+  - id: comment_back
+    agent: scm-pr-author
+    actions: [issues.comment]
+    prompt: |
+      Post a triage summary on issue
+      {{ event.repo.full_name }}#{{ event.payload.issue.number }}
+      with severity {{ steps.classify.max_severity }}.
+```
+
+### 3. Inspect what's wired
+
+```
+$ rupu cron events
+NAME                         EVENT                            SOURCES                                  CURSOR
+triage-incoming-issues       github.issue.opened              github:Section9Labs/rupu,gitlab:foo/bar  etag:W/"abc"|since:2026-05-07T00:00:00Z
+```
+
+### 4. Tick
+
+The same `rupu cron tick` that fires `cron`-triggered workflows also polls events. Two flags split the tiers if you want to run them at different cadences:
+
+```
+* * * * *      rupu cron tick --skip-events     # cron only, every minute
+*/5 * * * *    rupu cron tick --only-events     # events every 5 minutes
+```
+
+### What you can match against
+
+The polled connector lifts events from each vendor's events API and maps them onto the rupu vocabulary:
+
+| Event id | GitHub | GitLab |
+|---|:-:|:-:|
+| `github.issue.opened` / `github.issue.closed` / `github.issue.reopened` | ✓ | — |
+| `github.issue.commented` | ✓ | — |
+| `github.pr.opened` / `github.pr.closed` / `github.pr.merged` / `github.pr.reopened` | ✓ | — |
+| `github.push` | ✓ | — |
+| `gitlab.issue.opened` / `gitlab.issue.closed` / `gitlab.issue.reopened` | — | ✓ |
+| `gitlab.mr.opened` / `gitlab.mr.closed` / `gitlab.mr.merged` / `gitlab.mr.reopened` | — | ✓ |
+| `gitlab.comment` | — | ✓ |
+| `gitlab.push` | — | ✓ |
+
+Events that depend on webhook-only signal (e.g. `github.pr.review_requested`, `github.issue.labeled`, `github.issue.assigned`) are **not** delivered by the polled tier. Use webhook-serve for those — see below.
+
+### Coverage caveats
+
+- **Warmup tick.** On the very first poll (no cursor), rupu emits zero events and sets the cursor to "now." This avoids a workflow stampede on the last 90 days of history.
+- **Latency.** Polling latency is one tick interval (1-5 minutes typical). Use webhook-serve for sub-second responsiveness.
+- **At-most-once.** A workflow that crashes after rupu advances the cursor won't be re-processed. This is intentional — re-firing a triage workflow is worse than dropping a single event during a crash.
+- **Idempotent re-fires.** The deterministic run-id (`evt-<workflow>-<vendor>-<delivery>`) lets the polled tier and the webhook tier coexist on the same workflow without double-firing the same logical event.
+
+---
+
+## Event-triggered workflows (webhook serve)
+
+For sub-second latency or events the polled tier doesn't deliver, run `rupu webhook serve` as a long-lived process under your own supervisor.
+
+```
+RUPU_GITHUB_WEBHOOK_SECRET=<your-webhook-secret> \
+  rupu webhook serve --addr 0.0.0.0:8080
+```
+
+Same workflow YAML; same event vocabulary. The webhook receiver:
+
+- Validates `X-Hub-Signature-256` (GitHub) / `X-Gitlab-Token` (GitLab).
+- Maps the raw vendor delivery onto the rupu event id.
+- Fires matching workflows with `{{event.*}}` populated.
+
+Secrets are read from environment variables — never config files, never the keychain. Webhook secrets are operational secrets and belong in your process supervisor's environment block.
+
+Bind to `127.0.0.1` and front with a TLS-terminating reverse proxy in production. rupu does not terminate TLS itself.
+
+---
+
+## Choosing a tier
+
+- **Want to just react to issues / PRs / pushes on a laptop?** Polled tier. Add `poll_sources`, set up `rupu cron tick` in launchd / cron, done.
+- **Have an always-on server (homelab, VPS, container)?** Webhook serve. Lower latency, broader event coverage.
+- **Both?** That works. The deterministic-run-id rule means the same logical event fires once, regardless of whether polling or webhook saw it first.
+
+---
+
+## Templating
+
+Both tiers expose the same `{{event.*}}` shape inside step prompts and `when:` filters:
+
+```
+event:
+  id: github.issue.opened
+  vendor: github
+  delivery: <vendor unique id for this delivery>
+  repo:
+    full_name: Section9Labs/rupu
+    owner: Section9Labs
+    name: rupu
+  payload: <vendor's raw JSON, untouched — reach inside via event.payload.*>
+```
+
+Common patterns:
+
+```
+{{ event.payload.issue.number }}              # GitHub: issue #
+{{ event.payload.pull_request.head.ref }}     # GitHub: PR head branch
+{{ event.payload.object_attributes.iid }}     # GitLab: issue / MR iid
+```
+
+The `filter:` field is the same minijinja you'd write in a `when:` expression — but evaluated at trigger-match time, against the event payload only. It must render to `true` or `false`.

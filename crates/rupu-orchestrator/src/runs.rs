@@ -299,6 +299,12 @@ pub enum RunStoreError {
     Json(#[from] serde_json::Error),
     #[error("run `{0}` not found")]
     NotFound(String),
+    /// A run with the supplied id already exists. Surfaced when
+    /// triggered runs (cron, polled events, webhooks) use deterministic
+    /// run-ids: the duplicate dispatch is the *expected* behavior on
+    /// re-delivery; the caller should log + skip, not panic.
+    #[error("run `{0}` already exists")]
+    AlreadyExists(String),
 }
 
 /// Filesystem-backed run store. One root directory; one
@@ -332,12 +338,21 @@ impl RunStore {
 
     /// Create the run directory and persist initial `run.json` and
     /// the workflow YAML snapshot. Returns the created `RunRecord`.
+    ///
+    /// Returns [`RunStoreError::AlreadyExists`] if `run.json` is
+    /// present at the resolved path — used by the cron-tick polled-
+    /// events tier to skip re-delivery of the same logical event
+    /// without re-firing the workflow. Manual runs use `run_<ULID>`
+    /// ids which never collide so this branch is invisible to them.
     pub fn create(
         &self,
         record: RunRecord,
         workflow_yaml: &str,
     ) -> Result<RunRecord, RunStoreError> {
         let dir = self.run_dir(&record.id);
+        if self.run_json(&record.id).is_file() {
+            return Err(RunStoreError::AlreadyExists(record.id));
+        }
         std::fs::create_dir_all(&dir)?;
         std::fs::write(self.workflow_snapshot(&record.id), workflow_yaml)?;
         // Touch the step-results log so subsequent appends don't
@@ -637,6 +652,20 @@ mod tests {
             resolved: true,
             finished_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn create_with_existing_id_returns_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("evt-triage-github-12345");
+        let yaml = "name: x\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
+
+        // First create succeeds.
+        store.create(rec.clone(), yaml).unwrap();
+        // Second create with the same id returns AlreadyExists.
+        let err = store.create(rec.clone(), yaml).unwrap_err();
+        assert!(matches!(err, RunStoreError::AlreadyExists(id) if id == "evt-triage-github-12345"));
     }
 
     #[test]

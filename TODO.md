@@ -10,7 +10,7 @@ Has its own design spec: [`docs/superpowers/specs/2026-05-07-rupu-workflow-trigg
 - ✅ Trigger schema (`trigger.on: manual|cron|event`) parses + validates.
 - ✅ `rupu cron tick` fires `trigger.on: cron` workflows from system cron / launchd. Idempotent.
 - ✅ `rupu webhook serve` (long-running HTTP receiver, HMAC-validated) fires `trigger.on: event` workflows.
-- ⏳ **Plan 1 — polled events on cron tick** ([plan](docs/superpowers/plans/2026-05-07-rupu-workflow-triggers-plan-1-polled-events.md)). The piece that lets users WITHOUT a server use event triggers — `rupu cron tick` polls SCM connectors for events between ticks and fires matching workflows.
+- ✅ **Plan 1 — polled events on cron tick** ([plan](docs/superpowers/plans/2026-05-07-rupu-workflow-triggers-plan-1-polled-events.md)). `rupu cron tick` now also polls `[triggers].poll_sources` for SCM events, fires matching workflows with `{{event.*}}` populated, idempotent via deterministic `evt-<wf>-<vendor>-<delivery>` run-ids. New: `rupu cron events` for inspection; `--skip-events` / `--only-events` flags for splitting tick frequencies. User docs at [`docs/triggers.md`](docs/triggers.md).
 - ⏳ Plan 2 (future) — glob matching on `trigger.event:` (`github.issue.*`), extended event vocab (issue-tracker queue events).
 - ⏳ Plan 3 (future, Slice E) — rupu.cloud webhook relay; cloud-as-connector or cloud-as-stream consumption.
 
