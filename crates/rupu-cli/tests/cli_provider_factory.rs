@@ -53,15 +53,10 @@ async fn deferred_provider_returns_blocked_error() {
         );
     }
 
-    // Insert dummy credentials for gemini and local so we test their
-    // NotWiredInV0 path rather than the resolver-side missing-credential path.
-    resolver
-        .put(
-            ProviderId::Gemini,
-            AuthMode::ApiKey,
-            StoredCredential::api_key("dummy"),
-        )
-        .await;
+    // Insert a dummy credential for `local` so we test its NotWiredInV0 path
+    // rather than the resolver-side missing-credential path. Gemini was wired
+    // (TODO.md: "Gemini API-key support via AI Studio ✅ shipped") so it now
+    // takes the credential happily — assertion-set narrowed to `local` only.
     resolver
         .put(
             ProviderId::Local,
@@ -70,7 +65,7 @@ async fn deferred_provider_returns_blocked_error() {
         )
         .await;
 
-    for p in ["gemini", "local"] {
+    for p in ["local"] {
         let res = build_for_provider(p, "x", None, &resolver).await;
         let err = format!("{}", res.err().expect("expected Err"));
         assert!(

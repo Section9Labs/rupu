@@ -163,6 +163,17 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
     let resolver = rupu_auth::resolver::KeychainResolver::new();
     if opts.all {
         if !opts.yes {
+            // Refuse to prompt when stdin isn't a tty (CI, pipes, scripts)
+            // because `read_line` would otherwise block forever or read EOF
+            // and silently abort. Match the same posture `rupu run` takes for
+            // its `ask` permission mode.
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                anyhow::bail!(
+                    "rupu auth logout --all in non-tty refuses to prompt — \
+                     pass --yes to confirm, or run from an interactive terminal"
+                );
+            }
             print!("Remove all stored credentials? [y/N]: ");
             std::io::Write::flush(&mut std::io::stdout())?;
             let mut buf = String::new();

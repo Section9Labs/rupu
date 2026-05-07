@@ -360,11 +360,24 @@ async fn events() -> anyhow::Result<()> {
     let workflows = collect_event_workflows()?;
     let cursors_root = global.join("cron-state").join("event-cursors");
 
-    println!("{:<28} {:<32} {:<40} CURSOR", "NAME", "EVENT", "SOURCES");
     if workflows.is_empty() {
-        println!("(no event-triggered workflows found)");
+        println!(
+            "(no event-triggered workflows found)\n\n\
+             To add one, drop a workflow YAML under `.rupu/workflows/` with:\n  \
+             trigger:\n    on: event\n    event: github.issue.opened\n\
+             Then configure poll sources in `[triggers].poll_sources` of your\n\
+             `config.toml`. See `docs/triggers.md` for details."
+        );
         return Ok(());
     }
+    if cfg.triggers.poll_sources.is_empty() {
+        println!(
+            "(workflows configured, but `[triggers].poll_sources` is empty in\n \
+             config.toml — `rupu cron tick` will not poll any sources until\n \
+             you add at least one entry like `github:owner/repo`.)\n"
+        );
+    }
+    println!("{:<28} {:<32} {:<40} CURSOR", "NAME", "EVENT", "SOURCES");
 
     for wf in &workflows {
         let sources = cfg.triggers.poll_sources.join(",");

@@ -118,9 +118,9 @@ Slice B-1 captures `Event::Usage` per response in JSONL transcripts. A `rupu usa
 
 Added `GeminiVariant::AiStudio` to the existing `GoogleGeminiClient` (rather than a separate `GoogleGeminiAiStudioClient`) so the OAuth and api-key paths share the body builder + response parser. Variant-specific branches handle the different URL pattern (`v1beta/models/{model}:generateContent`), `x-goog-api-key` header, request-body shape (no Cloud Code Assist `project` / `requestId` wrapping), and skipped token refresh. Wired through `provider_factory::build_gemini` so `rupu auth login --provider gemini --mode api-key --key AIzaSy...` followed by `rupu run --provider gemini ...` works end-to-end.
 
-## Copilot `default_model` inconsistency (low-priority polish)
+## Copilot `default_model` inconsistency ✅ resolved
 
-`crates/rupu-providers/src/github_copilot.rs:410`'s trait `default_model()` returns `"claude-sonnet-4"`, but other places in the same file (lines 497, 597, 749, 1996) use `"claude-sonnet-4-6"`. Either align the trait default to `"claude-sonnet-4-6"` (likely correct) or decide both are intentional and document why. Minor — only surfaces when an agent file omits `model:` and the provider is Copilot.
+All sites in `crates/rupu-providers/src/github_copilot.rs` agree on `"claude-sonnet-4-6"` as of the polish-pass review (2026-05-07). No action needed.
 
 ## ProviderError truncate-helper test gap (deferred from Plan 1 Task 11)
 
