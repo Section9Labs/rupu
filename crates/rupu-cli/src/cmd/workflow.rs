@@ -35,6 +35,21 @@ pub enum Action {
         #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
     },
+    /// Open a workflow file in `$VISUAL` / `$EDITOR`. Validates the
+    /// YAML on save (warn-only).
+    Edit {
+        /// Workflow name (filename stem under `workflows/`).
+        name: String,
+        /// Force the project shadow (`.rupu/workflows/<name>.yaml`) or
+        /// the global file (`<global>/workflows/<name>.yaml`). Default:
+        /// prefer project if it exists, else global.
+        #[arg(long, value_parser = ["global", "project"])]
+        scope: Option<String>,
+        /// Override the editor (e.g. `--editor "code --wait"`).
+        /// Default: `$VISUAL` then `$EDITOR` then `vi`.
+        #[arg(long)]
+        editor: Option<String>,
+    },
     /// Run a workflow.
     Run {
         /// Workflow name (filename stem under `workflows/`).
@@ -114,6 +129,11 @@ pub async fn handle(action: Action) -> ExitCode {
     let result = match action {
         Action::List => list().await,
         Action::Show { name } => show(&name).await,
+        Action::Edit {
+            name,
+            scope,
+            editor,
+        } => edit(&name, scope.as_deref(), editor.as_deref()).await,
         Action::Run {
             name,
             target,
@@ -181,6 +201,90 @@ async fn show(name: &str) -> anyhow::Result<()> {
     let body = std::fs::read_to_string(&path)?;
     print!("{body}");
     Ok(())
+}
+
+async fn edit(name: &str, scope: Option<&str>, editor_override: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+
+    let target = resolve_workflow_path(name, scope, &global, project_root.as_deref())?;
+    let scope_label = if target.starts_with(&global) {
+        "global"
+    } else {
+        "project"
+    };
+    println!("editing {} ({scope_label})", target.display());
+
+    crate::cmd::editor::open_for_edit(editor_override, &target)?;
+
+    match Workflow::parse_file(&target) {
+        Ok(_) => {
+            println!("✓ {name}: workflow YAML parses cleanly");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("⚠ {name}: failed to re-parse after save:\n  {e}");
+            Ok(())
+        }
+    }
+}
+
+/// Pick the on-disk file to edit. With `--scope` set we honor it
+/// strictly; without it we prefer the project shadow if present and
+/// fall back to global. Tries `.yaml` first, then `.yml`.
+fn resolve_workflow_path(
+    name: &str,
+    scope: Option<&str>,
+    global: &Path,
+    project_root: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    let candidates_for = |dir: PathBuf| -> Vec<PathBuf> {
+        vec![
+            dir.join(format!("{name}.yaml")),
+            dir.join(format!("{name}.yml")),
+        ]
+    };
+
+    let project_dir = project_root.map(|p| p.join(".rupu").join("workflows"));
+    let global_dir = global.join("workflows");
+
+    let pick = |dir: PathBuf| -> Option<PathBuf> {
+        candidates_for(dir).into_iter().find(|p| p.exists())
+    };
+
+    match scope {
+        Some("project") => match project_dir {
+            Some(d) => pick(d.clone()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workflow `{name}` not found at project scope ({}/{name}.{{yaml,yml}})",
+                    d.display()
+                )
+            }),
+            None => Err(anyhow::anyhow!(
+                "no project root detected; cannot use --scope project"
+            )),
+        },
+        Some("global") => pick(global_dir.clone()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow `{name}` not found at global scope ({}/{name}.{{yaml,yml}})",
+                global_dir.display()
+            )
+        }),
+        Some(other) => Err(anyhow::anyhow!(
+            "invalid --scope `{other}` (expected `global` or `project`)"
+        )),
+        None => {
+            if let Some(d) = project_dir {
+                if let Some(p) = pick(d) {
+                    return Ok(p);
+                }
+            }
+            pick(global_dir).ok_or_else(|| {
+                anyhow::anyhow!("workflow `{name}` not found in project or global workflows dir")
+            })
+        }
+    }
 }
 
 async fn runs(
