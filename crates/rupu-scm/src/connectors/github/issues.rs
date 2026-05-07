@@ -180,6 +180,18 @@ fn parse_project(project: &str) -> Result<(String, String), ScmError> {
 }
 
 fn issue_from_octocrab(project: String, item: octocrab::models::issues::Issue) -> Issue {
+    // Walk labels once, building both the name list and the
+    // name->hex map. octocrab exposes `Label.color` as a hex string
+    // without `#`; persist as-is so the renderer can reuse it
+    // verbatim.
+    let mut labels = Vec::with_capacity(item.labels.len());
+    let mut label_colors = std::collections::BTreeMap::new();
+    for l in item.labels {
+        if !l.color.is_empty() {
+            label_colors.insert(l.name.clone(), l.color);
+        }
+        labels.push(l.name);
+    }
     Issue {
         r: IssueRef {
             tracker: IssueTracker::Github,
@@ -192,7 +204,8 @@ fn issue_from_octocrab(project: String, item: octocrab::models::issues::Issue) -
             octocrab::models::IssueState::Open => IssueState::Open,
             _ => IssueState::Closed,
         },
-        labels: item.labels.into_iter().map(|l| l.name).collect(),
+        labels,
+        label_colors,
         author: item.user.login,
         created_at: item.created_at,
         updated_at: item.updated_at,

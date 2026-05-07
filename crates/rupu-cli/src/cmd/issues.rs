@@ -154,7 +154,11 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
         table.add_row(vec![
             Cell::new(i.r.number.to_string()),
             crate::output::tables::status_cell(state, &prefs),
-            Cell::new(crate::output::tables::label_chips(&i.labels, &prefs)),
+            Cell::new(crate::output::tables::label_chips_with_colors(
+                &i.labels,
+                &i.label_colors,
+                &prefs,
+            )),
             Cell::new(i.author.clone()),
             Cell::new(title),
         ]);
