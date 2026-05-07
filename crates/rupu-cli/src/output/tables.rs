@@ -105,6 +105,35 @@ pub fn label_chips(labels: &[String], prefs: &UiPrefs) -> String {
         .join(" ")
 }
 
+/// Like [`label_chips`] but consults `colors` (name → hex without `#`)
+/// for the upstream-provided color of each label. Labels without a
+/// hex entry fall back to the deterministic hash-based palette so
+/// mixed sets (some GitHub-colored, some uncolored) render coherently.
+/// GitHub's IssueConnector populates this map; GitLab's currently
+/// doesn't (separate API call required), and a label set with an
+/// empty `colors` map degrades cleanly to the hash-based render.
+pub fn label_chips_with_colors(
+    labels: &[String],
+    colors: &std::collections::BTreeMap<String, String>,
+    prefs: &UiPrefs,
+) -> String {
+    if labels.is_empty() {
+        return if prefs.use_color() {
+            "\x1b[2m—\x1b[0m".to_string()
+        } else {
+            "—".to_string()
+        };
+    }
+    labels
+        .iter()
+        .map(|l| match colors.get(l) {
+            Some(hex) => colored_label_chip_with_hex(l, hex, prefs),
+            None => colored_label_chip(l, prefs),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Map a label name to one of N preset background colors using a
 /// stable FNV-1a hash. Names with the same color cluster visually
 /// without forcing the user to memorize anything.
@@ -157,9 +186,10 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Hex variant — kept here so the call sites can switch to it once
-/// `Issue.label_colors` is plumbed through. Same luminance picker.
-#[allow(dead_code)]
+/// Hex variant — used by [`label_chips_with_colors`] to render a
+/// label with its upstream vendor color. `hex_no_hash` is the bare
+/// six-digit string GitHub serves (e.g. `"d73a4a"`); a malformed hex
+/// falls back to the hash-based palette via [`colored_label_chip`].
 pub fn colored_label_chip_with_hex(name: &str, hex_no_hash: &str, prefs: &UiPrefs) -> String {
     if !prefs.use_color() {
         return format!("[{name}]");
@@ -309,6 +339,30 @@ mod tests {
     fn label_chips_empty_renders_em_dash() {
         let p = prefs_no_color();
         assert_eq!(label_chips(&[], &p), "—");
+    }
+
+    #[test]
+    fn label_chips_with_colors_uses_hex_when_present() {
+        use std::collections::BTreeMap;
+        let p = prefs_color_always();
+        let labels = vec!["bug".to_string(), "no-color-on-this-one".to_string()];
+        let mut colors = BTreeMap::new();
+        colors.insert("bug".to_string(), "d73a4a".to_string()); // GitHub bug red
+        let out = label_chips_with_colors(&labels, &colors, &p);
+        // The "bug" chip should carry the GitHub-supplied red bg.
+        assert!(out.contains("\x1b[48;2;215;58;74m"));
+        // The unmapped label still renders as a chip (hash-based fg/bg).
+        assert!(out.contains("no-color-on-this-one"));
+    }
+
+    #[test]
+    fn label_chips_with_colors_no_color_falls_back_to_brackets() {
+        use std::collections::BTreeMap;
+        let p = prefs_no_color();
+        let labels = vec!["bug".to_string()];
+        let mut colors = BTreeMap::new();
+        colors.insert("bug".to_string(), "d73a4a".to_string());
+        assert_eq!(label_chips_with_colors(&labels, &colors, &p), "[bug]");
     }
 
     #[test]

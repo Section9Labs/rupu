@@ -100,6 +100,15 @@ pub struct Issue {
     pub body: String,
     pub state: IssueState,
     pub labels: Vec<String>,
+    /// Vendor-supplied hex colors (no leading `#`) for each label.
+    /// Optional — connectors that don't expose label colors leave this
+    /// empty and the renderer falls back to a deterministic hash-based
+    /// chip color. Persisted on `RunRecord.issue` so resume / replay
+    /// keep the chip colors stable across rupu restarts. Backward-
+    /// compatible: pre-existing serialized issues without this field
+    /// deserialize as an empty map.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub label_colors: std::collections::BTreeMap<String, String>,
     pub author: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

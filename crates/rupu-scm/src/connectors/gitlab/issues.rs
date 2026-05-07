@@ -209,6 +209,13 @@ fn translate_issue(project: String, v: &serde_json::Value) -> Result<Issue, ScmE
         body,
         state,
         labels,
+        // GitLab's `GET /projects/:id/issues` returns `labels: [string]`
+        // (just names) — no embedded hex. Fetching colors requires a
+        // separate `GET /projects/:id/labels` round-trip per list call.
+        // Leaving empty here; the renderer falls back to a hash-based
+        // chip color which is visually fine. Wiring real GitLab label
+        // colors is a follow-up if users ask.
+        label_colors: std::collections::BTreeMap::new(),
         author,
         created_at,
         updated_at,
