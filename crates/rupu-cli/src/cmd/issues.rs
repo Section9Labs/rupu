@@ -6,8 +6,10 @@
 //! not supplied. The detection logic looks up `origin` in `.git/config`
 //! and parses common SSH / HTTPS / shorthand forms into a `RepoRef`.
 
+use crate::cmd::completers::workflow_names;
 use crate::paths;
 use clap::{Args as ClapArgs, Subcommand};
+use clap_complete::ArgValueCompleter;
 use comfy_table::{ContentArrangement, Table};
 use rupu_scm::{IssueFilter, IssueRef, IssueState, IssueTracker, Platform, Registry, RepoRef};
 use std::path::Path;
@@ -22,7 +24,8 @@ pub enum Action {
     /// Show one issue's full body + metadata.
     Show(ShowArgs),
     /// Convenience: run a workflow with an issue run-target.
-    /// Equivalent to `rupu workflow run <name> --target <issue-ref>`.
+    /// Equivalent to `rupu workflow run <name> <issue-ref>` (the
+    /// run-target is a positional on `workflow run`, not a flag).
     Run(RunArgs),
 }
 
@@ -58,6 +61,7 @@ pub struct RunArgs {
     /// Workflow filename stem under `.rupu/workflows/` (or
     /// `<global>/workflows/`). Same name `rupu workflow run`
     /// accepts.
+    #[arg(add = ArgValueCompleter::new(workflow_names))]
     pub workflow: String,
     /// Issue ref. Same shorthand rules as `show`.
     pub r#ref: String,

@@ -1,7 +1,9 @@
 //! `rupu agent list | show <name>`.
 
+use crate::cmd::completers::agent_names;
 use crate::paths;
 use clap::Subcommand;
+use clap_complete::ArgValueCompleter;
 use rupu_agent::{load_agent, load_agents};
 use std::process::ExitCode;
 
@@ -12,6 +14,7 @@ pub enum Action {
     /// Print an agent's frontmatter and body.
     Show {
         /// Name of the agent.
+        #[arg(add = ArgValueCompleter::new(agent_names))]
         name: String,
     },
 }
