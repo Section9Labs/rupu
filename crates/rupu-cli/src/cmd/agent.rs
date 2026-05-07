@@ -13,7 +13,12 @@ use std::process::ExitCode;
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// List all available agents (global + project).
-    List,
+    List {
+        /// Disable colored output (also honored: `NO_COLOR` env,
+        /// `[ui].color = "never"` in config).
+        #[arg(long)]
+        no_color: bool,
+    },
     /// Print an agent's frontmatter and body.
     Show {
         /// Name of the agent.
@@ -51,7 +56,7 @@ pub enum Action {
 
 pub async fn handle(action: Action) -> ExitCode {
     match action {
-        Action::List => match list().await {
+        Action::List { no_color } => match list(no_color).await {
             Ok(()) => ExitCode::from(0),
             Err(e) => {
                 eprintln!("rupu agent list: {e}");
@@ -94,19 +99,36 @@ pub async fn handle(action: Action) -> ExitCode {
     }
 }
 
-async fn list() -> anyhow::Result<()> {
+async fn list(no_color: bool) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     let agents = load_agents(&global, project_agents_parent.as_deref())?;
 
-    println!("{:<24} {:<10} DESCRIPTION", "NAME", "SCOPE");
+    if agents.is_empty() {
+        println!(
+            "(no agents found)\n\nDrop a `<name>.md` under `.rupu/agents/` (project) or \
+             `~/.rupu/agents/` (global). See `rupu init --with-samples` for a starter set."
+        );
+        return Ok(());
+    }
+
+    let cfg = layered_config(&global, project_root.as_deref());
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
+
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["NAME", "SCOPE", "DESCRIPTION"]);
     for a in &agents {
         let scope = scope_for(&a.name, &global, project_agents_parent.as_deref());
         let desc = a.description.as_deref().unwrap_or("-");
-        println!("{:<24} {:<10} {}", a.name, scope, desc);
+        table.add_row(vec![
+            comfy_table::Cell::new(&a.name),
+            crate::output::tables::status_cell(&scope, &prefs),
+            comfy_table::Cell::new(desc),
+        ]);
     }
+    println!("{table}");
     Ok(())
 }
 
