@@ -5,6 +5,7 @@ pub mod auth;
 pub mod config;
 pub mod cron;
 pub mod init;
+pub mod issues;
 pub mod mcp;
 pub mod models;
 pub mod repos;

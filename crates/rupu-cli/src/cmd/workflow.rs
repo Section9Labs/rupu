@@ -538,6 +538,19 @@ pub async fn run_by_name(
     run_with_outcome(name, None, inputs, mode, event, false, false).await
 }
 
+/// Public wrapper for `rupu issues run <name> <ref>` and similar
+/// callers that need to invoke a workflow with a specific
+/// run-target string. Same UI semantics as `rupu workflow run`
+/// (interactive line-stream by default) so the issue-targeted run
+/// looks identical to the user.
+pub async fn run_by_target(
+    name: &str,
+    target: &str,
+    mode: Option<&str>,
+) -> anyhow::Result<()> {
+    run(name, Some(target), Vec::new(), mode, None, false).await
+}
+
 async fn run(
     name: &str,
     target: Option<&str>,
@@ -725,6 +738,8 @@ async fn run_with_outcome(
     let workspace_path_for_resume = workspace_path.clone();
     let transcripts_for_resume = transcripts.clone();
     let event_for_resume = event.clone();
+    let issue_for_resume = issue_payload.clone();
+    let issue_ref_for_resume = issue_ref_text.clone();
     let workspace_id_for_resume = ws.id.clone();
     let factory_for_resume = Arc::clone(&factory);
     let run_store_for_resume = Arc::clone(&run_store);
@@ -849,6 +864,8 @@ async fn run_with_outcome(
                                 transcript_dir: transcripts_for_resume.clone(),
                                 factory: factory_dyn,
                                 event: event_for_resume.clone(),
+                                issue: issue_for_resume.clone(),
+                                issue_ref: issue_ref_for_resume.clone(),
                                 run_store: Some(Arc::clone(&run_store_for_resume)),
                                 workflow_yaml: Some(body_for_resume.clone()),
                                 resume_from: Some(resume),
