@@ -22,7 +22,8 @@ pub enum Action {
     /// Show one issue's full body + metadata.
     Show(ShowArgs),
     /// Convenience: run a workflow with an issue run-target.
-    /// Equivalent to `rupu workflow run <name> --target <issue-ref>`.
+    /// Equivalent to `rupu workflow run <name> <issue-ref>` (the
+    /// run-target is a positional on `workflow run`, not a flag).
     Run(RunArgs),
 }
 
