@@ -63,6 +63,14 @@ pub enum Action {
         /// `failed` / `awaiting_approval` / `rejected`.
         #[arg(long)]
         status: Option<String>,
+        /// Filter by issue ref (full or shorthand). Matches the
+        /// textual `RunRecord.issue_ref` persisted at run start.
+        /// Accepts:
+        ///   - `<platform>:<owner>/<repo>/issues/<N>` (full),
+        ///   - `<owner>/<repo>#<N>` (GitHub shorthand),
+        ///   - bare `<N>` (autodetects from cwd's git remote).
+        #[arg(long)]
+        issue: Option<String>,
     },
     /// Inspect one persisted run: status, inputs, per-step
     /// transcript pointers.
@@ -109,7 +117,11 @@ pub async fn handle(action: Action) -> ExitCode {
             mode,
             canvas,
         } => run(&name, target.as_deref(), input, mode.as_deref(), None, canvas).await,
-        Action::Runs { limit, status } => runs(limit, status.as_deref()).await,
+        Action::Runs {
+            limit,
+            status,
+            issue,
+        } => runs(limit, status.as_deref(), issue.as_deref()).await,
         Action::ShowRun { run_id } => show_run(&run_id).await,
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
@@ -167,7 +179,11 @@ async fn show(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn runs(limit: usize, status_filter: Option<&str>) -> anyhow::Result<()> {
+async fn runs(
+    limit: usize,
+    status_filter: Option<&str>,
+    issue_filter: Option<&str>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let mut all = store
@@ -183,11 +199,24 @@ async fn runs(limit: usize, status_filter: Option<&str>) -> anyhow::Result<()> {
         let _ = store.expire_if_overdue(r, now);
     }
 
+    // Normalize the optional issue filter once. Accepts the same
+    // forms `rupu issues show / run` accept; we resolve to the
+    // canonical `<tracker>:<project>/issues/<N>` text and compare
+    // against `RunRecord.issue_ref` verbatim.
+    let issue_filter_canonical: Option<String> = match issue_filter {
+        None => None,
+        Some(s) => Some(super::issues::canonical_issue_ref(s)?),
+    };
+
     let filtered: Vec<_> = all
         .into_iter()
         .filter(|r| match status_filter {
             None => true,
             Some(s) => r.status.as_str() == s,
+        })
+        .filter(|r| match &issue_filter_canonical {
+            None => true,
+            Some(canonical) => r.issue_ref.as_deref() == Some(canonical.as_str()),
         })
         .take(limit)
         .collect();
@@ -716,6 +745,14 @@ async fn run_with_outcome(
     // line-stream printer to locate step JSONL files).
     let transcripts_dir_snapshot = transcripts.clone();
 
+    // Snapshot fields the post-run notify path needs before we move
+    // them into the factory / opts.
+    let registry_for_notify = Arc::clone(&mcp_registry);
+    let notify_issue_enabled = workflow.notify_issue;
+    let workflow_name_for_notify = workflow.name.clone();
+    let issue_ref_text_for_notify = issue_ref_text.clone();
+    let issue_payload_for_notify = issue_payload.clone();
+
     let factory = Arc::new(CliStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
@@ -898,10 +935,110 @@ async fn run_with_outcome(
         run_workflow(opts).await?
     };
 
+    // Auto-comment on the targeted issue when the workflow opted in
+    // via `notifyIssue: true`. Best-effort: a failure to post just
+    // logs a warning so a slow / down issue tracker doesn't fail the
+    // run. We skip silently when `notifyIssue` is off OR when the
+    // run-target wasn't an issue.
+    if notify_issue_enabled {
+        if let (Some(ref_text), Some(payload)) = (&issue_ref_text_for_notify, &issue_payload_for_notify) {
+            post_run_summary_to_issue(
+                &registry_for_notify,
+                ref_text,
+                payload,
+                &workflow_name_for_notify,
+                &result,
+            )
+            .await;
+        }
+    }
+
     Ok(RunOutcomeSummary {
         run_id: result.run_id,
         awaiting_step_id: result.awaiting.map(|a| a.step_id),
     })
+}
+
+/// Post a one-line summary comment to the targeted issue describing
+/// the run's outcome. Best-effort — surfaces a `tracing::warn!` on
+/// failure rather than propagating, so a slow / down issue tracker
+/// doesn't fail an otherwise-successful run.
+async fn post_run_summary_to_issue(
+    registry: &rupu_scm::Registry,
+    ref_text: &str,
+    payload: &serde_json::Value,
+    workflow_name: &str,
+    result: &rupu_orchestrator::OrchestratorRunResult,
+) {
+    // Reconstruct an `IssueRef` from the persisted text + payload.
+    // The text carries the canonical
+    // `<tracker>:<project>/issues/<N>` form; the JSON payload's
+    // `r.tracker` field is more reliable for the typed value.
+    let tracker_str = payload
+        .pointer("/r/tracker")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tracker = match tracker_str {
+        "github" => rupu_scm::IssueTracker::Github,
+        "gitlab" => rupu_scm::IssueTracker::Gitlab,
+        other => {
+            tracing::warn!(tracker = %other, "notifyIssue: unknown tracker; skipping comment");
+            return;
+        }
+    };
+    let project = payload
+        .pointer("/r/project")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let number = payload
+        .pointer("/r/number")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if project.is_empty() || number == 0 {
+        tracing::warn!(ref_text, "notifyIssue: malformed payload; skipping comment");
+        return;
+    }
+    let r = rupu_scm::IssueRef {
+        tracker,
+        project,
+        number,
+    };
+
+    let Some(conn) = registry.issues(tracker) else {
+        tracing::warn!(
+            tracker = %tracker,
+            "notifyIssue: no credential for tracker; skipping comment"
+        );
+        return;
+    };
+
+    let outcome = match &result.awaiting {
+        Some(info) => format!("paused at step `{}` awaiting approval", info.step_id),
+        None => {
+            // Distinguish failure from success by checking that
+            // every step in the result succeeded. The orchestrator
+            // would have returned Err earlier if there was a hard
+            // failure, so reaching here means a clean run.
+            let step_count = result.step_results.len();
+            format!("completed ({step_count} steps)")
+        }
+    };
+
+    let body = format!(
+        "🤖 rupu workflow `{}` (run `{}`) {}.\n\n\
+         Inspect: `rupu workflow show-run {}`\n\
+         Live: `rupu watch {}`",
+        workflow_name, result.run_id, outcome, result.run_id, result.run_id,
+    );
+
+    if let Err(e) = conn.comment_issue(&r, &body).await {
+        tracing::warn!(
+            error = %e,
+            ref_text,
+            "notifyIssue: posting comment failed"
+        );
+    }
 }
 
 /// Collect the names of all `run_<ULID>` subdirectories currently

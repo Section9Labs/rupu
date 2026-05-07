@@ -433,6 +433,14 @@ pub struct Workflow {
     /// Per-workflow defaults shared by every step.
     #[serde(default)]
     pub defaults: WorkflowDefaults,
+    /// When `true` AND the run-target resolves to an issue, the CLI
+    /// posts an auto-comment on the issue at run start (with the
+    /// run-id) and at terminal state (with the outcome — completed /
+    /// failed / awaiting_approval). Renders empty when no issue
+    /// target. Default is `false` so existing workflows don't
+    /// suddenly start writing to issue threads after upgrade.
+    #[serde(default, rename = "notifyIssue")]
+    pub notify_issue: bool,
     pub steps: Vec<Step>,
 }
 

@@ -266,6 +266,16 @@ fn resolve_repo_or_autodetect(repo_arg: Option<&str>) -> anyhow::Result<RepoRef>
     }
 }
 
+/// Resolve a CLI issue-ref string into the canonical
+/// `<tracker>:<project>/issues/<N>` form — the same shape persisted
+/// on `RunRecord.issue_ref` and used by the orchestrator. Filters
+/// (`rupu workflow runs --issue <ref>`) compare against this
+/// canonical form so the user can pass any of the accepted shapes.
+pub(crate) fn canonical_issue_ref(s: &str) -> anyhow::Result<String> {
+    let r = resolve_issue_ref(s)?;
+    Ok(format!("{}:{}/issues/{}", r.tracker, r.project, r.number))
+}
+
 /// Parse a CLI issue ref. Accepts:
 /// - Full run-target form: `github:Section9Labs/rupu/issues/42`.
 /// - Just a number (`42` or `#42`) — resolves via cwd autodetect.
