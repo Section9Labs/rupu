@@ -63,6 +63,14 @@ pub enum Action {
         /// `failed` / `awaiting_approval` / `rejected`.
         #[arg(long)]
         status: Option<String>,
+        /// Filter by issue ref (full or shorthand). Matches the
+        /// textual `RunRecord.issue_ref` persisted at run start.
+        /// Accepts:
+        ///   - `<platform>:<owner>/<repo>/issues/<N>` (full),
+        ///   - `<owner>/<repo>#<N>` (GitHub shorthand),
+        ///   - bare `<N>` (autodetects from cwd's git remote).
+        #[arg(long)]
+        issue: Option<String>,
     },
     /// Inspect one persisted run: status, inputs, per-step
     /// transcript pointers.
@@ -109,7 +117,11 @@ pub async fn handle(action: Action) -> ExitCode {
             mode,
             canvas,
         } => run(&name, target.as_deref(), input, mode.as_deref(), None, canvas).await,
-        Action::Runs { limit, status } => runs(limit, status.as_deref()).await,
+        Action::Runs {
+            limit,
+            status,
+            issue,
+        } => runs(limit, status.as_deref(), issue.as_deref()).await,
         Action::ShowRun { run_id } => show_run(&run_id).await,
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
@@ -167,7 +179,11 @@ async fn show(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn runs(limit: usize, status_filter: Option<&str>) -> anyhow::Result<()> {
+async fn runs(
+    limit: usize,
+    status_filter: Option<&str>,
+    issue_filter: Option<&str>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let mut all = store
@@ -183,11 +199,24 @@ async fn runs(limit: usize, status_filter: Option<&str>) -> anyhow::Result<()> {
         let _ = store.expire_if_overdue(r, now);
     }
 
+    // Normalize the optional issue filter once. Accepts the same
+    // forms `rupu issues show / run` accept; we resolve to the
+    // canonical `<tracker>:<project>/issues/<N>` text and compare
+    // against `RunRecord.issue_ref` verbatim.
+    let issue_filter_canonical: Option<String> = match issue_filter {
+        None => None,
+        Some(s) => Some(super::issues::canonical_issue_ref(s)?),
+    };
+
     let filtered: Vec<_> = all
         .into_iter()
         .filter(|r| match status_filter {
             None => true,
             Some(s) => r.status.as_str() == s,
+        })
+        .filter(|r| match &issue_filter_canonical {
+            None => true,
+            Some(canonical) => r.issue_ref.as_deref() == Some(canonical.as_str()),
         })
         .take(limit)
         .collect();
