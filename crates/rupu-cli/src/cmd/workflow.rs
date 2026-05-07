@@ -34,6 +34,18 @@ pub enum Action {
         /// Workflow name (filename stem under `workflows/`).
         #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
+        /// Disable colored output (also honored: `NO_COLOR` env var).
+        #[arg(long)]
+        no_color: bool,
+        /// syntect theme name. Default: `base16-ocean.dark`.
+        #[arg(long)]
+        theme: Option<String>,
+        /// Force pager. Default: page when stdout is a tty.
+        #[arg(long, conflicts_with = "no_pager")]
+        pager: bool,
+        /// Disable pager.
+        #[arg(long)]
+        no_pager: bool,
     },
     /// Open a workflow file in `$VISUAL` / `$EDITOR`. Validates the
     /// YAML on save (warn-only).
@@ -128,7 +140,22 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
 pub async fn handle(action: Action) -> ExitCode {
     let result = match action {
         Action::List => list().await,
-        Action::Show { name } => show(&name).await,
+        Action::Show {
+            name,
+            no_color,
+            theme,
+            pager,
+            no_pager,
+        } => {
+            let pager_flag = if pager {
+                Some(true)
+            } else if no_pager {
+                Some(false)
+            } else {
+                None
+            };
+            show(&name, no_color, theme.as_deref(), pager_flag).await
+        }
         Action::Edit {
             name,
             scope,
@@ -196,10 +223,26 @@ fn push_yaml_names(dir: &Path, scope: &str, into: &mut BTreeMap<String, String>)
     }
 }
 
-async fn show(name: &str) -> anyhow::Result<()> {
+async fn show(
+    name: &str,
+    no_color: bool,
+    theme: Option<&str>,
+    pager_flag: Option<bool>,
+) -> anyhow::Result<()> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
-    print!("{body}");
+
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let global_cfg = global.join("config.toml");
+    let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    let cfg =
+        rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
+
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag);
+    let rendered = crate::cmd::ui::highlight_yaml(&body, &prefs);
+    crate::cmd::ui::paginate(&rendered, &prefs)?;
     Ok(())
 }
 
