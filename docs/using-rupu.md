@@ -278,6 +278,11 @@ rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
 rupu autoflow tick
 ```
 
+Operational visibility:
+
+- `rupu autoflow status` shows contested issues when more than one autoflow matches the same issue
+- `rupu autoflow claims` shows the selected workflow priority and the losing contenders, for example `*issue-supervisor-dispatch[100], phase-ready-autoflow[50]`
+
 Two useful shapes:
 
 - controller autoflow: selects the next workflow and emits `dispatch`

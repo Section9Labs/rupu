@@ -254,6 +254,12 @@ mod tests {
             claim_owner: Some("host:user:pid".into()),
             lease_expires_at: Some("2026-05-08T23:00:00Z".into()),
             pending_dispatch: None,
+            contenders: vec![crate::autoflow_claim::AutoflowContender {
+                workflow: "issue-supervisor-dispatch".into(),
+                priority: 100,
+                scope: Some("project".into()),
+                selected: true,
+            }],
             updated_at: "2026-05-08T20:00:00Z".into(),
         };
         store.save(&rec).unwrap();

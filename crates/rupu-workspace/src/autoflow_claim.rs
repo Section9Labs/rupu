@@ -26,6 +26,16 @@ pub struct PendingDispatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoflowContender {
+    pub workflow: String,
+    pub priority: i32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoflowClaimRecord {
     pub issue_ref: String,
     pub repo_ref: String,
@@ -47,5 +57,7 @@ pub struct AutoflowClaimRecord {
     pub lease_expires_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub pending_dispatch: Option<PendingDispatch>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contenders: Vec<AutoflowContender>,
     pub updated_at: String,
 }

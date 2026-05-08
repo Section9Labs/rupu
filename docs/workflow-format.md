@@ -191,6 +191,7 @@ Notes:
 - `autoflow` template rendering is strict. Missing variables are a protocol error in autonomous mode.
 - `wake_on` becomes actionable only when `rupu autoflow tick` can see matching SCM events, typically via `[triggers].poll_sources` for the repo.
 - Matching precedence is deterministic: higher `priority` wins, then workflow name.
+- Operator-facing commands surface that decision: `rupu autoflow status` lists contested issues, and `rupu autoflow claims` shows the selected priority plus losing contenders.
 
 Typical pattern:
 
