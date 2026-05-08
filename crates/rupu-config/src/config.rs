@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pricing_config::PricingConfig;
 use crate::provider_config::ProviderConfig;
 use crate::scm_config::{IssuesSection, ScmSection};
 use crate::triggers_config::TriggersConfig;
@@ -34,6 +35,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub triggers: TriggersConfig,
+    #[serde(default)]
+    pub pricing: PricingConfig,
 }
 
 /// Terminal-output rendering preferences. Consumed by

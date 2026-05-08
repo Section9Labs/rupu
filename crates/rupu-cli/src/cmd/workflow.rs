@@ -412,6 +412,8 @@ async fn runs(
         "STARTED (UTC)",
         "DURATION",
         "EXPIRES",
+        "TOKENS",
+        "COST",
         "WORKFLOW",
     ]);
     for r in &filtered {
@@ -427,17 +429,101 @@ async fn runs(
             }
             None => comfy_table::Cell::new(""),
         };
+
+        // Aggregate Usage events from this specific run's per-step
+        // transcripts (NOT the project-wide `.rupu/transcripts/`
+        // directory, which would double-count every run's tokens).
+        // Step-result records pin down each agent invocation's
+        // transcript path, including per-panelist sub-runs.
+        let agg = aggregate_run_usage_from_store(&store, &r.id);
+        let tokens_cell = comfy_table::Cell::new(format_tokens_cell(&agg));
+        let cost_cell = run_cost_cell(&agg, &cfg.pricing, &prefs);
+
         table.add_row(vec![
             comfy_table::Cell::new(&r.id),
             crate::output::tables::status_cell(r.status.as_str(), &prefs),
             comfy_table::Cell::new(started),
             comfy_table::Cell::new(duration),
             expires_cell,
+            tokens_cell,
+            cost_cell,
             comfy_table::Cell::new(&r.workflow_name),
         ]);
     }
     println!("{table}");
     Ok(())
+}
+
+/// Per-step transcripts for one run, sourced from the run's
+/// `step_results.jsonl`. Includes panel sub-run transcripts
+/// (`items[].transcript_path`) so a panel-of-3 review counts all
+/// three reviewers' tokens.
+///
+/// This is the version used by `rupu workflow runs`: scoping to one
+/// run via the run-store avoids the double-count you'd get from
+/// scanning the project-wide `transcript_dir` (which collects every
+/// run's transcripts together).
+fn aggregate_run_usage_from_store(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+) -> Vec<rupu_transcript::UsageRow> {
+    let Ok(records) = store.read_step_results(run_id) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for rec in &records {
+        paths.push(rec.transcript_path.clone());
+        for item in &rec.items {
+            paths.push(item.transcript_path.clone());
+        }
+    }
+    rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default())
+}
+
+/// Compact `input + output` token total for the runs table. Returns
+/// `—` when the run had no Usage events (fresh in-flight run, or one
+/// that failed before the first turn).
+fn format_tokens_cell(rows: &[rupu_transcript::UsageRow]) -> String {
+    let total: u64 = rows
+        .iter()
+        .map(|r| r.input_tokens + r.output_tokens)
+        .sum();
+    if total == 0 {
+        return "—".into();
+    }
+    if total >= 1_000_000 {
+        format!("{:.2}M", total as f64 / 1_000_000.0)
+    } else if total >= 1_000 {
+        format!("{:.1}K", total as f64 / 1_000.0)
+    } else {
+        total.to_string()
+    }
+}
+
+/// Sum costs across every `(provider, model, agent)` triple in the
+/// run. Renders `$X.XX` when at least one row had pricing, dim `—`
+/// when none did.
+fn run_cost_cell(
+    rows: &[rupu_transcript::UsageRow],
+    pricing: &rupu_config::PricingConfig,
+    prefs: &crate::cmd::ui::UiPrefs,
+) -> comfy_table::Cell {
+    let mut total = 0.0f64;
+    let mut any = false;
+    for r in rows {
+        if let Some(p) = crate::pricing::lookup(pricing, &r.provider, &r.model, &r.agent) {
+            total += p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens);
+            any = true;
+        }
+    }
+    if !any {
+        return if prefs.use_color() {
+            comfy_table::Cell::new("\x1b[2m—\x1b[0m")
+        } else {
+            comfy_table::Cell::new("—")
+        };
+    }
+    comfy_table::Cell::new(format!("${total:.4}"))
 }
 
 fn layered_config_workflow(
@@ -452,6 +538,10 @@ fn layered_config_workflow(
 
 async fn show_run(run_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let cfg = layered_config_workflow(&global, project_root.as_deref());
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None);
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let record = store.load(run_id).map_err(|e| {
         anyhow::anyhow!(
@@ -530,6 +620,72 @@ async fn show_run(run_id: &str) -> anyhow::Result<()> {
             }
         }
     }
+
+    // ── Usage summary ────────────────────────────────────────────
+    // Aggregate every transcript referenced by this run's step
+    // results, group by (provider, model, agent), and render with
+    // the same table style `rupu usage` uses. Cost lookup honors the
+    // layered pricing config + built-in defaults.
+    let usage_rows = aggregate_run_usage_from_store(&store, run_id);
+    if !usage_rows.is_empty() {
+        println!();
+        println!("USAGE:");
+        let mut t = crate::output::tables::new_table();
+        t.set_header(vec![
+            "PROVIDER",
+            "MODEL",
+            "AGENT",
+            "INPUT",
+            "OUTPUT",
+            "CACHED",
+            "COST (USD)",
+        ]);
+        let mut total_in = 0u64;
+        let mut total_out = 0u64;
+        let mut total_cached = 0u64;
+        let mut total_cost = 0.0f64;
+        let mut any_priced = false;
+        for r in &usage_rows {
+            let cost = crate::pricing::lookup(&cfg.pricing, &r.provider, &r.model, &r.agent)
+                .map(|p| p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens));
+            if let Some(c) = cost {
+                total_cost += c;
+                any_priced = true;
+            }
+            let cost_str = match cost {
+                Some(c) => format!("${c:.4}"),
+                None => "—".into(),
+            };
+            t.add_row(vec![
+                comfy_table::Cell::new(&r.provider),
+                comfy_table::Cell::new(&r.model),
+                comfy_table::Cell::new(&r.agent),
+                comfy_table::Cell::new(r.input_tokens.to_string()),
+                comfy_table::Cell::new(r.output_tokens.to_string()),
+                comfy_table::Cell::new(r.cached_tokens.to_string()),
+                comfy_table::Cell::new(cost_str),
+            ]);
+            total_in += r.input_tokens;
+            total_out += r.output_tokens;
+            total_cached += r.cached_tokens;
+        }
+        t.add_row(vec![
+            comfy_table::Cell::new("TOTAL"),
+            comfy_table::Cell::new(""),
+            comfy_table::Cell::new(""),
+            comfy_table::Cell::new(total_in.to_string()),
+            comfy_table::Cell::new(total_out.to_string()),
+            comfy_table::Cell::new(total_cached.to_string()),
+            comfy_table::Cell::new(if any_priced {
+                format!("${total_cost:.4}")
+            } else {
+                "—".into()
+            }),
+        ]);
+        println!("{t}");
+    }
+
+    let _ = prefs; // reserved for future colorized cost cells in show_run
     Ok(())
 }
 
