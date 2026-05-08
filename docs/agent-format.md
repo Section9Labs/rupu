@@ -1,220 +1,316 @@
 # Agent File Format Reference
 
-> Part of the rupu reference docs: [spec.md](spec.md) · **agent-format.md** ·
-> [workflow-format.md](workflow-format.md) · [transcript-schema.md](transcript-schema.md)
+> See also: [agent-authoring.md](agent-authoring.md) · [workflow-format.md](workflow-format.md) · [using-rupu.md](using-rupu.md)
 
 ---
 
 ## Overview
 
-An agent file is a Markdown document with YAML frontmatter. The frontmatter configures how the
-agent runs (provider, model, tools, permission mode, turn limit). The body — everything after the
-closing `---` — is used verbatim as the LLM system prompt.
+An agent is a Markdown file with YAML frontmatter. The frontmatter tells `rupu` how to run the agent; the Markdown body is the system prompt sent to the model.
+
+`rupu` parses agent frontmatter with strict unknown-field rejection. Typos fail fast instead of being silently ignored.
 
 ---
 
-## File location
+## File location and resolution
 
-```
+```text
 <dir>/agents/<name>.md
 ```
 
-Where `<dir>` is one of:
+`<dir>` is one of:
 
-- `~/.rupu/` — global agent library; available in every workspace.
-- `<project>/.rupu/` — project-local agents; override globals with the same `name`.
+- `~/.rupu` for global agents
+- `<project>/.rupu` for project-local agents
 
-Resolution: when two files share the same `name:` value, the project-local file wins entirely
-(no frontmatter merging). `rupu agent list` labels each entry `(global)` or `(project)`.
+Resolution rules:
+
+- project-local agents shadow global agents by `name:`
+- shadowing is all-or-nothing; `rupu` does not merge frontmatter or prompts
+- `rupu agent list` shows whether an agent is coming from project or global scope
+
+---
+
+## Required structure
+
+```markdown
+---
+name: fix-bug
+provider: anthropic
+model: claude-sonnet-4-6
+permissionMode: ask
+---
+
+You are a careful engineer. Reproduce the bug, find the root cause,
+apply the minimal fix, and verify the result.
+```
+
+Everything after the closing `---` is the system prompt.
 
 ---
 
 ## Frontmatter fields
 
-The frontmatter is parsed with `#[serde(deny_unknown_fields)]`. Unknown keys — including
-misspellings like `permision_mode` or `max_turns` — are rejected at parse time with a clear
-error message.
+| Key | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | — | Agent identifier used by `rupu run <name>` and workflows |
+| `description` | string | no | none | Human-readable summary shown by `rupu agent list` |
+| `provider` | string | no | `anthropic` | Use an explicit provider in checked-in agents |
+| `auth` | `api-key` \| `sso` | no | resolver chooses | Optional auth-mode hint when both modes exist |
+| `model` | string | no | config `default_model`, else `claude-sonnet-4-6` | Provider-specific model id |
+| `tools` | array<string> | no | built-in tools + discovered MCP tools | Strongly recommend declaring this explicitly |
+| `maxTurns` | integer | no | `50` | Hard cap on model turns |
+| `permissionMode` | `ask` \| `bypass` \| `readonly` | no | `ask` | CLI `--mode` overrides the file |
+| `anthropicOauthPrefix` | bool | no | provider default | Anthropic SSO only |
+| `effort` | string | no | provider default | Cross-provider reasoning level |
+| `contextWindow` | string | no | model default | Cross-provider context tier |
+| `outputFormat` | `text` \| `json` | no | free-form text | Hint for structured outputs |
+| `anthropicTaskBudget` | integer | no | none | Anthropic-only soft output budget |
+| `anthropicContextManagement` | string | no | none | Anthropic-only context pruning |
+| `anthropicSpeed` | string | no | none | Anthropic-only fast mode |
+
+---
+
+## Field details
 
 ### `name`
 
-| Attribute | Value    |
-|-----------|----------|
-| Type      | string   |
-| Required  | yes      |
-
-The agent's unique name within its scope (global or project). Used in:
-
-- `rupu run <name> [prompt]`
-- `rupu agent show <name>`
-- `agent:` field in workflow step definitions
-
-Names are case-sensitive. Convention: lowercase, hyphen-separated (`fix-bug`, `add-tests`).
-
----
-
-### `description`
-
-| Attribute | Value    |
-|-----------|----------|
-| Type      | string   |
-| Required  | no       |
-
-One-line human-readable description. Displayed by `rupu agent list` and `rupu agent show`.
-
----
+Use lowercase, hyphen-separated names such as `fix-bug`, `review-diff`, or `security-reviewer`.
 
 ### `provider`
 
-| Attribute | Value       |
-|-----------|-------------|
-| Type      | string      |
-| Required  | no          |
-| Default   | `anthropic` |
+Use the canonical provider names in checked-in agents:
 
-LLM provider to use for this agent. Currently only `anthropic` is fully wired in v0. Other
-values (`openai`, `copilot`, `local`) are accepted at parse time but return a
-`"not wired in v0"` error at runtime.
+- `anthropic`
+- `openai`
+- `gemini`
+- `copilot`
 
-Mode resolution (highest precedence first): CLI flag → agent frontmatter → project config →
-global config → `anthropic`.
+`rupu` accepts some aliases internally, but canonical names keep your repo easier to read and maintain.
 
----
+### `auth`
+
+Valid values:
+
+- `api-key`
+- `sso`
+
+Use `auth:` when the same provider may have multiple valid credentials and the agent depends on one path. If omitted, the credential resolver picks the available credential, preferring SSO when both exist.
 
 ### `model`
 
-| Attribute | Value                |
-|-----------|----------------------|
-| Type      | string               |
-| Required  | no                   |
-| Default   | `claude-sonnet-4-6`  |
+`model:` is provider-specific. `rupu` does not validate model ids at parse time. Invalid ids fail at runtime when the provider call is made.
 
-Model identifier passed to the provider. Must be a model the chosen provider supports. rupu does
-not validate the model string at parse time; invalid values surface as provider errors at
-runtime.
-
----
+For stable project behavior, prefer setting `model:` per agent instead of relying on a mutable global default.
 
 ### `tools`
 
-| Attribute | Value                                                   |
-|-----------|---------------------------------------------------------|
-| Type      | array\<string\>                                         |
-| Required  | no                                                      |
-| Default   | all six: `[bash, read_file, write_file, edit_file, grep, glob]` |
+`tools:` is the agent's tool allowlist.
 
-Subset of the six v0 tools that this agent is allowed to call. Tools omitted from this list are
-not registered with the provider for this agent; the LLM never sees them as options.
+Built-in tool names:
 
-Available tool names: `bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`.
+- `bash`
+- `read_file`
+- `write_file`
+- `edit_file`
+- `grep`
+- `glob`
 
-To create a read-only agent at the tool level (regardless of `permissionMode`), omit the
-write tools: `tools: [bash, read_file, grep, glob]`.
+MCP-backed tool names are also valid, for example:
 
----
+- `scm.prs.get`
+- `scm.prs.diff`
+- `scm.prs.create`
+- `issues.get`
+- `issues.comment`
+- `scm.*`
+- `issues.*`
+- `*`
 
-### `maxTurns`
+Allowlist matching rules:
 
-| Attribute | Value  |
-|-----------|--------|
-| Type      | u32    |
-| Required  | no     |
-| Default   | `50`   |
+- exact match: `scm.prs.get`
+- prefix wildcard: `scm.*`
+- global wildcard: `*`
 
-Maximum number of agent turns before the run is aborted with `run_complete { status: "error",
-error: "max_turns_reached" }`. One turn is one round-trip to the LLM (user message →
-assistant response). A single turn may contain multiple tool calls.
+Notes:
 
----
+- if you omit `tools:`, the agent gets the full built-in surface and, when SCM / issue connectors are configured, discovered MCP tools as well
+- for reusable repo agents, explicit `tools:` is better than relying on the implicit wide-open default
+- `tools:` is not the same thing as workflow `actions:`; `tools:` gates tool calls, `actions:` gates the action protocol emitted from agent output inside workflows
 
 ### `permissionMode`
 
-| Attribute | Value  |
-|-----------|--------|
-| Type      | string |
-| Required  | no     |
-| Default   | `ask`  |
+Valid values:
 
-Controls how the agent may affect the filesystem and shell. One of:
+| Value | Meaning |
+| --- | --- |
+| `ask` | prompt before shell and write effects |
+| `bypass` | execute allowed tools without confirmation |
+| `readonly` | allow reads, deny writes |
 
-| Value      | Effect                                                           |
-|------------|------------------------------------------------------------------|
-| `ask`      | Prompt the user before `bash`, `write_file`, `edit_file`         |
-| `bypass`   | Execute all tools without prompting                              |
-| `readonly` | Allow `read_file`, `grep`, `glob`; deny `bash`, `write_file`, `edit_file` |
+`readonly` blocks:
 
-Non-TTY + `ask` aborts the run before the first tool call. Silently degrading to `bypass` in
-CI is how accidents happen; rupu refuses to do it.
+- built-in writes: `write_file`, `edit_file`, destructive shell work via `bash`
+- MCP write tools such as `scm.prs.create`, `issues.comment`, `issues.create`, `scm.branches.create`
 
-Denied tool calls return a `tool_result` with `error: "permission_denied"`. The agent sees this
-and can adapt (e.g., switch to investigation-only behavior).
+`ask` is the safest default for agents that edit code. In non-interactive contexts, `ask` cannot proceed; use `--mode bypass` or `--mode readonly` explicitly.
+
+### `maxTurns`
+
+`maxTurns` is a hard stop on model turns, not a token budget. Keep it lower for narrow agents such as reviewers and higher for implementation agents.
+
+### `effort`
+
+Accepted values:
+
+- `auto`
+- `minimal`
+- `low`
+- `medium`
+- `high`
+- `max`
+
+Aliases also accepted:
+
+- `adaptive` → `auto`
+- `xhigh` → `max`
+
+Use `effort` only when the task genuinely benefits from more reasoning. Setting every agent to `max` is usually wasted latency and cost.
+
+### `contextWindow`
+
+Accepted values:
+
+- `default`
+- `1m`
+- `1M`
+- `one_million`
+
+Use this sparingly. Most agents should let the model use its normal context window.
+
+### `outputFormat`
+
+Accepted values:
+
+- `text`
+- `json`
+
+Use `json` only when the caller downstream needs machine-readable output. If you set `outputFormat: json`, the system prompt should still describe the exact JSON shape expected.
+
+### Anthropic-specific fields
+
+| Key | Valid values | Purpose |
+| --- | --- | --- |
+| `anthropicOauthPrefix` | `true` / `false` | Enables or disables Anthropic's OAuth system prefix |
+| `anthropicTaskBudget` | positive integer | Soft output budget, separate from `maxTurns` |
+| `anthropicContextManagement` | `tool_clearing` | Server-side pruning of older tool blocks |
+| `anthropicSpeed` | `fast` | Account-gated fast mode |
+
+If an agent needs to stay portable across providers, avoid Anthropic-only fields.
 
 ---
 
-## Body (system prompt)
+## System prompt body
 
-Everything after the second `---` delimiter is the system prompt. It is passed to the LLM as
-the `system` message before the user turn. Standard Markdown is fine; rupu passes the raw text
-without rendering it.
+The Markdown body is passed as the system prompt exactly as written.
 
-There is no length limit enforced by rupu, but very large system prompts consume context window.
+A good agent prompt usually contains:
+
+1. the role it should play
+2. the scope of the task
+3. the expected work sequence
+4. the validation bar
+5. the stop condition
+6. the output contract
+
+See [agent-authoring.md](agent-authoring.md) for concrete prompting patterns.
 
 ---
 
 ## Worked examples
 
-### Minimal agent (name + body only)
+### Minimal read-only reviewer
 
 ```markdown
 ---
-name: summarize-diff
+name: review-summary
+tools: [read_file, grep, glob]
+permissionMode: readonly
 ---
 
-You are a code reviewer. When given a git diff, produce a concise summary
-of what changed and why it matters. Use bullet points. Be direct.
+You review the files the user points at.
+Return a short bulleted list of issues, or `no issues`.
+Do not make edits.
 ```
 
-All fields are at their defaults: provider `anthropic`, model `claude-sonnet-4-6`, all six tools
-available, `maxTurns` 50, `permissionMode` `ask`.
-
----
-
-### Full agent (all fields set)
+### SCM PR reviewer
 
 ```markdown
 ---
-name: fix-bug
-description: Investigate a failing test and propose a minimal fix.
+name: scm-pr-review
 provider: anthropic
 model: claude-sonnet-4-6
-tools: [bash, read_file, write_file, edit_file, grep, glob]
-maxTurns: 30
+tools: [scm.prs.get, scm.prs.diff, scm.prs.comment]
+maxTurns: 6
 permissionMode: ask
 ---
 
-You are a careful senior engineer. When given a failing test or bug
-report, you:
-1. Reproduce the failure with `cargo test -- --nocapture` (or the
-   appropriate command).
-2. Read the relevant source until you understand the failure.
-3. Propose the *minimal* edit that fixes it.
-4. Verify the test passes.
-5. Stop. Do not refactor surrounding code or fix unrelated lints.
+You are a code reviewer.
+Read the PR metadata and diff.
+Look for correctness, security, and missing-test issues.
+Post one concise review comment.
 ```
 
-This is the `fix-bug` agent shipped at `<repo>/.rupu/agents/fix-bug.md` and usable as a
-template for custom agents.
+### Panel reviewer with structured JSON output
+
+```markdown
+---
+name: security-reviewer
+tools: [read_file, grep, glob, scm.prs.get, scm.prs.diff]
+permissionMode: readonly
+outputFormat: json
+maxTurns: 6
+---
+
+You are a security reviewer.
+If given a PR ref, fetch the diff with SCM tools.
+If given a local file or diff, inspect that directly.
+
+Your final assistant message must contain:
+{
+  "findings": [
+    { "severity": "low|medium|high|critical",
+      "title": "short title",
+      "body": "one sentence detail" }
+  ]
+}
+
+If there are no findings, return {"findings":[]}.
+```
 
 ---
 
-## Schema validation
+## Validation and failure modes
 
-The frontmatter deserializer is configured with `#[serde(deny_unknown_fields)]`. Any key that
-is not in the list above — including common misspellings — produces a parse error:
+Common failures:
 
-```
-error: unknown field `permision_mode`, expected one of `name`, `description`,
-       `provider`, `model`, `tools`, `maxTurns`, `permissionMode`
-```
+- missing opening `---` or closing frontmatter delimiter
+- misspelled keys such as `permision_mode`
+- invalid enum values such as `outputFormat: yaml`
+- unsupported or missing provider credentials at runtime
+- `ask` mode in a non-interactive context
 
-This fires at `rupu run` / `rupu agent show` load time, not at the start of a tool call deep
-inside a run. Fix the frontmatter and re-run.
+For predictable behavior:
+
+- set `provider`, `model`, `tools`, and `permissionMode` explicitly in checked-in agents
+- keep agents narrow and specialized
+- prefer separate reviewer and implementer agents over one broad do-everything prompt
+
+---
+
+## Practical guidance
+
+- Use [agent-authoring.md](agent-authoring.md) when you are designing a new agent.
+- Use [workflow-format.md](workflow-format.md) when that agent will participate in a workflow.
+- Use [examples/README.md](../examples/README.md) for complete copyable agent and workflow sets.

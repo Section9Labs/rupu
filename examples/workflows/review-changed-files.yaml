@@ -1,0 +1,26 @@
+name: review-changed-files
+description: Fan out one reviewer across a list of files and aggregate the findings.
+inputs:
+  files:
+    type: string
+    required: true
+steps:
+  - id: review_each
+    agent: code-reviewer
+    actions: []
+    for_each: "{{ inputs.files }}"
+    max_parallel: 4
+    prompt: |
+      Review file {{ item }} ({{ loop.index }} of {{ loop.length }}).
+      Return either `no issues` or a short bulleted list.
+
+  - id: summarize
+    agent: writer
+    actions: []
+    prompt: |
+      Combine these per-file reviews into one concise engineering summary.
+
+      {% for r in steps.review_each.results %}
+      ---
+      {{ r }}
+      {% endfor %}

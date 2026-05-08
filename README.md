@@ -57,11 +57,13 @@ rupu auth login --provider anthropic --mode sso
 rupu run review-diff
 ```
 
-`rupu init --with-samples` seeds six curated agent templates
+`rupu init --with-samples` seeds the focused single-agent helpers
 (`review-diff`, `add-tests`, `fix-bug`, `scaffold`, `summarize-diff`,
-`scm-pr-review`) plus one workflow (`investigate-then-fix`) under
-`.rupu/`. Re-running is a no-op; pass `--force` to overwrite local
-template customizations with the latest embedded versions.
+`scm-pr-review`) plus a fuller project-oriented sample library for
+issue intake, spec writing, phase planning, PR review panels, and
+phased delivery under `.rupu/`. Re-running is a no-op; pass `--force`
+to overwrite local template customizations with the latest embedded
+versions.
 
 ---
 
@@ -235,6 +237,16 @@ coverage gaps.
 
 ---
 
+## Documentation
+
+- `docs/using-rupu.md` — practical day-to-day usage
+- `docs/agent-format.md` — complete agent schema reference
+- `docs/agent-authoring.md` — how to write good agents
+- `docs/workflow-format.md` — complete workflow schema reference
+- `docs/workflow-authoring.md` — how to design good workflows
+- `docs/development-flows.md` — recommended engineering flows
+- `examples/README.md` — copyable agents and workflows
+
 ## Subcommands
 
 ```
@@ -269,24 +281,25 @@ positional slots.
 
 See [`docs/spec.md`](docs/spec.md) for the full architecture. Short version:
 
-- **Agents** are `.md` files with YAML frontmatter (name, provider, model, tools,
-  permissions) and a markdown system prompt as the body.
-- **Workflows** are YAML files with a linear sequence of steps; each step names an
-  agent and optionally passes context from previous steps.
-- **Transcripts** are append-only JSONL files — one event per line. Every run writes
-  one regardless of whether it succeeds or fails.
-- **Action protocol** gates what tools an agent may call. The runtime validates every
-  proposed action against an allowlist before execution.
+- **Agents** are `.md` files with YAML frontmatter for provider, model, tools,
+  permission mode, and optional reasoning / output controls, plus a markdown system
+  prompt body.
+- **Workflows** are YAML orchestration files with sequential steps plus `for_each`,
+  `parallel`, `panel`, `approval`, and trigger support.
+- **Transcripts** are append-only JSONL files, and workflow runs are also tracked in
+  the persistent run store for re-attach, approval, and history.
+- **Tool policy** lives in each agent's `tools:` and `permissionMode`; workflow
+  `actions:` is a separate action-protocol allowlist, not a tool allowlist.
 
 ---
 
 ## Agents are code
 
 Bypass mode runs arbitrary shell commands on your machine. Review every agent file
-before you run it, just as you would review a shell script. The action-protocol
-allowlist in the agent frontmatter controls what tools the runtime will execute, but
-the content of `shell` tool calls is determined by the LLM. Treat an agent you did
-not write with the same caution you would treat untrusted code.
+before you run it, just as you would review a shell script. An agent's `tools:` list
+and `permissionMode` define its tool surface; workflow `actions:` is a separate
+mechanism and does not replace tool policy. Treat an agent you did not write with
+the same caution you would treat untrusted code.
 
 ---
 

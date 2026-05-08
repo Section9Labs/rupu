@@ -31,6 +31,8 @@ Cross-field rules (validated at parse):
 - `event:` and `filter:` only allowed when `on: event`.
 - Missing `on:` defaults to `manual`.
 
+Reminder: step `actions:` is not a tool allowlist. Keep `actions: []` unless your agent intentionally emits the workflow action protocol; the agent file's `tools:` frontmatter controls tool access.
+
 ---
 
 ## Cron-scheduled triggers
@@ -45,7 +47,7 @@ trigger:
 steps:
   - id: scan
     agent: security-reviewer
-    actions: [bash, read_file]
+    actions: []
     prompt: |
       Audit the repo for newly-added secrets in the last 24h.
 ```
@@ -99,7 +101,7 @@ steps:
     panel:
       panelists:
         - security-reviewer
-        - perf-reviewer
+        - performance-reviewer
         - maintainability-reviewer
       subject: |
         Issue #{{ event.payload.issue.number }}
@@ -108,8 +110,8 @@ steps:
         {{ event.payload.issue.body }}
 
   - id: comment_back
-    agent: scm-pr-author
-    actions: [issues.comment]
+    agent: issue-commenter
+    actions: []
     prompt: |
       Post a triage summary on issue
       {{ event.repo.full_name }}#{{ event.payload.issue.number }}

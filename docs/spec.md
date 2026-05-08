@@ -24,8 +24,7 @@ discovered during implementation:
   via `include_str!`; the shipped approach commits them to `.rupu/agents/` and `.rupu/workflows/`
   in the rupu repository itself. They are discovered by rupu's normal project-discovery logic
   when running `rupu` inside the rupu checkout, and serve as copy-paste templates for new users.
-- **Anthropic-only v0 wiring** — only `provider: anthropic` is fully wired. Other provider
-  strings parse successfully but return `"not wired in v0"` errors at runtime.
+- **Provider wiring expanded beyond the original Slice A notes** — current `rupu` ships working Anthropic, OpenAI, Gemini, and Copilot provider integrations. Prefer the provider-specific docs for current auth and model details.
 
 ---
 
@@ -37,7 +36,7 @@ sequence of agent steps), then invokes `rupu run` or `rupu workflow run`. The ag
 an LLM through tool calls — bash, file read/write/edit, grep, glob — logging every event to an
 immutable JSONL transcript. The action protocol contract is present from day one so Slice B can
 wire real effects (open PR, post comment) without schema changes. Slice A is local-only; no
-SaaS, no SCM connectors, no sandbox.
+SaaS control plane and remote sandboxing are still out of scope here; SCM and issue integrations are now part of the shipped local CLI.
 
 ---
 
@@ -46,26 +45,25 @@ SaaS, no SCM connectors, no sandbox.
 ### Shipped
 
 - Single Rust binary `rupu` (crate `rupu-cli`).
-- Provider stack lifted from phi-cell; Anthropic fully wired; OpenAI/Copilot/local present but
-  not wired in v0 (return `"not wired in v0"` error).
+- Provider stack lifted from phi-cell; Anthropic, OpenAI, Gemini, and Copilot are wired in the local CLI.
 - Agent file format: `.md` + YAML frontmatter, `#[deny_unknown_fields]`.
 - Six tools: `bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`.
 - Permission modes: `ask`, `bypass`, `readonly`.
-- Linear workflow runner (no fan-out, no gates, no conditionals).
+- Workflow runner with sequential steps plus `for_each`, `parallel`, `panel`, `when`, approval gates, and trigger-aware context.
 - JSONL transcript schema with 11 event types.
 - Two-tier config: global `~/.rupu/config.toml` + project `<repo>/.rupu/config.toml`.
 - Credential storage: OS keychain via `keyring` crate, chmod-600 JSON fallback.
 - `rupu agent list|show`, `rupu workflow list|show|run`, `rupu transcript list|show`,
   `rupu config get|set`, `rupu auth login|logout|status`.
-- 5 sample agents + 1 sample workflow at `<repo>/.rupu/`.
+- Curated starter samples in `crates/rupu-cli/templates/` plus richer repo-local examples under `examples/`.
 - `cargo install`-able; tag-triggered GitHub Releases (macOS arm64/x86_64, Linux x86_64/arm64).
 
 ### Deferred to Slice B+
 
-- SCM connectors (GitHub/GitLab/Bitbucket), issue-tracker triggers.
-- DAG workflow engine: `parallel`, `when`, `gates` (parse-time error with "deferred to Slice B").
+- Bitbucket, Linear, and Jira connectors.
+- General DAG scheduling beyond the current sequential-step engine.
 - Workflow action effects (open PR, post comment). v0 logs `action_emitted` only.
-- Workflow approval gates (`gate_requested` event reserved but not emitted in v0).
+- Workflow action effects beyond today's transcripted action-protocol validation.
 - Transcript compaction, resume from aborted run, concurrent-run locking.
 - SaaS control plane, remote runs, OAuth flows.
 - Sandbox / microVM / session save-restore.
@@ -243,8 +241,7 @@ Full reference: [workflow-format.md](workflow-format.md)
 
 YAML, one file per workflow at `<dir>/workflows/<name>.yaml`. Validated at parse time.
 
-v0 supports only a linear `steps:` list. The keys `parallel`, `when`, and `gates` are
-future-reserved and produce a parse error in v0 with a clear "deferred to Slice B" message.
+Current `rupu` workflows run steps in declaration order, but each step can also use `when:`, `for_each:`, `parallel:`, `panel:`, and `approval:`. For the up-to-date schema, rely on `docs/workflow-format.md` rather than the original Slice A narrative below.
 
 Engine behavior per step:
 

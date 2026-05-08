@@ -1,0 +1,28 @@
+name: quick-bugfix
+description: Investigate a bug, implement the minimal fix, and summarize verification.
+inputs:
+  prompt:
+    type: string
+    required: true
+steps:
+  - id: investigate
+    agent: repo-investigator
+    actions: []
+    prompt: |
+      Investigate this bug report or failing test:
+
+      {{ inputs.prompt }}
+
+      Stop at diagnosis. Identify the likely root cause, affected files,
+      and the narrowest useful validation.
+
+  - id: implement
+    agent: repo-implementer
+    actions: []
+    prompt: |
+      Implement the minimal fix for this investigation:
+
+      {{ steps.investigate.output }}
+
+      Keep the change tightly scoped.
+      Verify with the smallest useful command first.
