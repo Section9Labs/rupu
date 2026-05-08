@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "review_packet_v1",
+  "type": "object",
+  "required": [
+    "pr_ref",
+    "summary",
+    "validations",
+    "risks",
+    "findings"
+  ],
+  "properties": {
+    "pr_ref": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "validations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "source",
+          "severity",
+          "title",
+          "body"
+        ],
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "severity": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

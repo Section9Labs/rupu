@@ -181,6 +181,101 @@ Repeat until the issue's planned phases are exhausted.
 
 ---
 
+## Autonomous issue ownership
+
+When the manual phase flow is stable, the same repo can move to an autoflow pattern:
+
+1. attach the repo to a local checkout
+2. run a controller autoflow against labeled issues
+3. dispatch one child workflow at a time
+4. keep one persistent worktree per issue
+5. reconcile on a scheduler until the issue is done
+
+### Example: attach and inspect
+
+```sh
+rupu repos attach github:your-org/your-repo .
+rupu autoflow list
+rupu autoflow show issue-supervisor-dispatch
+```
+
+### Example: controller autoflow
+
+```sh
+rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
+```
+
+Expected behavior:
+
+- if the spec or plan is missing, dispatch `issue-to-spec-and-plan`
+- if phase `phase-1` is ready, dispatch `phase-delivery-cycle`
+- if a PR is waiting on human merge, return `await_external`
+- if all planned phases are done, return `complete`
+
+### Example: scheduled reconciliation
+
+```sh
+rupu autoflow tick
+```
+
+What the tick should do:
+
+- discover autoflow-enabled workflows
+- match candidate issues by selector and `autoflow.priority`
+- acquire or refresh the issue claim
+- create or reuse the persistent worktree
+- run one autonomous cycle
+- validate the structured contract output
+- persist the next status or dispatch for the next tick
+
+### Controller vs direct child workflows
+
+Two patterns are valid:
+
+- **Controller first**: `issue-supervisor-dispatch` has higher `autoflow.priority` and decides what child workflow should run next.
+- **Direct phase owner**: a workflow like `phase-ready-autoflow` matches the issue directly and owns the current phase without a separate controller.
+
+Use the controller pattern for larger repos. It keeps repo-specific decision logic in one place.
+
+### Background scheduling
+
+Recommended v1 model: run `rupu autoflow tick` from the OS scheduler.
+
+- macOS `launchd`: run every 5 or 10 minutes
+- Linux `systemd --user` timer or cron
+- Windows Task Scheduler
+
+Example crontab:
+
+```text
+*/10 * * * * cd /path/to/repo && rupu autoflow tick
+```
+
+Example `launchd` program arguments:
+
+```text
+/bin/zsh -lc 'cd /path/to/repo && rupu autoflow tick'
+```
+
+Example `systemd --user` service command:
+
+```text
+WorkingDirectory=/path/to/repo
+ExecStart=/usr/bin/env rupu autoflow tick
+```
+
+Example Windows Task Scheduler program/script:
+
+```text
+Program/script: rupu
+Arguments: autoflow tick
+Start in: C:\\path\\to\\repo
+```
+
+Use event or webhook wakeups only after the autonomous loop is stable on periodic ticks.
+
+---
+
 ## Why this decomposition is better than one giant autonomous workflow
 
 Because it gives you:
@@ -217,12 +312,13 @@ That is enough to support disciplined end-to-end delivery without pretending the
 
 ## When to add event triggers
 
-Add triggers after the manual flow is working.
+Add triggers after the manual or autoflow path is working.
 
 Good candidates:
 
 - issue labeled `triage` → run issue intake
 - PR opened → run automated review panel
+- issue labeled `autoflow` → let `rupu autoflow tick` pick it up
 - nightly cron → run dependency or security audits
 
 Do not start with triggers if the underlying manual workflow is still unstable.

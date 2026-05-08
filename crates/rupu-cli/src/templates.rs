@@ -125,6 +125,26 @@ pub const MANIFEST: &[Template] = &[
         target_relpath: ".rupu/workflows/phase-delivery-cycle.yaml",
         content: include_str!("../templates/workflows/phase-delivery-cycle.yaml"),
     },
+    Template {
+        target_relpath: ".rupu/workflows/issue-supervisor-dispatch.yaml",
+        content: include_str!("../templates/workflows/issue-supervisor-dispatch.yaml"),
+    },
+    Template {
+        target_relpath: ".rupu/contracts/autoflow_outcome_v1.json",
+        content: include_str!("../templates/contracts/autoflow_outcome_v1.json"),
+    },
+    Template {
+        target_relpath: ".rupu/contracts/workflow_dispatch_v1.json",
+        content: include_str!("../templates/contracts/workflow_dispatch_v1.json"),
+    },
+    Template {
+        target_relpath: ".rupu/contracts/phase_plan_v1.json",
+        content: include_str!("../templates/contracts/phase_plan_v1.json"),
+    },
+    Template {
+        target_relpath: ".rupu/contracts/review_packet_v1.json",
+        content: include_str!("../templates/contracts/review_packet_v1.json"),
+    },
 ];
 
 /// Skeleton config.toml content. Created on every `rupu init`.
@@ -140,6 +160,12 @@ pub const CONFIG_SKELETON: &str = r#"# rupu project config — see https://githu
 # [issues.default]
 # tracker = "github"
 # project = "<your-org>/<this-repo>"
+
+# [autoflow]
+# enabled = true
+# repo = "github:<your-org>/<this-repo>"
+# permission_mode = "bypass"
+# strict_templates = true
 "#;
 
 /// `.gitignore` line that rupu owns. Init appends this to an existing

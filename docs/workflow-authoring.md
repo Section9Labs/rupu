@@ -134,6 +134,53 @@ A reliable decomposition is:
 
 That is easier to observe, approve, and recover.
 
+### 7. Put autonomous policy in `autoflow:`, not in ad-hoc prose
+
+If a workflow should own an issue over time, declare that explicitly:
+
+```yaml
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["autoflow"]
+  reconcile_every: "10m"
+```
+
+Use `autoflow:` for:
+
+- ownership and matching
+- worktree strategy
+- lease duration
+- wake hints
+- which structured output the runtime should consume
+
+Do not bury those rules in a prompt and expect the runtime to infer them later.
+
+### 8. Put workflow handoffs behind contracts
+
+If one workflow hands off to another, declare the output contract and keep the schema in `.rupu/contracts/`.
+
+Good pattern:
+
+```yaml
+contracts:
+  outputs:
+    result:
+      from_step: handoff
+      format: json
+      schema: autoflow_outcome_v1
+```
+
+That gives you:
+
+- machine-readable validation
+- durable child-dispatch payloads
+- reviewable repo-local protocol files
+
+Without that, you are asking the runtime to parse prose. That does not scale.
+
 ---
 
 ## Recommended structure for real code work
@@ -165,6 +212,16 @@ That is easier to observe, approve, and recover.
 - human merge between phases
 - rerun the phase workflow for the next phase
 
+### Autonomous issue ownership
+
+- controller autoflow selects candidate issues
+- controller emits `dispatch` when a child workflow should run
+- child workflow owns one implementation phase or review cycle
+- child workflow emits a structured handoff back to the controller
+- `rupu autoflow tick` reconciles the repo repeatedly
+
+This is the right model when you want autonomy without inventing a second orchestration language.
+
 This is the practical way to get "agentic orchestration" without pretending the system has an infinite autonomous planning loop.
 
 ---
@@ -179,6 +236,8 @@ This is the practical way to get "agentic orchestration" without pretending the 
 | No explicit human gate | Risky actions happen too easily | Add `approval:` where ownership changes |
 | Huge prompts with hidden assumptions | Maintenance cost grows quickly | Keep prompts narrow and named |
 | Using `actions:` as a tool policy | It does not do that | Put tool limits in the agent file |
+| Parsing workflow handoffs from prose | Breaks under real automation | Declare `contracts:` and validate them |
+| Child autoflows with no owner precedence | Matching becomes non-deterministic | Use `autoflow.priority` intentionally |
 
 ---
 
@@ -193,6 +252,58 @@ Before you commit a workflow, verify that:
 - `for_each`, `parallel`, and `panel` are used only where they help
 - outputs consumed by later steps are shaped intentionally
 - large efforts are split into reviewable phases
+- autoflow ownership is explicit when the workflow is meant for `rupu autoflow`
+- matching precedence is deliberate when more than one autoflow can select the same issue
+- every autonomous handoff has a declared contract schema under `.rupu/contracts/`
+
+---
+
+## Autoflow authoring patterns
+
+### Controller autoflow
+
+Use when the repo needs one top-level policy owner that decides what to do next.
+
+Recommended shape:
+
+- high `autoflow.priority`
+- broad issue selector such as `labels_all: ["autoflow"]`
+- one step that emits `autoflow_outcome_v1`
+- `dispatch` to `issue-to-spec-and-plan` or `phase-delivery-cycle`
+
+### Direct phase autoflow
+
+Use when phase execution should take over immediately once the issue hits a specific state.
+
+Recommended shape:
+
+- lower priority than the controller by default
+- label-scoped selector such as `["autoflow", "phase:phase-1"]`
+- final step emits `autoflow_outcome_v1`
+- handoff can dispatch back to the controller after the phase is ready
+
+If you want the direct phase workflow to win instead of the controller, raise its `autoflow.priority`.
+
+### Repo binding and scheduling
+
+Autoflows do not discover repos from your shell `cwd`. They need an explicit repo binding:
+
+```sh
+rupu repos attach github:your-org/your-repo .
+```
+
+Then reconcile with:
+
+```sh
+rupu autoflow list
+rupu autoflow tick
+```
+
+Schedule `rupu autoflow tick` outside the workflow YAML:
+
+- macOS: `launchd`
+- Linux: `systemd --user` timer or cron
+- Windows: Task Scheduler
 
 ---
 

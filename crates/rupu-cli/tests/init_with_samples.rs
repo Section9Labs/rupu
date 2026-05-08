@@ -3,8 +3,10 @@
 
 use std::path::Path;
 
+use jsonschema::JSONSchema;
 use rupu_cli::cmd::init::{init_for_test, InitArgs};
 use rupu_cli::templates::MANIFEST;
+use rupu_orchestrator::Workflow;
 
 fn args(path: &Path) -> InitArgs {
     InitArgs {
@@ -48,5 +50,29 @@ fn samples_byte_match_dogfooded_files() {
             "drift between {} (rupu repo) and the embedded template",
             t.target_relpath
         );
+    }
+}
+
+#[test]
+fn sample_contract_schemas_compile() {
+    for t in MANIFEST
+        .iter()
+        .filter(|t| t.target_relpath.starts_with(".rupu/contracts/"))
+    {
+        let schema_json: serde_json::Value = serde_json::from_str(t.content)
+            .unwrap_or_else(|e| panic!("contract {} is not valid JSON: {e}", t.target_relpath));
+        JSONSchema::compile(&schema_json)
+            .unwrap_or_else(|e| panic!("contract {} does not compile: {e}", t.target_relpath));
+    }
+}
+
+#[test]
+fn sample_workflows_parse() {
+    for t in MANIFEST
+        .iter()
+        .filter(|t| t.target_relpath.starts_with(".rupu/workflows/"))
+    {
+        Workflow::parse(t.content)
+            .unwrap_or_else(|e| panic!("workflow {} failed to parse: {e}", t.target_relpath));
     }
 }

@@ -22,8 +22,10 @@ fn rupu_init_with_samples_smoke() {
         ".rupu/agents/review-diff.md",
         ".rupu/agents/repo-investigator.md",
         ".rupu/agents/scm-pr-review.md",
+        ".rupu/contracts/autoflow_outcome_v1.json",
         ".rupu/workflows/investigate-then-fix.yaml",
         ".rupu/workflows/phase-delivery-cycle.yaml",
+        ".rupu/workflows/issue-supervisor-dispatch.yaml",
     ] {
         assert!(
             stdout.contains(needle),
@@ -37,7 +39,10 @@ fn rupu_init_with_samples_smoke() {
 
     // Spot-check a couple of files actually exist.
     assert!(tmp.path().join(".rupu/agents/review-diff.md").exists());
-    assert!(tmp.path().join(".rupu/agents/repo-investigator.md").exists());
+    assert!(tmp
+        .path()
+        .join(".rupu/agents/repo-investigator.md")
+        .exists());
     assert!(tmp
         .path()
         .join(".rupu/workflows/investigate-then-fix.yaml")
@@ -45,6 +50,14 @@ fn rupu_init_with_samples_smoke() {
     assert!(tmp
         .path()
         .join(".rupu/workflows/phase-delivery-cycle.yaml")
+        .exists());
+    assert!(tmp
+        .path()
+        .join(".rupu/workflows/issue-supervisor-dispatch.yaml")
+        .exists());
+    assert!(tmp
+        .path()
+        .join(".rupu/contracts/autoflow_outcome_v1.json")
         .exists());
     assert!(tmp.path().join(".rupu/config.toml").exists());
     assert!(tmp.path().join(".gitignore").exists());

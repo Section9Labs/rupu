@@ -1,0 +1,54 @@
+name: issue-supervisor-dispatch
+description: Controller autoflow that decides what workflow should run next for an issue.
+autoflow:
+  enabled: true
+  entity: issue
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["autoflow"]
+    limit: 100
+  wake_on:
+    - github.issue.opened
+    - github.issue.labeled
+    - github.pull_request.closed
+    - github.pull_request.reopened
+  reconcile_every: "10m"
+  claim:
+    key: issue
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: issue-understander
+    actions: []
+    contract:
+      emits: autoflow_outcome_v1
+      format: json
+    prompt: |
+      You are the controller autoflow for issue #{{ issue.number }}.
+
+      Available context:
+      - issue title, body, and labels
+      - repo-local spec path: `docs/specs/issue-{{ issue.number }}.md`
+      - repo-local phase plan path: `docs/plans/issue-{{ issue.number }}.md`
+
+      Decide what workflow should run next.
+
+      Rules:
+      - If the spec or phase plan does not exist yet, dispatch `issue-to-spec-and-plan`.
+      - If a planned phase is ready to execute, dispatch `phase-delivery-cycle` and provide `phase` in `dispatch.inputs`.
+      - If the issue is waiting on a human merge or another external repo change, return `await_external`.
+      - If the issue is complete, return `complete`.
+
+      Return only valid JSON for `autoflow_outcome_v1`.
