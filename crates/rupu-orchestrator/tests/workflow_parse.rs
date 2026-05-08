@@ -698,3 +698,155 @@ steps:
     let err = Workflow::parse(s).unwrap_err().to_string();
     assert!(err.contains("contract disagree on `schema`"), "got: {err}");
 }
+
+// ── Template-reference lint ───────────────────────────────────────────
+
+#[test]
+fn lint_accepts_valid_step_field_reference() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: w
+    actions: []
+    prompt: hello
+  - id: b
+    agent: w
+    actions: []
+    prompt: |
+      prior output: {{ steps.a.output }}
+      success: {{ steps.a.success }}
+"#;
+    Workflow::parse(s).expect("valid step.field reference should parse");
+}
+
+#[test]
+fn lint_rejects_unknown_step_reference() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: w
+    actions: []
+    prompt: |
+      missing: {{ steps.does_not_exist.output }}
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("steps.does_not_exist") && err.contains("no step with that id"),
+        "expected unknown-step error, got: {err}"
+    );
+}
+
+#[test]
+fn lint_rejects_forward_step_reference() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: w
+    actions: []
+    prompt: |
+      from later: {{ steps.b.output }}
+  - id: b
+    agent: w
+    actions: []
+    prompt: hello
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("steps.b") && err.contains("forward reference"),
+        "expected forward-reference error, got: {err}"
+    );
+}
+
+#[test]
+fn lint_rejects_unknown_step_field() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: w
+    actions: []
+    prompt: hi
+  - id: b
+    agent: w
+    actions: []
+    prompt: |
+      typo: {{ steps.a.outupt }}
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("steps.a.outupt") && err.contains("not a known step-output field"),
+        "expected unknown-field error, got: {err}"
+    );
+}
+
+#[test]
+fn lint_accepts_deeper_paths_through_known_field() {
+    // sub_results.<sub_id>.output — first two segments validate
+    // (sub_results is a known field), deeper segments aren't checked.
+    let s = r#"
+name: x
+steps:
+  - id: review
+    actions: []
+    parallel:
+      - id: sec
+        agent: a
+        prompt: hello
+      - id: perf
+        agent: a
+        prompt: hello
+  - id: summary
+    agent: w
+    actions: []
+    prompt: |
+      sec: {{ steps.review.sub_results.sec.output }}
+      perf: {{ steps.review.sub_results.perf.output }}
+"#;
+    Workflow::parse(s).expect("deep paths through known fields should pass");
+}
+
+#[test]
+fn lint_validates_panel_subject_template() {
+    // Panel `subject:` is a templated string — references inside it
+    // must validate the same way prompts do.
+    let s = r#"
+name: x
+steps:
+  - id: review
+    actions: []
+    panel:
+      panelists: [a, b]
+      subject: "from earlier: {{ steps.nope.output }}"
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("steps.nope") && err.contains("no step with that id"),
+        "expected lint to walk panel.subject, got: {err}"
+    );
+}
+
+#[test]
+fn lint_validates_when_template() {
+    let s = r#"
+name: x
+steps:
+  - id: a
+    agent: w
+    actions: []
+    prompt: hi
+  - id: b
+    when: "{{ steps.a.maxx_severity == 'critical' }}"
+    agent: w
+    actions: []
+    prompt: hi
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(
+        err.contains("steps.a.maxx_severity"),
+        "expected when: lint to fire, got: {err}"
+    );
+}
+
