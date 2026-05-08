@@ -60,8 +60,9 @@ rupu run review-diff
 `rupu init --with-samples` seeds the focused single-agent helpers
 (`review-diff`, `add-tests`, `fix-bug`, `scaffold`, `summarize-diff`,
 `scm-pr-review`) plus a fuller project-oriented sample library for
-issue intake, spec writing, phase planning, PR review panels, and
-phased delivery under `.rupu/`. Re-running is a no-op; pass `--force`
+issue intake, spec writing, phase planning, PR review panels, phased
+delivery, contract schemas, and autonomous controller samples under
+`.rupu/`. Re-running is a no-op; pass `--force`
 to overwrite local template customizations with the latest embedded
 versions.
 
@@ -201,6 +202,9 @@ rupu run summarize-diff "summarize changes since main"
 |------|---------|
 | `~/.rupu/config.toml` | Global config (default provider, log level, …) |
 | `~/.rupu/auth.json` | Stored provider credentials |
+| `~/.rupu/repos/` | Repo-to-local-checkout bindings for autonomous runs |
+| `~/.rupu/autoflows/` | Persistent issue claims and worktree state |
+| `~/.rupu/contracts/` | Global reusable contract schemas |
 | `~/.rupu/transcripts/` | JSONL run transcripts |
 | `~/.rupu/cache/` | Scratch space + crash logs |
 | `~/.rupu/workspaces/` | Reserved for Slice C session state |
@@ -210,6 +214,7 @@ rupu run summarize-diff "summarize changes since main"
 | Path | Purpose |
 |------|---------|
 | `<project>/.rupu/agents/` | Agent `.md` files for this repo |
+| `<project>/.rupu/contracts/` | Repo-local JSON Schemas for workflow handoffs |
 | `<project>/.rupu/workflows/` | Workflow YAML files for this repo |
 | `<project>/.rupu/config.toml` | Project-local config overrides |
 

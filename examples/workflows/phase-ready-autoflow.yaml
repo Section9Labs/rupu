@@ -1,0 +1,112 @@
+name: phase-ready-autoflow
+description: Direct autonomous phase workflow that determines the ready phase from issue context before implementing it.
+autoflow:
+  enabled: true
+  entity: issue
+  priority: 200
+  selector:
+    states: ["open"]
+    labels_all: ["autoflow", "phase:phase-1"]
+    limit: 100
+  wake_on:
+    - github.issue.labeled
+    - github.pull_request.closed
+    - github.pull_request.reopened
+  reconcile_every: "10m"
+  claim:
+    key: issue
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: result
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: determine_phase
+    agent: phase-planner
+    actions: []
+    prompt: |
+      Read `docs/plans/issue-{{ issue.number }}.md` and inspect the issue labels.
+
+      Determine which phase is currently ready to execute.
+
+      Return:
+      - the exact phase id
+      - the scoped tasks for that phase
+      - focused validation
+      - done criteria
+
+  - id: implement
+    agent: repo-implementer
+    actions: []
+    prompt: |
+      Implement the ready phase for issue #{{ issue.number }}.
+
+      Use this scoped plan:
+      {{ steps.determine_phase.output }}
+
+      Constraints:
+      - keep the change limited to that one phase
+      - create or switch to the appropriate phase branch
+      - do not open a PR yet
+      - end with branch name, changed files, and validation summary
+
+  - id: open_pr
+    agent: pr-author
+    actions: []
+    prompt: |
+      Open a draft PR for the ready phase of issue #{{ issue.number }}.
+
+      Context:
+      {{ steps.implement.output }}
+
+      Requirements:
+      - first response line must be `PR: <platform>:owner/repo#number`
+      - title must include the phase id from the implementation summary
+      - include scope, validation, and follow-up notes in the PR body
+
+  - id: review_panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - performance-reviewer
+        - maintainability-reviewer
+      subject: |
+        Review this draft PR for issue #{{ issue.number }}.
+
+        {{ steps.open_pr.output }}
+
+        Intended scope:
+        {{ steps.determine_phase.output }}
+      max_parallel: 3
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: finding-fixer
+        max_iterations: 4
+
+  - id: result
+    agent: writer
+    actions: []
+    contract:
+      emits: autoflow_outcome_v1
+      format: json
+    prompt: |
+      Return only valid JSON for `autoflow_outcome_v1`.
+
+      Context:
+      - issue #{{ issue.number }}
+      - phase summary: {{ steps.determine_phase.output }}
+      - PR summary: {{ steps.open_pr.output }}
+      - max severity: {{ steps.review_panel.max_severity }}
+      - remaining findings: {{ steps.review_panel.findings | length }}
+
+      Use this direct-autonomous pattern:
+      - `status: "await_human"` when the PR is ready for human review
+      - `status: "blocked"` if the remaining findings still need manual intervention

@@ -1,5 +1,32 @@
 name: phase-delivery-cycle
 description: Execute one planned phase, open a draft PR, run a review panel, and pause for human approval.
+autoflow:
+  enabled: true
+  entity: issue
+  priority: 50
+  selector:
+    states: ["open"]
+    labels_all: ["autoflow", "phase:phase-1"]
+    limit: 100
+  wake_on:
+    - github.issue.labeled
+    - github.pull_request.closed
+    - github.pull_request.reopened
+  reconcile_every: "10m"
+  claim:
+    key: issue
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: handoff
+      format: json
+      schema: autoflow_outcome_v1
 inputs:
   phase:
     type: string
@@ -93,3 +120,25 @@ steps:
 
       Use this implementation summary:
       {{ steps.implement.output }}
+
+  - id: handoff
+    agent: writer
+    actions: []
+    contract:
+      emits: autoflow_outcome_v1
+      format: json
+    prompt: |
+      Return only valid JSON for `autoflow_outcome_v1`.
+
+      Context:
+      - issue #{{ issue.number }}
+      - phase `{{ inputs.phase }}`
+      - PR summary: {{ steps.open_pr.output }}
+      - panel max severity: {{ steps.review_panel.max_severity }}
+      - remaining findings: {{ steps.review_panel.findings | length }}
+
+      Emit:
+      - `status: "continue"`
+      - a short `summary`
+      - a `dispatch` object that hands control back to `issue-supervisor-dispatch`
+        for the same issue target with no extra inputs

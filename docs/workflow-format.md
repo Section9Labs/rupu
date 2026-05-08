@@ -16,6 +16,8 @@ A workflow can:
 - run structured review panels with `panel:`
 - pause for human approval with `approval:`
 - start manually, on cron, or from an event trigger
+- carry contract-validated outputs for downstream automation
+- opt into persistent autonomous reconciliation with `autoflow:`
 
 Step prompts are rendered with minijinja templates against workflow inputs, prior step outputs, and optional issue / event context.
 
@@ -49,6 +51,8 @@ Resolution rules match agents:
 | `trigger` | object | no | `manual` | Manual, cron, or event trigger |
 | `inputs` | map | no | `{}` | Typed runtime inputs |
 | `defaults` | object | no | `{}` | Workflow-wide defaults |
+| `contracts` | object | no | `{}` | Named structured outputs validated against JSON Schema |
+| `autoflow` | object | no | none | Autonomous ownership metadata for `rupu autoflow ...` |
 | `notifyIssue` | bool | no | `false` | Auto-comment only when the run target is an issue |
 | `steps` | array<Step> | yes | — | Ordered step list |
 
@@ -127,6 +131,119 @@ If a step does not set `continue_on_error`, it inherits the workflow default.
 
 ---
 
+## `autoflow:` block
+
+Use `autoflow:` when the same workflow file should also be runnable through:
+
+```sh
+rupu autoflow run <name> <issue-ref>
+rupu autoflow tick
+```
+
+Example:
+
+```yaml
+autoflow:
+  enabled: true
+  entity: issue
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["autoflow"]
+    limit: 100
+  wake_on:
+    - github.issue.opened
+    - github.issue.labeled
+    - github.pull_request.closed
+  reconcile_every: "10m"
+  claim:
+    key: issue
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+```
+
+Fields:
+
+| Key | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `enabled` | bool | no | `false` | Workflow appears under `rupu autoflow list` only when true |
+| `entity` | `issue` | no | `issue` | v1 supports issue ownership only |
+| `priority` | integer | no | `0` | Higher wins when multiple autoflows match the same issue |
+| `selector.states` | array<`open`\|`closed`> | no | `[]` | Empty means any issue state |
+| `selector.labels_all` | array<string> | no | `[]` | Every listed label must be present |
+| `selector.limit` | integer | no | none | Candidate cap per reconciliation cycle |
+| `wake_on` | array<string> | no | `[]` | Event ids used as wake hints |
+| `reconcile_every` | duration | no | none | Re-run cadence like `10m`, `2h`, `1d` |
+| `claim.key` | `issue` | no | `issue` | v1 claim granularity |
+| `claim.ttl` | duration | no | none | Lease duration for persistent issue ownership |
+| `workspace.strategy` | `worktree`\|`in_place` | no | `worktree` | How repo files are materialized |
+| `workspace.branch` | string | no | generated | Strict-rendered branch template |
+| `outcome.output` | string | yes for autoflows | none | Name of the declared workflow output to consume |
+
+Notes:
+
+- `autoflow:` does not replace `trigger:`. `trigger:` still describes one-shot starts; `autoflow:` describes persistent ownership over time.
+- Workflow files remain usable with `rupu workflow run`; autoflow semantics activate only under `rupu autoflow ...`.
+- `autoflow` template rendering is strict. Missing variables are a protocol error in autonomous mode.
+- Matching precedence is deterministic: higher `priority` wins, then workflow name.
+
+Typical pattern:
+
+- a high-priority controller autoflow like `issue-supervisor-dispatch`
+- one or more lower-priority child autoflows such as a phase-delivery workflow
+- explicit `dispatch` objects in the output contract when one workflow should hand off to another
+
+---
+
+## `contracts:` block
+
+Use `contracts:` to name machine-readable workflow outputs and validate them against schemas stored under:
+
+```text
+<project>/.rupu/contracts/
+~/.rupu/contracts/
+```
+
+Project-local contracts shadow global contracts by name.
+
+Example:
+
+```yaml
+contracts:
+  outputs:
+    result:
+      from_step: handoff
+      format: json
+      schema: autoflow_outcome_v1
+```
+
+Fields:
+
+| Key | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `outputs.<name>.from_step` | string | yes | Step id whose final output is the canonical value |
+| `outputs.<name>.format` | `json`\|`yaml` | yes | Serialization expected from the step output |
+| `outputs.<name>.schema` | string | yes | Contract name resolved to `.json` schema file |
+
+Why this matters:
+
+- autoflows need structured outcomes instead of free-form prose
+- controller workflows need durable child-dispatch payloads
+- later workflows can depend on stable artifacts like phase plans or review packets
+
+Common shipped schemas:
+
+- `autoflow_outcome_v1`
+- `workflow_dispatch_v1`
+- `phase_plan_v1`
+- `review_packet_v1`
+
+---
+
 ## Step fields
 
 Every step has an `id` and exactly one execution shape:
@@ -146,6 +263,7 @@ Common fields:
 | `continue_on_error` | bool | all steps | Tolerates failure and continues |
 | `max_parallel` | integer | `for_each`, `parallel`, `panel` | Concurrency cap, must be at least 1 |
 | `approval` | object | all steps | Human pause before the step dispatches |
+| `contract` | object | linear steps | Optional documentation for a structured step output |
 
 ### `actions`
 
@@ -201,6 +319,34 @@ Behavior:
 - resume with `rupu workflow approve <run-id>`
 - reject with `rupu workflow reject <run-id> --reason "..."`
 - timeouts are enforced lazily on the next run-store interaction
+
+### `contract`
+
+Use `contract:` on a step when humans and prompts should see the expected output shape directly on the step:
+
+```yaml
+- id: handoff
+  agent: writer
+  actions: []
+  contract:
+    emits: autoflow_outcome_v1
+    format: json
+  prompt: |
+    Return only valid JSON for `autoflow_outcome_v1`.
+```
+
+Fields:
+
+| Key | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `emits` | string | yes | Contract name the step is expected to emit |
+| `format` | `json`\|`yaml` | yes | Serialization the step should return |
+
+Important:
+
+- workflow-level `contracts.outputs.*` remains the runtime authority
+- step-level `contract:` is authoring metadata
+- if the step metadata disagrees with the workflow output declaration, the workflow is invalid
 
 ---
 

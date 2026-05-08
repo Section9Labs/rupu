@@ -25,6 +25,7 @@ Inside a repo, `rupu` looks for:
 ```text
 <repo>/.rupu/
   agents/
+  contracts/
   workflows/
   config.toml
 ```
@@ -34,9 +35,12 @@ Global state lives under:
 ```text
 ~/.rupu/
   agents/
+  contracts/
   workflows/
   config.toml
   auth.json
+  repos/
+  autoflows/
   transcripts/
   runs/
 ```
@@ -53,7 +57,7 @@ Project-local agents and workflows shadow global ones with the same `name:`.
 rupu init --with-samples --git
 ```
 
-This creates `.rupu/agents/`, `.rupu/workflows/`, and `.rupu/config.toml`.
+This creates `.rupu/agents/`, `.rupu/workflows/`, `.rupu/config.toml`, and the sample set also seeds `.rupu/contracts/`.
 
 ### 2. Authenticate at least one model provider
 
@@ -88,6 +92,24 @@ repo = "your-repo"
 [issues.default]
 tracker = "github"
 project = "your-org/your-repo"
+```
+
+### 4. Attach the repo if you want autonomous issue ownership
+
+Autoflows need a repo-to-local-checkout binding:
+
+```sh
+rupu repos attach github:your-org/your-repo .
+```
+
+Optional autonomous defaults:
+
+```toml
+[autoflow]
+enabled = true
+repo = "github:your-org/your-repo"
+permission_mode = "bypass"
+strict_templates = true
 ```
 
 ---
@@ -163,6 +185,17 @@ rupu issues list --repo github:your-org/your-repo
 rupu issues show github:your-org/your-repo/issues/42
 ```
 
+### Inspect and run autoflows
+
+```sh
+rupu autoflow list
+rupu autoflow show issue-supervisor-dispatch
+rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
+rupu autoflow tick
+rupu autoflow status
+rupu autoflow claims
+```
+
 ---
 
 ## Targets and execution context
@@ -182,6 +215,7 @@ Behavior:
 
 - repo and PR / MR targets clone to a temp workspace for the run
 - issue targets do not clone; the workflow runs in the current checkout and receives `{{ issue.* }}` metadata
+- autoflow issue cycles prefer persistent worktrees under `~/.rupu/autoflows/worktrees/`
 
 Practical implication:
 
@@ -219,6 +253,32 @@ Use workflows when work crosses boundaries:
 - PR review loops
 
 Examples are in [development-flows.md](development-flows.md) and [examples/README.md](../examples/README.md).
+
+### Autoflow mode
+
+Use autoflows when the same workflow should keep owning an issue over time.
+
+Typical pattern:
+
+- attach the repo once with `rupu repos attach`
+- declare `autoflow:` and `contracts:` in the workflow YAML
+- store schemas under `.rupu/contracts/`
+- run `rupu autoflow tick` from a scheduler
+
+Examples:
+
+```sh
+rupu autoflow show issue-supervisor-dispatch
+rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
+rupu autoflow tick
+```
+
+Two useful shapes:
+
+- controller autoflow: selects the next workflow and emits `dispatch`
+- direct autoflow: owns one issue phase directly and returns `await_human` or `complete`
+
+See [workflow-format.md](workflow-format.md) for the `autoflow:` and `contracts:` schema and [examples/README.md](../examples/README.md) for copyable controller and direct examples.
 
 ---
 
@@ -316,6 +376,7 @@ Use this when you want Claude Desktop, Cursor, or another MCP host to operate on
 3. promote repeated multi-step work into workflows
 4. add issue-target workflows
 5. add panel review and approval gates
-6. add cron or webhook triggers only after the manual flows are solid
+6. attach the repo and add autoflows only after manual workflows are solid
+7. add cron or webhook wakeups only after the autonomous loop is stable
 
 That path keeps the system observable and avoids automating a weak process.
