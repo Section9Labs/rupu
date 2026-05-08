@@ -99,3 +99,35 @@ fn directory_passed_as_config_returns_error() {
         );
     }
 }
+
+#[test]
+fn project_overrides_global_autoflow_table() {
+    let g = tmp_with(
+        r#"
+[autoflow]
+enabled = true
+repo = "github:Section9Labs/rupu"
+worktree_root = "~/.rupu/autoflows/worktrees"
+strict_templates = true
+"#,
+    );
+    let p = tmp_with(
+        r#"
+[autoflow]
+strict_templates = false
+max_active = 3
+"#,
+    );
+    let cfg = layer_files(Some(g.path()), Some(p.path())).unwrap();
+    assert_eq!(cfg.autoflow.enabled, Some(true));
+    assert_eq!(
+        cfg.autoflow.repo.as_deref(),
+        Some("github:Section9Labs/rupu")
+    );
+    assert_eq!(
+        cfg.autoflow.worktree_root.as_deref(),
+        Some("~/.rupu/autoflows/worktrees")
+    );
+    assert_eq!(cfg.autoflow.strict_templates, Some(false));
+    assert_eq!(cfg.autoflow.max_active, Some(3));
+}

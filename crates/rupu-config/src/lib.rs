@@ -6,6 +6,7 @@
 //! globals so users can subtract). See [`layer::layer_files`] for the
 //! merge rules.
 
+pub mod autoflow_config;
 pub mod config;
 
 // `layer_files` is implemented in Task 8 (TDD); the module exists here so
@@ -20,6 +21,7 @@ pub mod scm_config;
 
 pub mod triggers_config;
 
+pub use autoflow_config::{AutoflowCheckout, AutoflowConfig};
 pub use config::{BashConfig, Config, RetryConfig, UiConfig};
 pub use layer::{layer_files, LayerError};
 pub use pricing_config::{ModelPricing, PricingConfig};

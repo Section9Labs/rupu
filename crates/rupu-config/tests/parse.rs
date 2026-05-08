@@ -27,6 +27,16 @@ fn parses_full_config() {
         [retry]
         max_attempts = 3
         initial_delay_ms = 200
+
+        [autoflow]
+        enabled = true
+        repo = "github:Section9Labs/rupu"
+        checkout = "worktree"
+        worktree_root = "~/.rupu/autoflows/worktrees"
+        permission_mode = "bypass"
+        strict_templates = true
+        max_active = 2
+        cleanup_after = "7d"
     "#;
     let cfg: Config = toml::from_str(toml).expect("parse");
     assert_eq!(cfg.permission_mode.as_deref(), Some("ask"));
@@ -37,6 +47,12 @@ fn parses_full_config() {
         Some(vec!["MY_VAR".into(), "AWS_PROFILE".into()])
     );
     assert_eq!(cfg.retry.max_attempts, Some(3));
+    assert_eq!(cfg.autoflow.enabled, Some(true));
+    assert_eq!(
+        cfg.autoflow.repo.as_deref(),
+        Some("github:Section9Labs/rupu")
+    );
+    assert_eq!(cfg.autoflow.max_active, Some(2));
 }
 
 #[test]
