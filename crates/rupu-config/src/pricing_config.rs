@@ -75,9 +75,7 @@ impl ModelPricing {
         let cached = cached_tokens.min(input_tokens) as f64;
         let uncached_input = (input_tokens.saturating_sub(cached_tokens)) as f64;
         let output = output_tokens as f64;
-        let cached_rate = self
-            .cached_input_per_mtok
-            .unwrap_or(self.input_per_mtok);
+        let cached_rate = self.cached_input_per_mtok.unwrap_or(self.input_per_mtok);
         (uncached_input * self.input_per_mtok
             + cached * cached_rate
             + output * self.output_per_mtok)
@@ -183,7 +181,12 @@ output_per_mtok = 15.0
         assert_eq!(sonnet.output_per_mtok, 15.0);
         assert_eq!(sonnet.cached_input_per_mtok, Some(0.30));
 
-        let gpt5 = cfg.models.get("openai").and_then(|m| m.get("gpt-5")).copied().unwrap();
+        let gpt5 = cfg
+            .models
+            .get("openai")
+            .and_then(|m| m.get("gpt-5"))
+            .copied()
+            .unwrap();
         assert_eq!(gpt5.cached_input_per_mtok, None);
 
         let agent = cfg.agents.get("security-reviewer").copied().unwrap();

@@ -159,7 +159,12 @@ fn strip_date_suffix(model: &str) -> &str {
 ///
 /// Returns `None` when no tier yields a price; callers render that as
 /// a placeholder (`—`) in the cost column.
-pub fn lookup(cfg: &PricingConfig, provider: &str, model: &str, agent: &str) -> Option<ModelPricing> {
+pub fn lookup(
+    cfg: &PricingConfig,
+    provider: &str,
+    model: &str,
+    agent: &str,
+) -> Option<ModelPricing> {
     let canon_provider = canonicalize_provider(provider);
     let no_tag = strip_model_tag(model);
     let no_date = strip_date_suffix(no_tag);
@@ -385,9 +390,6 @@ mod tests {
     #[test]
     fn strip_date_suffix_strips_trailing_iso_date() {
         assert_eq!(strip_date_suffix("gpt-5-2025-08-07"), "gpt-5");
-        assert_eq!(
-            strip_date_suffix("gpt-4o-mini-2024-07-18"),
-            "gpt-4o-mini"
-        );
+        assert_eq!(strip_date_suffix("gpt-4o-mini-2024-07-18"), "gpt-4o-mini");
     }
 }

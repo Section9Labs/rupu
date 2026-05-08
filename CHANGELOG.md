@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.3 — GitHub auth fix + token cost tracking + completion polish (2026-05-07)
+
+### Fixed
+- **GitHub OAuth: switch from Copilot GitHub App to gh OAuth App.** rupu's GitHub `--mode sso` flow previously impersonated the GitHub Copilot client_id (`Iv1.b507a08c87ecfe98`), which is a *GitHub App*. GitHub App user-to-server tokens grant per-installation access — they don't carry OAuth scopes — so private repos in non-Copilot-installed orgs were silently invisible regardless of what scopes we requested. Switched to gh's public OAuth App client_id (`178c6fc778ccc68e1d6a`); resulting tokens are classic OAuth tokens that expose `X-OAuth-Scopes: repo, read:org, …` and list private repos as expected. UX matches `gh auth login`. Long-term `Register rupu-specific OAuth clients with each vendor` (TODO.md) remains the proper cure.
+- **`repos list` private-repo diagnostic now distinguishes GitHub App tokens from OAuth tokens.** v0.5.2's "missing `repo` scope" warning fired with `(current scopes: (none))` for any GitHub App-issued token — but those don't have OAuth scopes at all, so re-logging in via `--mode sso` chased the user in circles. Three-case handler in `cmd::repos::emit_private_repo_diag` distinguishes (a) empty scopes = GitHub App token (explain installation model + suggest classic PAT), (b) classic OAuth missing `repo` (re-login or PAT swap), (c) `repo` present (stay quiet — empty list is genuine).
+
+### Added
+- **Token cost tracking.** New `[pricing]` section in `config.toml` lets users declare per-million-token rates per (provider, model). Run-records pick up COST columns end-to-end so `rupu workflow runs` and the per-step transcript views show $$ alongside tokens. Default pricing for the major Anthropic / OpenAI / Gemini SKUs ships embedded; override or add your own in config. New `rupu-cli/src/pricing.rs` + `rupu-config/src/pricing_config.rs` (PR #94).
+- **zsh completion filters flags from positional value completion.** `rupu workflow run <TAB>` no longer mixes `--input` / `--mode` / `--canvas` flag candidates into the workflow-name list. The hand-rolled zsh bootstrap classifies each candidate by whether its value-segment starts with `-` and only surfaces the bucket matching what the user is typing. `rupu workflow run --<TAB>` (typing a flag) still shows flags. bash / fish keep their existing `clap_complete` behavior — same logic can be ported in a follow-up.
+- **Empty-completion hint.** When `rupu workflow run <TAB>` (or any positional that completes agent/workflow names) returns no value candidates, zsh now emits a dim `_message` line: *"no agents/workflows found in cwd or ~/.rupu — try `rupu init --with-samples`"*. Previously the user just saw silence and had to guess what was missing.
+
+### Changed
+- **`rupu issues list` truncates labels at 3 with `…` overflow indicator.** Issues with many labels were wrapping table rows multi-line, breaking grep / scripting. Capped at 3 visible labels per row + a dim `…+N` chip when more exist. Full list still available via `rupu issues show <ref>`.
+
 ## v0.5.2 — `repos list` token-scope diagnostic (2026-05-07)
 
 ### Added

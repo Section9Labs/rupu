@@ -484,10 +484,7 @@ fn aggregate_run_usage_from_store(
 /// `—` when the run had no Usage events (fresh in-flight run, or one
 /// that failed before the first turn).
 fn format_tokens_cell(rows: &[rupu_transcript::UsageRow]) -> String {
-    let total: u64 = rows
-        .iter()
-        .map(|r| r.input_tokens + r.output_tokens)
-        .sum();
+    let total: u64 = rows.iter().map(|r| r.input_tokens + r.output_tokens).sum();
     if total == 0 {
         return "—".into();
     }
