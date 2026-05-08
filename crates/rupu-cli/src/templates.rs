@@ -50,8 +50,80 @@ pub const MANIFEST: &[Template] = &[
         content: include_str!("../templates/agents/scm-pr-review.md"),
     },
     Template {
+        target_relpath: ".rupu/agents/repo-investigator.md",
+        content: include_str!("../templates/agents/repo-investigator.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/repo-implementer.md",
+        content: include_str!("../templates/agents/repo-implementer.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/code-reviewer.md",
+        content: include_str!("../templates/agents/code-reviewer.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/issue-understander.md",
+        content: include_str!("../templates/agents/issue-understander.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/spec-writer.md",
+        content: include_str!("../templates/agents/spec-writer.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/phase-planner.md",
+        content: include_str!("../templates/agents/phase-planner.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/pr-author.md",
+        content: include_str!("../templates/agents/pr-author.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/issue-commenter.md",
+        content: include_str!("../templates/agents/issue-commenter.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/writer.md",
+        content: include_str!("../templates/agents/writer.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/security-reviewer.md",
+        content: include_str!("../templates/agents/security-reviewer.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/performance-reviewer.md",
+        content: include_str!("../templates/agents/performance-reviewer.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/maintainability-reviewer.md",
+        content: include_str!("../templates/agents/maintainability-reviewer.md"),
+    },
+    Template {
+        target_relpath: ".rupu/agents/finding-fixer.md",
+        content: include_str!("../templates/agents/finding-fixer.md"),
+    },
+    Template {
         target_relpath: ".rupu/workflows/investigate-then-fix.yaml",
         content: include_str!("../templates/workflows/investigate-then-fix.yaml"),
+    },
+    Template {
+        target_relpath: ".rupu/workflows/quick-bugfix.yaml",
+        content: include_str!("../templates/workflows/quick-bugfix.yaml"),
+    },
+    Template {
+        target_relpath: ".rupu/workflows/review-changed-files.yaml",
+        content: include_str!("../templates/workflows/review-changed-files.yaml"),
+    },
+    Template {
+        target_relpath: ".rupu/workflows/code-review-panel.yaml",
+        content: include_str!("../templates/workflows/code-review-panel.yaml"),
+    },
+    Template {
+        target_relpath: ".rupu/workflows/issue-to-spec-and-plan.yaml",
+        content: include_str!("../templates/workflows/issue-to-spec-and-plan.yaml"),
+    },
+    Template {
+        target_relpath: ".rupu/workflows/phase-delivery-cycle.yaml",
+        content: include_str!("../templates/workflows/phase-delivery-cycle.yaml"),
     },
 ];
 

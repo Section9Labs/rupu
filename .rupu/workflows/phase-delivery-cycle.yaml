@@ -1,0 +1,95 @@
+name: phase-delivery-cycle
+description: Execute one planned phase, open a draft PR, run a review panel, and pause for human approval.
+inputs:
+  phase:
+    type: string
+    required: true
+steps:
+  - id: phase_scope
+    agent: repo-investigator
+    actions: []
+    prompt: |
+      Read `docs/plans/issue-{{ issue.number }}.md` and extract the exact
+      scope for phase `{{ inputs.phase }}`.
+
+      Return:
+      - a short scope summary
+      - the likely touched files or modules
+      - focused validation to run
+      - what counts as done for this phase
+
+  - id: implement
+    agent: repo-implementer
+    actions: []
+    prompt: |
+      Implement phase `{{ inputs.phase }}` for issue #{{ issue.number }}.
+
+      Use this scoped plan:
+      {{ steps.phase_scope.output }}
+
+      Constraints:
+      - keep the change limited to this phase
+      - create or switch to branch `issue-{{ issue.number }}-{{ inputs.phase }}`
+      - do not open a PR yet
+      - end with branch name, changed files, and validation summary
+
+  - id: open_pr
+    agent: pr-author
+    actions: []
+    prompt: |
+      Open a draft PR for phase `{{ inputs.phase }}` of issue #{{ issue.number }}.
+
+      Context:
+      {{ steps.implement.output }}
+
+      Requirements:
+      - first response line must be `PR: <platform>:owner/repo#number`
+      - title format: `[Issue #{{ issue.number }}][{{ inputs.phase }}] <short title>`
+      - include scope, validation, and follow-up notes in the PR body
+
+  - id: review_panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - performance-reviewer
+        - maintainability-reviewer
+      subject: |
+        Review this draft PR for phase `{{ inputs.phase }}` of issue #{{ issue.number }}.
+
+        {{ steps.open_pr.output }}
+
+        Intended scope:
+        {{ steps.phase_scope.output }}
+      max_parallel: 3
+      gate:
+        until_no_findings_at_severity_or_above: high
+        fix_with: finding-fixer
+        max_iterations: 4
+
+  - id: ready_for_merge
+    agent: issue-commenter
+    actions: []
+    approval:
+      required: true
+      prompt: |
+        Phase `{{ inputs.phase }}` for issue #{{ issue.number }} is ready for human review.
+
+        PR:
+        {{ steps.open_pr.output }}
+
+        Final panel state:
+        - max severity: {{ steps.review_panel.max_severity }}
+        - remaining findings: {{ steps.review_panel.findings | length }}
+
+        Approve to post the ready-for-merge issue comment.
+    prompt: |
+      Post a concise issue comment on issue #{{ issue.number }} stating:
+      - phase `{{ inputs.phase }}` is implemented
+      - the draft PR reference
+      - the validation summary from implementation
+      - the panel iterations and remaining findings count
+      - that the PR is ready for human review and merge
+
+      Use this implementation summary:
+      {{ steps.implement.output }}

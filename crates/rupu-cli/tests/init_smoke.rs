@@ -20,8 +20,10 @@ fn rupu_init_with_samples_smoke() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for needle in [
         ".rupu/agents/review-diff.md",
+        ".rupu/agents/repo-investigator.md",
         ".rupu/agents/scm-pr-review.md",
         ".rupu/workflows/investigate-then-fix.yaml",
+        ".rupu/workflows/phase-delivery-cycle.yaml",
     ] {
         assert!(
             stdout.contains(needle),
@@ -35,9 +37,14 @@ fn rupu_init_with_samples_smoke() {
 
     // Spot-check a couple of files actually exist.
     assert!(tmp.path().join(".rupu/agents/review-diff.md").exists());
+    assert!(tmp.path().join(".rupu/agents/repo-investigator.md").exists());
     assert!(tmp
         .path()
         .join(".rupu/workflows/investigate-then-fix.yaml")
+        .exists());
+    assert!(tmp
+        .path()
+        .join(".rupu/workflows/phase-delivery-cycle.yaml")
         .exists());
     assert!(tmp.path().join(".rupu/config.toml").exists());
     assert!(tmp.path().join(".gitignore").exists());

@@ -1,0 +1,54 @@
+name: issue-to-spec-and-plan
+description: Turn an issue into a repo-local spec document and phased implementation plan.
+notifyIssue: true
+steps:
+  - id: understand
+    agent: issue-understander
+    actions: []
+    prompt: |
+      Read issue #{{ issue.number }} on {{ issue.r.project }}.
+
+      Title: {{ issue.title }}
+      Labels: {{ issue.labels | join(", ") }}
+
+      Body:
+      {{ issue.body }}
+
+      Produce an implementation-ready understanding of the work.
+
+  - id: spec
+    agent: spec-writer
+    actions: []
+    prompt: |
+      Create `docs/specs/issue-{{ issue.number }}.md` from this issue analysis:
+
+      {{ steps.understand.output }}
+
+      Make the spec specific to this repo.
+      Return the written file path and a brief summary.
+
+  - id: plan
+    agent: phase-planner
+    actions: []
+    prompt: |
+      Read `docs/specs/issue-{{ issue.number }}.md` and create
+      `docs/plans/issue-{{ issue.number }}.md`.
+
+      Split the work into reviewable phases. Each phase should fit in
+      one PR and should include validation and exit criteria.
+
+      Return the numbered phase list.
+
+  - id: comment_back
+    agent: issue-commenter
+    actions: []
+    prompt: |
+      Post a concise issue comment for issue #{{ issue.number }}.
+
+      Mention:
+      - the spec file path
+      - the plan file path
+      - the proposed phases
+
+      Use this plan output:
+      {{ steps.plan.output }}

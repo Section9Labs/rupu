@@ -1,6 +1,6 @@
 //! Verifies that running `rupu agent list` and `rupu workflow list`
-//! from the rupu repo's own checkout surfaces the 5 sample agents
-//! and 1 sample workflow under `.rupu/` via normal project-discovery.
+//! from the rupu repo's own checkout surfaces the repo-local sample
+//! library under `.rupu/` via normal project-discovery.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
