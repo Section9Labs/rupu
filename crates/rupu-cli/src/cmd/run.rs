@@ -33,6 +33,18 @@ pub struct Args {
     /// Skip token streaming; receive the full response at once.
     #[arg(long)]
     pub no_stream: bool,
+    /// For `<platform>:<owner>/<repo>` targets: clone into this
+    /// directory instead of the default `./<repo>/`. The directory
+    /// must not already exist (refuse-by-default — pass an explicit
+    /// path you own). Mutually exclusive with `--tmp`.
+    #[arg(long, value_name = "PATH", conflicts_with = "tmp")]
+    pub into: Option<std::path::PathBuf>,
+    /// For `<platform>:<owner>/<repo>` targets: clone into a
+    /// temporary directory that is auto-deleted on exit. Useful for
+    /// one-shot agents that produce findings without modifying the
+    /// repo. Mutually exclusive with `--into`.
+    #[arg(long, conflicts_with = "into")]
+    pub tmp: bool,
 }
 
 pub async fn handle(args: Args) -> ExitCode {
@@ -168,10 +180,19 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         None => spec.system_prompt.clone(),
     };
 
-    // Clone the target repo into a tmpdir for Repo/Pr targets unless the
-    // cwd is already that checkout. Issue targets don't need a clone.
-    // _clone_guard is bound at function scope so its Drop runs on return,
-    // keeping the directory alive for the duration of the run.
+    // Clone the target repo for Repo/Pr targets. Three destination
+    // modes, in priority order:
+    //   1. `--tmp`           → tempfile::TempDir, auto-deleted on exit
+    //   2. `--into <path>`   → that path, persistent. Refuse if it exists.
+    //   3. (no flag)         → `./<repo>/` in cwd, persistent. Refuse if it exists.
+    //
+    // Refuse-by-default on existing paths to protect uncommitted work
+    // and prevent surprising clobbers. The error message points at the
+    // available escape hatches.
+    //
+    // _clone_guard holds the TempDir handle in mode 1 so Drop runs on
+    // function exit, keeping the directory alive for the run. Modes 2
+    // and 3 set it to None — the user owns cleanup.
     let _clone_guard: Option<tempfile::TempDir>;
     let workspace_path: std::path::PathBuf = match run_target.as_ref() {
         Some(crate::run_target::RunTarget::Repo {
@@ -198,11 +219,16 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
                     platform
                 )
             })?;
-            let tmp = tempfile::tempdir()?;
-            conn.clone_to(&r, tmp.path()).await?;
-            let path = tmp.path().to_path_buf();
-            _clone_guard = Some(tmp);
-            path
+
+            let (dest, guard) = resolve_clone_dest(&pwd, repo, args.into.as_deref(), args.tmp)?;
+            // Brief progress line on stderr so the user knows where the
+            // clone is landing — the LineStreamPrinter rail has already
+            // printed `▶ <agent>` on stdout and we don't want to break
+            // its visual flow with a clone-progress line in the middle.
+            eprintln!("  cloning {}/{} → {}", owner, repo, dest.display());
+            conn.clone_to(&r, &dest).await?;
+            _clone_guard = guard;
+            dest
         }
         _ => {
             _clone_guard = None;
@@ -354,6 +380,88 @@ fn pick_decider(mode: PermissionMode) -> Arc<dyn PermissionDecider> {
         PermissionMode::Bypass => Arc::new(BypassDecider),
         PermissionMode::Readonly => Arc::new(ReadonlyDecider),
         PermissionMode::Ask => Arc::new(AskDecider),
+    }
+}
+
+/// Resolve where to clone a `<platform>:<owner>/<repo>` target. Returns
+/// `(destination_path, optional_tempdir_guard)`. The guard, when
+/// `Some`, must be held alive for the duration of the run so its Drop
+/// (which deletes the directory) doesn't fire early.
+///
+/// Three modes, in priority order:
+///   1. `tmp == true`              → fresh `tempfile::TempDir`
+///   2. `into = Some(p)`           → `p`, persistent. Must not exist.
+///   3. (default)                  → `cwd / <repo>`, persistent. Must not exist.
+///
+/// Modes 2 and 3 refuse-by-default on existing paths to protect
+/// uncommitted work; the error message points at `--into`, `--tmp`,
+/// or removing the existing directory as escape hatches.
+fn resolve_clone_dest(
+    cwd: &std::path::Path,
+    repo: &str,
+    into: Option<&std::path::Path>,
+    tmp: bool,
+) -> anyhow::Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
+    if tmp {
+        let td = tempfile::tempdir()?;
+        let path = td.path().to_path_buf();
+        return Ok((path, Some(td)));
+    }
+    let dest = match into {
+        Some(p) => p.to_path_buf(),
+        None => cwd.join(repo),
+    };
+    if dest.exists() {
+        anyhow::bail!(
+            "{} already exists; pass `--into <dir>` to clone elsewhere, \
+             `--tmp` for a throwaway clone, or remove the directory first",
+            dest.display()
+        );
+    }
+    Ok((dest, None))
+}
+
+#[cfg(test)]
+mod resolve_clone_dest_tests {
+    use super::resolve_clone_dest;
+    use std::path::Path;
+
+    #[test]
+    fn tmp_returns_a_guarded_tmpdir() {
+        let cwd = Path::new("/tmp");
+        let (dest, guard) = resolve_clone_dest(cwd, "rupu", None, true).unwrap();
+        assert!(guard.is_some(), "tmp mode should hand back the TempDir guard");
+        assert!(dest.exists(), "TempDir should already exist on disk");
+    }
+
+    #[test]
+    fn default_uses_cwd_repo_and_refuses_when_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Default path: <tmp>/myrepo. Doesn't exist yet → ok.
+        let (dest, guard) = resolve_clone_dest(tmp.path(), "myrepo", None, false).unwrap();
+        assert_eq!(dest, tmp.path().join("myrepo"));
+        assert!(guard.is_none(), "default mode does not hold a TempDir guard");
+        // Now create it and re-run — should refuse.
+        std::fs::create_dir(&dest).unwrap();
+        let err = resolve_clone_dest(tmp.path(), "myrepo", None, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already exists"), "got: {msg}");
+        assert!(msg.contains("--into"), "error should hint at --into: {msg}");
+        assert!(msg.contains("--tmp"), "error should hint at --tmp: {msg}");
+    }
+
+    #[test]
+    fn into_uses_explicit_path_and_refuses_when_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("custom-name");
+        // Doesn't exist → ok.
+        let (dest, guard) =
+            resolve_clone_dest(tmp.path(), "rupu", Some(&target), false).unwrap();
+        assert_eq!(dest, target);
+        assert!(guard.is_none());
+        // Create it → second call refuses.
+        std::fs::create_dir(&target).unwrap();
+        assert!(resolve_clone_dest(tmp.path(), "rupu", Some(&target), false).is_err());
     }
 }
 
