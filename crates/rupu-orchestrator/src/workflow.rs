@@ -67,6 +67,24 @@ pub enum WorkflowParseError {
     PanelEmpty { step: String },
     #[error("step `{step}`: `panel.gate.max_iterations` must be at least 1, got {value}")]
     PanelMaxIterationsInvalid { step: String, value: u32 },
+    #[error(
+        "autoflow field `{field}` has invalid duration `{value}`; expected `<int><unit>` where unit is one of `s`, `m`, `h`, `d`"
+    )]
+    InvalidAutoflowDuration { field: &'static str, value: String },
+    #[error("workflow output contract `{output}` references unknown step `{step}`")]
+    ContractOutputUnknownStep { output: String, step: String },
+    #[error("autoflow outcome references unknown workflow output `{output}`")]
+    AutoflowOutcomeUnknownOutput { output: String },
+    #[error(
+        "workflow output `{output}` and step `{step}` contract disagree on `{field}`: workflow declares `{workflow_declared}`, step declares `{step_declared}`"
+    )]
+    ContractStepMismatch {
+        output: String,
+        step: String,
+        field: &'static str,
+        workflow_declared: String,
+        step_declared: String,
+    },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -166,6 +184,134 @@ impl InputDef {
     fn default_type() -> InputType {
         InputType::String
     }
+}
+
+/// Top-level `autoflow:` block. This extends the existing workflow
+/// YAML schema with autonomous-execution metadata while keeping the
+/// same `steps:` DSL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Autoflow {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub entity: AutoflowEntity,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub selector: AutoflowSelector,
+    #[serde(default)]
+    pub wake_on: Vec<String>,
+    #[serde(default)]
+    pub reconcile_every: Option<String>,
+    #[serde(default)]
+    pub claim: Option<AutoflowClaim>,
+    #[serde(default)]
+    pub workspace: Option<AutoflowWorkspace>,
+    #[serde(default)]
+    pub outcome: Option<AutoflowOutcomeRef>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoflowEntity {
+    #[default]
+    Issue,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoflowSelector {
+    #[serde(default)]
+    pub states: Vec<AutoflowIssueState>,
+    #[serde(default)]
+    pub labels_all: Vec<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoflowIssueState {
+    Open,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoflowClaim {
+    #[serde(default)]
+    pub key: AutoflowClaimKey,
+    #[serde(default)]
+    pub ttl: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoflowClaimKey {
+    #[default]
+    Issue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoflowWorkspace {
+    #[serde(default)]
+    pub strategy: AutoflowWorkspaceStrategy,
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoflowWorkspaceStrategy {
+    #[default]
+    Worktree,
+    InPlace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AutoflowOutcomeRef {
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Contracts {
+    #[serde(default)]
+    pub outputs: BTreeMap<String, WorkflowOutputContract>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowOutputContract {
+    pub from_step: String,
+    pub format: ContractFormat,
+    pub schema: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContractFormat {
+    Json,
+    Yaml,
+}
+
+impl ContractFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StepContract {
+    pub emits: String,
+    pub format: ContractFormat,
 }
 
 /// Severity ordering for panel-step findings. Compares as
@@ -400,6 +546,11 @@ pub struct Step {
     /// `parallel:`, and the linear `agent`/`prompt`. See [`Panel`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel: Option<Panel>,
+    /// Optional authoring metadata describing the structured output this
+    /// step is expected to emit. Workflow-level `contracts.outputs.*`
+    /// remain authoritative for runtime validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<StepContract>,
 }
 
 /// One sub-step inside a `parallel:` block. Same surface as a linear
@@ -433,6 +584,14 @@ pub struct Workflow {
     /// Per-workflow defaults shared by every step.
     #[serde(default)]
     pub defaults: WorkflowDefaults,
+    /// Optional autonomous-execution metadata. Present workflows still
+    /// run normally via `rupu workflow run`; this block is consumed by
+    /// the future `rupu autoflow ...` runtime.
+    #[serde(default)]
+    pub autoflow: Option<Autoflow>,
+    /// Optional machine-readable workflow output declarations.
+    #[serde(default)]
+    pub contracts: Contracts,
     /// When `true` AND the run-target resolves to an issue, the CLI
     /// posts an auto-comment on the issue at run start (with the
     /// run-id) and at terminal state (with the outcome — completed /
@@ -476,6 +635,8 @@ impl Workflow {
             validate_input_def(name, def)?;
         }
         validate_trigger(&wf.trigger)?;
+        validate_contracts(&wf)?;
+        validate_autoflow(&wf)?;
         Ok(wf)
     }
 
@@ -699,6 +860,82 @@ fn validate_input_def(name: &str, def: &InputDef) -> Result<(), WorkflowParseErr
         }
     }
     Ok(())
+}
+
+fn validate_contracts(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    for (output, contract) in &wf.contracts.outputs {
+        let Some(step) = wf.steps.iter().find(|step| step.id == contract.from_step) else {
+            return Err(WorkflowParseError::ContractOutputUnknownStep {
+                output: output.clone(),
+                step: contract.from_step.clone(),
+            });
+        };
+        if let Some(step_contract) = &step.contract {
+            if step_contract.emits != contract.schema {
+                return Err(WorkflowParseError::ContractStepMismatch {
+                    output: output.clone(),
+                    step: step.id.clone(),
+                    field: "schema",
+                    workflow_declared: contract.schema.clone(),
+                    step_declared: step_contract.emits.clone(),
+                });
+            }
+            if step_contract.format != contract.format {
+                return Err(WorkflowParseError::ContractStepMismatch {
+                    output: output.clone(),
+                    step: step.id.clone(),
+                    field: "format",
+                    workflow_declared: contract.format.as_str().to_string(),
+                    step_declared: step_contract.format.as_str().to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_autoflow(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    let Some(autoflow) = &wf.autoflow else {
+        return Ok(());
+    };
+
+    if let Some(reconcile_every) = &autoflow.reconcile_every {
+        validate_duration_field("autoflow.reconcile_every", reconcile_every)?;
+    }
+    if let Some(claim) = &autoflow.claim {
+        if let Some(ttl) = &claim.ttl {
+            validate_duration_field("autoflow.claim.ttl", ttl)?;
+        }
+    }
+    if let Some(outcome) = &autoflow.outcome {
+        if !wf.contracts.outputs.contains_key(&outcome.output) {
+            return Err(WorkflowParseError::AutoflowOutcomeUnknownOutput {
+                output: outcome.output.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_duration_field(field: &'static str, value: &str) -> Result<(), WorkflowParseError> {
+    let trimmed = value.trim();
+    let Some(unit) = trimmed.chars().last() else {
+        return Err(WorkflowParseError::InvalidAutoflowDuration {
+            field,
+            value: value.to_string(),
+        });
+    };
+    let number = &trimmed[..trimmed.len().saturating_sub(1)];
+    let valid_unit = matches!(unit, 's' | 'm' | 'h' | 'd');
+    let valid_number = !number.is_empty() && number.chars().all(|c| c.is_ascii_digit());
+    if valid_unit && valid_number {
+        Ok(())
+    } else {
+        Err(WorkflowParseError::InvalidAutoflowDuration {
+            field,
+            value: value.to_string(),
+        })
+    }
 }
 
 /// Render a YAML scalar to the same string form `--input k=v` would

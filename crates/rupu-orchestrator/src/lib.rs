@@ -30,6 +30,9 @@ pub use templates::{
     SubResult,
 };
 pub use workflow::{
-    Approval, InputDef, InputType, Panel, PanelGate, Severity, Step, SubStep, Trigger, TriggerKind,
-    Workflow, WorkflowDefaults, WorkflowParseError,
+    Approval, Autoflow, AutoflowClaim, AutoflowClaimKey, AutoflowEntity, AutoflowIssueState,
+    AutoflowOutcomeRef, AutoflowSelector, AutoflowWorkspace, AutoflowWorkspaceStrategy,
+    ContractFormat, Contracts, InputDef, InputType, Panel, PanelGate, Severity, Step, StepContract,
+    SubStep, Trigger, TriggerKind, Workflow, WorkflowDefaults, WorkflowOutputContract,
+    WorkflowParseError,
 };

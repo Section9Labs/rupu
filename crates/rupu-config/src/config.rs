@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::autoflow_config::AutoflowConfig;
 use crate::pricing_config::PricingConfig;
 use crate::provider_config::ProviderConfig;
 use crate::scm_config::{IssuesSection, ScmSection};
@@ -35,6 +36,8 @@ pub struct Config {
     pub ui: UiConfig,
     #[serde(default)]
     pub triggers: TriggersConfig,
+    #[serde(default)]
+    pub autoflow: AutoflowConfig,
     #[serde(default)]
     pub pricing: PricingConfig,
 }

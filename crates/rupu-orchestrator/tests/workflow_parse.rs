@@ -550,3 +550,151 @@ fn notify_issue_defaults_to_false() {
     let wf = Workflow::parse(s).unwrap();
     assert!(!wf.notify_issue);
 }
+
+#[test]
+fn parses_autoflow_and_contracts_blocks() {
+    let s = r#"
+name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  entity: issue
+  priority: 100
+  selector:
+    states: [open]
+    labels_all: [autoflow]
+    limit: 100
+  wake_on:
+    - github.issue.opened
+    - github.pr.merged
+  reconcile_every: 10m
+  claim:
+    key: issue
+    ttl: 3h
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: issue-understander
+    actions: []
+    contract:
+      emits: autoflow_outcome_v1
+      format: json
+    prompt: "Return only valid JSON."
+"#;
+    let wf = Workflow::parse(s).expect("autoflow should parse");
+    let autoflow = wf.autoflow.as_ref().expect("autoflow");
+    assert!(autoflow.enabled);
+    assert_eq!(autoflow.priority, 100);
+    assert_eq!(autoflow.selector.labels_all, vec!["autoflow"]);
+    assert_eq!(autoflow.reconcile_every.as_deref(), Some("10m"));
+    assert_eq!(
+        wf.contracts.outputs["result"].schema,
+        "autoflow_outcome_v1".to_string()
+    );
+}
+
+#[test]
+fn autoflow_priority_defaults_to_zero() {
+    let s = r#"
+name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  entity: issue
+steps:
+  - id: decide
+    agent: a
+    actions: []
+    prompt: hi
+"#;
+    let wf = Workflow::parse(s).expect("parse");
+    assert_eq!(wf.autoflow.as_ref().unwrap().priority, 0);
+}
+
+#[test]
+fn rejects_invalid_autoflow_duration() {
+    let s = r#"
+name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  entity: issue
+  reconcile_every: daily
+steps:
+  - id: decide
+    agent: a
+    actions: []
+    prompt: hi
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(err.contains("invalid duration"), "got: {err}");
+}
+
+#[test]
+fn rejects_contract_output_referencing_missing_step() {
+    let s = r#"
+name: issue-supervisor-dispatch
+contracts:
+  outputs:
+    result:
+      from_step: finalize
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: a
+    actions: []
+    prompt: hi
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(err.contains("unknown step `finalize`"), "got: {err}");
+}
+
+#[test]
+fn rejects_autoflow_outcome_referencing_unknown_output() {
+    let s = r#"
+name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  entity: issue
+  outcome:
+    output: result
+steps:
+  - id: decide
+    agent: a
+    actions: []
+    prompt: hi
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(err.contains("unknown workflow output"), "got: {err}");
+}
+
+#[test]
+fn rejects_step_contract_mismatch_with_workflow_output() {
+    let s = r#"
+name: issue-supervisor-dispatch
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: a
+    actions: []
+    contract:
+      emits: workflow_dispatch_v1
+      format: json
+    prompt: hi
+"#;
+    let err = Workflow::parse(s).unwrap_err().to_string();
+    assert!(err.contains("contract disagree on `schema`"), "got: {err}");
+}
