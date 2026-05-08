@@ -23,6 +23,12 @@ pub enum RenderError {
     Template(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderMode {
+    Permissive,
+    Strict,
+}
+
 /// Variable bag passed to the renderer.
 ///
 /// `event` is populated when the workflow was kicked off by the
@@ -281,9 +287,16 @@ impl StepContext {
 /// in a manually-triggered workflow where `event` is `None`) also
 /// render empty rather than erroring — matching the permissive
 /// philosophy stated in this module's docs.
-pub fn render_step_prompt(template: &str, ctx: &StepContext) -> Result<String, RenderError> {
+pub fn render_step_prompt(
+    template: &str,
+    ctx: &StepContext,
+    mode: RenderMode,
+) -> Result<String, RenderError> {
     let mut env = Environment::new();
-    env.set_undefined_behavior(UndefinedBehavior::Chainable);
+    env.set_undefined_behavior(match mode {
+        RenderMode::Permissive => UndefinedBehavior::Chainable,
+        RenderMode::Strict => UndefinedBehavior::Strict,
+    });
     env.add_template("step", template)
         .map_err(|e| RenderError::Template(e.to_string()))?;
     let tmpl = env
@@ -302,8 +315,12 @@ pub fn render_step_prompt(template: &str, ctx: &StepContext) -> Result<String, R
 /// workflow engines do — and lets agents emit `success: true` /
 /// `success: false` JSON in their final assistant message and have
 /// downstream steps gate on it via `{{steps.foo.output | trim}}`.
-pub fn render_when_expression(template: &str, ctx: &StepContext) -> Result<bool, RenderError> {
-    let rendered = render_step_prompt(template, ctx)?;
+pub fn render_when_expression(
+    template: &str,
+    ctx: &StepContext,
+    mode: RenderMode,
+) -> Result<bool, RenderError> {
+    let rendered = render_step_prompt(template, ctx, mode)?;
     Ok(is_truthy(&rendered))
 }
 
@@ -350,9 +367,11 @@ mod when_tests {
                 ..Default::default()
             },
         );
-        let v = render_when_expression("{{ steps.review.output }}", &ctx).expect("render");
+        let v = render_when_expression("{{ steps.review.output }}", &ctx, RenderMode::Permissive)
+            .expect("render");
         assert!(!v);
-        let v = render_when_expression("{{ steps.review.success }}", &ctx).expect("render");
+        let v = render_when_expression("{{ steps.review.success }}", &ctx, RenderMode::Permissive)
+            .expect("render");
         assert!(v);
     }
 }
@@ -371,6 +390,7 @@ mod event_tests {
         let out = render_step_prompt(
             "PR #{{ event.pull_request.number }} in {{ event.repository.full_name }}: {{ event.pull_request.title }}",
             &ctx,
+            RenderMode::Permissive,
         )
         .expect("render");
         assert_eq!(out, "PR #42 in Section9Labs/rupu: Fix flaky test");
@@ -379,7 +399,12 @@ mod event_tests {
     #[test]
     fn missing_event_renders_empty_string() {
         let ctx = StepContext::new();
-        let out = render_step_prompt("repo={{ event.repository.name }}!", &ctx).expect("render");
+        let out = render_step_prompt(
+            "repo={{ event.repository.name }}!",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("render");
         assert_eq!(out, "repo=!");
     }
 
@@ -388,14 +413,35 @@ mod event_tests {
         let ctx = StepContext::new().with_event(json!({
             "pull_request": { "merged": true }
         }));
-        let take = render_when_expression("{{ event.pull_request.merged }}", &ctx).expect("render");
+        let take = render_when_expression(
+            "{{ event.pull_request.merged }}",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("render");
         assert!(take, "merged=true should be truthy");
 
         let ctx2 = StepContext::new().with_event(json!({
             "pull_request": { "merged": false }
         }));
-        let take =
-            render_when_expression("{{ event.pull_request.merged }}", &ctx2).expect("render");
+        let take = render_when_expression(
+            "{{ event.pull_request.merged }}",
+            &ctx2,
+            RenderMode::Permissive,
+        )
+        .expect("render");
         assert!(!take, "merged=false should be falsy");
+    }
+}
+
+#[cfg(test)]
+mod strict_tests {
+    use super::*;
+
+    #[test]
+    fn strict_mode_errors_on_missing_variable() {
+        let ctx = StepContext::new();
+        let err = render_step_prompt("{{ issue.title }}", &ctx, RenderMode::Strict).unwrap_err();
+        assert!(err.to_string().contains("template:"));
     }
 }

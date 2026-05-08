@@ -19,7 +19,8 @@
 //! collected into `steps.<id>.results[*]`.
 
 use crate::templates::{
-    render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,
+    render_step_prompt, render_when_expression, LoopInfo, RenderError, RenderMode, StepContext,
+    StepOutput,
 };
 use crate::workflow::{yaml_scalar_to_string, InputType, Step, Workflow, WorkflowParseError};
 use async_trait::async_trait;
@@ -150,6 +151,8 @@ pub struct OrchestratorRunOpts {
     /// already exists, `RunStoreError::AlreadyExists` surfaces and
     /// the caller is expected to log + skip.
     pub run_id_override: Option<String>,
+    /// When `true`, missing template variables abort rendering.
+    pub strict_templates: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -503,8 +506,8 @@ async fn run_steps_inner(
         // appears in `step_results` so downstream `when:` chains can
         // observe it.
         if let Some(when_expr) = &step.when {
-            let take =
-                render_when_expression(when_expr, &ctx).map_err(|e| RunWorkflowError::Render {
+            let take = render_when_expression(when_expr, &ctx, render_mode(opts.strict_templates))
+                .map_err(|e| RunWorkflowError::Render {
                     step: step.id.clone(),
                     source: e,
                 })?;
@@ -535,12 +538,13 @@ async fn run_steps_inner(
         if let Some(approval) = &step.approval {
             if approval.required && approved_step_id != Some(step.id.as_str()) {
                 let prompt = match &approval.prompt {
-                    Some(template) => render_step_prompt(template, &ctx).map_err(|e| {
-                        RunWorkflowError::Render {
-                            step: step.id.clone(),
-                            source: e,
-                        }
-                    })?,
+                    Some(template) => {
+                        render_step_prompt(template, &ctx, render_mode(opts.strict_templates))
+                            .map_err(|e| RunWorkflowError::Render {
+                                step: step.id.clone(),
+                                source: e,
+                            })?
+                    }
                     None => format!(
                         "Approve step `{}` of workflow `{}`?",
                         step.id, opts.workflow.name
@@ -673,10 +677,13 @@ async fn run_linear_step(
         .agent
         .as_deref()
         .expect("validate_step_shape guarantees agent for linear steps");
-    let rendered = render_step_prompt(prompt, ctx).map_err(|e| RunWorkflowError::Render {
-        step: step.id.clone(),
-        source: e,
-    })?;
+    let rendered =
+        render_step_prompt(prompt, ctx, render_mode(opts.strict_templates)).map_err(|e| {
+            RunWorkflowError::Render {
+                step: step.id.clone(),
+                source: e,
+            }
+        })?;
     let run_id = format!("run_{}", Ulid::new());
     let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
 
@@ -741,8 +748,8 @@ async fn run_fanout_step(
         .for_each
         .as_ref()
         .expect("run_fanout_step called for a non-fan-out step");
-    let rendered_list =
-        render_step_prompt(for_each_expr, ctx).map_err(|e| RunWorkflowError::Render {
+    let rendered_list = render_step_prompt(for_each_expr, ctx, render_mode(opts.strict_templates))
+        .map_err(|e| RunWorkflowError::Render {
             step: step.id.clone(),
             source: e,
         })?;
@@ -788,10 +795,11 @@ async fn run_fanout_step(
             .as_deref()
             .expect("validate_step_shape guarantees prompt for for_each steps");
         let rendered =
-            render_step_prompt(item_prompt, &item_ctx).map_err(|e| RunWorkflowError::Render {
-                step: format!("{}[{}]", step.id, idx),
-                source: e,
-            })?;
+            render_step_prompt(item_prompt, &item_ctx, render_mode(opts.strict_templates))
+                .map_err(|e| RunWorkflowError::Render {
+                    step: format!("{}[{}]", step.id, idx),
+                    source: e,
+                })?;
         let run_id = format!("run_{}", Ulid::new());
         let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
         prepared.push((idx, item.clone(), rendered, run_id, transcript_path));
@@ -955,8 +963,8 @@ async fn run_parallel_step(
     let mut prepared: Vec<(usize, String, String, String, String, PathBuf)> =
         Vec::with_capacity(total);
     for (idx, sub) in subs.iter().enumerate() {
-        let rendered =
-            render_step_prompt(&sub.prompt, ctx).map_err(|e| RunWorkflowError::Render {
+        let rendered = render_step_prompt(&sub.prompt, ctx, render_mode(opts.strict_templates))
+            .map_err(|e| RunWorkflowError::Render {
                 step: format!("{}.{}", step.id, sub.id),
                 source: e,
             })?;
@@ -1322,10 +1330,12 @@ async fn run_panel_step(
     // When a `gate:` loop is configured, subsequent iterations
     // re-bind the subject to the fixer agent's output.
     let initial_subject =
-        render_step_prompt(&panel.subject, ctx).map_err(|e| RunWorkflowError::Render {
-            step: format!("{}.subject", step.id),
-            source: e,
-        })?;
+        render_step_prompt(&panel.subject, ctx, render_mode(opts.strict_templates)).map_err(
+            |e| RunWorkflowError::Render {
+                step: format!("{}.subject", step.id),
+                source: e,
+            },
+        )?;
 
     // No gate → run a single panel pass and return.
     let Some(gate) = &panel.gate else {
@@ -1527,10 +1537,11 @@ async fn run_panel_iteration(
             .insert("subject".to_string(), current_subject.to_string());
         let rendered = match &panel.prompt {
             Some(template) => {
-                render_step_prompt(template, &item_ctx).map_err(|e| RunWorkflowError::Render {
-                    step: format!("{}.{}", step.id, panelist),
-                    source: e,
-                })?
+                render_step_prompt(template, &item_ctx, render_mode(opts.strict_templates))
+                    .map_err(|e| RunWorkflowError::Render {
+                        step: format!("{}.{}", step.id, panelist),
+                        source: e,
+                    })?
             }
             None => current_subject.to_string(),
         };
@@ -1718,6 +1729,14 @@ fn parse_findings(text: &str) -> Result<Vec<ParsedFinding>, ParseFindingsError> 
     // Emit a debug log so authors can see during iteration.
     info!("no parseable findings JSON in panelist output");
     Ok(Vec::new())
+}
+
+fn render_mode(strict: bool) -> RenderMode {
+    if strict {
+        RenderMode::Strict
+    } else {
+        RenderMode::Permissive
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

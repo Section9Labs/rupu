@@ -39,6 +39,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::workflow::Action,
     },
+    /// Run autonomous workflows against persistent issue state.
+    Autoflow {
+        #[command(subcommand)]
+        action: cmd::autoflow::Action,
+    },
     /// Browse transcripts.
     Transcript {
         #[command(subcommand)]
@@ -129,6 +134,9 @@ pub async fn run(args: Vec<String>) -> ExitCode {
             | Cmd::Workflow {
                 action: cmd::workflow::Action::Run { .. }
             }
+            | Cmd::Autoflow {
+                action: cmd::autoflow::Action::Run { .. }
+            }
     );
     if is_output_cmd {
         logging::init_to_file();
@@ -140,6 +148,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Run(args) => cmd::run::handle(args).await,
         Cmd::Agent { action } => cmd::agent::handle(action).await,
         Cmd::Workflow { action } => cmd::workflow::handle(action).await,
+        Cmd::Autoflow { action } => cmd::autoflow::handle(action).await,
         Cmd::Transcript { action } => cmd::transcript::handle(action).await,
         Cmd::Config { action } => cmd::config::handle(action).await,
         Cmd::Auth { action } => cmd::auth::handle(action).await,
