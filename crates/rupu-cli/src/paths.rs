@@ -62,6 +62,11 @@ pub fn autoflow_worktrees_dir(global: &Path) -> PathBuf {
     autoflows_dir(global).join("worktrees")
 }
 
+/// Global autoflow event cursor directory.
+pub fn autoflow_event_cursors_dir(global: &Path) -> PathBuf {
+    autoflows_dir(global).join("event-cursors")
+}
+
 /// Convenience: ensure a directory exists. Used to lazily create
 /// `~/.rupu/cache/`, `~/.rupu/transcripts/`, etc. on first use.
 pub fn ensure_dir(p: &Path) -> Result<()> {
