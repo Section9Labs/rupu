@@ -1,27 +1,25 @@
 #!/usr/bin/env bash
-# scripts/gh-build.sh — publish the local release binary to a fixed
-# `latest-build` GitHub release that floats over time.
+# scripts/gh-build.sh — publish the local release binary to GitHub
+# under TWO releases:
+#
+#   1. `latest-build`            — rolling tag, force-moved on every
+#                                  run. Stable URL for "give me the
+#                                  freshest local build."
+#   2. `v<X.Y.Z>-build`          — versioned tag, derived from the
+#                                  workspace `[workspace.package].version`
+#                                  in Cargo.toml. Stable per-version
+#                                  reference. Re-running at the same
+#                                  Cargo version overwrites the same
+#                                  versioned release; bumping via
+#                                  `make bump` creates a new one.
+#
+# Both publish the SAME binary + SHA-256 sidecar. Use `latest-build`
+# for "always current" links, `v<X.Y.Z>-build` for "pin to this
+# specific build" references in chat / runbooks / etc.
 #
 # Pre-condition: target/release/rupu has just been built and signed
 # (the Makefile's `gh-build` target runs `release` first, which does
 # both via `make release` → `cargo build --release` + `scripts/sign-dev.sh`).
-#
-# What this script does:
-#   1. Re-confirms the binary exists and computes a SHA-256 sidecar.
-#   2. Force-moves the lightweight tag `latest-build` to the current
-#      HEAD (locally and on origin).
-#   3. Creates the prerelease `latest-build` if it doesn't exist; if
-#      it does, leaves the release in place and just refreshes assets.
-#   4. Uploads the binary (named `rupu-<os>-<arch>`) and `.sha256`
-#      sidecar via `gh release upload --clobber`, so each invocation
-#      replaces the prior asset at the same URL.
-#   5. Edits the release notes with the source branch + SHA + bin
-#      hash so anyone landing on the release page knows what they're
-#      looking at.
-#
-# Why a rolling tag: the tag is a sharable URL anyone can curl to
-# grab the latest local build, but it's NOT a real version tag —
-# CHANGELOG and the v0.x.y release line stay clean.
 
 set -euo pipefail
 
@@ -53,6 +51,18 @@ SHA_FULL="$(git rev-parse HEAD)"
 SHA_SHORT="$(git rev-parse --short HEAD)"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
+# Read the workspace version from Cargo.toml. The grep is anchored to
+# `^version = "..."` which the workspace `[workspace.package]` block
+# is the only owner of (per-crate `Cargo.toml`s use `version.workspace
+# = true`). If we ever stop satisfying that invariant the assertion
+# below catches it before we publish a wrongly-tagged release.
+WORKSPACE_VERSION="$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)".*/\1/')"
+if [[ -z "$WORKSPACE_VERSION" ]]; then
+  echo "could not parse workspace version from Cargo.toml — expected a line like 'version = \"X.Y.Z\"'" >&2
+  exit 1
+fi
+VERSIONED_TAG="v${WORKSPACE_VERSION}-build"
+
 # Warn loud if the working tree is dirty — the binary may not match HEAD.
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "warning: working tree is dirty; the published binary may not match \`$SHA_SHORT\`." >&2
@@ -62,20 +72,27 @@ echo "→ Hashing binary..."
 shasum -a 256 "$BIN" | tee "$BIN.sha256"
 BIN_SHA="$(awk '{print $1}' "$BIN.sha256")"
 
-echo "→ Moving rolling tag \`latest-build\` → ${SHA_SHORT}..."
-git tag -f latest-build
-# Force-push is correct here: latest-build is an explicitly rolling tag.
-# Don't use --force-with-lease — its semantics for tags differ from
-# branches and would block the legitimate move on a stale lease.
-git push --force origin latest-build
-
-# Body is fed to both `release create` (initial) and `release edit`
-# (subsequent runs) so the message stays in sync with whatever we
-# just published.
-NOTES="$(cat <<EOF
+# Common notes body, reused for both release upserts.
+NOTES_ROLLING="$(cat <<EOF
 Rolling local build of rupu — the tag floats; do not link to it from
 the CHANGELOG or version columns. Use the tagged \`v0.x.y-cli\`
 releases for stable references.
+
+Built locally from \`${BRANCH}\` @ \`${SHA_SHORT}\` (\`${SHA_FULL}\`).
+Workspace version: \`${WORKSPACE_VERSION}\`.
+
+Asset: \`${ASSET_NAME}\`
+SHA-256: \`${BIN_SHA}\`
+EOF
+)"
+
+NOTES_VERSIONED="$(cat <<EOF
+Local build of rupu pinned to workspace version \`${WORKSPACE_VERSION}\`.
+This tag is overwritten if you re-run \`make gh-build\` at the same
+Cargo version; bump via \`make bump VERSION=<new>\` to start a new
+versioned release. Use this URL when you want a stable per-version
+reference; use \`latest-build\` when you want the freshest local
+build regardless of version.
 
 Built locally from \`${BRANCH}\` @ \`${SHA_SHORT}\` (\`${SHA_FULL}\`).
 
@@ -84,21 +101,52 @@ SHA-256: \`${BIN_SHA}\`
 EOF
 )"
 
-if gh release view latest-build >/dev/null 2>&1; then
-  echo "→ Release \`latest-build\` exists — refreshing assets + notes..."
-  gh release edit latest-build --notes "$NOTES" --prerelease
-else
-  echo "→ Creating prerelease \`latest-build\`..."
-  gh release create latest-build \
-    --prerelease \
-    --title "rolling local build" \
-    --notes "$NOTES"
-fi
+# Upsert + upload to a single release tag. Used for both the rolling
+# `latest-build` tag and the versioned `v<X.Y.Z>-build` tag — same
+# binary, different semantics on tag movement (rolling vs pinned).
+publish_release() {
+  local tag="$1"
+  local title="$2"
+  local notes="$3"
+  local rolling="$4"  # "rolling" or "versioned" — controls force-move semantics
 
-echo "→ Uploading $ASSET_NAME..."
-gh release upload latest-build "$BIN#$ASSET_NAME" --clobber
-gh release upload latest-build "$BIN.sha256" --clobber
+  echo "→ ${tag}: tagging HEAD ${SHA_SHORT}..."
+  if [[ "$rolling" == "rolling" ]]; then
+    # Rolling tag: force-move every run. Don't use --force-with-lease;
+    # tag semantics for it differ from branches and would block the
+    # legitimate move on a stale lease.
+    git tag -f "$tag"
+    git push --force origin "$tag"
+  else
+    # Versioned tag: re-create only if absent, otherwise force-move so
+    # re-runs at the same Cargo version still publish the latest binary
+    # under the same versioned URL. Bumping via `make bump` creates a
+    # new tag for the new version.
+    git tag -f "$tag"
+    git push --force origin "$tag"
+  fi
 
-URL="$(gh release view latest-build --json url --jq '.url')"
+  if gh release view "$tag" >/dev/null 2>&1; then
+    echo "→ Release \`${tag}\` exists — refreshing notes..."
+    gh release edit "$tag" --notes "$notes" --prerelease >/dev/null
+  else
+    echo "→ Creating prerelease \`${tag}\`..."
+    gh release create "$tag" \
+      --prerelease \
+      --title "$title" \
+      --notes "$notes" >/dev/null
+  fi
+
+  echo "→ Uploading $ASSET_NAME → $tag..."
+  gh release upload "$tag" "$BIN#$ASSET_NAME" --clobber >/dev/null
+  gh release upload "$tag" "$BIN.sha256" --clobber >/dev/null
+}
+
+publish_release "latest-build" "rolling local build" "$NOTES_ROLLING" "rolling"
+publish_release "$VERSIONED_TAG" "rupu ${VERSIONED_TAG}" "$NOTES_VERSIONED" "versioned"
+
+LATEST_URL="$(gh release view latest-build --json url --jq '.url')"
+VERSIONED_URL="$(gh release view "$VERSIONED_TAG" --json url --jq '.url')"
 echo ""
-echo "→ Done: $URL"
+echo "→ Rolling:    $LATEST_URL"
+echo "→ Versioned:  $VERSIONED_URL"
