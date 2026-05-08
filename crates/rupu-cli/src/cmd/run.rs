@@ -249,7 +249,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         PermissionMode::Readonly => "readonly",
     };
 
-    let decider: Arc<dyn PermissionDecider> = pick_decider(mode);
+    let decider: Arc<dyn PermissionDecider> = pick_decider(mode, Some(printer.multi_handle()));
 
     let opts = AgentRunOpts {
         agent_name: spec.name.clone(),
@@ -375,11 +375,14 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn pick_decider(mode: PermissionMode) -> Arc<dyn PermissionDecider> {
+fn pick_decider(
+    mode: PermissionMode,
+    multi: Option<indicatif::MultiProgress>,
+) -> Arc<dyn PermissionDecider> {
     match mode {
         PermissionMode::Bypass => Arc::new(BypassDecider),
         PermissionMode::Readonly => Arc::new(ReadonlyDecider),
-        PermissionMode::Ask => Arc::new(AskDecider),
+        PermissionMode::Ask => Arc::new(AskDecider { multi }),
     }
 }
 
@@ -487,7 +490,16 @@ impl PermissionDecider for ReadonlyDecider {
 /// Prompts via [`rupu_agent::PermissionPrompt::for_stdio`], which writes
 /// to stderr and reads from stdin. We re-take the stderr lock for each
 /// decision so back-to-back prompts don't deadlock.
-struct AskDecider;
+struct AskDecider {
+    /// Clone of the printer's `MultiProgress`. When `Some`, the
+    /// permission prompt suspends the spinner via
+    /// `MultiProgress::suspend` so the spinner's `\r`-based redraw
+    /// on stdout doesn't clobber the prompt the agent runtime just
+    /// wrote to stderr. (`\r` is a cursor-level operation; it moves
+    /// the same physical cursor that stderr writes are using.)
+    /// `None` = no spinner active (non-TTY / test) — prompt directly.
+    multi: Option<indicatif::MultiProgress>,
+}
 impl PermissionDecider for AskDecider {
     fn decide(
         &self,
@@ -499,10 +511,16 @@ impl PermissionDecider for AskDecider {
         if !matches!(tool, "bash" | "write_file" | "edit_file") {
             return Ok(PermissionDecision::Allow);
         }
-        let mut stderr = std::io::stderr();
-        let mut prompt = rupu_agent::PermissionPrompt::for_stdio(&mut stderr);
-        prompt
-            .ask(tool, input, workspace)
-            .map_err(|e| rupu_agent::runner::RunError::Provider(format!("ask prompt io: {e}")))
+        let do_prompt = || -> Result<PermissionDecision, rupu_agent::runner::RunError> {
+            let mut stderr = std::io::stderr();
+            let mut prompt = rupu_agent::PermissionPrompt::for_stdio(&mut stderr);
+            prompt
+                .ask(tool, input, workspace)
+                .map_err(|e| rupu_agent::runner::RunError::Provider(format!("ask prompt io: {e}")))
+        };
+        match &self.multi {
+            Some(m) => m.suspend(do_prompt),
+            None => do_prompt(),
+        }
     }
 }
