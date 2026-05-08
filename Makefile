@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync gh-build fmt lint test gates tui-smoke clean help
+.PHONY: build release sign-dev sign-release run install sync gh-build bump fmt lint test gates tui-smoke clean help
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -58,6 +58,39 @@ sync:
 gh-build: release
 	@scripts/gh-build.sh
 
+# Bump the workspace `[workspace.package].version` in Cargo.toml,
+# refresh Cargo.lock to match, and create a `release: bump workspace
+# to vX.Y.Z` commit ready for review. Doesn't push — you push when
+# the bump is part of a PR you're opening separately, or fold it into
+# whatever feature branch you're shipping.
+#
+# Usage:
+#     make bump VERSION=0.5.4
+#
+# Validation: VERSION must look like X.Y.Z (with optional `-rc.N` etc).
+# We refuse to overwrite the same version (no-op detection) so a typo
+# doesn't silently produce an empty commit.
+bump:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "usage: make bump VERSION=<X.Y.Z>"; exit 1; \
+	fi
+	@case "$(VERSION)" in \
+		[0-9]*.[0-9]*.[0-9]*) ;; \
+		*) echo "VERSION must look like X.Y.Z (got: $(VERSION))"; exit 1 ;; \
+	esac
+	@CURRENT=$$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml | head -n1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+[^"]*)".*/\1/'); \
+	if [ "$$CURRENT" = "$(VERSION)" ]; then \
+		echo "Cargo.toml is already at $(VERSION) — no-op"; exit 0; \
+	fi; \
+	echo "→ bumping workspace $$CURRENT → $(VERSION)..."; \
+	sed -i.bak -E 's/^(version = ")[0-9]+\.[0-9]+\.[0-9]+[^"]*"/\1$(VERSION)"/' Cargo.toml; \
+	rm -f Cargo.toml.bak; \
+	cargo update -w >/dev/null; \
+	git add Cargo.toml Cargo.lock; \
+	git commit -m "release: bump workspace to v$(VERSION)" >/dev/null; \
+	echo "→ committed: release: bump workspace to v$(VERSION)"; \
+	echo "   next:  make gh-build   (or push the branch + PR if you want CI to see the bump first)"
+
 fmt:
 	cargo fmt --all -- --check
 
@@ -91,7 +124,8 @@ help:
 	@echo "  run            build + run target/debug/rupu (pass ARGS=...)"
 	@echo "  install        release + install to /usr/local/bin/rupu (sudo)"
 	@echo "  sync           git fetch origin; fast-forward main if checked out"
-	@echo "  gh-build       release + publish to the rolling \`latest-build\` GH release"
+	@echo "  gh-build       release + publish to \`latest-build\` (rolling) AND \`v<X.Y.Z>-build\`"
+	@echo "  bump           bump workspace version + commit (usage: make bump VERSION=X.Y.Z)"
 	@echo "  fmt            cargo fmt --all -- --check"
 	@echo "  lint           cargo clippy --workspace --all-targets -D warnings"
 	@echo "  test           cargo test --workspace"
