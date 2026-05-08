@@ -1,0 +1,82 @@
+name: build
+
+# Manual `gh workflow run build.yml` trigger (also exposed via
+# `make gh-build`). Produces an UNSIGNED macOS arm64 release binary
+# you can download via `gh run download <id>`. Local sign + notarize
+# (`make release && scripts/notarize-release.sh`) is still the path
+# for shipping to users.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch / tag / SHA). Default: the workflow's checkout ref."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build rupu (macOS arm64, unsigned)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Print Rust toolchain
+        run: rustc --version && cargo --version
+
+      - name: Build release
+        run: cargo build --release -p rupu-cli
+
+      - name: Smoke test --version
+        run: ./target/release/rupu --version
+
+      - name: Compute SHA-256
+        id: sha
+        run: |
+          shasum -a 256 target/release/rupu | tee target/release/rupu.sha256
+          echo "sha=$(shasum -a 256 target/release/rupu | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: rupu-darwin-arm64
+          path: |
+            target/release/rupu
+            target/release/rupu.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Summary
+        run: |
+          {
+            echo "### rupu build (unsigned)"
+            echo ""
+            echo "- ref: \`${{ inputs.ref || github.ref }}\`"
+            echo "- SHA-256: \`${{ steps.sha.outputs.sha }}\`"
+            echo ""
+            echo "Download with:"
+            echo ""
+            echo '```'
+            echo "gh run download ${{ github.run_id }} --name rupu-darwin-arm64"
+            echo '```'
+            echo ""
+            echo "_Unsigned — Gatekeeper will block it on first launch unless you locally sign with \`scripts/sign-dev.sh\` or run via \`xattr -d com.apple.quarantine\`. For shipping releases use \`make release && scripts/notarize-release.sh\` locally._"
+          } >> "$GITHUB_STEP_SUMMARY"
