@@ -165,14 +165,39 @@ fn backoff(attempt: u32) -> Duration {
 }
 
 /// Classify an octocrab error into the rupu ScmError vocabulary.
+///
+/// Special-case 403: `classify_scm_error`'s 403 branch needs the
+/// response headers to disambiguate "missing scope" (non-retryable)
+/// from "rate limited" (retryable). octocrab's `GitHubError` doesn't
+/// hand us the headers, so we look at the message body instead — and
+/// when in doubt, default to a NON-retryable `Forbidden`. The previous
+/// behavior unconditionally classified header-less 403s as
+/// `RateLimited`, which sent the retry loop into a 60s+ exponential
+/// backoff for what was actually a permanent permission denial. The
+/// symptom: `scm.files.read` against an SSO-gated org repo would
+/// stall for ~120s per call before surfacing the error.
 pub fn classify_octocrab_error(err: octocrab::Error) -> ScmError {
     use octocrab::Error as OE;
     match err {
         OE::GitHub { source, .. } => {
-            // octocrab's GitHubError carries status + message; we don't
-            // get headers easily, so missing-scope can't be detected
-            // here. Fall back to status-only classification.
             let status = source.status_code.as_u16();
+            if status == 403 {
+                let msg = source.message.to_lowercase();
+                let looks_rate_limited = msg.contains("rate limit")
+                    || msg.contains("api rate")
+                    || msg.contains("abuse detection")
+                    || msg.contains("secondary rate");
+                if looks_rate_limited {
+                    return ScmError::RateLimited { retry_after: None };
+                }
+                // Default 403 → permanent denial. SSO-gated repos,
+                // missing-scope tokens, and "you don't have permission"
+                // all land here; none should be retried.
+                return ScmError::Forbidden {
+                    platform: Platform::Github.as_str().into(),
+                    message: source.message,
+                };
+            }
             classify_scm_error(
                 Platform::Github,
                 status,

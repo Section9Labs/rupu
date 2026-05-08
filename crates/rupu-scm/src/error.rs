@@ -38,6 +38,15 @@ pub enum ScmError {
         hint: String,
     },
 
+    /// 403 with no rate-limit signal in the message — typically an
+    /// SSO-gated org repo, a token without the required permission,
+    /// or a deny-by-policy. NOT retried (unlike `RateLimited`). The
+    /// agent surfaces this verbatim to the model so it can adapt
+    /// (e.g. fall back to local file reads when the repo's already
+    /// cloned to the workspace).
+    #[error("forbidden on {platform}: {message}")]
+    Forbidden { platform: String, message: String },
+
     #[error("network unreachable: {0}")]
     Network(#[source] anyhow::Error),
 
