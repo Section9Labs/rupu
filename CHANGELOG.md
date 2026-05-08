@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.5.2 — `repos list` token-scope diagnostic (2026-05-07)
+
+### Added
+- **`rupu repos list` warns when private repos are missing due to insufficient token scope.** When the GitHub run comes back with zero `private: true` entries, the connector probes the token's `X-OAuth-Scopes` header via a cheap `GET /user` follow-up. If `repo` is missing — typically because the token was minted before rupu added that scope to the OAuth flow, or a PAT lacks it — the CLI emits an actionable `⚠ warn` line listing the actual scope set + the re-login command. Probe is non-fatal (any failure surfaces no warning rather than a speculative one). New `GithubClient::fetch_token_scopes()` + `GithubExtras::fetch_token_scopes()` helpers expose the capability for future diagnostic surfaces.
+
 ## v0.5.1 — friendlier diagnostics + auth-login stall fix (2026-05-07)
 
 ### Added
