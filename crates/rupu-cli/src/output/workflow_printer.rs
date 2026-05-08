@@ -19,7 +19,7 @@
 //! approve or reject based on the user's response.
 
 use super::{printer::LineStreamPrinter, SpinnerHandle, TranscriptTailer};
-use rupu_orchestrator::{FindingRecord, StepResultRecord};
+use rupu_orchestrator::{FindingRecord, ItemResultRecord, StepKind, StepResultRecord};
 use rupu_transcript::Event as TxEvent;
 use std::collections::BTreeSet;
 use std::io;
@@ -341,63 +341,249 @@ fn drain_step_results(
             continue;
         }
 
-        let is_panel = !rec.items.is_empty();
-
         if *step_count > 0 {
             printer.phase_separator();
         }
         *step_count += 1;
 
-        if is_panel {
-            // Open the panel header, then immediately render each panelist
-            // summary line. Panel steps don't have a top-level transcript;
-            // their events live in each panelist's transcript.
-            let spinner = printer.panel_start(&rec.step_id, rec.items.len());
-            for item in &rec.items {
-                let count = rec
-                    .findings
-                    .iter()
-                    .filter(|f| f.source == item.sub_id)
-                    .count();
-                printer.panelist_line(&item.sub_id, item.success, count);
+        match rec.kind {
+            StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
+                render_fanout_step(&rec, printer);
             }
-            spinner.stop();
+            StepKind::Linear => {
+                // Linear step — open a tailer if we have a transcript.
+                if rec.transcript_path.as_os_str().is_empty() || !rec.transcript_path.exists() {
+                    // Header + immediate footer (nothing to stream).
+                    let spinner = printer.step_start(&rec.step_id, None, None, None);
+                    spinner.stop();
+                    if rec.success {
+                        printer.step_done(&rec.step_id, Duration::ZERO, 0);
+                    } else {
+                        printer.step_failed(&rec.step_id, "no transcript");
+                    }
+                    continue;
+                }
+                if opened.contains(&rec.transcript_path) {
+                    continue;
+                }
+                opened.insert(rec.transcript_path.clone());
+                let tailer = TranscriptTailer::new(&rec.transcript_path);
+                let spinner = printer.step_start(&rec.step_id, None, None, None);
+                steps.push(StepState {
+                    tailer,
+                    step_id: rec.step_id.clone(),
+                    agent: None,
+                    provider: None,
+                    model: None,
+                    spinner: Some(spinner),
+                });
+            }
+        }
+    }
+    let _ = transcript_dir;
+}
+
+/// Render a for_each / parallel / panel step as a parent frame
+/// holding N child frames at indent+1, one per item / sub-step /
+/// panelist. By the time the parent record reaches us, all child
+/// transcripts are complete on disk — so we replay each one fully
+/// rather than tailing live.
+fn render_fanout_step(rec: &StepResultRecord, printer: &mut LineStreamPrinter) {
+    // Parent header — emit the same `╭─ … ────  (kind · count)` shape
+    // the linear-step header uses, with kind-specific meta. Reuse
+    // `panel_start` for panels (it already wires the ticker copy);
+    // for_each / parallel get a generic fanout opener.
+    let parent_spinner = match rec.kind {
+        StepKind::Panel => printer.panel_start(&rec.step_id, rec.items.len()),
+        StepKind::ForEach => printer.fanout_start(&rec.step_id, "for_each", rec.items.len()),
+        StepKind::Parallel => printer.fanout_start(&rec.step_id, "parallel", rec.items.len()),
+        StepKind::Linear => unreachable!("render_fanout_step called for linear step"),
+    };
+
+    // Child frames at indent+1.
+    printer.push_indent();
+    for item in &rec.items {
+        render_child_item(rec, item, printer);
+    }
+    printer.pop_indent();
+    parent_spinner.stop();
+
+    // Parent footer — kind-specific summary.
+    match rec.kind {
+        StepKind::Panel => {
             printer.panel_done(
                 &rec.step_id,
                 rec.success,
                 rec.findings.len(),
                 Duration::ZERO,
             );
-        } else {
-            // Linear step — open a tailer if we have a transcript.
-            if rec.transcript_path.as_os_str().is_empty() || !rec.transcript_path.exists() {
-                // Header + immediate footer (nothing to stream).
-                let spinner = printer.step_start(&rec.step_id, None, None, None);
-                spinner.stop();
-                if rec.success {
-                    printer.step_done(&rec.step_id, Duration::ZERO, 0);
-                } else {
-                    printer.step_failed(&rec.step_id, "no transcript");
+        }
+        StepKind::ForEach | StepKind::Parallel => {
+            let success_count = rec.items.iter().filter(|i| i.success).count();
+            let total = rec.items.len();
+            printer.fanout_done(
+                &rec.step_id,
+                rec.success,
+                success_count,
+                total,
+                Duration::ZERO,
+            );
+        }
+        StepKind::Linear => unreachable!(),
+    }
+}
+
+/// Render one child item of a fan-out step: pre-scan the item's
+/// transcript for the agent / provider / model, open a child frame
+/// with a kind-appropriate headline, replay the rest of the
+/// transcript inline, then close the child frame. Findings count
+/// (for panels) is tallied from the parent's `findings[]`.
+fn render_child_item(
+    parent: &StepResultRecord,
+    item: &ItemResultRecord,
+    printer: &mut LineStreamPrinter,
+) {
+    // Read the full transcript (file is complete by the time we
+    // see it). Empty/missing transcripts produce a header+immediate
+    // footer with no body.
+    let events: Vec<TxEvent> = if !item.transcript_path.as_os_str().is_empty()
+        && item.transcript_path.exists()
+    {
+        let mut tailer = TranscriptTailer::new(&item.transcript_path);
+        tailer.drain()
+    } else {
+        Vec::new()
+    };
+
+    // Extract provider / model from the first RunStart for the meta tail.
+    // Agent name isn't used as the headline — the per-item label
+    // (`iter[N]` for for_each, sub_id for parallel/panel) is more
+    // informative since fan-out items share an agent.
+    let (provider, model) = events
+        .iter()
+        .find_map(|e| match e {
+            TxEvent::RunStart {
+                provider, model, ..
+            } => Some((provider.clone(), model.clone())),
+            _ => None,
+        })
+        .unwrap_or((String::new(), String::new()));
+
+    // Pick the headline. For for_each, the index + a short
+    // representation of the input is most useful (so the operator
+    // can map "iter[3]" back to the YAML input list). For
+    // parallel + panel, the sub_id (which is the YAML-declared
+    // sub-step or panelist agent name) is the right label.
+    let headline = match parent.kind {
+        StepKind::ForEach => {
+            let input_label = item_input_label(&item.item);
+            if input_label.is_empty() {
+                format!("iter[{}]", item.index + 1)
+            } else {
+                format!("iter[{}] · {}", item.index + 1, input_label)
+            }
+        }
+        StepKind::Parallel | StepKind::Panel => item.sub_id.clone(),
+        StepKind::Linear => unreachable!(),
+    };
+
+    // The headline replaces the agent slot in step_start so it shows
+    // as the bold opener line. Provider + model still show in the
+    // dim meta tail when present.
+    let spinner = printer.step_start(
+        &item.sub_id,
+        Some(&headline),
+        non_empty(&provider),
+        non_empty(&model),
+    );
+
+    // Replay assistant chunks + tool calls. Track tokens for the
+    // child's footer.
+    let mut total_tokens = 0u64;
+    let mut child_dur = Duration::ZERO;
+    let mut child_status_override: Option<String> = None;
+    for ev in events {
+        match ev {
+            TxEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
+                printer.assistant_chunk(&content);
+            }
+            TxEvent::ToolCall { tool, input, .. } => {
+                let summary = summarize_tool_input(&tool, &input);
+                printer.tool_call(&tool, &summary);
+            }
+            TxEvent::RunComplete {
+                total_tokens: t,
+                duration_ms,
+                status,
+                error,
+                ..
+            } => {
+                total_tokens += t;
+                child_dur = Duration::from_millis(duration_ms);
+                if matches!(
+                    status,
+                    rupu_transcript::RunStatus::Error | rupu_transcript::RunStatus::Aborted
+                ) {
+                    child_status_override = Some(error.unwrap_or_else(|| "unknown".into()));
                 }
-                continue;
             }
-            if opened.contains(&rec.transcript_path) {
-                continue;
-            }
-            opened.insert(rec.transcript_path.clone());
-            let tailer = TranscriptTailer::new(&rec.transcript_path);
-            let spinner = printer.step_start(&rec.step_id, None, None, None);
-            steps.push(StepState {
-                tailer,
-                step_id: rec.step_id.clone(),
-                agent: None,
-                provider: None,
-                model: None,
-                spinner: Some(spinner),
-            });
+            _ => {}
         }
     }
-    let _ = transcript_dir;
+    spinner.stop();
+
+    // Decide footer based on item.success (authoritative) plus any
+    // RunComplete error reason from the transcript.
+    let _ = ();
+    if !item.success {
+        let reason = child_status_override
+            .clone()
+            .unwrap_or_else(|| "item failed".into());
+        printer.step_failed(&item.sub_id, &reason);
+    } else if matches!(parent.kind, StepKind::Panel) {
+        // Panel children show their findings count instead of token
+        // count — that's the semantically interesting tally.
+        let findings_count = parent
+            .findings
+            .iter()
+            .filter(|f| f.source == item.sub_id)
+            .count();
+        printer.panelist_done(&item.sub_id, findings_count, child_dur);
+    } else {
+        printer.step_done(&item.sub_id, child_dur, total_tokens);
+    }
+}
+
+/// Empty-string → None mapping for the meta-tail extras.
+fn non_empty(s: &str) -> Option<&str> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Best-effort one-line label for a for_each item's `item:` value.
+/// Strings render as themselves; other JSON types render as a short
+/// `serde_json::to_string` (stripped of surrounding whitespace and
+/// truncated to 60 chars). Empty/null returns empty so the headline
+/// degrades to just `iter[N]`.
+fn item_input_label(value: &serde_json::Value) -> String {
+    let raw = match value {
+        serde_json::Value::Null => return String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.chars().count() <= 60 {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(57).collect();
+        format!("{head}…")
+    }
 }
 
 fn process_event(
@@ -572,5 +758,53 @@ fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
             }
             String::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_input_label_strings_pass_through() {
+        assert_eq!(
+            item_input_label(&serde_json::json!("src/foo.rs")),
+            "src/foo.rs"
+        );
+    }
+
+    #[test]
+    fn item_input_label_null_returns_empty() {
+        assert_eq!(item_input_label(&serde_json::Value::Null), "");
+    }
+
+    #[test]
+    fn item_input_label_blank_string_returns_empty() {
+        assert_eq!(item_input_label(&serde_json::json!("   ")), "");
+    }
+
+    #[test]
+    fn item_input_label_truncates_long_strings() {
+        let long = "a".repeat(120);
+        let label = item_input_label(&serde_json::Value::String(long));
+        // 57 chars + ellipsis = 58 chars total. The cap is 60 so 58
+        // is the ceiling we land on for any string > 60 chars.
+        assert_eq!(label.chars().count(), 58);
+        assert!(label.ends_with('…'));
+    }
+
+    #[test]
+    fn item_input_label_renders_objects_as_compact_json() {
+        let obj = serde_json::json!({"path": "src/foo.rs", "line": 42});
+        let label = item_input_label(&obj);
+        // Should be a compact JSON form — exact key order isn't
+        // guaranteed but the path string should appear somewhere.
+        assert!(label.contains("src/foo.rs"));
+    }
+
+    #[test]
+    fn non_empty_filters_blank() {
+        assert_eq!(non_empty("anthropic"), Some("anthropic"));
+        assert_eq!(non_empty(""), None);
     }
 }

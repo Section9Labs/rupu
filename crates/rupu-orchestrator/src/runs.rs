@@ -141,6 +141,21 @@ pub struct RunRecord {
     pub issue: Option<serde_json::Value>,
 }
 
+/// Workflow-step shape, persisted alongside the result so the
+/// printer can dispatch on it without re-inferring from items+findings.
+/// Older `step_results.jsonl` records lack this field; serde defaults
+/// missing values to [`StepKind::Linear`] (the inference matches what
+/// the line-stream printer used pre-PR-B for any record without `items`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StepKind {
+    #[default]
+    Linear,
+    ForEach,
+    Parallel,
+    Panel,
+}
+
 /// One entry in `step_results.jsonl`. Mirrors [`StepResult`] but with
 /// types that round-trip through serde cleanly. We keep the runtime
 /// `StepResult` and this on-disk record separate so internal types
@@ -156,6 +171,11 @@ pub struct StepResultRecord {
     pub success: bool,
     pub skipped: bool,
     pub rendered_prompt: String,
+    /// Workflow-step shape. Drives line-stream printer dispatch
+    /// (linear / for_each / parallel / panel). Defaults to
+    /// `Linear` on read for back-compat with pre-PR-B records.
+    #[serde(default)]
+    pub kind: StepKind,
     /// Per-unit records for fan-out steps. Empty for linear steps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: Vec<ItemResultRecord>,
@@ -216,6 +236,7 @@ impl From<&StepResult> for StepResultRecord {
             success: sr.success,
             skipped: sr.skipped,
             rendered_prompt: sr.rendered_prompt.clone(),
+            kind: sr.kind,
             items: sr.items.iter().map(ItemResultRecord::from).collect(),
             findings: sr
                 .findings
@@ -259,6 +280,7 @@ impl From<&StepResultRecord> for StepResult {
             output: rec.output.clone(),
             success: rec.success,
             skipped: rec.skipped,
+            kind: rec.kind,
             items: rec.items.iter().map(ItemResult::from).collect(),
             findings: rec
                 .findings
@@ -676,6 +698,7 @@ mod tests {
             success: true,
             skipped: false,
             rendered_prompt: format!("prompt for {step_id}"),
+            kind: StepKind::Linear,
             items: Vec::new(),
             findings: Vec::new(),
             iterations: 0,
@@ -922,6 +945,43 @@ mod tests {
         assert_eq!(reloaded.status, RunStatus::Running);
         assert!(reloaded.awaiting_step_id.is_none());
         assert!(reloaded.approval_prompt.is_none());
+    }
+
+    #[test]
+    fn step_kind_round_trips_through_jsonl() {
+        // Each variant must round-trip cleanly through serde so the
+        // line-stream printer can dispatch on the persisted value.
+        for kind in [
+            StepKind::Linear,
+            StepKind::ForEach,
+            StepKind::Parallel,
+            StepKind::Panel,
+        ] {
+            let mut rec = sample_step_result("k");
+            rec.kind = kind;
+            let json = serde_json::to_string(&rec).unwrap();
+            let parsed: StepResultRecord = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.kind, kind);
+        }
+    }
+
+    #[test]
+    fn step_result_record_without_kind_field_defaults_to_linear() {
+        // Back-compat: pre-PR-B step_results.jsonl files have records
+        // without `kind`. They must deserialize as Linear so older
+        // runs still render correctly when the user re-attaches.
+        let json = serde_json::json!({
+            "step_id": "ancient",
+            "run_id": "run_old",
+            "transcript_path": "/tmp/old.jsonl",
+            "output": "x",
+            "success": true,
+            "skipped": false,
+            "rendered_prompt": "p",
+            "finished_at": Utc::now().to_rfc3339(),
+        });
+        let parsed: StepResultRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.kind, StepKind::Linear);
     }
 
     #[test]

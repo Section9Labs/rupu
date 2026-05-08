@@ -23,7 +23,7 @@ pub use runner::{
 };
 pub use runs::{
     ApprovalDecision, ApprovalError, FindingRecord, ItemResultRecord, RunRecord, RunStatus,
-    RunStore, RunStoreError, StepResultRecord,
+    RunStore, RunStoreError, StepKind, StepResultRecord,
 };
 pub use templates::{
     render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,

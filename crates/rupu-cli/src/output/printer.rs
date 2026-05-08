@@ -331,6 +331,88 @@ impl LineStreamPrinter {
         Spinner::start()
     }
 
+    /// `├─╭─ ◐ <step_id> ────  (<kind_label> · N items)`
+    ///
+    /// Opener for `for_each` / `parallel` fan-out steps — establishes
+    /// the parent frame so child iterations can render at indent+1.
+    /// `kind_label` is the YAML keyword (`for_each`, `parallel`) so
+    /// the operator can correlate the rendered shape to the workflow.
+    pub fn fanout_start(
+        &mut self,
+        step_id: &str,
+        kind_label: &str,
+        count: usize,
+    ) -> SpinnerHandle {
+        self.step_start = Some(std::time::Instant::now());
+
+        let mut buf = String::new();
+        self.push_frame_open(&mut buf);
+        buf.push(' ');
+        let _ = palette::write_bold_colored(&mut buf, "◐", RUNNING);
+        buf.push(' ');
+        let _ = palette::write_bold_colored(&mut buf, step_id, RUNNING);
+        buf.push(' ');
+        let rule = "─".repeat(FRAME_RULE_DASHES);
+        let _ = palette::write_colored(&mut buf, &rule, BRAND_300);
+        let item_word = match kind_label {
+            "parallel" => {
+                if count == 1 {
+                    "sub-step"
+                } else {
+                    "sub-steps"
+                }
+            }
+            _ => {
+                if count == 1 {
+                    "item"
+                } else {
+                    "items"
+                }
+            }
+        };
+        let meta = format!("  ({kind_label} · {count} {item_word})");
+        let _ = palette::write_colored(&mut buf, &meta, DIM);
+        self.out(&buf);
+        self.start_ticker(format!("running {step_id} ({kind_label} · {count})…"));
+
+        Spinner::start()
+    }
+
+    /// `├─╰─ ✓ done · S/T · <duration>` — closer for fan-out steps.
+    /// Shows success/total ratio so a partial-failure run reads clearly.
+    pub fn fanout_done(
+        &mut self,
+        step_id: &str,
+        success: bool,
+        success_count: usize,
+        total: usize,
+        duration: Duration,
+    ) {
+        self.stop_ticker();
+        let elapsed = self
+            .step_start
+            .take()
+            .map(|s| s.elapsed())
+            .unwrap_or(duration);
+        let dur_str = format_duration(elapsed);
+        let mut buf = String::new();
+        self.push_frame_close(&mut buf);
+        buf.push(' ');
+        let (glyph, color) = if success {
+            ("✓", COMPLETE)
+        } else {
+            ("✗", FAILED)
+        };
+        let _ = palette::write_bold_colored(&mut buf, glyph, color);
+        buf.push(' ');
+        let closure = if success { "done" } else { "failed" };
+        let tally = format!("{closure} · {success_count}/{total} · {dur_str}");
+        let _ = palette::write_colored(&mut buf, &tally, color);
+        let _ = palette::write_colored(&mut buf, &format!("  ({step_id})"), DIM);
+        self.out(&buf);
+        self.print_rail_only();
+    }
+
     /// `├─ ⧗ panel: <step_id>  (N panelists)`
     ///
     /// Special opener for panel steps — sets visual expectation that
@@ -387,6 +469,29 @@ impl LineStreamPrinter {
         };
         let _ = palette::write_colored(&mut buf, &tally, DIM);
         self.out(&buf);
+    }
+
+    /// Footer for a panelist child frame (replaces the legacy
+    /// one-line `panelist_line` summary when the panelist has its own
+    /// child frame open). Same shape as `step_done` but the meta
+    /// shows findings count instead of token count — that's the
+    /// semantically interesting tally for a reviewer.
+    pub fn panelist_done(&mut self, sub_id: &str, findings_count: usize, duration: Duration) {
+        let dur_str = format_duration(duration);
+        let mut buf = String::new();
+        self.push_frame_close(&mut buf);
+        buf.push(' ');
+        let _ = palette::write_bold_colored(&mut buf, "✓", COMPLETE);
+        buf.push(' ');
+        let tally = if findings_count == 1 {
+            format!("done · 1 finding · {dur_str}")
+        } else {
+            format!("done · {findings_count} findings · {dur_str}")
+        };
+        let _ = palette::write_colored(&mut buf, &tally, COMPLETE);
+        let _ = palette::write_colored(&mut buf, &format!("  ({sub_id})"), DIM);
+        self.out(&buf);
+        self.print_rail_only();
     }
 
     /// Print a phase separator. Caller is responsible for any preceding
@@ -1143,6 +1248,40 @@ mod tests {
         let mut buf = String::new();
         p.push_frame_close(&mut buf);
         assert_eq!(buf, "├─╰─");
+    }
+
+    #[test]
+    fn test_frame_close_at_indent1() {
+        no_color();
+        let mut p = LineStreamPrinter::new();
+        p.push_indent();
+        let mut buf = String::new();
+        p.push_frame_close(&mut buf);
+        // At indent=1 the parent rail is in front, then the frame
+        // closer hangs off it — so the closer's `╰` sits at column 6
+        // (rail-indent of 3 cells plus 2 BRANCH cells plus the `╰`).
+        assert_eq!(buf, "│  ├─╰─");
+    }
+
+    #[test]
+    fn test_body_prefix_at_indent1_aligns_under_indent1_frame_top() {
+        // Frame open at indent=1 is `│  ├─╭─`. The body bar `┃` should
+        // sit at column 6 (under the `╭`) so the indent=1 frame reads
+        // as one continuous shape.
+        no_color();
+        let mut p = LineStreamPrinter::new();
+        p.push_indent();
+        let mut frame = String::new();
+        p.push_frame_open(&mut frame);
+        let mut body = String::new();
+        p.push_body_prefix(&mut body);
+
+        let frame_chars: Vec<char> = frame.chars().collect();
+        let body_chars: Vec<char> = body.chars().collect();
+        // Position 5 is the `╭` in `│  ├─╭─`; same position is `┃` in
+        // body prefix `│  │ ┃  `.
+        assert_eq!(frame_chars[5], '╭');
+        assert_eq!(body_chars[5], '┃');
     }
 
     #[test]
