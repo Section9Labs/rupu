@@ -55,7 +55,7 @@ reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "http2
 async-trait = "0.1"
 futures-util = "0.3"
 fs2 = "0.4"
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2", "vendored-openssl"] }
+git2 = { version = "0.19", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
 gitlab = "0.1710"
 octocrab = "0.42"
 http = "1"
