@@ -5,11 +5,15 @@
 //! takeover. Colors come from the Okesu palette and auto-degrade when
 //! stdout is not a TTY or `NO_COLOR=1` is set.
 //!
-//! Design constraint: this is a single-writer, append-only stream.
-//! No cursor save/restore, no in-place glyph animation — those break
-//! when interleaved with concurrent text output. Status changes are
-//! conveyed by what we print at the time of the transition (header
-//! line for "started", footer line for "done").
+//! Animation: a single `indicatif::ProgressBar` (the "ticker") may
+//! occupy the bottom row of the visible stream, owned by an
+//! `indicatif::MultiProgress` group. All printed lines go through
+//! `multi.println` so the ticker is cleared and re-rendered around
+//! each emission — that's the contract that lets us avoid the
+//! cursor-save races that killed the previous spinner attempt. When
+//! stdout is not a TTY (`MultiProgress` detects this), the ticker
+//! draws nothing and `multi.println` falls through to the regular
+//! print stream — pipes and CI runners get clean output.
 
 #[cfg(test)]
 use super::palette::Status;
@@ -20,6 +24,7 @@ use super::spinner::{Spinner, SpinnerHandle};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rupu_orchestrator::FindingRecord;
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
@@ -35,10 +40,21 @@ const SPACE: &str = "  ";
 /// Line-stream timeline printer. Writes to `stdout`.
 ///
 /// Indent depth is managed by `push_indent` / `pop_indent` for
-/// nested panel runs.
+/// nested panel runs. The optional `ticker` field hosts an animated
+/// indicatif spinner on the bottom row when something is in flight;
+/// callers control it via [`Self::start_ticker`], [`Self::tick_with`],
+/// and [`Self::stop_ticker`]. All printed output is routed through
+/// `multi.println` so the ticker redraws cleanly around each line.
 pub struct LineStreamPrinter {
     indent: usize,
     step_start: Option<std::time::Instant>,
+    multi: MultiProgress,
+    ticker: Option<ProgressBar>,
+    /// True when stdout is an interactive TTY. When false, all `out` /
+    /// `out_partial` calls bypass `MultiProgress` entirely so non-TTY
+    /// consumers (pipes, cargo-test capture, CI logs) get a plain
+    /// stdout stream with no spinner control codes.
+    is_tty: bool,
 }
 
 impl Default for LineStreamPrinter {
@@ -49,9 +65,116 @@ impl Default for LineStreamPrinter {
 
 impl LineStreamPrinter {
     pub fn new() -> Self {
+        // Only animate when stdout is an interactive TTY. In every
+        // other case (pipe, redirected file, cargo-test stdout capture,
+        // CI runner) we use a hidden draw target — the ticker becomes
+        // a no-op and `out` falls through to plain `println!` via the
+        // multi-progress `println` path, which writes to the real
+        // stdout regardless of the draw target. This keeps the line
+        // stream clean for downstream consumers and avoids the
+        // tick-thread / capture-pipe deadlocks that bit the v0.4.x
+        // attempt at this same feature.
+        let is_tty = io::stdout().is_terminal();
+        let target = if is_tty {
+            indicatif::ProgressDrawTarget::stdout()
+        } else {
+            indicatif::ProgressDrawTarget::hidden()
+        };
+        let multi = MultiProgress::with_draw_target(target);
         Self {
             indent: 0,
             step_start: None,
+            multi,
+            ticker: None,
+            is_tty,
+        }
+    }
+
+    // ── Print routing ────────────────────────────────────────────────────
+    // All `print*` calls in this module go through these helpers instead
+    // of `print!` / `println!` directly. That gives `MultiProgress` a
+    // chance to clear the ticker, write the line, and re-render the
+    // ticker — preventing the visual interleaving that broke the
+    // previous spinner attempt.
+
+    /// Print a line above the ticker (or to stdout when no ticker /
+    /// not a TTY). Strips a single trailing newline if present so we
+    /// don't end up with a double blank.
+    fn out(&self, line: &str) {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        if self.is_tty {
+            // Coordinate with the ticker so the spinner row gets
+            // cleared and re-rendered around this line.
+            if self.multi.println(trimmed).is_err() {
+                println!("{trimmed}");
+            }
+        } else {
+            // Non-TTY (pipe, cargo-test capture, CI). The hidden
+            // draw target would swallow `multi.println` lines, so go
+            // direct to stdout instead. No ticker is up in this
+            // branch anyway — `start_ticker` is gated on `is_tty`.
+            println!("{trimmed}");
+        }
+    }
+
+    /// Print a partial line (no newline). Used for the approval-prompt
+    /// inline tail. Bypasses `MultiProgress` since we need cursor to
+    /// stay on the same line for the keypress.
+    fn out_partial(&self, line: &str) {
+        if self.is_tty {
+            // Suspend the ticker while we hold an inline cursor so it
+            // can't erase the prompt before the user sees it.
+            self.multi.suspend(|| {
+                print!("{line}");
+                let _ = io::stdout().flush();
+            });
+        } else {
+            print!("{line}");
+            let _ = io::stdout().flush();
+        }
+    }
+
+    // ── Ticker control ───────────────────────────────────────────────────
+
+    /// Start the bottom-row ticker with the given message. No-op when
+    /// a ticker is already running; use [`Self::tick_with`] to update
+    /// the message instead.
+    pub fn start_ticker(&mut self, message: impl Into<String>) {
+        if !self.is_tty || self.ticker.is_some() {
+            // Skip when not a TTY — no terminal to animate against.
+            // Skip when already running — `tick_with` is the path for
+            // updating the message in place.
+            return;
+        }
+        let pb = self.multi.add(ProgressBar::new_spinner());
+        // Braille-block frames; ~80 ms per tick reads as a smooth
+        // pulse without flooding the terminal.
+        pb.set_style(
+            ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner())
+                .tick_strings(&[
+                    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+                ]),
+        );
+        pb.set_message(message.into());
+        pb.enable_steady_tick(Duration::from_millis(80));
+        self.ticker = Some(pb);
+    }
+
+    /// Update the ticker's message in place. No-op when no ticker is
+    /// running — caller can blindly call this on every event without
+    /// having to re-check state.
+    pub fn tick_with(&self, message: impl Into<String>) {
+        if let Some(pb) = &self.ticker {
+            pb.set_message(message.into());
+        }
+    }
+
+    /// Stop and clear the bottom-row ticker. Idempotent — safe to call
+    /// from event paths that may or may not have started a ticker.
+    pub fn stop_ticker(&mut self) {
+        if let Some(pb) = self.ticker.take() {
+            pb.finish_and_clear();
         }
     }
 
@@ -73,7 +196,7 @@ impl LineStreamPrinter {
         buf.push_str("  ");
         let ts = started_at.format("%H:%M:%S").to_string();
         let _ = palette::write_colored(&mut buf, &ts, DIM);
-        println!("{buf}");
+        self.out(&buf);
         // Continuous rail: even the gap line carries the pipe so the
         // user's eye doesn't lose the column.
         self.print_rail_only();
@@ -90,7 +213,7 @@ impl LineStreamPrinter {
         let _ = palette::write_colored(&mut buf, &meta, DIM);
         buf.push_str("  ");
         let _ = palette::write_colored(&mut buf, run_id, DIM);
-        println!("{buf}");
+        self.out(&buf);
         self.print_rail_only();
     }
 
@@ -120,8 +243,13 @@ impl LineStreamPrinter {
             let meta = format!("  ({})", parts.join(" · "));
             let _ = palette::write_colored(&mut buf, &meta, DIM);
         }
-        println!("{buf}");
-        let _ = io::stdout().flush();
+        self.out(&buf);
+        // Light up the bottom-row ticker so the operator knows the
+        // step is in flight even before any chunks arrive. The
+        // workflow_printer can call `tick_with` to refine the message
+        // as the LLM transitions through tool calls + assistant
+        // chunks. Stopped automatically by `step_done` / `step_failed`.
+        self.start_ticker(format!("running {step_id}…"));
 
         Spinner::start()
     }
@@ -141,8 +269,14 @@ impl LineStreamPrinter {
         let _ = palette::write_bold_colored(&mut buf, step_id, RUNNING);
         let meta = format!("  (panel · {panelists} panelists)");
         let _ = palette::write_colored(&mut buf, &meta, DIM);
-        println!("{buf}");
-        let _ = io::stdout().flush();
+        self.out(&buf);
+        // Panel runs N panelists in parallel — phrase the message
+        // accordingly so the operator doesn't think we've stalled
+        // before any panelist has reported.
+        self.start_ticker(format!(
+            "running {step_id} panel ({panelists} panelist{plural})…",
+            plural = if panelists == 1 { "" } else { "s" }
+        ));
 
         Spinner::start()
     }
@@ -172,7 +306,7 @@ impl LineStreamPrinter {
             format!("  · {findings_count} findings")
         };
         let _ = palette::write_colored(&mut buf, &tally, DIM);
-        println!("{buf}");
+        self.out(&buf);
     }
 
     /// Print a phase separator. Caller is responsible for any preceding
@@ -182,13 +316,17 @@ impl LineStreamPrinter {
         self.push_content_prefix(&mut buf);
         let line = "──────────────────────";
         let _ = palette::write_colored(&mut buf, line, SEPARATOR);
-        println!("{buf}");
+        self.out(&buf);
         self.print_rail_only();
     }
 
     /// One assistant-text chunk. Preserves blank lines as rail-only lines so
     /// the visual column never breaks.
     pub fn assistant_chunk(&mut self, chunk: &str) {
+        // Refresh the ticker so the operator sees the model is actively
+        // emitting tokens (even if the per-chunk lines are short and
+        // scroll fast). No-op when no ticker is up (e.g. replay mode).
+        self.tick_with("model streaming…");
         for line in chunk.split('\n') {
             if line.is_empty() {
                 self.print_rail_only();
@@ -196,13 +334,16 @@ impl LineStreamPrinter {
                 let mut buf = String::new();
                 self.push_content_prefix(&mut buf);
                 buf.push_str(line);
-                println!("{buf}");
+                self.out(&buf);
             }
         }
     }
 
     /// Tool call: `│  → <tool>  <summary>`
     pub fn tool_call(&mut self, tool: &str, summary: &str) {
+        // Update the bottom-row ticker with the current tool's name so
+        // the operator sees what's running while the call is in flight.
+        self.tick_with(format!("running tool {tool}…"));
         let mut buf = String::new();
         self.push_content_prefix(&mut buf);
         let arrow = "→ ";
@@ -212,7 +353,7 @@ impl LineStreamPrinter {
             buf.push_str("  ");
             let _ = palette::write_colored(&mut buf, summary, DIM);
         }
-        println!("{buf}");
+        self.out(&buf);
     }
 
     /// `│  ✓ <step_id>  · N findings · Xs`  — panel-step footer with
@@ -224,6 +365,7 @@ impl LineStreamPrinter {
         findings_count: usize,
         duration: Duration,
     ) {
+        self.stop_ticker();
         let elapsed = self
             .step_start
             .take()
@@ -250,12 +392,13 @@ impl LineStreamPrinter {
         buf.push_str("  ");
         let dur_meta = format!("· {dur_str}");
         let _ = palette::write_colored(&mut buf, &dur_meta, DIM);
-        println!("{buf}");
+        self.out(&buf);
         self.print_rail_only();
     }
 
     /// `│  ✓ <step_id>  · <duration> · <tokens> tokens`
     pub fn step_done(&mut self, step_id: &str, duration: Duration, total_tokens: u64) {
+        self.stop_ticker();
         let elapsed = self
             .step_start
             .take()
@@ -274,12 +417,13 @@ impl LineStreamPrinter {
             format!("· {dur_str}")
         };
         let _ = palette::write_colored(&mut buf, &meta, DIM);
-        println!("{buf}");
+        self.out(&buf);
         self.print_rail_only();
     }
 
     /// `│  ✗ <step_id>  failed: <reason>`
     pub fn step_failed(&mut self, step_id: &str, reason: &str) {
+        self.stop_ticker();
         self.step_start = None;
         let mut buf = String::new();
         self.push_content_prefix(&mut buf);
@@ -289,7 +433,7 @@ impl LineStreamPrinter {
         buf.push_str("  ");
         let msg = format!("failed: {reason}");
         let _ = palette::write_colored(&mut buf, &msg, FAILED);
-        println!("{buf}");
+        self.out(&buf);
         self.print_rail_only();
     }
 
@@ -301,13 +445,18 @@ impl LineStreamPrinter {
     /// Returns `'a'`, `'r'`, `'v'`, `'q'`, or another typed char. Ctrl-C
     /// and Esc map to `'q'`.
     pub fn approval_prompt(&mut self, step_id: &str, prompt: &str) -> io::Result<char> {
+        // Suspend the ticker — it could overwrite the inline `[a/r/v/q]:`
+        // tail or eat the user's typed character before crossterm reads it.
+        // We're paused waiting on input; nothing's happening that needs a
+        // ticker anyway. The next step will start a fresh one.
+        self.stop_ticker();
         let mut buf = String::new();
         self.push_prefix(&mut buf, BRANCH);
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, "⏸", AWAITING);
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, step_id, AWAITING);
-        println!("{buf}");
+        self.out(&buf);
 
         for line in prompt.split('\n') {
             if line.is_empty() {
@@ -316,7 +465,7 @@ impl LineStreamPrinter {
                 let mut b = String::new();
                 self.push_content_prefix(&mut b);
                 b.push_str(line);
-                println!("{b}");
+                self.out(&b);
             }
         }
 
@@ -325,15 +474,14 @@ impl LineStreamPrinter {
         let mut b = String::new();
         self.push_content_prefix(&mut b);
         let _ = palette::write_colored(&mut b, options_str, AWAITING);
-        println!("{b}");
+        self.out(&b);
 
         // Inline marker that names the keys — no `> ` (which reads as
         // "type something here").
         let mut b = String::new();
         self.push_content_prefix(&mut b);
         let _ = palette::write_bold_colored(&mut b, "[a/r/v/q]: ", AWAITING);
-        print!("{b}");
-        let _ = io::stdout().flush();
+        self.out_partial(&b);
 
         let ch = if io::stdin().is_terminal() {
             read_single_key()?
@@ -344,7 +492,7 @@ impl LineStreamPrinter {
         // Echo the chosen character and a newline.
         let mut echo = String::new();
         let _ = palette::write_bold_colored(&mut echo, &ch.to_string(), AWAITING);
-        println!("{echo}");
+        self.out(&echo);
         Ok(ch)
     }
 
@@ -354,8 +502,7 @@ impl LineStreamPrinter {
         let mut b = String::new();
         self.push_content_prefix(&mut b);
         b.push_str("Reason (optional, Enter to skip): ");
-        print!("{b}");
-        let _ = io::stdout().flush();
+        self.out_partial(&b);
         let mut line = String::new();
         io::stdin().read_line(&mut line)?;
         Ok(line.trim().to_string())
@@ -371,7 +518,7 @@ impl LineStreamPrinter {
             let mut b = String::new();
             self.push_content_prefix(&mut b);
             let _ = palette::write_colored(&mut b, "(no findings)", DIM);
-            println!("{b}");
+            self.out(&b);
             return;
         }
 
@@ -384,7 +531,7 @@ impl LineStreamPrinter {
             format!("─── {total} findings ───")
         };
         let _ = palette::write_colored(&mut hdr, &header_text, SEPARATOR);
-        println!("{hdr}");
+        self.out(&hdr);
         self.print_rail_only();
 
         for (step_id, findings) in groups {
@@ -394,7 +541,7 @@ impl LineStreamPrinter {
                 self.push_content_prefix(&mut sub);
                 let label = format!("from {} ({})", step_id, findings.len());
                 let _ = palette::write_colored(&mut sub, &label, DIM);
-                println!("{sub}");
+                self.out(&sub);
             }
 
             for f in findings {
@@ -412,7 +559,7 @@ impl LineStreamPrinter {
                 b.push_str("  ");
                 let _ =
                     palette::write_bold_colored(&mut b, &f.title, palette::Status::Active.color());
-                println!("{b}");
+                self.out(&b);
 
                 // Source.
                 if !f.source.is_empty() {
@@ -421,7 +568,7 @@ impl LineStreamPrinter {
                     src.push_str("    ");
                     let stext = format!("source: {}", f.source);
                     let _ = palette::write_colored(&mut src, &stext, DIM);
-                    println!("{src}");
+                    self.out(&src);
                 }
 
                 // Body (wrapped).
@@ -431,7 +578,7 @@ impl LineStreamPrinter {
                         self.push_content_prefix(&mut bl);
                         bl.push_str("    ");
                         let _ = palette::write_colored(&mut bl, &line, DIM);
-                        println!("{bl}");
+                        self.out(&bl);
                     }
                 }
                 self.print_rail_only();
@@ -447,7 +594,8 @@ impl LineStreamPrinter {
         duration: Duration,
         total_tokens: u64,
     ) {
-        println!();
+        self.stop_ticker();
+        self.out("");
         let dur_str = format_duration(duration);
         let mut buf = String::new();
         let _ = palette::write_bold_colored(&mut buf, "✓", COMPLETE);
@@ -458,12 +606,13 @@ impl LineStreamPrinter {
         buf.push_str("  ");
         let meta = format!("· {dur_str} · {total_tokens} tokens total");
         let _ = palette::write_colored(&mut buf, &meta, DIM);
-        println!("{buf}");
+        self.out(&buf);
     }
 
     /// `✗ <workflow_name> failed  <run_id>  error: <error>`
     pub fn workflow_failed(&mut self, workflow_name: &str, run_id: &str, error: &str) {
-        println!();
+        self.stop_ticker();
+        self.out("");
         let mut buf = String::new();
         let _ = palette::write_bold_colored(&mut buf, "✗", FAILED);
         buf.push(' ');
@@ -473,7 +622,7 @@ impl LineStreamPrinter {
         buf.push_str("  ");
         let msg = format!("error: {error}");
         let _ = palette::write_colored(&mut buf, &msg, FAILED);
-        println!("{buf}");
+        self.out(&buf);
     }
 
     /// Bump indent depth — for nested panel step runs.
@@ -512,7 +661,7 @@ impl LineStreamPrinter {
         let mut buf = String::new();
         self.push_indent_pipes(&mut buf);
         let _ = palette::write_colored(&mut buf, PIPE, BRAND_300);
-        println!("{buf}");
+        self.out(&buf);
     }
 }
 
@@ -793,5 +942,65 @@ mod tests {
             ),
         ];
         p.print_findings(&groups);
+    }
+
+    // ── Ticker tests ─────────────────────────────────────────────────
+    // Indicatif draws nothing under `cargo test` (stdout isn't a TTY,
+    // and `MultiProgress::println` swallows output to a hidden draw
+    // target), so we can't snapshot the rendered frames. What we CAN
+    // verify is that the lifecycle methods don't panic in any order
+    // and that `tick_with` is a safe no-op when no ticker is up.
+
+    #[test]
+    fn test_ticker_lifecycle_no_panic() {
+        no_color();
+        let mut p = LineStreamPrinter::new();
+        p.start_ticker("running…");
+        p.tick_with("now streaming…");
+        p.stop_ticker();
+        // Idempotent stop.
+        p.stop_ticker();
+    }
+
+    #[test]
+    fn test_ticker_double_start_is_noop() {
+        no_color();
+        let mut p = LineStreamPrinter::new();
+        p.start_ticker("first message");
+        // Should NOT replace the existing ticker — `tick_with` is the
+        // path for updating the message in place.
+        p.start_ticker("second message");
+        p.stop_ticker();
+    }
+
+    #[test]
+    fn test_tick_with_no_ticker_is_noop() {
+        no_color();
+        let p = LineStreamPrinter::new();
+        // Caller can blindly tick on every event without checking
+        // whether a ticker is running — must not panic.
+        p.tick_with("update");
+    }
+
+    #[test]
+    fn test_step_done_clears_ticker_field() {
+        // Under cargo-test stdout isn't a TTY so `start_ticker` is a
+        // no-op; the assertion is that step_done leaves
+        // `ticker = None` regardless of whether one was armed (the
+        // teardown is idempotent).
+        no_color();
+        let mut p = LineStreamPrinter::new();
+        let _h = p.step_start("step_a", None, None, None);
+        p.step_done("step_a", Duration::from_secs(1), 100);
+        assert!(p.ticker.is_none());
+    }
+
+    #[test]
+    fn test_step_failed_clears_ticker_field() {
+        no_color();
+        let mut p = LineStreamPrinter::new();
+        let _h = p.step_start("step_a", None, None, None);
+        p.step_failed("step_a", "boom");
+        assert!(p.ticker.is_none());
     }
 }

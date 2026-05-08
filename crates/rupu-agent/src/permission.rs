@@ -88,23 +88,27 @@ impl<'r, 'w, W: Write> PermissionPrompt<'r, 'w, W> {
 
     /// Print the prompt body and read a single decision character.
     /// Re-prompts on invalid input.
+    ///
+    /// One-line format: `  → <tool>  <inline-summary>  (ws: <compact-path>)  [y/n/a/s]: `
+    /// — collapses the previous five-line block (`Tool:`, `Workspace:`,
+    /// `Input:`, JSON body, `Decision [y/n/a/s]:`) into a single
+    /// horizontal scan. The summary picker knows the common tools
+    /// (`bash`, `read`, `write_file`, `edit_file`); unknown tools fall
+    /// back to a compact JSON one-liner. Long values are truncated with
+    /// the `…(more)` marker so the line stays under one terminal row.
     pub fn ask(
         &mut self,
         tool: &str,
         input_json: &Value,
         workspace_path: &str,
     ) -> std::io::Result<PermissionDecision> {
-        // Render the prompt body
-        writeln!(self.writer)?;
-        writeln!(self.writer, "  Tool:      {tool}")?;
-        writeln!(self.writer, "  Workspace: {workspace_path}")?;
-        let pretty = render_input(input_json);
-        writeln!(self.writer, "  Input:")?;
-        for line in pretty.lines() {
-            writeln!(self.writer, "    {line}")?;
-        }
+        let summary = render_inline_summary(tool, input_json);
+        let ws = compact_workspace(workspace_path);
         loop {
-            write!(self.writer, "  Decision [y/n/a/s]: ")?;
+            write!(
+                self.writer,
+                "  → {tool}  {summary}  (ws: {ws})  [y/n/a/s]: "
+            )?;
             self.writer.flush()?;
             let mut line = String::new();
             if self.reader.read_line(&mut line)? == 0 {
@@ -125,6 +129,81 @@ impl<'r, 'w, W: Write> PermissionPrompt<'r, 'w, W> {
             }
         }
     }
+}
+
+/// Pull a compact one-line summary out of `input_json` for the most
+/// common tools. Returns `tool`-tailored output rather than raw JSON
+/// so the operator's eye lands on the load-bearing field at a glance.
+fn render_inline_summary(tool: &str, v: &Value) -> String {
+    match tool {
+        "bash" => v
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(|s| truncate_inline(s, TRUNCATE_AT))
+            .unwrap_or_else(|| "(no command)".to_string()),
+        "read" => v
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(no path)".to_string()),
+        "write_file" => {
+            let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+            let bytes = v
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
+            format!("{path}  ({bytes} bytes)")
+        }
+        "edit_file" => v
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "(no path)".to_string()),
+        _ => {
+            // Fallback: compact JSON one-liner, truncated. Don't pretty-
+            // print — that would re-introduce multiple lines.
+            let s = serde_json::to_string(v).unwrap_or_else(|_| String::new());
+            truncate_inline(&s, TRUNCATE_AT)
+        }
+    }
+}
+
+/// Truncate `s` to `max` chars, appending `…(more)` when cut. The
+/// `(more)` marker is asserted by the existing prompt tests; keep the
+/// substring stable.
+fn truncate_inline(s: &str, max: usize) -> String {
+    // `s.chars().count()` would be more correct for multi-byte input
+    // but tool inputs are mostly ASCII; the byte-length heuristic is
+    // good enough and matches what the previous renderer did.
+    if s.len() <= max {
+        return s.to_string();
+    }
+    // Find a UTF-8-safe cut point at or before `max`.
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…(more)", &s[..cut])
+}
+
+/// Render `path` for the inline prompt: shows the full path when short,
+/// otherwise an ellipsis-prefixed tail (`…/T/.tmpXEVvgt`). Keeps the
+/// prompt under a typical 100-col terminal width.
+fn compact_workspace(path: &str) -> String {
+    const MAX: usize = 30;
+    if path.len() <= MAX {
+        return path.to_string();
+    }
+    // Take the trailing MAX-1 chars after a leading ellipsis.
+    let suffix_len = MAX - 1;
+    let start = path.len() - suffix_len;
+    // UTF-8-safe boundary.
+    let mut start = start;
+    while start < path.len() && !path.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &path[start..])
 }
 
 impl<'w> PermissionPrompt<'static, 'w, std::io::Stderr> {
@@ -150,16 +229,3 @@ impl<'w> PermissionPrompt<'static, 'w, std::io::Stderr> {
     }
 }
 
-fn render_input(v: &Value) -> String {
-    let s = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
-    let mut lines: Vec<String> = Vec::new();
-    for raw in s.lines() {
-        if raw.len() > TRUNCATE_AT {
-            let cut = &raw[..TRUNCATE_AT];
-            lines.push(format!("{cut}\u{2026}(more)"));
-        } else {
-            lines.push(raw.to_string());
-        }
-    }
-    lines.join("\n")
-}
