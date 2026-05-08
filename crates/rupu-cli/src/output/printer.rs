@@ -543,9 +543,13 @@ impl LineStreamPrinter {
         for line in highlighted.split('\n') {
             // Visible-len 0 means truly blank line. Strip ANSI to
             // verify rather than checking byte-len, which a
-            // colored-but-empty rendering still has > 0.
+            // colored-but-empty rendering still has > 0. Use the
+            // body-blank prefix (rail + body bar) instead of the
+            // rail-only one — paragraph breaks inside an agent
+            // response need to KEEP the body bar so the visual
+            // column doesn't dissolve mid-thought.
             if visible_len(line) == 0 {
-                self.print_rail_only();
+                self.print_body_blank();
                 continue;
             }
             for piece in wrap_with_ansi(line, avail) {
@@ -890,11 +894,20 @@ impl LineStreamPrinter {
         let _ = palette::write_colored(buf, FRAME_TOP, BRAND_300);
     }
 
-    /// `├─╰─` — frame closer, fused to the workflow rail. Mirror of
-    /// [`Self::push_frame_open`].
+    /// `│ ╰─` — frame closer that continues the body's vertical
+    /// column rather than branching off the parent rail. The earlier
+    /// shape `├─╰─` placed `├` at col 3·N (with a rightward `─` stub
+    /// at col 3·N+1) and `╰` at col 3·N+2 — column-correct on paper
+    /// but the horizontal `─` strokes broke the eye's vertical
+    /// reading of the body bar `┃`. The new shape keeps the inner
+    /// rail `│` at col 3·N (matching the body lines above) and bends
+    /// `╰─` from col 3·N+2 (where `┃` was) into the close content.
+    /// Same prefix width (4 visible cells past indent_pipes), same
+    /// content column — pure visual cleanup, callers don't change.
     fn push_frame_close(&self, buf: &mut String) {
         self.push_indent_pipes(buf);
-        let _ = palette::write_colored(buf, BRANCH, BRAND_300);
+        let _ = palette::write_colored(buf, PIPE, BRAND_300);
+        buf.push(' ');
         let _ = palette::write_colored(buf, FRAME_BOT, BRAND_300);
     }
 
@@ -943,6 +956,22 @@ impl LineStreamPrinter {
         self.push_indent_pipes(&mut buf);
         let _ = palette::write_colored(&mut buf, PIPE, BRAND_300);
         self.out(&buf);
+    }
+
+    /// Print the body prefix (`<indent_pipes>│ ┃  `) with no content,
+    /// used for blank lines INSIDE an agent's response so the body
+    /// bar `┃` stays visually continuous through paragraph breaks.
+    /// `print_rail_only` would drop the body bar (rendering only
+    /// `<indent_pipes>│`), which makes a paragraph gap look like the
+    /// frame ended — confusing when the agent is mid-response.
+    fn print_body_blank(&self) {
+        let mut buf = String::new();
+        self.push_body_prefix(&mut buf);
+        // Trim the trailing `  ` from push_body_prefix's output so a
+        // blank body line doesn't leave invisible whitespace at EOL
+        // that some terminals render as a soft underline.
+        let trimmed = buf.trim_end_matches(' ').to_string();
+        self.out(&trimmed);
     }
 }
 
@@ -1247,7 +1276,10 @@ mod tests {
         let p = LineStreamPrinter::new();
         let mut buf = String::new();
         p.push_frame_close(&mut buf);
-        assert_eq!(buf, "├─╰─");
+        // `│ ╰─` continues the body's vertical column (col 0 = `│`,
+        // col 2 = `╰`) instead of branching off the parent rail with
+        // `├─`. Same width (4 visible cells) so callers don't shift.
+        assert_eq!(buf, "│ ╰─");
     }
 
     #[test]
@@ -1257,10 +1289,14 @@ mod tests {
         p.push_indent();
         let mut buf = String::new();
         p.push_frame_close(&mut buf);
-        // At indent=1 the parent rail is in front, then the frame
-        // closer hangs off it — so the closer's `╰` sits at column 6
-        // (rail-indent of 3 cells plus 2 BRANCH cells plus the `╰`).
-        assert_eq!(buf, "│  ├─╰─");
+        // At indent=1: parent rail (3 cells), then the body's inner
+        // rail `│ ` (2 cells), then `╰─` bending into content. The
+        // `╰` lands at col 5, exactly under the body bar `┃` of
+        // assistant-chunk lines at the same indent. (Pre-fix this
+        // was `│  ├─╰─` — same `╰` column, but the `├─` introduced
+        // a horizontal stroke at col 4 that broke the eye's
+        // vertical reading of the body column.)
+        assert_eq!(buf, "│  │ ╰─");
     }
 
     #[test]
