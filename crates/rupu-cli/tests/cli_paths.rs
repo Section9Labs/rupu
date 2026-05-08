@@ -1,5 +1,8 @@
 use assert_fs::prelude::*;
-use rupu_cli::paths::{global_dir, project_root_for, transcripts_dir};
+use rupu_cli::paths::{
+    autoflow_claims_dir, autoflow_worktrees_dir, autoflows_dir, global_dir, project_root_for,
+    repos_dir, transcripts_dir,
+};
 
 #[test]
 fn global_dir_uses_rupu_home_env_when_set() {
@@ -50,4 +53,25 @@ fn transcripts_dir_falls_back_to_global() {
     let tmp_global = assert_fs::TempDir::new().unwrap();
     let dir = transcripts_dir(tmp_global.path(), None);
     assert!(dir.ends_with("transcripts"));
+}
+
+#[test]
+fn state_dirs_live_under_global_root() {
+    let tmp_global = assert_fs::TempDir::new().unwrap();
+    assert_eq!(
+        repos_dir(tmp_global.path()),
+        tmp_global.path().join("repos")
+    );
+    assert_eq!(
+        autoflows_dir(tmp_global.path()),
+        tmp_global.path().join("autoflows")
+    );
+    assert_eq!(
+        autoflow_claims_dir(tmp_global.path()),
+        tmp_global.path().join("autoflows/claims")
+    );
+    assert_eq!(
+        autoflow_worktrees_dir(tmp_global.path()),
+        tmp_global.path().join("autoflows/worktrees")
+    );
 }

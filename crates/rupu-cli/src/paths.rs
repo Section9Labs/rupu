@@ -42,6 +42,26 @@ pub fn transcripts_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
     global.join("transcripts")
 }
 
+/// Global repo registry directory.
+pub fn repos_dir(global: &Path) -> PathBuf {
+    global.join("repos")
+}
+
+/// Global autoflow state root.
+pub fn autoflows_dir(global: &Path) -> PathBuf {
+    global.join("autoflows")
+}
+
+/// Global autoflow claims directory.
+pub fn autoflow_claims_dir(global: &Path) -> PathBuf {
+    autoflows_dir(global).join("claims")
+}
+
+/// Global autoflow worktrees directory.
+pub fn autoflow_worktrees_dir(global: &Path) -> PathBuf {
+    autoflows_dir(global).join("worktrees")
+}
+
 /// Convenience: ensure a directory exists. Used to lazily create
 /// `~/.rupu/cache/`, `~/.rupu/transcripts/`, etc. on first use.
 pub fn ensure_dir(p: &Path) -> Result<()> {

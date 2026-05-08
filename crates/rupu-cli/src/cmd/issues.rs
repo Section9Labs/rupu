@@ -275,7 +275,7 @@ fn repo_to_issue_tracker(p: Platform) -> IssueTracker {
 
 /// Parse `--repo` (run-target syntax) or auto-detect from cwd's
 /// git remote when `--repo` is `None`. Returns a typed `RepoRef`.
-fn resolve_repo_or_autodetect(repo_arg: Option<&str>) -> anyhow::Result<RepoRef> {
+pub(crate) fn resolve_repo_or_autodetect(repo_arg: Option<&str>) -> anyhow::Result<RepoRef> {
     if let Some(s) = repo_arg {
         let parsed = crate::run_target::parse_run_target(s)?;
         match parsed {
@@ -392,9 +392,17 @@ fn resolve_issue_ref(s: &str) -> anyhow::Result<IssueRef> {
 /// Autodetect the repo from the cwd's git remote. Walks up looking
 /// for `.git/config`, parses the `[remote "origin"]` `url = ...`
 /// line, and converts common forms (HTTPS, SSH) into a `RepoRef`.
+pub(crate) fn canonical_repo_ref(repo: &RepoRef) -> String {
+    format!("{}:{}/{}", repo.platform, repo.owner, repo.repo)
+}
+
 fn autodetect_repo_from_cwd() -> anyhow::Result<RepoRef> {
     let pwd = std::env::current_dir()?;
-    let git_config = find_git_config(&pwd).ok_or_else(|| {
+    autodetect_repo_from_path(&pwd)
+}
+
+pub(crate) fn autodetect_repo_from_path(path: &Path) -> anyhow::Result<RepoRef> {
+    let git_config = find_git_config(path).ok_or_else(|| {
         anyhow::anyhow!("not in a git checkout — pass --repo <platform>:<owner>/<repo>")
     })?;
     let url = read_origin_url(&git_config)?;
@@ -415,7 +423,7 @@ fn find_git_config(start: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
-fn read_origin_url(config_path: &Path) -> anyhow::Result<String> {
+pub(crate) fn read_origin_url(config_path: &Path) -> anyhow::Result<String> {
     let text = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow::anyhow!("read {}: {e}", config_path.display()))?;
     let mut in_origin = false;
@@ -446,7 +454,7 @@ fn read_origin_url(config_path: &Path) -> anyhow::Result<String> {
 /// - `ssh://git@github.com/owner/repo`
 /// - GitLab equivalents
 /// - `github-<alias>:owner/repo` (SSH alias forms used in user `.ssh/config`)
-fn parse_remote_url(url: &str) -> Option<RepoRef> {
+pub(crate) fn parse_remote_url(url: &str) -> Option<RepoRef> {
     let stripped = url.trim().trim_end_matches('/').trim_end_matches(".git");
     // ssh-alias / SSH form: `<host>:owner/repo` (no scheme)
     if !stripped.contains("://") {
