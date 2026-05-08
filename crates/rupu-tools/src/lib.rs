@@ -37,5 +37,8 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use permission::{PermissionGate, PermissionMode};
 pub use read_file::ReadFileTool;
-pub use tool::{DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
+pub use tool::{
+    AgentDispatcher, DerivedEvent, DispatchError, DispatchOutcome, Tool, ToolContext, ToolError,
+    ToolOutput,
+};
 pub use write_file::WriteFileTool;

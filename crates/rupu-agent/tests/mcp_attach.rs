@@ -48,6 +48,9 @@ async fn mcp_registry_attaches_tools_to_run() {
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        parent_run_id: None,
+        depth: 0,
+        dispatchable_agents: None,
     };
 
     run_agent(opts).await.unwrap();

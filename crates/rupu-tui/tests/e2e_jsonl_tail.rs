@@ -63,6 +63,7 @@ fn tail_emits_run_update_when_run_json_changes() {
         expires_at: None,
         issue_ref: None,
         issue: None,
+        parent_run_id: None,
     };
     std::fs::write(
         dir.path().join("run.json"),

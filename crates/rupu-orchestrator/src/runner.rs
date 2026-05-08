@@ -355,6 +355,7 @@ pub async fn run_workflow(
                 expires_at: None,
                 issue_ref: opts.issue_ref.clone(),
                 issue: opts.issue.clone(),
+                parent_run_id: None,
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {

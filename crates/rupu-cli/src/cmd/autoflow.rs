@@ -895,6 +895,7 @@ fn active_or_fallback_contenders(
     }]
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_autoflow_cycle(
     global: &Path,
     claim_store: &AutoflowClaimStore,
@@ -1371,6 +1372,7 @@ fn push_workflow_paths(dir: &Path, scope: &str, into: &mut BTreeMap<String, (Str
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_resolved_autoflow_paths(
     dir: &Path,
     scope: &str,
@@ -2197,6 +2199,7 @@ steps:
             expires_at: None,
             issue_ref: Some("github:Section9Labs/rupu/issues/42".into()),
             issue: None,
+            parent_run_id: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store

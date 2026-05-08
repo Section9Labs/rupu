@@ -771,6 +771,9 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         mode_str,
         mcp_registry,
         system_prompt_suffix: None,
+        // dispatcher is wired below by `with_dispatcher` once the
+        // run-store-backed OrchestratorDispatcher is constructed.
+        dispatcher: None,
     });
 
     let resume = rupu_orchestrator::ResumeState {
@@ -1201,6 +1204,9 @@ async fn execute_workflow_invocation(
         mode_str: ctx.mode.clone(),
         mcp_registry,
         system_prompt_suffix: ctx.system_prompt_suffix.clone(),
+        // dispatcher is wired below by `with_dispatcher` once the
+        // OrchestratorDispatcher is constructed.
+        dispatcher: None,
     });
 
     let inputs_map: BTreeMap<String, String> = ctx.inputs.into_iter().collect();
@@ -1503,6 +1509,13 @@ struct CliStepFactory {
     /// Formatted `## Run target` text to append to each step's system prompt.
     /// `None` when no `--target` was supplied at workflow invocation.
     system_prompt_suffix: Option<String>,
+    /// Sub-agent dispatcher wired into every step's `ToolContext`.
+    /// `None` if the caller didn't construct one (no behavior change
+    /// from pre-dispatch builds; `dispatch_agent` calls fail with
+    /// "no dispatcher" in that case). The orchestrator constructs
+    /// this alongside the factory so it has access to the same
+    /// run_store + factory + agent loader.
+    dispatcher: Option<Arc<dyn rupu_tools::AgentDispatcher>>,
 }
 
 #[async_trait]
@@ -1556,6 +1569,7 @@ impl StepFactory for CliStepFactory {
                         anthropic_task_budget: None,
                         anthropic_context_management: None,
                         anthropic_speed: None,
+                        dispatchable_agents: None,
                         system_prompt: rendered_prompt.clone(),
                     }
                 });
@@ -1594,6 +1608,13 @@ impl StepFactory for CliStepFactory {
             None => spec.system_prompt,
         };
 
+        // Precompute the parent_run_id clone before moving `run_id`
+        // into the struct literal (otherwise the borrow-checker
+        // flags it because struct-literal field-init order is the
+        // *source* order: `run_id` moves before `tool_context` is
+        // constructed).
+        let parent_run_id_for_tool_ctx = Some(run_id.clone());
+
         AgentRunOpts {
             agent_name: spec.name,
             agent_system_prompt,
@@ -1611,6 +1632,16 @@ impl StepFactory for CliStepFactory {
                 workspace_path,
                 bash_env_allowlist: Vec::new(),
                 bash_timeout_secs: 120,
+                // Sub-agent dispatch wiring. The dispatcher is set on
+                // the factory by the workflow runner before
+                // `run_workflow` starts; the per-step ToolContext
+                // gets the dispatcher Arc plus the agent's declared
+                // allowlist + parent run id so the `dispatch_agent`
+                // tool can enforce both gates.
+                dispatcher: self.dispatcher.clone(),
+                dispatchable_agents: spec.dispatchable_agents.clone(),
+                parent_run_id: parent_run_id_for_tool_ctx,
+                depth: 0,
             },
             user_message: rendered_prompt,
             mode_str: self.mode_str.clone(),
@@ -1627,6 +1658,13 @@ impl StepFactory for CliStepFactory {
             anthropic_task_budget: spec.anthropic_task_budget,
             anthropic_context_management: spec.anthropic_context_management,
             anthropic_speed: spec.anthropic_speed,
+            // Top-level workflow steps run at depth 0 with no parent.
+            // Sub-agent dispatch within a step bumps depth via the
+            // `dispatch_agent` tool; this struct literal only fires
+            // for the workflow → agent direct dispatch.
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: spec.dispatchable_agents,
         }
     }
 }
