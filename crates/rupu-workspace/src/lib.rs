@@ -9,6 +9,7 @@
 
 pub mod autoflow_claim;
 pub mod autoflow_claim_store;
+pub mod autoflow_worktree;
 pub mod record;
 pub mod repo_record;
 pub mod repo_store;
@@ -25,6 +26,7 @@ pub use autoflow_claim::{AutoflowClaimRecord, ClaimStatus, PendingDispatch};
 pub use autoflow_claim_store::{
     ActiveLockRecord, AutoflowClaimStore, ClaimLockGuard, ClaimStoreError,
 };
+pub use autoflow_worktree::{ensure_issue_worktree, AutoflowWorktree, AutoflowWorktreeError};
 pub use discover::{discover, DiscoverError, Discovery};
 pub use record::{new_id, Workspace};
 pub use repo_record::TrackedRepo;

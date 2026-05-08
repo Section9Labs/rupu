@@ -1,9 +1,14 @@
-use rupu_orchestrator::templates::{render_step_prompt, StepContext};
+use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 
 #[test]
 fn renders_inputs_prompt() {
     let ctx = StepContext::new().with_input("prompt", "find the bug");
-    let out = render_step_prompt("Investigate: {{ inputs.prompt }}", &ctx).unwrap();
+    let out = render_step_prompt(
+        "Investigate: {{ inputs.prompt }}",
+        &ctx,
+        RenderMode::Permissive,
+    )
+    .unwrap();
     assert_eq!(out, "Investigate: find the bug");
 }
 
@@ -13,6 +18,7 @@ fn renders_prior_step_output() {
     let out = render_step_prompt(
         "Based on:\n{{ steps.investigate.output }}\nPropose fix.",
         &ctx,
+        RenderMode::Permissive,
     )
     .unwrap();
     assert!(out.contains("the bug is in foo()"));
@@ -22,12 +28,12 @@ fn renders_prior_step_output() {
 fn missing_variable_yields_empty_string_in_v0() {
     let ctx = StepContext::new();
     // minijinja's default behavior: undefined renders as "" — fine for v0.
-    let out = render_step_prompt("Hello {{ inputs.x }}!", &ctx).unwrap();
+    let out = render_step_prompt("Hello {{ inputs.x }}!", &ctx, RenderMode::Permissive).unwrap();
     assert_eq!(out, "Hello !");
 }
 
 #[test]
 fn syntax_error_returns_render_error() {
     let ctx = StepContext::new();
-    assert!(render_step_prompt("{{ unclosed", &ctx).is_err());
+    assert!(render_step_prompt("{{ unclosed", &ctx, RenderMode::Permissive).is_err());
 }

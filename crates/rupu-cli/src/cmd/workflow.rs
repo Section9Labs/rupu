@@ -792,6 +792,7 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         workflow_yaml: Some(body),
         resume_from: Some(resume),
         run_id_override: None,
+        strict_templates: false,
     };
 
     let result = run_workflow(opts).await?;
@@ -875,21 +876,31 @@ async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
-    let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
-    if let Some(p) = &project_root {
-        let candidate = p.join(".rupu/workflows").join(format!("{name}.yaml"));
+pub(crate) fn locate_workflow_in(
+    global: &Path,
+    project_root: Option<&Path>,
+    name: &str,
+) -> anyhow::Result<PathBuf> {
+    if let Some(project_root) = project_root {
+        let candidate = project_root
+            .join(".rupu/workflows")
+            .join(format!("{name}.yaml"));
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
-    let global = paths::global_dir()?;
     let candidate = global.join("workflows").join(format!("{name}.yaml"));
     if candidate.is_file() {
         return Ok(candidate);
     }
     Err(anyhow::anyhow!("workflow not found: {name}"))
+}
+
+fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let global = paths::global_dir()?;
+    locate_workflow_in(&global, project_root.as_deref(), name)
 }
 
 /// Lightweight outcome surface for [`run_by_name`] callers (the
@@ -901,6 +912,23 @@ fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
 pub struct RunOutcomeSummary {
     pub run_id: String,
     pub awaiting_step_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplicitWorkflowRunContext {
+    pub project_root: Option<PathBuf>,
+    pub workspace_path: PathBuf,
+    pub workspace_id: String,
+    pub inputs: Vec<(String, String)>,
+    pub mode: String,
+    pub event: Option<serde_json::Value>,
+    pub issue: Option<serde_json::Value>,
+    pub issue_ref: Option<String>,
+    pub system_prompt_suffix: Option<String>,
+    pub attach_ui: bool,
+    pub use_canvas: bool,
+    pub run_id_override: Option<String>,
+    pub strict_templates: bool,
 }
 
 /// Public wrapper around the workflow-run pipeline so other
@@ -1103,94 +1131,120 @@ async fn run_with_outcome(
         },
     }
 
-    let mode_str = mode.unwrap_or("ask").to_string();
-    let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
+    execute_workflow_invocation(
+        name,
+        workflow,
+        body,
+        global,
+        ExplicitWorkflowRunContext {
+            project_root: project_root.clone(),
+            workspace_path,
+            workspace_id: ws.id,
+            inputs,
+            mode: mode.unwrap_or("ask").to_string(),
+            event,
+            issue: issue_payload,
+            issue_ref: issue_ref_text,
+            system_prompt_suffix,
+            attach_ui,
+            use_canvas,
+            run_id_override,
+            strict_templates: false,
+        },
+    )
+    .await
+}
+
+pub async fn run_with_explicit_context(
+    name: &str,
+    ctx: ExplicitWorkflowRunContext,
+) -> anyhow::Result<RunOutcomeSummary> {
+    let global = paths::global_dir()?;
+    paths::ensure_dir(&global)?;
+    let path = locate_workflow_in(&global, ctx.project_root.as_deref(), name)?;
+    let body = std::fs::read_to_string(&path)?;
+    let workflow = Workflow::parse(&body)?;
+    execute_workflow_invocation(name, workflow, body, global, ctx).await
+}
+
+async fn execute_workflow_invocation(
+    name: &str,
+    workflow: Workflow,
+    body: String,
+    global: PathBuf,
+    ctx: ExplicitWorkflowRunContext,
+) -> anyhow::Result<RunOutcomeSummary> {
+    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+    let global_cfg_path = global.join("config.toml");
+    let project_cfg_path = ctx
+        .project_root
+        .as_ref()
+        .map(|p| p.join(".rupu/config.toml"));
+    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+
+    let transcripts = paths::transcripts_dir(&global, ctx.project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
-    // Capture transcript dir before it's moved into opts (used by the
-    // line-stream printer to locate step JSONL files).
     let transcripts_dir_snapshot = transcripts.clone();
 
-    // Snapshot fields the post-run notify path needs before we move
-    // them into the factory / opts.
     let registry_for_notify = Arc::clone(&mcp_registry);
     let notify_issue_enabled = workflow.notify_issue;
     let workflow_name_for_notify = workflow.name.clone();
-    let issue_ref_text_for_notify = issue_ref_text.clone();
-    let issue_payload_for_notify = issue_payload.clone();
+    let issue_ref_text_for_notify = ctx.issue_ref.clone();
+    let issue_payload_for_notify = ctx.issue.clone();
 
     let factory = Arc::new(CliStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
-        project_root: project_root.clone(),
+        project_root: ctx.project_root.clone(),
         resolver,
-        mode_str,
+        mode_str: ctx.mode.clone(),
         mcp_registry,
-        system_prompt_suffix,
+        system_prompt_suffix: ctx.system_prompt_suffix.clone(),
     });
 
-    let inputs_map: BTreeMap<String, String> = inputs.into_iter().collect();
+    let inputs_map: BTreeMap<String, String> = ctx.inputs.into_iter().collect();
     let runs_dir = global.join("runs");
     paths::ensure_dir(&runs_dir)?;
     let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir.clone()));
 
-    // Snapshot the cloneable pieces so we can rebuild `OrchestratorRunOpts`
-    // for each resume iteration. `factory`, `run_store`, and `workflow`
-    // are Arc/Clone-cheap.
     let workflow_for_resume = workflow.clone();
-    let workspace_path_for_resume = workspace_path.clone();
+    let workspace_path_for_resume = ctx.workspace_path.clone();
     let transcripts_for_resume = transcripts.clone();
-    let event_for_resume = event.clone();
-    let issue_for_resume = issue_payload.clone();
-    let issue_ref_for_resume = issue_ref_text.clone();
-    let workspace_id_for_resume = ws.id.clone();
+    let event_for_resume = ctx.event.clone();
+    let issue_for_resume = ctx.issue.clone();
+    let issue_ref_for_resume = ctx.issue_ref.clone();
+    let workspace_id_for_resume = ctx.workspace_id.clone();
     let factory_for_resume = Arc::clone(&factory);
     let run_store_for_resume = Arc::clone(&run_store);
     let body_for_resume = body.clone();
     let inputs_for_resume = inputs_map.clone();
+    let strict_templates = ctx.strict_templates;
 
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
-        workspace_id: ws.id,
-        workspace_path,
+        workspace_id: ctx.workspace_id,
+        workspace_path: ctx.workspace_path,
         transcript_dir: transcripts,
         factory,
-        event,
-        issue: issue_payload,
-        issue_ref: issue_ref_text,
+        event: ctx.event,
+        issue: ctx.issue,
+        issue_ref: ctx.issue_ref,
         run_store: Some(run_store),
         workflow_yaml: Some(body.clone()),
         resume_from: None,
-        run_id_override,
+        run_id_override: ctx.run_id_override,
+        strict_templates,
     };
 
-    // Non-interactive callers (webhook receiver, cron tick) pass
-    // `attach_ui = false` and keep the original inline-await path so
-    // they can capture and forward the result without a terminal.
-    //
-    // Interactive callers get a live UI. Default: line-stream printer
-    // (works in any terminal, pipe, or CI runner). `--canvas` opt-in
-    // keeps the alt-screen TUI canvas.
-    let result = if attach_ui {
-        // Snapshot the run dir entries that exist *before* the spawn so
-        // we can detect the new one the orchestrator creates.
+    let result = if ctx.attach_ui {
         let existing_run_ids: std::collections::BTreeSet<String> = list_run_dir_entries(&runs_dir);
-
-        // transcript_dir_snapshot was captured before opts was constructed.
-
-        // Spawn the workflow runner. `opts` is moved into the task;
-        // `_clone_guard` keeps the tmpdir alive through the scope.
         let runner_task = tokio::spawn(run_workflow(opts));
-
-        // Poll for the new run directory (created synchronously by the
-        // orchestrator before any step work begins). 2 s upper bound;
-        // in practice this is microseconds.
         let new_run_id = wait_for_new_run_dir(&runs_dir, &existing_run_ids, 2_000).await;
 
-        // First-attach result we'll merge with any resumed run.
-        let first_result = if let Some(ref rid) = new_run_id {
-            if use_canvas {
-                // Alt-screen TUI canvas (opt-in via --canvas).
+        if let Some(ref rid) = new_run_id {
+            if ctx.use_canvas {
                 if let Err(e) = rupu_tui::run_attached(rid.clone(), runs_dir.clone()) {
                     eprintln!("rupu: TUI exited early: {e}");
                 }
@@ -1199,16 +1253,12 @@ async fn run_with_outcome(
                     .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
                     .map_err(anyhow::Error::from)?
             } else {
-                // Line-stream printer (default). Loops over Approved
-                // outcomes, transparently spinning a resumed runner each
-                // time the user presses `a` at a gate.
                 let printer_store = rupu_orchestrator::RunStore::new(runs_dir.clone());
                 let mut printer = crate::output::LineStreamPrinter::new();
-
                 let mut attach_opts = crate::output::workflow_printer::AttachOpts::default();
                 let mut current_runner = runner_task;
 
-                let last_result: rupu_orchestrator::OrchestratorRunResult = loop {
+                loop {
                     let outcome = match crate::output::workflow_printer::attach_and_print_with(
                         name,
                         rid,
@@ -1225,7 +1275,6 @@ async fn run_with_outcome(
                         }
                     };
 
-                    // Drain the runner that produced this attach's events.
                     let result = current_runner
                         .await
                         .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
@@ -1234,11 +1283,9 @@ async fn run_with_outcome(
                     use crate::output::workflow_printer::AttachOutcome;
                     match outcome {
                         AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
-                            break result
+                            break result;
                         }
                         AttachOutcome::Approved { awaited_step_id } => {
-                            // Spin a resumed run with the same id and
-                            // re-attach the printer in skip-header mode.
                             let prior_records =
                                 run_store_for_resume.read_step_results(rid).map_err(|e| {
                                     anyhow::anyhow!("read step results for resume: {e}")
@@ -1270,40 +1317,28 @@ async fn run_with_outcome(
                                 workflow_yaml: Some(body_for_resume.clone()),
                                 resume_from: Some(resume),
                                 run_id_override: None,
+                                strict_templates,
                             };
                             current_runner = tokio::spawn(run_workflow(resume_opts));
                             attach_opts = crate::output::workflow_printer::AttachOpts {
                                 skip_header: true,
                                 skip_count: prior_count,
                             };
-                            // Loop back: re-attach the same printer. We
-                            // intentionally drop the just-finished result —
-                            // the resumed run will produce a fresh one.
                             let _ = result;
                         }
                     }
-                };
-
-                last_result
+                }
             }
         } else {
-            // No new run directory appeared — propagate the runner's error.
             runner_task
                 .await
                 .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
                 .map_err(anyhow::Error::from)?
-        };
-
-        first_result
+        }
     } else {
         run_workflow(opts).await?
     };
 
-    // Auto-comment on the targeted issue when the workflow opted in
-    // via `notifyIssue: true`. Best-effort: a failure to post just
-    // logs a warning so a slow / down issue tracker doesn't fail the
-    // run. We skip silently when `notifyIssue` is off OR when the
-    // run-target wasn't an issue.
     if notify_issue_enabled {
         if let (Some(ref_text), Some(payload)) =
             (&issue_ref_text_for_notify, &issue_payload_for_notify)

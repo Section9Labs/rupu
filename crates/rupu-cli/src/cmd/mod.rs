@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod auth;
+pub mod autoflow;
 pub mod completers;
 pub mod completions;
 pub mod config;

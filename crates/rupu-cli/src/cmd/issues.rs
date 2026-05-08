@@ -334,7 +334,7 @@ pub(crate) fn canonical_issue_ref(s: &str) -> anyhow::Result<String> {
 /// - Full run-target form: `github:Section9Labs/rupu/issues/42`.
 /// - Just a number (`42` or `#42`) — resolves via cwd autodetect.
 /// - `<repo>#42` shorthand: `Section9Labs/rupu#42` — assumes GitHub.
-fn resolve_issue_ref(s: &str) -> anyhow::Result<IssueRef> {
+pub(crate) fn resolve_issue_ref(s: &str) -> anyhow::Result<IssueRef> {
     let trimmed = s.trim();
 
     // Just a number / `#N` form: needs cwd autodetect for the project.
