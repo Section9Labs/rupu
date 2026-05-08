@@ -22,8 +22,8 @@ use rupu_scm::{
     Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
 };
 use rupu_workspace::{
-    ensure_issue_worktree, issue_dir_name, AutoflowClaimRecord, AutoflowClaimStore, ClaimStatus,
-    PendingDispatch, RepoRegistryStore,
+    ensure_issue_worktree, issue_dir_name, AutoflowClaimRecord, AutoflowClaimStore,
+    AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -289,6 +289,12 @@ async fn run(
         mode,
         true,
         BTreeMap::new(),
+        vec![AutoflowContender {
+            workflow: resolved.workflow.name.clone(),
+            priority: resolved.autoflow()?.priority,
+            scope: Some(resolved.scope.clone()),
+            selected: true,
+        }],
     )
     .await
 }
@@ -312,11 +318,11 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
         .context("collect autoflow wake hints")?;
 
     let tick_started_at = chrono::Utc::now();
-    let winners = choose_winning_matches(
-        collect_issue_matches(&discovered, resolver.as_ref())
-            .await
-            .context("discover autoflow issue matches")?,
-    );
+    let matches = collect_issue_matches(&discovered, resolver.as_ref())
+        .await
+        .context("discover autoflow issue matches")?;
+    let contenders_by_issue = summarize_issue_contenders(&matches);
+    let winners = choose_winning_matches(matches);
     let mut claims_by_issue: BTreeMap<String, AutoflowClaimRecord> = claim_store
         .list()?
         .into_iter()
@@ -340,6 +346,10 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
     for issue_ref_text in issue_keys {
         let winner = winners.get(&issue_ref_text).cloned();
         let mut claim = claims_by_issue.remove(&issue_ref_text);
+        let contenders = contenders_by_issue
+            .get(&issue_ref_text)
+            .cloned()
+            .unwrap_or_default();
 
         if let Some(mut current) = claim.take() {
             let active_lock = claim_store.read_active_lock(&issue_ref_text)?;
@@ -365,6 +375,11 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                 }
             } else {
                 let mut resolved = owner_resolution?;
+                current.contenders = active_or_fallback_contenders(
+                    &contenders,
+                    Some(&resolved),
+                    &current.workflow,
+                );
                 reconcile_claim_from_last_run(&global, &resolved, &mut current)?;
 
                 if current.status == ClaimStatus::Released {
@@ -402,6 +417,7 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                         None,
                         false,
                         dispatch.inputs,
+                        current.contenders.clone(),
                     )
                     .await?;
                     ran += 1;
@@ -428,6 +444,7 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                         None,
                         false,
                         BTreeMap::new(),
+                        current.contenders.clone(),
                     )
                     .await?;
                     ran += 1;
@@ -462,6 +479,11 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
             None,
             false,
             BTreeMap::new(),
+            active_or_fallback_contenders(
+                &contenders,
+                Some(&winner.resolved),
+                &winner.resolved.workflow.name,
+            ),
         )
         .await?;
         *active_claim_counts
@@ -485,8 +507,9 @@ async fn status() -> anyhow::Result<()> {
     let store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
+    let claims = store.list()?;
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for claim in store.list()? {
+    for claim in &claims {
         *counts.entry(status_name(claim.status)).or_insert(0) += 1;
     }
     if counts.is_empty() {
@@ -496,6 +519,20 @@ async fn status() -> anyhow::Result<()> {
     println!("{:<16} COUNT", "STATUS");
     for (status, count) in counts {
         println!("{status:<16} {count}");
+    }
+    let contested = claims
+        .iter()
+        .filter(|claim| claim.contenders.len() > 1)
+        .collect::<Vec<_>>();
+    if !contested.is_empty() {
+        println!("\ncontested issues:");
+        for claim in contested {
+            println!(
+                "- {} -> {}",
+                claim.issue_ref,
+                format_contenders(&claim.contenders)
+            );
+        }
     }
     Ok(())
 }
@@ -512,13 +549,28 @@ async fn claims() -> anyhow::Result<()> {
     }
 
     let mut table = crate::output::tables::new_table();
-    table.set_header(vec!["Issue", "Workflow", "Status", "Run", "Workspace"]);
+    table.set_header(vec![
+        "Issue",
+        "Workflow",
+        "Priority",
+        "Status",
+        "Next",
+        "Contenders",
+        "Workspace",
+    ]);
     for claim in claims {
+        let priority = selected_priority(&claim)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into());
+        let next = next_action_summary(&claim);
+        let contenders = format_contenders(&claim.contenders);
         table.add_row(vec![
             Cell::new(claim.issue_ref),
             Cell::new(claim.workflow),
+            Cell::new(priority),
             Cell::new(status_name(claim.status)),
-            Cell::new(claim.last_run_id.unwrap_or_else(|| "-".into())),
+            Cell::new(next),
+            Cell::new(contenders),
             Cell::new(claim.worktree_path.unwrap_or_else(|| "-".into())),
         ]);
     }
@@ -776,6 +828,73 @@ fn choose_winning_matches(matches: Vec<IssueMatch>) -> BTreeMap<String, IssueMat
     winners
 }
 
+fn summarize_issue_contenders(matches: &[IssueMatch]) -> BTreeMap<String, Vec<AutoflowContender>> {
+    let mut grouped: BTreeMap<String, Vec<AutoflowContender>> = BTreeMap::new();
+    for item in matches {
+        grouped
+            .entry(item.issue_ref_text.clone())
+            .or_default()
+            .push(AutoflowContender {
+                workflow: item.resolved.workflow.name.clone(),
+                priority: item.resolved.autoflow().expect("autoflow").priority,
+                scope: Some(item.resolved.scope.clone()),
+                selected: false,
+            });
+    }
+    for contenders in grouped.values_mut() {
+        contenders.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.workflow.cmp(&right.workflow))
+        });
+        let mut deduped = Vec::with_capacity(contenders.len());
+        for contender in contenders.drain(..) {
+            if deduped
+                .iter()
+                .any(|existing: &AutoflowContender| existing.workflow == contender.workflow)
+            {
+                continue;
+            }
+            deduped.push(contender);
+        }
+        if let Some(first) = deduped.first_mut() {
+            first.selected = true;
+        }
+        *contenders = deduped;
+    }
+    grouped
+}
+
+fn active_or_fallback_contenders(
+    contenders: &[AutoflowContender],
+    resolved: Option<&ResolvedAutoflowWorkflow>,
+    selected_workflow: &str,
+) -> Vec<AutoflowContender> {
+    if !contenders.is_empty() {
+        let mut cloned = contenders.to_vec();
+        let mut matched_selected = false;
+        for contender in &mut cloned {
+            contender.selected = contender.workflow == selected_workflow;
+            matched_selected |= contender.selected;
+        }
+        if !matched_selected {
+            if let Some(first) = cloned.first_mut() {
+                first.selected = true;
+            }
+        }
+        return cloned;
+    }
+    vec![AutoflowContender {
+        workflow: selected_workflow.to_string(),
+        priority: resolved
+            .and_then(|resolved| resolved.autoflow().ok().map(|autoflow| autoflow.priority))
+            .unwrap_or_default(),
+        scope: resolved.map(|resolved| resolved.scope.clone()),
+        selected: true,
+    }]
+}
+
 async fn execute_autoflow_cycle(
     global: &Path,
     claim_store: &AutoflowClaimStore,
@@ -785,6 +904,7 @@ async fn execute_autoflow_cycle(
     mode_override: Option<&str>,
     attach_ui: bool,
     inputs: BTreeMap<String, String>,
+    contenders: Vec<AutoflowContender>,
 ) -> anyhow::Result<()> {
     let autoflow = resolved.autoflow()?;
     let issue_payload = issue_payload(issue)?;
@@ -844,6 +964,7 @@ async fn execute_autoflow_cycle(
             claim_owner: None,
             lease_expires_at: None,
             pending_dispatch: None,
+            contenders: vec![],
             updated_at: chrono::Utc::now().to_rfc3339(),
         });
     claim.workflow = resolved.workflow.name.clone();
@@ -853,6 +974,7 @@ async fn execute_autoflow_cycle(
     claim.claim_owner = Some(owner);
     claim.lease_expires_at = lease_expires_at;
     claim.pending_dispatch = None;
+    claim.contenders = contenders;
     claim.updated_at = chrono::Utc::now().to_rfc3339();
     claim_store.save(&claim)?;
 
@@ -1657,6 +1779,43 @@ fn status_name(status: ClaimStatus) -> &'static str {
     }
 }
 
+fn selected_priority(claim: &AutoflowClaimRecord) -> Option<i32> {
+    claim
+        .contenders
+        .iter()
+        .find(|contender| contender.selected)
+        .map(|contender| contender.priority)
+}
+
+fn next_action_summary(claim: &AutoflowClaimRecord) -> String {
+    if let Some(dispatch) = &claim.pending_dispatch {
+        return format!("dispatch {}", dispatch.workflow);
+    }
+    if let Some(next_retry_at) = &claim.next_retry_at {
+        return format!("retry {next_retry_at}");
+    }
+    match claim.status {
+        ClaimStatus::AwaitHuman => "human approval".into(),
+        ClaimStatus::AwaitExternal => "external change".into(),
+        ClaimStatus::Running => claim.last_run_id.clone().unwrap_or_else(|| "running".into()),
+        _ => claim.last_run_id.clone().unwrap_or_else(|| "-".into()),
+    }
+}
+
+fn format_contenders(contenders: &[AutoflowContender]) -> String {
+    if contenders.is_empty() {
+        return "-".into();
+    }
+    contenders
+        .iter()
+        .map(|contender| {
+            let selected = if contender.selected { "*" } else { "" };
+            format!("{selected}{}[{}]", contender.workflow, contender.priority)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1883,6 +2042,7 @@ steps:
             claim_owner: None,
             lease_expires_at: None,
             pending_dispatch: None,
+            contenders: vec![],
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -2073,6 +2233,7 @@ steps:
             claim_owner: None,
             lease_expires_at: None,
             pending_dispatch: None,
+            contenders: vec![],
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
         apply_terminal_run_to_claim(&global, &resolved, "run_dispatch", &mut claim).unwrap();
@@ -2312,6 +2473,7 @@ steps:
                     (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
                 ),
                 pending_dispatch: None,
+                contenders: vec![],
                 updated_at: chrono::Utc::now().to_rfc3339(),
             })
             .unwrap();

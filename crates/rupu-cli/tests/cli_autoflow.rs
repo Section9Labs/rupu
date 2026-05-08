@@ -4,7 +4,9 @@
 //! `RUPU_MOCK_PROVIDER_SCRIPT`, cwd). Hold `ENV_LOCK` for the full
 //! body.
 
+use assert_cmd::Command;
 use assert_fs::prelude::*;
+use predicates::prelude::*;
 use tokio::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -168,6 +170,7 @@ async fn autoflow_release_deletes_claim() {
             claim_owner: None,
             lease_expires_at: None,
             pending_dispatch: None,
+            contenders: vec![],
             updated_at: chrono::Utc::now().to_rfc3339(),
         })
         .unwrap();
@@ -184,4 +187,59 @@ async fn autoflow_release_deletes_claim() {
 
     assert_eq!(exit, std::process::ExitCode::from(0));
     assert!(claim_store.load(issue_ref).unwrap().is_none());
+}
+
+#[test]
+fn autoflow_claims_shows_contenders_and_selected_priority() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.join("autoflows/claims"),
+    };
+    let issue_ref = "github:Section9Labs/rupu/issues/42";
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: issue_ref.into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "controller".into(),
+            status: rupu_workspace::ClaimStatus::Claimed,
+            worktree_path: Some("/tmp/rupu/issue-42".into()),
+            branch: None,
+            last_run_id: Some("run_123".into()),
+            last_error: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![
+                rupu_workspace::AutoflowContender {
+                    workflow: "controller".into(),
+                    priority: 100,
+                    scope: Some("project".into()),
+                    selected: true,
+                },
+                rupu_workspace::AutoflowContender {
+                    workflow: "phase-ready".into(),
+                    priority: 50,
+                    scope: Some("project".into()),
+                    selected: false,
+                },
+            ],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["autoflow", "claims"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Priority"))
+        .stdout(predicate::str::contains("Contenders"))
+        .stdout(predicate::str::contains("controller"))
+        .stdout(predicate::str::contains("*controller[100]"))
+        .stdout(predicate::str::contains("phase-ready[50]"));
 }

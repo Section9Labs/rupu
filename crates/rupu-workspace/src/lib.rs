@@ -22,7 +22,7 @@ pub mod worktree_layout;
 pub mod discover;
 pub mod store;
 
-pub use autoflow_claim::{AutoflowClaimRecord, ClaimStatus, PendingDispatch};
+pub use autoflow_claim::{AutoflowClaimRecord, AutoflowContender, ClaimStatus, PendingDispatch};
 pub use autoflow_claim_store::{
     ActiveLockRecord, AutoflowClaimStore, ClaimLockGuard, ClaimStoreError,
 };
