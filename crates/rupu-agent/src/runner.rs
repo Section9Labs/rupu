@@ -169,8 +169,25 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 rupu_mcp::serve_in_process(scm_registry.clone(), permission.clone());
             let dispatcher = Arc::new(rupu_mcp::ToolDispatcher::new(scm_registry, permission));
 
-            // Insert each MCP tool into the agent's tool registry.
+            // Insert each MCP tool into the agent's tool registry,
+            // BUT respect the agent's `tools:` allowlist when present.
+            // Otherwise the model would see scm.* / issues.* / vendor
+            // tools advertised even when the agent declared a narrower
+            // surface — the model picks one of the leaked tools, the
+            // dispatcher denies it (correctly), and we waste turns on
+            // permission_denied retries. With this gate the model only
+            // sees what it's allowed to call.
+            //
+            // `None` means "no agent allowlist" → register everything,
+            // matching the prior unrestricted behavior.
             for spec in rupu_mcp::tool_catalog() {
+                let allowed = match &opts.agent_tools {
+                    None => true,
+                    Some(list) => mcp_tool_name_matches_allowlist(spec.name, list),
+                };
+                if !allowed {
+                    continue;
+                }
                 let adapter = Arc::new(McpToolAdapter::new(
                     spec.name,
                     spec.description,
@@ -488,6 +505,70 @@ fn parse_file_edit_kind(s: &str) -> FileEditKind {
         "create" => FileEditKind::Create,
         "delete" => FileEditKind::Delete,
         _ => FileEditKind::Modify,
+    }
+}
+
+/// Mirror the allowlist match `McpPermission::tool_in_allowlist` uses,
+/// scoped to the registration-time decision (do we even ADVERTISE
+/// this tool to the model?). Same wildcard semantics:
+///
+/// - `*` matches everything
+/// - `prefix*` matches any tool whose name starts with `prefix`
+///   (e.g. `scm.*` matches `scm.repos.list`, `scm.files.read`, …)
+/// - exact match otherwise
+///
+/// Built-in (non-MCP) tool names like `bash` / `read` in the agent's
+/// `tools:` list don't appear in the MCP catalog, so they correctly
+/// don't match anything here — they're registered separately by
+/// `default_tool_registry`.
+fn mcp_tool_name_matches_allowlist(name: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|entry| {
+        if entry == "*" || entry == name {
+            return true;
+        }
+        if let Some(prefix) = entry.strip_suffix('*') {
+            name.starts_with(prefix)
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::mcp_tool_name_matches_allowlist;
+
+    #[test]
+    fn exact_match() {
+        let list = vec!["scm.repos.get".into(), "issues.list".into()];
+        assert!(mcp_tool_name_matches_allowlist("scm.repos.get", &list));
+        assert!(mcp_tool_name_matches_allowlist("issues.list", &list));
+        assert!(!mcp_tool_name_matches_allowlist("scm.files.read", &list));
+    }
+
+    #[test]
+    fn star_matches_all() {
+        let list = vec!["*".into()];
+        assert!(mcp_tool_name_matches_allowlist("any.tool", &list));
+        assert!(mcp_tool_name_matches_allowlist("scm.files.read", &list));
+    }
+
+    #[test]
+    fn namespace_wildcard() {
+        let list = vec!["scm.*".into()];
+        assert!(mcp_tool_name_matches_allowlist("scm.repos.get", &list));
+        assert!(mcp_tool_name_matches_allowlist("scm.files.read", &list));
+        assert!(!mcp_tool_name_matches_allowlist("issues.list", &list));
+    }
+
+    #[test]
+    fn builtin_tools_are_not_matched() {
+        // `bash` / `read` are agent-side built-ins, not MCP tools.
+        // The allowlist may list them but no MCP tool catalog entry
+        // should ever match them.
+        let list = vec!["bash".into(), "read".into()];
+        assert!(!mcp_tool_name_matches_allowlist("scm.repos.get", &list));
+        assert!(!mcp_tool_name_matches_allowlist("issues.list", &list));
     }
 }
 

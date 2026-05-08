@@ -124,16 +124,18 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));
 
-    // Print the agent header now that the run_id is known.
-    {
-        let mut printer = crate::output::LineStreamPrinter::new();
-        printer.agent_header(
-            &agent_header_name,
-            &agent_header_provider,
-            &agent_header_model,
-            &run_id,
-        );
-    }
+    // Construct ONE LineStreamPrinter for the whole run. Keeping a
+    // single instance means a single MultiProgress + ticker — earlier
+    // we built one for the header and another for the tail loop, and
+    // their indicatif draw targets stomped on each other (visible as
+    // two stale spinner rows under heavy tool-call traffic).
+    let mut printer = crate::output::LineStreamPrinter::new();
+    printer.agent_header(
+        &agent_header_name,
+        &agent_header_provider,
+        &agent_header_model,
+        &run_id,
+    );
 
     // Tool context config (the path is filled in after target resolution below).
     let bash_timeout = cfg.bash.timeout_secs.unwrap_or(120);
@@ -266,9 +268,10 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     // the tokio task drives the agent.
     let agent_task = tokio::spawn(rupu_agent::run_agent(opts));
 
-    // Tail the transcript in this thread.
+    // Tail the transcript in this thread, reusing the printer from
+    // the agent_header above so we don't construct a second
+    // MultiProgress that would double-render the bottom-row ticker.
     {
-        let mut printer = crate::output::LineStreamPrinter::new();
         printer.step_start(&spec_name_for_printer, None, None, None);
         let mut tailer = crate::output::TranscriptTailer::new(&transcript_path_for_printer);
         let mut total_tokens = 0u64;
