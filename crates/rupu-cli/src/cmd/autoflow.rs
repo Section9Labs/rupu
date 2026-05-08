@@ -1664,7 +1664,7 @@ mod tests {
     use httpmock::MockServer;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::StoredCredential;
-    use rupu_orchestrator::{RunRecord, StepResultRecord};
+    use rupu_orchestrator::{RunRecord, StepKind, StepResultRecord};
     use rupu_providers::AuthMode;
     use std::io::Write;
     use tokio::sync::Mutex;
@@ -2050,7 +2050,7 @@ steps:
                     success: true,
                     skipped: false,
                     rendered_prompt: "hi".into(),
-                    kind: rupu_orchestrator::StepKind::Linear,
+                    kind: StepKind::Linear,
                     items: vec![],
                     findings: vec![],
                     iterations: 0,
