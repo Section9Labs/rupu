@@ -92,6 +92,31 @@ pub fn ensure_issue_worktree(
     })
 }
 
+pub fn remove_issue_worktree(
+    base_checkout: &Path,
+    worktree_path: &Path,
+) -> Result<bool, AutoflowWorktreeError> {
+    let base_checkout = base_checkout
+        .canonicalize()
+        .map_err(|e| AutoflowWorktreeError::Io {
+            action: format!("canonicalize {}", base_checkout.display()),
+            source: e,
+        })?;
+    if !worktree_path.exists() {
+        return Ok(false);
+    }
+    run_git(
+        &base_checkout,
+        [
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path.to_string_lossy().as_ref(),
+        ],
+    )?;
+    Ok(true)
+}
+
 fn branch_exists(base_checkout: &Path, branch: &str) -> Result<bool, AutoflowWorktreeError> {
     let out = Command::new("git")
         .arg("-C")
@@ -227,5 +252,28 @@ mod tests {
         .unwrap();
         assert!(reused.reused);
         assert_eq!(reused.path, created.path);
+    }
+
+    #[test]
+    fn removes_issue_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let root = tmp.path().join("worktrees");
+        init_git_repo(&repo);
+
+        let created = ensure_issue_worktree(
+            &repo,
+            &root,
+            "github:Section9Labs/rupu",
+            "github:Section9Labs/rupu/issues/42",
+            "rupu/issue-42",
+            Some("HEAD"),
+        )
+        .unwrap();
+        assert!(created.path.exists());
+
+        let removed = remove_issue_worktree(&repo, &created.path).unwrap();
+        assert!(removed);
+        assert!(!created.path.exists());
     }
 }

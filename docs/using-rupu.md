@@ -277,6 +277,12 @@ Typical pattern:
 - declare `autoflow:` and `contracts:` in the workflow YAML
 - store schemas under `.rupu/contracts/`
 - run `rupu autoflow tick` from a scheduler
+- set `[autoflow].cleanup_after` if you want completed claims and their worktrees pruned automatically
+
+Operational cleanup:
+
+- `rupu autoflow release <issue-ref>` now removes the persisted claim and its managed worktree immediately
+- terminal `complete` and `released` claims are pruned on later `rupu autoflow tick` runs once `cleanup_after` has elapsed
 
 Examples:
 

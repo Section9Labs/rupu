@@ -7,6 +7,7 @@
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
+use std::process::Command as ProcessCommand;
 use tokio::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -16,6 +17,54 @@ const MOCK_SCRIPT: &str = r#"
   { "AssistantText": { "text": "autoflow output", "stop": "end_turn" } }
 ]
 "#;
+
+fn init_git_checkout(path: &std::path::Path, origin_url: &str) {
+    std::fs::create_dir_all(path).unwrap();
+    assert!(ProcessCommand::new("git")
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "user.email", "test@example.com"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "user.name", "Test User"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "add", "origin", origin_url])
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(path.join("README.md"), "hello\n").unwrap();
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["add", "README.md"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap()
+        .success());
+}
 
 fn write_agent_and_workflow(
     project: &assert_fs::TempDir,
@@ -152,6 +201,28 @@ async fn autoflow_release_deletes_claim() {
 
     let tmp = assert_fs::TempDir::new().unwrap();
     let home = tmp.path().join("home");
+    let project = tmp.path().join("repo");
+    init_git_checkout(&project, "git@github.com:Section9Labs/rupu.git");
+    let repo_store = rupu_workspace::RepoRegistryStore {
+        root: home.join("repos"),
+    };
+    repo_store
+        .upsert(
+            "github:Section9Labs/rupu",
+            &project,
+            Some("git@github.com:Section9Labs/rupu.git"),
+            Some("main"),
+        )
+        .unwrap();
+    let worktree = rupu_workspace::ensure_issue_worktree(
+        &project,
+        &home.join("autoflows/worktrees"),
+        "github:Section9Labs/rupu",
+        "github:Section9Labs/rupu/issues/42",
+        "rupu/issue-42",
+        Some("HEAD"),
+    )
+    .unwrap();
     let claim_store = rupu_workspace::AutoflowClaimStore {
         root: home.join("autoflows/claims"),
     };
@@ -162,7 +233,7 @@ async fn autoflow_release_deletes_claim() {
             repo_ref: "github:Section9Labs/rupu".into(),
             workflow: "auto-wf".into(),
             status: rupu_workspace::ClaimStatus::Claimed,
-            worktree_path: None,
+            worktree_path: Some(worktree.path.display().to_string()),
             branch: None,
             last_run_id: None,
             last_error: None,
@@ -187,6 +258,7 @@ async fn autoflow_release_deletes_claim() {
 
     assert_eq!(exit, std::process::ExitCode::from(0));
     assert!(claim_store.load(issue_ref).unwrap().is_none());
+    assert!(!worktree.path.exists());
 }
 
 #[test]

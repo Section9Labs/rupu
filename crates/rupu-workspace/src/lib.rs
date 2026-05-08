@@ -26,7 +26,9 @@ pub use autoflow_claim::{AutoflowClaimRecord, AutoflowContender, ClaimStatus, Pe
 pub use autoflow_claim_store::{
     ActiveLockRecord, AutoflowClaimStore, ClaimLockGuard, ClaimStoreError,
 };
-pub use autoflow_worktree::{ensure_issue_worktree, AutoflowWorktree, AutoflowWorktreeError};
+pub use autoflow_worktree::{
+    ensure_issue_worktree, remove_issue_worktree, AutoflowWorktree, AutoflowWorktreeError,
+};
 pub use discover::{discover, DiscoverError, Discovery};
 pub use record::{new_id, Workspace};
 pub use repo_record::TrackedRepo;
