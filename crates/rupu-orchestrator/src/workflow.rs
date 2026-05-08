@@ -5,10 +5,12 @@
 //! (`continue_on_error`), typed workflow inputs (`inputs:`), a
 //! `trigger:` declaration (manual / cron / event), data fan-out
 //! (`for_each:`) — one agent across N items, results in
-//! `steps.<id>.results[*]` — and agent fan-out (`parallel:`) — N
+//! `steps.<id>.results[*]` — agent fan-out (`parallel:`) — N
 //! distinct sub-steps over the same input, results in
-//! `steps.<id>.results.<sub_id>`. Panel steps still deferred — see
-//! TODO.md.
+//! `steps.<id>.results.<sub_id>` — and panel steps (`panel:`) — N
+//! reviewer agents in parallel over a shared subject with optional
+//! gate-loop and fixer dispatch (see [`Panel`] and
+//! `runner::run_panel_step`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

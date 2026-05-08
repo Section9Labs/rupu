@@ -41,7 +41,18 @@ const PIPE: &str = "│";
 /// emitted this" without needing any explicit framing — the eye reads
 /// it as one continuous gutter on the left of the streamed output.
 const BAR_HEAVY: &str = "┃";
+/// Frame opener — pairs with [`FRAME_BOT`] to form a Slack/Discord-style
+/// callout around an agent's run. The top edge carries the agent name;
+/// the bottom edge carries the close summary.
+const FRAME_TOP: &str = "╭─";
+/// Frame closer — see [`FRAME_TOP`].
+const FRAME_BOT: &str = "╰─";
 const SPACE: &str = "  ";
+
+/// Number of trailing `─` characters drawn after the agent name in the
+/// frame opener. Just enough to read as a section rule without crowding
+/// the meta tail.
+const FRAME_RULE_DASHES: usize = 6;
 
 /// Fallback terminal width when stdout is not a tty (pipe, CI). Same
 /// number `comfy-table` uses for headless renders. Long agent lines
@@ -277,18 +288,37 @@ impl LineStreamPrinter {
     ) -> SpinnerHandle {
         self.step_start = Some(std::time::Instant::now());
 
+        // Frame opener: `├─╭─ ◐ <headline> ────  step: <id>  (provider · model)`
+        // The agent name is the headline when present (matt's preferred
+        // reading: "I want to see *which* agent is running"), with the
+        // workflow step_id demoted to the dim meta tail. When no agent
+        // is wired (utility steps), step_id IS the headline and there
+        // is no `step:` tail.
         let mut buf = String::new();
-        self.push_prefix(&mut buf, BRANCH);
+        self.push_frame_open(&mut buf);
         buf.push(' ');
-        // Static "working" glyph in blue.
         let _ = palette::write_bold_colored(&mut buf, "◐", RUNNING);
         buf.push(' ');
-        let _ = palette::write_bold_colored(&mut buf, step_id, RUNNING);
+        let headline = agent.unwrap_or(step_id);
+        let _ = palette::write_bold_colored(&mut buf, headline, RUNNING);
+        buf.push(' ');
+        let rule = "─".repeat(FRAME_RULE_DASHES);
+        let _ = palette::write_colored(&mut buf, &rule, BRAND_300);
 
-        let parts: Vec<&str> = [agent, provider, model].iter().filter_map(|o| *o).collect();
-        if !parts.is_empty() {
-            let meta = format!("  ({})", parts.join(" · "));
-            let _ = palette::write_colored(&mut buf, &meta, DIM);
+        // Meta tail. When the agent is shown as headline, surface the
+        // step_id so the operator can correlate to the YAML; otherwise
+        // skip it (it's already the headline).
+        let mut meta_parts: Vec<String> = Vec::new();
+        if agent.is_some() {
+            meta_parts.push(format!("step: {step_id}"));
+        }
+        let provider_model: Vec<&str> = [provider, model].iter().filter_map(|o| *o).collect();
+        if !provider_model.is_empty() {
+            meta_parts.push(format!("({})", provider_model.join(" · ")));
+        }
+        if !meta_parts.is_empty() {
+            buf.push_str("  ");
+            let _ = palette::write_colored(&mut buf, &meta_parts.join("  "), DIM);
         }
         self.out(&buf);
         // Light up the bottom-row ticker so the operator knows the
@@ -309,11 +339,14 @@ impl LineStreamPrinter {
         self.step_start = Some(std::time::Instant::now());
 
         let mut buf = String::new();
-        self.push_prefix(&mut buf, BRANCH);
+        self.push_frame_open(&mut buf);
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, "◐", RUNNING);
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, step_id, RUNNING);
+        buf.push(' ');
+        let rule = "─".repeat(FRAME_RULE_DASHES);
+        let _ = palette::write_colored(&mut buf, &rule, BRAND_300);
         let meta = format!("  (panel · {panelists} panelists)");
         let _ = palette::write_colored(&mut buf, &meta, DIM);
         self.out(&buf);
@@ -453,7 +486,8 @@ impl LineStreamPrinter {
             .unwrap_or(duration);
         let dur_str = format_duration(elapsed);
         let mut buf = String::new();
-        self.push_content_prefix(&mut buf);
+        self.push_frame_close(&mut buf);
+        buf.push(' ');
         let (glyph, color) = if success {
             ("✓", COMPLETE)
         } else {
@@ -461,11 +495,8 @@ impl LineStreamPrinter {
         };
         let _ = palette::write_bold_colored(&mut buf, glyph, color);
         buf.push(' ');
-        let _ = palette::write_bold_colored(&mut buf, step_id, color);
-        buf.push_str("  ");
         // Closure word + tally + duration in the success/failure
-        // color so the panel footer reads as one unmistakable line
-        // (was previously dim meta, which scrolled past unnoticed).
+        // color so the panel footer reads as one unmistakable line.
         let closure = if success { "done" } else { "failed" };
         let tally = if findings_count == 1 {
             format!("{closure} · 1 finding · {dur_str}")
@@ -473,6 +504,7 @@ impl LineStreamPrinter {
             format!("{closure} · {findings_count} findings · {dur_str}")
         };
         let _ = palette::write_colored(&mut buf, &tally, color);
+        let _ = palette::write_colored(&mut buf, &format!("  ({step_id})"), DIM);
         self.out(&buf);
         self.print_rail_only();
     }
@@ -492,22 +524,25 @@ impl LineStreamPrinter {
             .map(|s| s.elapsed())
             .unwrap_or(duration);
         let dur_str = format_duration(elapsed);
+        // Frame closer: `├─╰─ ✓ done · <dur> · <tokens>`. The `╰`
+        // sits directly under the opener's `╭` so the agent's frame
+        // reads as one continuous shape from open through body to
+        // close. Whole footer in COMPLETE so the closure reads as a
+        // signal line, not a scrollable meta row.
         let mut buf = String::new();
-        self.push_content_prefix(&mut buf);
+        self.push_frame_close(&mut buf);
+        buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, "✓", COMPLETE);
         buf.push(' ');
-        let _ = palette::write_bold_colored(&mut buf, step_id, COMPLETE);
-        buf.push_str("  ");
-        // "done" word + meta both rendered in COMPLETE (not DIM) so the
-        // entire footer reads as one signal. Was previously DIM meta,
-        // which made the closure visually identical to a normal info
-        // line and got scrolled past.
         let meta = if total_tokens > 0 {
             format!("done · {dur_str} · {total_tokens} tokens")
         } else {
             format!("done · {dur_str}")
         };
         let _ = palette::write_colored(&mut buf, &meta, COMPLETE);
+        // step_id only useful when it differs from the headline (panels,
+        // utility steps without an agent). Trailing dim tail.
+        let _ = palette::write_colored(&mut buf, &format!("  ({step_id})"), DIM);
         self.out(&buf);
         self.print_rail_only();
     }
@@ -521,13 +556,13 @@ impl LineStreamPrinter {
         self.stop_ticker();
         self.step_start = None;
         let mut buf = String::new();
-        self.push_content_prefix(&mut buf);
+        self.push_frame_close(&mut buf);
+        buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, "✗", FAILED);
         buf.push(' ');
-        let _ = palette::write_bold_colored(&mut buf, step_id, FAILED);
-        buf.push_str("  ");
         let msg = format!("failed: {reason}");
         let _ = palette::write_bold_colored(&mut buf, &msg, FAILED);
+        let _ = palette::write_colored(&mut buf, &format!("  ({step_id})"), DIM);
         self.out(&buf);
         self.print_rail_only();
     }
@@ -741,19 +776,40 @@ impl LineStreamPrinter {
         let _ = palette::write_colored(buf, branch, BRAND_300);
     }
 
+    /// `├─╭─` — frame opener, fused to the workflow rail. Produces a
+    /// 4-cell prefix that places `╭` in column 3, directly above the
+    /// body bar `┃` so the open/body/close form one continuous frame.
+    fn push_frame_open(&self, buf: &mut String) {
+        self.push_indent_pipes(buf);
+        let _ = palette::write_colored(buf, BRANCH, BRAND_300);
+        let _ = palette::write_colored(buf, FRAME_TOP, BRAND_300);
+    }
+
+    /// `├─╰─` — frame closer, fused to the workflow rail. Mirror of
+    /// [`Self::push_frame_open`].
+    fn push_frame_close(&self, buf: &mut String) {
+        self.push_indent_pipes(buf);
+        let _ = palette::write_colored(buf, BRANCH, BRAND_300);
+        let _ = palette::write_colored(buf, FRAME_BOT, BRAND_300);
+    }
+
     fn push_content_prefix(&self, buf: &mut String) {
         self.push_indent_pipes(buf);
         let _ = palette::write_colored(buf, PIPE, BRAND_300);
         buf.push_str("  ");
     }
 
-    /// Body-content prefix — `┃ ` in BRAND (purple-500). Heavier than
-    /// the chrome `│` so the eye separates "agent emitted this" from
-    /// "rupu emitted this" at a glance. Used by [`Self::assistant_chunk`].
+    /// Body-content prefix — rail + frame-bar (`│ ┃  `) in BRAND_300/BRAND.
+    /// The rail keeps the workflow timeline continuous; the heavier `┃`
+    /// sits directly under the frame opener's `╭` (column 3) so the
+    /// agent's callout reads as one unbroken shape from open to close.
+    /// Used by [`Self::assistant_chunk`].
     fn push_body_prefix(&self, buf: &mut String) {
         self.push_indent_pipes(buf);
-        let _ = palette::write_colored(buf, BAR_HEAVY, BRAND);
+        let _ = palette::write_colored(buf, PIPE, BRAND_300);
         buf.push(' ');
+        let _ = palette::write_colored(buf, BAR_HEAVY, BRAND);
+        buf.push_str("  ");
     }
 
     /// Visible-character width consumed by the body prefix at the
@@ -762,8 +818,10 @@ impl LineStreamPrinter {
     /// wrap math.
     fn body_prefix_visual_width(&self) -> usize {
         // Each indent level is `│` + 2 spaces = 3 visible cells.
-        // Body prefix adds `┃ ` = 2 visible cells.
-        self.indent * 3 + 2
+        // Body prefix adds `│ ┃  ` = 5 visible cells (rail + space +
+        // bar + 2 spaces, content from col 6 — aligned with the
+        // frame-opener's content column).
+        self.indent * 3 + 5
     }
 
     fn push_indent_pipes(&self, buf: &mut String) {
@@ -1067,6 +1125,57 @@ mod tests {
         let mut buf = String::new();
         p.push_prefix(&mut buf, "├─");
         assert_eq!(buf, "│  ├─");
+    }
+
+    #[test]
+    fn test_frame_open_at_indent0() {
+        no_color();
+        let p = LineStreamPrinter::new();
+        let mut buf = String::new();
+        p.push_frame_open(&mut buf);
+        assert_eq!(buf, "├─╭─");
+    }
+
+    #[test]
+    fn test_frame_close_at_indent0() {
+        no_color();
+        let p = LineStreamPrinter::new();
+        let mut buf = String::new();
+        p.push_frame_close(&mut buf);
+        assert_eq!(buf, "├─╰─");
+    }
+
+    #[test]
+    fn test_frame_open_at_indent1() {
+        no_color();
+        let mut p = LineStreamPrinter::new();
+        p.push_indent();
+        let mut buf = String::new();
+        p.push_frame_open(&mut buf);
+        assert_eq!(buf, "│  ├─╭─");
+    }
+
+    #[test]
+    fn test_body_prefix_aligns_under_frame_top() {
+        // The body bar `┃` must sit at column 3 — directly under the
+        // frame opener's `╭` (also at column 3 in `├─╭─`). Anything
+        // else breaks the visual continuity of the frame.
+        no_color();
+        let p = LineStreamPrinter::new();
+        let mut frame = String::new();
+        p.push_frame_open(&mut frame);
+        let mut body = String::new();
+        p.push_body_prefix(&mut body);
+
+        // Visible-width must match (5 cells either way).
+        assert_eq!(visible_len(&frame), 4); // ├─╭─ (no trailing space yet)
+        assert_eq!(visible_len(&body), 5); // │ ┃ + 2 trailing spaces
+
+        // Column-3 character: `╭` in the opener, `┃` in the body.
+        let frame_chars: Vec<char> = frame.chars().collect();
+        let body_chars: Vec<char> = body.chars().collect();
+        assert_eq!(frame_chars[2], '╭');
+        assert_eq!(body_chars[2], '┃');
     }
 
     #[test]
