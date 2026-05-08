@@ -87,6 +87,31 @@ pub enum WorkflowParseError {
         workflow_declared: String,
         step_declared: String,
     },
+    #[error(
+        "step `{step}` {template_kind} references `steps.{referenced}` but no step with that id exists"
+    )]
+    TemplateUnknownStepRef {
+        step: String,
+        template_kind: &'static str,
+        referenced: String,
+    },
+    #[error(
+        "step `{step}` {template_kind} references `steps.{referenced}` but that step runs *after* this one (forward reference — its output isn't bound yet)"
+    )]
+    TemplateForwardStepRef {
+        step: String,
+        template_kind: &'static str,
+        referenced: String,
+    },
+    #[error(
+        "step `{step}` {template_kind} references `steps.{referenced_step}.{field}` but `{field}` is not a known step-output field (valid: output, success, skipped, results, sub_results, findings, max_severity, iterations, resolved)"
+    )]
+    TemplateUnknownStepField {
+        step: String,
+        template_kind: &'static str,
+        referenced_step: String,
+        field: String,
+    },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -639,6 +664,7 @@ impl Workflow {
         validate_trigger(&wf.trigger)?;
         validate_contracts(&wf)?;
         validate_autoflow(&wf)?;
+        validate_template_refs(&wf)?;
         Ok(wf)
     }
 
@@ -894,6 +920,166 @@ fn validate_contracts(wf: &Workflow) -> Result<(), WorkflowParseError> {
         }
     }
     Ok(())
+}
+
+/// Known fields on `StepOutput` (see `templates::StepOutput`).
+/// Used by [`validate_template_refs`] to flag typos like
+/// `{{ steps.x.findngs }}` at parse time.
+const STEP_OUTPUT_FIELDS: &[&str] = &[
+    "output",
+    "success",
+    "skipped",
+    "results",
+    "sub_results",
+    "findings",
+    "max_severity",
+    "iterations",
+    "resolved",
+];
+
+/// Walk every templated string in the workflow and validate
+/// `steps.<id>.<field>` references against the actual step graph.
+/// Catches:
+///   - References to step ids that don't exist anywhere in the workflow.
+///   - References to step ids that come *later* in the linear order
+///     (forward reference — the value isn't bound yet at render time).
+///   - References to fields that aren't on `StepOutput`.
+///
+/// Limitations of the MVP scanner:
+///   - Doesn't validate deeper paths like `steps.x.sub_results.<sub_id>`
+///     beyond the first two segments. The first two suffice to catch
+///     the vast majority of authoring mistakes.
+///   - Doesn't see references that are computed at runtime
+///     (`{{ steps[var] }}`). We accept the false negative — those
+///     are rare in workflow YAML and would still fail loudly at render.
+fn validate_template_refs(wf: &Workflow) -> Result<(), WorkflowParseError> {
+    // Linear order of step ids — every reference must point at a
+    // step earlier in this list.
+    let step_order: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+    for (idx, step) in wf.steps.iter().enumerate() {
+        let prior: BTreeSet<&str> = step_order[..idx].iter().copied().collect();
+        // Top-level prompt / when / for_each / panel.subject.
+        for (kind, src) in collect_templates_for_step(step) {
+            for (referenced, field) in scan_step_refs(&src) {
+                if !prior.contains(referenced.as_str()) {
+                    // Distinguish "doesn't exist anywhere" from "forward
+                    // reference" so the error message is actionable.
+                    let exists_later = wf.steps.iter().any(|s| s.id == referenced);
+                    if exists_later {
+                        return Err(WorkflowParseError::TemplateForwardStepRef {
+                            step: step.id.clone(),
+                            template_kind: kind,
+                            referenced,
+                        });
+                    } else {
+                        return Err(WorkflowParseError::TemplateUnknownStepRef {
+                            step: step.id.clone(),
+                            template_kind: kind,
+                            referenced,
+                        });
+                    }
+                }
+                if let Some(f) = field {
+                    if !STEP_OUTPUT_FIELDS.contains(&f.as_str()) {
+                        return Err(WorkflowParseError::TemplateUnknownStepField {
+                            step: step.id.clone(),
+                            template_kind: kind,
+                            referenced_step: referenced,
+                            field: f,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Yield every templated string on a Step paired with a short
+/// kind tag (`"prompt"`, `"when"`, `"for_each"`, `"panel.subject"`,
+/// `"parallel.<id>.prompt"`).
+fn collect_templates_for_step(step: &Step) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    if let Some(p) = &step.prompt {
+        out.push(("prompt", p.clone()));
+    }
+    if let Some(w) = &step.when {
+        out.push(("when", w.clone()));
+    }
+    if let Some(f) = &step.for_each {
+        out.push(("for_each", f.clone()));
+    }
+    if let Some(panel) = &step.panel {
+        out.push(("panel.subject", panel.subject.clone()));
+        // Panelists are bare agent names; the agent file owns its own
+        // prompt template — nothing workflow-level to lint here.
+    }
+    if let Some(subs) = &step.parallel {
+        for sub in subs {
+            out.push(("parallel.prompt", sub.prompt.clone()));
+        }
+    }
+    out
+}
+
+/// Scan a template string for `steps.<id>(.<field>)?` references and
+/// return them as `(referenced_step_id, optional_field)` tuples.
+/// Both the step id and field segments must be ASCII identifier
+/// characters (`[A-Za-z0-9_]`); anything else terminates the match
+/// (so `steps.review-each` would yield `("review", None)` — but
+/// step ids that contain hyphens can't be referenced in jinja
+/// templates anyway, since `-` isn't part of a jinja identifier).
+fn scan_step_refs(template: &str) -> Vec<(String, Option<String>)> {
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+    let bytes = template.as_bytes();
+    let needle = b"steps.";
+    let mut refs = Vec::new();
+    let mut i = 0usize;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] != needle {
+            i += 1;
+            continue;
+        }
+        // Must be a word-boundary before "steps." — otherwise we'd
+        // match things like `mysteps.foo`. Accept start-of-string.
+        if i > 0 && is_ident_byte(bytes[i - 1]) {
+            i += 1;
+            continue;
+        }
+        let id_start = i + needle.len();
+        let mut j = id_start;
+        while j < bytes.len() && is_ident_byte(bytes[j]) {
+            j += 1;
+        }
+        if j == id_start {
+            // `steps.` not followed by an identifier — skip.
+            i = j;
+            continue;
+        }
+        // SAFETY: id_start..j is a contiguous ASCII identifier slice.
+        let step_id = std::str::from_utf8(&bytes[id_start..j]).unwrap().to_string();
+        let field = if j < bytes.len() && bytes[j] == b'.' {
+            let f_start = j + 1;
+            let mut k = f_start;
+            while k < bytes.len() && is_ident_byte(bytes[k]) {
+                k += 1;
+            }
+            if k > f_start {
+                let f = std::str::from_utf8(&bytes[f_start..k]).unwrap().to_string();
+                j = k;
+                Some(f)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        refs.push((step_id, field));
+        i = j;
+    }
+    refs
 }
 
 fn validate_autoflow(wf: &Workflow) -> Result<(), WorkflowParseError> {

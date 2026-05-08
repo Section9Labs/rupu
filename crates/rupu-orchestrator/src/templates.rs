@@ -118,23 +118,33 @@ pub struct StepOutput {
     pub skipped: bool,
     /// Per-unit outputs (strings) for fan-out steps. Empty for
     /// non-fan-out steps. Bound as `steps.<id>.results[*]`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Always serialized — `skip_serializing_if` would make empty
+    /// vecs *absent* in the template context, causing
+    /// `{{ steps.x.results | length }}` to fail with "undefined" on
+    /// any step that legitimately produced zero results. Workflow
+    /// authors should never need defensive `default([])` plumbing
+    /// for fields the engine guarantees exist.
+    #[serde(default)]
     pub results: Vec<String>,
     /// Per-sub-step map for `parallel:` steps. Empty for `for_each:`
     /// and linear steps. Bound as
     /// `steps.<id>.sub_results.<sub_id>.{output,success}`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Always serialized — see `results` for rationale.
+    #[serde(default)]
     pub sub_results: BTreeMap<String, SubResult>,
     /// Aggregated findings for `panel:` steps. Empty for non-panel
     /// steps. Bound as `steps.<id>.findings[*]` and
     /// `steps.<id>.max_severity` ("critical" / "high" / "medium" /
     /// "low" / "" when there are no findings).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always serialized — see `results` for rationale.
+    #[serde(default)]
     pub findings: Vec<FindingView>,
     /// Highest severity in `findings`. Empty string when no
     /// findings. Convenient for `when:` gates: e.g.
     /// `when: "{{ steps.panel.max_severity == 'critical' }}"`.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Always serialized — see `results` for rationale.
+    #[serde(default)]
     pub max_severity: String,
     /// Iteration count for panel steps with a `gate:` loop. `0` for
     /// non-panel steps and panel steps without a gate (which run a
@@ -373,6 +383,77 @@ mod when_tests {
         let v = render_when_expression("{{ steps.review.success }}", &ctx, RenderMode::Permissive)
             .expect("render");
         assert!(v);
+    }
+
+    #[test]
+    fn empty_collection_fields_render_as_empty_not_undefined() {
+        // Regression: `findings` / `results` / `sub_results` /
+        // `max_severity` previously had `skip_serializing_if = "*::is_empty"`
+        // which made empty values absent from the template context —
+        // `{{ steps.x.findings | length }}` then errored with
+        // "cannot calculate length of value of type undefined" on any
+        // step that legitimately produced zero findings. The fields
+        // are now always serialized so workflow authors don't need
+        // defensive `default([])` plumbing.
+        let mut ctx = StepContext::new();
+        ctx.steps.insert(
+            "panel".into(),
+            StepOutput {
+                output: "ok".into(),
+                success: true,
+                skipped: false,
+                results: Vec::new(),
+                sub_results: BTreeMap::new(),
+                findings: Vec::new(),
+                max_severity: String::new(),
+                ..Default::default()
+            },
+        );
+
+        // `findings | length` must return 0, not error on undefined.
+        let prompt = render_step_prompt(
+            "findings={{ steps.panel.findings | length }}",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("findings | length should not error on empty");
+        assert_eq!(prompt, "findings=0");
+
+        // `results | length` same property.
+        let prompt = render_step_prompt(
+            "results={{ steps.panel.results | length }}",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("results | length should not error on empty");
+        assert_eq!(prompt, "results=0");
+
+        // `sub_results | length` same property.
+        let prompt = render_step_prompt(
+            "subs={{ steps.panel.sub_results | length }}",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("sub_results | length should not error on empty");
+        assert_eq!(prompt, "subs=0");
+
+        // `max_severity` should render as empty string, not undefined.
+        let prompt = render_step_prompt(
+            "sev=<{{ steps.panel.max_severity }}>",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("render");
+        assert_eq!(prompt, "sev=<>");
+
+        // `for r in results` over empty must loop zero times silently.
+        let prompt = render_step_prompt(
+            "items=[{% for r in steps.panel.results %}{{ r }};{% endfor %}]",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("for-loop over empty should be a no-op");
+        assert_eq!(prompt, "items=[]");
     }
 }
 
