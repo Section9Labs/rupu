@@ -9,6 +9,7 @@
 use crate::paths;
 use chrono::{DateTime, Utc};
 use clap::Args;
+use comfy_table::Cell;
 use rupu_transcript::{aggregate, TimeWindow, UsageRow};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -65,12 +66,29 @@ async fn run(args: UsageArgs) -> anyhow::Result<()> {
 
     let rows = aggregate(&paths_to_scan, window);
 
+    // Layered config supplies pricing overrides + UI prefs for the
+    // colored cost cells. Failing to load the config files isn't
+    // fatal — a default `Config` still picks up the built-in price
+    // table and renders with no color overrides.
+    let cfg = layered_config(&global, project_root.as_deref());
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None);
+
     match args.format.as_str() {
-        "json" => print_json(&rows)?,
-        "table" => print_table(&rows),
+        "json" => print_json(&rows, &cfg.pricing)?,
+        "table" => print_table(&rows, &cfg.pricing, &prefs),
         other => anyhow::bail!("unknown --format: {other} (expected `table` or `json`)"),
     }
     Ok(())
+}
+
+fn layered_config(
+    global: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+) -> rupu_config::Config {
+    let global_cfg_path = global.join("config.toml");
+    let project_cfg_path = project_root.map(|p| p.join(".rupu/config.toml"));
+    rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())
+        .unwrap_or_default()
 }
 
 /// Accept either a full RFC-3339 timestamp (`2026-05-01T00:00:00Z`)
@@ -123,37 +141,73 @@ fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn print_table(rows: &[UsageRow]) {
+fn print_table(
+    rows: &[UsageRow],
+    pricing: &rupu_config::PricingConfig,
+    prefs: &crate::cmd::ui::UiPrefs,
+) {
     if rows.is_empty() {
         println!("(no runs match — try `--since 30d` to widen the window)");
         return;
     }
-    println!(
-        "{:<14} {:<28} {:<28} {:>10} {:>10} {:>10} {:>6}",
-        "PROVIDER", "MODEL", "AGENT", "INPUT", "OUTPUT", "CACHED", "RUNS"
-    );
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec![
+        "PROVIDER", "MODEL", "AGENT", "INPUT", "OUTPUT", "CACHED", "RUNS", "COST (USD)",
+    ]);
     let mut total_in = 0u64;
     let mut total_out = 0u64;
     let mut total_cached = 0u64;
     let mut total_runs = 0u64;
+    let mut total_cost = 0.0f64;
+    let mut any_priced = false;
     for r in rows {
-        println!(
-            "{:<14} {:<28} {:<28} {:>10} {:>10} {:>10} {:>6}",
-            r.provider, r.model, r.agent, r.input_tokens, r.output_tokens, r.cached_tokens, r.runs
-        );
+        let cost = crate::pricing::lookup(pricing, &r.provider, &r.model, &r.agent)
+            .map(|p| p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens));
+        if let Some(c) = cost {
+            total_cost += c;
+            any_priced = true;
+        }
+        table.add_row(vec![
+            Cell::new(&r.provider),
+            Cell::new(&r.model),
+            Cell::new(&r.agent),
+            Cell::new(format_count(r.input_tokens)),
+            Cell::new(format_count(r.output_tokens)),
+            Cell::new(format_count(r.cached_tokens)),
+            Cell::new(r.runs.to_string()),
+            cost_cell(cost, prefs),
+        ]);
         total_in += r.input_tokens;
         total_out += r.output_tokens;
         total_cached += r.cached_tokens;
         total_runs += r.runs;
     }
-    println!(
-        "{:<14} {:<28} {:<28} {:>10} {:>10} {:>10} {:>6}",
-        "TOTAL", "", "", total_in, total_out, total_cached, total_runs
-    );
+    table.add_row(vec![
+        Cell::new("TOTAL"),
+        Cell::new(""),
+        Cell::new(""),
+        Cell::new(format_count(total_in)),
+        Cell::new(format_count(total_out)),
+        Cell::new(format_count(total_cached)),
+        Cell::new(total_runs.to_string()),
+        cost_cell(if any_priced { Some(total_cost) } else { None }, prefs),
+    ]);
+    println!("{table}");
+    if !any_priced {
+        // Hint the user once at the bottom — only when literally
+        // nothing matched the price table, so configured users don't
+        // see noise.
+        println!(
+            "(no pricing data — add `[pricing.<provider>.\"<model>\"]` or \
+             `[pricing.agents.<agent>]` to your config.toml to enable cost)",
+        );
+    }
 }
 
-fn print_json(rows: &[UsageRow]) -> anyhow::Result<()> {
+fn print_json(rows: &[UsageRow], pricing: &rupu_config::PricingConfig) -> anyhow::Result<()> {
     for r in rows {
+        let cost = crate::pricing::lookup(pricing, &r.provider, &r.model, &r.agent)
+            .map(|p| p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens));
         let v = serde_json::json!({
             "provider": r.provider,
             "model": r.model,
@@ -162,10 +216,42 @@ fn print_json(rows: &[UsageRow]) -> anyhow::Result<()> {
             "output_tokens": r.output_tokens,
             "cached_tokens": r.cached_tokens,
             "runs": r.runs,
+            "cost_usd": cost,
         });
         println!("{}", serde_json::to_string(&v)?);
     }
     Ok(())
+}
+
+/// Render a cost cell as `$1.2345` with 4 decimals (sub-cent visible
+/// for cheap calls), or a dim em-dash placeholder when no price is
+/// known. Sized for the COST column so the table stays compact.
+fn cost_cell(cost_usd: Option<f64>, prefs: &crate::cmd::ui::UiPrefs) -> Cell {
+    match cost_usd {
+        Some(c) => Cell::new(format!("${c:.4}")),
+        None => {
+            if prefs.use_color() {
+                Cell::new("\x1b[2m—\x1b[0m")
+            } else {
+                Cell::new("—")
+            }
+        }
+    }
+}
+
+/// Format a token count with thousands separators (`1,234,567`). Keeps
+/// the INPUT / OUTPUT / CACHED columns readable when transcripts span
+/// millions of tokens.
+fn format_count(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
 }
 
 #[cfg(test)]

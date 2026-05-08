@@ -12,6 +12,8 @@ pub mod config;
 // that the lib re-export shape is stable from skeleton onward.
 pub mod layer;
 
+pub mod pricing_config;
+
 pub mod provider_config;
 
 pub mod scm_config;
@@ -20,6 +22,7 @@ pub mod triggers_config;
 
 pub use config::{BashConfig, Config, RetryConfig, UiConfig};
 pub use layer::{layer_files, LayerError};
+pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};
 pub use scm_config::{IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmSection};
 pub use triggers_config::TriggersConfig;
