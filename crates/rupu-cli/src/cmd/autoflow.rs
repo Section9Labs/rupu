@@ -18,7 +18,9 @@ use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
     WorkflowOutputContract,
 };
-use rupu_scm::{Issue, IssueFilter, IssueRef, IssueState, IssueTracker};
+use rupu_scm::{
+    Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
+};
 use rupu_workspace::{
     ensure_issue_worktree, issue_dir_name, AutoflowClaimRecord, AutoflowClaimStore, ClaimStatus,
     PendingDispatch, RepoRegistryStore,
@@ -122,6 +124,40 @@ struct DispatchDoc {
     target: String,
     #[serde(default)]
     inputs: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WakeHints {
+    by_issue: BTreeMap<String, BTreeSet<String>>,
+    by_repo: BTreeMap<String, BTreeSet<String>>,
+    total_polled_events: usize,
+}
+
+impl WakeHints {
+    fn record(&mut self, repo_ref: &str, event: &PolledEvent) {
+        self.total_polled_events += 1;
+        self.by_repo
+            .entry(repo_ref.to_string())
+            .or_default()
+            .insert(event.id.clone());
+        if let Some(issue_ref) = extract_issue_ref_from_polled_event(event) {
+            self.by_issue
+                .entry(issue_ref)
+                .or_default()
+                .insert(event.id.clone());
+        }
+    }
+
+    fn events_for(&self, issue_ref: &str, repo_ref: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        if let Some(events) = self.by_repo.get(repo_ref) {
+            out.extend(events.iter().cloned());
+        }
+        if let Some(events) = self.by_issue.get(issue_ref) {
+            out.extend(events.iter().cloned());
+        }
+        out
+    }
 }
 
 pub async fn handle(action: Action) -> ExitCode {
@@ -271,6 +307,9 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
         println!("(no autoflows)");
         return Ok(());
     }
+    let wake_hints = collect_polled_wake_hints(&global, &discovered, resolver.as_ref())
+        .await
+        .context("collect autoflow wake hints")?;
 
     let tick_started_at = chrono::Utc::now();
     let winners = choose_winning_matches(
@@ -367,7 +406,13 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                     .await?;
                     ran += 1;
                     continue;
-                } else if should_run_claim(&current, &resolved, &claim_store, tick_started_at)? {
+                } else if should_run_claim(
+                    &current,
+                    &resolved,
+                    &claim_store,
+                    tick_started_at,
+                    &wake_hints.events_for(&issue_ref_text, &current.repo_ref),
+                )? {
                     let issue = fetch_issue(
                         &resolved.cfg,
                         resolver.as_ref(),
@@ -426,8 +471,9 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
     }
 
     println!(
-        "autoflow tick: {} workflow(s), {} cycle(s) ran, {} skipped",
+        "autoflow tick: {} workflow(s), {} polled event(s), {} cycle(s) ran, {} skipped",
         discovered.len(),
+        wake_hints.total_polled_events,
         ran,
         skipped
     );
@@ -592,6 +638,72 @@ fn discover_tick_autoflows(
             .then_with(|| left.scope.cmp(&right.scope))
     });
     Ok(out)
+}
+
+async fn collect_polled_wake_hints(
+    global: &Path,
+    discovered: &[ResolvedAutoflowWorkflow],
+    resolver: &dyn CredentialResolver,
+) -> anyhow::Result<WakeHints> {
+    let cursors_root = paths::autoflow_event_cursors_dir(global);
+    paths::ensure_dir(&cursors_root)?;
+
+    let mut unique_repos: BTreeMap<String, &ResolvedAutoflowWorkflow> = BTreeMap::new();
+    for resolved in discovered {
+        if resolved.autoflow()?.wake_on.is_empty() {
+            continue;
+        }
+        unique_repos
+            .entry(resolved.repo_ref.clone())
+            .or_insert(resolved);
+    }
+
+    let mut wake_hints = WakeHints::default();
+    for (repo_ref, resolved) in unique_repos {
+        if !resolved
+            .cfg
+            .triggers
+            .poll_sources
+            .iter()
+            .any(|source| source == &repo_ref)
+        {
+            continue;
+        }
+        let Some((platform, repo)) = parse_poll_source(&repo_ref) else {
+            warn!(repo_ref, "invalid autoflow repo ref for wake polling");
+            continue;
+        };
+        let registry = Arc::new(rupu_scm::Registry::discover(resolver, &resolved.cfg).await);
+        let Some(connector) = registry.events(platform) else {
+            warn!(
+                repo_ref,
+                "no event connector configured for autoflow wake polling"
+            );
+            continue;
+        };
+        let cursor_file = autoflow_cursor_path(&cursors_root, platform, &repo);
+        let cursor = read_cursor(&cursor_file).ok();
+        let max = resolved.cfg.triggers.effective_max_events_per_tick();
+        let polled = match connector.poll_events(&repo, cursor.as_deref(), max).await {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(repo_ref, error = %err, "failed to poll autoflow wake events");
+                continue;
+            }
+        };
+        if let Err(err) = write_cursor(&cursor_file, &polled.next_cursor) {
+            warn!(
+                repo_ref,
+                error = %err,
+                "failed to persist autoflow wake cursor; events may be replayed on next tick"
+            );
+        }
+        for event in polled.events {
+            wake_hints.record(&repo_ref, &event);
+        }
+    }
+
+    Ok(wake_hints)
 }
 
 async fn collect_issue_matches(
@@ -1033,15 +1145,23 @@ fn should_run_claim(
     resolved: &ResolvedAutoflowWorkflow,
     claim_store: &AutoflowClaimStore,
     tick_started_at: chrono::DateTime<chrono::Utc>,
+    wake_events: &BTreeSet<String>,
 ) -> anyhow::Result<bool> {
     if claim_store.read_active_lock(&claim.issue_ref)?.is_some() {
         return Ok(false);
     }
+    let wake_due = wake_events_match(resolved.autoflow()?, wake_events);
     match claim.status {
         ClaimStatus::Eligible
         | ClaimStatus::Claimed
         | ClaimStatus::Running
-        | ClaimStatus::AwaitExternal => due_by_reconcile_interval(claim, resolved),
+        | ClaimStatus::AwaitExternal => {
+            if wake_due {
+                Ok(true)
+            } else {
+                due_by_reconcile_interval(claim, resolved)
+            }
+        }
         ClaimStatus::RetryBackoff => due_by_retry_backoff(claim),
         ClaimStatus::AwaitHuman => Ok(false),
         ClaimStatus::Blocked | ClaimStatus::Complete | ClaimStatus::Released => Ok(false),
@@ -1096,6 +1216,20 @@ fn claim_lease_expired(claim: &AutoflowClaimRecord) -> anyhow::Result<bool> {
         .with_context(|| format!("parse lease expiry for `{}`", claim.issue_ref))?
         .with_timezone(&chrono::Utc);
     Ok(lease <= chrono::Utc::now())
+}
+
+fn wake_events_match(
+    autoflow: &rupu_orchestrator::Autoflow,
+    wake_events: &BTreeSet<String>,
+) -> bool {
+    if autoflow.wake_on.is_empty() || wake_events.is_empty() {
+        return false;
+    }
+    autoflow.wake_on.iter().any(|pattern| {
+        wake_events
+            .iter()
+            .any(|event_id| rupu_orchestrator::event_matches(pattern, event_id))
+    })
 }
 
 fn push_workflow_paths(dir: &Path, scope: &str, into: &mut BTreeMap<String, (String, PathBuf)>) {
@@ -1328,6 +1462,103 @@ fn parse_repo_ref(repo_ref: &str) -> anyhow::Result<(IssueTracker, String)> {
     ))
 }
 
+fn parse_poll_source(source: &str) -> Option<(Platform, RepoRef)> {
+    let (platform_str, rest) = source.split_once(':')?;
+    let (owner, repo) = rest.split_once('/')?;
+    let platform = match platform_str {
+        "github" => Platform::Github,
+        "gitlab" => Platform::Gitlab,
+        _ => return None,
+    };
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((
+        platform,
+        RepoRef {
+            platform,
+            owner: owner.into(),
+            repo: repo.into(),
+        },
+    ))
+}
+
+fn autoflow_cursor_path(root: &Path, platform: Platform, repo: &RepoRef) -> PathBuf {
+    root.join(platform.as_str())
+        .join(format!("{}--{}.cursor", repo.owner, repo.repo))
+}
+
+fn read_cursor(path: &Path) -> anyhow::Result<String> {
+    Ok(std::fs::read_to_string(path)?.trim().to_string())
+}
+
+fn write_cursor(path: &Path, body: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("cursor.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn extract_issue_ref_from_polled_event(event: &PolledEvent) -> Option<String> {
+    let tracker = match event.repo.platform {
+        Platform::Github => IssueTracker::Github,
+        Platform::Gitlab => IssueTracker::Gitlab,
+    };
+    let project = format!("{}/{}", event.repo.owner, event.repo.repo);
+    let number = match event.repo.platform {
+        Platform::Github => {
+            if !event.id.starts_with("github.issue.") {
+                return None;
+            }
+            event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("issue"))
+                .and_then(|issue| issue.get("number"))
+                .and_then(json_u64)
+        }
+        Platform::Gitlab => {
+            if event.id.starts_with("gitlab.issue.") {
+                event
+                    .payload
+                    .get("target_iid")
+                    .and_then(json_u64)
+                    .or_else(|| {
+                        event
+                            .payload
+                            .get("object_attributes")
+                            .and_then(|obj| obj.get("iid"))
+                            .and_then(json_u64)
+                    })
+                    .or_else(|| {
+                        event
+                            .payload
+                            .get("issue")
+                            .and_then(|issue| issue.get("iid"))
+                            .and_then(json_u64)
+                    })
+            } else if event.id == "gitlab.comment"
+                && event.payload.get("target_type").and_then(|v| v.as_str()) == Some("Issue")
+            {
+                event.payload.get("target_iid").and_then(json_u64)
+            } else {
+                None
+            }
+        }
+    }?;
+    Some(format!("{tracker}:{project}/issues/{number}"))
+}
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| (n >= 0).then_some(n as u64)))
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+}
+
 fn format_issue_ref(issue_ref: &IssueRef) -> String {
     format!(
         "{}:{}/issues/{}",
@@ -1435,6 +1666,7 @@ mod tests {
     use rupu_auth::StoredCredential;
     use rupu_orchestrator::{RunRecord, StepResultRecord};
     use rupu_providers::AuthMode;
+    use std::io::Write;
     use tokio::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -1566,6 +1798,114 @@ base_url = "{base_url}"
     #[test]
     fn issue_target_parser_rejects_repo_targets() {
         assert!(parse_full_issue_target("github:Section9Labs/rupu").is_err());
+    }
+
+    #[test]
+    fn github_issue_polled_event_maps_to_issue_ref() {
+        let repo = RepoRef {
+            platform: Platform::Github,
+            owner: "Section9Labs".into(),
+            repo: "rupu".into(),
+        };
+        let event = PolledEvent {
+            id: "github.issue.labeled".into(),
+            delivery: "evt_1".into(),
+            repo,
+            payload: serde_json::json!({
+                "payload": {
+                    "action": "labeled",
+                    "issue": { "number": 123 }
+                }
+            }),
+        };
+        assert_eq!(
+            extract_issue_ref_from_polled_event(&event).as_deref(),
+            Some("github:Section9Labs/rupu/issues/123")
+        );
+    }
+
+    #[test]
+    fn github_pr_polled_event_does_not_fake_issue_ref() {
+        let repo = RepoRef {
+            platform: Platform::Github,
+            owner: "Section9Labs".into(),
+            repo: "rupu".into(),
+        };
+        let event = PolledEvent {
+            id: "github.pr.closed".into(),
+            delivery: "evt_2".into(),
+            repo,
+            payload: serde_json::json!({
+                "payload": {
+                    "action": "closed",
+                    "pull_request": { "number": 77 }
+                }
+            }),
+        };
+        assert!(extract_issue_ref_from_polled_event(&event).is_none());
+    }
+
+    #[test]
+    fn matching_wake_event_makes_await_external_claim_due() {
+        let resolved = ResolvedAutoflowWorkflow {
+            scope: "project".into(),
+            name: "issue-supervisor-dispatch".into(),
+            workflow: Workflow::parse(
+                r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  wake_on:
+    - github.issue.labeled
+  reconcile_every: "1d"
+steps:
+  - id: a
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+            )
+            .unwrap(),
+            project_root: None,
+            repo_ref: "github:Section9Labs/rupu".into(),
+            preferred_checkout: PathBuf::from("/tmp/repo"),
+            cfg: Config::default(),
+        };
+        let claim = AutoflowClaimRecord {
+            issue_ref: "github:Section9Labs/rupu/issues/42".into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "issue-supervisor-dispatch".into(),
+            status: ClaimStatus::AwaitExternal,
+            worktree_path: None,
+            branch: None,
+            last_run_id: None,
+            last_error: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowClaimStore {
+            root: tmp.path().join("claims"),
+        };
+
+        assert!(should_run_claim(
+            &claim,
+            &resolved,
+            &store,
+            chrono::Utc::now(),
+            &BTreeSet::from(["github.issue.labeled".to_string()]),
+        )
+        .unwrap());
+        assert!(!should_run_claim(
+            &claim,
+            &resolved,
+            &store,
+            chrono::Utc::now(),
+            &BTreeSet::new()
+        )
+        .unwrap());
     }
 
     #[test]
@@ -1710,6 +2050,7 @@ steps:
                     success: true,
                     skipped: false,
                     rendered_prompt: "hi".into(),
+                    kind: rupu_orchestrator::StepKind::Linear,
                     items: vec![],
                     findings: vec![],
                     iterations: 0,
@@ -1843,5 +2184,171 @@ steps:
             .as_deref()
             .unwrap()
             .contains("issue-123"));
+    }
+
+    #[tokio::test]
+    async fn tick_uses_polled_wake_events_to_resume_await_external_claims() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let issues_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issues_body);
+        });
+        let issue_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issue_get_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues/123");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issue_body.clone());
+        });
+        let events_body = serde_json::json!([
+            {
+                "id": "evt-123",
+                "type": "IssuesEvent",
+                "created_at": "2026-05-08T20:10:00Z",
+                "payload": {
+                    "action": "labeled",
+                    "issue": { "number": 123 }
+                }
+            }
+        ]);
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/events");
+            then.status(200)
+                .header("content-type", "application/json")
+                .header("etag", "\"wake-1\"")
+                .json_body(events_body.clone());
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  wake_on:
+    - github.issue.labeled
+  reconcile_every: "1d"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(project.join(".rupu/config.toml"))
+            .unwrap()
+            .write_all(b"\n[triggers]\npoll_sources = [\"github:Section9Labs/rupu\"]\n")
+            .unwrap();
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: "github:Section9Labs/rupu/issues/123".into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "issue-supervisor-dispatch".into(),
+                status: ClaimStatus::AwaitExternal,
+                worktree_path: Some(project.display().to_string()),
+                branch: Some("rupu/issue-123".into()),
+                last_run_id: None,
+                last_error: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
+                ),
+                pending_dispatch: None,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let cursor_file = autoflow_cursor_path(
+            &paths::autoflow_event_cursors_dir(&global),
+            Platform::Github,
+            &RepoRef {
+                platform: Platform::Github,
+                owner: "Section9Labs".into(),
+                repo: "rupu".into(),
+            },
+        );
+        write_cursor(&cursor_file, "etag:|since:2026-05-08T19:00:00Z").unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        tick_with_resolver(resolver).await.unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let claim = claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.status, ClaimStatus::Complete);
+        assert!(claim.last_run_id.is_some());
     }
 }

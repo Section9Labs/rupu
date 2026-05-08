@@ -110,7 +110,12 @@ enabled = true
 repo = "github:your-org/your-repo"
 permission_mode = "bypass"
 strict_templates = true
+
+[triggers]
+poll_sources = ["github:your-org/your-repo"]
 ```
+
+Use `[triggers].poll_sources` when you want `autoflow.wake_on` to react before the next `reconcile_every` deadline.
 
 ---
 
