@@ -172,6 +172,10 @@ pub struct StepResult {
     /// True when the step was skipped because its `when:` expression
     /// evaluated falsy. `success` is false in that case.
     pub skipped: bool,
+    /// Workflow-step shape (linear / for_each / parallel / panel).
+    /// Persisted into [`crate::runs::StepResultRecord`] so the
+    /// line-stream printer can dispatch on it directly.
+    pub kind: crate::runs::StepKind,
     /// Per-item records for fan-out steps. Empty for non-fan-out
     /// steps (and for skipped fan-out steps).
     pub items: Vec<ItemResult>,
@@ -211,6 +215,7 @@ impl Default for StepResult {
             output: String::new(),
             success: false,
             skipped: false,
+            kind: crate::runs::StepKind::Linear,
             items: Vec::new(),
             findings: Vec::new(),
             iterations: 0,
@@ -758,6 +763,7 @@ async fn run_fanout_step(
             output: "[]".into(),
             success: true,
             skipped: false,
+            kind: crate::runs::StepKind::ForEach,
             items: Vec::new(),
             ..Default::default()
         });
@@ -924,6 +930,7 @@ async fn run_fanout_step(
         output: aggregate_output,
         success,
         skipped: false,
+        kind: crate::runs::StepKind::ForEach,
         items: items_vec,
         ..Default::default()
     })
@@ -1085,6 +1092,7 @@ async fn run_parallel_step(
         output: aggregate_output,
         success,
         skipped: false,
+        kind: crate::runs::StepKind::Parallel,
         items: items_vec,
         ..Default::default()
     })
@@ -1434,6 +1442,7 @@ impl PanelPass {
             output: aggregate_output,
             success: self.success,
             skipped: false,
+            kind: crate::runs::StepKind::Panel,
             items: self.items,
             findings: self.findings,
             iterations,
