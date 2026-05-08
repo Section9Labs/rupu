@@ -152,7 +152,14 @@ fn print_table(
     }
     let mut table = crate::output::tables::new_table();
     table.set_header(vec![
-        "PROVIDER", "MODEL", "AGENT", "INPUT", "OUTPUT", "CACHED", "RUNS", "COST (USD)",
+        "PROVIDER",
+        "MODEL",
+        "AGENT",
+        "INPUT",
+        "OUTPUT",
+        "CACHED",
+        "RUNS",
+        "COST (USD)",
     ]);
     let mut total_in = 0u64;
     let mut total_out = 0u64;

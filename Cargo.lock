@@ -3309,7 +3309,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-agent"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -3336,7 +3336,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-auth"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -3365,7 +3365,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-cli"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3409,7 +3409,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-config"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "serde",
  "tempfile",
@@ -3419,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-keychain-acl"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
@@ -3429,7 +3429,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-mcp"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3449,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-orchestrator"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -3473,7 +3473,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-providers"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3496,7 +3496,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-scm"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-tools"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "assert_fs",
  "async-trait",
@@ -3539,7 +3539,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-transcript"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "chrono",
  "serde",
@@ -3552,7 +3552,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-tui"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "chrono",
  "crossterm 0.28.1",
@@ -3573,7 +3573,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-webhook"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3596,7 +3596,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-workspace"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "assert_fs",
  "chrono",
