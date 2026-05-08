@@ -472,38 +472,101 @@ pub fn tool_summary(tool: &str, input: &serde_json::Value) -> String {
 }
 
 fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
+    // Helpers — `s_str(field)` reads a top-level string field; `truncate`
+    // caps at width with an ellipsis. Pulled out so per-tool arms below
+    // read as a flat dispatch table.
+    let s_str = |k: &str| -> Option<String> {
+        input
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+    };
+    let truncate = |s: String, max: usize| -> String {
+        if s.chars().count() > max {
+            let cut: String = s.chars().take(max).collect();
+            format!("{cut}…")
+        } else {
+            s
+        }
+    };
+    let owner_repo = || -> Option<String> {
+        let owner = s_str("owner")?;
+        let repo = s_str("repo")?;
+        Some(format!("{owner}/{repo}"))
+    };
+
     match tool {
-        "bash" => input
-            .get("command")
-            .and_then(|v| v.as_str())
-            .map(|s| {
-                let trimmed = s.trim();
-                if trimmed.len() > 72 {
-                    format!("{}…", &trimmed[..72])
-                } else {
-                    trimmed.to_string()
-                }
-            })
-            .unwrap_or_default(),
-        "write_file" | "edit_file" => input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "read_file" => input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        // ── built-in tools ───────────────────────────────────────────
+        "bash" => s_str("command").map(|s| truncate(s, 72)).unwrap_or_default(),
+        "write_file" | "edit_file" => s_str("path").unwrap_or_default(),
+        "read_file" => s_str("path").unwrap_or_default(),
+
+        // ── MCP scm.* tools ──────────────────────────────────────────
+        "scm.repos.get" | "scm.repos.list" => owner_repo().unwrap_or_default(),
+        "scm.branches.list" | "scm.branches.create" => owner_repo().unwrap_or_default(),
+        "scm.files.read" => {
+            // Show `<owner>/<repo>:<path>` so the operator can see WHICH
+            // file is being fetched, not just the owner.
+            let or = owner_repo().unwrap_or_default();
+            let path = s_str("path").unwrap_or_default();
+            if or.is_empty() {
+                path
+            } else if path.is_empty() {
+                or
+            } else {
+                format!("{or}:{path}")
+            }
+        }
+        "scm.prs.list" => owner_repo().unwrap_or_default(),
+        "scm.prs.get" | "scm.prs.diff" | "scm.prs.comment" => {
+            // PR refs include `pr` (number); show `<owner>/<repo>#<N>`.
+            let or = owner_repo().unwrap_or_default();
+            let pr = input.get("pr").and_then(|v| v.as_u64());
+            match (or.is_empty(), pr) {
+                (false, Some(n)) => format!("{or}#{n}"),
+                (false, None) => or,
+                (true, Some(n)) => format!("#{n}"),
+                _ => String::new(),
+            }
+        }
+        "scm.prs.create" => {
+            let or = owner_repo().unwrap_or_default();
+            let title = s_str("title").unwrap_or_default();
+            if title.is_empty() {
+                or
+            } else {
+                truncate(format!("{or}: {title}"), 72)
+            }
+        }
+
+        // ── MCP issues.* tools ───────────────────────────────────────
+        "issues.list" => s_str("project").unwrap_or_default(),
+        "issues.get" | "issues.comment" | "issues.update_state" => {
+            let project = s_str("project").unwrap_or_default();
+            let n = input.get("number").and_then(|v| v.as_u64());
+            match (project.is_empty(), n) {
+                (false, Some(n)) => format!("{project}#{n}"),
+                (false, None) => project,
+                (true, Some(n)) => format!("#{n}"),
+                _ => String::new(),
+            }
+        }
+        "issues.create" => {
+            let project = s_str("project").unwrap_or_default();
+            let title = s_str("title").unwrap_or_default();
+            if title.is_empty() {
+                project
+            } else {
+                truncate(format!("{project}: {title}"), 72)
+            }
+        }
+
+        // ── unknown tool: first string field, truncated ──────────────
         _ => {
             if let Some(obj) = input.as_object() {
                 for (_, v) in obj.iter().take(1) {
                     if let Some(s) = v.as_str() {
-                        let trimmed = s.trim();
-                        if trimmed.len() > 60 {
-                            return format!("{}…", &trimmed[..60]);
-                        }
-                        return trimmed.to_string();
+                        return truncate(s.trim().to_string(), 60);
                     }
                 }
             }
