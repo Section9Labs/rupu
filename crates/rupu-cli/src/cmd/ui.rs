@@ -117,6 +117,18 @@ pub fn highlight_yaml(text: &str, prefs: &UiPrefs) -> String {
     highlight_with_extension(text, "yaml", prefs).unwrap_or_else(|| text.to_string())
 }
 
+/// Highlight a Markdown buffer (covers fenced code blocks, headings,
+/// lists, emphasis). Used by the line-stream printer to colorize
+/// assistant-text chunks so agent output is visually delineated from
+/// rupu's chrome lines. Falls back to plain text on syntect lookup
+/// failure or when color is disabled.
+pub fn highlight_markdown(text: &str, prefs: &UiPrefs) -> String {
+    if !prefs.use_color() {
+        return text.to_string();
+    }
+    highlight_with_extension(text, "md", prefs).unwrap_or_else(|| text.to_string())
+}
+
 /// Highlight an agent file: split on the trailing `---` of the YAML
 /// frontmatter, color the frontmatter as YAML and the body as Markdown.
 /// If the split fails (no frontmatter or shape unexpected), fall back
