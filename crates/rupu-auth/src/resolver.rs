@@ -378,6 +378,20 @@ impl KeychainResolver {
             rupu_providers::auth::AuthCredentials::OAuth { extra, .. } => extra.clone(),
             _ => Default::default(),
         };
+        // `credentials.expires` is the SAME field the provider crates'
+        // `is_token_expired(expires_ms)` checks, and they all interpret
+        // it as ABSOLUTE milliseconds-since-Unix-epoch (see e.g.
+        // `rupu_providers::anthropic::refresh_anthropic_token` and
+        // `rupu_auth::oauth::callback::*` which both store `now_ms +
+        // expires_in*1000`). Storing the raw `expires_in` in seconds
+        // here corrupted the field to a tiny number (~3600), which
+        // `is_token_expired` then read as a Unix timestamp deep in the
+        // past and concluded the token was expired — re-firing a
+        // provider-side refresh on every call. Anthropic's OAuth
+        // server rotates refresh tokens, so the second refresh would
+        // race the first and surface as `invalid_grant`. Fix: convert
+        // to absolute ms here, matching every other write site.
+        let expires_ms = expires_in_secs_to_ms_epoch(r.expires_in);
         Ok(StoredCredential {
             credentials: rupu_providers::auth::AuthCredentials::OAuth {
                 access: r.access_token.clone(),
@@ -385,7 +399,7 @@ impl KeychainResolver {
                     .refresh_token
                     .clone()
                     .unwrap_or_else(|| refresh_token.to_string()),
-                expires: r.expires_in.unwrap_or(0) as u64,
+                expires: expires_ms,
                 extra: prior_extra,
             },
             refresh_token: Some(r.refresh_token.unwrap_or_else(|| refresh_token.to_string())),
@@ -458,6 +472,85 @@ impl CredentialResolver for KeychainResolver {
         let new = self.refresh_inner(p, mode, &sc).await?;
         self.store(p, mode, &new).await?;
         Ok(new.credentials)
+    }
+}
+
+/// Convert an OAuth `expires_in` (relative seconds, the wire-format
+/// every standard token endpoint returns) into the ABSOLUTE
+/// milliseconds-since-Unix-epoch shape that
+/// `rupu_providers::auth::is_token_expired` expects. `None` →
+/// `0`, matching the "no expiry / treat as valid" sentinel
+/// `is_token_expired` already understands.
+///
+/// Pulled out into a free function so we can lock the conversion
+/// behavior under a unit test without spinning up a token-endpoint
+/// mock.
+fn expires_in_secs_to_ms_epoch(expires_in: Option<i64>) -> u64 {
+    match expires_in {
+        Some(s) if s > 0 => {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            now_ms + (s as u64) * 1000
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod expires_in_tests {
+    use super::expires_in_secs_to_ms_epoch;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn one_hour_lands_within_one_hour_of_now() {
+        // expires_in = 3600s → result must be (now ± a few ms) + 3.6e6 ms.
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let got = expires_in_secs_to_ms_epoch(Some(3600));
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(
+            got >= before + 3_600_000 && got <= after + 3_600_000,
+            "expected {}..{} (1h window), got {got}",
+            before + 3_600_000,
+            after + 3_600_000,
+        );
+    }
+
+    #[test]
+    fn none_returns_zero_no_expiry_sentinel() {
+        // `is_token_expired(0)` short-circuits to "valid" — preserve
+        // that contract for refresh responses that omit `expires_in`.
+        assert_eq!(expires_in_secs_to_ms_epoch(None), 0);
+    }
+
+    #[test]
+    fn zero_or_negative_returns_zero_sentinel() {
+        // Pathological responses (negative / zero expiry) shouldn't
+        // get encoded as "now" — that'd round-trip to "expired" and
+        // cause the same refresh-loop the bug fix targets.
+        assert_eq!(expires_in_secs_to_ms_epoch(Some(0)), 0);
+        assert_eq!(expires_in_secs_to_ms_epoch(Some(-1)), 0);
+    }
+
+    #[test]
+    fn result_is_compatible_with_is_token_expired() {
+        // End-to-end shape check: a refresh that issues a 1h token
+        // produces an `expires_ms` that `is_token_expired` reads as
+        // "valid". Pre-fix this returned a tiny number (~3600) that
+        // `is_token_expired` immediately classified as expired,
+        // re-firing the refresh on every call.
+        let expires_ms = expires_in_secs_to_ms_epoch(Some(3600));
+        assert!(
+            !rupu_providers::auth::is_token_expired(expires_ms),
+            "fresh 1h token must not read as expired (got expires_ms={expires_ms})",
+        );
     }
 }
 
