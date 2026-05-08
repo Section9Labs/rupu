@@ -15,6 +15,7 @@ use rupu_tools::{PermissionMode, ToolContext};
 use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::sync::Arc;
+use tracing::warn;
 use ulid::Ulid;
 
 #[derive(ClapArgs, Debug)]
@@ -95,6 +96,9 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         root: global.join("workspaces"),
     };
     let ws = rupu_workspace::upsert(&ws_store, &pwd)?;
+    if let Err(err) = crate::cmd::repos::auto_track_checkout(&global, &pwd) {
+        warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
+    }
 
     // Provider build via CredentialResolver.
     let resolver = rupu_auth::KeychainResolver::new();
@@ -433,7 +437,10 @@ mod resolve_clone_dest_tests {
     fn tmp_returns_a_guarded_tmpdir() {
         let cwd = Path::new("/tmp");
         let (dest, guard) = resolve_clone_dest(cwd, "rupu", None, true).unwrap();
-        assert!(guard.is_some(), "tmp mode should hand back the TempDir guard");
+        assert!(
+            guard.is_some(),
+            "tmp mode should hand back the TempDir guard"
+        );
         assert!(dest.exists(), "TempDir should already exist on disk");
     }
 
@@ -443,7 +450,10 @@ mod resolve_clone_dest_tests {
         // Default path: <tmp>/myrepo. Doesn't exist yet → ok.
         let (dest, guard) = resolve_clone_dest(tmp.path(), "myrepo", None, false).unwrap();
         assert_eq!(dest, tmp.path().join("myrepo"));
-        assert!(guard.is_none(), "default mode does not hold a TempDir guard");
+        assert!(
+            guard.is_none(),
+            "default mode does not hold a TempDir guard"
+        );
         // Now create it and re-run — should refuse.
         std::fs::create_dir(&dest).unwrap();
         let err = resolve_clone_dest(tmp.path(), "myrepo", None, false).unwrap_err();
@@ -458,8 +468,7 @@ mod resolve_clone_dest_tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("custom-name");
         // Doesn't exist → ok.
-        let (dest, guard) =
-            resolve_clone_dest(tmp.path(), "rupu", Some(&target), false).unwrap();
+        let (dest, guard) = resolve_clone_dest(tmp.path(), "rupu", Some(&target), false).unwrap();
         assert_eq!(dest, target);
         assert!(guard.is_none());
         // Create it → second call refuses.

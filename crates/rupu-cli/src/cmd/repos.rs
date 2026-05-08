@@ -11,6 +11,7 @@ use rupu_workspace::RepoRegistryStore;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use tracing::debug;
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
@@ -350,6 +351,29 @@ fn detect_origin_default_branch(path: &Path) -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+pub(crate) fn auto_track_checkout(global: &Path, path: &Path) -> anyhow::Result<bool> {
+    let repo = match autodetect_repo_from_path(path) {
+        Ok(repo) => repo,
+        Err(err) => {
+            debug!(path = %path.display(), error = %err, "skipping repo auto-track");
+            return Ok(false);
+        }
+    };
+    let repo_ref = canonical_repo_ref(&repo);
+    let origin_url = detect_origin_url(path)?;
+    let default_branch = detect_origin_default_branch(path);
+    let store = RepoRegistryStore {
+        root: paths::repos_dir(global),
+    };
+    store.upsert(
+        &repo_ref,
+        path,
+        origin_url.as_deref(),
+        default_branch.as_deref(),
+    )?;
+    Ok(true)
 }
 
 /// Three cases to handle when private repos are absent:

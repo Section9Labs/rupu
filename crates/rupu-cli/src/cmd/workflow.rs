@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use tracing::warn;
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
@@ -1013,6 +1014,9 @@ async fn run_with_outcome(
         root: global.join("workspaces"),
     };
     let ws = rupu_workspace::upsert(&ws_store, &pwd)?;
+    if let Err(err) = crate::cmd::repos::auto_track_checkout(&global, &pwd) {
+        warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
+    }
 
     // Credential resolver (shared across all steps in this workflow run).
     let resolver = Arc::new(rupu_auth::KeychainResolver::new());
