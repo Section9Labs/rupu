@@ -2,6 +2,49 @@
 
 Items deferred from completed slices. Each entry should name **why deferred**, **prereqs**, and **what unblocks it**.
 
+## Sub-agent dispatch — agent-as-tool
+
+Today an agent's `tools:` field is a hard-coded whitelist of the six v0 builtins (bash, read_file, write_file, edit_file, grep, glob — see `crates/rupu-agent/src/tool_registry.rs:72-81`). There is no way for an agent to invoke another agent as a tool call within its own run; agents only compose at the workflow layer (one step = one agent, or panelists in a `panel:`).
+
+**Why we want it:** delegation. A "writer" agent could dispatch a `security-reviewer` and a `perf-reviewer` mid-run, fold their findings back into its context, and continue — without the workflow author having to model every fan-out shape upfront. Closer to the Claude Code / Okesu agent-as-tool pattern.
+
+**Shape (sketch, needs design):**
+- New tool family: `dispatch_agent` (single) / `dispatch_agents_parallel` (fan-out). Inputs: `agent: <name>`, `prompt: <rendered>`, optional `inputs: { … }`. Output: child agent's final assistant text + structured findings if any.
+- Agent frontmatter `tools:` accepts agent names alongside builtin names. Resolution order: builtin → agent registry → error.
+- Permission model: the parent agent's permission decider gates which agents it can dispatch (allowlist per parent), mirroring the existing builtin allowlist.
+- Tree-flow rendering ties to the depth-aware printer below — each dispatched agent renders one indent level deeper.
+
+**Prereqs:** none hard. Wants the depth-aware printer (below) to land alongside so dispatched runs are visually distinguishable.
+
+**Unblock-when:** matt approves the design sketch.
+
+## Depth-aware tree-flow rendering for fan-out / parallel / panel
+
+The line-stream printer today is depth-1: every fan-out iteration prints flat against the workflow rail, so a `for_each: {{inputs.files}}` over 8 files looks like 8 sibling steps with no visual indication that they're branches of a single fan-out. Same for `parallel:` sub-steps and panel panelists.
+
+**What we want:** phylogenetic-tree shape — fan-out emits a "branch" event the printer renders with depth-aware connectors:
+
+```
+│
+├─╭─ ◐ review-changed-files ────  (8 iterations · max_parallel=4)
+│ ┃
+│ ├─╭─ ◐ writer ────  iter[1]: src/foo.rs  (anthropic · sonnet)
+│ │ ┃  body…
+│ ├─╰─ ✓ done · 1.2s
+│ ├─╭─ ◐ writer ────  iter[2]: src/bar.rs
+│ │ ┃  body…
+│ ├─╰─ ✓ done · 0.9s
+│ …
+├─╰─ ✓ done · 8 iters · 4.1s
+│
+```
+
+**Prereqs:**
+- Runner emits explicit "fan-out begin / iteration N start / iteration N end / fan-out end" events on the printer event channel (today the runner just calls `step_start`/`step_done` flatly per iteration).
+- Printer gains a `branch_begin` / `branch_end` API that bumps/pops indent and draws the appropriate connector glyphs.
+
+**Unblock-when:** PR A (callout frame, this PR) merges. Then PR B does the runner-event surface and the printer-side connectors together.
+
 ## Workflow triggers — manual / cron / event-driven
 
 Has its own design spec: [`docs/superpowers/specs/2026-05-07-rupu-workflow-triggers-design.md`](docs/superpowers/specs/2026-05-07-rupu-workflow-triggers-design.md). That doc is the source of truth for the architecture (three tiers: cron-tick polled, webhook-serve, rupu.cloud relay), the schema, the event vocabulary, and the Slice E hand-off contract.
