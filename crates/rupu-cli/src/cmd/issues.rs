@@ -10,7 +10,7 @@ use crate::cmd::completers::workflow_names;
 use crate::paths;
 use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
-use comfy_table::Cell;
+use comfy_table::{Cell, ColumnConstraint, Width};
 use rupu_scm::{IssueFilter, IssueRef, IssueState, IssueTracker, Platform, Registry, RepoRef};
 use std::path::Path;
 use std::process::ExitCode;
@@ -144,18 +144,27 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
         // Truncate long titles so the table stays one-row-per-issue
         // in narrow terminals. `comfy_table` Dynamic arrangement
         // handles soft-wrap but a hard cap reads cleaner here.
-        let title = truncate(&i.title, 80);
+        let title = truncate(&i.title, 60);
         table.add_row(vec![
             Cell::new(i.r.number.to_string()),
             crate::output::tables::status_cell(state, &prefs),
-            Cell::new(crate::output::tables::label_chips_with_colors(
+            Cell::new(crate::output::tables::label_chips_with_colors_capped(
                 &i.labels,
                 &i.label_colors,
                 &prefs,
+                3,
             )),
             Cell::new(i.author.clone()),
             Cell::new(title),
         ]);
+    }
+    // Pin the LABELS column to its capped width so issues with many
+    // labels don't push comfy-table's Dynamic arrangement into wrapping
+    // each chip onto its own line. The 3-chip cap above keeps the cell
+    // bounded, but we still need to tell the layout engine not to use
+    // this column as the wrap target. TITLE remains the wrap fallback.
+    if let Some(col) = table.column_mut(2) {
+        col.set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(48)));
     }
     println!("{table}");
     Ok(())

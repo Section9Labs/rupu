@@ -132,6 +132,45 @@ pub fn label_chips_with_colors(
         .join(" ")
 }
 
+/// Capped variant of [`label_chips_with_colors`]: renders the first
+/// `max` labels and appends a dim `+N` overflow indicator when there
+/// are more. Keeps issue/PR list rows to a single visual line so the
+/// table doesn't word-wrap each chip onto its own row when an issue
+/// carries many labels (`enhancement`, `area:foo`, `type:bar`, …).
+pub fn label_chips_with_colors_capped(
+    labels: &[String],
+    colors: &std::collections::BTreeMap<String, String>,
+    prefs: &UiPrefs,
+    max: usize,
+) -> String {
+    if labels.is_empty() {
+        return if prefs.use_color() {
+            "\x1b[2m—\x1b[0m".to_string()
+        } else {
+            "—".to_string()
+        };
+    }
+    let take = max.max(1).min(labels.len());
+    let mut out = labels
+        .iter()
+        .take(take)
+        .map(|l| match colors.get(l) {
+            Some(hex) => colored_label_chip_with_hex(l, hex, prefs),
+            None => colored_label_chip(l, prefs),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let overflow = labels.len().saturating_sub(take);
+    if overflow > 0 {
+        if prefs.use_color() {
+            out.push_str(&format!(" \x1b[2m+{overflow}\x1b[0m"));
+        } else {
+            out.push_str(&format!(" +{overflow}"));
+        }
+    }
+    out
+}
+
 /// Map a label name to one of N preset background colors using a
 /// stable FNV-1a hash. Names with the same color cluster visually
 /// without forcing the user to memorize anything.
@@ -379,6 +418,40 @@ mod tests {
         let mut colors = BTreeMap::new();
         colors.insert("bug".to_string(), "d73a4a".to_string());
         assert_eq!(label_chips_with_colors(&labels, &colors, &p), "[bug]");
+    }
+
+    #[test]
+    fn label_chips_capped_appends_overflow_indicator() {
+        use std::collections::BTreeMap;
+        let p = prefs_no_color();
+        let labels = vec![
+            "enhancement".to_string(),
+            "area:foundation".to_string(),
+            "type:testing".to_string(),
+            "epic".to_string(),
+            "good-first-issue".to_string(),
+        ];
+        let colors = BTreeMap::new();
+        let out = label_chips_with_colors_capped(&labels, &colors, &p, 3);
+        assert_eq!(out, "[enhancement] [area:foundation] [type:testing] +2");
+    }
+
+    #[test]
+    fn label_chips_capped_no_overflow_when_under_cap() {
+        use std::collections::BTreeMap;
+        let p = prefs_no_color();
+        let labels = vec!["bug".to_string(), "wontfix".to_string()];
+        let colors = BTreeMap::new();
+        let out = label_chips_with_colors_capped(&labels, &colors, &p, 3);
+        assert_eq!(out, "[bug] [wontfix]");
+    }
+
+    #[test]
+    fn label_chips_capped_empty_renders_em_dash() {
+        use std::collections::BTreeMap;
+        let p = prefs_no_color();
+        let colors = BTreeMap::new();
+        assert_eq!(label_chips_with_colors_capped(&[], &colors, &p, 3), "—");
     }
 
     #[test]
