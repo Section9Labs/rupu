@@ -131,7 +131,22 @@ fn install(args: InstallArgs) -> Result<()> {
 /// Re-invokes the running binary with `COMPLETE=<shell>` set; that
 /// triggers `CompleteEnv::complete()` in `lib.rs::run` which prints
 /// the registration snippet and exits 0.
+///
+/// **zsh special-case.** The default snippet from `clap_complete`
+/// surfaces flag candidates (`--input`, `--mode`, …) alongside
+/// positional value candidates at any cursor position. That's
+/// technically correct (flags are valid anywhere on the line) but
+/// reads as noise when the user is plainly mid-typing a workflow /
+/// agent name. We override the zsh snippet with a hand-rolled one
+/// that splits candidates into "starts with `-` = flag" vs. "value"
+/// buckets and only shows the bucket matching what the user is
+/// actually typing. Empty value bucket emits a `_message` hint
+/// pointing at `rupu init --with-samples` so users on a fresh shell
+/// see something instead of silence.
 fn generate_bootstrap(shell: Shell) -> Result<String> {
+    if matches!(shell, Shell::Zsh) {
+        return generate_zsh_bootstrap();
+    }
     let exe = std::env::current_exe().context("locate current executable")?;
     let shell_name = shell_var_value(shell)?;
     let output = Command::new(&exe)
@@ -148,6 +163,69 @@ fn generate_bootstrap(shell: Shell) -> Result<String> {
         ));
     }
     String::from_utf8(output.stdout).context("non-utf8 bootstrap output")
+}
+
+/// Hand-rolled zsh dynamic-completion bootstrap. Implements the same
+/// `COMPLETE=zsh` env-var protocol as `clap_complete::CompleteEnv`,
+/// then post-processes the candidate list before handing it to
+/// `_describe` / `_message`.
+fn generate_zsh_bootstrap() -> Result<String> {
+    let exe = std::env::current_exe().context("locate current executable")?;
+    let exe_str = exe.to_string_lossy();
+    Ok(format!(
+        r##"#compdef rupu
+# Hand-rolled zsh completion for rupu. See
+# `crates/rupu-cli/src/cmd/completions.rs::generate_zsh_bootstrap`
+# for the rationale (flag/value bucket split + empty-candidate hint).
+_rupu() {{
+    local _CLAP_COMPLETE_INDEX=$(expr $CURRENT - 1)
+    local _CLAP_IFS=$'\n'
+    local current_word="${{words[$CURRENT]}}"
+
+    local raw=("${{(@f)$( \
+        _CLAP_IFS="$_CLAP_IFS" \
+        _CLAP_COMPLETE_INDEX="$_CLAP_COMPLETE_INDEX" \
+        COMPLETE="zsh" \
+        {exe_str} -- "${{words[@]}}" 2>/dev/null \
+    )}}")
+
+    local -a values=()
+    local -a flags=()
+    local entry
+    for entry in $raw; do
+        local val="${{entry%%:*}}"
+        # Treat lines whose value-segment starts with `-` as flags
+        # (covers `--long`, `-s`, `--long=value`). Everything else is
+        # a positional value candidate.
+        if [[ "$val" == -* ]]; then
+            flags+=("$entry")
+        else
+            values+=("$entry")
+        fi
+    done
+
+    if [[ "$current_word" == -* ]]; then
+        # User is typing a flag — show only flag candidates.
+        [[ -n $flags ]] && _describe 'option' flags
+    else
+        if [[ -n $values ]]; then
+            _describe 'value' values
+        elif [[ -n $flags ]]; then
+            # No positional candidates available. Tell the user why
+            # before falling through to flags so the cursor isn't left
+            # with a silent "no completion." `_message` lines are
+            # informational and don't complete to text.
+            _message $'no agents/workflows found in cwd or ~/.rupu — try `rupu init --with-samples`'
+            _describe 'option' flags
+        else
+            _message $'no candidates'
+        fi
+    fi
+}}
+
+compdef _rupu rupu
+"##
+    ))
 }
 
 fn shell_var_value(shell: Shell) -> Result<&'static str> {
