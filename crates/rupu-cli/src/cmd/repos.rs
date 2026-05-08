@@ -118,33 +118,69 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
     if !any_private {
         if let Some(extras) = registry.github_extras() {
             if let Some(scopes) = extras.fetch_token_scopes().await {
-                let has_repo = scopes.iter().any(|s| s == "repo");
-                let has_public_only = scopes.iter().any(|s| s == "public_repo");
-                if !has_repo {
-                    let detail = if has_public_only {
-                        "your stored github token only has the `public_repo` scope; \
-                         private repos require the `repo` scope."
-                    } else {
-                        "your stored github token does not have the `repo` scope, \
-                         which is needed to list private repos."
-                    };
-                    crate::output::diag::warn_with_hint(
-                        &prefs,
-                        format!(
-                            "no private github repos shown — {detail} \
-                             (current scopes: {})",
-                            if scopes.is_empty() {
-                                "(none)".into()
-                            } else {
-                                scopes.join(", ")
-                            }
-                        ),
-                        "rupu auth logout --provider github && rupu auth login --provider github --mode sso",
-                    );
-                }
+                emit_private_repo_diag(&prefs, &scopes);
             }
         }
     }
 
     Ok(())
+}
+
+/// Three cases to handle when private repos are absent:
+///
+/// 1. **Empty `X-OAuth-Scopes` header.** The token is a GitHub App
+///    user-to-server token, not a classic OAuth token. GitHub Apps
+///    don't grant OAuth scopes; access is per-installation. (rupu's
+///    SSO flow uses the GitHub Copilot client_id `Iv1.…` — see
+///    `crates/rupu-auth/src/oauth/providers.rs`.) Re-logging in via
+///    `--mode sso` won't change anything because no scope is involved.
+///    The fix is either an installation-level grant on the user's
+///    org, or switching to `--mode api-key` with a classic PAT
+///    that has the `repo` scope.
+///
+/// 2. **Has scopes but `repo` is missing.** Classic OAuth token with
+///    insufficient scope. Re-login (or PAT) with the right scope.
+///
+/// 3. **Has `repo`.** Token is fully privileged; the repos must
+///    genuinely not exist or the user lacks access. Say nothing.
+fn emit_private_repo_diag(prefs: &crate::cmd::ui::UiPrefs, scopes: &[String]) {
+    if scopes.is_empty() {
+        // Case 1: GitHub App user token.
+        crate::output::diag::warn_with_hint(
+            prefs,
+            "no private github repos shown — your stored token is a GitHub App \
+             user-to-server token (rupu impersonates the GitHub Copilot client). \
+             GitHub App tokens don't carry OAuth scopes; they grant per-installation \
+             access, so private repos only appear from orgs / accounts where the \
+             Copilot app is installed and has access to those repos.",
+            "use `rupu auth login --provider github --mode api-key` with a classic \
+             PAT (https://github.com/settings/tokens) that has the `repo` scope, \
+             OR install the Copilot app on the relevant org / repos at \
+             https://github.com/settings/installations.",
+        );
+        return;
+    }
+    let has_repo = scopes.iter().any(|s| s == "repo");
+    if has_repo {
+        // Case 3: token IS privileged. Stay quiet — no private repos
+        // visible just means the user genuinely has none accessible.
+        return;
+    }
+    // Case 2: classic OAuth token, but `repo` scope missing.
+    let has_public_only = scopes.iter().any(|s| s == "public_repo");
+    let detail = if has_public_only {
+        "your stored github token only has the `public_repo` scope; \
+         private repos require the `repo` scope."
+    } else {
+        "your stored github token does not have the `repo` scope, \
+         which is needed to list private repos."
+    };
+    crate::output::diag::warn_with_hint(
+        prefs,
+        format!(
+            "no private github repos shown — {detail} (current scopes: {})",
+            scopes.join(", ")
+        ),
+        "rupu auth logout --provider github && rupu auth login --provider github --mode sso",
+    );
 }
