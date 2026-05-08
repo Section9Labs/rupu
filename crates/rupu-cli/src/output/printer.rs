@@ -212,6 +212,19 @@ impl LineStreamPrinter {
         }
     }
 
+    /// Hand out a clone of the underlying `MultiProgress`. Cheap —
+    /// `MultiProgress` is `Arc`-backed internally. Used by the
+    /// `AskDecider` so it can call `multi.suspend(...)` around the
+    /// stderr permission prompt: indicatif rewrites the spinner row
+    /// via `\r` on stdout, but `\r` is a terminal-level cursor move
+    /// — it clobbers ANY content on that row, including a prompt
+    /// the agent runtime just wrote to stderr. Suspending freezes
+    /// the bars until the prompt resolves so the operator can
+    /// actually see (and respond to) `[y/n/a/s]:`.
+    pub fn multi_handle(&self) -> MultiProgress {
+        self.multi.clone()
+    }
+
     // ── Public API ────────────────────────────────────────────────────────
 
     /// `▶ <workflow_name>  <run_id>  HH:MM:SS`

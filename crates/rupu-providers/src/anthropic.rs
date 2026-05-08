@@ -817,6 +817,15 @@ impl AnthropicClient {
         let model_for_betas = "claude-sonnet-4-6";
         let req = self.client.get(&bootstrap_url);
         let req = self.apply_auth_headers(req, model_for_betas, None);
+        // Cap this best-effort warmup at 10s so a slow / hanging
+        // bootstrap endpoint can't strand the agent at the spinner
+        // before its first message turn. The shared HTTP client
+        // doesn't have a default timeout (streams need to wait
+        // arbitrary durations between SSE chunks), so the cap has to
+        // be set per-request here. On timeout we log + continue,
+        // matching the existing best-effort error semantics — the
+        // first /v1/messages call will surface any real auth issue.
+        let req = req.timeout(std::time::Duration::from_secs(10));
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 debug!(url = %bootstrap_url, "bootstrap OK");
@@ -825,6 +834,12 @@ impl AnthropicClient {
                 warn!(
                     status = resp.status().as_u16(),
                     "bootstrap returned non-success; continuing"
+                );
+            }
+            Err(e) if e.is_timeout() => {
+                warn!(
+                    url = %bootstrap_url,
+                    "bootstrap timed out after 10s; continuing without warmup"
                 );
             }
             Err(e) => {
