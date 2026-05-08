@@ -43,21 +43,20 @@ sync:
 		echo "   to update main:  git checkout main && git pull --ff-only"; \
 	fi
 
-# Trigger the build.yml workflow on origin and watch it through to
-# completion. Produces an unsigned macOS arm64 binary as a downloadable
-# artifact. Useful when you want a clean-room build off origin without
-# a local toolchain. Requires the `gh` CLI.
-gh-build:
-	@command -v gh >/dev/null 2>&1 || { echo "gh CLI not installed — \`brew install gh\` then \`gh auth login\`"; exit 1; }
-	@echo "→ Triggering build.yml workflow on origin..."
-	@gh workflow run build.yml
-	@sleep 3
-	@RUN_ID=$$(gh run list --workflow=build.yml --limit 1 --json databaseId --jq '.[0].databaseId'); \
-	if [ -z "$$RUN_ID" ]; then echo "could not resolve run id; check \`gh run list --workflow=build.yml\`"; exit 1; fi; \
-	echo "→ Watching run $$RUN_ID (Ctrl-C to detach — the run continues remotely)..."; \
-	gh run watch "$$RUN_ID" --exit-status; \
-	echo ""; \
-	echo "→ Download artifact:  gh run download $$RUN_ID --name rupu-darwin-arm64"
+# Build the release binary locally, then publish it to the rolling
+# `latest-build` GitHub release as a `gh release upload --clobber`
+# asset. Produces a stable URL — `https://github.com/Section9Labs/rupu/releases/tag/latest-build`
+# — that anyone can curl. The tag floats, so do NOT link it from
+# CHANGELOG or anywhere that needs a stable version anchor; use the
+# `v0.x.y-cli` tags for that.
+#
+# `release` first because the binary needs to be signed before it
+# leaves the laptop. The release itself is unsigned-by-Apple in the
+# notarization sense — only `notarize-release.sh` does that — but
+# the local Developer ID signature is enough for `xattr -d
+# com.apple.quarantine` users.
+gh-build: release
+	@scripts/gh-build.sh
 
 fmt:
 	cargo fmt --all -- --check
@@ -92,7 +91,7 @@ help:
 	@echo "  run            build + run target/debug/rupu (pass ARGS=...)"
 	@echo "  install        release + install to /usr/local/bin/rupu (sudo)"
 	@echo "  sync           git fetch origin; fast-forward main if checked out"
-	@echo "  gh-build       trigger the GH Actions build.yml workflow + watch"
+	@echo "  gh-build       release + publish to the rolling \`latest-build\` GH release"
 	@echo "  fmt            cargo fmt --all -- --check"
 	@echo "  lint           cargo clippy --workspace --all-targets -D warnings"
 	@echo "  test           cargo test --workspace"
