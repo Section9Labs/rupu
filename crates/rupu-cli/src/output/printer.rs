@@ -32,8 +32,23 @@ use std::time::Duration;
 // ── Tree characters ──────────────────────────────────────────────────────────
 
 const BRANCH: &str = "├─";
+/// Light vertical thread for rupu chrome (step headers, footers, the
+/// continuous rail). Soft purple — easy on the eye, doesn't compete
+/// with the agent body it surrounds.
 const PIPE: &str = "│";
+/// Heavier vertical bar for agent body lines (assistant chunks).
+/// Visual delineation between "rupu emitted this" and "the agent
+/// emitted this" without needing any explicit framing — the eye reads
+/// it as one continuous gutter on the left of the streamed output.
+const BAR_HEAVY: &str = "┃";
 const SPACE: &str = "  ";
+
+/// Fallback terminal width when stdout is not a tty (pipe, CI). Same
+/// number `comfy-table` uses for headless renders. Long agent lines
+/// in non-tty mode wrap to this width with continuation prefix —
+/// pipelines that grep / wc / etc. on rupu output get sensible row
+/// lengths instead of one 4000-char line.
+const FALLBACK_TERM_WIDTH: u16 = 100;
 
 // ── LineStreamPrinter ────────────────────────────────────────────────────────
 
@@ -55,6 +70,16 @@ pub struct LineStreamPrinter {
     /// consumers (pipes, cargo-test capture, CI logs) get a plain
     /// stdout stream with no spinner control codes.
     is_tty: bool,
+    /// Terminal column count, captured at construction. Used to wrap
+    /// long agent body lines so the visual gutter stays continuous
+    /// (terminal-side wrap drops the leading prefix on continuation
+    /// rows). Falls back to [`FALLBACK_TERM_WIDTH`] when the size
+    /// probe fails (non-tty, sandboxed terminal).
+    term_width: u16,
+    /// UI preferences (color / theme / pager). Cached at construction
+    /// so we don't re-read the config on every assistant chunk —
+    /// streaming hot paths fire dozens of these per step.
+    prefs: crate::cmd::ui::UiPrefs,
 }
 
 impl Default for LineStreamPrinter {
@@ -81,12 +106,21 @@ impl LineStreamPrinter {
             indicatif::ProgressDrawTarget::hidden()
         };
         let multi = MultiProgress::with_draw_target(target);
+        // Probe terminal width once. crossterm's `terminal::size()`
+        // queries the controlling tty; on non-tty we fall through to
+        // the documented fallback. The width is treated as static for
+        // the run — handling SIGWINCH mid-stream would force a
+        // re-layout that the line-stream model doesn't support.
+        let term_width = terminal::size().map(|(w, _)| w).unwrap_or(FALLBACK_TERM_WIDTH);
+        let prefs = crate::output::diag::prefs_for_diag(false);
         Self {
             indent: 0,
             step_start: None,
             multi,
             ticker: None,
             is_tty,
+            term_width,
+            prefs,
         }
     }
 
@@ -320,20 +354,53 @@ impl LineStreamPrinter {
         self.print_rail_only();
     }
 
-    /// One assistant-text chunk. Preserves blank lines as rail-only lines so
-    /// the visual column never breaks.
+    /// One assistant-text chunk. Highlights the body via syntect's
+    /// markdown grammar (so fenced code blocks, headings, lists, etc.
+    /// pick up color) and wraps each line to the terminal width with
+    /// a continuation prefix — without that wrap, the terminal's own
+    /// soft-wrap drops the leading gutter glyph on the wrapped row
+    /// and visually breaks the timeline.
+    ///
+    /// Body lines render with the heavier `┃` bar (vs. the `│` rupu
+    /// uses for chrome) so a reader scanning the stream sees agent
+    /// output and rupu structure as two distinct columns.
+    ///
+    /// Preserves blank lines as rail-only lines so the visual column
+    /// never breaks across paragraphs.
     pub fn assistant_chunk(&mut self, chunk: &str) {
         // Refresh the ticker so the operator sees the model is actively
         // emitting tokens (even if the per-chunk lines are short and
         // scroll fast). No-op when no ticker is up (e.g. replay mode).
         self.tick_with("model streaming…");
-        for line in chunk.split('\n') {
-            if line.is_empty() {
+
+        // Highlight as markdown. syntect retains state across the
+        // chunk's internal newlines, so a chunk that opens a fenced
+        // code block keeps the "code body" coloring even after
+        // newlines. State is dropped at chunk boundaries — fine in
+        // practice since the LLM rarely splits a single fenced block
+        // across stream chunks.
+        let highlighted = crate::cmd::ui::highlight_markdown(chunk, &self.prefs);
+
+        // Wrap to (term_width - body_prefix_width). Compute once per
+        // chunk; indent depth is stable for the duration of the
+        // chunk.
+        let avail = self
+            .term_width
+            .saturating_sub(self.body_prefix_visual_width() as u16)
+            .max(20) as usize;
+
+        for line in highlighted.split('\n') {
+            // Visible-len 0 means truly blank line. Strip ANSI to
+            // verify rather than checking byte-len, which a
+            // colored-but-empty rendering still has > 0.
+            if visible_len(line) == 0 {
                 self.print_rail_only();
-            } else {
+                continue;
+            }
+            for piece in wrap_with_ansi(line, avail) {
                 let mut buf = String::new();
-                self.push_content_prefix(&mut buf);
-                buf.push_str(line);
+                self.push_body_prefix(&mut buf);
+                buf.push_str(&piece);
                 self.out(&buf);
             }
         }
@@ -383,20 +450,27 @@ impl LineStreamPrinter {
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, step_id, color);
         buf.push_str("  ");
+        // Closure word + tally + duration in the success/failure
+        // color so the panel footer reads as one unmistakable line
+        // (was previously dim meta, which scrolled past unnoticed).
+        let closure = if success { "done" } else { "failed" };
         let tally = if findings_count == 1 {
-            "· 1 finding".to_string()
+            format!("{closure} · 1 finding · {dur_str}")
         } else {
-            format!("· {findings_count} findings")
+            format!("{closure} · {findings_count} findings · {dur_str}")
         };
-        let _ = palette::write_colored(&mut buf, &tally, DIM);
-        buf.push_str("  ");
-        let dur_meta = format!("· {dur_str}");
-        let _ = palette::write_colored(&mut buf, &dur_meta, DIM);
+        let _ = palette::write_colored(&mut buf, &tally, color);
         self.out(&buf);
         self.print_rail_only();
     }
 
-    /// `│  ✓ <step_id>  · <duration> · <tokens> tokens`
+    /// `│  ✓ <step_id>  done · <duration> · <tokens> tokens`
+    ///
+    /// Step closure footer — the entire line renders in `COMPLETE`
+    /// green so the eye registers it as a cleared phase, not a
+    /// continuation. Header glyph (`◐`) intentionally stays static
+    /// per v0.4.8 lessons (cursor-save/restore fights with the
+    /// print thread); the prominent footer is the closure cue.
     pub fn step_done(&mut self, step_id: &str, duration: Duration, total_tokens: u64) {
         self.stop_ticker();
         let elapsed = self
@@ -411,17 +485,25 @@ impl LineStreamPrinter {
         buf.push(' ');
         let _ = palette::write_bold_colored(&mut buf, step_id, COMPLETE);
         buf.push_str("  ");
+        // "done" word + meta both rendered in COMPLETE (not DIM) so the
+        // entire footer reads as one signal. Was previously DIM meta,
+        // which made the closure visually identical to a normal info
+        // line and got scrolled past.
         let meta = if total_tokens > 0 {
-            format!("· {dur_str} · {total_tokens} tokens")
+            format!("done · {dur_str} · {total_tokens} tokens")
         } else {
-            format!("· {dur_str}")
+            format!("done · {dur_str}")
         };
-        let _ = palette::write_colored(&mut buf, &meta, DIM);
+        let _ = palette::write_colored(&mut buf, &meta, COMPLETE);
         self.out(&buf);
         self.print_rail_only();
     }
 
     /// `│  ✗ <step_id>  failed: <reason>`
+    ///
+    /// Step failure footer — entire line in `FAILED` red so the
+    /// failure is unmissable. Same prominence treatment as
+    /// [`Self::step_done`].
     pub fn step_failed(&mut self, step_id: &str, reason: &str) {
         self.stop_ticker();
         self.step_start = None;
@@ -432,7 +514,7 @@ impl LineStreamPrinter {
         let _ = palette::write_bold_colored(&mut buf, step_id, FAILED);
         buf.push_str("  ");
         let msg = format!("failed: {reason}");
-        let _ = palette::write_colored(&mut buf, &msg, FAILED);
+        let _ = palette::write_bold_colored(&mut buf, &msg, FAILED);
         self.out(&buf);
         self.print_rail_only();
     }
@@ -639,13 +721,36 @@ impl LineStreamPrinter {
 
     fn push_prefix(&self, buf: &mut String, branch: &str) {
         self.push_indent_pipes(buf);
-        buf.push_str(branch);
+        // Color the branch character in the same BRAND_300 as the
+        // vertical thread so the timeline reads as one continuous
+        // brand-tinted skeleton (was uncolored, rendering in the
+        // terminal default fg and visually breaking the gutter).
+        let _ = palette::write_colored(buf, branch, BRAND_300);
     }
 
     fn push_content_prefix(&self, buf: &mut String) {
         self.push_indent_pipes(buf);
         let _ = palette::write_colored(buf, PIPE, BRAND_300);
         buf.push_str("  ");
+    }
+
+    /// Body-content prefix — `┃ ` in BRAND (purple-500). Heavier than
+    /// the chrome `│` so the eye separates "agent emitted this" from
+    /// "rupu emitted this" at a glance. Used by [`Self::assistant_chunk`].
+    fn push_body_prefix(&self, buf: &mut String) {
+        self.push_indent_pipes(buf);
+        let _ = palette::write_colored(buf, BAR_HEAVY, BRAND);
+        buf.push(' ');
+    }
+
+    /// Visible-character width consumed by the body prefix at the
+    /// current indent level. ANSI escape sequences are zero-width;
+    /// only the actual glyphs count. Used for terminal-width-aware
+    /// wrap math.
+    fn body_prefix_visual_width(&self) -> usize {
+        // Each indent level is `│` + 2 spaces = 3 visible cells.
+        // Body prefix adds `┃ ` = 2 visible cells.
+        self.indent * 3 + 2
     }
 
     fn push_indent_pipes(&self, buf: &mut String) {
@@ -697,6 +802,104 @@ fn severity_color(severity: &str) -> (owo_colors::Rgb, bool) {
 }
 
 /// Naïve word-wrap: split on whitespace, re-join into lines ≤ `width` chars.
+/// Visible (printed) char count of a string that may contain ANSI
+/// CSI sequences (`ESC [ … m`). Each `ESC[…m` run is zero-width;
+/// every other `char` counts once. Conservative — doesn't try to
+/// account for double-width CJK / emoji glyphs (treated as 1).
+fn visible_len(s: &str) -> usize {
+    let mut n = 0usize;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Eat the rest of the CSI: `[` + parameters + final 'm'.
+            // Tolerant of malformed sequences — any char that arrives
+            // before a closing `m` is just consumed.
+            for inner in chars.by_ref() {
+                if inner == 'm' {
+                    break;
+                }
+            }
+        } else {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Wrap a possibly-ANSI-colored string into pieces of at most
+/// `width` *visible* characters, preserving in-place SGR (color)
+/// state across the cuts.
+///
+/// Each emitted piece ends with a `\x1b[0m` reset (so a downstream
+/// prefix in a different color doesn't pick up the leftover style)
+/// and the next piece replays the latest active SGR at its start
+/// (so continued colored text stays colored on every row).
+///
+/// Hard-break only — splits at exactly `width` visible chars
+/// regardless of word boundaries. This keeps the implementation
+/// short and predictable; the alternative (word-break preferred)
+/// is a polish add-on we can layer on later if matt asks.
+fn wrap_with_ansi(line: &str, width: usize) -> Vec<String> {
+    if width == 0 || visible_len(line) <= width {
+        return vec![line.to_string()];
+    }
+
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_visible: usize = 0;
+    let mut active_sgr = String::new(); // last SGR string we saw, e.g. "\x1b[38;2;…m"
+
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Capture the full CSI run (assumes terminating `m`).
+            let mut sgr = String::from("\x1b");
+            for inner in chars.by_ref() {
+                sgr.push(inner);
+                if inner == 'm' {
+                    break;
+                }
+            }
+            // Reset clears the active style; everything else replaces it.
+            if sgr == "\x1b[0m" {
+                active_sgr.clear();
+            } else {
+                active_sgr = sgr.clone();
+            }
+            current.push_str(&sgr);
+            continue;
+        }
+
+        if current_visible == width {
+            // Adding `c` would overflow — close the current piece and
+            // start a fresh one.
+            if !active_sgr.is_empty() {
+                current.push_str("\x1b[0m");
+            }
+            pieces.push(std::mem::take(&mut current));
+            current_visible = 0;
+            if !active_sgr.is_empty() {
+                current.push_str(&active_sgr);
+            }
+        }
+
+        current.push(c);
+        current_visible += 1;
+    }
+
+    if !current.is_empty() {
+        if !active_sgr.is_empty() {
+            current.push_str("\x1b[0m");
+        }
+        pieces.push(current);
+    }
+
+    if pieces.is_empty() {
+        pieces.push(String::new());
+    }
+    pieces
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
@@ -869,6 +1072,56 @@ mod tests {
     fn test_wrap_text_empty() {
         let lines = wrap_text("", 80);
         assert_eq!(lines, vec![""]);
+    }
+
+    #[test]
+    fn visible_len_strips_ansi() {
+        // 12 visible chars, plus a 24-bit color sequence + reset.
+        let s = "\x1b[38;2;163;190;140mhello, world\x1b[0m";
+        assert_eq!(visible_len(s), 12);
+    }
+
+    #[test]
+    fn visible_len_handles_plain_text() {
+        assert_eq!(visible_len("hello"), 5);
+        assert_eq!(visible_len(""), 0);
+    }
+
+    #[test]
+    fn wrap_with_ansi_short_line_passes_through() {
+        let pieces = wrap_with_ansi("hello world", 80);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0], "hello world");
+    }
+
+    #[test]
+    fn wrap_with_ansi_hard_breaks_at_width() {
+        // 13 visible chars wrapped at 7 → 7 + 6.
+        let pieces = wrap_with_ansi("one two three", 7);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(visible_len(&pieces[0]), 7);
+        assert_eq!(visible_len(&pieces[1]), 6);
+    }
+
+    #[test]
+    fn wrap_with_ansi_preserves_active_color_across_wraps() {
+        let s = "\x1b[38;2;100;100;100mhello world friend\x1b[0m";
+        let pieces = wrap_with_ansi(s, 7);
+        // 18 visible chars wrapped at 7 → 3 pieces (7 + 7 + 4).
+        assert_eq!(pieces.len(), 3);
+        for p in &pieces {
+            assert!(p.starts_with("\x1b[38;2;100;100;100m"));
+            assert!(p.ends_with("\x1b[0m"));
+        }
+    }
+
+    #[test]
+    fn wrap_with_ansi_three_segments_no_whitespace() {
+        let pieces = wrap_with_ansi("abcdefghij", 4);
+        assert_eq!(pieces.len(), 3);
+        assert_eq!(visible_len(&pieces[0]), 4);
+        assert_eq!(visible_len(&pieces[1]), 4);
+        assert_eq!(visible_len(&pieces[2]), 2);
     }
 
     fn make_finding(severity: &str, title: &str, body: &str, source: &str) -> FindingRecord {
