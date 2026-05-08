@@ -192,11 +192,28 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
         ProviderId::Local => None,
         ProviderId::Github => Some(ProviderOAuth {
             flow: OAuthFlow::Device,
-            client_id: "Iv1.b507a08c87ecfe98",
+            // GitHub CLI's public OAuth-App client_id (embedded in
+            // every published `gh` binary). Classic OAuth App,
+            // device-flow enabled, scope-aware. We previously
+            // impersonated the GitHub Copilot client_id
+            // (`Iv1.b507a08c87ecfe98`), which is a *GitHub App* — its
+            // user-to-server tokens don't carry OAuth scopes, only
+            // installation-level access, so private repos in
+            // non-Copilot-installed orgs were silently invisible.
+            // Switching to gh's classic OAuth client_id restores the
+            // scope-based authorization model users expect from
+            // `gh auth login`. See TODO.md "Register rupu-specific
+            // OAuth clients" for the proper long-term cure.
+            client_id: "178c6fc778ccc68e1d6a",
             authorize_url: "",
             token_url: "https://github.com/login/oauth/access_token",
             device_url: Some("https://github.com/login/device/code"),
-            scopes: &["read:user", "repo", "workflow", "gist", "read:org"],
+            // Scopes intentionally minimal: `repo` covers code +
+            // issues + PRs + commits; `read:org` lets us list org
+            // repos; `workflow` covers `gh workflow run`-style
+            // dispatch; `gist` is cheap to keep. Add more here only
+            // when a specific feature needs them.
+            scopes: &["repo", "read:org", "workflow", "gist", "read:user"],
             redirect_path: "",
             redirect_host: "",
             fixed_ports: None,
