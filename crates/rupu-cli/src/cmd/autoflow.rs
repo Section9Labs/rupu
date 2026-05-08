@@ -22,8 +22,8 @@ use rupu_scm::{
     Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
 };
 use rupu_workspace::{
-    ensure_issue_worktree, issue_dir_name, AutoflowClaimRecord, AutoflowClaimStore,
-    AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
+    ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
+    AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -308,9 +308,14 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
     let claim_store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
+    let cleaned = cleanup_terminal_claims(&global, &repo_store, &claim_store, chrono::Utc::now())?;
     let discovered = discover_tick_autoflows(&global, &repo_store)?;
     if discovered.is_empty() {
-        println!("(no autoflows)");
+        if cleaned == 0 {
+            println!("(no autoflows)");
+        } else {
+            println!("autoflow tick: 0 workflow(s), 0 polled event(s), 0 cycle(s) ran, 0 skipped, {cleaned} cleaned");
+        }
         return Ok(());
     }
     let wake_hints = collect_polled_wake_hints(&global, &discovered, resolver.as_ref())
@@ -375,11 +380,8 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                 }
             } else {
                 let mut resolved = owner_resolution?;
-                current.contenders = active_or_fallback_contenders(
-                    &contenders,
-                    Some(&resolved),
-                    &current.workflow,
-                );
+                current.contenders =
+                    active_or_fallback_contenders(&contenders, Some(&resolved), &current.workflow);
                 reconcile_claim_from_last_run(&global, &resolved, &mut current)?;
 
                 if current.status == ClaimStatus::Released {
@@ -493,11 +495,12 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
     }
 
     println!(
-        "autoflow tick: {} workflow(s), {} polled event(s), {} cycle(s) ran, {} skipped",
+        "autoflow tick: {} workflow(s), {} polled event(s), {} cycle(s) ran, {} skipped, {} cleaned",
         discovered.len(),
         wake_hints.total_polled_events,
         ran,
-        skipped
+        skipped,
+        cleaned
     );
     Ok(())
 }
@@ -581,10 +584,15 @@ async fn claims() -> anyhow::Result<()> {
 async fn release(r#ref: &str) -> anyhow::Result<()> {
     let issue_ref = canonical_issue_ref(r#ref)?;
     let global = paths::global_dir()?;
-    let store = AutoflowClaimStore {
+    let repo_store = RepoRegistryStore {
+        root: paths::repos_dir(&global),
+    };
+    let claim_store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
-    if store.delete(&issue_ref)? {
+    if let Some(claim) = claim_store.load(&issue_ref)? {
+        cleanup_claim_artifacts(&repo_store, &claim)?;
+        claim_store.delete(&issue_ref)?;
         println!("released {issue_ref}");
     } else {
         println!("{issue_ref} was not claimed");
@@ -1485,6 +1493,102 @@ fn resolve_config(global: &Path, project_root: Option<&Path>) -> anyhow::Result<
     )?)
 }
 
+fn cleanup_terminal_claims(
+    global: &Path,
+    repo_store: &RepoRegistryStore,
+    claim_store: &AutoflowClaimStore,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<usize> {
+    let mut cleaned = 0usize;
+    for claim in claim_store.list()? {
+        if !matches!(claim.status, ClaimStatus::Complete | ClaimStatus::Released) {
+            continue;
+        }
+        let Some(cleanup_after) = cleanup_after_for_claim(global, repo_store, &claim)? else {
+            continue;
+        };
+        if !claim_cleanup_due(&claim, now, cleanup_after)? {
+            continue;
+        }
+        match cleanup_claim_artifacts(repo_store, &claim) {
+            Ok(_) => {
+                claim_store.delete(&claim.issue_ref)?;
+                cleaned += 1;
+            }
+            Err(err) => warn!(
+                issue_ref = %claim.issue_ref,
+                repo_ref = %claim.repo_ref,
+                error = %err,
+                "failed to cleanup terminal autoflow claim"
+            ),
+        }
+    }
+    Ok(cleaned)
+}
+
+fn cleanup_after_for_claim(
+    global: &Path,
+    repo_store: &RepoRegistryStore,
+    claim: &AutoflowClaimRecord,
+) -> anyhow::Result<Option<chrono::Duration>> {
+    let tracked = repo_store.load(&claim.repo_ref)?;
+    let project_root = tracked
+        .as_ref()
+        .and_then(|tracked| PathBuf::from(&tracked.preferred_path).canonicalize().ok())
+        .and_then(|preferred_checkout| {
+            paths::project_root_for(&preferred_checkout)
+                .ok()
+                .flatten()
+                .or(Some(preferred_checkout))
+        });
+    let cfg = resolve_config(global, project_root.as_deref())?;
+    cfg.autoflow
+        .cleanup_after
+        .as_deref()
+        .map(parse_duration)
+        .transpose()
+}
+
+fn claim_cleanup_due(
+    claim: &AutoflowClaimRecord,
+    now: chrono::DateTime<chrono::Utc>,
+    cleanup_after: chrono::Duration,
+) -> anyhow::Result<bool> {
+    let updated_at = chrono::DateTime::parse_from_rfc3339(&claim.updated_at)
+        .with_context(|| format!("parse claim updated_at for `{}`", claim.issue_ref))?
+        .with_timezone(&chrono::Utc);
+    Ok(updated_at + cleanup_after <= now)
+}
+
+fn cleanup_claim_artifacts(
+    repo_store: &RepoRegistryStore,
+    claim: &AutoflowClaimRecord,
+) -> anyhow::Result<()> {
+    let Some(worktree_path) = claim.worktree_path.as_deref() else {
+        return Ok(());
+    };
+    let worktree_path = PathBuf::from(worktree_path);
+    if !worktree_path.exists() {
+        return Ok(());
+    }
+    let tracked = repo_store
+        .load(&claim.repo_ref)?
+        .ok_or_else(|| anyhow!("repo `{}` is not tracked", claim.repo_ref))?;
+    let preferred_checkout = PathBuf::from(&tracked.preferred_path);
+    let preferred_canonical = preferred_checkout
+        .canonicalize()
+        .unwrap_or_else(|_| preferred_checkout.clone());
+    let worktree_canonical = worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.clone());
+    if worktree_canonical == preferred_canonical {
+        return Ok(());
+    }
+    remove_issue_worktree(&preferred_checkout, &worktree_path)
+        .with_context(|| format!("remove worktree {}", worktree_path.display()))?;
+    Ok(())
+}
+
 fn build_issue_filter(autoflow: &rupu_orchestrator::Autoflow) -> IssueFilter {
     let state = match autoflow.selector.states.as_slice() {
         [rupu_orchestrator::AutoflowIssueState::Open] => Some(IssueState::Open),
@@ -1797,7 +1901,10 @@ fn next_action_summary(claim: &AutoflowClaimRecord) -> String {
     match claim.status {
         ClaimStatus::AwaitHuman => "human approval".into(),
         ClaimStatus::AwaitExternal => "external change".into(),
-        ClaimStatus::Running => claim.last_run_id.clone().unwrap_or_else(|| "running".into()),
+        ClaimStatus::Running => claim
+            .last_run_id
+            .clone()
+            .unwrap_or_else(|| "running".into()),
         _ => claim.last_run_id.clone().unwrap_or_else(|| "-".into()),
     }
 }
@@ -2066,6 +2173,28 @@ steps:
             &BTreeSet::new()
         )
         .unwrap());
+    }
+
+    #[test]
+    fn terminal_claim_cleanup_respects_grace_period() {
+        let claim = AutoflowClaimRecord {
+            issue_ref: "github:Section9Labs/rupu/issues/42".into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "issue-supervisor-dispatch".into(),
+            status: ClaimStatus::Complete,
+            worktree_path: None,
+            branch: None,
+            last_run_id: None,
+            last_error: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339(),
+        };
+        assert!(claim_cleanup_due(&claim, chrono::Utc::now(), chrono::Duration::days(1)).unwrap());
+        assert!(!claim_cleanup_due(&claim, chrono::Utc::now(), chrono::Duration::days(7)).unwrap());
     }
 
     #[test]
@@ -2512,5 +2641,77 @@ steps:
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn tick_cleans_complete_claims_after_cleanup_window() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        std::fs::create_dir_all(project.join(".rupu")).unwrap();
+        std::fs::write(
+            project.join(".rupu/config.toml"),
+            "[autoflow]\ncleanup_after = \"1d\"\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("main"),
+            )
+            .unwrap();
+
+        let worktree = ensure_issue_worktree(
+            &project,
+            &paths::autoflow_worktrees_dir(&global),
+            "github:Section9Labs/rupu",
+            "github:Section9Labs/rupu/issues/42",
+            "rupu/issue-42",
+            Some("HEAD"),
+        )
+        .unwrap();
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: issue_ref.into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "issue-supervisor-dispatch".into(),
+                status: ClaimStatus::Complete,
+                worktree_path: Some(worktree.path.display().to_string()),
+                branch: Some("rupu/issue-42".into()),
+                last_run_id: Some("run_done".into()),
+                last_error: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: None,
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+            })
+            .unwrap();
+
+        std::env::set_var("RUPU_HOME", &global);
+        tick_with_resolver(Arc::new(InMemoryResolver::new()))
+            .await
+            .unwrap();
+        std::env::remove_var("RUPU_HOME");
+
+        assert!(claim_store.load(issue_ref).unwrap().is_none());
+        assert!(!worktree.path.exists());
     }
 }
