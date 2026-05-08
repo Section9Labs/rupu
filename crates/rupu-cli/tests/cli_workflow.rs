@@ -5,6 +5,7 @@
 //! whole body of every test to serialize them within this binary.
 
 use assert_fs::prelude::*;
+use std::process::Command;
 use tokio::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -22,6 +23,24 @@ steps:
     actions: []
     prompt: hi
 "#;
+
+fn init_git_checkout(path: &std::path::Path, origin_url: &str) {
+    let status = Command::new("git")
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "add", "origin", origin_url])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
 
 #[tokio::test]
 async fn workflow_list_shows_global_and_project() {
@@ -171,4 +190,59 @@ async fn workflow_run_executes_one_step_via_mock() {
     );
     let summary = rupu_transcript::JsonlReader::summary(entries[0].path()).unwrap();
     assert_eq!(summary.status, rupu_transcript::RunStatus::Ok);
+}
+
+#[tokio::test]
+async fn workflow_run_auto_tracks_current_checkout() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/echo.md")
+        .write_str("---\nname: echo\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\nyou echo.")
+        .unwrap();
+    global.child("workflows").create_dir_all().unwrap();
+    global
+        .child("workflows/hello-wf.yaml")
+        .write_str(WORKFLOW_YAML)
+        .unwrap();
+
+    let project = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(project.path(), "git@github.com:Section9Labs/rupu.git");
+
+    std::env::set_var("RUPU_HOME", global.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT);
+    std::env::set_current_dir(project.path()).unwrap();
+
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "run".into(),
+        "hello-wf".into(),
+        "--mode".into(),
+        "bypass".into(),
+    ])
+    .await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    std::env::remove_var("RUPU_HOME");
+
+    assert_eq!(exit, std::process::ExitCode::from(0));
+
+    let store = rupu_workspace::RepoRegistryStore {
+        root: global.path().join("repos"),
+    };
+    let tracked = store
+        .load("github:Section9Labs/rupu")
+        .unwrap()
+        .expect("repo should be auto-tracked");
+    assert_eq!(tracked.repo_ref, "github:Section9Labs/rupu");
+    assert_eq!(tracked.known_paths.len(), 1);
+    assert_eq!(
+        tracked.preferred_path,
+        project.path().canonicalize().unwrap().display().to_string()
+    );
 }

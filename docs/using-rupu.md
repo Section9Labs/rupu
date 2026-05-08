@@ -102,6 +102,14 @@ Autoflows need a repo-to-local-checkout binding:
 rupu repos attach github:your-org/your-repo .
 ```
 
+Manual local-checkout commands also auto-track the current repo when `origin` is parseable:
+
+- `rupu run ...`
+- `rupu workflow run ...`
+- `rupu issues ...`
+
+Use `rupu repos attach` or `rupu repos prefer` when you want to seed the binding explicitly or switch the preferred checkout.
+
 Optional autonomous defaults:
 
 ```toml

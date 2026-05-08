@@ -15,6 +15,7 @@ use rupu_scm::{IssueFilter, IssueRef, IssueState, IssueTracker, Platform, Regist
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use tracing::warn;
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
@@ -249,6 +250,9 @@ async fn build_registry() -> anyhow::Result<(
     paths::ensure_dir(&global)?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
+    if let Err(err) = crate::cmd::repos::auto_track_checkout(&global, &pwd) {
+        warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
+    }
     let global_cfg = global.join("config.toml");
     let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref())?;
