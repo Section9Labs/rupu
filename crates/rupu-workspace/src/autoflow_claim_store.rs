@@ -317,6 +317,11 @@ mod tests {
             branch: Some("rupu/issue-42".into()),
             last_run_id: Some("run_123".into()),
             last_error: None,
+            last_summary: Some("phase 1 ready".into()),
+            pr_url: Some("https://github.com/Section9Labs/rupu/pull/42".into()),
+            artifacts: Some(serde_json::json!({
+                "review_packet": "docs/reviews/issue-42.json"
+            })),
             next_retry_at: None,
             claim_owner: Some("host:user:pid".into()),
             lease_expires_at: Some("2026-05-08T23:00:00Z".into()),
