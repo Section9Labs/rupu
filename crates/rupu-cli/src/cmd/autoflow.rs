@@ -2714,4 +2714,114 @@ steps:
         assert!(claim_store.load(issue_ref).unwrap().is_none());
         assert!(!worktree.path.exists());
     }
+
+    #[tokio::test]
+    async fn tick_reaps_stale_orphan_lock_and_runs_cycle() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(body);
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let issue_ref = "github:Section9Labs/rupu/issues/123";
+        let issue_dir = paths::autoflow_claims_dir(&global)
+            .join(rupu_workspace::autoflow_claim_store::issue_key(issue_ref));
+        std::fs::create_dir_all(&issue_dir).unwrap();
+        std::fs::write(
+            issue_dir.join(".lock"),
+            toml::to_string(&rupu_workspace::ActiveLockRecord {
+                owner: "stale-owner".into(),
+                acquired_at: "2026-05-08T20:00:00Z".into(),
+                lease_expires_at: Some("2000-01-01T00:00:00Z".into()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        tick_with_resolver(resolver).await.unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        let claim = claim_store.load(issue_ref).unwrap().unwrap();
+        assert_eq!(claim.status, ClaimStatus::Complete);
+        assert!(claim.last_run_id.is_some());
+        assert!(!issue_dir.join(".lock").exists());
+    }
 }
