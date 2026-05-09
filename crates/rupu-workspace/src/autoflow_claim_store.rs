@@ -2,7 +2,7 @@
 
 use crate::autoflow_claim::AutoflowClaimRecord;
 use crate::repo_store::sanitize_component;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -175,22 +175,39 @@ impl AutoflowClaimStore {
             source: e,
         })?;
         let path = self.lock_path(issue_ref);
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    ClaimStoreError::AlreadyLocked {
-                        issue_ref: issue_ref.to_string(),
-                    }
+        let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if self.reap_expired_active_lock(issue_ref, Utc::now())? {
+                    OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&path)
+                        .map_err(|e| {
+                            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                                ClaimStoreError::AlreadyLocked {
+                                    issue_ref: issue_ref.to_string(),
+                                }
+                            } else {
+                                ClaimStoreError::Io {
+                                    action: format!("open {}", path.display()),
+                                    source: e,
+                                }
+                            }
+                        })?
                 } else {
-                    ClaimStoreError::Io {
-                        action: format!("open {}", path.display()),
-                        source: e,
-                    }
+                    return Err(ClaimStoreError::AlreadyLocked {
+                        issue_ref: issue_ref.to_string(),
+                    });
                 }
-            })?;
+            }
+            Err(err) => {
+                return Err(ClaimStoreError::Io {
+                    action: format!("open {}", path.display()),
+                    source: err,
+                });
+            }
+        };
 
         let lock = ActiveLockRecord {
             owner: owner.to_string(),
@@ -210,6 +227,7 @@ impl AutoflowClaimStore {
         &self,
         issue_ref: &str,
     ) -> Result<Option<ActiveLockRecord>, ClaimStoreError> {
+        self.reap_expired_active_lock(issue_ref, Utc::now())?;
         let path = self.lock_path(issue_ref);
         if !path.exists() {
             return Ok(None);
@@ -224,10 +242,59 @@ impl AutoflowClaimStore {
         })?;
         Ok(Some(lock))
     }
+
+    fn reap_expired_active_lock(
+        &self,
+        issue_ref: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, ClaimStoreError> {
+        let path = self.lock_path(issue_ref);
+        let Some(lock) = self.read_lock_file_if_present(&path)? else {
+            return Ok(false);
+        };
+        if !lock_expired(&lock, now) {
+            return Ok(false);
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(err) => Err(ClaimStoreError::Io {
+                action: format!("remove_file {}", path.display()),
+                source: err,
+            }),
+        }
+    }
+
+    fn read_lock_file_if_present(
+        &self,
+        path: &PathBuf,
+    ) -> Result<Option<ActiveLockRecord>, ClaimStoreError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(path).map_err(|e| ClaimStoreError::Io {
+            action: format!("read {}", path.display()),
+            source: e,
+        })?;
+        let lock = toml::from_str(&text).map_err(|e| ClaimStoreError::Parse {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        Ok(Some(lock))
+    }
 }
 
 pub fn issue_key(issue_ref: &str) -> String {
     sanitize_component(issue_ref)
+}
+
+fn lock_expired(lock: &ActiveLockRecord, now: DateTime<Utc>) -> bool {
+    let Some(lease_expires_at) = lock.lease_expires_at.as_deref() else {
+        return false;
+    };
+    DateTime::parse_from_rfc3339(lease_expires_at)
+        .map(|lease| lease.with_timezone(&Utc) <= now)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -274,16 +341,17 @@ mod tests {
             root: tmp.path().join("claims"),
         };
         let issue_ref = "github:Section9Labs/rupu/issues/42";
+        let lease = (Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
         let guard = store
-            .try_acquire_active_lock(issue_ref, "owner-a", Some("2026-05-08T23:00:00Z"))
+            .try_acquire_active_lock(issue_ref, "owner-a", Some(&lease))
             .unwrap();
         let err = store
-            .try_acquire_active_lock(issue_ref, "owner-b", Some("2026-05-08T23:00:00Z"))
+            .try_acquire_active_lock(issue_ref, "owner-b", Some(&lease))
             .unwrap_err();
         assert!(matches!(err, ClaimStoreError::AlreadyLocked { .. }));
         drop(guard);
         let _guard2 = store
-            .try_acquire_active_lock(issue_ref, "owner-b", Some("2026-05-08T23:00:00Z"))
+            .try_acquire_active_lock(issue_ref, "owner-b", Some(&lease))
             .unwrap();
     }
 
@@ -294,14 +362,61 @@ mod tests {
             root: tmp.path().join("claims"),
         };
         let issue_ref = "github:Section9Labs/rupu/issues/42";
+        let lease = (Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
         let _guard = store
-            .try_acquire_active_lock(issue_ref, "owner-a", Some("2026-05-08T23:00:00Z"))
+            .try_acquire_active_lock(issue_ref, "owner-a", Some(&lease))
             .unwrap();
         let lock = store.read_active_lock(issue_ref).unwrap().unwrap();
         assert_eq!(lock.owner, "owner-a");
-        assert_eq!(
-            lock.lease_expires_at.as_deref(),
-            Some("2026-05-08T23:00:00Z")
-        );
+        assert_eq!(lock.lease_expires_at.as_deref(), Some(lease.as_str()));
+    }
+
+    #[test]
+    fn expired_active_lock_is_reaped_on_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowClaimStore {
+            root: tmp.path().join("claims"),
+        };
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        let issue_dir = store.root.join(issue_key(issue_ref));
+        std::fs::create_dir_all(&issue_dir).unwrap();
+        let path = issue_dir.join(".lock");
+        let body = toml::to_string(&ActiveLockRecord {
+            owner: "owner-a".into(),
+            acquired_at: "2026-05-08T20:00:00Z".into(),
+            lease_expires_at: Some("2000-01-01T00:00:00Z".into()),
+        })
+        .unwrap();
+        std::fs::write(&path, body).unwrap();
+
+        assert!(store.read_active_lock(issue_ref).unwrap().is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn expired_active_lock_can_be_reacquired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowClaimStore {
+            root: tmp.path().join("claims"),
+        };
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        let issue_dir = store.root.join(issue_key(issue_ref));
+        std::fs::create_dir_all(&issue_dir).unwrap();
+        let path = issue_dir.join(".lock");
+        let body = toml::to_string(&ActiveLockRecord {
+            owner: "owner-a".into(),
+            acquired_at: "2026-05-08T20:00:00Z".into(),
+            lease_expires_at: Some("2000-01-01T00:00:00Z".into()),
+        })
+        .unwrap();
+        std::fs::write(&path, body).unwrap();
+
+        let lease = (Utc::now() + chrono::Duration::hours(3)).to_rfc3339();
+        let _guard = store
+            .try_acquire_active_lock(issue_ref, "owner-b", Some(&lease))
+            .unwrap();
+        let lock = store.read_active_lock(issue_ref).unwrap().unwrap();
+        assert_eq!(lock.owner, "owner-b");
+        assert_eq!(lock.lease_expires_at.as_deref(), Some(lease.as_str()));
     }
 }
