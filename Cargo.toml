@@ -68,7 +68,7 @@ lru = "0.12"
 # CLI / templating (used in Plan 2 but pinned now for cohesion)
 clap = { version = "4", features = ["derive"] }
 clap_complete = { version = "4", features = ["unstable-dynamic"] }
-comfy-table = "7"
+comfy-table = { version = "7", features = ["custom_styling"] }
 indicatif = "0.17"
 owo-colors = { version = "4", features = ["supports-colors"] }
 
