@@ -997,6 +997,33 @@ pub async fn run_by_name_with_run_id(
     run_with_outcome(name, None, inputs, mode, event, false, false, Some(run_id)).await
 }
 
+/// Run a specific workflow file using the same execution pipeline as
+/// `rupu workflow run`, but with an explicit workflow path and
+/// workspace context. Used by repo-aware webhook dispatch, where the
+/// candidate workflow may live in a tracked checkout outside the
+/// server's current working directory.
+pub async fn run_by_path(
+    workflow_path: PathBuf,
+    project_root: Option<PathBuf>,
+    workspace_path: PathBuf,
+    inputs: Vec<(String, String)>,
+    mode: Option<&str>,
+    event: Option<serde_json::Value>,
+) -> anyhow::Result<RunOutcomeSummary> {
+    run_path_with_outcome(
+        workflow_path,
+        project_root,
+        workspace_path,
+        inputs,
+        mode,
+        event,
+        false,
+        false,
+        None,
+    )
+    .await
+}
+
 /// Public wrapper for `rupu issues run <name> <ref>` and similar
 /// callers that need to invoke a workflow with a specific
 /// run-target string. Same UI semantics as `rupu workflow run`
@@ -1184,6 +1211,62 @@ async fn run_with_outcome(
             issue: issue_payload,
             issue_ref: issue_ref_text,
             system_prompt_suffix,
+            attach_ui,
+            use_canvas,
+            run_id_override,
+            strict_templates: false,
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_path_with_outcome(
+    workflow_path: PathBuf,
+    project_root: Option<PathBuf>,
+    workspace_path: PathBuf,
+    inputs: Vec<(String, String)>,
+    mode: Option<&str>,
+    event: Option<serde_json::Value>,
+    attach_ui: bool,
+    use_canvas: bool,
+    run_id_override: Option<String>,
+) -> anyhow::Result<RunOutcomeSummary> {
+    let body = std::fs::read_to_string(&workflow_path)?;
+    let workflow = Workflow::parse(&body)?;
+    let workflow_name = workflow.name.clone();
+
+    let global = paths::global_dir()?;
+    paths::ensure_dir(&global)?;
+
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.join("workspaces"),
+    };
+    let ws = rupu_workspace::upsert(&ws_store, &workspace_path)?;
+    if let Err(err) = crate::cmd::repos::auto_track_checkout(&global, &workspace_path) {
+        warn!(
+            path = %workspace_path.display(),
+            error = %err,
+            "failed to auto-track checkout"
+        );
+    }
+
+    execute_workflow_invocation(
+        &workflow_name,
+        workflow,
+        body,
+        workflow_path,
+        global,
+        ExplicitWorkflowRunContext {
+            project_root,
+            workspace_path,
+            workspace_id: ws.id,
+            inputs,
+            mode: mode.unwrap_or("ask").to_string(),
+            event,
+            issue: None,
+            issue_ref: None,
+            system_prompt_suffix: None,
             attach_ui,
             use_canvas,
             run_id_override,
