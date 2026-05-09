@@ -7,6 +7,7 @@
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
+use rupu_workspace::RepoRegistryStore;
 use std::process::Command as ProcessCommand;
 use tokio::sync::Mutex;
 
@@ -20,62 +21,50 @@ const MOCK_SCRIPT: &str = r#"
 
 fn init_git_checkout(path: &std::path::Path, origin_url: &str) {
     std::fs::create_dir_all(path).unwrap();
-    assert!(
-        ProcessCommand::new("git")
-            .arg("init")
-            .arg("-b")
-            .arg("main")
-            .arg(path)
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.email", "test@example.com"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.name", "Test User"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["remote", "add", "origin", origin_url])
-            .status()
-            .unwrap()
-            .success()
-    );
+    assert!(ProcessCommand::new("git")
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "user.email", "test@example.com"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "user.name", "Test User"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "add", "origin", origin_url])
+        .status()
+        .unwrap()
+        .success());
     std::fs::write(path.join("README.md"), "hello\n").unwrap();
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["add", "README.md"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["commit", "-m", "init"])
-            .status()
-            .unwrap()
-            .success()
-    );
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["add", "README.md"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap()
+        .success());
 }
 
 fn write_agent_and_workflow(
@@ -93,6 +82,13 @@ fn write_agent_and_workflow(
         .child(format!(".rupu/workflows/{workflow_name}.yaml"))
         .write_str(workflow_yaml)
         .unwrap();
+}
+
+fn track_repo(home: &assert_fs::fixture::ChildPath, repo_ref: &str, path: &std::path::Path) {
+    let store = RepoRegistryStore {
+        root: home.path().join("repos"),
+    };
+    store.upsert(repo_ref, path, None, None).unwrap();
 }
 
 #[test]
@@ -218,6 +214,138 @@ steps:
         .stdout(predicate::str::contains("selector limit: 25"))
         .stdout(predicate::str::contains("---"))
         .stdout(predicate::str::contains("name: controller"));
+}
+
+#[test]
+fn autoflow_list_includes_tracked_repo_workflows_outside_project() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let outside = tmp.child("outside");
+    outside.create_dir_all().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(project.path(), "git@github.com:Section9Labs/rupu.git");
+    write_agent_and_workflow(
+        &project,
+        "controller",
+        r#"name: controller
+autoflow:
+  enabled: true
+  priority: 100
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    track_repo(&home, "github:Section9Labs/rupu", project.path());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .current_dir(outside.path())
+        .args(["autoflow", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("controller"))
+        .stdout(predicate::str::contains("github:Section9Labs/rupu"));
+}
+
+#[test]
+fn autoflow_show_resolves_tracked_repo_outside_project() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let outside = tmp.child("outside");
+    outside.create_dir_all().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(project.path(), "git@github.com:Section9Labs/rupu.git");
+    write_agent_and_workflow(
+        &project,
+        "controller",
+        r#"name: controller
+autoflow:
+  enabled: true
+  priority: 100
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    track_repo(&home, "github:Section9Labs/rupu", project.path());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .current_dir(outside.path())
+        .args([
+            "autoflow",
+            "show",
+            "controller",
+            "--repo",
+            "github:Section9Labs/rupu",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scope: project"))
+        .stdout(predicate::str::contains("repo: github:Section9Labs/rupu"))
+        .stdout(predicate::str::contains("preferred checkout:"))
+        .stdout(predicate::str::contains("name: controller"));
+}
+
+#[test]
+fn autoflow_show_errors_when_name_is_ambiguous_across_tracked_repos() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let outside = tmp.child("outside");
+    outside.create_dir_all().unwrap();
+    let repo_a = assert_fs::TempDir::new().unwrap();
+    let repo_b = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(repo_a.path(), "git@github.com:Section9Labs/rupu.git");
+    init_git_checkout(repo_b.path(), "git@github.com:Section9Labs/okegu.git");
+    for repo in [&repo_a, &repo_b] {
+        write_agent_and_workflow(
+            repo,
+            "controller",
+            r#"name: controller
+autoflow:
+  enabled: true
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+        );
+    }
+    track_repo(&home, "github:Section9Labs/rupu", repo_a.path());
+    track_repo(&home, "github:Section9Labs/okegu", repo_b.path());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .current_dir(outside.path())
+        .args(["autoflow", "show", "controller"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "multiple autoflows named `controller` are visible",
+        ))
+        .stderr(predicate::str::contains(
+            "pass `--repo <platform>:<owner>/<repo>` to disambiguate",
+        ))
+        .stderr(predicate::str::contains("github:Section9Labs/rupu"))
+        .stderr(predicate::str::contains("github:Section9Labs/okegu"));
 }
 
 #[tokio::test]
