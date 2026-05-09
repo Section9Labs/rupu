@@ -307,6 +307,7 @@ Operational visibility:
 
 - `rupu autoflow status` shows contested issues when more than one autoflow matches the same issue
 - `rupu autoflow claims` shows the selected workflow priority and the losing contenders, for example `*issue-supervisor-dispatch[100], phase-ready-autoflow[50]`
+- if a higher-priority autoflow starts matching later, `rupu autoflow tick` can hand ownership to it once the old claim is idle; active or approval-paused claims stay put until they finish or are released
 
 Two useful shapes:
 
