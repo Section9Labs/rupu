@@ -13,6 +13,7 @@ pub mod printer;
 pub mod spinner;
 pub mod tables;
 pub mod workflow_printer;
+pub mod yaml_snippet;
 
 pub use jsonl_reader::TranscriptTailer;
 pub use printer::LineStreamPrinter;
