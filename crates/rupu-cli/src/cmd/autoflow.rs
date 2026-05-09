@@ -550,7 +550,29 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                     );
                     reconcile_claim_from_last_run(&global, &resolved, &mut current)?;
 
-                    if current.status == ClaimStatus::Released {
+                    if claim_should_yield_to_winner(
+                        &current,
+                        winner.as_ref(),
+                        active_lock.is_some(),
+                    ) {
+                        if let Some(winner) = winner.as_ref() {
+                            current.contenders = active_or_fallback_contenders(
+                                &contenders,
+                                Some(&winner.resolved),
+                                &winner.resolved.workflow.name,
+                            );
+                        }
+                        current.status = ClaimStatus::Released;
+                        current.pending_dispatch = None;
+                        current.updated_at = chrono::Utc::now().to_rfc3339();
+                        claim_store.save(&current)?;
+                        adjust_active_claim_count(
+                            &mut active_claim_counts,
+                            &current.repo_ref,
+                            Some(previous_status),
+                            Some(current.status),
+                        );
+                    } else if current.status == ClaimStatus::Released {
                         claim_store.save(&current)?;
                         adjust_active_claim_count(
                             &mut active_claim_counts,
@@ -1269,6 +1291,29 @@ fn summarize_issue_contenders(matches: &[IssueMatch]) -> BTreeMap<String, Vec<Au
         *contenders = deduped;
     }
     grouped
+}
+
+fn claim_should_yield_to_winner(
+    claim: &AutoflowClaimRecord,
+    winner: Option<&IssueMatch>,
+    active_lock_held: bool,
+) -> bool {
+    if active_lock_held {
+        return false;
+    }
+    let Some(winner) = winner else {
+        return false;
+    };
+    if winner.resolved.workflow.name == claim.workflow {
+        return false;
+    }
+    !matches!(
+        claim.status,
+        ClaimStatus::AwaitHuman
+            | ClaimStatus::Blocked
+            | ClaimStatus::Complete
+            | ClaimStatus::Released
+    )
 }
 
 fn active_or_fallback_contenders(
@@ -2956,6 +3001,74 @@ steps:
     }
 
     #[test]
+    fn idle_claim_yields_to_higher_priority_winner() {
+        let winner = IssueMatch {
+            resolved: ResolvedAutoflowWorkflow {
+                scope: "project".into(),
+                name: "phase-delivery-cycle".into(),
+                workflow: Workflow::parse(
+                    r#"name: phase-delivery-cycle
+autoflow:
+  enabled: true
+  priority: 200
+steps:
+  - id: a
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+                )
+                .unwrap(),
+                workflow_path: PathBuf::from("/tmp/repo/.rupu/workflows/phase-delivery-cycle.yaml"),
+                project_root: None,
+                repo_ref: "github:Section9Labs/rupu".into(),
+                preferred_checkout: PathBuf::from("/tmp/repo"),
+                cfg: Config::default(),
+            },
+            issue: Issue {
+                r: IssueRef {
+                    tracker: IssueTracker::Github,
+                    project: "Section9Labs/rupu".into(),
+                    number: 42,
+                },
+                title: "x".into(),
+                body: String::new(),
+                state: IssueState::Open,
+                labels: vec!["bug".into()],
+                label_colors: BTreeMap::new(),
+                author: "matt".into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            issue_ref_text: "github:Section9Labs/rupu/issues/42".into(),
+        };
+        let mut claim = AutoflowClaimRecord {
+            issue_ref: "github:Section9Labs/rupu/issues/42".into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "issue-supervisor-dispatch".into(),
+            status: ClaimStatus::AwaitExternal,
+            worktree_path: None,
+            branch: None,
+            last_run_id: None,
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        assert!(claim_should_yield_to_winner(&claim, Some(&winner), false));
+        assert!(!claim_should_yield_to_winner(&claim, Some(&winner), true));
+        claim.status = ClaimStatus::AwaitHuman;
+        assert!(!claim_should_yield_to_winner(&claim, Some(&winner), false));
+    }
+
+    #[test]
     fn winners_prefer_priority_then_workflow_name() {
         let workflow = |name: &str, priority: i32| {
             Workflow::parse(&format!(
@@ -3834,6 +3947,184 @@ steps:
                 .unwrap()
                 .contains("issue-123")
         );
+    }
+
+    #[tokio::test]
+    async fn tick_releases_idle_claim_for_higher_priority_winner() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let issues_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issues_body.clone());
+        });
+        let issue_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issue_get_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues/123");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issue_body.clone());
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 50
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "controller {{ issue.number }}"
+"#,
+        );
+        std::fs::write(
+            project.join(".rupu/workflows/phase-delivery-cycle.yaml"),
+            r#"name: phase-delivery-cycle
+autoflow:
+  enabled: true
+  priority: 200
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: implement
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: implement
+    agent: echo
+    actions: []
+    prompt: "phase owner {{ issue.number }}"
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: "github:Section9Labs/rupu/issues/123".into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "issue-supervisor-dispatch".into(),
+                status: ClaimStatus::AwaitExternal,
+                worktree_path: Some(project.display().to_string()),
+                branch: Some("rupu/issue-123".into()),
+                last_run_id: Some("run_controller".into()),
+                last_error: None,
+                last_summary: Some("waiting for external change".into()),
+                pr_url: None,
+                artifacts: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
+                ),
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        tick_with_resolver(resolver).await.unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let claim = claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.workflow, "phase-delivery-cycle");
+        assert_eq!(claim.status, ClaimStatus::Complete);
+        assert_eq!(claim.last_summary.as_deref(), Some("done"));
+        assert_eq!(
+            claim
+                .contenders
+                .iter()
+                .find(|contender| contender.selected)
+                .map(|contender| contender.workflow.as_str()),
+            Some("phase-delivery-cycle")
+        );
+
+        let run_id = claim.last_run_id.as_deref().expect("last run id");
+        let run_store = RunStore::new(global.join("runs"));
+        let run = run_store.load(run_id).unwrap();
+        assert_eq!(run.workflow_name, "phase-delivery-cycle");
     }
 
     #[tokio::test]
