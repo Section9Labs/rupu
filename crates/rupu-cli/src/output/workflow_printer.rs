@@ -157,6 +157,21 @@ pub fn attach_and_print_with(
         printer.workflow_header(workflow_name, run_id, started_at);
     }
 
+    // Workflow-level liveness ticker. `step_results.jsonl` is appended
+    // at step COMPLETION, so the per-step `start_ticker` inside
+    // `step_start` only fires after the step has already finished —
+    // by which point the printer drains the entire transcript at once
+    // and the per-step ticker dies in milliseconds. To keep the user
+    // visually informed during a long step, we arm a workflow-level
+    // ticker upfront and re-arm it at the end of every poll iteration
+    // (idempotent — `start_ticker` updates the message in place when
+    // already running). Per-step `start_ticker` calls override the
+    // message with `running <step_id>…`; their `stop_ticker` at step
+    // close still tears it down, but the next iteration's re-arm
+    // brings it back before the next sleep so the bottom row is
+    // never empty during an in-flight workflow.
+    printer.start_ticker("running…");
+
     let mut seen_step_results: usize = opts.skip_count;
     let mut steps: Vec<StepState> = Vec::new();
     let mut total_tokens: u64 = 0;
@@ -192,6 +207,13 @@ pub fn attach_and_print_with(
             }
         };
 
+        // Re-arm the workflow ticker before any terminal-status branch
+        // takes us out of the loop. `start_ticker` updates the message
+        // in place when already running, so this is cheap; it's
+        // load-bearing only when a step's `step_done` just tore the
+        // ticker down (which happens inside `process_event` above).
+        printer.start_ticker("running…");
+
         let status = record["status"].as_str().unwrap_or("unknown");
         match status {
             "awaiting_approval" => {
@@ -206,6 +228,12 @@ pub fn attach_and_print_with(
                     .unwrap_or("Approve this step?")
                     .to_string();
 
+                // Tear down the workflow-level ticker before the
+                // approval prompt — the prompt reads from stdin and
+                // an animating bottom row would compete with the
+                // cursor for that row's cells. Terminal-return paths
+                // below also drop the ticker.
+                printer.stop_ticker();
                 loop {
                     let ch = printer.approval_prompt(&step_id, &prompt).unwrap_or('q');
 
@@ -276,6 +304,7 @@ pub fn attach_and_print_with(
                     })
                     .unwrap_or(0);
                 let dur = Duration::from_millis(duration_ms);
+                printer.stop_ticker();
                 printer.workflow_done(workflow_name, run_id, dur, total_tokens);
                 return Ok(AttachOutcome::Done);
             }
@@ -284,6 +313,7 @@ pub fn attach_and_print_with(
                 flush_all_tailers(&mut steps, printer, &mut total_tokens);
 
                 let err = record["error_message"].as_str().unwrap_or("unknown error");
+                printer.stop_ticker();
                 printer.workflow_failed(workflow_name, run_id, err);
                 return Ok(AttachOutcome::Done);
             }
