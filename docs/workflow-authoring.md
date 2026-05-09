@@ -268,6 +268,7 @@ Recommended shape:
 
 - high `autoflow.priority`
 - broad issue selector such as `labels_all: ["autoflow"]`
+- optional `labels_any` / `labels_none` when the controller should narrow by readiness or exclude blocked work
 - one step that emits `autoflow_outcome_v1`
 - `dispatch` to `issue-to-spec-and-plan` or `phase-delivery-cycle`
 
@@ -278,7 +279,8 @@ Use when phase execution should take over immediately once the issue hits a spec
 Recommended shape:
 
 - lower priority than the controller by default
-- label-scoped selector such as `["autoflow", "phase:phase-1"]`
+- label-scoped selector such as `labels_all: ["autoflow", "phase:phase-1"]`
+- use `labels_any` for alternate readiness labels and `labels_none` to exclude pause labels such as `blocked`
 - final step emits `autoflow_outcome_v1`
 - handoff can dispatch back to the controller after the phase is ready
 

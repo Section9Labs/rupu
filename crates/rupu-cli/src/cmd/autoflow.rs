@@ -276,6 +276,18 @@ async fn show(name: &str) -> anyhow::Result<()> {
             autoflow.selector.labels_all.join(",")
         );
     }
+    if !autoflow.selector.labels_any.is_empty() {
+        println!(
+            "selector labels_any: {}",
+            autoflow.selector.labels_any.join(",")
+        );
+    }
+    if !autoflow.selector.labels_none.is_empty() {
+        println!(
+            "selector labels_none: {}",
+            autoflow.selector.labels_none.join(",")
+        );
+    }
     if let Some(limit) = autoflow.selector.limit {
         println!("selector limit: {limit}");
     }
@@ -1776,6 +1788,9 @@ fn build_issue_filter(autoflow: &rupu_orchestrator::Autoflow) -> IssueFilter {
         [rupu_orchestrator::AutoflowIssueState::Closed] => Some(IssueState::Closed),
         _ => None,
     };
+    // The SCM issue connectors only support a conjunctive label filter,
+    // so keep using `labels_all` as the server-side narrowing set and
+    // apply `labels_any` / `labels_none` client-side in `selector_matches`.
     IssueFilter {
         state,
         labels: autoflow.selector.labels_all.clone(),
@@ -1802,11 +1817,32 @@ fn selector_matches(autoflow: &rupu_orchestrator::Autoflow, issue: &Issue) -> bo
             return false;
         }
     }
-    autoflow
+    if !autoflow
         .selector
         .labels_all
         .iter()
         .all(|label| issue.labels.iter().any(|existing| existing == label))
+    {
+        return false;
+    }
+    if !autoflow.selector.labels_any.is_empty()
+        && !autoflow
+            .selector
+            .labels_any
+            .iter()
+            .any(|label| issue.labels.iter().any(|existing| existing == label))
+    {
+        return false;
+    }
+    if autoflow
+        .selector
+        .labels_none
+        .iter()
+        .any(|label| issue.labels.iter().any(|existing| existing == label))
+    {
+        return false;
+    }
+    true
 }
 
 async fn fetch_issue(
@@ -2396,6 +2432,51 @@ steps:
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn selector_matches_honors_labels_all_any_and_none() {
+        let workflow = Workflow::parse(
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  selector:
+    labels_all: ["autoflow"]
+    labels_any: ["bug", "urgent"]
+    labels_none: ["blocked"]
+steps:
+  - id: a
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+        )
+        .unwrap();
+        let autoflow = workflow.autoflow.as_ref().unwrap();
+        let issue = |labels: &[&str]| Issue {
+            r: IssueRef {
+                tracker: IssueTracker::Github,
+                project: "Section9Labs/rupu".into(),
+                number: 42,
+            },
+            title: "x".into(),
+            body: String::new(),
+            state: IssueState::Open,
+            labels: labels.iter().map(|label| (*label).to_string()).collect(),
+            label_colors: BTreeMap::new(),
+            author: "matt".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        assert!(selector_matches(autoflow, &issue(&["autoflow", "bug"])));
+        assert!(selector_matches(autoflow, &issue(&["autoflow", "urgent"])));
+        assert!(!selector_matches(autoflow, &issue(&["bug"])));
+        assert!(!selector_matches(autoflow, &issue(&["autoflow"])));
+        assert!(!selector_matches(
+            autoflow,
+            &issue(&["autoflow", "bug", "blocked"])
+        ));
     }
 
     #[test]

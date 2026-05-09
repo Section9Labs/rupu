@@ -34,7 +34,6 @@ fn parses_two_step_linear_workflow() {
         .unwrap()
         .contains("Propose a minimal fix"));
 }
-
 #[test]
 fn accepts_parallel_block() {
     let s = r#"
@@ -576,6 +575,8 @@ autoflow:
   selector:
     states: [open]
     labels_all: [autoflow]
+    labels_any: [bug, urgent]
+    labels_none: [blocked]
     limit: 100
   wake_on:
     - github.issue.opened
@@ -609,6 +610,8 @@ steps:
     assert!(autoflow.enabled);
     assert_eq!(autoflow.priority, 100);
     assert_eq!(autoflow.selector.labels_all, vec!["autoflow"]);
+    assert_eq!(autoflow.selector.labels_any, vec!["bug", "urgent"]);
+    assert_eq!(autoflow.selector.labels_none, vec!["blocked"]);
     assert_eq!(autoflow.reconcile_every.as_deref(), Some("10m"));
     assert_eq!(
         wf.contracts.outputs["result"].schema,
@@ -863,4 +866,3 @@ steps:
         "expected when: lint to fire, got: {err}"
     );
 }
-
