@@ -207,6 +207,7 @@ rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
 
 Expected behavior:
 
+- if the issue already has a live or blocked claim, the manual run fails fast instead of stealing ownership
 - if the spec or plan is missing, dispatch `issue-to-spec-and-plan`
 - if phase `phase-1` is ready, dispatch `phase-delivery-cycle`
 - if a PR is waiting on human merge, return `await_external`

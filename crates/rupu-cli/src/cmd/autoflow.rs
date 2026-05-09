@@ -381,10 +381,11 @@ async fn run(
     let resolved = resolve_autoflow_workflow_for_repo(&global, &repo_store, &repo_ref, name)?;
     let _ =
         resolve_autoflow_permission_mode(mode, resolved.cfg.autoflow.permission_mode.as_deref())?;
-    let issue = fetch_issue(&resolved.cfg, resolver.as_ref(), &issue_ref).await?;
     let claim_store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
+    ensure_manual_run_can_take_claim(&claim_store, &issue_ref_text)?;
+    let issue = fetch_issue(&resolved.cfg, resolver.as_ref(), &issue_ref).await?;
     execute_autoflow_cycle(
         &global,
         &claim_store,
@@ -402,6 +403,38 @@ async fn run(
         }],
     )
     .await
+}
+
+fn ensure_manual_run_can_take_claim(
+    claim_store: &AutoflowClaimStore,
+    issue_ref_text: &str,
+) -> anyhow::Result<()> {
+    let Some(claim) = claim_store.load(issue_ref_text)? else {
+        return Ok(());
+    };
+    if matches!(claim.status, ClaimStatus::Complete | ClaimStatus::Released) {
+        return Ok(());
+    }
+    if claim.status == ClaimStatus::Blocked {
+        bail!(
+            "issue `{issue_ref_text}` has a blocked autoflow claim for workflow `{}`; release it first with `rupu autoflow release {issue_ref_text}`",
+            claim.workflow
+        );
+    }
+    if claim_store.read_active_lock(issue_ref_text)?.is_some() {
+        bail!(
+            "issue `{issue_ref_text}` already has an active autoflow cycle for workflow `{}`",
+            claim.workflow
+        );
+    }
+    if !claim_lease_expired(&claim)? {
+        bail!(
+            "issue `{issue_ref_text}` already has an owned autoflow claim for workflow `{}` with status `{}`; wait for it, run `rupu autoflow tick`, or release it first",
+            claim.workflow,
+            status_name(claim.status)
+        );
+    }
+    Ok(())
 }
 
 async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Result<()> {
@@ -2816,6 +2849,110 @@ steps:
             err.to_string()
                 .contains("invalid autoflow permission mode `admin`")
         );
+    }
+
+    #[test]
+    fn manual_run_rejects_owned_non_terminal_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowClaimStore {
+            root: tmp.path().join("claims"),
+        };
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        store
+            .save(&AutoflowClaimRecord {
+                issue_ref: issue_ref.into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "controller".into(),
+                status: ClaimStatus::AwaitExternal,
+                worktree_path: None,
+                branch: None,
+                last_run_id: None,
+                last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                ),
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let err = ensure_manual_run_can_take_claim(&store, issue_ref).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("already has an owned autoflow claim")
+        );
+    }
+
+    #[test]
+    fn manual_run_allows_expired_claim_takeover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowClaimStore {
+            root: tmp.path().join("claims"),
+        };
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        store
+            .save(&AutoflowClaimRecord {
+                issue_ref: issue_ref.into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "controller".into(),
+                status: ClaimStatus::AwaitExternal,
+                worktree_path: None,
+                branch: None,
+                last_run_id: None,
+                last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some("2000-01-01T00:00:00Z".into()),
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        ensure_manual_run_can_take_claim(&store, issue_ref).unwrap();
+    }
+
+    #[test]
+    fn manual_run_rejects_blocked_claim_until_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowClaimStore {
+            root: tmp.path().join("claims"),
+        };
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        store
+            .save(&AutoflowClaimRecord {
+                issue_ref: issue_ref.into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "controller".into(),
+                status: ClaimStatus::Blocked,
+                worktree_path: None,
+                branch: None,
+                last_run_id: None,
+                last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some("2000-01-01T00:00:00Z".into()),
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let err = ensure_manual_run_can_take_claim(&store, issue_ref).unwrap_err();
+        assert!(err.to_string().contains("blocked autoflow claim"));
+        assert!(err.to_string().contains("rupu autoflow release"));
     }
 
     #[test]

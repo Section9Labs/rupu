@@ -715,6 +715,136 @@ steps:
 }
 
 #[tokio::test]
+async fn autoflow_run_rejects_existing_owned_claim() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(project.path(), "git@github.com:Section9Labs/rupu.git");
+    write_agent_and_workflow(
+        &project,
+        "auto-wf",
+        r#"name: auto-wf
+autoflow:
+  enabled: true
+steps:
+  - id: a
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    track_repo(&home, "github:Section9Labs/rupu", project.path());
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.path().join("autoflows/claims"),
+    };
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: "github:Section9Labs/rupu/issues/42".into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "controller".into(),
+            status: rupu_workspace::ClaimStatus::AwaitExternal,
+            worktree_path: Some("/tmp/rupu/issue-42".into()),
+            branch: None,
+            last_run_id: None,
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_current_dir(project.path()).unwrap();
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "autoflow".into(),
+        "run".into(),
+        "auto-wf".into(),
+        "github:Section9Labs/rupu/issues/42".into(),
+    ])
+    .await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_HOME");
+
+    assert_ne!(exit, std::process::ExitCode::from(0));
+}
+
+#[tokio::test]
+async fn autoflow_run_rejects_blocked_claim_until_release() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(project.path(), "git@github.com:Section9Labs/rupu.git");
+    write_agent_and_workflow(
+        &project,
+        "auto-wf",
+        r#"name: auto-wf
+autoflow:
+  enabled: true
+steps:
+  - id: a
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    track_repo(&home, "github:Section9Labs/rupu", project.path());
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.path().join("autoflows/claims"),
+    };
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: "github:Section9Labs/rupu/issues/42".into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "controller".into(),
+            status: rupu_workspace::ClaimStatus::Blocked,
+            worktree_path: Some("/tmp/rupu/issue-42".into()),
+            branch: None,
+            last_run_id: None,
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: Some("2000-01-01T00:00:00Z".into()),
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_current_dir(project.path()).unwrap();
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "autoflow".into(),
+        "run".into(),
+        "auto-wf".into(),
+        "github:Section9Labs/rupu/issues/42".into(),
+    ])
+    .await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_HOME");
+
+    assert_ne!(exit, std::process::ExitCode::from(0));
+}
+
+#[tokio::test]
 async fn autoflow_release_deletes_claim() {
     let _guard = ENV_LOCK.lock().await;
 

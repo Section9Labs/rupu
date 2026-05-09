@@ -217,6 +217,8 @@ rupu autoflow claims --repo github:your-org/your-repo
 
 `rupu autoflow list`, `show`, `status`, and `claims` inspect tracked repos, not just the current working directory. Use `rupu repos attach` first if you want to inspect autoflows from outside a checkout, and pass `--repo` when you want to narrow output to one tracked repo.
 
+`rupu autoflow run ...` does not steal a live or blocked claim from another autoflow cycle. If the issue is already owned, let `rupu autoflow tick` reconcile it or release the claim first.
+
 ---
 
 ## Targets and execution context
