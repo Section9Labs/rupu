@@ -1,20 +1,21 @@
 //! `rupu autoflow ...` — manual/autonomous workflow entrypoints.
 
+use super::autoflow_wake::drain_webhook_wake_events;
 use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::workflow::{
-    ExplicitWorkflowRunContext, locate_workflow_in, run_with_explicit_context,
+    locate_workflow_in, run_with_explicit_context, ExplicitWorkflowRunContext,
 };
 use crate::paths;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
 use jsonschema::JSONSchema;
 use rupu_auth::{CredentialResolver, KeychainResolver};
 use rupu_config::{AutoflowCheckout, Config};
-use rupu_orchestrator::templates::{RenderMode, StepContext, render_step_prompt};
+use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
     WorkflowOutputContract,
@@ -23,8 +24,8 @@ use rupu_scm::{
     Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
 };
 use rupu_workspace::{
-    AutoflowClaimRecord, AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch,
-    RepoRegistryStore, ensure_issue_worktree, issue_dir_name, remove_issue_worktree,
+    ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
+    AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -164,6 +165,7 @@ struct WakeHints {
     by_issue: BTreeMap<String, BTreeSet<String>>,
     by_repo: BTreeMap<String, BTreeSet<String>>,
     total_polled_events: usize,
+    total_webhook_events: usize,
 }
 
 impl WakeHints {
@@ -453,12 +455,12 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
             println!("(no autoflows)");
         } else {
             println!(
-                "autoflow tick: 0 workflow(s), 0 polled event(s), 0 cycle(s) ran, 0 skipped, {cleaned} cleaned"
+                "autoflow tick: 0 workflow(s), 0 polled event(s), 0 webhook event(s), 0 cycle(s) ran, 0 skipped, {cleaned} cleaned"
             );
         }
         return Ok(());
     }
-    let wake_hints = collect_polled_wake_hints(&global, &discovered, resolver.as_ref())
+    let wake_hints = collect_wake_hints(&global, &discovered, resolver.as_ref())
         .await
         .context("collect autoflow wake hints")?;
 
@@ -744,9 +746,10 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
     }
 
     println!(
-        "autoflow tick: {} workflow(s), {} polled event(s), {} cycle(s) ran, {} skipped, {} failed, {} cleaned",
+        "autoflow tick: {} workflow(s), {} polled event(s), {} webhook event(s), {} cycle(s) ran, {} skipped, {} failed, {} cleaned",
         discovered.len(),
         wake_hints.total_polled_events,
+        wake_hints.total_webhook_events,
         ran,
         skipped,
         failed,
@@ -1119,6 +1122,31 @@ fn discover_tick_autoflows(
     Ok(out)
 }
 
+async fn collect_wake_hints(
+    global: &Path,
+    discovered: &[ResolvedAutoflowWorkflow],
+    resolver: &dyn CredentialResolver,
+) -> anyhow::Result<WakeHints> {
+    let mut wake_hints = collect_polled_wake_hints(global, discovered, resolver).await?;
+    let webhook_events = collect_webhook_wake_events(global, discovered)?;
+    for event in webhook_events {
+        wake_hints.total_webhook_events += 1;
+        wake_hints
+            .by_repo
+            .entry(event.repo_ref.clone())
+            .or_default()
+            .insert(event.event_id.clone());
+        if let Some(issue_ref) = event.issue_ref {
+            wake_hints
+                .by_issue
+                .entry(issue_ref)
+                .or_default()
+                .insert(event.event_id);
+        }
+    }
+    Ok(wake_hints)
+}
+
 async fn collect_polled_wake_hints(
     global: &Path,
     discovered: &[ResolvedAutoflowWorkflow],
@@ -1183,6 +1211,24 @@ async fn collect_polled_wake_hints(
     }
 
     Ok(wake_hints)
+}
+
+fn collect_webhook_wake_events(
+    global: &Path,
+    discovered: &[ResolvedAutoflowWorkflow],
+) -> anyhow::Result<Vec<super::autoflow_wake::StoredWebhookWakeEvent>> {
+    let mut repo_refs = BTreeSet::new();
+    for resolved in discovered {
+        if resolved.autoflow()?.wake_on.is_empty() {
+            continue;
+        }
+        repo_refs.insert(resolved.repo_ref.clone());
+    }
+    if repo_refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root = paths::autoflow_webhook_events_dir(global);
+    drain_webhook_wake_events(&root, &repo_refs)
 }
 
 async fn collect_issue_matches(
@@ -2481,10 +2527,11 @@ fn format_contenders(contenders: &[AutoflowContender]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::autoflow_wake;
     use httpmock::Method::GET;
     use httpmock::MockServer;
-    use rupu_auth::StoredCredential;
     use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::StoredCredential;
     use rupu_orchestrator::{RunRecord, StepKind, StepResultRecord};
     use rupu_providers::AuthMode;
     use std::io::Write;
@@ -2505,62 +2552,50 @@ mod tests {
 
     fn init_git_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("init")
-                .arg("-b")
-                .arg("main")
-                .arg(path)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["config", "user.email", "test@example.com"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["config", "user.name", "Test User"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["config", "commit.gpgsign", "false"])
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(std::process::Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "commit.gpgsign", "false"])
+            .status()
+            .unwrap()
+            .success());
         std::fs::write(path.join("README.md"), "hello\n").unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["add", "README.md"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["commit", "-m", "init"])
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap()
+            .success());
     }
 
     fn write_autoflow_project(
@@ -2737,26 +2772,22 @@ steps:
             root: tmp.path().join("claims"),
         };
 
-        assert!(
-            should_run_claim(
-                &claim,
-                &resolved,
-                &store,
-                chrono::Utc::now(),
-                &BTreeSet::from(["github.issue.labeled".to_string()]),
-            )
-            .unwrap()
-        );
-        assert!(
-            !should_run_claim(
-                &claim,
-                &resolved,
-                &store,
-                chrono::Utc::now(),
-                &BTreeSet::new()
-            )
-            .unwrap()
-        );
+        assert!(should_run_claim(
+            &claim,
+            &resolved,
+            &store,
+            chrono::Utc::now(),
+            &BTreeSet::from(["github.issue.labeled".to_string()]),
+        )
+        .unwrap());
+        assert!(!should_run_claim(
+            &claim,
+            &resolved,
+            &store,
+            chrono::Utc::now(),
+            &BTreeSet::new()
+        )
+        .unwrap());
     }
 
     #[test]
@@ -2863,37 +2894,33 @@ steps:
     #[test]
     fn autoflow_permission_mode_rejects_ask_override() {
         let err = resolve_autoflow_permission_mode(Some("ask"), Some("bypass")).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("autoflow does not support `ask` permission mode")
-        );
+        assert!(err
+            .to_string()
+            .contains("autoflow does not support `ask` permission mode"));
     }
 
     #[test]
     fn autoflow_permission_mode_rejects_ask_config() {
         let err = resolve_autoflow_permission_mode(None, Some("ask")).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("autoflow does not support `ask` permission mode")
-        );
+        assert!(err
+            .to_string()
+            .contains("autoflow does not support `ask` permission mode"));
     }
 
     #[test]
     fn autoflow_permission_mode_rejects_unknown_override() {
         let err = resolve_autoflow_permission_mode(Some("admin"), Some("bypass")).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("invalid autoflow permission mode `admin`")
-        );
+        assert!(err
+            .to_string()
+            .contains("invalid autoflow permission mode `admin`"));
     }
 
     #[test]
     fn autoflow_permission_mode_rejects_unknown_config() {
         let err = resolve_autoflow_permission_mode(None, Some("admin")).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("invalid autoflow permission mode `admin`")
-        );
+        assert!(err
+            .to_string()
+            .contains("invalid autoflow permission mode `admin`"));
     }
 
     #[test]
@@ -2928,10 +2955,9 @@ steps:
             .unwrap();
 
         let err = ensure_manual_run_can_take_claim(&store, issue_ref).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("already has an owned autoflow claim")
-        );
+        assert!(err
+            .to_string()
+            .contains("already has an owned autoflow claim"));
     }
 
     #[test]
@@ -3940,13 +3966,11 @@ steps:
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
-        assert!(
-            claim
-                .worktree_path
-                .as_deref()
-                .unwrap()
-                .contains("issue-123")
-        );
+        assert!(claim
+            .worktree_path
+            .as_deref()
+            .unwrap()
+            .contains("issue-123"));
     }
 
     #[tokio::test]
@@ -4295,6 +4319,156 @@ steps:
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn tick_uses_webhook_wake_events_to_resume_await_external_claims() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let issues_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issues_body);
+        });
+        let issue_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issue_get_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues/123");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issue_body.clone());
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  wake_on:
+    - github.issue.labeled
+  reconcile_every: "1d"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: "github:Section9Labs/rupu/issues/123".into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "issue-supervisor-dispatch".into(),
+                status: ClaimStatus::AwaitExternal,
+                worktree_path: Some(project.display().to_string()),
+                branch: Some("rupu/issue-123".into()),
+                last_run_id: None,
+                last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
+                ),
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        autoflow_wake::store_webhook_wake_event(
+            &paths::autoflow_webhook_events_dir(&global),
+            &autoflow_wake::StoredWebhookWakeEvent {
+                delivery: "delivery-123".into(),
+                event_id: "github.issue.labeled".into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                issue_ref: Some("github:Section9Labs/rupu/issues/123".into()),
+                received_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        tick_with_resolver(resolver).await.unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let claim = claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.status, ClaimStatus::Complete);
+        assert!(claim.last_run_id.is_some());
+        let repo_queue_dir = paths::autoflow_webhook_events_dir(&global)
+            .join(rupu_workspace::repo_dir_name("github:Section9Labs/rupu"));
+        assert!(std::fs::read_dir(repo_queue_dir).unwrap().next().is_none());
     }
 
     #[tokio::test]
@@ -4996,13 +5170,11 @@ steps:
             .unwrap()
             .unwrap();
         assert_eq!(bad_claim.status, ClaimStatus::Blocked);
-        assert!(
-            bad_claim
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("output failed schema")
-        );
+        assert!(bad_claim
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("output failed schema"));
         assert_eq!(good_claim.status, ClaimStatus::Complete);
         assert!(good_claim.last_run_id.is_some());
     }

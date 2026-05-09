@@ -67,6 +67,11 @@ pub fn autoflow_event_cursors_dir(global: &Path) -> PathBuf {
     autoflows_dir(global).join("event-cursors")
 }
 
+/// Global queued webhook wake-event directory.
+pub fn autoflow_webhook_events_dir(global: &Path) -> PathBuf {
+    autoflows_dir(global).join("webhook-events")
+}
+
 /// Convenience: ensure a directory exists. Used to lazily create
 /// `~/.rupu/cache/`, `~/.rupu/transcripts/`, etc. on first use.
 pub fn ensure_dir(p: &Path) -> Result<()> {

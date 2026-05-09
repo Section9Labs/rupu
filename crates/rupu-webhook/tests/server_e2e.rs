@@ -83,6 +83,7 @@ async fn signed_pr_opened_dispatches_matching_workflow() {
         gitlab_token: None,
         workflow_loader: Arc::new(move || workflows.clone()),
         dispatcher: dispatcher_handle,
+        observer: None,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config).await;
@@ -145,6 +146,7 @@ async fn unsigned_request_returns_401() {
         gitlab_token: None,
         workflow_loader: Arc::new(move || workflows.clone()),
         dispatcher,
+        observer: None,
     };
     let server = tokio::spawn(async move {
         let _ = serve(config).await;

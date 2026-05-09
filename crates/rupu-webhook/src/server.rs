@@ -13,6 +13,7 @@
 use crate::dispatch::{dispatch_event, DispatchedWorkflow, WorkflowDispatcher};
 use crate::event_vocab::{map_github_event, map_gitlab_event};
 use crate::signature::{verify_github_signature, verify_gitlab_token};
+use async_trait::async_trait;
 use axum::{
     body::Bytes,
     extract::State,
@@ -23,6 +24,7 @@ use axum::{
 };
 use rupu_orchestrator::Workflow;
 use serde::Serialize;
+use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
@@ -54,6 +56,9 @@ pub struct WebhookConfig {
     /// Dispatches a matched workflow by name. Production: thin
     /// wrapper around `cmd::workflow::run_by_name`.
     pub dispatcher: Arc<dyn WorkflowDispatcher>,
+    /// Best-effort observer for every mapped webhook delivery.
+    /// Failures are logged and do not change the HTTP response.
+    pub observer: Option<Arc<dyn WebhookObserver>>,
 }
 
 #[derive(Clone)]
@@ -62,6 +67,26 @@ struct AppState {
     gitlab_token: Option<Arc<Vec<u8>>>,
     workflow_loader: Arc<dyn Fn() -> Vec<(String, Workflow)> + Send + Sync>,
     dispatcher: Arc<dyn WorkflowDispatcher>,
+    observer: Option<Arc<dyn WebhookObserver>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookSource {
+    Github,
+    Gitlab,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebhookEvent {
+    pub source: WebhookSource,
+    pub event_id: String,
+    pub delivery_id: Option<String>,
+    pub payload: Value,
+}
+
+#[async_trait]
+pub trait WebhookObserver: Send + Sync {
+    async fn observe(&self, event: &WebhookEvent) -> anyhow::Result<()>;
 }
 
 #[derive(Serialize)]
@@ -98,6 +123,7 @@ pub async fn serve(config: WebhookConfig) -> Result<(), WebhookError> {
         gitlab_token: config.gitlab_token.map(Arc::new),
         workflow_loader: config.workflow_loader,
         dispatcher: config.dispatcher,
+        observer: config.observer,
     };
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -169,6 +195,20 @@ async fn github_handler(
         .into_response();
     };
 
+    observe_event(
+        state.observer.as_ref(),
+        WebhookEvent {
+            source: WebhookSource::Github,
+            event_id: event_id.clone(),
+            delivery_id: headers
+                .get("x-github-delivery")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            payload: payload.clone(),
+        },
+    )
+    .await;
+
     let candidates = (state.workflow_loader)();
     let fired = dispatch_event(&event_id, &payload, &candidates, state.dispatcher.as_ref()).await;
     Json(WebhookResponse {
@@ -223,6 +263,20 @@ async fn gitlab_handler(
         .into_response();
     };
 
+    observe_event(
+        state.observer.as_ref(),
+        WebhookEvent {
+            source: WebhookSource::Gitlab,
+            event_id: event_id.clone(),
+            delivery_id: headers
+                .get("x-gitlab-event-uuid")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            payload: payload.clone(),
+        },
+    )
+    .await;
+
     let candidates = (state.workflow_loader)();
     let fired = dispatch_event(&event_id, &payload, &candidates, state.dispatcher.as_ref()).await;
     Json(WebhookResponse {
@@ -230,4 +284,141 @@ async fn gitlab_handler(
         fired,
     })
     .into_response()
+}
+
+async fn observe_event(observer: Option<&Arc<dyn WebhookObserver>>, event: WebhookEvent) {
+    let Some(observer) = observer else {
+        return;
+    };
+    if let Err(error) = observer.observe(&event).await {
+        warn!(
+            event = %event.event_id,
+            source = ?event.source,
+            delivery = event.delivery_id.as_deref().unwrap_or("-"),
+            %error,
+            "webhook observer failed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::Response;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use std::sync::Mutex;
+
+    type HmacSha256 = Hmac<Sha256>;
+
+    struct NoopDispatcher;
+
+    #[async_trait]
+    impl WorkflowDispatcher for NoopDispatcher {
+        async fn dispatch(
+            &self,
+            _workflow_name: &str,
+            _event: &Value,
+        ) -> anyhow::Result<crate::dispatch::DispatchOutcome> {
+            Ok(crate::dispatch::DispatchOutcome::default())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<WebhookEvent>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl WebhookObserver for RecordingObserver {
+        async fn observe(&self, event: &WebhookEvent) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push(event.clone());
+            if self.fail {
+                anyhow::bail!("boom");
+            }
+            Ok(())
+        }
+    }
+
+    fn github_signature(secret: &[u8], body: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret).expect("hmac");
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    fn state_with_observer(observer: Arc<dyn WebhookObserver>) -> AppState {
+        AppState {
+            github_secret: Some(Arc::new(b"secret".to_vec())),
+            gitlab_token: None,
+            workflow_loader: Arc::new(|| Vec::new()),
+            dispatcher: Arc::new(NoopDispatcher),
+            observer: Some(observer),
+        }
+    }
+
+    fn response_status(response: Response) -> StatusCode {
+        response.status()
+    }
+
+    #[tokio::test]
+    async fn github_handler_notifies_observer() {
+        let observer = Arc::new(RecordingObserver::default());
+        let body = br#"{
+          "action":"labeled",
+          "issue":{"number":123},
+          "repository":{"name":"rupu","owner":{"login":"Section9Labs"}}
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "issues".parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            github_signature(b"secret", body).parse().unwrap(),
+        );
+        headers.insert("x-github-delivery", "delivery-123".parse().unwrap());
+
+        let response = github_handler(
+            State(state_with_observer(observer.clone())),
+            headers,
+            Bytes::from_static(body),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response_status(response), StatusCode::OK);
+        let events = observer.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, WebhookSource::Github);
+        assert_eq!(events[0].event_id, "github.issue.labeled");
+        assert_eq!(events[0].delivery_id.as_deref(), Some("delivery-123"));
+    }
+
+    #[tokio::test]
+    async fn observer_failure_does_not_fail_request() {
+        let observer = Arc::new(RecordingObserver {
+            events: Mutex::new(Vec::new()),
+            fail: true,
+        });
+        let body = br#"{
+          "action":"labeled",
+          "issue":{"number":123},
+          "repository":{"name":"rupu","owner":{"login":"Section9Labs"}}
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "issues".parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            github_signature(b"secret", body).parse().unwrap(),
+        );
+
+        let response = github_handler(
+            State(state_with_observer(observer)),
+            headers,
+            Bytes::from_static(body),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response_status(response), StatusCode::OK);
+    }
 }
