@@ -234,6 +234,26 @@ async fn show(name: &str) -> anyhow::Result<()> {
             })
             .unwrap_or("worktree")
     );
+    if let Some(branch) = autoflow
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.branch.as_deref())
+    {
+        println!("workspace branch: {branch}");
+    }
+    if let Some(reconcile_every) = autoflow.reconcile_every.as_deref() {
+        println!("reconcile_every: {reconcile_every}");
+    }
+    if !autoflow.wake_on.is_empty() {
+        println!("wake_on: {}", autoflow.wake_on.join(","));
+    }
+    if let Some(ttl) = autoflow
+        .claim
+        .as_ref()
+        .and_then(|claim| claim.ttl.as_deref())
+    {
+        println!("claim ttl: {ttl}");
+    }
     if let Some(outcome) = &autoflow.outcome {
         println!("outcome output: {}", outcome.output);
     }
@@ -255,6 +275,9 @@ async fn show(name: &str) -> anyhow::Result<()> {
             "selector labels_all: {}",
             autoflow.selector.labels_all.join(",")
         );
+    }
+    if let Some(limit) = autoflow.selector.limit {
+        println!("selector limit: {limit}");
     }
     println!("---");
     print!("{body}");
