@@ -207,10 +207,22 @@ impl LineStreamPrinter {
     /// 3. elapsed time — auto-rendered via indicatif's `{elapsed}`.
     /// Together they read as "this step is alive and N seconds in".
     pub fn start_ticker(&mut self, message: impl Into<String>) {
-        if !self.is_tty || self.ticker.is_some() {
-            // Skip when not a TTY — no terminal to animate against.
-            // Skip when already running — `tick_with` is the path for
-            // updating the message in place.
+        if !self.is_tty {
+            // No terminal to animate against. Bail before any
+            // indicatif setup so non-TTY consumers (pipes, CI, cargo
+            // test capture) get a clean stdout stream.
+            return;
+        }
+        if let Some(pb) = &self.ticker {
+            // Already running — update the message in place rather
+            // than double-starting (which would put two bars on the
+            // bottom row). This makes `start_ticker` idempotent and
+            // lets workflow_printer keep a workflow-level ticker
+            // alive across step boundaries: per-step `start_ticker`
+            // calls update the message, then per-step `stop_ticker`
+            // tears it down at end of step, and the workflow-level
+            // poll loop re-arms it before the next sleep.
+            pb.set_message(message.into());
             return;
         }
         let pb = self.multi.add(ProgressBar::new_spinner());
@@ -1605,12 +1617,16 @@ mod tests {
     }
 
     #[test]
-    fn test_ticker_double_start_is_noop() {
+    fn test_ticker_double_start_updates_message() {
         no_color();
         let mut p = LineStreamPrinter::new();
         p.start_ticker("first message");
-        // Should NOT replace the existing ticker — `tick_with` is the
-        // path for updating the message in place.
+        // A second `start_ticker` call must NOT spawn a second
+        // indicatif bar — it should update the existing one in place.
+        // workflow_printer relies on this: it re-arms the ticker each
+        // poll iteration to keep it alive across step boundaries, and
+        // a step's own `start_ticker(running step1…)` overrides the
+        // workflow-level message without spawning a second bar.
         p.start_ticker("second message");
         p.stop_ticker();
     }
