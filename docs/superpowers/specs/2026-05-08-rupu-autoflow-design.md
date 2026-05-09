@@ -1,5 +1,7 @@
 # rupu Autoflows — Design
 
+> **Status (2026-05-09):** The v1 design in this document is implemented on `main` through the merged autoflow phase series ending at PR `#147`. The section below now tracks genuine post-v1 follow-ons, not unresolved v1 blockers.
+
 **Date:** 2026-05-08
 **Status:** Design (pre-plan)
 **Companion docs:** [Slice A design](./2026-05-01-rupu-slice-a-design.md), [Slice B-2 design](./2026-05-03-rupu-slice-b2-scm-design.md), [Workflow triggers design](./2026-05-07-rupu-workflow-triggers-design.md)
@@ -1015,12 +1017,11 @@ This design is correct if:
 7. the architecture does not create a second step DSL or a second run engine
 8. multiple matching autoflows resolve ownership deterministically via `priority`, then workflow name
 
-## 24. Open follow-on items
+## 24. Post-v1 follow-on items
 
-- exact Rust config structs for `[autoflow]`
-- exact claim-lock format and locking strategy
-- exact `autoflow_outcome_v1` schema contents
-- exact repo registry command surface under `rupu repos` (`attach`, `prefer`, `tracked`, `forget`)
-- optional `autoflow serve`
+- optional `rupu autoflow serve` as a long-lived wrapper over the existing `tick` engine
+- webhook replay protection / delivery dedup in `rupu-webhook`
+- richer operator observability for wake sources, queued webhook hints, claim transitions, and backoff state
+- deeper repair tooling for stuck claims / worktrees beyond `status`, `claims`, and `release`
 
-Those belong in the implementation plan, not this design.
+These are improvements on top of the implemented v1 design above, not blockers for it.
