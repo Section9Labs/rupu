@@ -127,14 +127,24 @@ Status:
 
 Slice B-1 captures `Event::Usage` per response in JSONL transcripts. A `rupu usage` subcommand would aggregate across transcripts (per-day, per-agent, per-provider) for cost visibility. Deferred to Slice D so the same aggregator can also power the SaaS dashboard rather than building two implementations.
 
-## Autoflow post-v1 backlog
+## Autoflow Plan 2 — portable runtime and serve mode
 
-Autoflow v1 is implemented on `main` through the merged phase series ending at PR `#147`. The remaining work is incremental rather than foundational:
+Has its own design spec: [`docs/superpowers/specs/2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md`](docs/superpowers/specs/2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md) and implementation plan: [`docs/superpowers/plans/2026-05-09-rupu-autoflow-plan-2-portable-runtime-and-serve.md`](docs/superpowers/plans/2026-05-09-rupu-autoflow-plan-2-portable-runtime-and-serve.md).
 
-- **Optional `rupu autoflow serve`.** Keep the current `tick` engine as the source of truth; if a long-lived mode lands, it should just wrap that engine rather than inventing new state semantics.
-- **Webhook replay protection / delivery dedup.** `rupu webhook serve` now feeds exact workflow dispatch + autoflow wake hints, but it still does not persist vendor delivery ids for replay defense.
-- **Richer autoflow observability.** Add better operator-facing visibility for wake sources, queued webhook hints, claim transitions, retry timers, and why a given issue was or was not run on a tick.
-- **Claim/worktree repair tooling.** `rupu autoflow release` is enough for v1, but a future `doctor` / `repair` surface for stuck claims and damaged worktrees would improve operator recovery.
+**Status:** Design + implementation plan ready.
+
+**Scope:**
+- `rupu autoflow serve` built on the same reconciliation engine as `tick`
+- normalized wake queue with replay protection / delivery dedupe
+- versioned `RunEnvelope`, `WakeRecord`, `ArtifactManifest`, and `WorkerRecord`
+- execution backend boundary with `local_worktree` as the first backend
+- richer operator tooling (`wakes`, `explain`, `doctor`, `repair`, `requeue`)
+
+**Post-Plan-2 backlog (future Slice E consumers):**
+- cloud control plane / remote API implementation
+- cloud worker backend
+- registered local worker dispatch from `rupu.cloud`
+- object-storage-backed artifact transport
 
 ## Gemini API-key support via AI Studio ✅ shipped
 

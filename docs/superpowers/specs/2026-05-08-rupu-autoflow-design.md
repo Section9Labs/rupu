@@ -1019,6 +1019,11 @@ This design is correct if:
 
 ## 24. Post-v1 follow-on items
 
+The next major follow-on is now captured in:
+
+- [`docs/superpowers/specs/2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md`](2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md)
+- [`docs/superpowers/plans/2026-05-09-rupu-autoflow-plan-2-portable-runtime-and-serve.md`](../plans/2026-05-09-rupu-autoflow-plan-2-portable-runtime-and-serve.md)
+
 - optional `rupu autoflow serve` as a long-lived wrapper over the existing `tick` engine
 - webhook replay protection / delivery dedup in `rupu-webhook`
 - richer operator observability for wake sources, queued webhook hints, claim transitions, and backoff state
