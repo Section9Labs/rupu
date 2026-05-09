@@ -43,6 +43,14 @@ pub struct RunSummary {
     pub total_tokens: u64,
     pub duration_ms: u64,
     pub error: Option<String>,
+    /// First non-empty `AssistantMessage` content, retained verbatim
+    /// (no truncation in the summary — callers decide presentation
+    /// width). Used by `rupu transcript list` to render a one-line
+    /// preview as a title alongside the otherwise opaque `run_id`.
+    /// `None` when the run aborted before any assistant output (rare;
+    /// most aborted runs still emit at least one chunk before the
+    /// abort).
+    pub first_assistant_text: Option<String>,
 }
 
 pub struct JsonlReader;
@@ -55,12 +63,18 @@ impl JsonlReader {
     pub fn summary(path: impl AsRef<Path>) -> Result<RunSummary, ReadError> {
         let mut start: Option<Event> = None;
         let mut complete: Option<Event> = None;
+        let mut first_assistant: Option<String> = None;
 
         let mut last_io_err: Option<std::io::Error> = None;
         for ev in Self::iter(path)? {
             match ev {
                 Ok(e @ Event::RunStart { .. }) if start.is_none() => start = Some(e),
                 Ok(e @ Event::RunComplete { .. }) => complete = Some(e),
+                Ok(Event::AssistantMessage { content, .. }) if first_assistant.is_none() => {
+                    if !content.trim().is_empty() {
+                        first_assistant = Some(content);
+                    }
+                }
                 Ok(_) => {}
                 // Track IO errors so we can surface them if no RunStart was found
                 // (concatenated/truncated runs are expected; permission denied is not).
@@ -111,6 +125,7 @@ impl JsonlReader {
             total_tokens,
             duration_ms,
             error,
+            first_assistant_text: first_assistant,
         })
     }
 
