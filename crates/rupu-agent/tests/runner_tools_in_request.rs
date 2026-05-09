@@ -52,8 +52,8 @@ async fn run_passes_all_default_tools_to_provider() {
     let tools = &requests[0].tools;
     assert_eq!(
         tools.len(),
-        7,
-        "expected 7 default tools (6 v0 + dispatch_agent), got {}",
+        8,
+        "expected 8 default tools (6 v0 + dispatch_agent + dispatch_agents_parallel), got {}",
         tools.len()
     );
 
@@ -64,6 +64,7 @@ async fn run_passes_all_default_tools_to_provider() {
         vec![
             "bash",
             "dispatch_agent",
+            "dispatch_agents_parallel",
             "edit_file",
             "glob",
             "grep",

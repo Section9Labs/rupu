@@ -32,9 +32,12 @@ pub mod glob;
 pub mod bash;
 // sub-agent dispatch (spec 2026-05-08): single-child synchronous.
 pub mod dispatch_agent;
+// sub-agent dispatch (spec 2026-05-08): fan-out parallel.
+pub mod dispatch_agents_parallel;
 
 pub use bash::BashTool;
 pub use dispatch_agent::DispatchAgentTool;
+pub use dispatch_agents_parallel::DispatchAgentsParallelTool;
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
