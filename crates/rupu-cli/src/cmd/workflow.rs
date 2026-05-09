@@ -763,6 +763,17 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
     let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
 
     let mode_str = mode.unwrap_or("ask").to_string();
+    let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
+        global.clone(),
+        project_root.clone(),
+        record.workspace_id.clone(),
+        workspace_path.clone(),
+        Arc::clone(&resolver),
+        mode_str.clone(),
+        Arc::clone(&mcp_registry),
+        Arc::clone(&store),
+    );
+    let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
     let factory = Arc::new(CliStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
@@ -771,9 +782,7 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         mode_str,
         mcp_registry,
         system_prompt_suffix: None,
-        // dispatcher is wired below by `with_dispatcher` once the
-        // run-store-backed OrchestratorDispatcher is constructed.
-        dispatcher: None,
+        dispatcher: Some(dispatcher_dyn),
     });
 
     let resume = rupu_orchestrator::ResumeState {
@@ -1196,6 +1205,25 @@ async fn execute_workflow_invocation(
     let issue_ref_text_for_notify = ctx.issue_ref.clone();
     let issue_payload_for_notify = ctx.issue.clone();
 
+    // Run-store first so the dispatcher can be constructed alongside the
+    // factory and threaded onto every step's `ToolContext`.
+    let inputs_map: BTreeMap<String, String> = ctx.inputs.into_iter().collect();
+    let runs_dir = global.join("runs");
+    paths::ensure_dir(&runs_dir)?;
+    let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir.clone()));
+
+    let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
+        global.clone(),
+        ctx.project_root.clone(),
+        ctx.workspace_id.clone(),
+        ctx.workspace_path.clone(),
+        Arc::clone(&resolver),
+        ctx.mode.clone(),
+        Arc::clone(&mcp_registry),
+        Arc::clone(&run_store),
+    );
+    let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+
     let factory = Arc::new(CliStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
@@ -1204,15 +1232,8 @@ async fn execute_workflow_invocation(
         mode_str: ctx.mode.clone(),
         mcp_registry,
         system_prompt_suffix: ctx.system_prompt_suffix.clone(),
-        // dispatcher is wired below by `with_dispatcher` once the
-        // OrchestratorDispatcher is constructed.
-        dispatcher: None,
+        dispatcher: Some(dispatcher_dyn),
     });
-
-    let inputs_map: BTreeMap<String, String> = ctx.inputs.into_iter().collect();
-    let runs_dir = global.join("runs");
-    paths::ensure_dir(&runs_dir)?;
-    let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir.clone()));
 
     let workflow_for_resume = workflow.clone();
     let workspace_path_for_resume = ctx.workspace_path.clone();

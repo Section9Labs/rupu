@@ -12,7 +12,7 @@ pub use replay::ReplaySource;
 #[derive(Debug, Clone)]
 pub enum SourceEvent {
     StepEvent { step_id: String, event: Event },
-    RunUpdate(RunRecord),
+    RunUpdate(Box<RunRecord>),
     Tick,
 }
 

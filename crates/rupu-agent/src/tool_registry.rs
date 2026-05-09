@@ -4,7 +4,10 @@
 //! The default registry contains the six v0 tools; agents can opt
 //! into a subset via the frontmatter `tools:` list ([`Self::filter_to`]).
 
-use rupu_tools::{BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, Tool, WriteFileTool};
+use rupu_tools::{
+    BashTool, DispatchAgentTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, Tool,
+    WriteFileTool,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -68,7 +71,7 @@ impl Default for ToolRegistry {
     }
 }
 
-/// All six v0 tools wired up.
+/// All v0 tools + sub-agent dispatch wired up.
 pub fn default_tool_registry() -> ToolRegistry {
     let mut r = ToolRegistry::new();
     r.insert("bash", Arc::new(BashTool));
@@ -77,5 +80,6 @@ pub fn default_tool_registry() -> ToolRegistry {
     r.insert("edit_file", Arc::new(EditFileTool));
     r.insert("grep", Arc::new(GrepTool));
     r.insert("glob", Arc::new(GlobTool));
+    r.insert("dispatch_agent", Arc::new(DispatchAgentTool));
     r
 }

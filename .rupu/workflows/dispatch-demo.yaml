@@ -1,0 +1,18 @@
+name: dispatch-demo
+description: Demonstrates sub-agent dispatch — a `writer-with-reviewers` parent dispatches specialist reviewers mid-draft. Run with `--mode bypass` to skip per-tool prompts.
+inputs:
+  subject:
+    type: string
+    required: true
+    description: A file path or short description of the code to review.
+steps:
+  - id: review
+    agent: writer-with-reviewers
+    actions: []
+    prompt: |
+      Review {{ inputs.subject }}.
+
+      Steps:
+      1. Read the relevant code into context.
+      2. Dispatch the security-reviewer and (if relevant) the perf-reviewer.
+      3. Aggregate their findings into a single short summary, ordered by severity.

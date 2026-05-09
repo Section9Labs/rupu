@@ -21,7 +21,7 @@
 use super::{printer::LineStreamPrinter, SpinnerHandle, TranscriptTailer};
 use rupu_orchestrator::{FindingRecord, ItemResultRecord, StepKind, StepResultRecord};
 use rupu_transcript::Event as TxEvent;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -41,6 +41,13 @@ struct StepState {
     provider: Option<String>,
     model: Option<String>,
     spinner: Option<SpinnerHandle>,
+    /// In-flight `dispatch_agent` tool calls keyed by `call_id`. The
+    /// `ToolCall` event seeds the entry with the requested agent name;
+    /// the matching `ToolResult` consumes it and renders the child
+    /// callout from the persisted child transcript. Other tool calls
+    /// (bash, read_file, …) bypass this map and use the existing
+    /// `printer.tool_call` summary line.
+    dispatches: BTreeMap<String, String>,
 }
 
 /// What `attach_and_print` returned. The caller decides what to do next:
@@ -376,6 +383,7 @@ fn drain_step_results(
                     provider: None,
                     model: None,
                     spinner: Some(spinner),
+                    dispatches: BTreeMap::new(),
                 });
             }
         }
@@ -606,9 +614,33 @@ fn process_event(
         TxEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
             printer.assistant_chunk(&content);
         }
-        TxEvent::ToolCall { tool, input, .. } => {
-            let summary = summarize_tool_input(&tool, &input);
-            printer.tool_call(&tool, &summary);
+        TxEvent::ToolCall {
+            call_id,
+            tool,
+            input,
+        } => {
+            if tool == "dispatch_agent" {
+                // Record the in-flight dispatch so the matching
+                // ToolResult can replay the child as a nested frame.
+                // Don't emit a `dispatch_agent <agent>` summary line —
+                // the child callout itself is the rendering.
+                let agent = input
+                    .get("agent")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                step.dispatches.insert(call_id, agent);
+            } else {
+                let summary = summarize_tool_input(&tool, &input);
+                printer.tool_call(&tool, &summary);
+            }
+        }
+        TxEvent::ToolResult {
+            call_id, output, ..
+        } => {
+            if let Some(agent_name) = step.dispatches.remove(&call_id) {
+                render_dispatch_child(&agent_name, &output, printer);
+            }
         }
         TxEvent::RunComplete {
             status,
@@ -634,6 +666,75 @@ fn process_event(
         }
         _ => {}
     }
+}
+
+/// Render a `dispatch_agent` child as an indent+1 callout under the
+/// parent's frame. The child transcript is fully written by the time
+/// the parent's `ToolResult` arrives (synchronous-replay model — the
+/// runner only emits ToolResult after `run_agent` returns), so we open
+/// a tailer and drain everything inline rather than streaming.
+///
+/// `output` is the JSON payload from the `dispatch_agent` tool: see
+/// `crates/rupu-tools/src/dispatch_agent.rs` for the shape. We need
+/// `transcript_path`, `tokens_used`, and `duration_ms` from it; if any
+/// are missing or the file isn't on disk yet we degrade to a
+/// header+immediate footer so the parent's stream stays coherent.
+fn render_dispatch_child(agent_name: &str, output: &str, printer: &mut LineStreamPrinter) {
+    let parsed: serde_json::Value = match serde_json::from_str(output) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let transcript_path = parsed["transcript_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let tokens_used = parsed["tokens_used"].as_u64().unwrap_or(0);
+    let duration_ms = parsed["duration_ms"].as_u64().unwrap_or(0);
+    let success = parsed["ok"].as_bool().unwrap_or(true);
+
+    let events: Vec<TxEvent> = if !transcript_path.as_os_str().is_empty() && transcript_path.exists()
+    {
+        TranscriptTailer::new(&transcript_path).drain()
+    } else {
+        Vec::new()
+    };
+
+    let (provider, model) = events
+        .iter()
+        .find_map(|e| match e {
+            TxEvent::RunStart {
+                provider, model, ..
+            } => Some((provider.clone(), model.clone())),
+            _ => None,
+        })
+        .unwrap_or((String::new(), String::new()));
+
+    printer.push_indent();
+    let spinner = printer.step_start(
+        agent_name,
+        Some(agent_name),
+        non_empty(&provider),
+        non_empty(&model),
+    );
+    for ev in events {
+        match ev {
+            TxEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
+                printer.assistant_chunk(&content);
+            }
+            TxEvent::ToolCall { tool, input, .. } => {
+                let summary = summarize_tool_input(&tool, &input);
+                printer.tool_call(&tool, &summary);
+            }
+            _ => {}
+        }
+    }
+    spinner.stop();
+    if success {
+        printer.step_done(agent_name, Duration::from_millis(duration_ms), tokens_used);
+    } else {
+        printer.step_failed(agent_name, "dispatch failed");
+    }
+    printer.pop_indent();
 }
 
 fn flush_all_tailers(

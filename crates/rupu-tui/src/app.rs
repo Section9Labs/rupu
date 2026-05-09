@@ -231,7 +231,7 @@ impl App {
                     }
                 }
             }
-            SourceEvent::RunUpdate(rec) => self.model.apply_run_update(rec),
+            SourceEvent::RunUpdate(rec) => self.model.apply_run_update(*rec),
             SourceEvent::Tick => {}
         }
     }

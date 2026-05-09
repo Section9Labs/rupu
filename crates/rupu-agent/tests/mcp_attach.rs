@@ -59,10 +59,14 @@ async fn mcp_registry_attaches_tools_to_run() {
     assert_eq!(requests.len(), 1, "expected exactly one request");
     let tool_names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
 
-    // The six builtins plus all MCP tools should be present.
+    // All builtins plus all MCP tools should be present.
     assert!(
         tool_names.contains(&"bash"),
         "builtin bash should still be present: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"dispatch_agent"),
+        "builtin dispatch_agent should be present: {tool_names:?}"
     );
     assert!(
         tool_names.contains(&"scm.repos.list"),
@@ -72,11 +76,11 @@ async fn mcp_registry_attaches_tools_to_run() {
         tool_names.contains(&"issues.list"),
         "MCP tool issues.list should be present: {tool_names:?}"
     );
-    // Total must be 6 builtins + 17 MCP tools = 23.
+    // Total must be 7 builtins (6 v0 + dispatch_agent) + 17 MCP tools = 24.
     assert_eq!(
         tool_names.len(),
-        23,
-        "expected 6 builtins + 17 MCP tools; got {} tools: {tool_names:?}",
+        24,
+        "expected 7 builtins + 17 MCP tools; got {} tools: {tool_names:?}",
         tool_names.len()
     );
 }

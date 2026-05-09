@@ -7,6 +7,7 @@ pub mod completers;
 pub mod completions;
 pub mod config;
 pub mod cron;
+pub mod dispatch;
 pub mod editor;
 pub mod init;
 pub mod issues;
