@@ -273,7 +273,7 @@ Arguments: autoflow tick
 Start in: C:\\path\\to\\repo
 ```
 
-Use event or webhook wakeups only after the autonomous loop is stable on periodic ticks.
+Use event or webhook wakeups only after the autonomous loop is stable on periodic ticks. Webhook mode still feeds back into `rupu autoflow tick`; it shortens wakeup latency but does not replace the periodic reconciliation loop.
 
 ---
 

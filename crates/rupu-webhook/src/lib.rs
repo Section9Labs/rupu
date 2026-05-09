@@ -36,5 +36,7 @@ pub mod signature;
 
 pub use dispatch::{dispatch_event, DispatchOutcome, DispatchedWorkflow, WorkflowDispatcher};
 pub use event_vocab::{map_github_event, map_gitlab_event};
-pub use server::{serve, WebhookConfig, WebhookError};
+pub use server::{
+    serve, WebhookConfig, WebhookError, WebhookEvent, WebhookObserver, WebhookSource,
+};
 pub use signature::{verify_github_signature, verify_gitlab_token, SignatureError};

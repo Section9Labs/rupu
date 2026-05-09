@@ -125,7 +125,7 @@ poll_sources = ["github:your-org/your-repo"]
 
 `rupu autoflow ...` accepts only `permission_mode = "bypass"` or `permission_mode = "readonly"`. `ask` and any other value are rejected.
 
-Use `[triggers].poll_sources` when you want `autoflow.wake_on` to react before the next `reconcile_every` deadline.
+Use `[triggers].poll_sources` when you want `autoflow.wake_on` to react before the next `reconcile_every` deadline. If you run `rupu webhook serve`, mapped webhook deliveries are also recorded as wake hints for tracked repos and picked up by the next `rupu autoflow tick`.
 
 ---
 
@@ -379,6 +379,8 @@ RUPU_GITHUB_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
 ```
 
 Use webhook mode when you want lower latency or event types that polling does not expose.
+
+When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and `rupu autoflow tick` consumes it on the next cycle.
 
 ---
 
