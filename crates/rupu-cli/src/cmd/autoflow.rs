@@ -2,18 +2,19 @@
 
 use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref;
+use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::workflow::{
-    ExplicitWorkflowRunContext, locate_workflow_in, run_with_explicit_context,
+    locate_workflow_in, run_with_explicit_context, ExplicitWorkflowRunContext,
 };
 use crate::paths;
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
 use jsonschema::JSONSchema;
 use rupu_auth::{CredentialResolver, KeychainResolver};
 use rupu_config::{AutoflowCheckout, Config};
-use rupu_orchestrator::templates::{RenderMode, StepContext, render_step_prompt};
+use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
     WorkflowOutputContract,
@@ -22,8 +23,8 @@ use rupu_scm::{
     Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
 };
 use rupu_workspace::{
-    AutoflowClaimRecord, AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch,
-    RepoRegistryStore, ensure_issue_worktree, issue_dir_name, remove_issue_worktree,
+    ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
+    AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,9 @@ pub enum Action {
     Show {
         #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
+        /// Limit resolution to one tracked repo.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Execute one autonomous cycle for one issue target.
     Run {
@@ -67,6 +71,7 @@ struct ResolvedAutoflowWorkflow {
     scope: String,
     name: String,
     workflow: Workflow,
+    workflow_path: PathBuf,
     project_root: Option<PathBuf>,
     repo_ref: String,
     preferred_checkout: PathBuf,
@@ -74,6 +79,27 @@ struct ResolvedAutoflowWorkflow {
 }
 
 impl ResolvedAutoflowWorkflow {
+    fn autoflow(&self) -> anyhow::Result<&rupu_orchestrator::Autoflow> {
+        self.workflow
+            .autoflow
+            .as_ref()
+            .filter(|autoflow| autoflow.enabled)
+            .ok_or_else(|| anyhow!("workflow `{}` is not autoflow-enabled", self.workflow.name))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VisibleAutoflowWorkflow {
+    scope: String,
+    name: String,
+    workflow: Workflow,
+    workflow_path: PathBuf,
+    project_root: Option<PathBuf>,
+    repo_ref: Option<String>,
+    preferred_checkout: Option<PathBuf>,
+}
+
+impl VisibleAutoflowWorkflow {
     fn autoflow(&self) -> anyhow::Result<&rupu_orchestrator::Autoflow> {
         self.workflow
             .autoflow
@@ -175,7 +201,7 @@ async fn handle_with_resolver(
 ) -> anyhow::Result<()> {
     match action {
         Action::List => list().await,
-        Action::Show { name } => show(&name).await,
+        Action::Show { name, repo } => show(&name, repo.as_deref()).await,
         Action::Run { name, target, mode } => run(&name, &target, mode.as_deref(), resolver).await,
         Action::Tick => tick_with_resolver(resolver).await,
         Action::Status => status().await,
@@ -186,36 +212,65 @@ async fn handle_with_resolver(
 
 async fn list() -> anyhow::Result<()> {
     let entries = visible_autoflows()?;
-    println!("{:<28} {:<8} {:<8} PRIORITY", "NAME", "SCOPE", "ENTITY");
-    for (name, scope, workflow) in entries {
-        let autoflow = workflow.autoflow.as_ref().expect("filtered to autoflows");
+    println!(
+        "{:<28} {:<8} {:<8} {:<8} REPO",
+        "NAME", "SCOPE", "ENTITY", "PRIORITY"
+    );
+    for entry in entries {
+        let autoflow = entry.autoflow()?;
         println!(
-            "{:<28} {:<8} {:<8} {}",
-            name,
-            scope,
+            "{:<28} {:<8} {:<8} {:<8} {}",
+            entry.name,
+            entry.scope,
             match autoflow.entity {
                 rupu_orchestrator::AutoflowEntity::Issue => "issue",
             },
-            autoflow.priority
+            autoflow.priority,
+            entry.repo_ref.as_deref().unwrap_or("-")
         );
     }
     Ok(())
 }
 
-async fn show(name: &str) -> anyhow::Result<()> {
-    let global = paths::global_dir()?;
-    let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
-    let path = locate_workflow_in(&global, project_root.as_deref(), name)?;
-    let body = std::fs::read_to_string(&path)?;
-    let workflow = Workflow::parse(&body)?;
-    let autoflow = workflow
-        .autoflow
-        .as_ref()
-        .filter(|a| a.enabled)
-        .ok_or_else(|| anyhow!("workflow `{name}` does not declare `autoflow.enabled = true`"))?;
+async fn show(name: &str, repo: Option<&str>) -> anyhow::Result<()> {
+    let matches = visible_autoflow_matches(name, repo)?;
+    let entry = match matches.as_slice() {
+        [] => match repo {
+            Some(repo) => bail!("no autoflow named `{name}` is visible for repo `{repo}`"),
+            None => bail!("no autoflow named `{name}` is visible"),
+        },
+        [entry] => entry,
+        many => {
+            let mut options = many
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "- {} ({}, {})",
+                        entry.repo_ref.as_deref().unwrap_or("-"),
+                        entry.scope,
+                        entry.workflow_path.display()
+                    )
+                })
+                .collect::<Vec<_>>();
+            options.sort();
+            bail!(
+                "multiple autoflows named `{name}` are visible:\n{}\npass `--repo <platform>:<owner>/<repo>` to disambiguate",
+                options.join("\n")
+            );
+        }
+    };
+    let body = std::fs::read_to_string(&entry.workflow_path)?;
+    let autoflow = entry.autoflow()?;
 
-    println!("path: {}", path.display());
+    println!("path: {}", entry.workflow_path.display());
+    println!("scope: {}", entry.scope);
+    println!("repo: {}", entry.repo_ref.as_deref().unwrap_or("-"));
+    if let Some(project_root) = &entry.project_root {
+        println!("project root: {}", project_root.display());
+    }
+    if let Some(preferred_checkout) = &entry.preferred_checkout {
+        println!("preferred checkout: {}", preferred_checkout.display());
+    }
     println!("priority: {}", autoflow.priority);
     println!(
         "entity: {}",
@@ -731,33 +786,152 @@ async fn release(r#ref: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn visible_autoflows() -> anyhow::Result<Vec<(String, String, Workflow)>> {
+fn visible_autoflow_matches(
+    name: &str,
+    repo: Option<&str>,
+) -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
+    let mut entries = visible_autoflows()?
+        .into_iter()
+        .filter(|entry| entry.name == name)
+        .collect::<Vec<_>>();
+    if let Some(repo_ref) = repo {
+        entries.retain(|entry| entry.repo_ref.as_deref() == Some(repo_ref));
+    }
+    entries.sort_by(|left, right| {
+        left.repo_ref
+            .cmp(&right.repo_ref)
+            .then_with(|| left.scope.cmp(&right.scope))
+            .then_with(|| left.workflow_path.cmp(&right.workflow_path))
+    });
+    Ok(entries)
+}
+
+fn visible_autoflows() -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let mut by_name: BTreeMap<String, (String, PathBuf)> = BTreeMap::new();
-    push_workflow_paths(&global.join("workflows"), "global", &mut by_name);
+    let repo_store = RepoRegistryStore {
+        root: paths::repos_dir(&global),
+    };
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+
     if let Some(project_root) = &project_root {
-        push_workflow_paths(
+        let cfg = resolve_config(&global, Some(project_root))?;
+        let repo_ref = cfg.autoflow.repo.clone().or_else(|| {
+            autodetect_repo_from_path(project_root)
+                .ok()
+                .map(|repo| canonical_repo_ref(&repo))
+        });
+        push_visible_workflow_paths(
             &project_root.join(".rupu/workflows"),
             "project",
-            &mut by_name,
-        );
+            Some(project_root),
+            repo_ref.clone(),
+            Some(project_root.clone()),
+            &mut seen,
+            &mut out,
+        )?;
+        push_visible_workflow_paths(
+            &global.join("workflows"),
+            "global",
+            Some(project_root),
+            repo_ref,
+            Some(project_root.clone()),
+            &mut seen,
+            &mut out,
+        )?;
+    } else {
+        let global_cfg = resolve_config(&global, None)?;
+        push_visible_workflow_paths(
+            &global.join("workflows"),
+            "global",
+            None,
+            global_cfg.autoflow.repo.clone(),
+            None,
+            &mut seen,
+            &mut out,
+        )?;
     }
-    let mut out = Vec::new();
-    for (name, (scope, path)) in by_name {
+
+    for resolved in discover_tick_autoflows(&global, &repo_store)? {
+        let key = visible_autoflow_key(
+            Some(&resolved.repo_ref),
+            &resolved.scope,
+            &resolved.workflow_path,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(VisibleAutoflowWorkflow {
+            scope: resolved.scope,
+            name: resolved.name,
+            workflow_path: resolved.workflow_path,
+            workflow: resolved.workflow,
+            project_root: resolved.project_root,
+            repo_ref: Some(resolved.repo_ref),
+            preferred_checkout: Some(resolved.preferred_checkout),
+        });
+    }
+
+    out.sort_by(|left, right| {
+        left.repo_ref
+            .cmp(&right.repo_ref)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.scope.cmp(&right.scope))
+            .then_with(|| left.workflow_path.cmp(&right.workflow_path))
+    });
+    Ok(out)
+}
+
+fn push_visible_workflow_paths(
+    dir: &Path,
+    scope: &str,
+    preferred_checkout: Option<&Path>,
+    repo_ref: Option<String>,
+    project_root: Option<PathBuf>,
+    seen: &mut BTreeSet<String>,
+    into: &mut Vec<VisibleAutoflowWorkflow>,
+) -> anyhow::Result<()> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in rd {
+        let entry = entry?;
+        let path = entry.path();
+        let ext = path.extension().and_then(|s| s.to_str());
+        if !matches!(ext, Some("yaml" | "yml")) {
+            continue;
+        }
         let body = std::fs::read_to_string(&path)?;
         let workflow = Workflow::parse(&body)?;
-        if workflow
+        if !workflow
             .autoflow
             .as_ref()
             .map(|a| a.enabled)
             .unwrap_or(false)
         {
-            out.push((name, scope, workflow));
+            continue;
         }
+        let key = visible_autoflow_key(repo_ref.as_deref(), scope, &path);
+        if !seen.insert(key) {
+            continue;
+        }
+        into.push(VisibleAutoflowWorkflow {
+            scope: scope.to_string(),
+            name: workflow.name.clone(),
+            workflow,
+            workflow_path: path,
+            project_root: project_root.clone(),
+            repo_ref: repo_ref.clone(),
+            preferred_checkout: preferred_checkout.map(Path::to_path_buf),
+        });
     }
-    Ok(out)
+    Ok(())
+}
+
+fn visible_autoflow_key(repo_ref: Option<&str>, scope: &str, path: &Path) -> String {
+    format!("{}|{}|{}", repo_ref.unwrap_or("-"), scope, path.display())
 }
 
 fn discover_tick_autoflows(
@@ -1554,23 +1728,6 @@ fn wake_events_match(
     })
 }
 
-fn push_workflow_paths(dir: &Path, scope: &str, into: &mut BTreeMap<String, (String, PathBuf)>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        let ext = path.extension().and_then(|s| s.to_str());
-        if !matches!(ext, Some("yaml" | "yml")) {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        into.insert(stem.to_string(), (scope.to_string(), path));
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn push_resolved_autoflow_paths(
     dir: &Path,
@@ -1657,6 +1814,7 @@ fn resolve_autoflow_from_path(
         scope,
         name: workflow.name.clone(),
         workflow,
+        workflow_path,
         project_root,
         repo_ref,
         preferred_checkout,
@@ -2170,8 +2328,8 @@ mod tests {
     use super::*;
     use httpmock::Method::GET;
     use httpmock::MockServer;
-    use rupu_auth::StoredCredential;
     use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::StoredCredential;
     use rupu_orchestrator::{RunRecord, StepKind, StepResultRecord};
     use rupu_providers::AuthMode;
     use std::io::Write;
@@ -2192,53 +2350,43 @@ mod tests {
 
     fn init_git_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("init")
-                .arg("-b")
-                .arg("main")
-                .arg(path)
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["config", "user.email", "test@example.com"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["config", "user.name", "Test User"])
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(std::process::Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap()
+            .success());
         std::fs::write(path.join("README.md"), "hello\n").unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["add", "README.md"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["commit", "-m", "init"])
-                .status()
-                .unwrap()
-                .success()
-        );
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap()
+            .success());
     }
 
     fn write_autoflow_project(
@@ -2383,6 +2531,9 @@ steps:
 "#,
             )
             .unwrap(),
+            workflow_path: PathBuf::from(
+                "/tmp/repo/.rupu/workflows/issue-supervisor-dispatch.yaml",
+            ),
             project_root: None,
             repo_ref: "github:Section9Labs/rupu".into(),
             preferred_checkout: PathBuf::from("/tmp/repo"),
@@ -2412,26 +2563,22 @@ steps:
             root: tmp.path().join("claims"),
         };
 
-        assert!(
-            should_run_claim(
-                &claim,
-                &resolved,
-                &store,
-                chrono::Utc::now(),
-                &BTreeSet::from(["github.issue.labeled".to_string()]),
-            )
-            .unwrap()
-        );
-        assert!(
-            !should_run_claim(
-                &claim,
-                &resolved,
-                &store,
-                chrono::Utc::now(),
-                &BTreeSet::new()
-            )
-            .unwrap()
-        );
+        assert!(should_run_claim(
+            &claim,
+            &resolved,
+            &store,
+            chrono::Utc::now(),
+            &BTreeSet::from(["github.issue.labeled".to_string()]),
+        )
+        .unwrap());
+        assert!(!should_run_claim(
+            &claim,
+            &resolved,
+            &store,
+            chrono::Utc::now(),
+            &BTreeSet::new()
+        )
+        .unwrap());
     }
 
     #[test]
@@ -2540,6 +2687,7 @@ steps:
             scope: "project".into(),
             name: name.into(),
             workflow: workflow(name, priority),
+            workflow_path: PathBuf::from(format!("/tmp/repo/.rupu/workflows/{name}.yaml")),
             project_root: None,
             repo_ref: "github:Section9Labs/rupu".into(),
             preferred_checkout: PathBuf::from("/tmp/repo"),
@@ -3390,13 +3538,11 @@ steps:
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
-        assert!(
-            claim
-                .worktree_path
-                .as_deref()
-                .unwrap()
-                .contains("issue-123")
-        );
+        assert!(claim
+            .worktree_path
+            .as_deref()
+            .unwrap()
+            .contains("issue-123"));
     }
 
     #[tokio::test]
@@ -4268,13 +4414,11 @@ steps:
             .unwrap()
             .unwrap();
         assert_eq!(bad_claim.status, ClaimStatus::Blocked);
-        assert!(
-            bad_claim
-                .last_error
-                .as_deref()
-                .unwrap()
-                .contains("output failed schema")
-        );
+        assert!(bad_claim
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("output failed schema"));
         assert_eq!(good_claim.status, ClaimStatus::Complete);
         assert!(good_claim.last_run_id.is_some());
     }
