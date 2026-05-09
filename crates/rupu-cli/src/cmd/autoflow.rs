@@ -52,7 +52,7 @@ pub enum Action {
         /// Issue target in full run-target form:
         /// `github:owner/repo/issues/42` or `gitlab:group/project/issues/9`.
         target: String,
-        /// Override permission mode (`ask` | `bypass` | `readonly`).
+        /// Override permission mode (`bypass` | `readonly`).
         #[arg(long)]
         mode: Option<String>,
     },
@@ -379,6 +379,8 @@ async fn run(
         root: paths::repos_dir(&global),
     };
     let resolved = resolve_autoflow_workflow_for_repo(&global, &repo_store, &repo_ref, name)?;
+    let _ =
+        resolve_autoflow_permission_mode(mode, resolved.cfg.autoflow.permission_mode.as_deref())?;
     let issue = fetch_issue(&resolved.cfg, resolver.as_ref(), &issue_ref).await?;
     let claim_store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
@@ -1353,6 +1355,10 @@ async fn execute_autoflow_cycle(
     claim.updated_at = chrono::Utc::now().to_rfc3339();
     claim_store.save(&claim)?;
 
+    let permission_mode = resolve_autoflow_permission_mode(
+        mode_override,
+        resolved.cfg.autoflow.permission_mode.as_deref(),
+    )?;
     let run_result = run_with_explicit_context(
         &resolved.name,
         ExplicitWorkflowRunContext {
@@ -1360,10 +1366,7 @@ async fn execute_autoflow_cycle(
             workspace_path,
             workspace_id: ws.id,
             inputs: inputs.into_iter().collect(),
-            mode: mode_override
-                .map(ToOwned::to_owned)
-                .or_else(|| resolved.cfg.autoflow.permission_mode.clone())
-                .unwrap_or_else(|| "bypass".to_string()),
+            mode: permission_mode,
             event: None,
             issue: Some(issue_payload),
             issue_ref: Some(issue_ref_text.to_string()),
@@ -1412,6 +1415,20 @@ async fn execute_autoflow_cycle(
             Err(err)
         }
     }
+}
+
+fn resolve_autoflow_permission_mode(
+    mode_override: Option<&str>,
+    config_mode: Option<&str>,
+) -> anyhow::Result<String> {
+    let mode = mode_override
+        .map(ToOwned::to_owned)
+        .or_else(|| config_mode.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "bypass".to_string());
+    if mode == "ask" {
+        bail!("autoflow does not support `ask` permission mode; use `bypass` or `readonly`");
+    }
+    Ok(mode)
 }
 
 fn reconcile_claim_from_last_run(
@@ -2744,6 +2761,32 @@ steps:
         )
         .unwrap();
         assert_eq!(branch, "rupu/issue-42-phase-1");
+    }
+
+    #[test]
+    fn autoflow_permission_mode_defaults_to_bypass() {
+        assert_eq!(
+            resolve_autoflow_permission_mode(None, None).unwrap(),
+            "bypass"
+        );
+    }
+
+    #[test]
+    fn autoflow_permission_mode_rejects_ask_override() {
+        let err = resolve_autoflow_permission_mode(Some("ask"), Some("bypass")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("autoflow does not support `ask` permission mode")
+        );
+    }
+
+    #[test]
+    fn autoflow_permission_mode_rejects_ask_config() {
+        let err = resolve_autoflow_permission_mode(None, Some("ask")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("autoflow does not support `ask` permission mode")
+        );
     }
 
     #[test]

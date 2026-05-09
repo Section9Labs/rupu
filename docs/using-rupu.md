@@ -123,6 +123,8 @@ strict_templates = true
 poll_sources = ["github:your-org/your-repo"]
 ```
 
+`rupu autoflow ...` rejects `permission_mode = "ask"`. Autonomous runs must use `bypass` or `readonly`.
+
 Use `[triggers].poll_sources` when you want `autoflow.wake_on` to react before the next `reconcile_every` deadline.
 
 ---
