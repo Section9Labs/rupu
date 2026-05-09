@@ -202,15 +202,18 @@ rupu issues show github:your-org/your-repo/issues/42
 
 ```sh
 rupu autoflow list
+rupu autoflow list --repo github:your-org/your-repo
 rupu autoflow show issue-supervisor-dispatch
 rupu autoflow show issue-supervisor-dispatch --repo github:your-org/your-repo
 rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
 rupu autoflow tick
 rupu autoflow status
+rupu autoflow status --repo github:your-org/your-repo
 rupu autoflow claims
+rupu autoflow claims --repo github:your-org/your-repo
 ```
 
-`rupu autoflow list` and `rupu autoflow show` inspect tracked repos, not just the current working directory. Use `rupu repos attach` first if you want to inspect autoflows from outside a checkout, and pass `--repo` when the same workflow name exists in more than one tracked repo.
+`rupu autoflow list`, `show`, `status`, and `claims` inspect tracked repos, not just the current working directory. Use `rupu repos attach` first if you want to inspect autoflows from outside a checkout, and pass `--repo` when you want to narrow output to one tracked repo.
 
 ---
 

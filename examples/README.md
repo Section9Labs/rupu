@@ -145,6 +145,7 @@ rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
 
 ```sh
 rupu autoflow list
+rupu autoflow list --repo github:your-org/your-repo
 rupu autoflow show issue-supervisor-dispatch --repo github:your-org/your-repo
 rupu autoflow tick
 ```

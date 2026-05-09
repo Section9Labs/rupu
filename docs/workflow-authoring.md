@@ -298,6 +298,7 @@ Then reconcile with:
 
 ```sh
 rupu autoflow list
+rupu autoflow list --repo github:your-org/your-repo
 rupu autoflow show issue-supervisor-dispatch --repo github:your-org/your-repo
 rupu autoflow tick
 ```

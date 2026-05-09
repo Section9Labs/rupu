@@ -4,17 +4,17 @@ use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::workflow::{
-    locate_workflow_in, run_with_explicit_context, ExplicitWorkflowRunContext,
+    ExplicitWorkflowRunContext, locate_workflow_in, run_with_explicit_context,
 };
 use crate::paths;
-use anyhow::{anyhow, bail, Context};
-use clap::Subcommand;
+use anyhow::{Context, anyhow, bail};
+use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
 use jsonschema::JSONSchema;
 use rupu_auth::{CredentialResolver, KeychainResolver};
 use rupu_config::{AutoflowCheckout, Config};
-use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
+use rupu_orchestrator::templates::{RenderMode, StepContext, render_step_prompt};
 use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
     WorkflowOutputContract,
@@ -23,8 +23,8 @@ use rupu_scm::{
     Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
 };
 use rupu_workspace::{
-    ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
-    AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
+    AutoflowClaimRecord, AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch,
+    RepoRegistryStore, ensure_issue_worktree, issue_dir_name, remove_issue_worktree,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ use tracing::warn;
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// List autoflow-enabled workflows.
-    List,
+    List(RepoFilterArgs),
     /// Show one autoflow workflow and its resolved metadata.
     Show {
         #[arg(add = ArgValueCompleter::new(workflow_names))]
@@ -59,11 +59,18 @@ pub enum Action {
     /// Reconcile every discovered autoflow once.
     Tick,
     /// Summarize persisted autoflow claim state.
-    Status,
+    Status(RepoFilterArgs),
     /// Inspect persisted autoflow claims.
-    Claims,
+    Claims(RepoFilterArgs),
     /// Force-release one claim.
     Release { r#ref: String },
+}
+
+#[derive(ClapArgs, Debug, Clone, Default)]
+pub struct RepoFilterArgs {
+    /// Limit results to one repo target, for example `github:owner/repo`.
+    #[arg(long)]
+    pub repo: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -200,18 +207,24 @@ async fn handle_with_resolver(
     resolver: Arc<dyn CredentialResolver>,
 ) -> anyhow::Result<()> {
     match action {
-        Action::List => list().await,
+        Action::List(args) => list(args.repo.as_deref()).await,
         Action::Show { name, repo } => show(&name, repo.as_deref()).await,
         Action::Run { name, target, mode } => run(&name, &target, mode.as_deref(), resolver).await,
         Action::Tick => tick_with_resolver(resolver).await,
-        Action::Status => status().await,
-        Action::Claims => claims().await,
+        Action::Status(args) => status(args.repo.as_deref()).await,
+        Action::Claims(args) => claims(args.repo.as_deref()).await,
         Action::Release { r#ref } => release(&r#ref).await,
     }
 }
 
-async fn list() -> anyhow::Result<()> {
+async fn list(repo: Option<&str>) -> anyhow::Result<()> {
+    let repo_filter = normalize_repo_filter(repo)?;
     let entries = visible_autoflows()?;
+    let entries = filter_visible_autoflows(entries, repo_filter.as_deref());
+    if entries.is_empty() {
+        println!("(no autoflows)");
+        return Ok(());
+    }
     println!(
         "{:<28} {:<8} {:<8} {:<8} REPO",
         "NAME", "SCOPE", "ENTITY", "PRIORITY"
@@ -685,12 +698,13 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
     Ok(())
 }
 
-async fn status() -> anyhow::Result<()> {
+async fn status(repo: Option<&str>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
-    let claims = store.list()?;
+    let repo_filter = normalize_repo_filter(repo)?;
+    let claims = filter_claims_by_repo(store.list()?, repo_filter.as_deref());
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for claim in &claims {
         *counts.entry(status_name(claim.status)).or_insert(0) += 1;
@@ -720,12 +734,13 @@ async fn status() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn claims() -> anyhow::Result<()> {
+async fn claims(repo: Option<&str>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
-    let claims = store.list()?;
+    let repo_filter = normalize_repo_filter(repo)?;
+    let claims = filter_claims_by_repo(store.list()?, repo_filter.as_deref());
     if claims.is_empty() {
         println!("(no autoflow claims)");
         return Ok(());
@@ -790,13 +805,12 @@ fn visible_autoflow_matches(
     name: &str,
     repo: Option<&str>,
 ) -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
+    let repo_filter = normalize_repo_filter(repo)?;
     let mut entries = visible_autoflows()?
         .into_iter()
         .filter(|entry| entry.name == name)
         .collect::<Vec<_>>();
-    if let Some(repo_ref) = repo {
-        entries.retain(|entry| entry.repo_ref.as_deref() == Some(repo_ref));
-    }
+    entries = filter_visible_autoflows(entries, repo_filter.as_deref());
     entries.sort_by(|left, right| {
         left.repo_ref
             .cmp(&right.repo_ref)
@@ -804,6 +818,49 @@ fn visible_autoflow_matches(
             .then_with(|| left.workflow_path.cmp(&right.workflow_path))
     });
     Ok(entries)
+}
+
+fn normalize_repo_filter(repo: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(repo) = repo else {
+        return Ok(None);
+    };
+    let parsed = crate::run_target::parse_run_target(repo)
+        .map_err(|err| anyhow!("invalid repo filter `{repo}`: {err}"))?;
+    match parsed {
+        crate::run_target::RunTarget::Repo {
+            platform,
+            owner,
+            repo,
+            ..
+        } => Ok(Some(format!("{platform}:{owner}/{repo}"))),
+        _ => bail!("invalid repo filter `{repo}`: expected `<platform>:<owner>/<repo>`"),
+    }
+}
+
+fn filter_visible_autoflows(
+    entries: Vec<VisibleAutoflowWorkflow>,
+    repo_filter: Option<&str>,
+) -> Vec<VisibleAutoflowWorkflow> {
+    match repo_filter {
+        Some(repo_ref) => entries
+            .into_iter()
+            .filter(|entry| entry.repo_ref.as_deref() == Some(repo_ref))
+            .collect(),
+        None => entries,
+    }
+}
+
+fn filter_claims_by_repo(
+    claims: Vec<AutoflowClaimRecord>,
+    repo_filter: Option<&str>,
+) -> Vec<AutoflowClaimRecord> {
+    match repo_filter {
+        Some(repo_ref) => claims
+            .into_iter()
+            .filter(|claim| claim.repo_ref == repo_ref)
+            .collect(),
+        None => claims,
+    }
 }
 
 fn visible_autoflows() -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
@@ -2328,8 +2385,8 @@ mod tests {
     use super::*;
     use httpmock::Method::GET;
     use httpmock::MockServer;
-    use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::StoredCredential;
+    use rupu_auth::in_memory::InMemoryResolver;
     use rupu_orchestrator::{RunRecord, StepKind, StepResultRecord};
     use rupu_providers::AuthMode;
     use std::io::Write;
@@ -2350,43 +2407,62 @@ mod tests {
 
     fn init_git_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
-        assert!(std::process::Command::new("git")
-            .arg("init")
-            .arg("-b")
-            .arg("main")
-            .arg(path)
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.email", "test@example.com"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.name", "Test User"])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-b")
+                .arg("main")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["config", "user.email", "test@example.com"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["config", "user.name", "Test User"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["config", "commit.gpgsign", "false"])
+                .status()
+                .unwrap()
+                .success()
+        );
         std::fs::write(path.join("README.md"), "hello\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["add", "README.md"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["commit", "-m", "init"])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["add", "README.md"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["commit", "-m", "init"])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn write_autoflow_project(
@@ -2563,22 +2639,26 @@ steps:
             root: tmp.path().join("claims"),
         };
 
-        assert!(should_run_claim(
-            &claim,
-            &resolved,
-            &store,
-            chrono::Utc::now(),
-            &BTreeSet::from(["github.issue.labeled".to_string()]),
-        )
-        .unwrap());
-        assert!(!should_run_claim(
-            &claim,
-            &resolved,
-            &store,
-            chrono::Utc::now(),
-            &BTreeSet::new()
-        )
-        .unwrap());
+        assert!(
+            should_run_claim(
+                &claim,
+                &resolved,
+                &store,
+                chrono::Utc::now(),
+                &BTreeSet::from(["github.issue.labeled".to_string()]),
+            )
+            .unwrap()
+        );
+        assert!(
+            !should_run_claim(
+                &claim,
+                &resolved,
+                &store,
+                chrono::Utc::now(),
+                &BTreeSet::new()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -3538,11 +3618,13 @@ steps:
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
-        assert!(claim
-            .worktree_path
-            .as_deref()
-            .unwrap()
-            .contains("issue-123"));
+        assert!(
+            claim
+                .worktree_path
+                .as_deref()
+                .unwrap()
+                .contains("issue-123")
+        );
     }
 
     #[tokio::test]
@@ -4414,11 +4496,13 @@ steps:
             .unwrap()
             .unwrap();
         assert_eq!(bad_claim.status, ClaimStatus::Blocked);
-        assert!(bad_claim
-            .last_error
-            .as_deref()
-            .unwrap()
-            .contains("output failed schema"));
+        assert!(
+            bad_claim
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("output failed schema")
+        );
         assert_eq!(good_claim.status, ClaimStatus::Complete);
         assert!(good_claim.last_run_id.is_some());
     }
