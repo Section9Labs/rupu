@@ -1,5 +1,7 @@
 # rupu Autoflow Plan 1 — Foundation, Runtime, and CLI
 
+> **Status (2026-05-09):** Implemented on `main` through the merged autoflow phase series ending at PR `#147`. This file is now a historical implementation plan rather than a live checkbox tracker. Current operator-facing guidance lives in `docs/workflow-format.md`, `docs/using-rupu.md`, and `docs/development-flows.md`. Remaining post-v1 backlog items live in `TODO.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement `autoflow` as a first-class, persistent execution mode for existing workflow YAML files. The feature must keep one workflow language, add durable issue ownership across multiple runs, reuse the existing workflow engine, and ship with a top-level `rupu autoflow ...` CLI surface.
@@ -286,6 +288,8 @@ examples/agents/*
 ---
 
 ## Acceptance criteria
+
+**Closeout:** All acceptance criteria below are satisfied on `main` as of merged PR `#147`.
 
 - The same workflow file can run via `rupu workflow run` and `rupu autoflow run`, with autoflow semantics only active in the latter path.
 - `rupu autoflow tick` can reconcile issues for repos not currently open in the operator's shell.
