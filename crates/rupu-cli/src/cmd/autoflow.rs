@@ -3,17 +3,17 @@
 use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref;
 use crate::cmd::workflow::{
-    locate_workflow_in, run_with_explicit_context, ExplicitWorkflowRunContext,
+    ExplicitWorkflowRunContext, locate_workflow_in, run_with_explicit_context,
 };
 use crate::paths;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
 use jsonschema::JSONSchema;
 use rupu_auth::{CredentialResolver, KeychainResolver};
 use rupu_config::{AutoflowCheckout, Config};
-use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
+use rupu_orchestrator::templates::{RenderMode, StepContext, render_step_prompt};
 use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
     WorkflowOutputContract,
@@ -22,8 +22,8 @@ use rupu_scm::{
     Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
 };
 use rupu_workspace::{
-    ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
-    AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
+    AutoflowClaimRecord, AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch,
+    RepoRegistryStore, ensure_issue_worktree, issue_dir_name, remove_issue_worktree,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -314,7 +314,9 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
         if cleaned == 0 {
             println!("(no autoflows)");
         } else {
-            println!("autoflow tick: 0 workflow(s), 0 polled event(s), 0 cycle(s) ran, 0 skipped, {cleaned} cleaned");
+            println!(
+                "autoflow tick: 0 workflow(s), 0 polled event(s), 0 cycle(s) ran, 0 skipped, {cleaned} cleaned"
+            );
         }
         return Ok(());
     }
@@ -1019,6 +1021,7 @@ async fn execute_autoflow_cycle(
             .and_then(|workspace| workspace.branch.as_deref()),
         &issue_payload,
         issue_ref_text,
+        &inputs,
     )?;
     let workspace_path = match workspace_strategy {
         AutoflowWorkspaceStrategy::Worktree => {
@@ -1978,9 +1981,13 @@ fn resolve_branch_name(
     template: Option<&str>,
     issue_payload: &serde_json::Value,
     issue_ref: &str,
+    inputs: &BTreeMap<String, String>,
 ) -> anyhow::Result<String> {
     if let Some(template) = template {
-        let ctx = StepContext::new().with_issue(issue_payload.clone());
+        let mut ctx = StepContext::new().with_issue(issue_payload.clone());
+        for (key, value) in inputs {
+            ctx = ctx.with_input(key.clone(), value.clone());
+        }
         let rendered = render_step_prompt(template, &ctx, RenderMode::Strict)?;
         let branch = rendered.trim();
         if !branch.is_empty() {
@@ -2104,8 +2111,8 @@ mod tests {
     use super::*;
     use httpmock::Method::GET;
     use httpmock::MockServer;
-    use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::StoredCredential;
+    use rupu_auth::in_memory::InMemoryResolver;
     use rupu_orchestrator::{RunRecord, StepKind, StepResultRecord};
     use rupu_providers::AuthMode;
     use std::io::Write;
@@ -2126,43 +2133,53 @@ mod tests {
 
     fn init_git_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
-        assert!(std::process::Command::new("git")
-            .arg("init")
-            .arg("-b")
-            .arg("main")
-            .arg(path)
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.email", "test@example.com"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.name", "Test User"])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-b")
+                .arg("main")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["config", "user.email", "test@example.com"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["config", "user.name", "Test User"])
+                .status()
+                .unwrap()
+                .success()
+        );
         std::fs::write(path.join("README.md"), "hello\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["add", "README.md"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["commit", "-m", "init"])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["add", "README.md"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["commit", "-m", "init"])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn write_autoflow_project(
@@ -2336,22 +2353,26 @@ steps:
             root: tmp.path().join("claims"),
         };
 
-        assert!(should_run_claim(
-            &claim,
-            &resolved,
-            &store,
-            chrono::Utc::now(),
-            &BTreeSet::from(["github.issue.labeled".to_string()]),
-        )
-        .unwrap());
-        assert!(!should_run_claim(
-            &claim,
-            &resolved,
-            &store,
-            chrono::Utc::now(),
-            &BTreeSet::new()
-        )
-        .unwrap());
+        assert!(
+            should_run_claim(
+                &claim,
+                &resolved,
+                &store,
+                chrono::Utc::now(),
+                &BTreeSet::from(["github.issue.labeled".to_string()]),
+            )
+            .unwrap()
+        );
+        assert!(
+            !should_run_claim(
+                &claim,
+                &resolved,
+                &store,
+                chrono::Utc::now(),
+                &BTreeSet::new()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -2377,6 +2398,21 @@ steps:
         };
         assert!(claim_cleanup_due(&claim, chrono::Utc::now(), chrono::Duration::days(1)).unwrap());
         assert!(!claim_cleanup_due(&claim, chrono::Utc::now(), chrono::Duration::days(7)).unwrap());
+    }
+
+    #[test]
+    fn resolve_branch_name_renders_inputs_and_issue_fields() {
+        let issue_payload = serde_json::json!({
+            "number": 42
+        });
+        let branch = resolve_branch_name(
+            Some("rupu/issue-{{ issue.number }}-{{ inputs.phase }}"),
+            &issue_payload,
+            "github:Section9Labs/rupu/issues/42",
+            &BTreeMap::from([("phase".into(), "phase-1".into())]),
+        )
+        .unwrap();
+        assert_eq!(branch, "rupu/issue-42-phase-1");
     }
 
     #[test]
@@ -2971,6 +3007,192 @@ steps:
     }
 
     #[tokio::test]
+    async fn tick_executes_pending_dispatch_on_next_pass() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let issues_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issues_body.clone());
+        });
+        let issue_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issue_get_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues/123");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issue_body.clone());
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "controller {{ issue.number }}"
+"#,
+        );
+        std::fs::write(
+            project.join(".rupu/workflows/phase-delivery-cycle.yaml"),
+            r#"name: phase-delivery-cycle
+autoflow:
+  enabled: true
+  priority: 50
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}-{{ inputs.phase }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: implement
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: implement
+    agent: echo
+    actions: []
+    prompt: "phase={{ inputs.phase }} issue={{ issue.number }}"
+"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        let issue_ref = "github:Section9Labs/rupu/issues/123";
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: issue_ref.into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "issue-supervisor-dispatch".into(),
+                status: ClaimStatus::Claimed,
+                worktree_path: Some(project.display().to_string()),
+                branch: Some("rupu/issue-123".into()),
+                last_run_id: Some("run_controller".into()),
+                last_error: None,
+                last_summary: Some("phase 1 is ready".into()),
+                pr_url: None,
+                artifacts: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
+                ),
+                pending_dispatch: Some(PendingDispatch {
+                    workflow: "phase-delivery-cycle".into(),
+                    target: issue_ref.into(),
+                    inputs: BTreeMap::from([("phase".into(), "phase-1".into())]),
+                }),
+                contenders: vec![],
+                updated_at: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            })
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+
+        tick_with_resolver(resolver.clone()).await.unwrap();
+
+        let skipped_claim = claim_store.load(issue_ref).unwrap().unwrap();
+        assert_eq!(skipped_claim.status, ClaimStatus::Claimed);
+        assert!(skipped_claim.pending_dispatch.is_some());
+        assert_eq!(skipped_claim.last_run_id.as_deref(), Some("run_controller"));
+
+        let runs_dir = global.join("runs");
+        assert!(!runs_dir.exists() || std::fs::read_dir(&runs_dir).unwrap().next().is_none());
+
+        let mut runnable_claim = skipped_claim;
+        runnable_claim.updated_at = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        claim_store.save(&runnable_claim).unwrap();
+
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+        tick_with_resolver(resolver).await.unwrap();
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let final_claim = claim_store.load(issue_ref).unwrap().unwrap();
+        assert_eq!(final_claim.status, ClaimStatus::Complete);
+        assert!(final_claim.pending_dispatch.is_none());
+        assert_eq!(final_claim.last_summary.as_deref(), Some("done"));
+
+        let run_id = final_claim.last_run_id.as_deref().expect("last run id");
+        let run_store = RunStore::new(global.join("runs"));
+        let run = run_store.load(run_id).unwrap();
+        assert_eq!(run.workflow_name, "phase-delivery-cycle");
+        assert_eq!(run.inputs.get("phase").map(String::as_str), Some("phase-1"));
+    }
+
+    #[tokio::test]
     async fn tick_discovers_tracked_repo_and_runs_autoflow_cycle() {
         let _guard = ENV_LOCK.lock().await;
 
@@ -3064,11 +3286,13 @@ steps:
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
-        assert!(claim
-            .worktree_path
-            .as_deref()
-            .unwrap()
-            .contains("issue-123"));
+        assert!(
+            claim
+                .worktree_path
+                .as_deref()
+                .unwrap()
+                .contains("issue-123")
+        );
     }
 
     #[tokio::test]
@@ -3940,11 +4164,13 @@ steps:
             .unwrap()
             .unwrap();
         assert_eq!(bad_claim.status, ClaimStatus::Blocked);
-        assert!(bad_claim
-            .last_error
-            .as_deref()
-            .unwrap()
-            .contains("output failed schema"));
+        assert!(
+            bad_claim
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("output failed schema")
+        );
         assert_eq!(good_claim.status, ClaimStatus::Complete);
         assert!(good_claim.last_run_id.is_some());
     }
