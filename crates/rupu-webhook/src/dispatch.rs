@@ -7,8 +7,8 @@
 //!
 //! `WorkflowDispatcher` is a trait so the receiver can be tested
 //! without spinning up the full agent runtime — tests inject a
-//! stub that records dispatch calls, production wires it to
-//! `rupu_cli::cmd::workflow::run_by_name`.
+//! stub that records dispatch calls, production wires it to the CLI
+//! workflow runner with an opaque candidate key.
 
 use async_trait::async_trait;
 use rupu_orchestrator::{event_matches, TriggerKind, Workflow};
@@ -23,7 +23,7 @@ pub enum DispatchError {
 }
 
 /// Trait the receiver uses to actually run a workflow once the
-/// event matched. Production impl wraps `rupu_cli::cmd::workflow::run_by_name`;
+/// event matched. Production impl wraps the CLI workflow runner;
 /// tests inject a stub.
 ///
 /// `event` is the raw vendor JSON payload that triggered the match.
@@ -37,8 +37,7 @@ pub enum DispatchError {
 /// to approve).
 #[async_trait]
 pub trait WorkflowDispatcher: Send + Sync {
-    async fn dispatch(&self, workflow_name: &str, event: &Value)
-        -> anyhow::Result<DispatchOutcome>;
+    async fn dispatch(&self, workflow_key: &str, event: &Value) -> anyhow::Result<DispatchOutcome>;
 }
 
 /// What `WorkflowDispatcher::dispatch` produced for one matched
@@ -83,7 +82,8 @@ pub async fn dispatch_event(
     dispatcher: &dyn WorkflowDispatcher,
 ) -> Vec<DispatchedWorkflow> {
     let mut out = Vec::new();
-    for (name, wf) in candidates {
+    for (workflow_key, wf) in candidates {
+        let display_name = wf.name.clone();
         if wf.trigger.on != TriggerKind::Event {
             continue;
         }
@@ -95,13 +95,13 @@ pub async fn dispatch_event(
             match render_filter(filter_expr, payload) {
                 Ok(true) => {}
                 Ok(false) => {
-                    info!(workflow = %name, event = %event_id, "filter rejected; skipping");
+                    info!(workflow = %display_name, event = %event_id, "filter rejected; skipping");
                     continue;
                 }
                 Err(e) => {
-                    warn!(workflow = %name, error = %e, "filter render failed; skipping");
+                    warn!(workflow = %display_name, error = %e, "filter render failed; skipping");
                     out.push(DispatchedWorkflow {
-                        name: name.clone(),
+                        name: display_name.clone(),
                         fired: false,
                         error: Some(format!("filter render: {e}")),
                         run_id: String::new(),
@@ -111,19 +111,19 @@ pub async fn dispatch_event(
                 }
             }
         }
-        info!(workflow = %name, event = %event_id, "dispatching");
-        match dispatcher.dispatch(name, payload).await {
+        info!(workflow = %display_name, event = %event_id, "dispatching");
+        match dispatcher.dispatch(workflow_key, payload).await {
             Ok(outcome) => out.push(DispatchedWorkflow {
-                name: name.clone(),
+                name: display_name.clone(),
                 fired: true,
                 error: None,
                 run_id: outcome.run_id,
                 awaiting_step_id: outcome.awaiting_step_id,
             }),
             Err(e) => {
-                warn!(workflow = %name, error = %e, "dispatch failed");
+                warn!(workflow = %display_name, error = %e, "dispatch failed");
                 out.push(DispatchedWorkflow {
-                    name: name.clone(),
+                    name: display_name,
                     fired: false,
                     error: Some(e.to_string()),
                     run_id: String::new(),

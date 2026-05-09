@@ -380,6 +380,8 @@ RUPU_GITHUB_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
 
 Use webhook mode when you want lower latency or event types that polling does not expose.
 
+`rupu webhook serve` now looks beyond the current checkout: it can load project workflows from tracked repos under `rupu repos ...`, and it dispatches the exact matched workflow file rather than resolving by bare workflow name from the server's cwd.
+
 When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and `rupu autoflow tick` consumes it on the next cycle.
 
 ---
