@@ -72,6 +72,9 @@ impl StepFactory for FakeFactory {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
         }
     }
 }
@@ -423,6 +426,9 @@ impl StepFactory for FailingFactory {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
         }
     }
 }
@@ -1139,6 +1145,9 @@ impl StepFactory for PanelFactory {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
         }
     }
 }
@@ -1367,6 +1376,9 @@ impl StepFactory for LoopingPanelFactory {
             anthropic_task_budget: None,
             anthropic_context_management: None,
             anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
         }
     }
 }

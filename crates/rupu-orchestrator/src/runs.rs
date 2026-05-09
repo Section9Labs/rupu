@@ -139,6 +139,14 @@ pub struct RunRecord {
     /// the issue tracker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<serde_json::Value>,
+    /// When this run is a sub-agent dispatch, the parent run's id.
+    /// `None` for top-level workflow runs. Sub-runs persist under
+    /// the parent's directory at
+    /// `<runs>/<parent_run_id>/sub/<sub_run_id>/` and don't appear
+    /// in `rupu workflow runs` output by default.
+    /// See `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
 }
 
 /// Workflow-step shape, persisted alongside the result so the
@@ -354,6 +362,17 @@ impl RunStore {
         self.run_dir(run_id).join("step_results.jsonl")
     }
 
+    /// Sub-run directory: lives under the parent's run dir so cleanup
+    /// follows parent lifecycle. See spec § 5.1.
+    fn sub_run_dir(&self, parent_run_id: &str, sub_run_id: &str) -> PathBuf {
+        self.run_dir(parent_run_id).join("sub").join(sub_run_id)
+    }
+
+    fn sub_run_transcript(&self, parent_run_id: &str, sub_run_id: &str) -> PathBuf {
+        self.sub_run_dir(parent_run_id, sub_run_id)
+            .join("transcript.jsonl")
+    }
+
     fn workflow_snapshot(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("workflow.yaml")
     }
@@ -385,6 +404,33 @@ impl RunStore {
             &serde_json::to_vec_pretty(&record)?,
         )?;
         Ok(record)
+    }
+
+    /// Allocate a sub-run directory under an existing parent run and
+    /// return `(sub_run_id, transcript_path)`. The `sub_run_id` is
+    /// `sub_<ULID>`. Caller is the [`crate::runner`] when it spawns
+    /// a child agent run via the `dispatch_agent` tool — it uses the
+    /// returned id for the child agent's `run_id` and the path for
+    /// `transcript_path`. See
+    /// `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`
+    /// § 5.1 for the directory layout.
+    pub fn create_sub_run(
+        &self,
+        parent_run_id: &str,
+        agent: &str,
+    ) -> Result<(String, PathBuf), RunStoreError> {
+        let _ = agent; // currently unused at the storage layer; carried
+                       // for future telemetry / sub-run listing.
+        let sub_run_id = format!("sub_{}", ulid::Ulid::new());
+        let dir = self.sub_run_dir(parent_run_id, &sub_run_id);
+        std::fs::create_dir_all(&dir)?;
+        let transcript = self.sub_run_transcript(parent_run_id, &sub_run_id);
+        // Touch the transcript file so the printer's tailer can attach
+        // immediately (it tolerates empty/missing files but a present
+        // empty file removes a class of "did the runner start yet?"
+        // races during testing).
+        File::create(&transcript)?;
+        Ok((sub_run_id, transcript))
     }
 
     /// Load a run by id.
@@ -686,6 +732,7 @@ mod tests {
             expires_at: None,
             issue_ref: None,
             issue: None,
+            parent_run_id: None,
         }
     }
 

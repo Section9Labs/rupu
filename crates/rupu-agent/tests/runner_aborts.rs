@@ -35,6 +35,9 @@ fn opts(
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        parent_run_id: None,
+        depth: 0,
+        dispatchable_agents: None,
     }
 }
 

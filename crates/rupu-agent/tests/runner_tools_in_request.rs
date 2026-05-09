@@ -5,7 +5,7 @@ use rupu_tools::ToolContext;
 use std::sync::Arc;
 
 #[tokio::test]
-async fn run_passes_all_six_default_tools_to_provider() {
+async fn run_passes_all_default_tools_to_provider() {
     let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
         text: "done".into(),
         stop: StopReason::EndTurn,
@@ -18,7 +18,7 @@ async fn run_passes_all_six_default_tools_to_provider() {
     let opts = AgentRunOpts {
         agent_name: "all-tools".into(),
         agent_system_prompt: "test".into(),
-        agent_tools: None, // None = all 6 default tools
+        agent_tools: None, // None = every default tool
         provider: Box::new(provider),
         provider_name: "mock".into(),
         model: "mock-1".into(),
@@ -40,6 +40,9 @@ async fn run_passes_all_six_default_tools_to_provider() {
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        parent_run_id: None,
+        depth: 0,
+        dispatchable_agents: None,
     };
 
     run_agent(opts).await.unwrap();
@@ -49,8 +52,8 @@ async fn run_passes_all_six_default_tools_to_provider() {
     let tools = &requests[0].tools;
     assert_eq!(
         tools.len(),
-        6,
-        "expected 6 default tools, got {}",
+        7,
+        "expected 7 default tools (6 v0 + dispatch_agent), got {}",
         tools.len()
     );
 
@@ -60,11 +63,12 @@ async fn run_passes_all_six_default_tools_to_provider() {
         names,
         vec![
             "bash",
+            "dispatch_agent",
             "edit_file",
             "glob",
             "grep",
             "read_file",
-            "write_file"
+            "write_file",
         ]
     );
 
@@ -117,6 +121,9 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         anthropic_task_budget: None,
         anthropic_context_management: None,
         anthropic_speed: None,
+        parent_run_id: None,
+        depth: 0,
+        dispatchable_agents: None,
     };
 
     run_agent(opts).await.unwrap();

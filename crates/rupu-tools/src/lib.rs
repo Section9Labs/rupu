@@ -30,12 +30,18 @@ pub mod grep;
 pub mod glob;
 // implemented in Task 24 (subprocess execution with timeout + env allowlist)
 pub mod bash;
+// sub-agent dispatch (spec 2026-05-08): single-child synchronous.
+pub mod dispatch_agent;
 
 pub use bash::BashTool;
+pub use dispatch_agent::DispatchAgentTool;
 pub use edit_file::EditFileTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use permission::{PermissionGate, PermissionMode};
 pub use read_file::ReadFileTool;
-pub use tool::{DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
+pub use tool::{
+    AgentDispatcher, DerivedEvent, DispatchError, DispatchOutcome, Tool, ToolContext, ToolError,
+    ToolOutput,
+};
 pub use write_file::WriteFileTool;

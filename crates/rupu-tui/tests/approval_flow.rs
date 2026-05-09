@@ -22,6 +22,7 @@ fn paused_record(dir: &std::path::Path) -> RunRecord {
         expires_at: None,
         issue_ref: None,
         issue: None,
+        parent_run_id: None,
     }
 }
 

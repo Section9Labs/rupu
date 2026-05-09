@@ -85,7 +85,7 @@ impl JsonlTailSource {
         }
         self.offsets.insert(path.clone(), bytes.len() as u64);
         match serde_json::from_slice::<rupu_orchestrator::RunRecord>(&bytes) {
-            Ok(rec) => out.push(SourceEvent::RunUpdate(rec)),
+            Ok(rec) => out.push(SourceEvent::RunUpdate(Box::new(rec))),
             Err(e) => warn!(error = %e, "malformed run.json; skipped"),
         }
     }

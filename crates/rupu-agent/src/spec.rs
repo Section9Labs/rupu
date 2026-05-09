@@ -91,6 +91,14 @@ struct Frontmatter {
     /// Ignored by other providers.
     #[serde(default, rename = "anthropicSpeed")]
     anthropic_speed: Option<Speed>,
+    /// Allowlist of agent names this agent is permitted to dispatch
+    /// via the `dispatch_agent` / `dispatch_agents_parallel` tools.
+    /// `None` = the agent doesn't dispatch any children (default for
+    /// most agents). The dispatch tools fail at invocation if the
+    /// requested agent isn't in this list. See
+    /// `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
+    #[serde(default, rename = "dispatchableAgents")]
+    dispatchable_agents: Option<Vec<String>>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -111,6 +119,9 @@ pub struct AgentSpec {
     pub anthropic_task_budget: Option<u32>,
     pub anthropic_context_management: Option<ContextManagement>,
     pub anthropic_speed: Option<Speed>,
+    /// Per-agent allowlist of children this agent can dispatch via
+    /// `dispatch_agent` / `dispatch_agents_parallel`.
+    pub dispatchable_agents: Option<Vec<String>>,
     pub system_prompt: String,
 }
 
@@ -148,6 +159,7 @@ impl AgentSpec {
             anthropic_task_budget: fm.anthropic_task_budget,
             anthropic_context_management: fm.anthropic_context_management,
             anthropic_speed: fm.anthropic_speed,
+            dispatchable_agents: fm.dispatchable_agents,
             system_prompt: body.to_string(),
         })
     }

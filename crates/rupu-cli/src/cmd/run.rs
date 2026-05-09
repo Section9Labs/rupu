@@ -241,10 +241,18 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     };
 
     // Build tool context now that the resolved workspace_path is known.
+    // No dispatcher is wired for bare `rupu run`; sub-agent dispatch
+    // is a workflow-runner-only feature today (orchestrator wires the
+    // dispatcher per-step). A `dispatch_agent` tool call from a bare
+    // `rupu run` therefore returns a clear error.
     let tool_context = ToolContext {
         workspace_path: workspace_path.clone(),
         bash_env_allowlist: bash_allowlist,
         bash_timeout_secs: bash_timeout,
+        dispatcher: None,
+        dispatchable_agents: spec.dispatchable_agents.clone(),
+        parent_run_id: None,
+        depth: 0,
     };
 
     let mode_str = match mode {
@@ -284,6 +292,11 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         anthropic_task_budget: spec.anthropic_task_budget,
         anthropic_context_management: spec.anthropic_context_management,
         anthropic_speed: spec.anthropic_speed,
+        // Top-level `rupu run` invocation — no parent, depth 0,
+        // dispatch surface taken from the agent's frontmatter.
+        parent_run_id: None,
+        depth: 0,
+        dispatchable_agents: spec.dispatchable_agents.clone(),
     };
 
     // Spawn the agent in a background task and tail the transcript with

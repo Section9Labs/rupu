@@ -126,6 +126,21 @@ pub struct AgentRunOpts {
     /// Anthropic-only fast-mode toggle (account-gated). Ignored by
     /// other providers.
     pub anthropic_speed: Option<rupu_providers::types::Speed>,
+    /// When this run is a sub-agent dispatch, the parent run's id.
+    /// `None` for top-level workflow runs.
+    pub parent_run_id: Option<String>,
+    /// Dispatch depth — 0 for top-level workflow steps, 1 for direct
+    /// children of the parent, 2 for grandchildren, etc. The
+    /// `dispatch_agent` tool checks this against the per-agent +
+    /// workspace max-depth limit before spawning a child. See
+    /// `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`
+    /// § 4.3.
+    pub depth: u32,
+    /// Per-agent allowlist of children this agent can dispatch via
+    /// `dispatch_agent` / `dispatch_agents_parallel`. Pulled from the
+    /// agent's `dispatchableAgents:` frontmatter field. `None`
+    /// (default) ⇒ no dispatches allowed.
+    pub dispatchable_agents: Option<Vec<String>>,
 }
 
 /// Outcome of a finished run.

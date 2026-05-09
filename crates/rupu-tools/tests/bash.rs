@@ -8,6 +8,7 @@ fn ctx_with_timeout(secs: u64) -> ToolContext {
         workspace_path: pwd,
         bash_env_allowlist: vec![],
         bash_timeout_secs: secs,
+        ..Default::default()
     }
 }
 
