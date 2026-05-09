@@ -1425,10 +1425,13 @@ fn resolve_autoflow_permission_mode(
         .map(ToOwned::to_owned)
         .or_else(|| config_mode.map(ToOwned::to_owned))
         .unwrap_or_else(|| "bypass".to_string());
-    if mode == "ask" {
-        bail!("autoflow does not support `ask` permission mode; use `bypass` or `readonly`");
+    match mode.as_str() {
+        "bypass" | "readonly" => Ok(mode),
+        "ask" => {
+            bail!("autoflow does not support `ask` permission mode; use `bypass` or `readonly`")
+        }
+        _ => bail!("invalid autoflow permission mode `{mode}`; expected `bypass` or `readonly`"),
     }
-    Ok(mode)
 }
 
 fn reconcile_claim_from_last_run(
@@ -2772,6 +2775,14 @@ steps:
     }
 
     #[test]
+    fn autoflow_permission_mode_accepts_readonly() {
+        assert_eq!(
+            resolve_autoflow_permission_mode(Some("readonly"), Some("bypass")).unwrap(),
+            "readonly"
+        );
+    }
+
+    #[test]
     fn autoflow_permission_mode_rejects_ask_override() {
         let err = resolve_autoflow_permission_mode(Some("ask"), Some("bypass")).unwrap_err();
         assert!(
@@ -2786,6 +2797,24 @@ steps:
         assert!(
             err.to_string()
                 .contains("autoflow does not support `ask` permission mode")
+        );
+    }
+
+    #[test]
+    fn autoflow_permission_mode_rejects_unknown_override() {
+        let err = resolve_autoflow_permission_mode(Some("admin"), Some("bypass")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid autoflow permission mode `admin`")
+        );
+    }
+
+    #[test]
+    fn autoflow_permission_mode_rejects_unknown_config() {
+        let err = resolve_autoflow_permission_mode(None, Some("admin")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid autoflow permission mode `admin`")
         );
     }
 
