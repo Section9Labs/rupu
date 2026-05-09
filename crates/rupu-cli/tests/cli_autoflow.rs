@@ -21,71 +21,57 @@ const MOCK_SCRIPT: &str = r#"
 
 fn init_git_checkout(path: &std::path::Path, origin_url: &str) {
     std::fs::create_dir_all(path).unwrap();
-    assert!(
-        ProcessCommand::new("git")
-            .arg("init")
-            .arg("-b")
-            .arg("main")
-            .arg(path)
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.email", "test@example.com"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.name", "Test User"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "commit.gpgsign", "false"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["remote", "add", "origin", origin_url])
-            .status()
-            .unwrap()
-            .success()
-    );
+    assert!(ProcessCommand::new("git")
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .arg(path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "user.email", "test@example.com"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "user.name", "Test User"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["config", "commit.gpgsign", "false"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "add", "origin", origin_url])
+        .status()
+        .unwrap()
+        .success());
     std::fs::write(path.join("README.md"), "hello\n").unwrap();
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["add", "README.md"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["commit", "-m", "init"])
-            .status()
-            .unwrap()
-            .success()
-    );
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["add", "README.md"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["commit", "-m", "init"])
+        .status()
+        .unwrap()
+        .success());
 }
 
 fn write_agent_and_workflow(
@@ -454,6 +440,7 @@ steps:
         workspace_id: "ws_auto".into(),
         inputs: Vec::new(),
         mode: "bypass".into(),
+        invocation_source: rupu_runtime::RunTriggerSource::Autoflow,
         event: None,
         issue: Some(serde_json::json!({
             "title": "Fix bug",
@@ -465,11 +452,30 @@ steps:
         use_canvas: false,
         run_id_override: Some("run_explicit_permissive".into()),
         strict_templates: false,
+        run_envelope_template: None,
     };
     let summary = rupu_cli::cmd::workflow::run_with_explicit_context("auto-wf", ctx)
         .await
         .expect("permissive run should succeed");
     assert_eq!(summary.run_id, "run_explicit_permissive");
+    let envelope = rupu_orchestrator::RunStore::new(global.path().join("runs"))
+        .read_run_envelope(&summary.run_id)
+        .expect("run envelope should persist");
+    assert_eq!(
+        envelope.trigger.source,
+        rupu_runtime::RunTriggerSource::Autoflow
+    );
+    assert_eq!(
+        envelope
+            .context
+            .as_ref()
+            .and_then(|context| context.issue_ref.as_deref()),
+        Some("github:Section9Labs/rupu/issues/42")
+    );
+    assert!(envelope
+        .context
+        .as_ref()
+        .is_some_and(|context| context.issue_present));
 
     let strict_ctx = rupu_cli::cmd::workflow::ExplicitWorkflowRunContext {
         project_root: Some(project.path().to_path_buf()),
@@ -477,6 +483,7 @@ steps:
         workspace_id: "ws_auto".into(),
         inputs: Vec::new(),
         mode: "bypass".into(),
+        invocation_source: rupu_runtime::RunTriggerSource::Autoflow,
         event: None,
         issue: Some(serde_json::json!({
             "title": "Fix bug",
@@ -488,6 +495,7 @@ steps:
         use_canvas: false,
         run_id_override: Some("run_explicit_strict".into()),
         strict_templates: true,
+        run_envelope_template: None,
     };
     let err = rupu_cli::cmd::workflow::run_with_explicit_context("auto-wf", strict_ctx)
         .await

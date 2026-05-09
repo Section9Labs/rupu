@@ -19,6 +19,11 @@ use clap_complete::ArgValueCompleter;
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::RunWorkflowError;
+use rupu_runtime::{
+    AutoflowEnvelope, ExecutionRequest, RepoBinding, RunContext, RunCorrelation, RunEnvelope,
+    RunKind, RunTrigger, RunTriggerSource, WorkerRequest, WorkflowBinding,
+};
+use sha2::{Digest, Sha256};
 
 /// Convert a typed `RunWorkflowError` to `anyhow::Error`. Input
 /// validation variants get a Cargo-style YAML snippet pointing at
@@ -46,6 +51,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tracing::warn;
+use ulid::Ulid;
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
@@ -955,6 +961,7 @@ pub struct ExplicitWorkflowRunContext {
     pub workspace_id: String,
     pub inputs: Vec<(String, String)>,
     pub mode: String,
+    pub invocation_source: RunTriggerSource,
     pub event: Option<serde_json::Value>,
     pub issue: Option<serde_json::Value>,
     pub issue_ref: Option<String>,
@@ -963,6 +970,22 @@ pub struct ExplicitWorkflowRunContext {
     pub use_canvas: bool,
     pub run_id_override: Option<String>,
     pub strict_templates: bool,
+    pub run_envelope_template: Option<RunEnvelopeTemplate>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RunEnvelopeTemplate {
+    pub repo_ref: Option<String>,
+    pub wake_id: Option<String>,
+    pub event_id: Option<String>,
+    pub backend: Option<String>,
+    pub workspace_strategy: Option<String>,
+    pub autoflow_name: Option<String>,
+    pub autoflow_claim_id: Option<String>,
+    pub autoflow_priority: Option<i32>,
+    pub requested_worker: Option<String>,
+    pub target: Option<String>,
+    pub correlation: Option<RunCorrelation>,
 }
 
 /// Public wrapper around the workflow-run pipeline so other
@@ -1195,6 +1218,16 @@ async fn run_with_outcome(
         },
     }
 
+    let invocation_source = if target.is_some() {
+        RunTriggerSource::IssueCommand
+    } else if run_id_override.is_some() && event.is_some() {
+        RunTriggerSource::CronEvent
+    } else if event.is_some() {
+        RunTriggerSource::EventDispatch
+    } else {
+        RunTriggerSource::WorkflowCli
+    };
+
     execute_workflow_invocation(
         name,
         workflow,
@@ -1207,6 +1240,7 @@ async fn run_with_outcome(
             workspace_id: ws.id,
             inputs,
             mode: mode.unwrap_or("ask").to_string(),
+            invocation_source,
             event,
             issue: issue_payload,
             issue_ref: issue_ref_text,
@@ -1215,6 +1249,7 @@ async fn run_with_outcome(
             use_canvas,
             run_id_override,
             strict_templates: false,
+            run_envelope_template: None,
         },
     )
     .await
@@ -1251,6 +1286,12 @@ async fn run_path_with_outcome(
         );
     }
 
+    let invocation_source = if event.is_some() {
+        RunTriggerSource::EventDispatch
+    } else {
+        RunTriggerSource::WorkflowCli
+    };
+
     execute_workflow_invocation(
         &workflow_name,
         workflow,
@@ -1263,6 +1304,7 @@ async fn run_path_with_outcome(
             workspace_id: ws.id,
             inputs,
             mode: mode.unwrap_or("ask").to_string(),
+            invocation_source,
             event,
             issue: None,
             issue_ref: None,
@@ -1271,6 +1313,7 @@ async fn run_path_with_outcome(
             use_canvas,
             run_id_override,
             strict_templates: false,
+            run_envelope_template: None,
         },
     )
     .await
@@ -1288,6 +1331,78 @@ pub async fn run_with_explicit_context(
     execute_workflow_invocation(name, workflow, body, path, global, ctx).await
 }
 
+fn build_run_envelope(
+    run_id: String,
+    workflow: &Workflow,
+    workflow_body: &str,
+    workflow_path: &Path,
+    ctx: &ExplicitWorkflowRunContext,
+) -> RunEnvelope {
+    let template = ctx.run_envelope_template.clone().unwrap_or_default();
+    let repo_ref = template.repo_ref.clone().or_else(|| {
+        ctx.project_root
+            .as_deref()
+            .or(Some(ctx.workspace_path.as_path()))
+            .and_then(|path| crate::cmd::issues::autodetect_repo_from_path(path).ok())
+            .map(|repo| crate::cmd::issues::canonical_repo_ref(&repo))
+    });
+    let issue_ref = ctx.issue_ref.clone();
+    let target = template.target.clone().or_else(|| issue_ref.clone());
+
+    RunEnvelope {
+        version: RunEnvelope::VERSION,
+        run_id,
+        kind: RunKind::WorkflowRun,
+        workflow: WorkflowBinding {
+            name: workflow.name.clone(),
+            source_path: workflow_path.to_path_buf(),
+            fingerprint: workflow_fingerprint(workflow_body),
+        },
+        repo: Some(RepoBinding {
+            repo_ref,
+            project_root: ctx.project_root.clone(),
+            workspace_id: ctx.workspace_id.clone(),
+            workspace_path: ctx.workspace_path.clone(),
+        }),
+        trigger: RunTrigger {
+            source: ctx.invocation_source.clone(),
+            wake_id: template.wake_id,
+            event_id: template.event_id,
+        },
+        inputs: ctx.inputs.iter().cloned().collect(),
+        context: Some(RunContext {
+            issue_ref,
+            target,
+            event_present: ctx.event.is_some(),
+            issue_present: ctx.issue.is_some(),
+        }),
+        execution: ExecutionRequest {
+            backend: template.backend,
+            permission_mode: ctx.mode.clone(),
+            workspace_strategy: template.workspace_strategy,
+            strict_templates: ctx.strict_templates,
+            attach_ui: ctx.attach_ui,
+            use_canvas: ctx.use_canvas,
+        },
+        autoflow: template.autoflow_name.map(|name| AutoflowEnvelope {
+            name,
+            claim_id: template.autoflow_claim_id,
+            priority: template.autoflow_priority.unwrap_or_default(),
+        }),
+        correlation: template.correlation,
+        worker: template
+            .requested_worker
+            .map(|requested_worker| WorkerRequest {
+                requested_worker: Some(requested_worker),
+            }),
+    }
+}
+
+fn workflow_fingerprint(body: &str) -> String {
+    let digest = Sha256::digest(body.as_bytes());
+    format!("sha256:{}", hex::encode(digest))
+}
+
 async fn execute_workflow_invocation(
     name: &str,
     workflow: Workflow,
@@ -1300,6 +1415,11 @@ async fn execute_workflow_invocation(
     // `run_workflow` call sites below. `body` is consumed by `opts`
     // (cloned) so we keep the `Path` and `&str` references local.
     let path = workflow_path;
+    let run_id = ctx
+        .run_id_override
+        .clone()
+        .unwrap_or_else(|| format!("run_{}", Ulid::new()));
+    let run_envelope = build_run_envelope(run_id.clone(), &workflow, &body, &path, &ctx);
     let resolver = Arc::new(rupu_auth::KeychainResolver::new());
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = ctx
@@ -1325,6 +1445,9 @@ async fn execute_workflow_invocation(
     let runs_dir = global.join("runs");
     paths::ensure_dir(&runs_dir)?;
     let run_store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir.clone()));
+    run_store
+        .write_run_envelope(&run_id, &run_envelope)
+        .map_err(|e| anyhow::anyhow!("persist run envelope: {e}"))?;
 
     let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
         global.clone(),
@@ -1375,7 +1498,7 @@ async fn execute_workflow_invocation(
         run_store: Some(run_store),
         workflow_yaml: Some(body.clone()),
         resume_from: None,
-        run_id_override: ctx.run_id_override,
+        run_id_override: Some(run_id),
         strict_templates,
     };
 

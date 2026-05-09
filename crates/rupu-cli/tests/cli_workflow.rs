@@ -190,6 +190,17 @@ async fn workflow_run_executes_one_step_via_mock() {
     );
     let summary = rupu_transcript::JsonlReader::summary(entries[0].path()).unwrap();
     assert_eq!(summary.status, rupu_transcript::RunStatus::Ok);
+
+    let run_store = rupu_orchestrator::RunStore::new(global.path().join("runs"));
+    let runs = run_store.list().unwrap();
+    assert_eq!(runs.len(), 1, "expected exactly one persisted workflow run");
+    let envelope = run_store.read_run_envelope(&runs[0].id).unwrap();
+    assert_eq!(
+        envelope.trigger.source,
+        rupu_runtime::RunTriggerSource::WorkflowCli
+    );
+    assert_eq!(envelope.workflow.name, "hello-wf");
+    assert_eq!(envelope.execution.permission_mode, "bypass");
 }
 
 #[tokio::test]
