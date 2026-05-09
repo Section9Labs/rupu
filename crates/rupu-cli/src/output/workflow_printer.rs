@@ -33,6 +33,15 @@ const RUN_DIR_TIMEOUT_MS: u64 = 5_000;
 /// How long to keep polling after RunComplete before declaring done.
 const DRAIN_EXTRA_MS: u64 = 200;
 
+/// Tracks an in-flight dispatch tool call so the matching `ToolResult`
+/// can render the child / children inline. Single-child dispatches
+/// carry the requested agent name; parallel dispatches need no extra
+/// state because the result payload is keyed by the caller-chosen `id`.
+enum InFlightDispatch {
+    Single { agent: String },
+    Parallel,
+}
+
 /// Per-step printer state for a non-panel (linear) step.
 struct StepState {
     tailer: TranscriptTailer,
@@ -41,13 +50,12 @@ struct StepState {
     provider: Option<String>,
     model: Option<String>,
     spinner: Option<SpinnerHandle>,
-    /// In-flight `dispatch_agent` tool calls keyed by `call_id`. The
-    /// `ToolCall` event seeds the entry with the requested agent name;
-    /// the matching `ToolResult` consumes it and renders the child
-    /// callout from the persisted child transcript. Other tool calls
-    /// (bash, read_file, …) bypass this map and use the existing
-    /// `printer.tool_call` summary line.
-    dispatches: BTreeMap<String, String>,
+    /// In-flight dispatch tool calls keyed by `call_id`. Seeded by
+    /// `ToolCall` events for `dispatch_agent` /
+    /// `dispatch_agents_parallel`; consumed by the matching
+    /// `ToolResult`. Other tool calls (bash, read_file, …) bypass this
+    /// map and use the existing `printer.tool_call` summary line.
+    dispatches: BTreeMap<String, InFlightDispatch>,
 }
 
 /// What `attach_and_print` returned. The caller decides what to do next:
@@ -618,8 +626,8 @@ fn process_event(
             call_id,
             tool,
             input,
-        } => {
-            if tool == "dispatch_agent" {
+        } => match tool.as_str() {
+            "dispatch_agent" => {
                 // Record the in-flight dispatch so the matching
                 // ToolResult can replay the child as a nested frame.
                 // Don't emit a `dispatch_agent <agent>` summary line —
@@ -629,19 +637,28 @@ fn process_event(
                     .and_then(|v| v.as_str())
                     .unwrap_or("?")
                     .to_string();
-                step.dispatches.insert(call_id, agent);
-            } else {
+                step.dispatches
+                    .insert(call_id, InFlightDispatch::Single { agent });
+            }
+            "dispatch_agents_parallel" => {
+                step.dispatches.insert(call_id, InFlightDispatch::Parallel);
+            }
+            _ => {
                 let summary = summarize_tool_input(&tool, &input);
                 printer.tool_call(&tool, &summary);
             }
-        }
+        },
         TxEvent::ToolResult {
             call_id, output, ..
-        } => {
-            if let Some(agent_name) = step.dispatches.remove(&call_id) {
-                render_dispatch_child(&agent_name, &output, printer);
+        } => match step.dispatches.remove(&call_id) {
+            Some(InFlightDispatch::Single { agent }) => {
+                render_dispatch_child(&agent, &output, printer);
             }
-        }
+            Some(InFlightDispatch::Parallel) => {
+                render_dispatch_children(&output, printer);
+            }
+            None => {}
+        },
         TxEvent::RunComplete {
             status,
             total_tokens: tokens,
@@ -684,13 +701,49 @@ fn render_dispatch_child(agent_name: &str, output: &str, printer: &mut LineStrea
         Ok(v) => v,
         Err(_) => return,
     };
-    let transcript_path = parsed["transcript_path"]
+    printer.push_indent();
+    render_one_child(agent_name, &parsed, printer);
+    printer.pop_indent();
+}
+
+/// Render every child of a `dispatch_agents_parallel` call. The tool
+/// returns `{ results: { id: outcome, ... }, all_succeeded }`; we open
+/// a single indent+1 frame and emit one child callout per id, headlined
+/// by the caller-chosen id (so two `security-reviewer` calls with
+/// distinct ids stay distinguishable in the output). serde_json's
+/// default `Map` is BTreeMap-backed, so iteration order is alphabetical
+/// — the same order the parent agent saw when it parsed the result, so
+/// the rendering matches what the model is reasoning about.
+fn render_dispatch_children(output: &str, printer: &mut LineStreamPrinter) {
+    let parsed: serde_json::Value = match serde_json::from_str(output) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(results) = parsed.get("results").and_then(|v| v.as_object()) else {
+        return;
+    };
+    if results.is_empty() {
+        return;
+    }
+    printer.push_indent();
+    for (id, outcome) in results.iter() {
+        render_one_child(id, outcome, printer);
+    }
+    printer.pop_indent();
+}
+
+/// Render one child callout: open frame, replay the persisted
+/// transcript inline, close frame. Shared between the single-dispatch
+/// and parallel-dispatch renderers.
+fn render_one_child(headline: &str, outcome: &serde_json::Value, printer: &mut LineStreamPrinter) {
+    let transcript_path = outcome["transcript_path"]
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_default();
-    let tokens_used = parsed["tokens_used"].as_u64().unwrap_or(0);
-    let duration_ms = parsed["duration_ms"].as_u64().unwrap_or(0);
-    let success = parsed["ok"].as_bool().unwrap_or(true);
+    let tokens_used = outcome["tokens_used"].as_u64().unwrap_or(0);
+    let duration_ms = outcome["duration_ms"].as_u64().unwrap_or(0);
+    let success = outcome["ok"].as_bool().unwrap_or(true);
+    let dispatch_error = outcome["error"].as_str();
 
     let events: Vec<TxEvent> = if !transcript_path.as_os_str().is_empty() && transcript_path.exists()
     {
@@ -709,10 +762,9 @@ fn render_dispatch_child(agent_name: &str, output: &str, printer: &mut LineStrea
         })
         .unwrap_or((String::new(), String::new()));
 
-    printer.push_indent();
     let spinner = printer.step_start(
-        agent_name,
-        Some(agent_name),
+        headline,
+        Some(headline),
         non_empty(&provider),
         non_empty(&model),
     );
@@ -730,11 +782,11 @@ fn render_dispatch_child(agent_name: &str, output: &str, printer: &mut LineStrea
     }
     spinner.stop();
     if success {
-        printer.step_done(agent_name, Duration::from_millis(duration_ms), tokens_used);
+        printer.step_done(headline, Duration::from_millis(duration_ms), tokens_used);
     } else {
-        printer.step_failed(agent_name, "dispatch failed");
+        let reason = dispatch_error.unwrap_or("dispatch failed");
+        printer.step_failed(headline, reason);
     }
-    printer.pop_indent();
 }
 
 fn flush_all_tailers(

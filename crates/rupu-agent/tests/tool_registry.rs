@@ -31,6 +31,7 @@ fn known_tools_returns_sorted_list() {
         vec![
             "bash",
             "dispatch_agent",
+            "dispatch_agents_parallel",
             "edit_file",
             "glob",
             "grep",
@@ -53,7 +54,7 @@ fn registry_respects_agent_tools_filter() {
 fn to_tool_definitions_returns_all_default_tools() {
     let r = default_tool_registry();
     let defs = r.to_tool_definitions();
-    assert_eq!(defs.len(), 7);
+    assert_eq!(defs.len(), 8);
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     names.sort();
     assert_eq!(
@@ -61,6 +62,7 @@ fn to_tool_definitions_returns_all_default_tools() {
         vec![
             "bash",
             "dispatch_agent",
+            "dispatch_agents_parallel",
             "edit_file",
             "glob",
             "grep",
