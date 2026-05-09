@@ -646,6 +646,8 @@ async fn claims() -> anyhow::Result<()> {
         "Priority",
         "Status",
         "Next",
+        "PR",
+        "Summary",
         "Contenders",
         "Workspace",
     ]);
@@ -654,6 +656,8 @@ async fn claims() -> anyhow::Result<()> {
             .map(|value| value.to_string())
             .unwrap_or_else(|| "-".into());
         let next = next_action_summary(&claim);
+        let pr = claim.pr_url.clone().unwrap_or_else(|| "-".into());
+        let summary = claim_summary(&claim);
         let contenders = format_contenders(&claim.contenders);
         table.add_row(vec![
             Cell::new(claim.issue_ref),
@@ -661,6 +665,8 @@ async fn claims() -> anyhow::Result<()> {
             Cell::new(priority),
             Cell::new(status_name(claim.status)),
             Cell::new(next),
+            Cell::new(pr),
+            Cell::new(summary),
             Cell::new(contenders),
             Cell::new(claim.worktree_path.unwrap_or_else(|| "-".into())),
         ]);
@@ -1057,6 +1063,9 @@ async fn execute_autoflow_cycle(
             branch: None,
             last_run_id: None,
             last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -1223,6 +1232,9 @@ fn apply_terminal_run_to_claim(
     )?;
     let outcome: AutoflowOutcomeDoc = serde_json::from_value(raw_output)?;
     claim.last_error = None;
+    claim.last_summary = outcome.summary.clone();
+    claim.pr_url = outcome.pr_url.clone();
+    claim.artifacts = outcome.artifacts.clone();
     claim.next_retry_at = None;
     claim.pending_dispatch = None;
 
@@ -1245,9 +1257,6 @@ fn apply_terminal_run_to_claim(
     if let Some(reason) = outcome.reason {
         claim.last_error = Some(reason);
     }
-    let _ = outcome.summary;
-    let _ = outcome.pr_url;
-    let _ = outcome.artifacts;
 
     claim.status = match outcome.status {
         AutoflowOutcomeStatus::Continue => ClaimStatus::Claimed,
@@ -2055,6 +2064,27 @@ fn next_action_summary(claim: &AutoflowClaimRecord) -> String {
     }
 }
 
+fn claim_summary(claim: &AutoflowClaimRecord) -> String {
+    claim
+        .last_summary
+        .as_deref()
+        .map(|value| truncate_for_table(value, 48))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn truncate_for_table(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return trimmed.to_string();
+    }
+    let head = chars
+        .into_iter()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    format!("{head}…")
+}
+
 fn format_contenders(contenders: &[AutoflowContender]) -> String {
     if contenders.is_empty() {
         return "-".into();
@@ -2291,6 +2321,9 @@ steps:
             branch: None,
             last_run_id: None,
             last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -2332,6 +2365,9 @@ steps:
             branch: None,
             last_run_id: None,
             last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -2482,7 +2518,7 @@ steps:
                     step_id: "decide".into(),
                     run_id: "step_1".into(),
                     transcript_path: global.join("transcripts/step.jsonl"),
-                    output: r#"{"status":"continue","dispatch":{"workflow":"phase-delivery-cycle","target":"github:Section9Labs/rupu/issues/42","inputs":{"phase":"phase-1"}}}"#.into(),
+                    output: r#"{"status":"continue","summary":"phase 1 is ready","pr_url":"https://github.com/Section9Labs/rupu/pull/42","artifacts":{"review_packet":"docs/reviews/issue-42.json"},"dispatch":{"workflow":"phase-delivery-cycle","target":"github:Section9Labs/rupu/issues/42","inputs":{"phase":"phase-1"}}}"#.into(),
                     success: true,
                     skipped: false,
                     rendered_prompt: "hi".into(),
@@ -2505,6 +2541,9 @@ steps:
             branch: None,
             last_run_id: Some("run_dispatch".into()),
             last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -2514,6 +2553,18 @@ steps:
         };
         apply_terminal_run_to_claim(&global, &resolved, "run_dispatch", &mut claim).unwrap();
         assert_eq!(claim.status, ClaimStatus::Claimed);
+        assert_eq!(claim.last_summary.as_deref(), Some("phase 1 is ready"));
+        assert_eq!(
+            claim.pr_url.as_deref(),
+            Some("https://github.com/Section9Labs/rupu/pull/42")
+        );
+        assert_eq!(
+            claim
+                .artifacts
+                .as_ref()
+                .and_then(|value| value.get("review_packet")),
+            Some(&serde_json::json!("docs/reviews/issue-42.json"))
+        );
         let dispatch = claim.pending_dispatch.expect("dispatch");
         assert_eq!(dispatch.workflow, "phase-delivery-cycle");
         assert_eq!(
@@ -2743,6 +2794,9 @@ steps:
                 branch: Some("rupu/issue-123".into()),
                 last_run_id: None,
                 last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(
@@ -2843,6 +2897,9 @@ steps:
                 branch: Some("rupu/issue-42".into()),
                 last_run_id: Some("run_done".into()),
                 last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: None,
@@ -3091,6 +3148,9 @@ base_url = "{}"
                 branch: Some("rupu/issue-123".into()),
                 last_run_id: Some("run_123".into()),
                 last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: None,
@@ -3251,6 +3311,9 @@ base_url = "{}"
                 branch: Some("rupu/issue-123".into()),
                 last_run_id: None,
                 last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(

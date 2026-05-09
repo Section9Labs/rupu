@@ -237,6 +237,9 @@ async fn autoflow_release_deletes_claim() {
             branch: None,
             last_run_id: None,
             last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -281,6 +284,11 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
             branch: None,
             last_run_id: Some("run_123".into()),
             last_error: None,
+            last_summary: Some("Draft PR opened and ready for review".into()),
+            pr_url: Some("https://github.com/Section9Labs/rupu/pull/42".into()),
+            artifacts: Some(serde_json::json!({
+                "review_packet": "docs/reviews/issue-42.json"
+            })),
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -310,8 +318,16 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Priority"))
+        .stdout(predicate::str::contains("PR"))
+        .stdout(predicate::str::contains("Summary"))
         .stdout(predicate::str::contains("Contenders"))
         .stdout(predicate::str::contains("controller"))
+        .stdout(predicate::str::contains(
+            "https://github.com/Section9Labs/rupu/pull/42",
+        ))
+        .stdout(predicate::str::contains(
+            "Draft PR opened and ready for review",
+        ))
         .stdout(predicate::str::contains("*controller[100]"))
         .stdout(predicate::str::contains("phase-ready[50]"));
 }
