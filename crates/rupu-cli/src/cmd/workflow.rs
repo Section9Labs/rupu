@@ -18,6 +18,27 @@ use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
+use rupu_orchestrator::RunWorkflowError;
+
+/// Convert a typed `RunWorkflowError` to `anyhow::Error`. Input
+/// validation variants get a Cargo-style YAML snippet pointing at
+/// the offending declaration; everything else falls through to the
+/// typed error's `Display`. Path + body must point at the workflow
+/// the runner just rejected — that's what the snippet renders.
+fn to_anyhow_with_input_snippet(
+    e: RunWorkflowError,
+    path: &std::path::Path,
+    body: &str,
+) -> anyhow::Error {
+    let formatted = crate::output::yaml_snippet::render_input_error(&e, path, body);
+    if formatted == e.to_string() {
+        // Non-input variant — fall through to the standard conversion
+        // so anyhow's source-chain integration remains intact.
+        anyhow::Error::from(e)
+    } else {
+        anyhow::anyhow!("{formatted}")
+    }
+}
 use rupu_orchestrator::Workflow;
 use rupu_tools::ToolContext;
 use std::collections::BTreeMap;
@@ -1151,6 +1172,7 @@ async fn run_with_outcome(
         name,
         workflow,
         body,
+        path,
         global,
         ExplicitWorkflowRunContext {
             project_root: project_root.clone(),
@@ -1180,16 +1202,21 @@ pub async fn run_with_explicit_context(
     let path = locate_workflow_in(&global, ctx.project_root.as_deref(), name)?;
     let body = std::fs::read_to_string(&path)?;
     let workflow = Workflow::parse(&body)?;
-    execute_workflow_invocation(name, workflow, body, global, ctx).await
+    execute_workflow_invocation(name, workflow, body, path, global, ctx).await
 }
 
 async fn execute_workflow_invocation(
     name: &str,
     workflow: Workflow,
     body: String,
+    workflow_path: PathBuf,
     global: PathBuf,
     ctx: ExplicitWorkflowRunContext,
 ) -> anyhow::Result<RunOutcomeSummary> {
+    // Borrow alias used by the input-snippet renderer at the
+    // `run_workflow` call sites below. `body` is consumed by `opts`
+    // (cloned) so we keep the `Path` and `&str` references local.
+    let path = workflow_path;
     let resolver = Arc::new(rupu_auth::KeychainResolver::new());
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = ctx
@@ -1282,7 +1309,7 @@ async fn execute_workflow_invocation(
                 runner_task
                     .await
                     .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-                    .map_err(anyhow::Error::from)?
+                    .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
             } else {
                 let printer_store = rupu_orchestrator::RunStore::new(runs_dir.clone());
                 let mut printer = crate::output::LineStreamPrinter::new();
@@ -1309,7 +1336,7 @@ async fn execute_workflow_invocation(
                     let result = current_runner
                         .await
                         .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-                        .map_err(anyhow::Error::from)?;
+                        .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?;
 
                     use crate::output::workflow_printer::AttachOutcome;
                     match outcome {
@@ -1364,10 +1391,12 @@ async fn execute_workflow_invocation(
             runner_task
                 .await
                 .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-                .map_err(anyhow::Error::from)?
+                .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
         }
     } else {
-        run_workflow(opts).await?
+        run_workflow(opts)
+            .await
+            .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
     };
 
     if notify_issue_enabled {
