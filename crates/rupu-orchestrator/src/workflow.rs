@@ -205,6 +205,12 @@ pub struct InputDef {
     /// three input types via stringification).
     #[serde(rename = "enum", default)]
     pub allowed: Vec<String>,
+    /// Free-form human description. Surfaced in `rupu workflow show`
+    /// and similar listings; ignored by the runtime. Matches the
+    /// convention from GitHub Actions / Argo / etc. so authors can
+    /// drop it in without surprise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 impl InputDef {

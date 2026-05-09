@@ -210,6 +210,20 @@ fn accepts_typed_inputs_block() {
 }
 
 #[test]
+fn accepts_input_description_field() {
+    // `description:` is a free-form metadata field — common in
+    // GitHub Actions / Argo / etc. Authors drop it in to document
+    // each input; the runtime ignores it. Pre-fix it would trip the
+    // `deny_unknown_fields` guard on `InputDef`.
+    let s = "name: x\ninputs:\n  subject:\n    type: string\n    required: true\n    description: \"Path to review.\"\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
+    let wf = Workflow::parse(s).expect("inputs: with description should parse");
+    assert_eq!(
+        wf.inputs["subject"].description.as_deref(),
+        Some("Path to review.")
+    );
+}
+
+#[test]
 fn rejects_input_default_with_wrong_type() {
     let s = "name: x\ninputs:\n  threshold:\n    type: int\n    default: \"thirty\"\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n";
     let err = format!("{}", Workflow::parse(s).unwrap_err());
