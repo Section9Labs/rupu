@@ -3450,6 +3450,7 @@ dependencies = [
  "comfy-table",
  "crossterm 0.28.1",
  "dirs",
+ "hex",
  "httpmock",
  "indicatif",
  "jsonschema",
@@ -3462,6 +3463,7 @@ dependencies = [
  "rupu-mcp",
  "rupu-orchestrator",
  "rupu-providers",
+ "rupu-runtime",
  "rupu-scm",
  "rupu-tools",
  "rupu-transcript",
@@ -3471,6 +3473,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "syntect",
  "tempfile",
  "thiserror 2.0.18",
@@ -3535,6 +3538,7 @@ dependencies = [
  "predicates",
  "rupu-agent",
  "rupu-providers",
+ "rupu-runtime",
  "rupu-tools",
  "rupu-transcript",
  "serde",
@@ -3568,6 +3572,14 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rupu-runtime"
+version = "0.5.4"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

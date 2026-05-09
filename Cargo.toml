@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rupu-transcript",
+    "crates/rupu-runtime",
     "crates/rupu-config",
     "crates/rupu-workspace",
     "crates/rupu-auth",

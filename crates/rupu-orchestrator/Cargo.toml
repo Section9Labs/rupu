@@ -24,6 +24,7 @@ ulid.workspace = true
 
 # In-workspace
 rupu-agent = { path = "../rupu-agent" }
+rupu-runtime = { path = "../rupu-runtime" }
 rupu-transcript = { path = "../rupu-transcript" }
 
 [dev-dependencies]

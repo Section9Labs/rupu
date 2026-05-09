@@ -5,7 +5,7 @@ use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::workflow::{
-    locate_workflow_in, run_with_explicit_context, ExplicitWorkflowRunContext,
+    locate_workflow_in, run_with_explicit_context, ExplicitWorkflowRunContext, RunEnvelopeTemplate,
 };
 use crate::paths;
 use anyhow::{anyhow, bail, Context};
@@ -20,6 +20,7 @@ use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
     WorkflowOutputContract,
 };
+use rupu_runtime::RunTriggerSource;
 use rupu_scm::{
     Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
 };
@@ -75,15 +76,15 @@ pub struct RepoFilterArgs {
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedAutoflowWorkflow {
-    scope: String,
-    name: String,
-    workflow: Workflow,
-    workflow_path: PathBuf,
-    project_root: Option<PathBuf>,
-    repo_ref: String,
-    preferred_checkout: PathBuf,
-    cfg: Config,
+pub(crate) struct ResolvedAutoflowWorkflow {
+    pub(crate) scope: String,
+    pub(crate) name: String,
+    pub(crate) workflow: Workflow,
+    pub(crate) workflow_path: PathBuf,
+    pub(crate) project_root: Option<PathBuf>,
+    pub(crate) repo_ref: String,
+    pub(crate) preferred_checkout: PathBuf,
+    pub(crate) cfg: Config,
 }
 
 impl ResolvedAutoflowWorkflow {
@@ -118,10 +119,10 @@ impl VisibleAutoflowWorkflow {
 }
 
 #[derive(Debug, Clone)]
-struct IssueMatch {
-    resolved: ResolvedAutoflowWorkflow,
-    issue: Issue,
-    issue_ref_text: String,
+pub(crate) struct IssueMatch {
+    pub(crate) resolved: ResolvedAutoflowWorkflow,
+    pub(crate) issue: Issue,
+    pub(crate) issue_ref_text: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -161,11 +162,11 @@ struct DispatchDoc {
 }
 
 #[derive(Debug, Clone, Default)]
-struct WakeHints {
-    by_issue: BTreeMap<String, BTreeSet<String>>,
-    by_repo: BTreeMap<String, BTreeSet<String>>,
-    total_polled_events: usize,
-    total_webhook_events: usize,
+pub(crate) struct WakeHints {
+    pub(crate) by_issue: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) by_repo: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) total_polled_events: usize,
+    pub(crate) total_webhook_events: usize,
 }
 
 impl WakeHints {
@@ -183,7 +184,7 @@ impl WakeHints {
         }
     }
 
-    fn events_for(&self, issue_ref: &str, repo_ref: &str) -> BTreeSet<String> {
+    pub(crate) fn events_for(&self, issue_ref: &str, repo_ref: &str) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         if let Some(events) = self.by_repo.get(repo_ref) {
             out.extend(events.iter().cloned());
@@ -440,320 +441,27 @@ fn ensure_manual_run_can_take_claim(
 }
 
 async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Result<()> {
-    let global = paths::global_dir()?;
-    paths::ensure_dir(&global)?;
-    let repo_store = RepoRegistryStore {
-        root: paths::repos_dir(&global),
-    };
-    let claim_store = AutoflowClaimStore {
-        root: paths::autoflow_claims_dir(&global),
-    };
-    let cleaned = cleanup_terminal_claims(&global, &repo_store, &claim_store, chrono::Utc::now())?;
-    let discovered = discover_tick_autoflows(&global, &repo_store)?;
-    if discovered.is_empty() {
-        if cleaned == 0 {
+    let report = crate::cmd::autoflow_runtime::tick_with_resolver(resolver).await?;
+    if report.workflow_count == 0 {
+        if report.cleaned_claims == 0 {
             println!("(no autoflows)");
         } else {
             println!(
-                "autoflow tick: 0 workflow(s), 0 polled event(s), 0 webhook event(s), 0 cycle(s) ran, 0 skipped, {cleaned} cleaned"
+                "autoflow tick: 0 workflow(s), 0 polled event(s), 0 webhook event(s), 0 cycle(s) ran, 0 skipped, {} cleaned",
+                report.cleaned_claims
             );
         }
         return Ok(());
     }
-    let wake_hints = collect_wake_hints(&global, &discovered, resolver.as_ref())
-        .await
-        .context("collect autoflow wake hints")?;
-
-    let tick_started_at = chrono::Utc::now();
-    let matches = collect_issue_matches(&discovered, resolver.as_ref())
-        .await
-        .context("discover autoflow issue matches")?;
-    let contenders_by_issue = summarize_issue_contenders(&matches);
-    let winners = choose_winning_matches(matches);
-    let mut claims_by_issue: BTreeMap<String, AutoflowClaimRecord> = claim_store
-        .list()?
-        .into_iter()
-        .map(|claim| (claim.issue_ref.clone(), claim))
-        .collect();
-    let mut issue_keys: BTreeSet<String> = winners.keys().cloned().collect();
-    issue_keys.extend(claims_by_issue.keys().cloned());
-
-    let mut active_claim_counts: BTreeMap<String, usize> = BTreeMap::new();
-    for claim in claims_by_issue.values() {
-        if claim_counts_toward_max_active(claim.status) {
-            *active_claim_counts
-                .entry(claim.repo_ref.clone())
-                .or_insert(0) += 1;
-        }
-    }
-
-    let mut ran = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = 0usize;
-
-    for issue_ref_text in issue_keys {
-        let winner = winners.get(&issue_ref_text).cloned();
-        let claim = claims_by_issue.remove(&issue_ref_text);
-        let contenders = contenders_by_issue
-            .get(&issue_ref_text)
-            .cloned()
-            .unwrap_or_default();
-        let repo_hint = claim
-            .as_ref()
-            .map(|current| current.repo_ref.clone())
-            .or_else(|| {
-                winner
-                    .as_ref()
-                    .map(|matched| matched.resolved.repo_ref.clone())
-            });
-        let workflow_hint = claim
-            .as_ref()
-            .map(|current| current.workflow.clone())
-            .or_else(|| {
-                winner
-                    .as_ref()
-                    .map(|matched| matched.resolved.workflow.name.clone())
-            });
-
-        let issue_result: anyhow::Result<bool> = async {
-            if let Some(mut current) = claim {
-                let previous_status = current.status;
-                let active_lock = claim_store.read_active_lock(&issue_ref_text)?;
-                let claim_expired = claim_lease_expired(&current)?;
-                let owner_resolution = resolve_autoflow_workflow_for_repo(
-                    &global,
-                    &repo_store,
-                    &current.repo_ref,
-                    &current.workflow,
-                );
-
-                if owner_resolution.is_err() && (!claim_expired || active_lock.is_some()) {
-                    return Ok(false);
-                }
-                if claim_expired && active_lock.is_none() && owner_resolution.is_err() {
-                    current.status = ClaimStatus::Released;
-                    current.updated_at = chrono::Utc::now().to_rfc3339();
-                    claim_store.save(&current)?;
-                    adjust_active_claim_count(
-                        &mut active_claim_counts,
-                        &current.repo_ref,
-                        Some(previous_status),
-                        Some(current.status),
-                    );
-                    if winner.is_none() {
-                        return Ok(false);
-                    }
-                } else {
-                    let mut resolved = owner_resolution?;
-                    current.contenders = active_or_fallback_contenders(
-                        &contenders,
-                        Some(&resolved),
-                        &current.workflow,
-                    );
-                    reconcile_claim_from_last_run(&global, &resolved, &mut current)?;
-
-                    if claim_should_yield_to_winner(
-                        &current,
-                        winner.as_ref(),
-                        active_lock.is_some(),
-                    ) {
-                        if let Some(winner) = winner.as_ref() {
-                            current.contenders = active_or_fallback_contenders(
-                                &contenders,
-                                Some(&winner.resolved),
-                                &winner.resolved.workflow.name,
-                            );
-                        }
-                        current.status = ClaimStatus::Released;
-                        current.pending_dispatch = None;
-                        current.updated_at = chrono::Utc::now().to_rfc3339();
-                        claim_store.save(&current)?;
-                        adjust_active_claim_count(
-                            &mut active_claim_counts,
-                            &current.repo_ref,
-                            Some(previous_status),
-                            Some(current.status),
-                        );
-                    } else if current.status == ClaimStatus::Released {
-                        claim_store.save(&current)?;
-                        adjust_active_claim_count(
-                            &mut active_claim_counts,
-                            &current.repo_ref,
-                            Some(previous_status),
-                            Some(current.status),
-                        );
-                    } else if current.status == ClaimStatus::Complete
-                        || current.status == ClaimStatus::Blocked
-                    {
-                        claim_store.save(&current)?;
-                        adjust_active_claim_count(
-                            &mut active_claim_counts,
-                            &current.repo_ref,
-                            Some(previous_status),
-                            Some(current.status),
-                        );
-                        return Ok(false);
-                    } else if let Some(dispatch) = current.pending_dispatch.clone() {
-                        if !updated_before_tick(&current, tick_started_at)? {
-                            claim_store.save(&current)?;
-                            adjust_active_claim_count(
-                                &mut active_claim_counts,
-                                &current.repo_ref,
-                                Some(previous_status),
-                                Some(current.status),
-                            );
-                            return Ok(false);
-                        }
-                        resolved = resolve_autoflow_workflow_for_repo(
-                            &global,
-                            &repo_store,
-                            &current.repo_ref,
-                            &dispatch.workflow,
-                        )?;
-                        let issue = fetch_issue(
-                            &resolved.cfg,
-                            resolver.as_ref(),
-                            &parse_issue_ref_text(&issue_ref_text)?,
-                        )
-                        .await?;
-                        execute_autoflow_cycle(
-                            &global,
-                            &claim_store,
-                            &resolved,
-                            &issue,
-                            &issue_ref_text,
-                            None,
-                            false,
-                            dispatch.inputs,
-                            current.contenders.clone(),
-                        )
-                        .await?;
-                        adjust_active_claim_count(
-                            &mut active_claim_counts,
-                            &current.repo_ref,
-                            Some(previous_status),
-                            Some(load_claim_status(&claim_store, &issue_ref_text)?),
-                        );
-                        return Ok(true);
-                    } else if should_run_claim(
-                        &current,
-                        &resolved,
-                        &claim_store,
-                        tick_started_at,
-                        &wake_hints.events_for(&issue_ref_text, &current.repo_ref),
-                    )? {
-                        let issue = fetch_issue(
-                            &resolved.cfg,
-                            resolver.as_ref(),
-                            &parse_issue_ref_text(&issue_ref_text)?,
-                        )
-                        .await?;
-                        execute_autoflow_cycle(
-                            &global,
-                            &claim_store,
-                            &resolved,
-                            &issue,
-                            &issue_ref_text,
-                            None,
-                            false,
-                            BTreeMap::new(),
-                            current.contenders.clone(),
-                        )
-                        .await?;
-                        adjust_active_claim_count(
-                            &mut active_claim_counts,
-                            &current.repo_ref,
-                            Some(previous_status),
-                            Some(load_claim_status(&claim_store, &issue_ref_text)?),
-                        );
-                        return Ok(true);
-                    } else {
-                        claim_store.save(&current)?;
-                        adjust_active_claim_count(
-                            &mut active_claim_counts,
-                            &current.repo_ref,
-                            Some(previous_status),
-                            Some(current.status),
-                        );
-                        return Ok(false);
-                    }
-                }
-            }
-
-            let Some(winner) = winner else {
-                return Ok(false);
-            };
-            let max_active = winner.resolved.cfg.autoflow.max_active.unwrap_or(u32::MAX) as usize;
-            let active = active_claim_counts
-                .get(&winner.resolved.repo_ref)
-                .copied()
-                .unwrap_or_default();
-            if active >= max_active {
-                return Ok(false);
-            }
-            execute_autoflow_cycle(
-                &global,
-                &claim_store,
-                &winner.resolved,
-                &winner.issue,
-                &winner.issue_ref_text,
-                None,
-                false,
-                BTreeMap::new(),
-                active_or_fallback_contenders(
-                    &contenders,
-                    Some(&winner.resolved),
-                    &winner.resolved.workflow.name,
-                ),
-            )
-            .await?;
-            adjust_active_claim_count(
-                &mut active_claim_counts,
-                &winner.resolved.repo_ref,
-                None,
-                Some(load_claim_status(&claim_store, &winner.issue_ref_text)?),
-            );
-            Ok(true)
-        }
-        .await;
-
-        match issue_result {
-            Ok(true) => ran += 1,
-            Ok(false) => skipped += 1,
-            Err(err) => {
-                failed += 1;
-                if let Some(repo_ref) = repo_hint.as_deref() {
-                    if let Err(sync_err) =
-                        sync_active_claim_count(&mut active_claim_counts, &claim_store, repo_ref)
-                    {
-                        warn!(
-                            issue_ref = %issue_ref_text,
-                            repo_ref,
-                            error = %sync_err,
-                            "failed to resync autoflow capacity after issue error"
-                        );
-                    }
-                }
-                warn!(
-                    issue_ref = %issue_ref_text,
-                    repo_ref = repo_hint.as_deref().unwrap_or("-"),
-                    workflow = workflow_hint.as_deref().unwrap_or("-"),
-                    error = %err,
-                    "autoflow tick failed for issue"
-                );
-            }
-        }
-    }
-
     println!(
         "autoflow tick: {} workflow(s), {} polled event(s), {} webhook event(s), {} cycle(s) ran, {} skipped, {} failed, {} cleaned",
-        discovered.len(),
-        wake_hints.total_polled_events,
-        wake_hints.total_webhook_events,
-        ran,
-        skipped,
-        failed,
-        cleaned
+        report.workflow_count,
+        report.polled_event_count,
+        report.webhook_event_count,
+        report.ran_cycles,
+        report.skipped_cycles,
+        report.failed_cycles,
+        report.cleaned_claims
     );
     Ok(())
 }
@@ -1051,7 +759,7 @@ fn visible_autoflow_key(repo_ref: Option<&str>, scope: &str, path: &Path) -> Str
     format!("{}|{}|{}", repo_ref.unwrap_or("-"), scope, path.display())
 }
 
-fn discover_tick_autoflows(
+pub(crate) fn discover_tick_autoflows(
     global: &Path,
     repo_store: &RepoRegistryStore,
 ) -> anyhow::Result<Vec<ResolvedAutoflowWorkflow>> {
@@ -1122,7 +830,7 @@ fn discover_tick_autoflows(
     Ok(out)
 }
 
-async fn collect_wake_hints(
+pub(crate) async fn collect_wake_hints(
     global: &Path,
     discovered: &[ResolvedAutoflowWorkflow],
     resolver: &dyn CredentialResolver,
@@ -1231,7 +939,7 @@ fn collect_webhook_wake_events(
     drain_webhook_wake_events(&root, &repo_refs)
 }
 
-async fn collect_issue_matches(
+pub(crate) async fn collect_issue_matches(
     discovered: &[ResolvedAutoflowWorkflow],
     resolver: &dyn CredentialResolver,
 ) -> anyhow::Result<Vec<IssueMatch>> {
@@ -1269,7 +977,7 @@ async fn collect_issue_matches(
     Ok(out)
 }
 
-fn choose_winning_matches(matches: Vec<IssueMatch>) -> BTreeMap<String, IssueMatch> {
+pub(crate) fn choose_winning_matches(matches: Vec<IssueMatch>) -> BTreeMap<String, IssueMatch> {
     let mut grouped: BTreeMap<String, Vec<IssueMatch>> = BTreeMap::new();
     for item in matches {
         grouped
@@ -1301,7 +1009,9 @@ fn choose_winning_matches(matches: Vec<IssueMatch>) -> BTreeMap<String, IssueMat
     winners
 }
 
-fn summarize_issue_contenders(matches: &[IssueMatch]) -> BTreeMap<String, Vec<AutoflowContender>> {
+pub(crate) fn summarize_issue_contenders(
+    matches: &[IssueMatch],
+) -> BTreeMap<String, Vec<AutoflowContender>> {
     let mut grouped: BTreeMap<String, Vec<AutoflowContender>> = BTreeMap::new();
     for item in matches {
         grouped
@@ -1339,7 +1049,7 @@ fn summarize_issue_contenders(matches: &[IssueMatch]) -> BTreeMap<String, Vec<Au
     grouped
 }
 
-fn claim_should_yield_to_winner(
+pub(crate) fn claim_should_yield_to_winner(
     claim: &AutoflowClaimRecord,
     winner: Option<&IssueMatch>,
     active_lock_held: bool,
@@ -1362,7 +1072,7 @@ fn claim_should_yield_to_winner(
     )
 }
 
-fn active_or_fallback_contenders(
+pub(crate) fn active_or_fallback_contenders(
     contenders: &[AutoflowContender],
     resolved: Option<&ResolvedAutoflowWorkflow>,
     selected_workflow: &str,
@@ -1392,7 +1102,7 @@ fn active_or_fallback_contenders(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_autoflow_cycle(
+pub(crate) async fn execute_autoflow_cycle(
     global: &Path,
     claim_store: &AutoflowClaimStore,
     resolved: &ResolvedAutoflowWorkflow,
@@ -1491,6 +1201,7 @@ async fn execute_autoflow_cycle(
             workspace_id: ws.id,
             inputs: inputs.into_iter().collect(),
             mode: permission_mode,
+            invocation_source: RunTriggerSource::Autoflow,
             event: None,
             issue: Some(issue_payload),
             issue_ref: Some(issue_ref_text.to_string()),
@@ -1505,6 +1216,31 @@ async fn execute_autoflow_cycle(
             use_canvas: false,
             run_id_override: None,
             strict_templates: resolved.cfg.autoflow.strict_templates.unwrap_or(true),
+            run_envelope_template: Some(RunEnvelopeTemplate {
+                repo_ref: Some(resolved.repo_ref.clone()),
+                wake_id: None,
+                event_id: None,
+                backend: Some(
+                    match workspace_strategy {
+                        AutoflowWorkspaceStrategy::Worktree => "local_worktree",
+                        AutoflowWorkspaceStrategy::InPlace => "local_checkout",
+                    }
+                    .to_string(),
+                ),
+                workspace_strategy: Some(
+                    match workspace_strategy {
+                        AutoflowWorkspaceStrategy::Worktree => "managed_worktree",
+                        AutoflowWorkspaceStrategy::InPlace => "in_place_checkout",
+                    }
+                    .to_string(),
+                ),
+                autoflow_name: Some(resolved.workflow.name.clone()),
+                autoflow_claim_id: Some(issue_ref_text.to_string()),
+                autoflow_priority: Some(autoflow.priority),
+                requested_worker: None,
+                target: Some(issue_ref_text.to_string()),
+                correlation: None,
+            }),
         },
     )
     .await;
@@ -1558,7 +1294,7 @@ fn resolve_autoflow_permission_mode(
     }
 }
 
-fn reconcile_claim_from_last_run(
+pub(crate) fn reconcile_claim_from_last_run(
     global: &Path,
     resolved: &ResolvedAutoflowWorkflow,
     claim: &mut AutoflowClaimRecord,
@@ -1781,7 +1517,7 @@ fn resolve_retry_at(value: &str) -> anyhow::Result<String> {
     Ok((chrono::Utc::now() + parse_duration(value)?).to_rfc3339())
 }
 
-fn should_run_claim(
+pub(crate) fn should_run_claim(
     claim: &AutoflowClaimRecord,
     resolved: &ResolvedAutoflowWorkflow,
     claim_store: &AutoflowClaimStore,
@@ -1839,7 +1575,7 @@ fn due_by_retry_backoff(claim: &AutoflowClaimRecord) -> anyhow::Result<bool> {
     Ok(retry_at <= chrono::Utc::now())
 }
 
-fn updated_before_tick(
+pub(crate) fn updated_before_tick(
     claim: &AutoflowClaimRecord,
     tick_started_at: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<bool> {
@@ -1849,7 +1585,7 @@ fn updated_before_tick(
     Ok(updated < tick_started_at)
 }
 
-fn claim_lease_expired(claim: &AutoflowClaimRecord) -> anyhow::Result<bool> {
+pub(crate) fn claim_lease_expired(claim: &AutoflowClaimRecord) -> anyhow::Result<bool> {
     let Some(lease_expires_at) = claim.lease_expires_at.as_deref() else {
         return Ok(false);
     };
@@ -1859,11 +1595,11 @@ fn claim_lease_expired(claim: &AutoflowClaimRecord) -> anyhow::Result<bool> {
     Ok(lease <= chrono::Utc::now())
 }
 
-fn claim_counts_toward_max_active(status: ClaimStatus) -> bool {
+pub(crate) fn claim_counts_toward_max_active(status: ClaimStatus) -> bool {
     !matches!(status, ClaimStatus::Complete | ClaimStatus::Released)
 }
 
-fn adjust_active_claim_count(
+pub(crate) fn adjust_active_claim_count(
     counts: &mut BTreeMap<String, usize>,
     repo_ref: &str,
     before: Option<ClaimStatus>,
@@ -1885,34 +1621,6 @@ fn adjust_active_claim_count(
         }
         _ => {}
     }
-}
-
-fn load_claim_status(
-    claim_store: &AutoflowClaimStore,
-    issue_ref: &str,
-) -> anyhow::Result<ClaimStatus> {
-    claim_store
-        .load(issue_ref)?
-        .map(|claim| claim.status)
-        .ok_or_else(|| anyhow!("claim `{issue_ref}` disappeared during tick"))
-}
-
-fn sync_active_claim_count(
-    counts: &mut BTreeMap<String, usize>,
-    claim_store: &AutoflowClaimStore,
-    repo_ref: &str,
-) -> anyhow::Result<()> {
-    let active = claim_store
-        .list()?
-        .into_iter()
-        .filter(|claim| claim.repo_ref == repo_ref && claim_counts_toward_max_active(claim.status))
-        .count();
-    if active == 0 {
-        counts.remove(repo_ref);
-    } else {
-        counts.insert(repo_ref.to_string(), active);
-    }
-    Ok(())
 }
 
 fn wake_events_match(
@@ -1964,7 +1672,7 @@ fn push_resolved_autoflow_paths(
     Ok(())
 }
 
-fn resolve_autoflow_workflow_for_repo(
+pub(crate) fn resolve_autoflow_workflow_for_repo(
     global: &Path,
     repo_store: &RepoRegistryStore,
     repo_ref: &str,
@@ -2045,7 +1753,7 @@ fn resolve_config(global: &Path, project_root: Option<&Path>) -> anyhow::Result<
     )?)
 }
 
-fn cleanup_terminal_claims(
+pub(crate) fn cleanup_terminal_claims(
     global: &Path,
     repo_store: &RepoRegistryStore,
     claim_store: &AutoflowClaimStore,
@@ -2204,7 +1912,7 @@ fn selector_matches(autoflow: &rupu_orchestrator::Autoflow, issue: &Issue) -> bo
     true
 }
 
-async fn fetch_issue(
+pub(crate) async fn fetch_issue(
     cfg: &Config,
     resolver: &dyn CredentialResolver,
     issue_ref: &IssueRef,
@@ -2240,7 +1948,7 @@ fn parse_full_issue_target(target: &str) -> anyhow::Result<IssueRef> {
     }
 }
 
-fn parse_issue_ref_text(value: &str) -> anyhow::Result<IssueRef> {
+pub(crate) fn parse_issue_ref_text(value: &str) -> anyhow::Result<IssueRef> {
     let (tracker, rest) = value
         .split_once(':')
         .ok_or_else(|| anyhow!("invalid issue ref `{value}`"))?;

@@ -9,6 +9,7 @@
 //! ```text
 //! <global>/runs/<run-id>/
 //!   ├── run.json           # RunRecord — status, inputs, event, timestamps, awaiting_*
+//!   ├── run_envelope.json  # RunEnvelope — portable execution request snapshot
 //!   ├── workflow.yaml      # snapshot of the workflow body at run start
 //!   └── step_results.jsonl # one StepResultRecord per completed step (append-only)
 //! ```
@@ -24,6 +25,7 @@
 
 use crate::runner::{ItemResult, StepResult};
 use chrono::{DateTime, Utc};
+use rupu_runtime::RunEnvelope;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -377,6 +379,10 @@ impl RunStore {
         self.run_dir(run_id).join("workflow.yaml")
     }
 
+    fn run_envelope(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("run_envelope.json")
+    }
+
     /// Create the run directory and persist initial `run.json` and
     /// the workflow YAML snapshot. Returns the created `RunRecord`.
     ///
@@ -404,6 +410,23 @@ impl RunStore {
             &serde_json::to_vec_pretty(&record)?,
         )?;
         Ok(record)
+    }
+
+    pub fn write_run_envelope(
+        &self,
+        run_id: &str,
+        envelope: &RunEnvelope,
+    ) -> Result<(), RunStoreError> {
+        if self.run_json(run_id).is_file() {
+            return Err(RunStoreError::AlreadyExists(run_id.to_string()));
+        }
+        let dir = self.run_dir(run_id);
+        std::fs::create_dir_all(&dir)?;
+        write_atomic(
+            &self.run_envelope(run_id),
+            &serde_json::to_vec_pretty(envelope)?,
+        )?;
+        Ok(())
     }
 
     /// Allocate a sub-run directory under an existing parent run and
@@ -505,6 +528,15 @@ impl RunStore {
             return Err(RunStoreError::NotFound(run_id.to_string()));
         }
         Ok(std::fs::read_to_string(path)?)
+    }
+
+    pub fn read_run_envelope(&self, run_id: &str) -> Result<RunEnvelope, RunStoreError> {
+        let path = self.run_envelope(run_id);
+        if !path.is_file() {
+            return Err(RunStoreError::NotFound(run_id.to_string()));
+        }
+        let body = std::fs::read(&path)?;
+        Ok(serde_json::from_slice(&body)?)
     }
 
     /// List every run currently on disk, newest-first by
@@ -710,6 +742,10 @@ fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use rupu_runtime::{
+        ExecutionRequest, RepoBinding, RunContext, RunEnvelope, RunKind, RunTrigger,
+        RunTriggerSource, WorkflowBinding,
+    };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 
@@ -754,6 +790,48 @@ mod tests {
         }
     }
 
+    fn sample_envelope(run_id: &str) -> RunEnvelope {
+        RunEnvelope {
+            version: RunEnvelope::VERSION,
+            run_id: run_id.into(),
+            kind: RunKind::WorkflowRun,
+            workflow: WorkflowBinding {
+                name: "investigate-then-fix".into(),
+                source_path: PathBuf::from(".rupu/workflows/investigate-then-fix.yaml"),
+                fingerprint: "sha256:abc123".into(),
+            },
+            repo: Some(RepoBinding {
+                repo_ref: Some("github:Section9Labs/rupu".into()),
+                project_root: Some(PathBuf::from("/tmp/proj")),
+                workspace_id: "ws_1".into(),
+                workspace_path: PathBuf::from("/tmp/proj"),
+            }),
+            trigger: RunTrigger {
+                source: RunTriggerSource::WorkflowCli,
+                wake_id: None,
+                event_id: None,
+            },
+            inputs: BTreeMap::from([("prompt".into(), "fix x".into())]),
+            context: Some(RunContext {
+                issue_ref: None,
+                target: None,
+                event_present: false,
+                issue_present: false,
+            }),
+            execution: ExecutionRequest {
+                backend: Some("local_checkout".into()),
+                permission_mode: "bypass".into(),
+                workspace_strategy: Some("in_place_checkout".into()),
+                strict_templates: false,
+                attach_ui: false,
+                use_canvas: false,
+            },
+            autoflow: None,
+            correlation: None,
+            worker: None,
+        }
+    }
+
     #[test]
     fn create_with_existing_id_returns_already_exists() {
         let tmp = TempDir::new().unwrap();
@@ -785,6 +863,31 @@ mod tests {
         // workflow snapshot round-trips
         let snap = store.read_workflow_snapshot(&rec.id).unwrap();
         assert_eq!(snap, yaml);
+    }
+
+    #[test]
+    fn write_and_read_run_envelope_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let envelope = sample_envelope("run_env_01");
+
+        store
+            .write_run_envelope(&envelope.run_id, &envelope)
+            .unwrap();
+        let loaded = store.read_run_envelope(&envelope.run_id).unwrap();
+        assert_eq!(loaded, envelope);
+    }
+
+    #[test]
+    fn write_run_envelope_rejects_existing_run_id() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("evt-triage-github-12345");
+        let envelope = sample_envelope(&rec.id);
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store.write_run_envelope(&rec.id, &envelope).unwrap_err();
+        assert!(matches!(err, RunStoreError::AlreadyExists(id) if id == rec.id));
     }
 
     #[test]
