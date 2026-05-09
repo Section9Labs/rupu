@@ -210,14 +210,39 @@ It should reuse the same reconciliation logic as `tick`, but run it continuously
 
 These examples matter because Plan 2 should be desirable from the operator's point of view, not just architecturally tidy.
 
-### 8.1 Solo developer, fully local
+### 8.1 Deployment modes
+
+Plan 2 should document four distinct operator stories:
+
+| Mode | Typical user | Inbound internet required | Recommended ingress |
+| --- | --- | --- | --- |
+| Laptop / local-first | solo developer on a workstation | no | cron polling + optional `autoflow serve` |
+| Dedicated worker machine | team-operated always-on Mac mini / Linux box | yes | `webhook serve` + `autoflow serve` |
+| Tunneled workstation | advanced power user on a laptop | indirectly | tunnel or edge service in front of `webhook serve` |
+| Future cloud relay | teams using `rupu.cloud` | no local inbound | cloud relay + dispatched work |
+
+The docs must make it explicit that **public webhook exposure is not the default laptop story**.
+
+### 8.2 Solo developer, fully local
 
 A single developer wants one repo to self-manage issues on a local workstation.
 
 ```sh
 rupu repos attach github:Section9Labs/rupu ~/Code/Oracle/rupu
-rupu webhook serve --addr 0.0.0.0:8080 &
 rupu autoflow serve --repo github:Section9Labs/rupu
+```
+
+And schedule polling:
+
+```sh
+rupu cron tick --only-events
+```
+
+or split it by cadence:
+
+```text
+* * * * *   rupu cron tick --skip-events
+*/5 * * * * rupu cron tick --only-events
 ```
 
 From there the operator uses:
@@ -232,13 +257,13 @@ rupu autoflow doctor --repo github:Section9Labs/rupu
 What this feels like:
 
 - issues arrive
-- webhook or poll wakes the local queue
+- polling discovers new SCM events without opening any inbound port
 - `serve` picks them up quickly
 - claims persist across restarts
 - worktrees remain inspectable locally
 - the user can intervene without losing automation state
 
-### 8.2 Team repo on one dedicated machine
+### 8.3 Team repo on one dedicated machine
 
 A team wants one always-on Mac mini or Linux box to act as the repo worker.
 
@@ -258,7 +283,27 @@ rupu autoflow explain github:Section9Labs/rupu/issues/123
 
 This is still CLI-only. It is already useful without any SaaS.
 
-### 8.3 Future hybrid control plane
+### 8.4 Tunneled workstation for advanced users
+
+Some power users still want low-latency webhooks on a laptop without directly exposing the machine.
+
+```sh
+rupu repos attach github:Section9Labs/rupu ~/Code/Oracle/rupu
+rupu webhook serve --addr 127.0.0.1:8080 &
+rupu autoflow serve --repo github:Section9Labs/rupu --worker matt-laptop
+```
+
+The public ingress is then handled by a separate tunnel or edge product such as:
+
+- Tailscale Funnel
+- Cloudflare Tunnel
+- ngrok
+
+This is an **advanced deployment recipe**, not a core requirement of the product.
+
+`rupu` should document this mode, but it should not force provider-specific integration in Plan 2.
+
+### 8.5 Future hybrid control plane
 
 Later, the same repo may be controlled by `rupu.cloud`.
 Some jobs run in cloud sandboxes; some jobs run on a registered local worker because they need private network or local assets.
@@ -464,6 +509,9 @@ Planned backends:
 - run the same reconciliation cycle
 - sleep until the next due wake or poll interval
 - handle process signals cleanly
+
+For laptop users, `serve` is usually paired with cron polling rather than direct public webhooks.
+For dedicated worker machines, `serve` commonly runs alongside `webhook serve`.
 
 ### 10.2 `serve` flow
 

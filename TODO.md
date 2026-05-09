@@ -145,6 +145,7 @@ Has its own design spec: [`docs/superpowers/specs/2026-05-09-rupu-autoflow-plan-
 - cloud worker backend
 - registered local worker dispatch from `rupu.cloud`
 - object-storage-backed artifact transport
+- documented or partially automated tunnel / edge deployment recipes for `webhook serve` (for example Tailscale Funnel, Cloudflare Tunnel, ngrok)
 
 ## Gemini API-key support via AI Studio ✅ shipped
 

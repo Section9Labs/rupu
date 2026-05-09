@@ -211,9 +211,15 @@ flowchart LR
   - `docs/workflow-format.md`
   - `docs/development-flows.md`
   - `examples/README.md`
+- [ ] Add a deployment-modes section that clearly separates:
+  - laptop / local-first polling
+  - dedicated always-on worker machine
+  - tunneled workstation for advanced users
+  - future cloud relay / hybrid dispatch
 - [ ] Add sample operator flows for:
   - solo local always-on use
   - dedicated team worker machine
+  - tunneled workstation behind a separate edge or tunnel service
   - future hybrid cloud/local dispatch
 - [ ] Add explicit mermaid diagrams to the user docs where they help explain the runtime.
 - [ ] Export or document the JSON shapes of `RunEnvelope`, `WakeRecord`, `ArtifactManifest`, and `WorkerRecord` so Slice E can consume them later.
