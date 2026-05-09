@@ -47,7 +47,13 @@ const BAR_HEAVY: &str = "┃";
 const FRAME_TOP: &str = "╭─";
 /// Frame closer — see [`FRAME_TOP`].
 const FRAME_BOT: &str = "╰─";
-const SPACE: &str = "  ";
+/// One indent level = `│` + this padding. Sized so the inner rail of
+/// indent N+1 lands in the same column as the body bar `┃` of the
+/// frame at indent N — i.e. the parent panel's body bar IS the child's
+/// inner rail. Without this alignment the frame opens at col 3·N+2,
+/// children's rails sit at col 3·(N+1), and the eye reads a 1-column
+/// jog where the body column "disappears" through the children.
+const SPACE: &str = " ";
 
 /// Number of trailing `─` characters drawn after the agent name in the
 /// frame opener. Just enough to read as a section rule without crowding
@@ -935,11 +941,11 @@ impl LineStreamPrinter {
     /// only the actual glyphs count. Used for terminal-width-aware
     /// wrap math.
     fn body_prefix_visual_width(&self) -> usize {
-        // Each indent level is `│` + 2 spaces = 3 visible cells.
-        // Body prefix adds `│ ┃  ` = 5 visible cells (rail + space +
-        // bar + 2 spaces, content from col 6 — aligned with the
-        // frame-opener's content column).
-        self.indent * 3 + 5
+        // Each indent level is `│` + 1 space = 2 visible cells (sized
+        // so the inner rail at indent N+1 lands in the body-bar column
+        // of the frame at indent N — see SPACE doc). Body prefix adds
+        // `│ ┃  ` = 5 visible cells (rail + space + bar + 2 spaces).
+        self.indent * 2 + 5
     }
 
     fn push_indent_pipes(&self, buf: &mut String) {
@@ -1240,7 +1246,10 @@ mod tests {
         p.push_indent();
         let mut buf = String::new();
         p.push_content_prefix(&mut buf);
-        assert_eq!(buf, "│  │  ");
+        // Indent 1 = `│ ` (2 cells, parent rail), then content prefix
+        // `│  ` = total 5 cells. The inner `│` lands at col 2 — same
+        // column as the parent frame's body bar `┃`.
+        assert_eq!(buf, "│ │  ");
     }
 
     #[test]
@@ -1258,7 +1267,11 @@ mod tests {
         p.push_indent();
         let mut buf = String::new();
         p.push_prefix(&mut buf, "├─");
-        assert_eq!(buf, "│  ├─");
+        // Indent 1: parent rail `│ ` (2 cells), then `├─`. The `├`
+        // lands at col 2 — exactly where the parent panel's body bar
+        // `┃` sits, so the branch reads as a clean tap into the
+        // parent's body column.
+        assert_eq!(buf, "│ ├─");
     }
 
     #[test]
@@ -1289,21 +1302,19 @@ mod tests {
         p.push_indent();
         let mut buf = String::new();
         p.push_frame_close(&mut buf);
-        // At indent=1: parent rail (3 cells), then the body's inner
-        // rail `│ ` (2 cells), then `╰─` bending into content. The
-        // `╰` lands at col 5, exactly under the body bar `┃` of
-        // assistant-chunk lines at the same indent. (Pre-fix this
-        // was `│  ├─╰─` — same `╰` column, but the `├─` introduced
-        // a horizontal stroke at col 4 that broke the eye's
-        // vertical reading of the body column.)
-        assert_eq!(buf, "│  │ ╰─");
+        // At indent=1: parent rail (2 cells `│ `), then the inner
+        // rail `│ ` (2 cells, lands at col 2 = parent body column),
+        // then `╰─` bending into content at col 4. `╰` lands directly
+        // under the indent-1 body bar `┃`.
+        assert_eq!(buf, "│ │ ╰─");
     }
 
     #[test]
     fn test_body_prefix_at_indent1_aligns_under_indent1_frame_top() {
-        // Frame open at indent=1 is `│  ├─╭─`. The body bar `┃` should
-        // sit at column 6 (under the `╭`) so the indent=1 frame reads
-        // as one continuous shape.
+        // Frame open at indent=1 is `│ ├─╭─` (parent rail + branch
+        // tap + frame top). The body bar `┃` should sit at col 4
+        // (under the `╭`) so the indent=1 frame reads as one
+        // continuous shape from open to body to close.
         no_color();
         let mut p = LineStreamPrinter::new();
         p.push_indent();
@@ -1314,10 +1325,9 @@ mod tests {
 
         let frame_chars: Vec<char> = frame.chars().collect();
         let body_chars: Vec<char> = body.chars().collect();
-        // Position 5 is the `╭` in `│  ├─╭─`; same position is `┃` in
-        // body prefix `│  │ ┃  `.
-        assert_eq!(frame_chars[5], '╭');
-        assert_eq!(body_chars[5], '┃');
+        // Col 4: `╭` in the opener, `┃` in the body prefix.
+        assert_eq!(frame_chars[4], '╭');
+        assert_eq!(body_chars[4], '┃');
     }
 
     #[test]
@@ -1327,7 +1337,10 @@ mod tests {
         p.push_indent();
         let mut buf = String::new();
         p.push_frame_open(&mut buf);
-        assert_eq!(buf, "│  ├─╭─");
+        // Indent 1: parent rail `│ ` (2 cells) directly feeds into
+        // the branch `├─` at col 2 — same column as the parent's
+        // body bar `┃` would occupy. The frame top `╭─` follows.
+        assert_eq!(buf, "│ ├─╭─");
     }
 
     #[test]
