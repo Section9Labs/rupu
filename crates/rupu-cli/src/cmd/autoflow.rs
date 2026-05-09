@@ -2573,6 +2573,403 @@ steps:
         );
     }
 
+    #[test]
+    fn reconcile_claim_blocks_rejected_approval_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+        write_autoflow_project(
+            &project,
+            "http://localhost.invalid",
+            "controller",
+            r#"name: controller
+autoflow:
+  enabled: true
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+        );
+
+        let resolved = resolve_autoflow_from_path(
+            &global,
+            project.join(".rupu/workflows/controller.yaml"),
+            "project".into(),
+            Some(project.clone()),
+            "github:Section9Labs/rupu".into(),
+            project.clone(),
+            resolve_config(&global, Some(&project)).unwrap(),
+        )
+        .unwrap();
+        let store = RunStore::new(global.join("runs"));
+        std::fs::create_dir_all(global.join("runs")).unwrap();
+        store
+            .create(
+                RunRecord {
+                    id: "run_rejected".into(),
+                    workflow_name: "controller".into(),
+                    status: RunStatus::Rejected,
+                    inputs: BTreeMap::new(),
+                    event: None,
+                    workspace_id: "ws_1".into(),
+                    workspace_path: project.clone(),
+                    transcript_dir: global.join("transcripts"),
+                    started_at: chrono::Utc::now(),
+                    finished_at: Some(chrono::Utc::now()),
+                    error_message: Some("rejected: needs changes".into()),
+                    awaiting_step_id: None,
+                    approval_prompt: None,
+                    awaiting_since: None,
+                    expires_at: None,
+                    issue_ref: Some("github:Section9Labs/rupu/issues/42".into()),
+                    issue: None,
+                    parent_run_id: None,
+                },
+                "name: controller\nsteps: []\n",
+            )
+            .unwrap();
+
+        let mut claim = AutoflowClaimRecord {
+            issue_ref: "github:Section9Labs/rupu/issues/42".into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "controller".into(),
+            status: ClaimStatus::AwaitHuman,
+            worktree_path: None,
+            branch: None,
+            last_run_id: Some("run_rejected".into()),
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        reconcile_claim_from_last_run(&global, &resolved, &mut claim).unwrap();
+
+        assert_eq!(claim.status, ClaimStatus::Blocked);
+        assert_eq!(claim.last_error.as_deref(), Some("rejected: needs changes"));
+    }
+
+    #[tokio::test]
+    async fn tick_preserves_await_human_claims_while_run_is_awaiting_approval() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let issues_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issues_body);
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let run_store = RunStore::new(global.join("runs"));
+        run_store
+            .create(
+                RunRecord {
+                    id: "run_waiting".into(),
+                    workflow_name: "issue-supervisor-dispatch".into(),
+                    status: RunStatus::AwaitingApproval,
+                    inputs: BTreeMap::new(),
+                    event: None,
+                    workspace_id: "ws_1".into(),
+                    workspace_path: project.clone(),
+                    transcript_dir: global.join("transcripts"),
+                    started_at: chrono::Utc::now(),
+                    finished_at: None,
+                    error_message: None,
+                    awaiting_step_id: Some("approve".into()),
+                    approval_prompt: Some("approve?".into()),
+                    awaiting_since: Some(chrono::Utc::now()),
+                    expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    issue_ref: Some("github:Section9Labs/rupu/issues/123".into()),
+                    issue: None,
+                    parent_run_id: None,
+                },
+                "name: issue-supervisor-dispatch\nsteps: []\n",
+            )
+            .unwrap();
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: "github:Section9Labs/rupu/issues/123".into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "issue-supervisor-dispatch".into(),
+                status: ClaimStatus::AwaitHuman,
+                worktree_path: Some(project.display().to_string()),
+                branch: Some("rupu/issue-123".into()),
+                last_run_id: Some("run_waiting".into()),
+                last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
+                ),
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        tick_with_resolver(resolver).await.unwrap();
+        std::env::remove_var("RUPU_HOME");
+
+        let claim = claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.status, ClaimStatus::AwaitHuman);
+        assert_eq!(claim.last_run_id.as_deref(), Some("run_waiting"));
+
+        let run = run_store.load("run_waiting").unwrap();
+        assert_eq!(run.status, RunStatus::AwaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn tick_reconciles_await_human_claim_once_run_completes() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let issues_body = std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issues_body);
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let run_store = RunStore::new(global.join("runs"));
+        run_store
+            .create(
+                RunRecord {
+                    id: "run_done".into(),
+                    workflow_name: "issue-supervisor-dispatch".into(),
+                    status: RunStatus::Completed,
+                    inputs: BTreeMap::new(),
+                    event: None,
+                    workspace_id: "ws_1".into(),
+                    workspace_path: project.clone(),
+                    transcript_dir: global.join("transcripts"),
+                    started_at: chrono::Utc::now(),
+                    finished_at: Some(chrono::Utc::now()),
+                    error_message: None,
+                    awaiting_step_id: None,
+                    approval_prompt: None,
+                    awaiting_since: None,
+                    expires_at: None,
+                    issue_ref: Some("github:Section9Labs/rupu/issues/123".into()),
+                    issue: None,
+                    parent_run_id: None,
+                },
+                "name: issue-supervisor-dispatch\nsteps: []\n",
+            )
+            .unwrap();
+        run_store
+            .append_step_result(
+                "run_done",
+                &StepResultRecord {
+                    step_id: "decide".into(),
+                    run_id: "step_1".into(),
+                    transcript_path: global.join("transcripts/step.jsonl"),
+                    output: r#"{"status":"complete","summary":"approved and done"}"#.into(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: "hi".into(),
+                    kind: StepKind::Linear,
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: "github:Section9Labs/rupu/issues/123".into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "issue-supervisor-dispatch".into(),
+                status: ClaimStatus::AwaitHuman,
+                worktree_path: Some(project.display().to_string()),
+                branch: Some("rupu/issue-123".into()),
+                last_run_id: Some("run_done".into()),
+                last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
+                ),
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        tick_with_resolver(resolver).await.unwrap();
+        std::env::remove_var("RUPU_HOME");
+
+        let claim = claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.status, ClaimStatus::Complete);
+        assert_eq!(claim.last_summary.as_deref(), Some("approved and done"));
+        assert_eq!(claim.last_run_id.as_deref(), Some("run_done"));
+    }
+
     #[tokio::test]
     async fn tick_discovers_tracked_repo_and_runs_autoflow_cycle() {
         let _guard = ENV_LOCK.lock().await;
