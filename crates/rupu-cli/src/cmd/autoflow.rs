@@ -4,17 +4,17 @@ use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::workflow::{
-    locate_workflow_in, run_with_explicit_context, ExplicitWorkflowRunContext,
+    ExplicitWorkflowRunContext, locate_workflow_in, run_with_explicit_context,
 };
 use crate::paths;
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
 use jsonschema::JSONSchema;
 use rupu_auth::{CredentialResolver, KeychainResolver};
 use rupu_config::{AutoflowCheckout, Config};
-use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
+use rupu_orchestrator::templates::{RenderMode, StepContext, render_step_prompt};
 use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
     WorkflowOutputContract,
@@ -23,8 +23,8 @@ use rupu_scm::{
     Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
 };
 use rupu_workspace::{
-    ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
-    AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
+    AutoflowClaimRecord, AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch,
+    RepoRegistryStore, ensure_issue_worktree, issue_dir_name, remove_issue_worktree,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -52,7 +52,7 @@ pub enum Action {
         /// Issue target in full run-target form:
         /// `github:owner/repo/issues/42` or `gitlab:group/project/issues/9`.
         target: String,
-        /// Override permission mode (`ask` | `bypass` | `readonly`).
+        /// Override permission mode (`bypass` | `readonly`).
         #[arg(long)]
         mode: Option<String>,
     },
@@ -366,6 +366,8 @@ async fn run(
         root: paths::repos_dir(&global),
     };
     let resolved = resolve_autoflow_workflow_for_repo(&global, &repo_store, &repo_ref, name)?;
+    let _ =
+        resolve_autoflow_permission_mode(mode, resolved.cfg.autoflow.permission_mode.as_deref())?;
     let issue = fetch_issue(&resolved.cfg, resolver.as_ref(), &issue_ref).await?;
     let claim_store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
@@ -1296,6 +1298,10 @@ async fn execute_autoflow_cycle(
     claim.updated_at = chrono::Utc::now().to_rfc3339();
     claim_store.save(&claim)?;
 
+    let permission_mode = resolve_autoflow_permission_mode(
+        mode_override,
+        resolved.cfg.autoflow.permission_mode.as_deref(),
+    )?;
     let run_result = run_with_explicit_context(
         &resolved.name,
         ExplicitWorkflowRunContext {
@@ -1303,10 +1309,7 @@ async fn execute_autoflow_cycle(
             workspace_path,
             workspace_id: ws.id,
             inputs: inputs.into_iter().collect(),
-            mode: mode_override
-                .map(ToOwned::to_owned)
-                .or_else(|| resolved.cfg.autoflow.permission_mode.clone())
-                .unwrap_or_else(|| "bypass".to_string()),
+            mode: permission_mode,
             event: None,
             issue: Some(issue_payload),
             issue_ref: Some(issue_ref_text.to_string()),
@@ -1355,6 +1358,20 @@ async fn execute_autoflow_cycle(
             Err(err)
         }
     }
+}
+
+fn resolve_autoflow_permission_mode(
+    mode_override: Option<&str>,
+    config_mode: Option<&str>,
+) -> anyhow::Result<String> {
+    let mode = mode_override
+        .map(ToOwned::to_owned)
+        .or_else(|| config_mode.map(ToOwned::to_owned))
+        .unwrap_or_else(|| "bypass".to_string());
+    if mode == "ask" {
+        bail!("autoflow does not support `ask` permission mode; use `bypass` or `readonly`");
+    }
+    Ok(mode)
 }
 
 fn reconcile_claim_from_last_run(
@@ -2328,8 +2345,8 @@ mod tests {
     use super::*;
     use httpmock::Method::GET;
     use httpmock::MockServer;
-    use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::StoredCredential;
+    use rupu_auth::in_memory::InMemoryResolver;
     use rupu_orchestrator::{RunRecord, StepKind, StepResultRecord};
     use rupu_providers::AuthMode;
     use std::io::Write;
@@ -2350,43 +2367,53 @@ mod tests {
 
     fn init_git_repo(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
-        assert!(std::process::Command::new("git")
-            .arg("init")
-            .arg("-b")
-            .arg("main")
-            .arg(path)
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.email", "test@example.com"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["config", "user.name", "Test User"])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-b")
+                .arg("main")
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["config", "user.email", "test@example.com"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["config", "user.name", "Test User"])
+                .status()
+                .unwrap()
+                .success()
+        );
         std::fs::write(path.join("README.md"), "hello\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["add", "README.md"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["commit", "-m", "init"])
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["add", "README.md"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["commit", "-m", "init"])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn write_autoflow_project(
@@ -2563,22 +2590,26 @@ steps:
             root: tmp.path().join("claims"),
         };
 
-        assert!(should_run_claim(
-            &claim,
-            &resolved,
-            &store,
-            chrono::Utc::now(),
-            &BTreeSet::from(["github.issue.labeled".to_string()]),
-        )
-        .unwrap());
-        assert!(!should_run_claim(
-            &claim,
-            &resolved,
-            &store,
-            chrono::Utc::now(),
-            &BTreeSet::new()
-        )
-        .unwrap());
+        assert!(
+            should_run_claim(
+                &claim,
+                &resolved,
+                &store,
+                chrono::Utc::now(),
+                &BTreeSet::from(["github.issue.labeled".to_string()]),
+            )
+            .unwrap()
+        );
+        assert!(
+            !should_run_claim(
+                &claim,
+                &resolved,
+                &store,
+                chrono::Utc::now(),
+                &BTreeSet::new()
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -2664,6 +2695,32 @@ steps:
         )
         .unwrap();
         assert_eq!(branch, "rupu/issue-42-phase-1");
+    }
+
+    #[test]
+    fn autoflow_permission_mode_defaults_to_bypass() {
+        assert_eq!(
+            resolve_autoflow_permission_mode(None, None).unwrap(),
+            "bypass"
+        );
+    }
+
+    #[test]
+    fn autoflow_permission_mode_rejects_ask_override() {
+        let err = resolve_autoflow_permission_mode(Some("ask"), Some("bypass")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("autoflow does not support `ask` permission mode")
+        );
+    }
+
+    #[test]
+    fn autoflow_permission_mode_rejects_ask_config() {
+        let err = resolve_autoflow_permission_mode(None, Some("ask")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("autoflow does not support `ask` permission mode")
+        );
     }
 
     #[test]
@@ -3538,11 +3595,13 @@ steps:
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
-        assert!(claim
-            .worktree_path
-            .as_deref()
-            .unwrap()
-            .contains("issue-123"));
+        assert!(
+            claim
+                .worktree_path
+                .as_deref()
+                .unwrap()
+                .contains("issue-123")
+        );
     }
 
     #[tokio::test]
@@ -4414,11 +4473,13 @@ steps:
             .unwrap()
             .unwrap();
         assert_eq!(bad_claim.status, ClaimStatus::Blocked);
-        assert!(bad_claim
-            .last_error
-            .as_deref()
-            .unwrap()
-            .contains("output failed schema"));
+        assert!(
+            bad_claim
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("output failed schema")
+        );
         assert_eq!(good_claim.status, ClaimStatus::Complete);
         assert!(good_claim.last_run_id.is_some());
     }
