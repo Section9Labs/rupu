@@ -21,50 +21,71 @@ const MOCK_SCRIPT: &str = r#"
 
 fn init_git_checkout(path: &std::path::Path, origin_url: &str) {
     std::fs::create_dir_all(path).unwrap();
-    assert!(ProcessCommand::new("git")
-        .arg("init")
-        .arg("-b")
-        .arg("main")
-        .arg(path)
-        .status()
-        .unwrap()
-        .success());
-    assert!(ProcessCommand::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["config", "user.email", "test@example.com"])
-        .status()
-        .unwrap()
-        .success());
-    assert!(ProcessCommand::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["config", "user.name", "Test User"])
-        .status()
-        .unwrap()
-        .success());
-    assert!(ProcessCommand::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["remote", "add", "origin", origin_url])
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        ProcessCommand::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ProcessCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ProcessCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ProcessCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "commit.gpgsign", "false"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ProcessCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["remote", "add", "origin", origin_url])
+            .status()
+            .unwrap()
+            .success()
+    );
     std::fs::write(path.join("README.md"), "hello\n").unwrap();
-    assert!(ProcessCommand::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["add", "README.md"])
-        .status()
-        .unwrap()
-        .success());
-    assert!(ProcessCommand::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["commit", "-m", "init"])
-        .status()
-        .unwrap()
-        .success());
+    assert!(
+        ProcessCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ProcessCommand::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 fn write_agent_and_workflow(
@@ -252,6 +273,63 @@ steps:
         .success()
         .stdout(predicate::str::contains("controller"))
         .stdout(predicate::str::contains("github:Section9Labs/rupu"));
+}
+
+#[test]
+fn autoflow_list_filters_to_one_repo() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let outside = tmp.child("outside");
+    outside.create_dir_all().unwrap();
+    let repo_a = assert_fs::TempDir::new().unwrap();
+    let repo_b = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(repo_a.path(), "git@github.com:Section9Labs/rupu.git");
+    init_git_checkout(repo_b.path(), "git@github.com:Section9Labs/okegu.git");
+    write_agent_and_workflow(
+        &repo_a,
+        "controller",
+        r#"name: controller
+autoflow:
+  enabled: true
+  priority: 100
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    write_agent_and_workflow(
+        &repo_b,
+        "controller",
+        r#"name: controller
+autoflow:
+  enabled: true
+  priority: 50
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    track_repo(&home, "github:Section9Labs/rupu", repo_a.path());
+    track_repo(&home, "github:Section9Labs/okegu", repo_b.path());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .current_dir(outside.path())
+        .args(["autoflow", "list", "--repo", "github:Section9Labs/rupu"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("github:Section9Labs/rupu"))
+        .stdout(predicate::str::contains("github:Section9Labs/okegu").not())
+        .stdout(predicate::str::contains("100"))
+        .stdout(predicate::str::contains("50").not());
 }
 
 #[test]
@@ -598,6 +676,65 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
 }
 
 #[test]
+fn autoflow_claims_filters_to_one_repo() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.join("autoflows/claims"),
+    };
+    for (repo_ref, issue_ref) in [
+        (
+            "github:Section9Labs/rupu",
+            "github:Section9Labs/rupu/issues/42",
+        ),
+        (
+            "github:Section9Labs/okegu",
+            "github:Section9Labs/okegu/issues/9",
+        ),
+    ] {
+        claim_store
+            .save(&rupu_workspace::AutoflowClaimRecord {
+                issue_ref: issue_ref.into(),
+                repo_ref: repo_ref.into(),
+                workflow: "controller".into(),
+                status: rupu_workspace::ClaimStatus::Claimed,
+                worktree_path: Some("/tmp/rupu/issue".into()),
+                branch: None,
+                last_run_id: None,
+                last_error: None,
+                last_summary: None,
+                pr_url: None,
+                artifacts: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: None,
+                pending_dispatch: None,
+                contenders: vec![rupu_workspace::AutoflowContender {
+                    workflow: "controller".into(),
+                    priority: 100,
+                    scope: Some("project".into()),
+                    selected: true,
+                }],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+    }
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["autoflow", "claims", "--repo", "github:Section9Labs/rupu"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "github:Section9Labs/rupu/issues/42",
+        ))
+        .stdout(predicate::str::contains("github:Section9Labs/okegu/issues/9").not());
+}
+
+#[test]
 fn autoflow_status_summarizes_counts_and_contested_issues() {
     let _guard = ENV_LOCK.blocking_lock();
 
@@ -682,4 +819,67 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
         ))
         .stdout(predicate::str::contains("*controller[100]"))
         .stdout(predicate::str::contains("phase-ready[50]"));
+}
+
+#[test]
+fn autoflow_status_filters_to_one_repo() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.join("autoflows/claims"),
+    };
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: "github:Section9Labs/rupu/issues/42".into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "controller".into(),
+            status: rupu_workspace::ClaimStatus::Claimed,
+            worktree_path: Some("/tmp/rupu/issue-42".into()),
+            branch: None,
+            last_run_id: None,
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: "github:Section9Labs/okegu/issues/9".into(),
+            repo_ref: "github:Section9Labs/okegu".into(),
+            workflow: "controller".into(),
+            status: rupu_workspace::ClaimStatus::AwaitHuman,
+            worktree_path: Some("/tmp/rupu/issue-9".into()),
+            branch: None,
+            last_run_id: None,
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["autoflow", "status", "--repo", "github:Section9Labs/rupu"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claimed"))
+        .stdout(predicate::str::contains("await_human").not())
+        .stdout(predicate::str::contains("github:Section9Labs/okegu/issues/9").not());
 }
