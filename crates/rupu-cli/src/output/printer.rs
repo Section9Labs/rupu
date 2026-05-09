@@ -60,6 +60,14 @@ const SPACE: &str = " ";
 /// the meta tail.
 const FRAME_RULE_DASHES: usize = 6;
 
+/// 24-bit ANSI escape for the DIM palette color (slate-500 #64748b).
+/// Inlined here so `start_ticker`'s indicatif template literal can
+/// open/close a dim region around `{elapsed}` without going through
+/// `palette::write_colored` (which writes to a `String`, not into a
+/// format-template literal).
+const DIM_OPEN: &str = "\x1b[38;2;100;116;139m";
+const DIM_CLOSE: &str = "\x1b[0m";
+
 /// Fallback terminal width when stdout is not a tty (pipe, CI). Same
 /// number `comfy-table` uses for headless renders. Long agent lines
 /// in non-tty mode wrap to this width with continuation prefix —
@@ -190,6 +198,14 @@ impl LineStreamPrinter {
     /// Start the bottom-row ticker with the given message. No-op when
     /// a ticker is already running; use [`Self::tick_with`] to update
     /// the message instead.
+    ///
+    /// The ticker is rendered with the active body prefix (`│ ┃ `) so
+    /// it visually continues the in-flight step's frame rather than
+    /// floating loose at the bottom. Three live components:
+    /// 1. spinner glyph — auto-rotates via `enable_steady_tick`,
+    /// 2. caller-supplied message — updated via [`Self::tick_with`],
+    /// 3. elapsed time — auto-rendered via indicatif's `{elapsed}`.
+    /// Together they read as "this step is alive and N seconds in".
     pub fn start_ticker(&mut self, message: impl Into<String>) {
         if !self.is_tty || self.ticker.is_some() {
             // Skip when not a TTY — no terminal to animate against.
@@ -198,16 +214,32 @@ impl LineStreamPrinter {
             return;
         }
         let pb = self.multi.add(ProgressBar::new_spinner());
-        // Braille-block frames; ~80 ms per tick reads as a smooth
-        // pulse without flooding the terminal.
+        // Body-prefix-aligned template. Indicatif treats anything
+        // outside `{...}` as a literal — including the 24-bit ANSI
+        // escapes inside the prefix string — so it renders the
+        // gutter exactly the way `assistant_chunk` does, with the
+        // spinner glyph + message picking up where streaming text
+        // would have. The trailing `  · {elapsed}` adds a live
+        // running counter dimmed with `:.dim` so the operator sees
+        // both that the spinner is moving AND that real time is
+        // passing (the glyph alone reads as "running" but doesn't
+        // disambiguate stuck-vs-slow).
+        let mut body_prefix = String::new();
+        self.push_body_prefix(&mut body_prefix);
+        let template = build_ticker_template(&body_prefix);
         pb.set_style(
-            ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+            ProgressStyle::with_template(&template)
                 .unwrap_or_else(|_| ProgressStyle::default_spinner())
                 .tick_strings(&[
                     "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
                 ]),
         );
         pb.set_message(message.into());
+        // ~80 ms per tick reads as a smooth pulse without flooding
+        // the terminal. The steady-tick thread also re-renders
+        // `{elapsed}` so the time counter updates roughly 12× per
+        // second — fast enough to feel live, slow enough to stay
+        // out of the way.
         pb.enable_steady_tick(Duration::from_millis(80));
         self.ticker = Some(pb);
     }
@@ -983,6 +1015,20 @@ impl LineStreamPrinter {
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
+/// Build the indicatif `ProgressStyle` template for the bottom-row
+/// ticker, body-prefix-aligned. The trailing 2-space content margin
+/// of `body_prefix` is replaced with a single space so the spinner
+/// glyph sits where the first body-text character would — the
+/// spinner IS the row's "first content character". Three live slots:
+/// `{spinner}` (rotating glyph), `{msg}` (caller-supplied via
+/// [`LineStreamPrinter::tick_with`]), `{elapsed}` (auto-rendered by
+/// indicatif). Free function so we can unit-test the literal shape
+/// without spinning up a real terminal.
+fn build_ticker_template(body_prefix: &str) -> String {
+    let trimmed = body_prefix.trim_end_matches(' ');
+    format!("{trimmed} {{spinner:.cyan}} {{msg}}  {DIM_OPEN}· {{elapsed}}{DIM_CLOSE}")
+}
+
 /// Format a `Duration` as `Xs` or `Xm Ys` or `HhXmYs`.
 pub fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
@@ -1513,6 +1559,39 @@ mod tests {
     // target), so we can't snapshot the rendered frames. What we CAN
     // verify is that the lifecycle methods don't panic in any order
     // and that `tick_with` is a safe no-op when no ticker is up.
+
+    #[test]
+    fn test_ticker_template_aligns_with_body_prefix() {
+        // Ticker template should reuse the body prefix (rail + body
+        // bar) so the spinner row visually continues the in-flight
+        // step's frame, with the trailing 2-space content margin
+        // collapsed to a single space (the spinner glyph IS the
+        // first content character).
+        no_color();
+        let p = LineStreamPrinter::new();
+        let mut prefix = String::new();
+        p.push_body_prefix(&mut prefix);
+        let tpl = build_ticker_template(&prefix);
+        // Indent 0: body prefix is `│ ┃  ` (5 cells); template
+        // collapses the trailing 2 spaces and spaces in `{spinner}`
+        // — net "│ ┃ {spinner:.cyan} {msg}  · {elapsed}" (with ANSI
+        // dim around the elapsed clause). Assert the salient slots
+        // and the alignment cue (single space after `┃` before the
+        // spinner placeholder).
+        assert!(tpl.contains("│"));
+        assert!(tpl.contains("┃"));
+        assert!(tpl.contains("{spinner:.cyan}"));
+        assert!(tpl.contains("{msg}"));
+        assert!(tpl.contains("{elapsed}"));
+        // Body bar must be followed by exactly one space before the
+        // spinner placeholder — anything else means the alignment
+        // shift broke and the ticker no longer reads as the frame's
+        // continuation.
+        assert!(
+            tpl.contains("┃ {spinner:.cyan}"),
+            "body bar should sit one space before the spinner placeholder: {tpl:?}"
+        );
+    }
 
     #[test]
     fn test_ticker_lifecycle_no_panic() {
