@@ -67,9 +67,29 @@ pub fn autoflow_event_cursors_dir(global: &Path) -> PathBuf {
     autoflows_dir(global).join("event-cursors")
 }
 
-/// Global queued webhook wake-event directory.
-pub fn autoflow_webhook_events_dir(global: &Path) -> PathBuf {
-    autoflows_dir(global).join("webhook-events")
+/// Global autoflow wake queue root.
+pub fn autoflow_wakes_dir(global: &Path) -> PathBuf {
+    autoflows_dir(global).join("wakes")
+}
+
+/// Global queued autoflow wake-record directory.
+pub fn autoflow_wake_queue_dir(global: &Path) -> PathBuf {
+    autoflow_wakes_dir(global).join("queue")
+}
+
+/// Global processed autoflow wake-record directory.
+pub fn autoflow_wake_processed_dir(global: &Path) -> PathBuf {
+    autoflow_wakes_dir(global).join("processed")
+}
+
+/// Global autoflow wake payload directory.
+pub fn autoflow_wake_payloads_dir(global: &Path) -> PathBuf {
+    autoflow_wakes_dir(global).join("payloads")
+}
+
+/// Global autoflow wake dedupe marker directory.
+pub fn autoflow_wake_dedupe_dir(global: &Path) -> PathBuf {
+    autoflow_wakes_dir(global).join("dedupe")
 }
 
 /// Convenience: ensure a directory exists. Used to lazily create

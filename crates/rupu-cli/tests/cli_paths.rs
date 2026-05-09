@@ -1,8 +1,9 @@
 use assert_fs::prelude::*;
 use rupu_cli::paths::{
-    autoflow_claims_dir, autoflow_event_cursors_dir, autoflow_webhook_events_dir,
-    autoflow_worktrees_dir, autoflows_dir, global_dir, project_root_for, repos_dir,
-    transcripts_dir,
+    autoflow_claims_dir, autoflow_event_cursors_dir, autoflow_wake_dedupe_dir,
+    autoflow_wake_payloads_dir, autoflow_wake_processed_dir, autoflow_wake_queue_dir,
+    autoflow_wakes_dir, autoflow_worktrees_dir, autoflows_dir, global_dir, project_root_for,
+    repos_dir, transcripts_dir,
 };
 
 #[test]
@@ -80,7 +81,23 @@ fn state_dirs_live_under_global_root() {
         tmp_global.path().join("autoflows/event-cursors")
     );
     assert_eq!(
-        autoflow_webhook_events_dir(tmp_global.path()),
-        tmp_global.path().join("autoflows/webhook-events")
+        autoflow_wakes_dir(tmp_global.path()),
+        tmp_global.path().join("autoflows/wakes")
+    );
+    assert_eq!(
+        autoflow_wake_queue_dir(tmp_global.path()),
+        tmp_global.path().join("autoflows/wakes/queue")
+    );
+    assert_eq!(
+        autoflow_wake_processed_dir(tmp_global.path()),
+        tmp_global.path().join("autoflows/wakes/processed")
+    );
+    assert_eq!(
+        autoflow_wake_payloads_dir(tmp_global.path()),
+        tmp_global.path().join("autoflows/wakes/payloads")
+    );
+    assert_eq!(
+        autoflow_wake_dedupe_dir(tmp_global.path()),
+        tmp_global.path().join("autoflows/wakes/dedupe")
     );
 }

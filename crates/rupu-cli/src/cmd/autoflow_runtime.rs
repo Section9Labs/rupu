@@ -2,6 +2,7 @@ use crate::cmd::autoflow as legacy;
 use crate::paths;
 use anyhow::Context;
 use rupu_auth::CredentialResolver;
+use rupu_runtime::WakeStore;
 use rupu_workspace::{AutoflowClaimRecord, AutoflowClaimStore, ClaimStatus, RepoRegistryStore};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub(crate) async fn tick_with_resolver(
     let claim_store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
+    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
     let cleaned =
         legacy::cleanup_terminal_claims(&global, &repo_store, &claim_store, chrono::Utc::now())?;
     let discovered = legacy::discover_tick_autoflows(&global, &repo_store)?;
@@ -312,6 +314,12 @@ pub(crate) async fn tick_with_resolver(
                 );
                 resync_active_claim_counts(&claim_store, &mut active_claim_counts)?;
             }
+        }
+    }
+
+    for wake_id in &wake_hints.due_wake_ids {
+        if let Err(error) = wake_store.mark_processed(wake_id) {
+            tracing::warn!(wake_id, %error, "failed to mark wake processed");
         }
     }
 
