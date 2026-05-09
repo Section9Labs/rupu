@@ -150,6 +150,8 @@ autoflow:
   selector:
     states: ["open"]
     labels_all: ["autoflow"]
+    labels_any: ["bug", "urgent"]
+    labels_none: ["blocked"]
     limit: 100
   wake_on:
     - github.issue.opened
@@ -175,6 +177,8 @@ Fields:
 | `priority` | integer | no | `0` | Higher wins when multiple autoflows match the same issue |
 | `selector.states` | array<`open`\|`closed`> | no | `[]` | Empty means any issue state |
 | `selector.labels_all` | array<string> | no | `[]` | Every listed label must be present |
+| `selector.labels_any` | array<string> | no | `[]` | At least one listed label must be present |
+| `selector.labels_none` | array<string> | no | `[]` | None of the listed labels may be present |
 | `selector.limit` | integer | no | none | Candidate cap per reconciliation cycle |
 | `wake_on` | array<string> | no | `[]` | Event ids used as wake hints |
 | `reconcile_every` | duration | no | none | Re-run cadence like `10m`, `2h`, `1d` |

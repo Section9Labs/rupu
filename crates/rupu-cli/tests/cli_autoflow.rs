@@ -162,6 +162,8 @@ autoflow:
   selector:
     states: ["open"]
     labels_all: ["autoflow", "bug"]
+    labels_any: ["urgent", "p1"]
+    labels_none: ["blocked"]
     limit: 25
   wake_on:
     - github.issue.labeled
@@ -211,6 +213,8 @@ steps:
         .stdout(predicate::str::contains(
             "selector labels_all: autoflow,bug",
         ))
+        .stdout(predicate::str::contains("selector labels_any: urgent,p1"))
+        .stdout(predicate::str::contains("selector labels_none: blocked"))
         .stdout(predicate::str::contains("selector limit: 25"))
         .stdout(predicate::str::contains("---"))
         .stdout(predicate::str::contains("name: controller"));

@@ -260,6 +260,10 @@ pub struct AutoflowSelector {
     #[serde(default)]
     pub labels_all: Vec<String>,
     #[serde(default)]
+    pub labels_any: Vec<String>,
+    #[serde(default)]
+    pub labels_none: Vec<String>,
+    #[serde(default)]
     pub limit: Option<u32>,
 }
 
