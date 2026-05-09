@@ -347,51 +347,50 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
 
     let mut ran = 0usize;
     let mut skipped = 0usize;
+    let mut failed = 0usize;
 
     for issue_ref_text in issue_keys {
         let winner = winners.get(&issue_ref_text).cloned();
-        let mut claim = claims_by_issue.remove(&issue_ref_text);
+        let claim = claims_by_issue.remove(&issue_ref_text);
         let contenders = contenders_by_issue
             .get(&issue_ref_text)
             .cloned()
             .unwrap_or_default();
+        let repo_hint = claim
+            .as_ref()
+            .map(|current| current.repo_ref.clone())
+            .or_else(|| {
+                winner
+                    .as_ref()
+                    .map(|matched| matched.resolved.repo_ref.clone())
+            });
+        let workflow_hint = claim
+            .as_ref()
+            .map(|current| current.workflow.clone())
+            .or_else(|| {
+                winner
+                    .as_ref()
+                    .map(|matched| matched.resolved.workflow.name.clone())
+            });
 
-        if let Some(mut current) = claim.take() {
-            let previous_status = current.status;
-            let active_lock = claim_store.read_active_lock(&issue_ref_text)?;
-            let claim_expired = claim_lease_expired(&current)?;
-            let owner_resolution = resolve_autoflow_workflow_for_repo(
-                &global,
-                &repo_store,
-                &current.repo_ref,
-                &current.workflow,
-            );
-
-            if owner_resolution.is_err() && (!claim_expired || active_lock.is_some()) {
-                skipped += 1;
-                continue;
-            }
-            if claim_expired && active_lock.is_none() && owner_resolution.is_err() {
-                current.status = ClaimStatus::Released;
-                current.updated_at = chrono::Utc::now().to_rfc3339();
-                claim_store.save(&current)?;
-                adjust_active_claim_count(
-                    &mut active_claim_counts,
+        let issue_result: anyhow::Result<bool> = async {
+            if let Some(mut current) = claim {
+                let previous_status = current.status;
+                let active_lock = claim_store.read_active_lock(&issue_ref_text)?;
+                let claim_expired = claim_lease_expired(&current)?;
+                let owner_resolution = resolve_autoflow_workflow_for_repo(
+                    &global,
+                    &repo_store,
                     &current.repo_ref,
-                    Some(previous_status),
-                    Some(current.status),
+                    &current.workflow,
                 );
-                if winner.is_none() {
-                    skipped += 1;
-                    continue;
-                }
-            } else {
-                let mut resolved = owner_resolution?;
-                current.contenders =
-                    active_or_fallback_contenders(&contenders, Some(&resolved), &current.workflow);
-                reconcile_claim_from_last_run(&global, &resolved, &mut current)?;
 
-                if current.status == ClaimStatus::Released {
+                if owner_resolution.is_err() && (!claim_expired || active_lock.is_some()) {
+                    return Ok(false);
+                }
+                if claim_expired && active_lock.is_none() && owner_resolution.is_err() {
+                    current.status = ClaimStatus::Released;
+                    current.updated_at = chrono::Utc::now().to_rfc3339();
                     claim_store.save(&current)?;
                     adjust_active_claim_count(
                         &mut active_claim_counts,
@@ -399,20 +398,19 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                         Some(previous_status),
                         Some(current.status),
                     );
-                } else if current.status == ClaimStatus::Complete
-                    || current.status == ClaimStatus::Blocked
-                {
-                    claim_store.save(&current)?;
-                    adjust_active_claim_count(
-                        &mut active_claim_counts,
-                        &current.repo_ref,
-                        Some(previous_status),
-                        Some(current.status),
+                    if winner.is_none() {
+                        return Ok(false);
+                    }
+                } else {
+                    let mut resolved = owner_resolution?;
+                    current.contenders = active_or_fallback_contenders(
+                        &contenders,
+                        Some(&resolved),
+                        &current.workflow,
                     );
-                    skipped += 1;
-                    continue;
-                } else if let Some(dispatch) = current.pending_dispatch.clone() {
-                    if !updated_before_tick(&current, tick_started_at)? {
+                    reconcile_claim_from_last_run(&global, &resolved, &mut current)?;
+
+                    if current.status == ClaimStatus::Released {
                         claim_store.save(&current)?;
                         adjust_active_claim_count(
                             &mut active_claim_counts,
@@ -420,132 +418,176 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                             Some(previous_status),
                             Some(current.status),
                         );
-                        skipped += 1;
-                        continue;
+                    } else if current.status == ClaimStatus::Complete
+                        || current.status == ClaimStatus::Blocked
+                    {
+                        claim_store.save(&current)?;
+                        adjust_active_claim_count(
+                            &mut active_claim_counts,
+                            &current.repo_ref,
+                            Some(previous_status),
+                            Some(current.status),
+                        );
+                        return Ok(false);
+                    } else if let Some(dispatch) = current.pending_dispatch.clone() {
+                        if !updated_before_tick(&current, tick_started_at)? {
+                            claim_store.save(&current)?;
+                            adjust_active_claim_count(
+                                &mut active_claim_counts,
+                                &current.repo_ref,
+                                Some(previous_status),
+                                Some(current.status),
+                            );
+                            return Ok(false);
+                        }
+                        resolved = resolve_autoflow_workflow_for_repo(
+                            &global,
+                            &repo_store,
+                            &current.repo_ref,
+                            &dispatch.workflow,
+                        )?;
+                        let issue = fetch_issue(
+                            &resolved.cfg,
+                            resolver.as_ref(),
+                            &parse_issue_ref_text(&issue_ref_text)?,
+                        )
+                        .await?;
+                        execute_autoflow_cycle(
+                            &global,
+                            &claim_store,
+                            &resolved,
+                            &issue,
+                            &issue_ref_text,
+                            None,
+                            false,
+                            dispatch.inputs,
+                            current.contenders.clone(),
+                        )
+                        .await?;
+                        adjust_active_claim_count(
+                            &mut active_claim_counts,
+                            &current.repo_ref,
+                            Some(previous_status),
+                            Some(load_claim_status(&claim_store, &issue_ref_text)?),
+                        );
+                        return Ok(true);
+                    } else if should_run_claim(
+                        &current,
+                        &resolved,
+                        &claim_store,
+                        tick_started_at,
+                        &wake_hints.events_for(&issue_ref_text, &current.repo_ref),
+                    )? {
+                        let issue = fetch_issue(
+                            &resolved.cfg,
+                            resolver.as_ref(),
+                            &parse_issue_ref_text(&issue_ref_text)?,
+                        )
+                        .await?;
+                        execute_autoflow_cycle(
+                            &global,
+                            &claim_store,
+                            &resolved,
+                            &issue,
+                            &issue_ref_text,
+                            None,
+                            false,
+                            BTreeMap::new(),
+                            current.contenders.clone(),
+                        )
+                        .await?;
+                        adjust_active_claim_count(
+                            &mut active_claim_counts,
+                            &current.repo_ref,
+                            Some(previous_status),
+                            Some(load_claim_status(&claim_store, &issue_ref_text)?),
+                        );
+                        return Ok(true);
+                    } else {
+                        claim_store.save(&current)?;
+                        adjust_active_claim_count(
+                            &mut active_claim_counts,
+                            &current.repo_ref,
+                            Some(previous_status),
+                            Some(current.status),
+                        );
+                        return Ok(false);
                     }
-                    resolved = resolve_autoflow_workflow_for_repo(
-                        &global,
-                        &repo_store,
-                        &current.repo_ref,
-                        &dispatch.workflow,
-                    )?;
-                    let issue = fetch_issue(
-                        &resolved.cfg,
-                        resolver.as_ref(),
-                        &parse_issue_ref_text(&issue_ref_text)?,
-                    )
-                    .await?;
-                    execute_autoflow_cycle(
-                        &global,
-                        &claim_store,
-                        &resolved,
-                        &issue,
-                        &issue_ref_text,
-                        None,
-                        false,
-                        dispatch.inputs,
-                        current.contenders.clone(),
-                    )
-                    .await?;
-                    adjust_active_claim_count(
-                        &mut active_claim_counts,
-                        &current.repo_ref,
-                        Some(previous_status),
-                        Some(load_claim_status(&claim_store, &issue_ref_text)?),
-                    );
-                    ran += 1;
-                    continue;
-                } else if should_run_claim(
-                    &current,
-                    &resolved,
-                    &claim_store,
-                    tick_started_at,
-                    &wake_hints.events_for(&issue_ref_text, &current.repo_ref),
-                )? {
-                    let issue = fetch_issue(
-                        &resolved.cfg,
-                        resolver.as_ref(),
-                        &parse_issue_ref_text(&issue_ref_text)?,
-                    )
-                    .await?;
-                    execute_autoflow_cycle(
-                        &global,
-                        &claim_store,
-                        &resolved,
-                        &issue,
-                        &issue_ref_text,
-                        None,
-                        false,
-                        BTreeMap::new(),
-                        current.contenders.clone(),
-                    )
-                    .await?;
-                    adjust_active_claim_count(
-                        &mut active_claim_counts,
-                        &current.repo_ref,
-                        Some(previous_status),
-                        Some(load_claim_status(&claim_store, &issue_ref_text)?),
-                    );
-                    ran += 1;
-                    continue;
-                } else {
-                    claim_store.save(&current)?;
-                    adjust_active_claim_count(
-                        &mut active_claim_counts,
-                        &current.repo_ref,
-                        Some(previous_status),
-                        Some(current.status),
-                    );
-                    skipped += 1;
-                    continue;
                 }
             }
-        }
 
-        let Some(winner) = winner else {
-            skipped += 1;
-            continue;
-        };
-        let max_active = winner.resolved.cfg.autoflow.max_active.unwrap_or(u32::MAX) as usize;
-        let active = active_claim_counts
-            .get(&winner.resolved.repo_ref)
-            .copied()
-            .unwrap_or_default();
-        if active >= max_active {
-            skipped += 1;
-            continue;
+            let Some(winner) = winner else {
+                return Ok(false);
+            };
+            let max_active = winner.resolved.cfg.autoflow.max_active.unwrap_or(u32::MAX) as usize;
+            let active = active_claim_counts
+                .get(&winner.resolved.repo_ref)
+                .copied()
+                .unwrap_or_default();
+            if active >= max_active {
+                return Ok(false);
+            }
+            execute_autoflow_cycle(
+                &global,
+                &claim_store,
+                &winner.resolved,
+                &winner.issue,
+                &winner.issue_ref_text,
+                None,
+                false,
+                BTreeMap::new(),
+                active_or_fallback_contenders(
+                    &contenders,
+                    Some(&winner.resolved),
+                    &winner.resolved.workflow.name,
+                ),
+            )
+            .await?;
+            adjust_active_claim_count(
+                &mut active_claim_counts,
+                &winner.resolved.repo_ref,
+                None,
+                Some(load_claim_status(&claim_store, &winner.issue_ref_text)?),
+            );
+            Ok(true)
         }
-        execute_autoflow_cycle(
-            &global,
-            &claim_store,
-            &winner.resolved,
-            &winner.issue,
-            &winner.issue_ref_text,
-            None,
-            false,
-            BTreeMap::new(),
-            active_or_fallback_contenders(
-                &contenders,
-                Some(&winner.resolved),
-                &winner.resolved.workflow.name,
-            ),
-        )
-        .await?;
-        adjust_active_claim_count(
-            &mut active_claim_counts,
-            &winner.resolved.repo_ref,
-            None,
-            Some(load_claim_status(&claim_store, &winner.issue_ref_text)?),
-        );
-        ran += 1;
+        .await;
+
+        match issue_result {
+            Ok(true) => ran += 1,
+            Ok(false) => skipped += 1,
+            Err(err) => {
+                failed += 1;
+                if let Some(repo_ref) = repo_hint.as_deref() {
+                    if let Err(sync_err) =
+                        sync_active_claim_count(&mut active_claim_counts, &claim_store, repo_ref)
+                    {
+                        warn!(
+                            issue_ref = %issue_ref_text,
+                            repo_ref,
+                            error = %sync_err,
+                            "failed to resync autoflow capacity after issue error"
+                        );
+                    }
+                }
+                warn!(
+                    issue_ref = %issue_ref_text,
+                    repo_ref = repo_hint.as_deref().unwrap_or("-"),
+                    workflow = workflow_hint.as_deref().unwrap_or("-"),
+                    error = %err,
+                    "autoflow tick failed for issue"
+                );
+            }
+        }
     }
 
     println!(
-        "autoflow tick: {} workflow(s), {} polled event(s), {} cycle(s) ran, {} skipped, {} cleaned",
+        "autoflow tick: {} workflow(s), {} polled event(s), {} cycle(s) ran, {} skipped, {} failed, {} cleaned",
         discovered.len(),
         wake_hints.total_polled_events,
         ran,
         skipped,
+        failed,
         cleaned
     );
     Ok(())
@@ -1430,6 +1472,24 @@ fn load_claim_status(
         .load(issue_ref)?
         .map(|claim| claim.status)
         .ok_or_else(|| anyhow!("claim `{issue_ref}` disappeared during tick"))
+}
+
+fn sync_active_claim_count(
+    counts: &mut BTreeMap<String, usize>,
+    claim_store: &AutoflowClaimStore,
+    repo_ref: &str,
+) -> anyhow::Result<()> {
+    let active = claim_store
+        .list()?
+        .into_iter()
+        .filter(|claim| claim.repo_ref == repo_ref && claim_counts_toward_max_active(claim.status))
+        .count();
+    if active == 0 {
+        counts.remove(repo_ref);
+    } else {
+        counts.insert(repo_ref.to_string(), active);
+    }
+    Ok(())
 }
 
 fn wake_events_match(
@@ -3228,5 +3288,201 @@ base_url = "{}"
         assert_eq!(claim_124.status, ClaimStatus::Complete);
         assert!(claim_123.last_run_id.is_some());
         assert!(claim_124.last_run_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn tick_continues_after_issue_level_failure() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let mut issues: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let base_issue = issues.as_array().unwrap()[0].clone();
+        let mut issue_123 = base_issue.clone();
+        issue_123["repository_url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu");
+        issue_123["html_url"] =
+            serde_json::json!("https://github.com/Section9Labs/rupu/issues/123");
+        issue_123["url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu/issues/123");
+        issue_123["number"] = serde_json::json!(123);
+        issue_123["labels"] = serde_json::json!([{
+            "id": 2,
+            "node_id": "LA_2",
+            "url": "https://api.github.com/repos/Section9Labs/rupu/labels/bad",
+            "name": "bad",
+            "color": "5319e7",
+            "default": false
+        }]);
+        let mut issue_124 = base_issue.clone();
+        issue_124["repository_url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu");
+        issue_124["html_url"] =
+            serde_json::json!("https://github.com/Section9Labs/rupu/issues/124");
+        issue_124["url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu/issues/124");
+        issue_124["number"] = serde_json::json!(124);
+        issue_124["title"] = serde_json::json!("Valid autoflow issue");
+        issue_124["updated_at"] = serde_json::json!("2026-05-03T09:00:00Z");
+        issue_124["labels"] = serde_json::json!([{
+            "id": 1,
+            "node_id": "LA_1",
+            "url": "https://api.github.com/repos/Section9Labs/rupu/labels/bug",
+            "name": "bug",
+            "color": "d73a4a",
+            "default": true
+        }]);
+        issues = serde_json::json!([issue_123, issue_124]);
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(issues.clone());
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "good-autoflow",
+            r#"name: good-autoflow
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+        std::fs::write(
+            project.join(".rupu/workflows/bad-autoflow.yaml"),
+            r#"name: bad-autoflow
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bad"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: bad_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".rupu/contracts/bad_outcome_v1.json"),
+            r#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "bad_outcome_v1",
+  "type": "object",
+  "required": ["status", "must_not_be_missing"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["complete"]
+    },
+    "must_not_be_missing": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}"#,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        tick_with_resolver(resolver).await.unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        let bad_claim = claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .unwrap();
+        let good_claim = claim_store
+            .load("github:Section9Labs/rupu/issues/124")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bad_claim.status, ClaimStatus::Blocked);
+        assert!(bad_claim
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("output failed schema"));
+        assert_eq!(good_claim.status, ClaimStatus::Complete);
+        assert!(good_claim.last_run_id.is_some());
     }
 }
