@@ -338,7 +338,7 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
 
     let mut active_claim_counts: BTreeMap<String, usize> = BTreeMap::new();
     for claim in claims_by_issue.values() {
-        if claim.status != ClaimStatus::Released {
+        if claim_counts_toward_max_active(claim.status) {
             *active_claim_counts
                 .entry(claim.repo_ref.clone())
                 .or_insert(0) += 1;
@@ -357,6 +357,7 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
             .unwrap_or_default();
 
         if let Some(mut current) = claim.take() {
+            let previous_status = current.status;
             let active_lock = claim_store.read_active_lock(&issue_ref_text)?;
             let claim_expired = claim_lease_expired(&current)?;
             let owner_resolution = resolve_autoflow_workflow_for_repo(
@@ -374,6 +375,12 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                 current.status = ClaimStatus::Released;
                 current.updated_at = chrono::Utc::now().to_rfc3339();
                 claim_store.save(&current)?;
+                adjust_active_claim_count(
+                    &mut active_claim_counts,
+                    &current.repo_ref,
+                    Some(previous_status),
+                    Some(current.status),
+                );
                 if winner.is_none() {
                     skipped += 1;
                     continue;
@@ -386,15 +393,33 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
 
                 if current.status == ClaimStatus::Released {
                     claim_store.save(&current)?;
+                    adjust_active_claim_count(
+                        &mut active_claim_counts,
+                        &current.repo_ref,
+                        Some(previous_status),
+                        Some(current.status),
+                    );
                 } else if current.status == ClaimStatus::Complete
                     || current.status == ClaimStatus::Blocked
                 {
                     claim_store.save(&current)?;
+                    adjust_active_claim_count(
+                        &mut active_claim_counts,
+                        &current.repo_ref,
+                        Some(previous_status),
+                        Some(current.status),
+                    );
                     skipped += 1;
                     continue;
                 } else if let Some(dispatch) = current.pending_dispatch.clone() {
                     if !updated_before_tick(&current, tick_started_at)? {
                         claim_store.save(&current)?;
+                        adjust_active_claim_count(
+                            &mut active_claim_counts,
+                            &current.repo_ref,
+                            Some(previous_status),
+                            Some(current.status),
+                        );
                         skipped += 1;
                         continue;
                     }
@@ -422,6 +447,12 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                         current.contenders.clone(),
                     )
                     .await?;
+                    adjust_active_claim_count(
+                        &mut active_claim_counts,
+                        &current.repo_ref,
+                        Some(previous_status),
+                        Some(load_claim_status(&claim_store, &issue_ref_text)?),
+                    );
                     ran += 1;
                     continue;
                 } else if should_run_claim(
@@ -449,10 +480,22 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
                         current.contenders.clone(),
                     )
                     .await?;
+                    adjust_active_claim_count(
+                        &mut active_claim_counts,
+                        &current.repo_ref,
+                        Some(previous_status),
+                        Some(load_claim_status(&claim_store, &issue_ref_text)?),
+                    );
                     ran += 1;
                     continue;
                 } else {
                     claim_store.save(&current)?;
+                    adjust_active_claim_count(
+                        &mut active_claim_counts,
+                        &current.repo_ref,
+                        Some(previous_status),
+                        Some(current.status),
+                    );
                     skipped += 1;
                     continue;
                 }
@@ -488,9 +531,12 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
             ),
         )
         .await?;
-        *active_claim_counts
-            .entry(winner.resolved.repo_ref.clone())
-            .or_insert(0) += 1;
+        adjust_active_claim_count(
+            &mut active_claim_counts,
+            &winner.resolved.repo_ref,
+            None,
+            Some(load_claim_status(&claim_store, &winner.issue_ref_text)?),
+        );
         ran += 1;
     }
 
@@ -1346,6 +1392,44 @@ fn claim_lease_expired(claim: &AutoflowClaimRecord) -> anyhow::Result<bool> {
         .with_context(|| format!("parse lease expiry for `{}`", claim.issue_ref))?
         .with_timezone(&chrono::Utc);
     Ok(lease <= chrono::Utc::now())
+}
+
+fn claim_counts_toward_max_active(status: ClaimStatus) -> bool {
+    !matches!(status, ClaimStatus::Complete | ClaimStatus::Released)
+}
+
+fn adjust_active_claim_count(
+    counts: &mut BTreeMap<String, usize>,
+    repo_ref: &str,
+    before: Option<ClaimStatus>,
+    after: Option<ClaimStatus>,
+) {
+    let counted_before = before.is_some_and(claim_counts_toward_max_active);
+    let counted_after = after.is_some_and(claim_counts_toward_max_active);
+    match (counted_before, counted_after) {
+        (false, true) => {
+            *counts.entry(repo_ref.to_string()).or_insert(0) += 1;
+        }
+        (true, false) => {
+            if let Some(count) = counts.get_mut(repo_ref) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    counts.remove(repo_ref);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn load_claim_status(
+    claim_store: &AutoflowClaimStore,
+    issue_ref: &str,
+) -> anyhow::Result<ClaimStatus> {
+    claim_store
+        .load(issue_ref)?
+        .map(|claim| claim.status)
+        .ok_or_else(|| anyhow!("claim `{issue_ref}` disappeared during tick"))
 }
 
 fn wake_events_match(
@@ -2823,5 +2907,326 @@ steps:
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
         assert!(!issue_dir.join(".lock").exists());
+    }
+
+    #[tokio::test]
+    async fn tick_ignores_complete_claims_when_enforcing_max_active() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let mut issues: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let base_issue = issues.as_array().unwrap()[0].clone();
+        let mut issue_123 = base_issue.clone();
+        issue_123["repository_url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu");
+        issue_123["html_url"] =
+            serde_json::json!("https://github.com/Section9Labs/rupu/issues/123");
+        issue_123["url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu/issues/123");
+        issue_123["number"] = serde_json::json!(123);
+        let mut issue_124 = issue_123.clone();
+        issue_124["html_url"] =
+            serde_json::json!("https://github.com/Section9Labs/rupu/issues/124");
+        issue_124["url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu/issues/124");
+        issue_124["number"] = serde_json::json!(124);
+        issue_124["title"] = serde_json::json!("Add missing regression");
+        issue_124["updated_at"] = serde_json::json!("2026-05-03T09:00:00Z");
+        issues = serde_json::json!([issue_123, issue_124]);
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(issues.clone());
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+    limit: 100
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+        std::fs::write(
+            project.join(".rupu/config.toml"),
+            format!(
+                r#"[autoflow]
+enabled = true
+permission_mode = "bypass"
+strict_templates = true
+max_active = 1
+
+[scm.github]
+base_url = "{}"
+"#,
+                server.base_url()
+            ),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: "github:Section9Labs/rupu/issues/123".into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "issue-supervisor-dispatch".into(),
+                status: ClaimStatus::Complete,
+                worktree_path: Some(project.display().to_string()),
+                branch: Some("rupu/issue-123".into()),
+                last_run_id: Some("run_123".into()),
+                last_error: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: None,
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        tick_with_resolver(resolver).await.unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let new_claim = claim_store
+            .load("github:Section9Labs/rupu/issues/124")
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_claim.status, ClaimStatus::Complete);
+        assert!(new_claim.last_run_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn tick_frees_capacity_after_existing_claim_completes() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let mut issues: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!(
+                "{}/../rupu-scm/tests/fixtures/github/issues_list_happy.json",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let base_issue = issues.as_array().unwrap()[0].clone();
+        let mut issue_123 = base_issue.clone();
+        issue_123["repository_url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu");
+        issue_123["html_url"] =
+            serde_json::json!("https://github.com/Section9Labs/rupu/issues/123");
+        issue_123["url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu/issues/123");
+        issue_123["number"] = serde_json::json!(123);
+        issue_123["updated_at"] = serde_json::json!("2026-05-01T09:00:00Z");
+        let mut issue_124 = issue_123.clone();
+        issue_124["html_url"] =
+            serde_json::json!("https://github.com/Section9Labs/rupu/issues/124");
+        issue_124["url"] =
+            serde_json::json!("https://api.github.com/repos/Section9Labs/rupu/issues/124");
+        issue_124["number"] = serde_json::json!(124);
+        issue_124["title"] = serde_json::json!("Add missing regression");
+        issue_124["updated_at"] = serde_json::json!("2026-05-03T09:00:00Z");
+        issues = serde_json::json!([issue_123.clone(), issue_124]);
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(issues.clone());
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues/123");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(issue_123.clone());
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+    limit: 100
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+        std::fs::write(
+            project.join(".rupu/config.toml"),
+            format!(
+                r#"[autoflow]
+enabled = true
+permission_mode = "bypass"
+strict_templates = true
+max_active = 1
+
+[scm.github]
+base_url = "{}"
+"#,
+                server.base_url()
+            ),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        claim_store
+            .save(&AutoflowClaimRecord {
+                issue_ref: "github:Section9Labs/rupu/issues/123".into(),
+                repo_ref: "github:Section9Labs/rupu".into(),
+                workflow: "issue-supervisor-dispatch".into(),
+                status: ClaimStatus::AwaitExternal,
+                worktree_path: Some(project.display().to_string()),
+                branch: Some("rupu/issue-123".into()),
+                last_run_id: None,
+                last_error: None,
+                next_retry_at: None,
+                claim_owner: None,
+                lease_expires_at: Some(
+                    (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
+                ),
+                pending_dispatch: None,
+                contenders: vec![],
+                updated_at: (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+            })
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        tick_with_resolver(resolver).await.unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let claim_123 = claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .unwrap();
+        let claim_124 = claim_store
+            .load("github:Section9Labs/rupu/issues/124")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim_123.status, ClaimStatus::Complete);
+        assert_eq!(claim_124.status, ClaimStatus::Complete);
+        assert!(claim_123.last_run_id.is_some());
+        assert!(claim_124.last_run_id.is_some());
     }
 }
