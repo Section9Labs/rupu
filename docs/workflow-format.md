@@ -192,7 +192,7 @@ Notes:
 
 - `autoflow:` does not replace `trigger:`. `trigger:` still describes one-shot starts; `autoflow:` describes persistent ownership over time.
 - Workflow files remain usable with `rupu workflow run`; autoflow semantics activate only under `rupu autoflow ...`.
-- Autoflow execution rejects `ask` permission mode. Use `bypass` or `readonly`.
+- Autoflow execution accepts only `bypass` or `readonly` permission modes. `ask` and any other value are rejected.
 - `autoflow` template rendering is strict. Missing variables are a protocol error in autonomous mode.
 - `wake_on` becomes actionable only when `rupu autoflow tick` can see matching SCM events, typically via `[triggers].poll_sources` for the repo.
 - Matching precedence is deterministic: higher `priority` wins, then workflow name.

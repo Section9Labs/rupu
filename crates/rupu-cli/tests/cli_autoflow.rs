@@ -627,6 +627,94 @@ steps:
 }
 
 #[tokio::test]
+async fn autoflow_run_rejects_unknown_mode_override() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(project.path(), "git@github.com:Section9Labs/rupu.git");
+    write_agent_and_workflow(
+        &project,
+        "auto-wf",
+        r#"name: auto-wf
+autoflow:
+  enabled: true
+steps:
+  - id: a
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    track_repo(&home, "github:Section9Labs/rupu", project.path());
+
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_current_dir(project.path()).unwrap();
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "autoflow".into(),
+        "run".into(),
+        "auto-wf".into(),
+        "github:Section9Labs/rupu/issues/42".into(),
+        "--mode".into(),
+        "admin".into(),
+    ])
+    .await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_HOME");
+
+    assert_ne!(exit, std::process::ExitCode::from(0));
+}
+
+#[tokio::test]
+async fn autoflow_run_rejects_unknown_mode_from_config() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(project.path(), "git@github.com:Section9Labs/rupu.git");
+    write_agent_and_workflow(
+        &project,
+        "auto-wf",
+        r#"name: auto-wf
+autoflow:
+  enabled: true
+steps:
+  - id: a
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    project
+        .child(".rupu/config.toml")
+        .write_str("[autoflow]\npermission_mode = \"admin\"\n")
+        .unwrap();
+    track_repo(&home, "github:Section9Labs/rupu", project.path());
+
+    std::env::set_var("RUPU_HOME", home.path());
+    std::env::set_current_dir(project.path()).unwrap();
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "autoflow".into(),
+        "run".into(),
+        "auto-wf".into(),
+        "github:Section9Labs/rupu/issues/42".into(),
+    ])
+    .await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_HOME");
+
+    assert_ne!(exit, std::process::ExitCode::from(0));
+}
+
+#[tokio::test]
 async fn autoflow_release_deletes_claim() {
     let _guard = ENV_LOCK.lock().await;
 
