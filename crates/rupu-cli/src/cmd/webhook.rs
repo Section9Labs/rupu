@@ -12,11 +12,12 @@
 //! 503 (service-unavailable) so the operator knows the route is
 //! intentionally disabled rather than misconfigured.
 
-use super::autoflow_wake::{store_webhook_wake_event, wake_event_from_webhook};
+use super::autoflow_wake::wake_request_from_webhook;
 use crate::paths;
 use async_trait::async_trait;
 use clap::Subcommand;
 use rupu_orchestrator::Workflow;
+use rupu_runtime::{WakeStore, WakeStoreError};
 use rupu_webhook::{
     serve, DispatchOutcome, WebhookConfig, WebhookEvent, WebhookObserver, WorkflowDispatcher,
 };
@@ -117,17 +118,21 @@ struct CliWebhookObserver {
 #[async_trait]
 impl WebhookObserver for CliWebhookObserver {
     async fn observe(&self, event: &WebhookEvent) -> anyhow::Result<()> {
-        let Some(stored) = wake_event_from_webhook(event) else {
+        let Some(request) = wake_request_from_webhook(event) else {
             return Ok(());
         };
         let repo_store = RepoRegistryStore {
             root: paths::repos_dir(&self.global),
         };
-        if repo_store.load(&stored.repo_ref)?.is_none() {
+        if repo_store.load(&request.repo_ref)?.is_none() {
             return Ok(());
         }
-        let root = paths::autoflow_webhook_events_dir(&self.global);
-        store_webhook_wake_event(&root, &stored)?;
+        let store = WakeStore::new(paths::autoflow_wakes_dir(&self.global));
+        match store.enqueue(request) {
+            Ok(_) => {}
+            Err(WakeStoreError::DuplicateDedupeKey(_)) => {}
+            Err(err) => return Err(err.into()),
+        }
         Ok(())
     }
 }
@@ -318,11 +323,56 @@ mod tests {
             .await
             .unwrap();
 
-        let queued = std::fs::read_dir(paths::autoflow_webhook_events_dir(&global))
-            .unwrap()
-            .flatten()
-            .count();
-        assert_eq!(queued, 1);
+        let queued = WakeStore::new(paths::autoflow_wakes_dir(&global))
+            .list_due(chrono::Utc::now())
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].repo_ref, "github:Section9Labs/rupu");
+    }
+
+    #[tokio::test]
+    async fn observer_dedupes_replayed_webhook_deliveries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        let repo_path = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_path).unwrap();
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &repo_path,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("main"),
+            )
+            .unwrap();
+
+        let observer = CliWebhookObserver {
+            global: global.clone(),
+        };
+        let replay = WebhookEvent {
+            source: WebhookSource::Github,
+            event_id: "github.issue.labeled".into(),
+            delivery_id: Some("delivery-123".into()),
+            payload: json!({
+                "issue": { "number": 42 },
+                "repository": {
+                    "name": "rupu",
+                    "owner": { "login": "Section9Labs" }
+                }
+            }),
+        };
+
+        observer.observe(&replay).await.unwrap();
+        observer.observe(&replay).await.unwrap();
+
+        let queued = WakeStore::new(paths::autoflow_wakes_dir(&global))
+            .list_due(chrono::Utc::now())
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].event.delivery_id.as_deref(), Some("delivery-123"));
     }
 
     #[test]

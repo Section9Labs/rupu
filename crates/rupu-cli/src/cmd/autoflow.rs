@@ -1,6 +1,6 @@
 //! `rupu autoflow ...` — manual/autonomous workflow entrypoints.
 
-use super::autoflow_wake::drain_webhook_wake_events;
+use super::autoflow_wake::wake_request_from_polled_event;
 use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
@@ -20,10 +20,8 @@ use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
     WorkflowOutputContract,
 };
-use rupu_runtime::RunTriggerSource;
-use rupu_scm::{
-    Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, PolledEvent, RepoRef,
-};
+use rupu_runtime::{RunTriggerSource, WakeEntityKind, WakeStore, WakeStoreError};
+use rupu_scm::{Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, RepoRef};
 use rupu_workspace::{
     ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
     AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
@@ -167,23 +165,10 @@ pub(crate) struct WakeHints {
     pub(crate) by_repo: BTreeMap<String, BTreeSet<String>>,
     pub(crate) total_polled_events: usize,
     pub(crate) total_webhook_events: usize,
+    pub(crate) due_wake_ids: Vec<String>,
 }
 
 impl WakeHints {
-    fn record(&mut self, repo_ref: &str, event: &PolledEvent) {
-        self.total_polled_events += 1;
-        self.by_repo
-            .entry(repo_ref.to_string())
-            .or_default()
-            .insert(event.id.clone());
-        if let Some(issue_ref) = extract_issue_ref_from_polled_event(event) {
-            self.by_issue
-                .entry(issue_ref)
-                .or_default()
-                .insert(event.id.clone());
-        }
-    }
-
     pub(crate) fn events_for(&self, issue_ref: &str, repo_ref: &str) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         if let Some(events) = self.by_repo.get(repo_ref) {
@@ -835,33 +820,47 @@ pub(crate) async fn collect_wake_hints(
     discovered: &[ResolvedAutoflowWorkflow],
     resolver: &dyn CredentialResolver,
 ) -> anyhow::Result<WakeHints> {
-    let mut wake_hints = collect_polled_wake_hints(global, discovered, resolver).await?;
-    let webhook_events = collect_webhook_wake_events(global, discovered)?;
-    for event in webhook_events {
-        wake_hints.total_webhook_events += 1;
+    let store = WakeStore::new(paths::autoflow_wakes_dir(global));
+    enqueue_polled_wakes(global, discovered, resolver).await?;
+    let mut wake_hints = WakeHints::default();
+    let repo_refs = wake_enabled_repo_refs(discovered)?;
+    if repo_refs.is_empty() {
+        return Ok(wake_hints);
+    }
+    for wake in store.list_due(chrono::Utc::now())? {
+        if !repo_refs.contains(&wake.repo_ref) {
+            continue;
+        }
+        match wake.source {
+            rupu_runtime::WakeSource::CronPoll => wake_hints.total_polled_events += 1,
+            rupu_runtime::WakeSource::Webhook => wake_hints.total_webhook_events += 1,
+            _ => {}
+        }
         wake_hints
             .by_repo
-            .entry(event.repo_ref.clone())
+            .entry(wake.repo_ref.clone())
             .or_default()
-            .insert(event.event_id.clone());
-        if let Some(issue_ref) = event.issue_ref {
+            .insert(wake.event.id.clone());
+        if wake.entity.kind == WakeEntityKind::Issue {
             wake_hints
                 .by_issue
-                .entry(issue_ref)
+                .entry(wake.entity.ref_text.clone())
                 .or_default()
-                .insert(event.event_id);
+                .insert(wake.event.id.clone());
         }
+        wake_hints.due_wake_ids.push(wake.wake_id);
     }
     Ok(wake_hints)
 }
 
-async fn collect_polled_wake_hints(
+async fn enqueue_polled_wakes(
     global: &Path,
     discovered: &[ResolvedAutoflowWorkflow],
     resolver: &dyn CredentialResolver,
-) -> anyhow::Result<WakeHints> {
+) -> anyhow::Result<()> {
     let cursors_root = paths::autoflow_event_cursors_dir(global);
     paths::ensure_dir(&cursors_root)?;
+    let store = WakeStore::new(paths::autoflow_wakes_dir(global));
 
     let mut unique_repos: BTreeMap<String, &ResolvedAutoflowWorkflow> = BTreeMap::new();
     for resolved in discovered {
@@ -873,7 +872,6 @@ async fn collect_polled_wake_hints(
             .or_insert(resolved);
     }
 
-    let mut wake_hints = WakeHints::default();
     for (repo_ref, resolved) in unique_repos {
         if !resolved
             .cfg
@@ -914,17 +912,22 @@ async fn collect_polled_wake_hints(
             );
         }
         for event in polled.events {
-            wake_hints.record(&repo_ref, &event);
+            match store.enqueue(wake_request_from_polled_event(&event)) {
+                Ok(_) => {}
+                Err(WakeStoreError::DuplicateDedupeKey(_)) => {}
+                Err(err) => {
+                    warn!(repo_ref, error = %err, "failed to enqueue polled autoflow wake");
+                }
+            }
         }
     }
 
-    Ok(wake_hints)
+    Ok(())
 }
 
-fn collect_webhook_wake_events(
-    global: &Path,
+fn wake_enabled_repo_refs(
     discovered: &[ResolvedAutoflowWorkflow],
-) -> anyhow::Result<Vec<super::autoflow_wake::StoredWebhookWakeEvent>> {
+) -> anyhow::Result<BTreeSet<String>> {
     let mut repo_refs = BTreeSet::new();
     for resolved in discovered {
         if resolved.autoflow()?.wake_on.is_empty() {
@@ -932,11 +935,7 @@ fn collect_webhook_wake_events(
         }
         repo_refs.insert(resolved.repo_ref.clone());
     }
-    if repo_refs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let root = paths::autoflow_webhook_events_dir(global);
-    drain_webhook_wake_events(&root, &repo_refs)
+    Ok(repo_refs)
 }
 
 pub(crate) async fn collect_issue_matches(
@@ -2012,63 +2011,6 @@ fn write_cursor(path: &Path, body: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn extract_issue_ref_from_polled_event(event: &PolledEvent) -> Option<String> {
-    let tracker = match event.repo.platform {
-        Platform::Github => IssueTracker::Github,
-        Platform::Gitlab => IssueTracker::Gitlab,
-    };
-    let project = format!("{}/{}", event.repo.owner, event.repo.repo);
-    let number = match event.repo.platform {
-        Platform::Github => {
-            if !event.id.starts_with("github.issue.") {
-                return None;
-            }
-            event
-                .payload
-                .get("payload")
-                .and_then(|payload| payload.get("issue"))
-                .and_then(|issue| issue.get("number"))
-                .and_then(json_u64)
-        }
-        Platform::Gitlab => {
-            if event.id.starts_with("gitlab.issue.") {
-                event
-                    .payload
-                    .get("target_iid")
-                    .and_then(json_u64)
-                    .or_else(|| {
-                        event
-                            .payload
-                            .get("object_attributes")
-                            .and_then(|obj| obj.get("iid"))
-                            .and_then(json_u64)
-                    })
-                    .or_else(|| {
-                        event
-                            .payload
-                            .get("issue")
-                            .and_then(|issue| issue.get("iid"))
-                            .and_then(json_u64)
-                    })
-            } else if event.id == "gitlab.comment"
-                && event.payload.get("target_type").and_then(|v| v.as_str()) == Some("Issue")
-            {
-                event.payload.get("target_iid").and_then(json_u64)
-            } else {
-                None
-            }
-        }
-    }?;
-    Some(format!("{tracker}:{project}/issues/{number}"))
-}
-
-fn json_u64(value: &serde_json::Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|n| (n >= 0).then_some(n as u64)))
-        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
-}
-
 fn format_issue_ref(issue_ref: &IssueRef) -> String {
     format!(
         "{}:{}/issues/{}",
@@ -2390,7 +2332,7 @@ base_url = "{base_url}"
             owner: "Section9Labs".into(),
             repo: "rupu".into(),
         };
-        let event = PolledEvent {
+        let event = rupu_scm::PolledEvent {
             id: "github.issue.labeled".into(),
             delivery: "evt_1".into(),
             repo,
@@ -2402,7 +2344,7 @@ base_url = "{base_url}"
             }),
         };
         assert_eq!(
-            extract_issue_ref_from_polled_event(&event).as_deref(),
+            autoflow_wake::extract_issue_ref_from_polled_event(&event).as_deref(),
             Some("github:Section9Labs/rupu/issues/123")
         );
     }
@@ -2414,7 +2356,7 @@ base_url = "{base_url}"
             owner: "Section9Labs".into(),
             repo: "rupu".into(),
         };
-        let event = PolledEvent {
+        let event = rupu_scm::PolledEvent {
             id: "github.pr.closed".into(),
             delivery: "evt_2".into(),
             repo,
@@ -2425,7 +2367,7 @@ base_url = "{base_url}"
                 }
             }),
         };
-        assert!(extract_issue_ref_from_polled_event(&event).is_none());
+        assert!(autoflow_wake::extract_issue_ref_from_polled_event(&event).is_none());
     }
 
     #[test]
@@ -4139,17 +4081,24 @@ steps:
             })
             .unwrap();
 
-        autoflow_wake::store_webhook_wake_event(
-            &paths::autoflow_webhook_events_dir(&global),
-            &autoflow_wake::StoredWebhookWakeEvent {
-                delivery: "delivery-123".into(),
-                event_id: "github.issue.labeled".into(),
-                repo_ref: "github:Section9Labs/rupu".into(),
-                issue_ref: Some("github:Section9Labs/rupu/issues/123".into()),
-                received_at: chrono::Utc::now().to_rfc3339(),
-            },
-        )
-        .unwrap();
+        let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+        wake_store
+            .enqueue(
+                autoflow_wake::wake_request_from_webhook(&rupu_webhook::WebhookEvent {
+                    source: rupu_webhook::WebhookSource::Github,
+                    event_id: "github.issue.labeled".into(),
+                    delivery_id: Some("delivery-123".into()),
+                    payload: serde_json::json!({
+                        "issue": { "number": 123 },
+                        "repository": {
+                            "name": "rupu",
+                            "owner": { "login": "Section9Labs" }
+                        }
+                    }),
+                })
+                .unwrap(),
+            )
+            .unwrap();
 
         let resolver = Arc::new(InMemoryResolver::new());
         resolver
@@ -4174,9 +4123,7 @@ steps:
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
-        let repo_queue_dir = paths::autoflow_webhook_events_dir(&global)
-            .join(rupu_workspace::repo_dir_name("github:Section9Labs/rupu"));
-        assert!(std::fs::read_dir(repo_queue_dir).unwrap().next().is_none());
+        assert!(wake_store.list_due(chrono::Utc::now()).unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -3578,8 +3578,14 @@ dependencies = [
 name = "rupu-runtime"
 version = "0.5.4"
 dependencies = [
+ "chrono",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "ulid",
 ]
 
 [[package]]
