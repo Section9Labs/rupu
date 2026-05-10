@@ -11,7 +11,10 @@
 //! workflow runner with an opaque candidate key.
 
 use async_trait::async_trait;
-use rupu_orchestrator::{event_matches, TriggerKind, Workflow};
+use rupu_orchestrator::{
+    annotate_event_payload, candidate_event_ids, matching_event_id_from_candidates, TriggerKind,
+    Workflow,
+};
 use serde_json::Value;
 use thiserror::Error;
 use tracing::{info, warn};
@@ -82,20 +85,25 @@ pub async fn dispatch_event(
     dispatcher: &dyn WorkflowDispatcher,
 ) -> Vec<DispatchedWorkflow> {
     let mut out = Vec::new();
+    let candidate_ids = candidate_event_ids(event_id, payload);
     for (workflow_key, wf) in candidates {
         let display_name = wf.name.clone();
         if wf.trigger.on != TriggerKind::Event {
             continue;
         }
-        match wf.trigger.event.as_deref() {
-            Some(pattern) if event_matches(pattern, event_id) => {}
+        let matched_event_id = match wf.trigger.event.as_deref() {
+            Some(pattern) => matching_event_id_from_candidates(pattern, &candidate_ids),
             _ => continue,
-        }
+        };
+        let Some(matched_event_id) = matched_event_id else {
+            continue;
+        };
+        let enriched_payload = annotate_event_payload(payload, event_id, &matched_event_id);
         if let Some(filter_expr) = &wf.trigger.filter {
-            match render_filter(filter_expr, payload) {
+            match render_filter(filter_expr, &enriched_payload) {
                 Ok(true) => {}
                 Ok(false) => {
-                    info!(workflow = %display_name, event = %event_id, "filter rejected; skipping");
+                    info!(workflow = %display_name, event = %matched_event_id, "filter rejected; skipping");
                     continue;
                 }
                 Err(e) => {
@@ -111,8 +119,8 @@ pub async fn dispatch_event(
                 }
             }
         }
-        info!(workflow = %display_name, event = %event_id, "dispatching");
-        match dispatcher.dispatch(workflow_key, payload).await {
+        info!(workflow = %display_name, event = %matched_event_id, "dispatching");
+        match dispatcher.dispatch(workflow_key, &enriched_payload).await {
             Ok(outcome) => out.push(DispatchedWorkflow {
                 name: display_name.clone(),
                 fired: true,
@@ -241,7 +249,10 @@ mod tests {
         let calls = d.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "review-pr");
-        assert_eq!(calls[0].1, payload);
+        assert_eq!(calls[0].1["pull_request"]["number"], 7);
+        assert_eq!(calls[0].1["id"], "github.pr.opened");
+        assert_eq!(calls[0].1["canonical_id"], "github.pr.opened");
+        assert_eq!(calls[0].1["payload"]["pull_request"]["number"], 7);
     }
 
     #[tokio::test]
@@ -294,5 +305,23 @@ mod tests {
         let names = d.names();
         assert!(names.contains(&"review-pr".to_string()));
         assert!(names.contains(&"notify-slack".to_string()));
+    }
+
+    #[tokio::test]
+    async fn semantic_alias_pattern_dispatches_once() {
+        let candidates = vec![wf("triage", "issue.queue_entered", None)];
+        let d = RecordingDispatcher::new();
+        let payload = json!({
+            "action": "labeled",
+            "issue": { "number": 42 },
+            "repository": { "name": "rupu" }
+        });
+        let results = dispatch_event("github.issue.labeled", &payload, &candidates, &d).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].fired);
+        let calls = d.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["id"], "issue.queue_entered");
+        assert_eq!(calls[0].1["canonical_id"], "github.issue.labeled");
     }
 }

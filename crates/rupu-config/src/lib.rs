@@ -27,4 +27,4 @@ pub use layer::{layer_files, LayerError};
 pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};
 pub use scm_config::{IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmSection};
-pub use triggers_config::TriggersConfig;
+pub use triggers_config::{PollSourceEntry, PollSourceSpec, TriggersConfig};

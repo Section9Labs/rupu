@@ -24,7 +24,10 @@ Has its own design spec: [`docs/superpowers/specs/2026-05-07-rupu-workflow-trigg
 - ✅ `rupu cron tick` fires `trigger.on: cron` workflows from system cron / launchd. Idempotent.
 - ✅ `rupu webhook serve` (long-running HTTP receiver, HMAC-validated) fires `trigger.on: event` workflows.
 - ✅ **Plan 1 — polled events on cron tick** ([plan](docs/superpowers/plans/2026-05-07-rupu-workflow-triggers-plan-1-polled-events.md)). `rupu cron tick` now also polls `[triggers].poll_sources` for SCM events, fires matching workflows with `{{event.*}}` populated, idempotent via deterministic `evt-<wf>-<vendor>-<delivery>` run-ids. New: `rupu cron events` for inspection; `--skip-events` / `--only-events` flags for splitting tick frequencies. User docs at [`docs/triggers.md`](docs/triggers.md).
-- ⏳ Plan 2 (future) — glob matching on `trigger.event:` (`github.issue.*`), extended event vocab (issue-tracker queue events).
+- ✅ Trigger glob matching on `trigger.event:` (`github.issue.*`) is shipped.
+- ✅ Extended semantic trigger vocabulary is shipped for queue/activity aliases such as `issue.queue_entered`, `issue.queue_changed`, and `pr.review_activity`.
+- ✅ Per-source polling cadence overrides are shipped via `[triggers].poll_sources = [{ source = "...", poll_interval = "5m" }]`.
+- ⏳ Remaining trigger vocabulary follow-on — native issue-tracker queue/state events for connectors that model queues directly (for example Linear/Jira-style board transitions).
 - ⏳ Plan 3 (future, Slice E) — rupu.cloud webhook relay; cloud-as-connector or cloud-as-stream consumption.
 
 ## Workflow Tier 2 — fan-out, panel steps, approval gates

@@ -110,7 +110,7 @@ Cross-field rules (validated at parse):
 
 ## 6. Event vocabulary
 
-Stable rupu event ids — dotted, vendor-prefixed. The webhook receiver and the polled-events tier both produce these identifiers; the workflow's `trigger.event:` field matches against them exactly (glob support is a tagged follow-up).
+Stable rupu event ids — dotted, vendor-prefixed. The webhook receiver and the polled-events tier both produce these identifiers; the workflow's `trigger.event:` field matches against them with glob support and an additional layer of derived semantic aliases.
 
 ### 6.1 Shipped (via webhook receiver)
 
@@ -157,8 +157,7 @@ Events that depend on webhook-only signal (`review_requested`, `labeled`, `assig
 
 ### 6.3 Future vocabulary (deferred)
 
-- **Issue-tracker queue events**: `issue.entered_queue:<queue>`, `issue.left_queue:<queue>`, `issue.state_changed:<from>-><to>`. Useful when an issue tracker has a board / column / status concept beyond open/closed. Requires the connector to model "queue" — Linear/Jira will surface this naturally; GitHub Issues + Projects v2 less so.
-- **Glob matching** on `trigger.event:` (e.g. `github.issue.*`). 5-line follow-up per the existing webhook event_vocab module note.
+- **Native issue-tracker queue events**: `issue.entered_queue:<queue>`, `issue.left_queue:<queue>`, `issue.state_changed:<from>-><to>`. Useful when an issue tracker has a board / column / status concept beyond open/closed. Requires the connector to model "queue" — Linear/Jira will surface this naturally; GitHub Issues + Projects v2 less so.
 
 ## 7. Templates — the `{{event.*}}` binding
 
@@ -166,7 +165,10 @@ Both webhook and polled paths populate the orchestrator's `StepContext.event` wi
 
 ```
 event:
-  id: github.issue.opened              # the rupu event id (matches trigger.event:)
+  id: github.issue.opened              # matched event id for this run
+  canonical_id: github.issue.opened    # raw vendor-mapped id
+  matched_as: github.issue.opened
+  aliases: []                          # derived semantic aliases for this delivery
   vendor: github | gitlab              # for cross-vendor templates
   delivery: <opaque vendor delivery-id> # webhook X-GitHub-Delivery / poll cursor item id
   repo:
@@ -200,7 +202,7 @@ A `[triggers]` section in `config.toml` (project shadows global) gates which pol
 # Each tick: rupu queries the connector for events since the last cursor.
 poll_sources = [
   "github:Section9Labs/rupu",
-  "gitlab:my-org/my-repo",
+  { source = "gitlab:my-org/my-repo", poll_interval = "15m" },
 ]
 
 # Optional cap on events processed per source per tick. Default: 50.
@@ -300,5 +302,5 @@ Both shapes consume the same `PolledEvent` shape and produce the same `{{event.*
 ## 16. Open questions
 
 - **Should `rupu webhook serve` also write events to a local queue and have `rupu cron tick` consume from it?** This would unify the two ingest paths. Pro: one dispatch entry. Con: an extra piece of state; the receiver path becomes "async fire" rather than "sync dispatch." Decision: defer — keep webhook serve as direct-dispatch, polled events as direct-dispatch, until we have a concrete reason to introduce the queue.
-- **Per-source poll frequency.** Today every source polls at every tick. If a user adds 50 repos and ticks at 1min, that's 50 GitHub calls/min — within budget but not necessarily wanted. Option: per-source `poll_interval:` override in `[triggers]`. Decision: defer to Plan 2; ship one global rate first.
+- **Native queue/state modeling for non-SCM trackers.** Semantic aliases now cover GitHub/GitLab queue-like activity, but true queue state transitions still need connector-native models (Linear/Jira-style column/status moves).
 - **Filter expression sandboxing.** `trigger.filter:` is minijinja. If an attacker can write a workflow file in `.rupu/`, they can already execute arbitrary code via `bash:` agents — so the filter sandbox isn't the threat boundary. Document this; don't sandbox.

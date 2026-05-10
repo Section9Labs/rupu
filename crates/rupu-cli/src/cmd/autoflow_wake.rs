@@ -1,9 +1,10 @@
+use rupu_orchestrator::{annotate_event_payload, candidate_event_ids};
 use rupu_runtime::{WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeSource};
 use rupu_scm::{IssueTracker, Platform, PolledEvent};
 use rupu_webhook::{WebhookEvent, WebhookSource};
 use sha2::{Digest, Sha256};
 
-pub fn wake_request_from_webhook(event: &WebhookEvent) -> Option<WakeEnqueueRequest> {
+pub fn wake_requests_from_webhook(event: &WebhookEvent) -> Option<Vec<WakeEnqueueRequest>> {
     let repo_ref = repo_ref_from_webhook_event(event)?;
     let issue_ref = issue_ref_from_webhook_event(event, &repo_ref);
     let entity = issue_ref
@@ -16,22 +17,37 @@ pub fn wake_request_from_webhook(event: &WebhookEvent) -> Option<WakeEnqueueRequ
             kind: WakeEntityKind::Repo,
             ref_text: repo_ref.clone(),
         });
-    Some(WakeEnqueueRequest {
-        source: WakeSource::Webhook,
-        repo_ref: repo_ref.clone(),
-        entity,
-        event: WakeEvent {
-            id: event.event_id.clone(),
-            delivery_id: event.delivery_id.clone(),
-            dedupe_key: Some(dedupe_key_from_webhook(event, &repo_ref)),
-        },
-        payload: Some(normalized_webhook_payload(event)),
-        received_at: chrono::Utc::now().to_rfc3339(),
-        not_before: chrono::Utc::now().to_rfc3339(),
-    })
+    let payload = normalized_webhook_payload(event);
+    let candidate_ids = candidate_event_ids(&event.event_id, &event.payload);
+    Some(
+        candidate_ids
+            .into_iter()
+            .map(|matched_id| WakeEnqueueRequest {
+                source: WakeSource::Webhook,
+                repo_ref: repo_ref.clone(),
+                entity: entity.clone(),
+                event: WakeEvent {
+                    id: matched_id.clone(),
+                    delivery_id: event.delivery_id.clone(),
+                    dedupe_key: Some(dedupe_key_from_webhook(event, &repo_ref, &matched_id)),
+                },
+                payload: Some(annotate_event_payload(
+                    &payload,
+                    &event.event_id,
+                    &matched_id,
+                )),
+                received_at: chrono::Utc::now().to_rfc3339(),
+                not_before: chrono::Utc::now().to_rfc3339(),
+            })
+            .collect(),
+    )
 }
 
-pub fn wake_request_from_polled_event(event: &PolledEvent) -> WakeEnqueueRequest {
+pub fn wake_request_from_webhook(event: &WebhookEvent) -> Option<WakeEnqueueRequest> {
+    wake_requests_from_webhook(event).and_then(|mut requests| requests.drain(..).next())
+}
+
+pub fn wake_requests_from_polled_event(event: &PolledEvent) -> Vec<WakeEnqueueRequest> {
     let repo_ref = format!(
         "{}:{}/{}",
         event.repo.platform.as_str(),
@@ -49,25 +65,37 @@ pub fn wake_request_from_polled_event(event: &PolledEvent) -> WakeEnqueueRequest
             kind: WakeEntityKind::Repo,
             ref_text: repo_ref.clone(),
         });
-    WakeEnqueueRequest {
-        source: WakeSource::CronPoll,
-        repo_ref,
-        entity,
-        event: WakeEvent {
-            id: event.id.clone(),
-            delivery_id: Some(event.delivery.clone()),
-            dedupe_key: Some(format!(
-                "cron_poll:{}:{}:{}:{}",
-                event.repo.platform.as_str(),
-                event.repo.owner,
-                event.repo.repo,
-                event.delivery
-            )),
-        },
-        payload: Some(normalized_polled_payload(event)),
-        received_at: chrono::Utc::now().to_rfc3339(),
-        not_before: chrono::Utc::now().to_rfc3339(),
-    }
+    let payload = normalized_polled_payload(event);
+    candidate_event_ids(&event.id, &event.payload)
+        .into_iter()
+        .map(|matched_id| WakeEnqueueRequest {
+            source: WakeSource::CronPoll,
+            repo_ref: repo_ref.clone(),
+            entity: entity.clone(),
+            event: WakeEvent {
+                id: matched_id.clone(),
+                delivery_id: Some(event.delivery.clone()),
+                dedupe_key: Some(format!(
+                    "cron_poll:{}:{}:{}:{}:{}",
+                    event.repo.platform.as_str(),
+                    event.repo.owner,
+                    event.repo.repo,
+                    event.delivery,
+                    matched_id
+                )),
+            },
+            payload: Some(annotate_event_payload(&payload, &event.id, &matched_id)),
+            received_at: chrono::Utc::now().to_rfc3339(),
+            not_before: chrono::Utc::now().to_rfc3339(),
+        })
+        .collect()
+}
+
+pub fn wake_request_from_polled_event(event: &PolledEvent) -> WakeEnqueueRequest {
+    wake_requests_from_polled_event(event)
+        .into_iter()
+        .next()
+        .expect("candidate_event_ids always includes canonical id")
 }
 
 pub fn extract_issue_ref_from_polled_event(event: &PolledEvent) -> Option<String> {
@@ -120,17 +148,13 @@ pub fn extract_issue_ref_from_polled_event(event: &PolledEvent) -> Option<String
     Some(format!("{tracker}:{project}/issues/{number}"))
 }
 
-fn dedupe_key_from_webhook(event: &WebhookEvent, repo_ref: &str) -> String {
+fn dedupe_key_from_webhook(event: &WebhookEvent, repo_ref: &str, event_id: &str) -> String {
     if let Some(delivery_id) = &event.delivery_id {
-        return format!("webhook:{repo_ref}:{}:{delivery_id}", event.event_id);
+        return format!("webhook:{repo_ref}:{event_id}:{delivery_id}");
     }
     let payload = serde_json::to_vec(&event.payload).unwrap_or_default();
     let digest = Sha256::digest(&payload);
-    format!(
-        "webhook:{repo_ref}:{}:{}",
-        event.event_id,
-        hex::encode(digest)
-    )
+    format!("webhook:{repo_ref}:{event_id}:{}", hex::encode(digest))
 }
 
 fn normalized_webhook_payload(event: &WebhookEvent) -> serde_json::Value {
@@ -296,6 +320,30 @@ mod tests {
     }
 
     #[test]
+    fn semantic_alias_wakes_are_emitted_for_webhooks() {
+        let event = WebhookEvent {
+            source: WebhookSource::Github,
+            event_id: "github.issue.labeled".into(),
+            delivery_id: Some("delivery-123".into()),
+            payload: json!({
+                "issue": { "number": 42 },
+                "repository": {
+                    "name": "rupu",
+                    "owner": { "login": "Section9Labs" }
+                }
+            }),
+        };
+        let wakes = wake_requests_from_webhook(&event).expect("wake requests");
+        let ids = wakes
+            .iter()
+            .map(|wake| wake.event.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"github.issue.labeled"));
+        assert!(ids.contains(&"github.issue.queue_changed"));
+        assert!(ids.contains(&"issue.queue_entered"));
+    }
+
+    #[test]
     fn polled_issue_event_maps_to_issue_wake_request() {
         let event = PolledEvent {
             id: "github.issue.opened".into(),
@@ -316,5 +364,32 @@ mod tests {
         assert_eq!(wake.entity.kind, WakeEntityKind::Issue);
         assert_eq!(wake.entity.ref_text, "github:Section9Labs/rupu/issues/42");
         assert_eq!(wake.event.id, "github.issue.opened");
+    }
+
+    #[test]
+    fn semantic_alias_wakes_are_emitted_for_polled_events() {
+        let event = PolledEvent {
+            id: "github.issue.labeled".into(),
+            delivery: "evt-123".into(),
+            repo: RepoRef {
+                platform: Platform::Github,
+                owner: "Section9Labs".into(),
+                repo: "rupu".into(),
+            },
+            payload: json!({
+                "payload": {
+                    "issue": { "number": 42 },
+                    "action": "labeled"
+                }
+            }),
+        };
+        let wakes = wake_requests_from_polled_event(&event);
+        let ids = wakes
+            .iter()
+            .map(|wake| wake.event.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"github.issue.labeled"));
+        assert!(ids.contains(&"github.issue.queue_changed"));
+        assert!(ids.contains(&"issue.queue_entered"));
     }
 }
