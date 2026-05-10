@@ -76,7 +76,7 @@ In `~/.rupu/config.toml` (global) or `<project>/.rupu/config.toml` (project shad
 [triggers]
 poll_sources = [
   "github:Section9Labs/rupu",
-  "gitlab:my-org/my-repo",
+  { source = "gitlab:my-org/my-repo", poll_interval = "15m" },
 ]
 
 # Optional: cap events processed per source per tick. Default 50.
@@ -85,6 +85,28 @@ max_events_per_tick = 50
 ```
 
 Empty by default — rupu doesn't poll anything until you ask it to.
+
+`poll_sources` accepts either:
+
+- a bare string source like `"github:owner/repo"` which is eligible on every event tick
+- an inline table with a source-local cadence override:
+
+```toml
+[triggers]
+poll_sources = [
+  { source = "github:hot-org/hot-repo", poll_interval = "1m" },
+  { source = "github:slow-org/archive", poll_interval = "30m" },
+]
+```
+
+`poll_interval` uses the same `<int><unit>` shape as other duration fields:
+
+- `30s`
+- `5m`
+- `2h`
+- `1d`
+
+This is an operational control only. It does not change workflow matching semantics; it only decides whether a source is due to be polled on a given `rupu cron tick --only-events`.
 
 ### 2. Write the workflow
 
@@ -122,8 +144,8 @@ steps:
 
 ```
 $ rupu cron events
-NAME                         EVENT                            SOURCES                                  CURSOR
-triage-incoming-issues       github.issue.opened              github:Section9Labs/rupu,gitlab:foo/bar  etag:W/"abc"|since:2026-05-07T00:00:00Z
+NAME                         EVENT                            SOURCES                                       CURSOR
+triage-incoming-issues       github.issue.opened              github:Section9Labs/rupu,gitlab:foo/bar@15m   etag:W/"abc"|since:2026-05-07T00:00:00Z
 ```
 
 ### 4. Tick
@@ -139,7 +161,7 @@ The same `rupu cron tick` that fires `cron`-triggered workflows also polls event
 
 The polled connector lifts events from each vendor's events API and maps them onto the rupu vocabulary. Glob wildcards (`*`) work in `trigger.event:` — see the next section.
 
-**GitHub (polled tier covers all of these):**
+**GitHub canonical ids:**
 
 | Category | Event ids |
 |---|---|
@@ -150,16 +172,50 @@ The polled connector lifts events from each vendor's events API and maps them on
 | PR review | `github.pr.labeled` / `github.pr.unlabeled` / `github.pr.assigned` / `github.pr.unassigned` / `github.pr.review_requested` / `github.pr.review_submitted` |
 | Push | `github.push` |
 
-**GitLab (polled tier covers a subset; webhook tier covers more):**
+**GitLab canonical ids:**
 
 | Category | Event ids |
 |---|---|
-| Issue lifecycle | `gitlab.issue.opened` / `gitlab.issue.closed` / `gitlab.issue.reopened` |
-| MR lifecycle | `gitlab.mr.opened` / `gitlab.mr.closed` / `gitlab.mr.merged` / `gitlab.mr.reopened` |
+| Issue lifecycle | `gitlab.issue.opened` / `gitlab.issue.closed` / `gitlab.issue.reopened` / `gitlab.issue.updated` |
+| MR lifecycle | `gitlab.mr.opened` / `gitlab.mr.closed` / `gitlab.mr.merged` / `gitlab.mr.reopened` / `gitlab.mr.updated` |
 | Comments | `gitlab.comment` |
 | Push | `gitlab.push` |
 
-Some GitLab events (label changes, assignment changes) aren't surfaced as discrete entries by GitLab's events API — use webhook-serve for those, or write a workflow against `gitlab.issue.opened` and inspect `event.payload.labels` in `trigger.filter:`.
+GitLab's events API is still less detailed than GitHub's for queue-like metadata moves. When discrete label / assignment / milestone events are not surfaced upstream, use webhook mode or match `gitlab.issue.updated` / `gitlab.mr.updated` and inspect `event.payload.changes.*` in `trigger.filter:`.
+
+### Semantic aliases
+
+In addition to the canonical vendor ids above, rupu derives a broader semantic vocabulary from those deliveries. These are **matchable** in `trigger.event:` and `autoflow.wake_on:`:
+
+| Alias family | Meaning |
+| --- | --- |
+| `issue.queue_changed` | queue-ish issue metadata changed |
+| `issue.queue_entered` | issue moved into a queue-like state |
+| `issue.queue_left` | issue moved out of a queue-like state |
+| `issue.activity` | issue comment/edit/update activity |
+| `pr.queue_changed` | queue-ish PR/MR metadata changed |
+| `pr.queue_entered` | PR/MR moved into a review/ready queue |
+| `pr.queue_left` | PR moved out of a queue-like state |
+| `pr.review_activity` | review-request / review-submission activity |
+| `pr.activity` | broader PR/MR activity updates |
+
+Vendor-scoped semantic aliases are also emitted where they help:
+
+- `github.issue.queue_changed`
+- `github.issue.queue_entered`
+- `github.issue.queue_left`
+- `github.pr.queue_changed`
+- `github.pr.queue_entered`
+- `github.pr.queue_left`
+- `github.pr.review_activity`
+- `gitlab.issue.activity`
+- `gitlab.issue.queue_changed`
+- `gitlab.mr.activity`
+- `gitlab.mr.queue_changed`
+- `gitlab.issue.commented`
+- `gitlab.mr.commented`
+
+These aliases do **not** replace canonical ids. One delivery still fires a workflow at most once; rupu just allows more than one pattern vocabulary to match that delivery.
 
 ### Glob matching on `trigger.event:`
 
@@ -173,15 +229,33 @@ Some GitLab events (label changes, assignment changes) aren't surfaced as discre
 
 ### Queue patterns
 
-GitHub Issues doesn't have first-class "queue" semantics (Linear / Jira do). The convention on GitHub is to use **labels as queue indicators** (e.g. `triage`, `ready`, `in-review`). Compose those with the existing label events + a filter expression:
+GitHub Issues doesn't have first-class "queue columns" the way Linear or Jira do. In practice, labels / assignment / milestones act as queue signals. With the new semantic aliases you can now express that intent directly and still refine it with filters.
+
+Example: any issue entering a queue-like state:
 
 ```yaml
-# .rupu/workflows/triage-on-label.yaml
-name: triage-on-label
+name: issue-entered-queue
 trigger:
   on: event
-  event: github.issue.labeled
-  filter: "{{ event.payload.label.name == 'triage' }}"
+  event: issue.queue_entered
+
+steps:
+  - id: classify
+    agent: triage-classifier
+    prompt: |
+      Issue {{ event.repo.full_name }}#{{ event.payload.issue.number }}
+      entered a queue-like state via {{ event.canonical_id }}.
+```
+
+Example: only the `triage` label should count as queue-entry:
+
+```yaml
+# .rupu/workflows/triage-on-triage-label.yaml
+name: triage-on-triage-label
+trigger:
+  on: event
+  event: issue.queue_entered
+  filter: "{{ event.canonical_id == 'github.issue.labeled' and event.payload.label.name == 'triage' }}"
 
 steps:
   - id: classify
@@ -196,12 +270,12 @@ steps:
 
 Variations:
 
-- **"Issue moved between queues."** Listen on `github.issue.labeled` AND `github.issue.unlabeled`. Glob: `trigger.event: github.issue.*labeled`. Filter on the specific label name.
-- **"PR awaiting review."** `trigger.event: github.pr.review_requested`. The reviewer is at `event.payload.requested_reviewer.login`.
-- **"PR moved out of draft."** `trigger.event: github.pr.ready_for_review`.
+- **"Issue moved between queues."** `trigger.event: issue.queue_changed` and inspect `event.canonical_id` plus the changed label/assignee/milestone fields.
+- **"PR awaiting review."** `trigger.event: pr.queue_entered` or the raw `github.pr.review_requested`. The reviewer is at `event.payload.requested_reviewer.login`.
+- **"PR moved out of draft."** `trigger.event: github.pr.ready_for_review` or the broader `pr.queue_entered`.
 - **"Issue assigned to me."** `trigger.event: github.issue.assigned` + `filter: "{{ event.payload.assignee.login == 'matt' }}"`.
 
-Native `entered_queue:<queue>` / `left_queue:<queue>` event sugar (per design spec §6.3) is deferred until rupu ships a Linear or Jira connector that natively models board columns. Until then, label-based composition is the GitHub idiom.
+True board-column events like `issue.entered_queue:<queue>` remain a future connector feature for trackers that model queues natively. For GitHub today, semantic aliases plus filters are the correct level of abstraction.
 
 ### Coverage caveats
 
@@ -243,18 +317,21 @@ Bind to `127.0.0.1` and front with a TLS-terminating reverse proxy in production
 
 ## Templating
 
-Both tiers expose the same `{{event.*}}` shape inside step prompts and `when:` filters:
+Both tiers expose the same normalized metadata inside step prompts and `when:` filters:
 
 ```
 event:
-  id: github.issue.opened
+  id: issue.queue_entered            # the matched id for this workflow
+  canonical_id: github.issue.labeled # the raw vendor-mapped id
+  matched_as: issue.queue_entered
+  aliases: [github.issue.queue_changed, github.issue.queue_entered, issue.queue_changed]
   vendor: github
   delivery: <vendor unique id for this delivery>
   repo:
     full_name: Section9Labs/rupu
     owner: Section9Labs
     name: rupu
-  payload: <vendor's raw JSON, untouched — reach inside via event.payload.*>
+  payload: <vendor's raw JSON>
 ```
 
 Common patterns:

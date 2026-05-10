@@ -17,10 +17,9 @@
 //!   gitlab.issue.opened
 //!   gitlab.push
 //!
-//! `*` glob-matching on the workflow side (e.g.
-//! `trigger.event: github.issue.*`) is **not yet supported** —
-//! workflows must declare the exact vendor event name. Glob support
-//! is a 5-line follow-up if needed.
+//! Workflow-side glob matching *is* supported by the orchestrator.
+//! This module only maps raw vendor deliveries onto canonical rupu
+//! event ids; broader semantic aliases are derived one layer up.
 
 use serde_json::Value;
 
@@ -35,6 +34,7 @@ pub fn map_github_event(event_header: &str, payload: &Value) -> Option<String> {
     match (event_header, action) {
         ("pull_request", Some("opened")) => Some("github.pr.opened".into()),
         ("pull_request", Some("reopened")) => Some("github.pr.reopened".into()),
+        ("pull_request", Some("edited")) => Some("github.pr.edited".into()),
         ("pull_request", Some("closed")) => {
             // GitHub fires `closed` for both merged and merely-closed
             // PRs; differentiate by checking `pull_request.merged`.
@@ -49,6 +49,11 @@ pub fn map_github_event(event_header: &str, payload: &Value) -> Option<String> {
                 "github.pr.closed".into()
             })
         }
+        ("pull_request", Some("ready_for_review")) => Some("github.pr.ready_for_review".into()),
+        ("pull_request", Some("labeled")) => Some("github.pr.labeled".into()),
+        ("pull_request", Some("unlabeled")) => Some("github.pr.unlabeled".into()),
+        ("pull_request", Some("assigned")) => Some("github.pr.assigned".into()),
+        ("pull_request", Some("unassigned")) => Some("github.pr.unassigned".into()),
         ("pull_request", Some("review_requested")) => Some("github.pr.review_requested".into()),
         ("pull_request", Some("synchronize")) => Some("github.pr.updated".into()),
         ("pull_request_review", Some("submitted")) => Some("github.pr.review_submitted".into()),
@@ -57,8 +62,13 @@ pub fn map_github_event(event_header: &str, payload: &Value) -> Option<String> {
         ("issues", Some("reopened")) => Some("github.issue.reopened".into()),
         ("issues", Some("edited")) => Some("github.issue.edited".into()),
         ("issues", Some("labeled")) => Some("github.issue.labeled".into()),
+        ("issues", Some("unlabeled")) => Some("github.issue.unlabeled".into()),
         ("issues", Some("assigned")) => Some("github.issue.assigned".into()),
+        ("issues", Some("unassigned")) => Some("github.issue.unassigned".into()),
+        ("issues", Some("milestoned")) => Some("github.issue.milestoned".into()),
+        ("issues", Some("demilestoned")) => Some("github.issue.demilestoned".into()),
         ("issue_comment", Some("created")) => Some("github.issue.commented".into()),
+        ("issue_comment", Some("edited")) => Some("github.issue.comment_edited".into()),
         ("push", _) => Some("github.push".into()),
         ("ping", _) => Some("github.ping".into()),
         _ => None,
@@ -123,6 +133,11 @@ mod tests {
             ("opened", "github.issue.opened"),
             ("closed", "github.issue.closed"),
             ("labeled", "github.issue.labeled"),
+            ("unlabeled", "github.issue.unlabeled"),
+            ("assigned", "github.issue.assigned"),
+            ("unassigned", "github.issue.unassigned"),
+            ("milestoned", "github.issue.milestoned"),
+            ("demilestoned", "github.issue.demilestoned"),
         ] {
             let payload = json!({ "action": action });
             assert_eq!(
@@ -145,6 +160,31 @@ mod tests {
         assert_eq!(
             map_github_event("push", &payload),
             Some("github.push".into())
+        );
+    }
+
+    #[test]
+    fn github_pr_queue_and_review_events() {
+        for (action, expected) in [
+            ("edited", "github.pr.edited"),
+            ("ready_for_review", "github.pr.ready_for_review"),
+            ("labeled", "github.pr.labeled"),
+            ("unlabeled", "github.pr.unlabeled"),
+            ("assigned", "github.pr.assigned"),
+            ("unassigned", "github.pr.unassigned"),
+            ("review_requested", "github.pr.review_requested"),
+        ] {
+            let payload = json!({ "action": action });
+            assert_eq!(
+                map_github_event("pull_request", &payload),
+                Some(expected.into()),
+                "for action={action}"
+            );
+        }
+        let payload = json!({ "action": "edited" });
+        assert_eq!(
+            map_github_event("issue_comment", &payload),
+            Some("github.issue.comment_edited".into())
         );
     }
 

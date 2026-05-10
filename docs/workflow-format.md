@@ -156,7 +156,7 @@ autoflow:
     limit: 100
   wake_on:
     - github.issue.opened
-    - github.issue.labeled
+    - issue.queue_entered
     - github.pull_request.closed
   reconcile_every: "10m"
   claim:
@@ -181,7 +181,7 @@ Fields:
 | `selector.labels_any` | array<string> | no | `[]` | At least one listed label must be present |
 | `selector.labels_none` | array<string> | no | `[]` | None of the listed labels may be present |
 | `selector.limit` | integer | no | none | Candidate cap per reconciliation cycle |
-| `wake_on` | array<string> | no | `[]` | Event ids used as wake hints |
+| `wake_on` | array<string> | no | `[]` | Canonical or semantic event ids used as wake hints |
 | `reconcile_every` | duration | no | none | Re-run cadence like `10m`, `2h`, `1d` |
 | `claim.key` | `issue` | no | `issue` | v1 claim granularity |
 | `claim.ttl` | duration | no | none | Lease duration for persistent issue ownership |
@@ -195,6 +195,7 @@ Notes:
 - Workflow files remain usable with `rupu workflow run`; autoflow semantics activate only under `rupu autoflow run`, `rupu autoflow tick`, or `rupu autoflow serve`.
 - Autoflow execution accepts only `bypass` or `readonly` permission modes. `ask` and any other value are rejected.
 - `autoflow` template rendering is strict. Missing variables are a protocol error in autonomous mode.
+- `wake_on` accepts the same canonical ids and semantic aliases documented in `docs/triggers.md`, for example `github.issue.labeled`, `issue.queue_entered`, or `pr.review_activity`.
 - `wake_on` becomes actionable only when the autoflow runtime can see matching SCM events, typically via `[triggers].poll_sources` for the repo or via webhook wake hints recorded by `rupu webhook serve`.
 - Most laptop users should start with polling plus `rupu autoflow tick` or `rupu autoflow serve`; public webhook exposure is optional and better suited to always-on or tunneled machines.
 - Matching precedence is deterministic: higher `priority` wins, then workflow name.

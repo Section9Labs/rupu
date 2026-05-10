@@ -12,7 +12,7 @@
 //! 503 (service-unavailable) so the operator knows the route is
 //! intentionally disabled rather than misconfigured.
 
-use super::autoflow_wake::wake_request_from_webhook;
+use super::autoflow_wake::wake_requests_from_webhook;
 use crate::paths;
 use async_trait::async_trait;
 use clap::Subcommand;
@@ -118,20 +118,25 @@ struct CliWebhookObserver {
 #[async_trait]
 impl WebhookObserver for CliWebhookObserver {
     async fn observe(&self, event: &WebhookEvent) -> anyhow::Result<()> {
-        let Some(request) = wake_request_from_webhook(event) else {
+        let Some(requests) = wake_requests_from_webhook(event) else {
             return Ok(());
         };
         let repo_store = RepoRegistryStore {
             root: paths::repos_dir(&self.global),
         };
-        if repo_store.load(&request.repo_ref)?.is_none() {
+        let Some(first_request) = requests.first() else {
+            return Ok(());
+        };
+        if repo_store.load(&first_request.repo_ref)?.is_none() {
             return Ok(());
         }
         let store = WakeStore::new(paths::autoflow_wakes_dir(&self.global));
-        match store.enqueue(request) {
-            Ok(_) => {}
-            Err(WakeStoreError::DuplicateDedupeKey(_)) => {}
-            Err(err) => return Err(err.into()),
+        for request in requests {
+            match store.enqueue(request) {
+                Ok(_) => {}
+                Err(WakeStoreError::DuplicateDedupeKey(_)) => {}
+                Err(err) => return Err(err.into()),
+            }
         }
         Ok(())
     }
@@ -293,21 +298,19 @@ mod tests {
         let observer = CliWebhookObserver {
             global: global.clone(),
         };
-        observer
-            .observe(&WebhookEvent {
-                source: WebhookSource::Github,
-                event_id: "github.issue.labeled".into(),
-                delivery_id: Some("delivery-123".into()),
-                payload: json!({
-                    "issue": { "number": 42 },
-                    "repository": {
-                        "name": "rupu",
-                        "owner": { "login": "Section9Labs" }
-                    }
-                }),
-            })
-            .await
-            .unwrap();
+        let tracked_event = WebhookEvent {
+            source: WebhookSource::Github,
+            event_id: "github.issue.labeled".into(),
+            delivery_id: Some("delivery-123".into()),
+            payload: json!({
+                "issue": { "number": 42 },
+                "repository": {
+                    "name": "rupu",
+                    "owner": { "login": "Section9Labs" }
+                }
+            }),
+        };
+        observer.observe(&tracked_event).await.unwrap();
         observer
             .observe(&WebhookEvent {
                 source: WebhookSource::Github,
@@ -327,8 +330,13 @@ mod tests {
         let queued = WakeStore::new(paths::autoflow_wakes_dir(&global))
             .list_due(chrono::Utc::now())
             .unwrap();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].repo_ref, "github:Section9Labs/rupu");
+        let expected = crate::cmd::autoflow_wake::wake_requests_from_webhook(&tracked_event)
+            .unwrap()
+            .len();
+        assert_eq!(queued.len(), expected);
+        assert!(queued
+            .iter()
+            .all(|wake| wake.repo_ref == "github:Section9Labs/rupu"));
     }
 
     #[tokio::test]
@@ -372,8 +380,13 @@ mod tests {
         let queued = WakeStore::new(paths::autoflow_wakes_dir(&global))
             .list_due(chrono::Utc::now())
             .unwrap();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].event.delivery_id.as_deref(), Some("delivery-123"));
+        let expected = crate::cmd::autoflow_wake::wake_requests_from_webhook(&replay)
+            .unwrap()
+            .len();
+        assert_eq!(queued.len(), expected);
+        assert!(queued
+            .iter()
+            .all(|wake| wake.event.delivery_id.as_deref() == Some("delivery-123")));
     }
 
     #[test]

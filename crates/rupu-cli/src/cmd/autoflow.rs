@@ -1,6 +1,6 @@
 //! `rupu autoflow ...` — manual/autonomous workflow entrypoints.
 
-use super::autoflow_wake::wake_request_from_polled_event;
+use super::autoflow_wake::wake_requests_from_polled_event;
 use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
@@ -15,7 +15,7 @@ use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
 use jsonschema::JSONSchema;
 use rupu_auth::{CredentialResolver, KeychainResolver};
-use rupu_config::{AutoflowCheckout, Config};
+use rupu_config::{AutoflowCheckout, Config, PollSourceEntry};
 use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
@@ -1802,19 +1802,21 @@ async fn enqueue_polled_wakes(
     }
 
     for (repo_ref, resolved) in unique_repos {
-        if !resolved
-            .cfg
-            .triggers
-            .poll_sources
-            .iter()
-            .any(|source| source == &repo_ref)
-        {
+        let Some(source) = resolved.cfg.triggers.poll_source(&repo_ref) else {
             continue;
-        }
+        };
         let Some((platform, repo)) = parse_poll_source(&repo_ref) else {
             warn!(repo_ref, "invalid autoflow repo ref for wake polling");
             continue;
         };
+        let last_polled_file = autoflow_last_polled_at_path(&cursors_root, platform, &repo);
+        match autoflow_poll_source_due(source, &last_polled_file, chrono::Utc::now()) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(err) => {
+                warn!(repo_ref, error = %err, "invalid autoflow poll interval; polling anyway");
+            }
+        }
         let registry = Arc::new(rupu_scm::Registry::discover(resolver, &resolved.cfg).await);
         let Some(connector) = registry.events(platform) else {
             warn!(
@@ -1840,12 +1842,21 @@ async fn enqueue_polled_wakes(
                 "failed to persist autoflow wake cursor; events may be replayed on next tick"
             );
         }
+        if let Err(err) = write_last_polled_at(&last_polled_file, chrono::Utc::now()) {
+            warn!(
+                repo_ref,
+                error = %err,
+                "failed to persist autoflow last-polled timestamp; source may poll early next tick"
+            );
+        }
         for event in polled.events {
-            match store.enqueue(wake_request_from_polled_event(&event)) {
-                Ok(_) => {}
-                Err(WakeStoreError::DuplicateDedupeKey(_)) => {}
-                Err(err) => {
-                    warn!(repo_ref, error = %err, "failed to enqueue polled autoflow wake");
+            for request in wake_requests_from_polled_event(&event) {
+                match store.enqueue(request) {
+                    Ok(_) => {}
+                    Err(WakeStoreError::DuplicateDedupeKey(_)) => {}
+                    Err(err) => {
+                        warn!(repo_ref, error = %err, "failed to enqueue polled autoflow wake");
+                    }
                 }
             }
         }
@@ -2935,6 +2946,11 @@ fn autoflow_cursor_path(root: &Path, platform: Platform, repo: &RepoRef) -> Path
         .join(format!("{}--{}.cursor", repo.owner, repo.repo))
 }
 
+fn autoflow_last_polled_at_path(root: &Path, platform: Platform, repo: &RepoRef) -> PathBuf {
+    root.join(platform.as_str())
+        .join(format!("{}--{}.last_polled", repo.owner, repo.repo))
+}
+
 fn read_cursor(path: &Path) -> anyhow::Result<String> {
     Ok(std::fs::read_to_string(path)?.trim().to_string())
 }
@@ -2947,6 +2963,38 @@ fn write_cursor(path: &Path, body: &str) -> anyhow::Result<()> {
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+fn read_last_polled_at(path: &Path) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    Ok(
+        chrono::DateTime::parse_from_rfc3339(std::fs::read_to_string(path)?.trim())?
+            .with_timezone(&chrono::Utc),
+    )
+}
+
+fn write_last_polled_at(path: &Path, at: chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("last_polled.tmp");
+    std::fs::write(&tmp, at.to_rfc3339())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn autoflow_poll_source_due(
+    source: &PollSourceEntry,
+    last_polled_path: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<bool> {
+    let Some(interval) = source.poll_interval() else {
+        return Ok(true);
+    };
+    let last_polled = match read_last_polled_at(last_polled_path) {
+        Ok(at) => at,
+        Err(_) => return Ok(true),
+    };
+    Ok(last_polled + parse_duration(interval)? <= now)
 }
 
 fn format_issue_ref(issue_ref: &IssueRef) -> String {

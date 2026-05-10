@@ -210,10 +210,12 @@ fn map_gitlab_event(ev: &Value) -> Option<String> {
             (Some("Issue"), Some("opened")) => "gitlab.issue.opened",
             (Some("Issue"), Some("closed")) => "gitlab.issue.closed",
             (Some("Issue"), Some("reopened")) => "gitlab.issue.reopened",
+            (Some("Issue"), Some("updated")) => "gitlab.issue.updated",
             (Some("MergeRequest"), Some("opened")) => "gitlab.mr.opened",
             (Some("MergeRequest"), Some("closed")) => "gitlab.mr.closed",
             (Some("MergeRequest"), Some("merged")) => "gitlab.mr.merged",
             (Some("MergeRequest"), Some("reopened")) => "gitlab.mr.reopened",
+            (Some("MergeRequest"), Some("updated")) => "gitlab.mr.updated",
             (Some("Note"), _) => "gitlab.comment",
             (None, Some(action)) if action.starts_with("pushed") => "gitlab.push",
             _ => {
@@ -284,10 +286,20 @@ mod tests {
             map_gitlab_event(&issue_opened).as_deref(),
             Some("gitlab.issue.opened")
         );
+        let issue_updated = json!({"target_type":"Issue","action_name":"updated"});
+        assert_eq!(
+            map_gitlab_event(&issue_updated).as_deref(),
+            Some("gitlab.issue.updated")
+        );
         let mr_merged = json!({"target_type":"MergeRequest","action_name":"merged"});
         assert_eq!(
             map_gitlab_event(&mr_merged).as_deref(),
             Some("gitlab.mr.merged")
+        );
+        let mr_updated = json!({"target_type":"MergeRequest","action_name":"updated"});
+        assert_eq!(
+            map_gitlab_event(&mr_updated).as_deref(),
+            Some("gitlab.mr.updated")
         );
         let push = json!({"action_name":"pushed to"});
         assert_eq!(map_gitlab_event(&push).as_deref(), Some("gitlab.push"));

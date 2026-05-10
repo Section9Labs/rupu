@@ -24,9 +24,9 @@
 use crate::paths;
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
+use rupu_config::PollSourceEntry;
 use rupu_orchestrator::cron_schedule::{next_fire_after, parse_schedule, should_fire};
-use rupu_orchestrator::event_matches;
-use rupu_orchestrator::{TriggerKind, Workflow};
+use rupu_orchestrator::{annotate_event_payload, matching_event_id, TriggerKind, Workflow};
 use rupu_scm::{Platform, RepoRef};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -261,13 +261,25 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
     }
 
     for source in &triggers_cfg.poll_sources {
-        let Some((platform, repo)) = parse_poll_source(source) else {
-            warn!(source = %source, "invalid poll_sources entry; expected `<platform>:<owner>/<repo>`");
+        let source_ref = source.source();
+        let Some((platform, repo)) = parse_poll_source(source_ref) else {
+            warn!(source = %source_ref, "invalid poll_sources entry; expected `<platform>:<owner>/<repo>`");
             continue;
         };
+        let last_polled_file = last_polled_at_path(&cursors_root, platform, &repo);
+        match poll_source_due(source, &last_polled_file, Utc::now()) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!(source = %source_ref, "poll source not due yet; skipping");
+                continue;
+            }
+            Err(e) => {
+                warn!(source = %source_ref, error = %e, "invalid poll interval; polling anyway");
+            }
+        }
         let Some(connector) = registry.events(platform) else {
             info!(
-                source = %source,
+                source = %source_ref,
                 "no event connector for platform — run `rupu auth login --provider {}`",
                 platform.as_str()
             );
@@ -280,7 +292,7 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
         let result = match connector.poll_events(&repo, cursor.as_deref(), max).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(source = %source, error = %e, "poll_events failed; will retry next tick");
+                warn!(source = %source_ref, error = %e, "poll_events failed; will retry next tick");
                 continue;
             }
         };
@@ -291,19 +303,28 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
         if !dry_run {
             if let Err(e) = write_cursor(&cursor_file, &result.next_cursor) {
                 warn!(
-                    source = %source,
+                    source = %source_ref,
                     error = %e,
                     "failed to persist event cursor; events may be re-fired on next tick"
+                );
+            }
+            if let Err(e) = write_last_polled_at(&last_polled_file, Utc::now()) {
+                warn!(
+                    source = %source_ref,
+                    error = %e,
+                    "failed to persist last-polled timestamp; source may poll early next tick"
                 );
             }
         }
 
         for event in &result.events {
             for wf in &event_workflows {
-                if !event_matches(&wf.event, &event.id) {
+                let Some(matched_event_id) =
+                    matching_event_id(&wf.event, &event.id, &event.payload)
+                else {
                     continue;
-                }
-                let event_payload = build_event_payload(event, platform);
+                };
+                let event_payload = build_event_payload(event, platform, &matched_event_id);
                 if let Some(filter) = &wf.filter {
                     match evaluate_filter(filter, &event_payload) {
                         Ok(true) => {}
@@ -423,13 +444,19 @@ async fn events(no_color: bool) -> anyhow::Result<()> {
     let mut table = crate::output::tables::new_table();
     table.set_header(vec!["NAME", "EVENT", "SOURCES", "CURSOR"]);
     for wf in &workflows {
-        let sources = cfg.triggers.poll_sources.join(",");
+        let sources = cfg
+            .triggers
+            .poll_sources
+            .iter()
+            .map(format_poll_source_entry)
+            .collect::<Vec<_>>()
+            .join(",");
         // Best-effort: print the cursor of the *first* configured source.
         let cursor_repr = cfg
             .triggers
             .poll_sources
             .iter()
-            .filter_map(|s| parse_poll_source(s))
+            .filter_map(|s| parse_poll_source(s.source()))
             .find_map(|(platform, repo)| {
                 let path = cursor_path(&cursors_root, platform, &repo);
                 read_cursor(&path).ok()
@@ -539,6 +566,13 @@ fn parse_poll_source(s: &str) -> Option<(Platform, RepoRef)> {
     ))
 }
 
+fn format_poll_source_entry(source: &PollSourceEntry) -> String {
+    match source.poll_interval() {
+        Some(interval) => format!("{}@{interval}", source.source()),
+        None => source.source().to_string(),
+    }
+}
+
 /// `<global>/cron-state/event-cursors/<vendor>/<owner>--<repo>.cursor`.
 /// `--` separator avoids ambiguity if either name contains `/`.
 fn cursor_path(root: &Path, platform: Platform, repo: &RepoRef) -> PathBuf {
@@ -560,12 +594,70 @@ fn write_cursor(path: &Path, body: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn last_polled_at_path(root: &Path, platform: Platform, repo: &RepoRef) -> PathBuf {
+    root.join(platform.as_str())
+        .join(format!("{}--{}.last_polled", repo.owner, repo.repo))
+}
+
+fn read_last_polled_at(path: &Path) -> anyhow::Result<DateTime<Utc>> {
+    let body = std::fs::read_to_string(path)?;
+    Ok(DateTime::parse_from_rfc3339(body.trim())?.with_timezone(&Utc))
+}
+
+fn write_last_polled_at(path: &Path, at: DateTime<Utc>) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("last_polled.tmp");
+    std::fs::write(&tmp, at.to_rfc3339())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn poll_source_due(
+    source: &PollSourceEntry,
+    last_polled_path: &Path,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let Some(interval) = source.poll_interval() else {
+        return Ok(true);
+    };
+    let last_polled = match read_last_polled_at(last_polled_path) {
+        Ok(at) => at,
+        Err(_) => return Ok(true),
+    };
+    Ok(last_polled + parse_relative_duration(interval)? <= now)
+}
+
+fn parse_relative_duration(value: &str) -> anyhow::Result<chrono::Duration> {
+    let trimmed = value.trim();
+    let unit = trimmed
+        .chars()
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("invalid duration `{value}`"))?;
+    let amount: i64 = trimmed[..trimmed.len().saturating_sub(1)]
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid duration `{value}`: {e}"))?;
+    let duration = match unit {
+        's' => chrono::Duration::seconds(amount),
+        'm' => chrono::Duration::minutes(amount),
+        'h' => chrono::Duration::hours(amount),
+        'd' => chrono::Duration::days(amount),
+        _ => anyhow::bail!("invalid duration `{value}`"),
+    };
+    Ok(duration)
+}
+
 /// Build the JSON value bound as `{{event.*}}` in step prompts +
 /// `when:` filters. Spec §7.
-fn build_event_payload(ev: &rupu_scm::PolledEvent, platform: Platform) -> serde_json::Value {
+fn build_event_payload(
+    ev: &rupu_scm::PolledEvent,
+    platform: Platform,
+    matched_event_id: &str,
+) -> serde_json::Value {
     let owner = &ev.repo.owner;
     let name = &ev.repo.repo;
-    serde_json::json!({
+    let base = serde_json::json!({
         "id": ev.id,
         "vendor": platform.as_str(),
         "delivery": ev.delivery,
@@ -575,7 +667,8 @@ fn build_event_payload(ev: &rupu_scm::PolledEvent, platform: Platform) -> serde_
             "name": name,
         },
         "payload": ev.payload,
-    })
+    });
+    annotate_event_payload(&base, &ev.id, matched_event_id)
 }
 
 /// Evaluate a `trigger.filter:` expression as a minijinja boolean.
@@ -695,6 +788,9 @@ fn write_last_fired(path: &Path, ts: DateTime<Utc>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rupu_config::PollSourceSpec;
+    use rupu_scm::{Platform, RepoRef};
+    use serde_json::json;
     use tempfile::TempDir;
 
     #[test]
@@ -707,5 +803,58 @@ mod tests {
         // RFC3339 round-trip preserves to-second precision; sub-second
         // can drift. Compare timestamps by truncating to seconds.
         assert_eq!(read.timestamp(), ts.timestamp());
+    }
+
+    #[test]
+    fn poll_source_due_without_interval_is_always_true() {
+        let tmp = TempDir::new().unwrap();
+        let entry = PollSourceEntry::Detailed(PollSourceSpec {
+            source: "github:Section9Labs/rupu".into(),
+            poll_interval: None,
+        });
+        assert!(poll_source_due(&entry, &tmp.path().join("missing"), Utc::now()).unwrap());
+    }
+
+    #[test]
+    fn poll_source_due_respects_last_polled_timestamp() {
+        let tmp = TempDir::new().unwrap();
+        let repo = RepoRef {
+            platform: Platform::Github,
+            owner: "Section9Labs".into(),
+            repo: "rupu".into(),
+        };
+        let path = last_polled_at_path(tmp.path(), Platform::Github, &repo);
+        write_last_polled_at(&path, Utc::now() - chrono::Duration::minutes(3)).unwrap();
+        let entry = PollSourceEntry::Detailed(PollSourceSpec {
+            source: "github:Section9Labs/rupu".into(),
+            poll_interval: Some("5m".into()),
+        });
+        assert!(!poll_source_due(&entry, &path, Utc::now()).unwrap());
+        write_last_polled_at(&path, Utc::now() - chrono::Duration::minutes(6)).unwrap();
+        assert!(poll_source_due(&entry, &path, Utc::now()).unwrap());
+    }
+
+    #[test]
+    fn build_event_payload_records_matched_alias() {
+        let event = rupu_scm::PolledEvent {
+            id: "github.issue.labeled".into(),
+            delivery: "evt-123".into(),
+            repo: RepoRef {
+                platform: Platform::Github,
+                owner: "Section9Labs".into(),
+                repo: "rupu".into(),
+            },
+            payload: json!({
+                "payload": {
+                    "action": "labeled",
+                    "issue": { "number": 42 }
+                }
+            }),
+        };
+        let payload = build_event_payload(&event, Platform::Github, "issue.queue_entered");
+        assert_eq!(payload["id"], "issue.queue_entered");
+        assert_eq!(payload["canonical_id"], "github.issue.labeled");
+        assert_eq!(payload["repo"]["full_name"], "Section9Labs/rupu");
+        assert_eq!(payload["payload"]["payload"]["issue"]["number"], 42);
     }
 }

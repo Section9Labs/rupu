@@ -120,12 +120,33 @@ permission_mode = "bypass"
 strict_templates = true
 
 [triggers]
-poll_sources = ["github:your-org/your-repo"]
+poll_sources = [
+  { source = "github:your-org/your-repo", poll_interval = "2m" }
+]
 ```
 
 `rupu autoflow ...` accepts only `permission_mode = "bypass"` or `permission_mode = "readonly"`. `ask` and any other value are rejected.
 
 Use `[triggers].poll_sources` when you want `autoflow.wake_on` to react before the next `reconcile_every` deadline. If you run `rupu webhook serve`, mapped webhook deliveries are also recorded as wake hints for tracked repos and picked up by the next `rupu autoflow tick`.
+
+Use a bare string source when every event tick should poll that repo:
+
+```toml
+[triggers]
+poll_sources = ["github:your-org/your-repo"]
+```
+
+Use an inline table when one repo should poll more slowly:
+
+```toml
+[triggers]
+poll_sources = [
+  { source = "github:hot-org/hot-repo", poll_interval = "1m" },
+  { source = "github:slow-org/archive", poll_interval = "30m" },
+]
+```
+
+`poll_interval` affects only source cadence. Workflow matching stays the same.
 
 ---
 
