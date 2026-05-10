@@ -102,7 +102,7 @@ pub enum Cmd {
         action: cmd::webhook::Action,
     },
     /// Aggregate token spend across persisted transcripts.
-    Usage(cmd::usage::UsageArgs),
+    Usage(Box<cmd::usage::UsageArgs>),
     /// Re-attach TUI to an existing run.
     Watch(cmd::watch::WatchArgs),
     /// Generate or install shell-completion scripts.
@@ -182,7 +182,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Cron { action } => cmd::cron::handle(action).await,
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
-        Cmd::Usage(args) => cmd::usage::handle(args, cli.format).await,
+        Cmd::Usage(args) => cmd::usage::handle(*args, cli.format).await,
         Cmd::Watch(args) => cmd::watch::handle(args).await,
         Cmd::Completions { action } => cmd::completions::handle(action).await,
     }

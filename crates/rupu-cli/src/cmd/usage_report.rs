@@ -61,6 +61,68 @@ pub struct UsageTotals {
     pub runs: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct UsageFilter {
+    pub repo_ref: Option<String>,
+    pub workflow_name: Option<String>,
+    pub agent: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub status: Option<String>,
+    pub failed_only: bool,
+}
+
+impl UsageFilter {
+    fn matches_fact(&self, fact: &UsageFact) -> bool {
+        if self.failed_only && fact.status != "failed" {
+            return false;
+        }
+        if self
+            .status
+            .as_deref()
+            .is_some_and(|status| fact.status != status)
+        {
+            return false;
+        }
+        if self
+            .repo_ref
+            .as_deref()
+            .is_some_and(|repo_ref| fact.repo_ref.as_deref() != Some(repo_ref))
+        {
+            return false;
+        }
+        if self
+            .workflow_name
+            .as_deref()
+            .is_some_and(|workflow| fact.workflow_name.as_deref() != Some(workflow))
+        {
+            return false;
+        }
+        if self
+            .agent
+            .as_deref()
+            .is_some_and(|agent| fact.agent != agent)
+        {
+            return false;
+        }
+        if self
+            .provider
+            .as_deref()
+            .is_some_and(|provider| fact.provider != provider)
+        {
+            return false;
+        }
+        if self
+            .model
+            .as_deref()
+            .is_some_and(|model| fact.model != model)
+        {
+            return false;
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageDataset {
     pub facts: Vec<UsageFact>,
@@ -78,16 +140,13 @@ impl UsageDataset {
         let referenced_paths = referenced_transcript_paths(&run_store, &workflow_runs);
 
         let mut facts = Vec::new();
-        let mut runs = Vec::new();
 
         for run in workflow_runs {
             let metadata = WorkflowUsageMetadata::from_run_record(&run, &run_store);
             let transcript_paths = transcript_paths_for_run(&run_store, &run.id);
             let rows = rupu_transcript::aggregate(&transcript_paths, TimeWindow::default());
-            let totals = usage_totals(&rows);
             if window_contains(window, run.started_at) {
                 facts.extend(rows.iter().map(|row| metadata.to_fact(row)));
-                runs.push(metadata.to_run(totals, &rows));
             }
         }
 
@@ -113,58 +172,110 @@ impl UsageDataset {
             let rows =
                 rupu_transcript::aggregate(std::slice::from_ref(&path), TimeWindow::default());
             let metadata = StandaloneUsageMetadata::from_summary(&summary);
-            let totals = usage_totals(&rows);
             facts.extend(rows.iter().map(|row| metadata.to_fact(row)));
-            runs.push(metadata.to_run(totals, &rows));
         }
 
+        let mut runs = build_runs(&facts);
         runs.sort_by_key(|row| std::cmp::Reverse(row.started_at));
         Ok(Self { facts, runs })
     }
 
-    pub fn composite_rows(&self) -> Vec<UsageRow> {
-        let mut grouped: BTreeMap<(String, String, String), UsageRow> = BTreeMap::new();
-        let mut run_ids_by_key: BTreeMap<(String, String, String), BTreeSet<String>> =
-            BTreeMap::new();
-        for fact in &self.facts {
-            let key = (
-                fact.provider.clone(),
-                fact.model.clone(),
-                fact.agent.clone(),
-            );
-            let entry = grouped.entry(key.clone()).or_insert_with(|| UsageRow {
-                provider: fact.provider.clone(),
-                model: fact.model.clone(),
-                agent: fact.agent.clone(),
-                ..UsageRow::default()
-            });
-            entry.input_tokens += fact.input_tokens;
-            entry.output_tokens += fact.output_tokens;
-            entry.cached_tokens += fact.cached_tokens;
-            run_ids_by_key
-                .entry(key)
-                .or_default()
-                .insert(fact.run_id.clone());
+    pub fn totals(&self) -> UsageTotals {
+        UsageTotals {
+            input_tokens: self.facts.iter().map(|fact| fact.input_tokens).sum(),
+            output_tokens: self.facts.iter().map(|fact| fact.output_tokens).sum(),
+            cached_tokens: self.facts.iter().map(|fact| fact.cached_tokens).sum(),
+            runs: self
+                .facts
+                .iter()
+                .map(|fact| fact.run_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len() as u64,
         }
-        for (key, run_ids) in run_ids_by_key {
-            if let Some(row) = grouped.get_mut(&key) {
-                row.runs = run_ids.len() as u64;
-            }
-        }
-        let mut rows = grouped.into_values().collect::<Vec<_>>();
-        rows.sort_by(|a, b| {
-            (b.input_tokens + b.output_tokens)
-                .cmp(&(a.input_tokens + a.output_tokens))
-                .then_with(|| {
-                    (a.provider.as_str(), a.model.as_str(), a.agent.as_str()).cmp(&(
-                        b.provider.as_str(),
-                        b.model.as_str(),
-                        b.agent.as_str(),
-                    ))
-                })
-        });
-        rows
     }
+
+    pub fn filtered(&self, filter: &UsageFilter) -> Self {
+        let facts = self
+            .facts
+            .iter()
+            .filter(|fact| filter.matches_fact(fact))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut runs = build_runs(&facts);
+        runs.sort_by_key(|row| std::cmp::Reverse(row.started_at));
+        Self { facts, runs }
+    }
+}
+
+fn build_runs(facts: &[UsageFact]) -> Vec<UsageRun> {
+    #[derive(Default)]
+    struct RunAccumulator {
+        source: Option<UsageSource>,
+        run_id: String,
+        started_at: Option<DateTime<Utc>>,
+        status: String,
+        workflow_name: Option<String>,
+        repo_ref: Option<String>,
+        issue_ref: Option<String>,
+        worker_id: Option<String>,
+        backend_id: Option<String>,
+        trigger_source: Option<String>,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        providers: BTreeSet<String>,
+        models: BTreeSet<String>,
+        agents: BTreeSet<String>,
+    }
+
+    let mut grouped: BTreeMap<String, RunAccumulator> = BTreeMap::new();
+    for fact in facts {
+        let entry = grouped
+            .entry(fact.run_id.clone())
+            .or_insert_with(|| RunAccumulator {
+                source: Some(fact.source),
+                run_id: fact.run_id.clone(),
+                started_at: Some(fact.started_at),
+                status: fact.status.clone(),
+                workflow_name: fact.workflow_name.clone(),
+                repo_ref: fact.repo_ref.clone(),
+                issue_ref: fact.issue_ref.clone(),
+                worker_id: fact.worker_id.clone(),
+                backend_id: fact.backend_id.clone(),
+                trigger_source: fact.trigger_source.clone(),
+                ..RunAccumulator::default()
+            });
+        entry.input_tokens += fact.input_tokens;
+        entry.output_tokens += fact.output_tokens;
+        entry.cached_tokens += fact.cached_tokens;
+        entry.providers.insert(fact.provider.clone());
+        entry.models.insert(fact.model.clone());
+        entry.agents.insert(fact.agent.clone());
+    }
+
+    grouped
+        .into_values()
+        .filter_map(|entry| {
+            Some(UsageRun {
+                source: entry.source?,
+                run_id: entry.run_id,
+                started_at: entry.started_at?,
+                status: entry.status,
+                workflow_name: entry.workflow_name,
+                repo_ref: entry.repo_ref,
+                issue_ref: entry.issue_ref,
+                worker_id: entry.worker_id,
+                backend_id: entry.backend_id,
+                trigger_source: entry.trigger_source,
+                input_tokens: entry.input_tokens,
+                output_tokens: entry.output_tokens,
+                cached_tokens: entry.cached_tokens,
+                providers: entry.providers.into_iter().collect(),
+                models: entry.models.into_iter().collect(),
+                agents: entry.agents.into_iter().collect(),
+            })
+        })
+        .collect()
 }
 
 fn referenced_transcript_paths(store: &RunStore, runs: &[RunRecord]) -> BTreeSet<PathBuf> {
@@ -211,15 +322,6 @@ fn canonicalize_path(path: PathBuf) -> PathBuf {
     path.canonicalize().unwrap_or(path)
 }
 
-fn usage_totals(rows: &[UsageRow]) -> UsageTotals {
-    UsageTotals {
-        input_tokens: rows.iter().map(|row| row.input_tokens).sum(),
-        output_tokens: rows.iter().map(|row| row.output_tokens).sum(),
-        cached_tokens: rows.iter().map(|row| row.cached_tokens).sum(),
-        runs: 1,
-    }
-}
-
 fn window_contains(window: TimeWindow, ts: DateTime<Utc>) -> bool {
     if let Some(since) = window.since {
         if ts < since {
@@ -232,10 +334,6 @@ fn window_contains(window: TimeWindow, ts: DateTime<Utc>) -> bool {
         }
     }
     true
-}
-
-fn distinct(values: impl Iterator<Item = String>) -> Vec<String> {
-    values.collect::<BTreeSet<_>>().into_iter().collect()
 }
 
 fn repo_ref_from_issue_ref(issue_ref: Option<&str>) -> Option<String> {
@@ -304,36 +402,12 @@ impl WorkflowUsageMetadata {
             cached_tokens: row.cached_tokens,
         }
     }
-
-    fn to_run(&self, totals: UsageTotals, rows: &[UsageRow]) -> UsageRun {
-        UsageRun {
-            source: UsageSource::WorkflowRun,
-            run_id: self.run_id.clone(),
-            started_at: self.started_at,
-            status: self.status.clone(),
-            workflow_name: self.workflow_name.clone(),
-            repo_ref: self.repo_ref.clone(),
-            issue_ref: self.issue_ref.clone(),
-            worker_id: self.worker_id.clone(),
-            backend_id: self.backend_id.clone(),
-            trigger_source: self.trigger_source.clone(),
-            input_tokens: totals.input_tokens,
-            output_tokens: totals.output_tokens,
-            cached_tokens: totals.cached_tokens,
-            providers: distinct(rows.iter().map(|row| row.provider.clone())),
-            models: distinct(rows.iter().map(|row| row.model.clone())),
-            agents: distinct(rows.iter().map(|row| row.agent.clone())),
-        }
-    }
 }
 
 struct StandaloneUsageMetadata {
     run_id: String,
     started_at: DateTime<Utc>,
     status: String,
-    agent: String,
-    provider: String,
-    model: String,
 }
 
 impl StandaloneUsageMetadata {
@@ -346,9 +420,6 @@ impl StandaloneUsageMetadata {
                 rupu_transcript::RunStatus::Error => "failed".into(),
                 rupu_transcript::RunStatus::Aborted => "aborted".into(),
             },
-            agent: summary.agent.clone(),
-            provider: summary.provider.clone(),
-            model: summary.model.clone(),
         }
     }
 
@@ -370,39 +441,6 @@ impl StandaloneUsageMetadata {
             input_tokens: row.input_tokens,
             output_tokens: row.output_tokens,
             cached_tokens: row.cached_tokens,
-        }
-    }
-
-    fn to_run(&self, totals: UsageTotals, rows: &[UsageRow]) -> UsageRun {
-        UsageRun {
-            source: UsageSource::StandaloneRun,
-            run_id: self.run_id.clone(),
-            started_at: self.started_at,
-            status: self.status.clone(),
-            workflow_name: None,
-            repo_ref: None,
-            issue_ref: None,
-            worker_id: None,
-            backend_id: None,
-            trigger_source: Some("standalone_run".into()),
-            input_tokens: totals.input_tokens,
-            output_tokens: totals.output_tokens,
-            cached_tokens: totals.cached_tokens,
-            providers: distinct(
-                rows.iter()
-                    .map(|row| row.provider.clone())
-                    .chain(std::iter::once(self.provider.clone())),
-            ),
-            models: distinct(
-                rows.iter()
-                    .map(|row| row.model.clone())
-                    .chain(std::iter::once(self.model.clone())),
-            ),
-            agents: distinct(
-                rows.iter()
-                    .map(|row| row.agent.clone())
-                    .chain(std::iter::once(self.agent.clone())),
-            ),
         }
     }
 }

@@ -1,16 +1,26 @@
 use assert_cmd::Command;
+use chrono::{Duration, Utc};
 use predicates::prelude::*;
-use rupu_transcript::{Event, JsonlWriter, RunMode, RunStatus};
+use rupu_orchestrator::{RunRecord, RunStatus, RunStore, StepKind, StepResultRecord};
+use rupu_runtime::{
+    ExecutionRequest, RepoBinding, RunContext, RunEnvelope, RunKind, RunTrigger, RunTriggerSource,
+    WorkflowBinding,
+};
+use rupu_transcript::{Event, JsonlWriter, RunMode};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
+#[allow(clippy::too_many_arguments)]
 fn write_usage_transcript(
-    dir: &std::path::Path,
+    dir: &Path,
     run_id: &str,
     agent: &str,
     provider: &str,
     model: &str,
+    started_at: chrono::DateTime<Utc>,
     input_tokens: u32,
     output_tokens: u32,
-) {
+) -> PathBuf {
     let path = dir.join(format!("{run_id}.jsonl"));
     let mut writer = JsonlWriter::create(&path).unwrap();
     writer
@@ -20,7 +30,7 @@ fn write_usage_transcript(
             agent: agent.into(),
             provider: provider.into(),
             model: model.into(),
-            started_at: chrono::Utc::now(),
+            started_at,
             mode: RunMode::Bypass,
         })
         .unwrap();
@@ -36,13 +46,168 @@ fn write_usage_transcript(
     writer
         .write(&Event::RunComplete {
             run_id: run_id.into(),
-            status: RunStatus::Ok,
+            status: rupu_transcript::RunStatus::Ok,
             total_tokens: (input_tokens + output_tokens) as u64,
             duration_ms: 100,
             error: None,
         })
         .unwrap();
     writer.flush().unwrap();
+    path
+}
+
+fn sample_run_record(
+    id: &str,
+    workflow_name: &str,
+    issue_ref: &str,
+    started_at: chrono::DateTime<Utc>,
+    transcript_dir: &Path,
+    status: RunStatus,
+) -> RunRecord {
+    RunRecord {
+        id: id.into(),
+        workflow_name: workflow_name.into(),
+        status,
+        inputs: BTreeMap::new(),
+        event: None,
+        workspace_id: "ws_01".into(),
+        workspace_path: PathBuf::from("/tmp/repo"),
+        transcript_dir: transcript_dir.to_path_buf(),
+        started_at,
+        finished_at: Some(started_at + Duration::minutes(5)),
+        error_message: None,
+        awaiting_step_id: None,
+        approval_prompt: None,
+        awaiting_since: None,
+        expires_at: None,
+        issue_ref: Some(issue_ref.into()),
+        issue: None,
+        parent_run_id: None,
+        backend_id: Some("local_worktree".into()),
+        worker_id: Some("worker_local_cli".into()),
+        artifact_manifest_path: None,
+        source_wake_id: None,
+    }
+}
+
+fn sample_envelope(
+    run_id: &str,
+    workflow_name: &str,
+    issue_ref: &str,
+    repo_ref: &str,
+) -> RunEnvelope {
+    RunEnvelope {
+        version: RunEnvelope::VERSION,
+        run_id: run_id.into(),
+        kind: RunKind::WorkflowRun,
+        workflow: WorkflowBinding {
+            name: workflow_name.into(),
+            source_path: PathBuf::from(format!(".rupu/workflows/{workflow_name}.yaml")),
+            fingerprint: "sha256:test".into(),
+        },
+        repo: Some(RepoBinding {
+            repo_ref: Some(repo_ref.into()),
+            project_root: Some(PathBuf::from("/tmp/repo")),
+            workspace_id: "ws_01".into(),
+            workspace_path: PathBuf::from("/tmp/repo"),
+        }),
+        trigger: RunTrigger {
+            source: RunTriggerSource::Autoflow,
+            wake_id: Some("wake_01".into()),
+            event_id: Some("github.issue.opened".into()),
+        },
+        inputs: BTreeMap::new(),
+        context: Some(RunContext {
+            issue_ref: Some(issue_ref.into()),
+            target: Some(issue_ref.into()),
+            event_present: false,
+            issue_present: true,
+        }),
+        execution: ExecutionRequest {
+            backend: Some("local_worktree".into()),
+            permission_mode: "bypass".into(),
+            workspace_strategy: Some("managed_worktree".into()),
+            strict_templates: true,
+            attach_ui: false,
+            use_canvas: false,
+        },
+        autoflow: None,
+        correlation: None,
+        worker: None,
+    }
+}
+
+fn sample_step_result(run_id: &str, transcript_path: &Path) -> StepResultRecord {
+    StepResultRecord {
+        step_id: "implement".into(),
+        run_id: run_id.into(),
+        transcript_path: transcript_path.to_path_buf(),
+        output: "ok".into(),
+        success: true,
+        skipped: false,
+        rendered_prompt: "do work".into(),
+        kind: StepKind::Linear,
+        items: Vec::new(),
+        findings: Vec::new(),
+        iterations: 0,
+        resolved: true,
+        finished_at: Utc::now(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_workflow_usage_run(
+    home: &Path,
+    run_id: &str,
+    workflow_name: &str,
+    issue_ref: &str,
+    repo_ref: &str,
+    status: RunStatus,
+    agent: &str,
+    provider: &str,
+    model: &str,
+    started_at: chrono::DateTime<Utc>,
+    input_tokens: u32,
+    output_tokens: u32,
+) {
+    let transcripts = home.join("transcripts");
+    let runs_root = home.join("runs");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    std::fs::create_dir_all(&runs_root).unwrap();
+
+    let transcript_path = write_usage_transcript(
+        &transcripts,
+        &format!("{run_id}_step"),
+        agent,
+        provider,
+        model,
+        started_at,
+        input_tokens,
+        output_tokens,
+    );
+    let store = RunStore::new(runs_root);
+    store
+        .write_run_envelope(
+            run_id,
+            &sample_envelope(run_id, workflow_name, issue_ref, repo_ref),
+        )
+        .unwrap();
+    store
+        .create(
+            sample_run_record(
+                run_id,
+                workflow_name,
+                issue_ref,
+                started_at,
+                &transcripts,
+                status,
+            ),
+            &format!("name: {workflow_name}\nsteps: []\n"),
+        )
+        .unwrap();
+    store
+        .append_step_result(run_id, &sample_step_result(run_id, &transcript_path))
+        .unwrap();
 }
 
 #[test]
@@ -59,6 +224,7 @@ fn usage_supports_global_json_format() {
         "reviewer",
         "anthropic",
         "claude-sonnet-4-6",
+        Utc::now(),
         12,
         4,
     );
@@ -70,8 +236,9 @@ fn usage_supports_global_json_format() {
         .args(["usage", "--format", "json"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("\"kind\": \"usage_breakdown\""))
         .stdout(predicate::str::contains("\"provider\": \"anthropic\""))
-        .stdout(predicate::str::contains("\"agent\": \"reviewer\""));
+        .stdout(predicate::str::contains("\"top_providers\""));
 }
 
 #[test]
@@ -88,6 +255,7 @@ fn usage_supports_csv_format() {
         "reviewer",
         "anthropic",
         "claude-sonnet-4-6",
+        Utc::now(),
         12,
         4,
     );
@@ -100,11 +268,158 @@ fn usage_supports_csv_format() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "provider,model,agent,input_tokens,output_tokens,cached_tokens,runs,cost_usd",
+            "group,provider,model,agent,input_tokens,output_tokens,cached_tokens,runs,cost_usd,cost_partial",
         ))
         .stdout(predicate::str::contains(
-            "anthropic,claude-sonnet-4-6,reviewer,12,4,0,1,",
+            "anthropic / claude-sonnet-4-6 / reviewer,anthropic,claude-sonnet-4-6,reviewer,12,4,0,1,",
         ));
+}
+
+#[test]
+fn usage_default_view_shows_summary_and_last_30d_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join(".rupu");
+    let project = dir.path().join("project");
+    let transcripts = home.join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    write_usage_transcript(
+        &transcripts,
+        "run_usage_table",
+        "reviewer",
+        "anthropic",
+        "claude-sonnet-4-6",
+        Utc::now(),
+        120,
+        40,
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&project)
+        .env("RUPU_HOME", &home)
+        .args(["usage"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("METRIC"))
+        .stdout(predicate::str::contains("last 30d"))
+        .stdout(predicate::str::contains("Top Providers"))
+        .stdout(predicate::str::contains("Top Agents"))
+        .stdout(predicate::str::contains("reviewer"))
+        .stdout(predicate::str::contains("claude-sonnet-4-6"));
+}
+
+#[test]
+fn usage_group_by_workflow_and_repo_filter_use_run_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join(".rupu");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    write_workflow_usage_run(
+        &home,
+        "run_phase",
+        "phase-delivery-cycle",
+        "github:Section9Labs/rupu/issues/42",
+        "github:Section9Labs/rupu",
+        RunStatus::Completed,
+        "implementer",
+        "anthropic",
+        "claude-sonnet-4-6",
+        Utc::now(),
+        80,
+        20,
+    );
+    write_workflow_usage_run(
+        &home,
+        "run_other_repo",
+        "code-review-panel",
+        "github:OtherOrg/other/issues/9",
+        "github:OtherOrg/other",
+        RunStatus::Completed,
+        "reviewer",
+        "openai",
+        "gpt-5",
+        Utc::now(),
+        50,
+        10,
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&project)
+        .env("RUPU_HOME", &home)
+        .args([
+            "usage",
+            "--group-by",
+            "workflow",
+            "--repo",
+            "github:Section9Labs/rupu",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("phase-delivery-cycle"))
+        .stdout(predicate::str::contains("code-review-panel").not());
+}
+
+#[test]
+fn usage_runs_support_failed_and_top_cost_views() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join(".rupu");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    write_workflow_usage_run(
+        &home,
+        "run_failed_large",
+        "phase-delivery-cycle",
+        "github:Section9Labs/rupu/issues/42",
+        "github:Section9Labs/rupu",
+        RunStatus::Failed,
+        "implementer",
+        "openai",
+        "gpt-5",
+        Utc::now(),
+        200,
+        100,
+    );
+    write_workflow_usage_run(
+        &home,
+        "run_completed_small",
+        "phase-delivery-cycle",
+        "github:Section9Labs/rupu/issues/43",
+        "github:Section9Labs/rupu",
+        RunStatus::Completed,
+        "reviewer",
+        "anthropic",
+        "claude-sonnet-4-6",
+        Utc::now() - Duration::hours(1),
+        20,
+        10,
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&project)
+        .env("RUPU_HOME", &home)
+        .args(["usage", "runs", "--failed"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run_failed_large"))
+        .stdout(predicate::str::contains("failed"))
+        .stdout(predicate::str::contains("run_completed_small").not());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&project)
+        .env("RUPU_HOME", &home)
+        .args(["usage", "runs", "--top-cost", "1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run_failed_large"))
+        .stdout(predicate::str::contains("worker_local_cli"))
+        .stdout(predicate::str::contains("local_worktree"))
+        .stdout(predicate::str::contains("run_completed_small").not());
 }
 
 #[test]
