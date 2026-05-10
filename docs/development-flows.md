@@ -240,7 +240,13 @@ Use the controller pattern for larger repos. It keeps repo-specific decision log
 
 ### Background scheduling
 
-Recommended v1 model: run `rupu autoflow tick` from the OS scheduler.
+Recommended model: use `rupu autoflow tick` when you want stateless scheduled reconciliation, or `rupu autoflow serve` when you want one always-on local worker that keeps consuming due wakes with lower latency.
+
+Pick the deployment mode that matches the machine:
+
+- **Laptop / workstation**: poll issues and events locally, then schedule `rupu autoflow tick` or leave `rupu autoflow serve` running in one terminal/session.
+- **Dedicated worker box**: run `rupu autoflow serve` continuously and pair it with `rupu webhook serve` if the box is reachable from the internet.
+- **Tunneled workstation**: advanced only; place `rupu webhook serve` behind Tailscale, Cloudflare Tunnel, or ngrok if you want webhook latency without a public VM.
 
 - macOS `launchd`: run every 5 or 10 minutes
 - Linux `systemd --user` timer or cron
@@ -265,6 +271,13 @@ WorkingDirectory=/path/to/repo
 ExecStart=/usr/bin/env rupu autoflow tick
 ```
 
+Example long-running `systemd --user` worker command:
+
+```text
+WorkingDirectory=/path/to/repo
+ExecStart=/usr/bin/env rupu autoflow serve --repo github:your-org/your-repo --worker build-box-01
+```
+
 Example Windows Task Scheduler program/script:
 
 ```text
@@ -273,7 +286,13 @@ Arguments: autoflow tick
 Start in: C:\\path\\to\\repo
 ```
 
-Use event or webhook wakeups only after the autonomous loop is stable on periodic ticks. Webhook mode still feeds back into `rupu autoflow tick`; it shortens wakeup latency but does not replace the periodic reconciliation loop. If you run `rupu webhook serve` from outside a repo checkout, attach the repo first so tracked repo workflows remain visible to the receiver.
+Example direct long-running local worker:
+
+```sh
+rupu autoflow serve --repo github:your-org/your-repo --worker laptop-01
+```
+
+Use event or webhook wakeups only after the autonomous loop is stable on periodic ticks. Webhook mode still feeds back into the same autoflow runtime; it shortens wakeup latency but does not replace the periodic reconciliation loop. If you run `rupu webhook serve` from outside a repo checkout, attach the repo first so tracked repo workflows remain visible to the receiver.
 
 ---
 

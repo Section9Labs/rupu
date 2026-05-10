@@ -1,10 +1,16 @@
 use crate::cmd::autoflow as legacy;
+use crate::cmd::workflow::{
+    default_execution_worker_context, upsert_worker_record, ExecutionWorkerContext,
+};
 use crate::paths;
 use anyhow::Context;
 use rupu_auth::CredentialResolver;
-use rupu_runtime::WakeStore;
-use rupu_workspace::{AutoflowClaimRecord, AutoflowClaimStore, ClaimStatus, RepoRegistryStore};
+use rupu_runtime::{WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeSource, WakeStore};
+use rupu_workspace::{
+    AutoflowClaimRecord, AutoflowClaimStore, ClaimStatus, RepoRegistryStore, WorkerKind,
+};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -18,8 +24,46 @@ pub struct TickReport {
     pub cleaned_claims: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TickOptions {
+    pub repo_filter: Option<String>,
+    pub worker: Option<ExecutionWorkerContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeOptions {
+    pub repo_filter: Option<String>,
+    pub worker_name: Option<String>,
+    pub idle_sleep: std::time::Duration,
+    pub max_cycles: Option<usize>,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            repo_filter: None,
+            worker_name: None,
+            idle_sleep: std::time::Duration::from_secs(10),
+            max_cycles: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServeReport {
+    pub cycles: usize,
+    pub total: TickReport,
+}
+
 pub(crate) async fn tick_with_resolver(
     resolver: Arc<dyn CredentialResolver>,
+) -> anyhow::Result<TickReport> {
+    tick_with_options(resolver, TickOptions::default()).await
+}
+
+pub(crate) async fn tick_with_options(
+    resolver: Arc<dyn CredentialResolver>,
+    options: TickOptions,
 ) -> anyhow::Result<TickReport> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -30,9 +74,17 @@ pub(crate) async fn tick_with_resolver(
         root: paths::autoflow_claims_dir(&global),
     };
     let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
-    let cleaned =
-        legacy::cleanup_terminal_claims(&global, &repo_store, &claim_store, chrono::Utc::now())?;
-    let discovered = legacy::discover_tick_autoflows(&global, &repo_store)?;
+    let cleaned = legacy::cleanup_terminal_claims(
+        &global,
+        &repo_store,
+        &claim_store,
+        chrono::Utc::now(),
+        options.repo_filter.as_deref(),
+    )?;
+    let mut discovered = legacy::discover_tick_autoflows(&global, &repo_store)?;
+    if let Some(repo_filter) = options.repo_filter.as_deref() {
+        discovered.retain(|resolved| resolved.repo_ref == repo_filter);
+    }
     if discovered.is_empty() {
         return Ok(TickReport {
             cleaned_claims: cleaned,
@@ -52,6 +104,7 @@ pub(crate) async fn tick_with_resolver(
     let mut claims_by_issue: BTreeMap<String, AutoflowClaimRecord> = claim_store
         .list()?
         .into_iter()
+        .filter(|claim| repo_filter_matches(options.repo_filter.as_deref(), &claim.repo_ref))
         .map(|claim| (claim.issue_ref.clone(), claim))
         .collect();
     let mut issue_keys: BTreeSet<String> = winners.keys().cloned().collect();
@@ -209,8 +262,10 @@ pub(crate) async fn tick_with_resolver(
                             false,
                             dispatch.inputs,
                             current.contenders.clone(),
+                            options.worker.clone(),
                         )
                         .await?;
+                        enqueue_follow_up_wake(&global, &claim_store, &issue_ref_text)?;
                         legacy::adjust_active_claim_count(
                             &mut active_claim_counts,
                             &current.repo_ref,
@@ -241,8 +296,10 @@ pub(crate) async fn tick_with_resolver(
                             false,
                             BTreeMap::new(),
                             current.contenders.clone(),
+                            options.worker.clone(),
                         )
                         .await?;
+                        enqueue_follow_up_wake(&global, &claim_store, &issue_ref_text)?;
                         legacy::adjust_active_claim_count(
                             &mut active_claim_counts,
                             &current.repo_ref,
@@ -288,8 +345,10 @@ pub(crate) async fn tick_with_resolver(
                     Some(&winner.resolved),
                     &winner.resolved.workflow.name,
                 ),
+                options.worker.clone(),
             )
             .await?;
+            enqueue_follow_up_wake(&global, &claim_store, &winner.issue_ref_text)?;
             legacy::adjust_active_claim_count(
                 &mut active_claim_counts,
                 &winner.resolved.repo_ref,
@@ -312,7 +371,11 @@ pub(crate) async fn tick_with_resolver(
                     %error,
                     "autoflow tick failed for issue"
                 );
-                resync_active_claim_counts(&claim_store, &mut active_claim_counts)?;
+                resync_active_claim_counts(
+                    &claim_store,
+                    &mut active_claim_counts,
+                    options.repo_filter.as_deref(),
+                )?;
             }
         }
     }
@@ -324,6 +387,214 @@ pub(crate) async fn tick_with_resolver(
     }
 
     Ok(report)
+}
+
+pub(crate) async fn serve_with_resolver(
+    resolver: Arc<dyn CredentialResolver>,
+    options: ServeOptions,
+) -> anyhow::Result<ServeReport> {
+    let global = paths::global_dir()?;
+    paths::ensure_dir(&global)?;
+    let worker = ServeWorker::acquire(&global, options.worker_name.as_deref(), options.repo_filter.as_deref())?;
+    let mut report = ServeReport::default();
+    let mut cycle_index = 0usize;
+
+    loop {
+        cycle_index += 1;
+        worker.heartbeat(options.repo_filter.as_deref())?;
+        let tick = tick_with_options(
+            Arc::clone(&resolver),
+            TickOptions {
+                repo_filter: options.repo_filter.clone(),
+                worker: Some(worker.execution_worker()),
+            },
+        )
+        .await?;
+        report.cycles += 1;
+        accumulate_tick_report(&mut report.total, &tick);
+
+        if options.max_cycles.is_some_and(|max| cycle_index >= max) {
+            break;
+        }
+
+        let sleep_for = if tick.ran_cycles > 0 || tick.failed_cycles > 0 {
+            std::cmp::min(options.idle_sleep, std::time::Duration::from_millis(250))
+        } else {
+            options.idle_sleep
+        };
+        if sleep_for.is_zero() {
+            continue;
+        }
+
+        tokio::select! {
+            _ = wait_for_shutdown() => break,
+            _ = tokio::time::sleep(sleep_for) => {}
+        }
+    }
+
+    Ok(report)
+}
+
+fn repo_filter_matches(repo_filter: Option<&str>, repo_ref: &str) -> bool {
+    repo_filter.is_none_or(|filter| filter == repo_ref)
+}
+
+fn accumulate_tick_report(total: &mut TickReport, tick: &TickReport) {
+    total.workflow_count = tick.workflow_count;
+    total.polled_event_count += tick.polled_event_count;
+    total.webhook_event_count += tick.webhook_event_count;
+    total.ran_cycles += tick.ran_cycles;
+    total.skipped_cycles += tick.skipped_cycles;
+    total.failed_cycles += tick.failed_cycles;
+    total.cleaned_claims += tick.cleaned_claims;
+}
+
+struct ServeWorker {
+    global: PathBuf,
+    worker: ExecutionWorkerContext,
+    lock_path: PathBuf,
+}
+
+impl ServeWorker {
+    fn acquire(
+        global: &Path,
+        worker_name: Option<&str>,
+        repo_filter: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let worker = default_execution_worker_context(WorkerKind::AutoflowServe, worker_name);
+        let workers_dir = paths::autoflow_workers_dir(global);
+        std::fs::create_dir_all(&workers_dir)?;
+        let lock_path = workers_dir.join(format!("{}.serve.lock", worker.worker_id));
+        let lock_body = serde_json::json!({
+            "worker_id": worker.worker_id,
+            "name": worker.name,
+            "repo_filter": repo_filter,
+            "pid": std::process::id(),
+            "started_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let mut lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("acquire serve lock {}", lock_path.display()))?;
+        use std::io::Write;
+        lock.write_all(serde_json::to_string_pretty(&lock_body)?.as_bytes())?;
+
+        let worker_ref = Self {
+            global: global.to_path_buf(),
+            worker,
+            lock_path,
+        };
+        worker_ref.heartbeat(repo_filter)?;
+        Ok(worker_ref)
+    }
+
+    fn execution_worker(&self) -> ExecutionWorkerContext {
+        self.worker.clone()
+    }
+
+    fn heartbeat(&self, repo_filter: Option<&str>) -> anyhow::Result<()> {
+        let _ = upsert_worker_record(
+            &self.global,
+            &self.worker,
+            "local_worktree",
+            "bypass",
+            repo_filter,
+        );
+        let _ = upsert_worker_record(
+            &self.global,
+            &self.worker,
+            "local_worktree",
+            "readonly",
+            repo_filter,
+        );
+        Ok(())
+    }
+}
+
+impl Drop for ServeWorker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
+}
+
+fn enqueue_follow_up_wake(
+    global: &Path,
+    claim_store: &AutoflowClaimStore,
+    issue_ref: &str,
+) -> anyhow::Result<()> {
+    let Some(claim) = claim_store.load(issue_ref)? else {
+        return Ok(());
+    };
+    let Some(request) = follow_up_wake_request(&claim)? else {
+        return Ok(());
+    };
+    let store = WakeStore::new(paths::autoflow_wakes_dir(global));
+    match store.enqueue(request) {
+        Ok(_) => {}
+        Err(rupu_runtime::WakeStoreError::DuplicateDedupeKey(_)) => {}
+        Err(error) => return Err(anyhow::Error::from(error)),
+    }
+    Ok(())
+}
+
+fn follow_up_wake_request(claim: &AutoflowClaimRecord) -> anyhow::Result<Option<WakeEnqueueRequest>> {
+    let (source, event_id, not_before) = match claim.status {
+        ClaimStatus::RetryBackoff => (
+            WakeSource::Retry,
+            "autoflow.retry.due",
+            claim.next_retry_at
+                .clone()
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+        ),
+        ClaimStatus::AwaitHuman => (
+            WakeSource::ApprovalResume,
+            "autoflow.approval.resume",
+            (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc3339(),
+        ),
+        ClaimStatus::Claimed if claim.pending_dispatch.is_some() => (
+            WakeSource::AutoflowDispatch,
+            "autoflow.dispatch.pending",
+            chrono::Utc::now().to_rfc3339(),
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some(WakeEnqueueRequest {
+        source,
+        repo_ref: claim.repo_ref.clone(),
+        entity: WakeEntity {
+            kind: WakeEntityKind::Issue,
+            ref_text: claim.issue_ref.clone(),
+        },
+        event: WakeEvent {
+            id: event_id.to_string(),
+            delivery_id: None,
+            dedupe_key: Some(format!(
+                "{}:{}:{}",
+                event_id,
+                claim.issue_ref,
+                claim.updated_at
+            )),
+        },
+        payload: None,
+        received_at: chrono::Utc::now().to_rfc3339(),
+        not_before,
+    }))
+}
+
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn load_claim_status(
@@ -339,9 +610,13 @@ fn load_claim_status(
 fn resync_active_claim_counts(
     claim_store: &AutoflowClaimStore,
     active_claim_counts: &mut BTreeMap<String, usize>,
+    repo_filter: Option<&str>,
 ) -> anyhow::Result<()> {
     active_claim_counts.clear();
     for claim in claim_store.list()? {
+        if !repo_filter_matches(repo_filter, &claim.repo_ref) {
+            continue;
+        }
         if legacy::claim_counts_toward_max_active(claim.status) {
             *active_claim_counts.entry(claim.repo_ref).or_insert(0) += 1;
         }

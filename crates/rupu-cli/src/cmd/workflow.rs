@@ -960,6 +960,13 @@ pub struct RunOutcomeSummary {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExecutionWorkerContext {
+    pub worker_id: String,
+    pub kind: WorkerKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ExplicitWorkflowRunContext {
     pub project_root: Option<PathBuf>,
     pub workspace_path: PathBuf,
@@ -976,6 +983,7 @@ pub struct ExplicitWorkflowRunContext {
     pub run_id_override: Option<String>,
     pub strict_templates: bool,
     pub run_envelope_template: Option<RunEnvelopeTemplate>,
+    pub worker: Option<ExecutionWorkerContext>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1270,6 +1278,7 @@ async fn run_with_outcome(
             run_id_override,
             strict_templates: false,
             run_envelope_template: None,
+            worker: None,
         },
     )
     .await
@@ -1334,6 +1343,7 @@ async fn run_path_with_outcome(
             run_id_override,
             strict_templates: false,
             run_envelope_template: None,
+            worker: None,
         },
     )
     .await
@@ -1357,7 +1367,7 @@ fn build_run_envelope(
     workflow_body: &str,
     workflow_path: &Path,
     ctx: &ExplicitWorkflowRunContext,
-    worker_id: &str,
+    worker: &ExecutionWorkerContext,
 ) -> RunEnvelope {
     let template = ctx.run_envelope_template.clone().unwrap_or_default();
     let repo_ref = template.repo_ref.clone().or_else(|| {
@@ -1413,7 +1423,7 @@ fn build_run_envelope(
         correlation: template.correlation,
         worker: Some(WorkerRequest {
             requested_worker: template.requested_worker,
-            assigned_worker_id: Some(worker_id.to_string()),
+            assigned_worker_id: Some(worker.worker_id.clone()),
         }),
     }
 }
@@ -1423,20 +1433,11 @@ fn workflow_fingerprint(body: &str) -> String {
     format!("sha256:{}", hex::encode(digest))
 }
 
-fn local_worker_id() -> String {
-    let host = local_host_name();
-    format!(
-        "worker_local_{}_{}_cli",
-        sanitize_worker_component(&whoami::username()),
-        sanitize_worker_component(&host)
-    )
-}
-
-fn local_host_name() -> String {
+pub(crate) fn local_host_name() -> String {
     whoami::fallible::hostname().unwrap_or_else(|_| "unknown-host".to_string())
 }
 
-fn sanitize_worker_component(value: &str) -> String {
+pub(crate) fn sanitize_worker_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() {
@@ -1453,15 +1454,39 @@ fn sanitize_worker_component(value: &str) -> String {
     }
 }
 
+pub(crate) fn default_execution_worker_context(
+    kind: WorkerKind,
+    name_override: Option<&str>,
+) -> ExecutionWorkerContext {
+    let host = local_host_name();
+    let display_name = name_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("{}@{}", whoami::username(), host));
+    let suffix = match kind {
+        WorkerKind::Cli => "cli",
+        WorkerKind::AutoflowServe => "serve",
+    };
+    let worker_id = format!(
+        "worker_local_{}_{}",
+        sanitize_worker_component(&display_name),
+        suffix
+    );
+    ExecutionWorkerContext {
+        worker_id,
+        kind,
+        name: display_name,
+    }
+}
+
 fn repo_host_from_ref(repo_ref: Option<&str>) -> Option<String> {
     repo_ref
         .and_then(|value| value.split(':').next())
         .map(ToOwned::to_owned)
 }
 
-fn upsert_local_worker_record(
+pub(crate) fn upsert_worker_record(
     global: &Path,
-    worker_id: &str,
+    worker: &ExecutionWorkerContext,
     backend_id: &str,
     permission_mode: &str,
     repo_ref: Option<&str>,
@@ -1471,7 +1496,7 @@ fn upsert_local_worker_record(
     };
     let now = chrono::Utc::now().to_rfc3339();
     let existing = store
-        .load(worker_id)
+        .load(&worker.worker_id)
         .map_err(|e| anyhow::anyhow!("load worker record: {e}"))?;
     let registered_at = existing
         .as_ref()
@@ -1500,9 +1525,9 @@ fn upsert_local_worker_record(
     }
     let record = WorkerRecord {
         version: WorkerRecord::VERSION,
-        worker_id: worker_id.to_string(),
-        kind: WorkerKind::Cli,
-        name: format!("{}@{}", whoami::username(), local_host_name()),
+        worker_id: worker.worker_id.clone(),
+        kind: worker.kind,
+        name: worker.name.clone(),
         host: local_host_name(),
         capabilities,
         registered_at,
@@ -1669,16 +1694,19 @@ async fn execute_workflow_invocation(
         .run_id_override
         .clone()
         .unwrap_or_else(|| format!("run_{}", Ulid::new()));
-    let worker_id = local_worker_id();
-    let run_envelope = build_run_envelope(run_id.clone(), &workflow, &body, &path, &ctx, &worker_id);
+    let worker_ctx = ctx
+        .worker
+        .clone()
+        .unwrap_or_else(|| default_execution_worker_context(WorkerKind::Cli, None));
+    let run_envelope = build_run_envelope(run_id.clone(), &workflow, &body, &path, &ctx, &worker_ctx);
     let backend_id = run_envelope
         .execution
         .backend
         .clone()
         .unwrap_or_else(|| "local_worktree".to_string());
-    let worker_record = upsert_local_worker_record(
+    let worker_record = upsert_worker_record(
         &global,
-        &worker_id,
+        &worker_ctx,
         &backend_id,
         &ctx.mode,
         run_envelope

@@ -5,7 +5,8 @@ use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::workflow::{
-    locate_workflow_in, run_with_explicit_context, ExplicitWorkflowRunContext, RunEnvelopeTemplate,
+    locate_workflow_in, run_with_explicit_context, ExecutionWorkerContext,
+    ExplicitWorkflowRunContext, RunEnvelopeTemplate,
 };
 use crate::paths;
 use anyhow::{anyhow, bail, Context};
@@ -58,6 +59,18 @@ pub enum Action {
     },
     /// Reconcile every discovered autoflow once.
     Tick,
+    /// Run the autoflow reconciler as a long-lived local worker.
+    Serve {
+        /// Limit reconciliation to one tracked repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional worker name override, for example `team-mini-01`.
+        #[arg(long)]
+        worker: Option<String>,
+        /// Idle sleep between reconciliation passes, for example `10s`.
+        #[arg(long, default_value = "10s")]
+        idle_sleep: String,
+    },
     /// Summarize persisted autoflow claim state.
     Status(RepoFilterArgs),
     /// Inspect persisted autoflow claims.
@@ -199,6 +212,11 @@ async fn handle_with_resolver(
         Action::Show { name, repo } => show(&name, repo.as_deref()).await,
         Action::Run { name, target, mode } => run(&name, &target, mode.as_deref(), resolver).await,
         Action::Tick => tick_with_resolver(resolver).await,
+        Action::Serve {
+            repo,
+            worker,
+            idle_sleep,
+        } => serve(repo.as_deref(), worker.as_deref(), &idle_sleep, resolver).await,
         Action::Status(args) => status(args.repo.as_deref()).await,
         Action::Claims(args) => claims(args.repo.as_deref()).await,
         Action::Release { r#ref } => release(&r#ref).await,
@@ -389,6 +407,7 @@ async fn run(
             scope: Some(resolved.scope.clone()),
             selected: true,
         }],
+        None,
     )
     .await
 }
@@ -447,6 +466,37 @@ async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Re
         report.skipped_cycles,
         report.failed_cycles,
         report.cleaned_claims
+    );
+    Ok(())
+}
+
+async fn serve(
+    repo: Option<&str>,
+    worker: Option<&str>,
+    idle_sleep: &str,
+    resolver: Arc<dyn CredentialResolver>,
+) -> anyhow::Result<()> {
+    let repo_filter = normalize_repo_filter(repo)?;
+    let idle_sleep = parse_duration(idle_sleep)?
+        .to_std()
+        .map_err(|_| anyhow!("idle sleep must be non-negative"))?;
+    let report = crate::cmd::autoflow_runtime::serve_with_resolver(
+        resolver,
+        crate::cmd::autoflow_runtime::ServeOptions {
+            repo_filter,
+            worker_name: worker.map(ToOwned::to_owned),
+            idle_sleep,
+            max_cycles: None,
+        },
+    )
+    .await?;
+    println!(
+        "autoflow serve stopped after {} cycle(s): ran={} skipped={} failed={} cleaned={}",
+        report.cycles,
+        report.total.ran_cycles,
+        report.total.skipped_cycles,
+        report.total.failed_cycles,
+        report.total.cleaned_claims
     );
     Ok(())
 }
@@ -1111,6 +1161,7 @@ pub(crate) async fn execute_autoflow_cycle(
     attach_ui: bool,
     inputs: BTreeMap<String, String>,
     contenders: Vec<AutoflowContender>,
+    worker: Option<ExecutionWorkerContext>,
 ) -> anyhow::Result<()> {
     let autoflow = resolved.autoflow()?;
     let issue_payload = issue_payload(issue)?;
@@ -1235,6 +1286,7 @@ pub(crate) async fn execute_autoflow_cycle(
                 target: Some(issue_ref_text.to_string()),
                 correlation: None,
             }),
+            worker,
         },
     )
     .await;
@@ -1760,9 +1812,13 @@ pub(crate) fn cleanup_terminal_claims(
     repo_store: &RepoRegistryStore,
     claim_store: &AutoflowClaimStore,
     now: chrono::DateTime<chrono::Utc>,
+    repo_filter: Option<&str>,
 ) -> anyhow::Result<usize> {
     let mut cleaned = 0usize;
     for claim in claim_store.list()? {
+        if !repo_filter.is_none_or(|repo| claim.repo_ref == repo) {
+            continue;
+        }
         if !matches!(claim.status, ClaimStatus::Complete | ClaimStatus::Released) {
             continue;
         }
@@ -2312,6 +2368,14 @@ base_url = "{base_url}"
             ),
         )
         .unwrap();
+    }
+
+    fn github_fixture(name: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/../rupu-scm/tests/fixtures/github/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -3651,6 +3715,420 @@ steps:
             .as_deref()
             .unwrap()
             .contains("issue-123"));
+    }
+
+    #[tokio::test]
+    async fn serve_runs_one_cycle_persists_worker_and_releases_lock() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let body = github_fixture("issues_list_happy.json").replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(body);
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        let report = crate::cmd::autoflow_runtime::serve_with_resolver(
+            resolver.clone(),
+            crate::cmd::autoflow_runtime::ServeOptions {
+                repo_filter: Some("github:Section9Labs/rupu".into()),
+                worker_name: Some("team-mini-01".into()),
+                idle_sleep: std::time::Duration::from_millis(1),
+                max_cycles: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        assert_eq!(report.cycles, 1);
+        assert_eq!(report.total.ran_cycles, 1);
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        let claim = claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.status, ClaimStatus::Complete);
+
+        let worker_ctx = crate::cmd::workflow::default_execution_worker_context(
+            rupu_workspace::WorkerKind::AutoflowServe,
+            Some("team-mini-01"),
+        );
+        let lock_path = paths::autoflow_workers_dir(&global)
+            .join(format!("{}.serve.lock", worker_ctx.worker_id));
+        assert!(!lock_path.exists(), "serve lock should be removed on exit");
+
+        let worker_store = rupu_workspace::WorkerStore {
+            root: paths::autoflow_workers_dir(&global),
+        };
+        let worker = worker_store
+            .load(&worker_ctx.worker_id)
+            .unwrap()
+            .expect("serve worker record should persist");
+        assert_eq!(worker.kind, rupu_workspace::WorkerKind::AutoflowServe);
+        assert_eq!(worker.name, "team-mini-01");
+        assert!(worker
+            .capabilities
+            .backends
+            .iter()
+            .any(|value| value == "local_worktree"));
+        assert!(worker
+            .capabilities
+            .permission_modes
+            .iter()
+            .any(|value| value == "bypass"));
+        assert!(worker
+            .capabilities
+            .permission_modes
+            .iter()
+            .any(|value| value == "readonly"));
+
+        std::env::set_var("RUPU_HOME", &global);
+        let restart = crate::cmd::autoflow_runtime::serve_with_resolver(
+            resolver,
+            crate::cmd::autoflow_runtime::ServeOptions {
+                repo_filter: Some("github:Section9Labs/rupu".into()),
+                worker_name: Some("team-mini-01".into()),
+                idle_sleep: std::time::Duration::from_millis(1),
+                max_cycles: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        std::env::remove_var("RUPU_HOME");
+
+        assert_eq!(restart.cycles, 1);
+        assert!(!lock_path.exists(), "serve lock should stay released after restart");
+    }
+
+    #[tokio::test]
+    async fn serve_respects_repo_filter() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project_a = tmp.path().join("repo-a");
+        let project_b = tmp.path().join("repo-b");
+        init_git_repo(&project_a);
+        init_git_repo(&project_b);
+
+        let server = MockServer::start();
+        let issues_rupu = github_fixture("issues_list_happy.json").replace("section9labs", "Section9Labs");
+        let issues_other = issues_rupu.replace("rupu", "other-repo");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issues_rupu);
+        });
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/other-repo/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(issues_other);
+        });
+
+        let workflow_yaml = r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#;
+        write_autoflow_project(
+            &project_a,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            workflow_yaml,
+        );
+        write_autoflow_project(
+            &project_b,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            workflow_yaml,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project_a,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+        repo_store
+            .upsert(
+                "github:Section9Labs/other-repo",
+                &project_b,
+                Some("https://github.com/Section9Labs/other-repo.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        let report = crate::cmd::autoflow_runtime::serve_with_resolver(
+            resolver,
+            crate::cmd::autoflow_runtime::ServeOptions {
+                repo_filter: Some("github:Section9Labs/rupu".into()),
+                worker_name: Some("repo-filter".into()),
+                idle_sleep: std::time::Duration::from_millis(1),
+                max_cycles: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        assert_eq!(report.cycles, 1);
+        assert_eq!(report.total.ran_cycles, 1);
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        assert!(claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .is_some());
+        assert!(claim_store
+            .load("github:Section9Labs/other-repo/issues/123")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn serve_enqueues_follow_up_dispatch_wake() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let body = github_fixture("issues_list_happy.json").replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(body);
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var(
+            "RUPU_MOCK_PROVIDER_SCRIPT",
+            r#"
+[
+  {
+    "AssistantText": {
+      "text": "{\"status\":\"continue\",\"summary\":\"phase queued\",\"dispatch\":{\"workflow\":\"phase-delivery-cycle\",\"target\":\"github:Section9Labs/rupu/issues/123\",\"inputs\":{\"phase\":\"phase-1\"}}}",
+      "stop": "end_turn"
+    }
+  }
+]
+"#,
+        );
+
+        let report = crate::cmd::autoflow_runtime::serve_with_resolver(
+            resolver,
+            crate::cmd::autoflow_runtime::ServeOptions {
+                repo_filter: Some("github:Section9Labs/rupu".into()),
+                worker_name: Some("dispatcher".into()),
+                idle_sleep: std::time::Duration::from_millis(1),
+                max_cycles: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        assert_eq!(report.cycles, 1);
+        assert_eq!(report.total.ran_cycles, 1);
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        let claim = claim_store
+            .load("github:Section9Labs/rupu/issues/123")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.status, ClaimStatus::Claimed);
+        assert_eq!(claim.last_summary.as_deref(), Some("phase queued"));
+        let dispatch = claim.pending_dispatch.expect("pending dispatch should persist");
+        assert_eq!(dispatch.workflow, "phase-delivery-cycle");
+        assert_eq!(dispatch.inputs.get("phase").map(String::as_str), Some("phase-1"));
+
+        let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+        let due = wake_store.list_due(chrono::Utc::now()).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].source, rupu_runtime::WakeSource::AutoflowDispatch);
+        assert_eq!(due[0].repo_ref, "github:Section9Labs/rupu");
+        assert_eq!(due[0].entity.kind, WakeEntityKind::Issue);
+        assert_eq!(due[0].entity.ref_text, "github:Section9Labs/rupu/issues/123");
+        assert_eq!(due[0].event.id, "autoflow.dispatch.pending");
     }
 
     #[tokio::test]
