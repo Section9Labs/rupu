@@ -16,12 +16,13 @@
 //!   gitlab.mr.merged
 //!   gitlab.issue.opened
 //!   gitlab.push
+//!   linear.issue.updated
 //!
 //! Workflow-side glob matching *is* supported by the orchestrator.
 //! This module only maps raw vendor deliveries onto canonical rupu
 //! event ids; broader semantic aliases are derived one layer up.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Map a GitHub webhook delivery to a rupu event id. `event_header`
 /// is `X-GitHub-Event` (e.g. `pull_request`, `issues`, `push`); the
@@ -96,6 +97,168 @@ pub fn map_gitlab_event(event_header: &str, payload: &Value) -> Option<String> {
         ("Note Hook", _) => Some("gitlab.comment".into()),
         ("Push Hook", _) => Some("gitlab.push".into()),
         _ => None,
+    }
+}
+
+/// Map a Linear webhook delivery to a rupu event id. Linear uses the
+/// `Linear-Event` header (resource type such as `Issue`) plus the
+/// payload's `action` field (`create` / `update` / `remove`).
+///
+/// Native workflow-state transitions are exposed through
+/// `linear.issue.updated` plus a normalized payload shape in the
+/// server layer. One delivery can therefore match multiple derived
+/// aliases such as `issue.state_changed` and `issue.cycle_changed`.
+pub fn map_linear_event(event_header: &str, payload: &Value) -> Option<String> {
+    let action = payload.get("action").and_then(|value| value.as_str());
+    let type_field = payload.get("type").and_then(|value| value.as_str());
+    let effective_type = if !event_header.is_empty() {
+        event_header
+    } else {
+        type_field?
+    };
+    match (effective_type, action) {
+        ("Issue", Some("create")) => Some("linear.issue.opened".into()),
+        ("Issue", Some("update")) => Some("linear.issue.updated".into()),
+        ("Issue", Some("remove")) => Some("linear.issue.removed".into()),
+        _ => None,
+    }
+}
+
+/// Normalize a Linear Issue webhook payload into the shape expected by
+/// the orchestrator's native tracker state alias layer. Raw vendor
+/// payload is preserved at `payload`.
+pub fn normalize_linear_event_payload(payload: &Value) -> Value {
+    let data = payload.get("data").and_then(Value::as_object);
+    let updated_from = payload.get("updatedFrom").and_then(Value::as_object);
+
+    let subject_ref = data
+        .and_then(|data| data.get("identifier"))
+        .and_then(Value::as_str)
+        .or_else(|| data.and_then(|data| data.get("id")).and_then(Value::as_str))
+        .unwrap_or_default();
+    let issue_id = data
+        .and_then(|data| data.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let state = transition_object(
+        updated_from.and_then(|obj| obj.get("stateId")),
+        data.and_then(|obj| obj.get("stateId")),
+        Some("workflow_state"),
+    );
+    let project = transition_object(
+        updated_from.and_then(|obj| obj.get("projectId")),
+        data.and_then(|obj| obj.get("projectId")),
+        None,
+    );
+    let cycle = transition_object(
+        updated_from.and_then(|obj| obj.get("cycleId")),
+        data.and_then(|obj| obj.get("cycleId")),
+        None,
+    );
+    let priority = transition_object(
+        updated_from.and_then(|obj| obj.get("priority")),
+        data.and_then(|obj| obj.get("priority")),
+        None,
+    );
+
+    let mut out = json!({
+        "vendor": "linear",
+        "delivery": payload
+            .get("webhookId")
+            .or_else(|| payload.get("deliveryId"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "subject": {
+            "kind": "issue",
+            "id": issue_id,
+            "ref": subject_ref,
+            "url": payload.get("url").cloned().unwrap_or(Value::Null),
+        },
+        "actor": payload.get("actor").cloned().unwrap_or(Value::Null),
+        "organization": {
+            "id": payload.get("organizationId").cloned().unwrap_or(Value::Null),
+        },
+        "team": {
+            "id": data.and_then(|obj| obj.get("teamId")).cloned().unwrap_or(Value::Null),
+            "key": subject_ref.split_once('-').map(|(key, _)| key).unwrap_or_default(),
+        },
+        "payload": payload.clone(),
+    });
+
+    if let Some(state) = state {
+        out["state"] = state;
+    }
+    if let Some(project) = project {
+        out["project"] = project;
+    }
+    if let Some(cycle) = cycle {
+        out["cycle"] = cycle;
+    }
+    if let Some(priority) = priority {
+        out["priority"] = priority;
+    }
+    if let Some(blocked) = updated_from
+        .and_then(|obj| obj.get("blockedByCount"))
+        .or_else(|| updated_from.and_then(|obj| obj.get("blocked")))
+    {
+        let current = data
+            .and_then(|obj| obj.get("blockedByCount"))
+            .or_else(|| data.and_then(|obj| obj.get("blocked")))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let blocked_after = blocked_flag(&current);
+        let blocked_before = blocked_flag(blocked);
+        if blocked_after != blocked_before {
+            out["blocked"] = Value::Bool(blocked_after);
+        }
+    }
+
+    out
+}
+
+fn transition_object(
+    before: Option<&Value>,
+    after: Option<&Value>,
+    category: Option<&str>,
+) -> Option<Value> {
+    let before_norm = stateish_value(before)?;
+    let after_norm = stateish_value(after)?;
+    if before_norm == after_norm {
+        return None;
+    }
+    let mut value = json!({
+        "before": before_norm,
+        "after": after_norm,
+    });
+    if let Some(category) = category {
+        value["category"] = Value::String(category.to_string());
+    }
+    Some(value)
+}
+
+fn stateish_value(value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    match value {
+        Value::Null => Some(Value::Null),
+        Value::String(text) => Some(json!({ "id": text })),
+        Value::Number(number) => Some(json!({ "id": number })),
+        Value::Object(map) => {
+            if map.contains_key("id") || map.contains_key("name") {
+                Some(Value::Object(map.clone()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn blocked_flag(value: &Value) -> bool {
+    match value {
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_i64().unwrap_or_default() > 0,
+        _ => false,
     }
 }
 
@@ -201,5 +364,66 @@ mod tests {
     fn gitlab_unknown_event() {
         let payload = json!({});
         assert!(map_gitlab_event("Magic Hook", &payload).is_none());
+    }
+
+    #[test]
+    fn linear_issue_events() {
+        for (action, expected) in [
+            ("create", "linear.issue.opened"),
+            ("update", "linear.issue.updated"),
+            ("remove", "linear.issue.removed"),
+        ] {
+            let payload = json!({ "type": "Issue", "action": action });
+            assert_eq!(
+                map_linear_event("Issue", &payload),
+                Some(expected.into()),
+                "for action={action}"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_unknown_event_is_none() {
+        let payload = json!({ "type": "Project", "action": "update" });
+        assert!(map_linear_event("Project", &payload).is_none());
+    }
+
+    #[test]
+    fn linear_issue_update_normalizes_transition_fields() {
+        let payload = json!({
+            "action": "update",
+            "type": "Issue",
+            "url": "https://linear.app/acme/issue/ENG-123",
+            "organizationId": "org-1",
+            "actor": { "id": "user-1", "name": "Matt" },
+            "data": {
+                "id": "issue-1",
+                "identifier": "ENG-123",
+                "stateId": "state-in-progress",
+                "projectId": "project-core",
+                "cycleId": "cycle-42",
+                "priority": 1,
+                "teamId": "team-1",
+                "blockedByCount": 2
+            },
+            "updatedFrom": {
+                "stateId": "state-todo",
+                "projectId": "project-backlog",
+                "cycleId": "cycle-41",
+                "priority": 3,
+                "blockedByCount": 0
+            },
+            "webhookId": "delivery-1"
+        });
+        let normalized = normalize_linear_event_payload(&payload);
+        assert_eq!(normalized["subject"]["ref"], "ENG-123");
+        assert_eq!(normalized["state"]["category"], "workflow_state");
+        assert_eq!(normalized["state"]["before"]["id"], "state-todo");
+        assert_eq!(normalized["state"]["after"]["id"], "state-in-progress");
+        assert_eq!(normalized["project"]["before"]["id"], "project-backlog");
+        assert_eq!(normalized["cycle"]["after"]["id"], "cycle-42");
+        assert_eq!(normalized["priority"]["after"]["id"], 1);
+        assert_eq!(normalized["blocked"], true);
+        assert_eq!(normalized["payload"]["data"]["identifier"], "ENG-123");
     }
 }

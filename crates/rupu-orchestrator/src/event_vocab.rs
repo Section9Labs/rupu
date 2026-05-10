@@ -199,9 +199,10 @@ fn push_aliases(into: &mut Vec<String>, aliases: &[&str]) {
 }
 
 fn native_issue_state_aliases(canonical_id: &str, payload: &Value, out: &mut Vec<String>) -> bool {
-    let Some((vendor, event_kind)) = native_issue_event_kind(canonical_id) else {
+    let Some((vendor, event_kind)) = native_issue_event_kind(canonical_id, payload) else {
         return false;
     };
+    let vendor = vendor.as_str();
     match event_kind {
         NativeIssueEventKind::StateChanged => {
             push_vendor_and_generic(out, vendor, "issue.state_changed");
@@ -367,6 +368,37 @@ fn native_issue_state_aliases(canonical_id: &str, payload: &Value, out: &mut Vec
         NativeIssueEventKind::Unblocked => {
             push_vendor_and_generic(out, vendor, "issue.unblocked");
         }
+        NativeIssueEventKind::Updated => {
+            if payload.get("state").is_some() {
+                native_issue_state_aliases(&format!("{vendor}.issue.state_changed"), payload, out);
+            }
+            if payload.get("project").is_some() {
+                native_issue_state_aliases(
+                    &format!("{vendor}.issue.project_changed"),
+                    payload,
+                    out,
+                );
+            }
+            if payload.get("cycle").is_some() {
+                native_issue_state_aliases(&format!("{vendor}.issue.cycle_changed"), payload, out);
+            }
+            if payload.get("sprint").is_some() {
+                native_issue_state_aliases(&format!("{vendor}.issue.sprint_changed"), payload, out);
+            }
+            if payload.get("priority").is_some() {
+                native_issue_state_aliases(
+                    &format!("{vendor}.issue.priority_changed"),
+                    payload,
+                    out,
+                );
+            }
+            if payload.get("blocked").and_then(Value::as_bool) == Some(true) {
+                native_issue_state_aliases(&format!("{vendor}.issue.blocked"), payload, out);
+            }
+            if payload.get("blocked").and_then(Value::as_bool) == Some(false) {
+                native_issue_state_aliases(&format!("{vendor}.issue.unblocked"), payload, out);
+            }
+        }
     }
     true
 }
@@ -458,6 +490,7 @@ fn slug_segment(raw: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeIssueEventKind {
+    Updated,
     StateChanged,
     ProjectChanged,
     CycleChanged,
@@ -467,13 +500,26 @@ enum NativeIssueEventKind {
     Unblocked,
 }
 
-fn native_issue_event_kind(canonical_id: &str) -> Option<(&str, NativeIssueEventKind)> {
+fn native_issue_event_kind(
+    canonical_id: &str,
+    payload: &Value,
+) -> Option<(String, NativeIssueEventKind)> {
     let parts: Vec<&str> = canonical_id.split('.').collect();
     if parts.len() != 3 || parts[1] != "issue" {
         return None;
     }
     let vendor = parts[0];
     let kind = match parts[2] {
+        "updated"
+            if payload.get("state").is_some()
+                || payload.get("project").is_some()
+                || payload.get("cycle").is_some()
+                || payload.get("sprint").is_some()
+                || payload.get("priority").is_some()
+                || payload.get("blocked").is_some() =>
+        {
+            NativeIssueEventKind::Updated
+        }
         "state_changed" => NativeIssueEventKind::StateChanged,
         "project_changed" => NativeIssueEventKind::ProjectChanged,
         "cycle_changed" => NativeIssueEventKind::CycleChanged,
@@ -483,7 +529,7 @@ fn native_issue_event_kind(canonical_id: &str) -> Option<(&str, NativeIssueEvent
         "unblocked" => NativeIssueEventKind::Unblocked,
         _ => return None,
     };
-    Some((vendor, kind))
+    Some((vendor.to_string(), kind))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,5 +689,25 @@ mod tests {
             matched.as_deref(),
             Some("issue.entered_workflow_state.ready_for_review")
         );
+    }
+
+    #[test]
+    fn umbrella_updated_event_derives_multiple_native_aliases() {
+        let payload = json!({
+            "state": {
+                "category": "workflow_state",
+                "before": { "name": "Todo" },
+                "after": { "name": "In Progress" }
+            },
+            "cycle": {
+                "before": { "name": "Sprint 41" },
+                "after": { "name": "Sprint 42" }
+            }
+        });
+        let aliases = derived_event_ids("linear.issue.updated", &payload);
+        assert!(aliases.contains(&"issue.state_changed".to_string()));
+        assert!(aliases.contains(&"issue.entered_workflow_state.in_progress".to_string()));
+        assert!(aliases.contains(&"issue.cycle_changed".to_string()));
+        assert!(aliases.contains(&"issue.entered_cycle.sprint_42".to_string()));
     }
 }

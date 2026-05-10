@@ -267,7 +267,7 @@ rupu transcript {list, show}          Browse JSONL transcripts
 rupu issues {list, show, run}         Issue-tracker surface (auto-detects from cwd)
 rupu repos list                       List configured-platform repositories
 rupu cron {list, tick, events}        Cron + polled-event trigger runtime
-rupu webhook serve [--addr]           Long-lived webhook receiver for GitHub / GitLab
+rupu webhook serve [--addr]           Long-lived webhook receiver for GitHub / GitLab / Linear
 rupu mcp serve [--transport]          Expose rupu's tools to MCP clients
 rupu auth {login, logout, status}     Provider credential management
 rupu models {list, refresh}           Browse / refresh discovered model lists

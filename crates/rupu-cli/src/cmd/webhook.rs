@@ -7,8 +7,9 @@
 //!
 //!   RUPU_GITHUB_WEBHOOK_SECRET   (HMAC-SHA256 secret for GitHub)
 //!   RUPU_GITLAB_WEBHOOK_TOKEN    (shared-secret token for GitLab)
+//!   RUPU_LINEAR_WEBHOOK_SECRET   (HMAC-SHA256 secret for Linear)
 //!
-//! Either may be unset; the corresponding endpoint then returns
+//! Any may be unset; the corresponding endpoint then returns
 //! 503 (service-unavailable) so the operator knows the route is
 //! intentionally disabled rather than misconfigured.
 
@@ -62,9 +63,13 @@ async fn serve_cmd(addr: SocketAddr) -> anyhow::Result<()> {
     let gitlab_token = std::env::var("RUPU_GITLAB_WEBHOOK_TOKEN")
         .ok()
         .map(|s| s.into_bytes());
-    if github_secret.is_none() && gitlab_token.is_none() {
+    let linear_secret = std::env::var("RUPU_LINEAR_WEBHOOK_SECRET")
+        .ok()
+        .map(|s| s.into_bytes());
+    if github_secret.is_none() && gitlab_token.is_none() && linear_secret.is_none() {
         anyhow::bail!(
-            "neither RUPU_GITHUB_WEBHOOK_SECRET nor RUPU_GITLAB_WEBHOOK_TOKEN is set; \
+            "none of RUPU_GITHUB_WEBHOOK_SECRET, RUPU_GITLAB_WEBHOOK_TOKEN, or \
+             RUPU_LINEAR_WEBHOOK_SECRET is set; \
              at least one webhook endpoint must be configured"
         );
     }
@@ -73,6 +78,7 @@ async fn serve_cmd(addr: SocketAddr) -> anyhow::Result<()> {
         addr,
         github_secret,
         gitlab_token,
+        linear_secret,
         workflow_loader: Arc::new(load_workflows),
         dispatcher: Arc::new(CliDispatcher),
         observer: Some(Arc::new(CliWebhookObserver { global })),

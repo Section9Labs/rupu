@@ -295,11 +295,36 @@ RUPU_GITHUB_WEBHOOK_SECRET=<your-webhook-secret> \
   rupu webhook serve --addr 0.0.0.0:8080
 ```
 
+Linear now works on the same receiver path:
+
+```sh
+RUPU_LINEAR_WEBHOOK_SECRET=<your-linear-webhook-secret> \
+  rupu webhook serve --addr 0.0.0.0:8080
+```
+
 Same workflow YAML; same event vocabulary. The webhook receiver:
 
-- Validates `X-Hub-Signature-256` (GitHub) / `X-Gitlab-Token` (GitLab).
+- Validates `X-Hub-Signature-256` (GitHub), `X-Gitlab-Token` (GitLab), or `Linear-Signature` + `webhookTimestamp` freshness (Linear).
 - Maps the raw vendor delivery onto the rupu event id.
 - Fires matching workflows with `{{event.*}}` populated.
+
+Linear issue updates are normalized before dispatch so workflows can match native state aliases such as:
+
+```yaml
+name: linear-review-ready
+trigger:
+  on: event
+  event: issue.entered_workflow_state
+  filter: "{{ event.vendor == 'linear' and event.subject.ref == 'ENG-123' }}"
+
+steps:
+  - id: review
+    agent: reviewer
+    prompt: |
+      Linear issue {{ event.subject.ref }} changed workflow state.
+      Before: {{ event.state.before.id }}
+      After:  {{ event.state.after.id }}
+```
 
 Secrets are read from environment variables — never config files, never the keychain. Webhook secrets are operational secrets and belong in your process supervisor's environment block.
 
@@ -340,6 +365,8 @@ Common patterns:
 {{ event.payload.issue.number }}              # GitHub: issue #
 {{ event.payload.pull_request.head.ref }}     # GitHub: PR head branch
 {{ event.payload.object_attributes.iid }}     # GitLab: issue / MR iid
+{{ event.subject.ref }}                       # Linear/Jira-style issue ref if normalized
+{{ event.state.after.id }}                    # Native tracker state transitions
 ```
 
 The `filter:` field is the same minijinja you'd write in a `when:` expression — but evaluated at trigger-match time, against the event payload only. It must render to `true` or `false`.

@@ -193,6 +193,7 @@ fn normalized_webhook_payload(event: &WebhookEvent) -> serde_json::Value {
                 })
             }),
         ),
+        WebhookSource::Linear => ("linear", None),
     };
     serde_json::json!({
         "id": event.event_id,
@@ -236,6 +237,7 @@ fn repo_ref_from_webhook_event(event: &WebhookEvent) -> Option<String> {
             let (owner, repo_name) = path.split_once('/')?;
             (Platform::Gitlab, owner.to_string(), repo_name.to_string())
         }
+        WebhookSource::Linear => return None,
     };
     Some(format!("{}:{owner}/{repo}", platform.as_str()))
 }
@@ -277,6 +279,7 @@ fn issue_ref_from_webhook_event(event: &WebhookEvent, repo_ref: &str) -> Option<
                 None
             }
         }
+        WebhookSource::Linear => None,
     }?;
     Some(format!("{repo_ref}/issues/{number}"))
 }
