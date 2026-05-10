@@ -11,6 +11,8 @@ use chrono::{DateTime, Utc};
 use clap::Args;
 use comfy_table::Cell;
 use rupu_transcript::{aggregate, TimeWindow, UsageRow};
+use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -25,22 +27,23 @@ pub struct UsageArgs {
     /// timestamp. Same syntax as `--since`.
     #[arg(long)]
     pub until: Option<String>,
-    /// Output format. `table` (default) prints a fixed-width table;
-    /// `json` prints one row per line as JSON for downstream
-    /// scripting.
-    #[arg(long, default_value = "table")]
-    pub format: String,
 }
 
-pub async fn handle(args: UsageArgs) -> ExitCode {
-    let result = run(args).await;
+pub async fn handle(
+    args: UsageArgs,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> ExitCode {
+    let result = run(args, global_format).await;
     match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => crate::output::diag::fail(e),
     }
 }
 
-async fn run(args: UsageArgs) -> anyhow::Result<()> {
+async fn run(
+    args: UsageArgs,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
     let since = args
         .since
         .as_deref()
@@ -58,11 +61,12 @@ async fn run(args: UsageArgs) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let mut paths_to_scan: Vec<PathBuf> = Vec::new();
+    let mut unique_paths: BTreeSet<PathBuf> = BTreeSet::new();
     if let Some(ref proj) = project_root {
-        collect_jsonl(&proj.join(".rupu/transcripts"), &mut paths_to_scan);
+        collect_jsonl(&proj.join(".rupu/transcripts"), &mut unique_paths);
     }
-    collect_jsonl(&global.join("transcripts"), &mut paths_to_scan);
+    collect_jsonl(&global.join("transcripts"), &mut unique_paths);
+    let paths_to_scan = unique_paths.into_iter().collect::<Vec<_>>();
 
     let rows = aggregate(&paths_to_scan, window);
 
@@ -72,11 +76,22 @@ async fn run(args: UsageArgs) -> anyhow::Result<()> {
     // table and renders with no color overrides.
     let cfg = layered_config(&global, project_root.as_deref());
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None);
+    let format =
+        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
+    crate::output::formats::ensure_supported(
+        "rupu usage",
+        format,
+        &[
+            crate::output::formats::OutputFormat::Table,
+            crate::output::formats::OutputFormat::Json,
+            crate::output::formats::OutputFormat::Csv,
+        ],
+    )?;
 
-    match args.format.as_str() {
-        "json" => print_json(&rows, &cfg.pricing)?,
-        "table" => print_table(&rows, &cfg.pricing, &prefs),
-        other => anyhow::bail!("unknown --format: {other} (expected `table` or `json`)"),
+    match format {
+        crate::output::formats::OutputFormat::Table => print_table(&rows, &cfg.pricing, &prefs),
+        crate::output::formats::OutputFormat::Json => print_json(&rows, &cfg.pricing)?,
+        crate::output::formats::OutputFormat::Csv => print_csv(&rows, &cfg.pricing)?,
     }
     Ok(())
 }
@@ -129,14 +144,21 @@ fn parse_time_arg(s: &str) -> Result<DateTime<Utc>, String> {
     Ok(Utc::now() - dur)
 }
 
-fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+fn collect_jsonl(dir: &std::path::Path, out: &mut BTreeSet<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in rd.flatten() {
         let p = entry.path();
         if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-            out.push(p);
+            match p.canonicalize() {
+                Ok(path) => {
+                    out.insert(path);
+                }
+                Err(_) => {
+                    out.insert(p);
+                }
+            }
         }
     }
 }
@@ -212,22 +234,19 @@ fn print_table(
 }
 
 fn print_json(rows: &[UsageRow], pricing: &rupu_config::PricingConfig) -> anyhow::Result<()> {
-    for r in rows {
-        let cost = crate::pricing::lookup(pricing, &r.provider, &r.model, &r.agent)
-            .map(|p| p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens));
-        let v = serde_json::json!({
-            "provider": r.provider,
-            "model": r.model,
-            "agent": r.agent,
-            "input_tokens": r.input_tokens,
-            "output_tokens": r.output_tokens,
-            "cached_tokens": r.cached_tokens,
-            "runs": r.runs,
-            "cost_usd": cost,
-        });
-        println!("{}", serde_json::to_string(&v)?);
-    }
-    Ok(())
+    let rows = rows
+        .iter()
+        .map(|row| UsageRowOutput::from_usage_row(row, pricing))
+        .collect::<Vec<_>>();
+    crate::output::formats::print_json(&rows)
+}
+
+fn print_csv(rows: &[UsageRow], pricing: &rupu_config::PricingConfig) -> anyhow::Result<()> {
+    let rows = rows
+        .iter()
+        .map(|row| UsageRowOutput::from_usage_row(row, pricing))
+        .collect::<Vec<_>>();
+    crate::output::formats::print_csv_rows(&rows)
 }
 
 /// Render a cost cell as `$1.2345` with 4 decimals (sub-cent visible
@@ -259,6 +278,36 @@ fn format_count(n: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageRowOutput {
+    provider: String,
+    model: String,
+    agent: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    runs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
+}
+
+impl UsageRowOutput {
+    fn from_usage_row(row: &UsageRow, pricing: &rupu_config::PricingConfig) -> Self {
+        let cost_usd = crate::pricing::lookup(pricing, &row.provider, &row.model, &row.agent)
+            .map(|p| p.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens));
+        Self {
+            provider: row.provider.clone(),
+            model: row.model.clone(),
+            agent: row.agent.clone(),
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cached_tokens: row.cached_tokens,
+            runs: row.runs,
+            cost_usd,
+        }
+    }
 }
 
 #[cfg(test)]

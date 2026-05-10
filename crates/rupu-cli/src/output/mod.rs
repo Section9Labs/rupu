@@ -7,6 +7,7 @@
 //! The TUI canvas remains available behind the `--canvas` flag.
 
 pub mod diag;
+pub mod formats;
 pub mod jsonl_reader;
 pub mod palette;
 pub mod printer;

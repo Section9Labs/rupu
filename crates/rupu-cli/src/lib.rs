@@ -28,6 +28,9 @@ use std::process::ExitCode;
 #[derive(Parser, Debug)]
 #[command(name = "rupu", version, about = "Agentic code-development CLI", long_about = None)]
 pub struct Cli {
+    /// Structured output format for commands that support tabular/report views.
+    #[arg(long, global = true)]
+    pub format: Option<output::formats::OutputFormat>,
     #[command(subcommand)]
     pub command: Cmd,
 }
@@ -130,6 +133,19 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         }
     };
 
+    if let Some(format) = cli.format {
+        match &cli.command {
+            Cmd::Usage(_) => {}
+            _ => {
+                eprintln!(
+                    "`rupu {}` does not support structured `--format {format}` output yet",
+                    command_name(&cli.command)
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     // Run / Workflow Run / Watch write to stdout (either line-stream or
     // alt-screen TUI canvas). Either way, tracing on stderr would bleed
     // through and corrupt the output. Route logs to the rupu log file
@@ -166,8 +182,30 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
         Cmd::Cron { action } => cmd::cron::handle(action).await,
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
-        Cmd::Usage(args) => cmd::usage::handle(args).await,
+        Cmd::Usage(args) => cmd::usage::handle(args, cli.format).await,
         Cmd::Watch(args) => cmd::watch::handle(args).await,
         Cmd::Completions { action } => cmd::completions::handle(action).await,
+    }
+}
+
+fn command_name(command: &Cmd) -> &'static str {
+    match command {
+        Cmd::Run(_) => "run",
+        Cmd::Agent { .. } => "agent",
+        Cmd::Workflow { .. } => "workflow",
+        Cmd::Autoflow { .. } => "autoflow",
+        Cmd::Transcript { .. } => "transcript",
+        Cmd::Config { .. } => "config",
+        Cmd::Auth { .. } => "auth",
+        Cmd::Models { .. } => "models",
+        Cmd::Repos { .. } => "repos",
+        Cmd::Issues { .. } => "issues",
+        Cmd::Init(_) => "init",
+        Cmd::Mcp { .. } => "mcp",
+        Cmd::Cron { .. } => "cron",
+        Cmd::Webhook { .. } => "webhook",
+        Cmd::Usage(_) => "usage",
+        Cmd::Watch(_) => "watch",
+        Cmd::Completions { .. } => "completions",
     }
 }
