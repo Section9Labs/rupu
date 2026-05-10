@@ -220,11 +220,53 @@ rupu autoflow status
 rupu autoflow status --repo github:your-org/your-repo
 rupu autoflow claims
 rupu autoflow claims --repo github:your-org/your-repo
+rupu --format json autoflow claims --repo github:your-org/your-repo
+rupu --format csv autoflow wakes --repo github:your-org/your-repo
 ```
 
 `rupu autoflow list`, `show`, `status`, and `claims` inspect tracked repos, not just the current working directory. Use `rupu repos attach` first if you want to inspect autoflows from outside a checkout, and pass `--repo` when you want to narrow output to one tracked repo.
 
 `rupu autoflow run ...` does not steal a live or blocked claim from another autoflow cycle. If the issue is already owned, let `rupu autoflow tick` reconcile it or release the claim first.
+
+### Inspect usage and structured reports
+
+```sh
+rupu usage
+rupu usage --group-by workflow
+rupu usage --repo github:your-org/your-repo
+rupu usage --provider anthropic --model claude-sonnet-4-6
+rupu usage runs --failed
+rupu usage runs --top-cost 20
+rupu --format json usage
+rupu --format csv usage --group-by repo
+rupu --format json repos tracked
+```
+
+Default `rupu usage` shows the last 30 days, total input/output/cached tokens, total cost, and top providers/models/agents, then a breakdown table grouped by `provider + model + agent`.
+
+Breakdowns support:
+
+- `--group-by provider`
+- `--group-by model`
+- `--group-by agent`
+- `--group-by workflow`
+- `--group-by repo`
+- `--group-by day`
+
+Run-level views support:
+
+- `rupu usage runs --failed`
+- `rupu usage runs --status completed`
+- `rupu usage runs --top-cost 20`
+
+Structured `--format table|json|csv` is currently supported on report/list commands that already have stable row shapes:
+
+- `rupu usage`
+- `rupu repos tracked`
+- `rupu autoflow list`
+- `rupu autoflow status`
+- `rupu autoflow claims`
+- `rupu autoflow wakes`
 
 ---
 

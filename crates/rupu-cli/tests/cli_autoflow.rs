@@ -203,6 +203,152 @@ steps:
 }
 
 #[test]
+fn autoflow_structured_outputs_cover_list_claims_status_and_wakes() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(project.path(), "git@github.com:Section9Labs/rupu.git");
+    write_agent_and_workflow(
+        &project,
+        "controller",
+        r#"name: controller
+autoflow:
+  enabled: true
+  priority: 100
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    track_repo(&home, "github:Section9Labs/rupu", project.path());
+    let issue_ref = "github:Section9Labs/rupu/issues/42";
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.path().join("autoflows/claims"),
+    };
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: issue_ref.into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "controller".into(),
+            status: rupu_workspace::ClaimStatus::AwaitExternal,
+            worktree_path: Some("/tmp/rupu/issue-42".into()),
+            branch: Some("rupu/issue-42".into()),
+            last_run_id: Some("run_usage".into()),
+            last_error: None,
+            last_summary: Some("waiting for review".into()),
+            pr_url: Some("https://github.com/Section9Labs/rupu/pull/1".into()),
+            artifacts: None,
+            artifact_manifest_path: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            pending_dispatch: None,
+            contenders: vec![
+                rupu_workspace::AutoflowContender {
+                    workflow: "controller".into(),
+                    priority: 100,
+                    scope: Some("project".into()),
+                    selected: true,
+                },
+                rupu_workspace::AutoflowContender {
+                    workflow: "phase-ready".into(),
+                    priority: 50,
+                    scope: Some("project".into()),
+                    selected: false,
+                },
+            ],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+    enqueue_issue_wake(
+        home.path(),
+        "github:Section9Labs/rupu",
+        issue_ref,
+        "github.issue.opened",
+        Some(serde_json::json!({ "payload": { "issue": { "number": 42 } } })),
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .current_dir(project.path())
+        .args([
+            "--format",
+            "json",
+            "autoflow",
+            "list",
+            "--repo",
+            "github:Section9Labs/rupu",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"kind\": \"autoflow_list\""))
+        .stdout(predicate::str::contains("\"name\": \"controller\""));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .args([
+            "--format",
+            "json",
+            "autoflow",
+            "claims",
+            "--repo",
+            "github:Section9Labs/rupu",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"kind\": \"autoflow_claims\""))
+        .stdout(predicate::str::contains(
+            "\"issue\": \"github:Section9Labs/rupu/issues/42\"",
+        ))
+        .stdout(predicate::str::contains("\"workflow\": \"controller\""));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .args([
+            "--format",
+            "json",
+            "autoflow",
+            "status",
+            "--repo",
+            "github:Section9Labs/rupu",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"kind\": \"autoflow_status\""))
+        .stdout(predicate::str::contains("\"contested\""))
+        .stdout(predicate::str::contains("\"await_external\""));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .args([
+            "--format",
+            "csv",
+            "autoflow",
+            "wakes",
+            "--repo",
+            "github:Section9Labs/rupu",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "wake_id,state,source,event,entity,not_before,repo",
+        ))
+        .stdout(predicate::str::contains("github.issue.opened"))
+        .stdout(predicate::str::contains(
+            "github:Section9Labs/rupu/issues/42",
+        ));
+}
+
+#[test]
 fn autoflow_show_prints_resolved_metadata_and_body() {
     let _guard = ENV_LOCK.blocking_lock();
 

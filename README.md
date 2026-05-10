@@ -273,12 +273,21 @@ rupu auth {login, logout, status}     Provider credential management
 rupu models {list, refresh}           Browse / refresh discovered model lists
 rupu config {get, set}                Read / write rupu configuration
 rupu completions {print, install}     Shell-completion scripts (with dynamic agent names)
-rupu usage                            Aggregate token spend across transcripts
+rupu usage                            Usage reports across transcripts + workflow runs
 ```
 
 Run `rupu <subcommand> --help` for the full surface of any one. Tab completion
 covers every flag and dynamically lists agent / workflow names for the
 positional slots.
+
+Structured `--format table|json|csv` is currently supported on:
+
+- `rupu usage`
+- `rupu repos tracked`
+- `rupu autoflow list`
+- `rupu autoflow status`
+- `rupu autoflow claims`
+- `rupu autoflow wakes`
 
 ---
 

@@ -134,15 +134,12 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     };
 
     if let Some(format) = cli.format {
-        match &cli.command {
-            Cmd::Usage(_) => {}
-            _ => {
-                eprintln!(
-                    "`rupu {}` does not support structured `--format {format}` output yet",
-                    command_name(&cli.command)
-                );
-                return ExitCode::from(2);
-            }
+        if !supports_structured_output(&cli.command) {
+            eprintln!(
+                "`rupu {}` does not support structured `--format {format}` output yet",
+                command_name(&cli.command)
+            );
+            return ExitCode::from(2);
         }
     }
 
@@ -171,12 +168,12 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Run(args) => cmd::run::handle(args).await,
         Cmd::Agent { action } => cmd::agent::handle(action).await,
         Cmd::Workflow { action } => cmd::workflow::handle(action).await,
-        Cmd::Autoflow { action } => cmd::autoflow::handle(action).await,
+        Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
         Cmd::Transcript { action } => cmd::transcript::handle(action).await,
         Cmd::Config { action } => cmd::config::handle(action).await,
         Cmd::Auth { action } => cmd::auth::handle(action).await,
         Cmd::Models { action } => cmd::models::handle(action).await,
-        Cmd::Repos { action } => cmd::repos::handle(action).await,
+        Cmd::Repos { action } => cmd::repos::handle(action, cli.format).await,
         Cmd::Issues { action } => cmd::issues::handle(action).await,
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
@@ -208,4 +205,20 @@ fn command_name(command: &Cmd) -> &'static str {
         Cmd::Watch(_) => "watch",
         Cmd::Completions { .. } => "completions",
     }
+}
+
+fn supports_structured_output(command: &Cmd) -> bool {
+    matches!(
+        command,
+        Cmd::Usage(_)
+            | Cmd::Repos {
+                action: cmd::repos::Action::Tracked(_),
+            }
+            | Cmd::Autoflow {
+                action: cmd::autoflow::Action::List(_)
+                    | cmd::autoflow::Action::Wakes(_)
+                    | cmd::autoflow::Action::Status(_)
+                    | cmd::autoflow::Action::Claims(_),
+            }
+    )
 }

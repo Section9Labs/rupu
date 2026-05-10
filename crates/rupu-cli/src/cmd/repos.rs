@@ -8,6 +8,7 @@ use clap::{Args as ClapArgs, Subcommand};
 use comfy_table::Cell;
 use rupu_scm::{Platform, Registry};
 use rupu_workspace::RepoRegistryStore;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -63,12 +64,15 @@ pub struct ForgetArgs {
     pub path: Option<String>,
 }
 
-pub async fn handle(action: Action) -> ExitCode {
+pub async fn handle(
+    action: Action,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> ExitCode {
     let result = match action {
         Action::List(args) => list_inner(args).await,
         Action::Attach(args) => attach_inner(args).await,
         Action::Prefer(args) => prefer_inner(args).await,
-        Action::Tracked(args) => tracked_inner(args).await,
+        Action::Tracked(args) => tracked_inner(args, global_format).await,
         Action::Forget(args) => forget_inner(args).await,
     };
     match result {
@@ -204,7 +208,26 @@ async fn prefer_inner(args: TrackArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn tracked_inner(args: TrackedArgs) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Serialize)]
+struct TrackedRepoRow {
+    repo: String,
+    preferred_path: String,
+    known_paths: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TrackedReposReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<TrackedRepoRow>,
+}
+
+async fn tracked_inner(
+    args: TrackedArgs,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let pwd = std::env::current_dir()?;
@@ -220,6 +243,42 @@ async fn tracked_inner(args: TrackedArgs) -> anyhow::Result<()> {
     if repos.is_empty() {
         println!("(no tracked repos)");
         return Ok(());
+    }
+    let rows = repos
+        .iter()
+        .map(|rec| TrackedRepoRow {
+            repo: rec.repo_ref.clone(),
+            preferred_path: rec.preferred_path.clone(),
+            known_paths: rec.known_paths.len(),
+            default_branch: rec.default_branch.clone(),
+        })
+        .collect::<Vec<_>>();
+    let format =
+        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
+    crate::output::formats::ensure_supported(
+        "rupu repos tracked",
+        format,
+        &[
+            crate::output::formats::OutputFormat::Table,
+            crate::output::formats::OutputFormat::Json,
+            crate::output::formats::OutputFormat::Csv,
+        ],
+    )?;
+    if format != crate::output::formats::OutputFormat::Table {
+        let report = TrackedReposReport {
+            kind: "tracked_repos",
+            version: 1,
+            rows,
+        };
+        return match format {
+            crate::output::formats::OutputFormat::Json => {
+                crate::output::formats::print_json(&report)
+            }
+            crate::output::formats::OutputFormat::Csv => {
+                crate::output::formats::print_csv_rows(&report.rows)
+            }
+            crate::output::formats::OutputFormat::Table => Ok(()),
+        };
     }
     let mut table = crate::output::tables::new_table();
     table.set_header(vec![
