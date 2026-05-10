@@ -157,7 +157,7 @@ Events that depend on webhook-only signal (`review_requested`, `labeled`, `assig
 
 ### 6.3 Future vocabulary (deferred)
 
-- **Native issue-tracker queue events**: `issue.entered_queue:<queue>`, `issue.left_queue:<queue>`, `issue.state_changed:<from>-><to>`. Useful when an issue tracker has a board / column / status concept beyond open/closed. Requires the connector to model "queue" — Linear/Jira will surface this naturally; GitHub Issues + Projects v2 less so.
+- **Native issue-tracker queue/state events**: true tracker-modeled workflow-state transitions such as `issue.entered_workflow_state.ready_for_review` and `issue.state_changed.todo.to.in_progress`. This is now split into a dedicated design + plan because it requires both a normalized payload contract and non-repo tracker connector work. See [`2026-05-10-rupu-native-tracker-state-events-design.md`](./2026-05-10-rupu-native-tracker-state-events-design.md).
 
 ## 7. Templates — the `{{event.*}}` binding
 
@@ -302,5 +302,5 @@ Both shapes consume the same `PolledEvent` shape and produce the same `{{event.*
 ## 16. Open questions
 
 - **Should `rupu webhook serve` also write events to a local queue and have `rupu cron tick` consume from it?** This would unify the two ingest paths. Pro: one dispatch entry. Con: an extra piece of state; the receiver path becomes "async fire" rather than "sync dispatch." Decision: defer — keep webhook serve as direct-dispatch, polled events as direct-dispatch, until we have a concrete reason to introduce the queue.
-- **Native queue/state modeling for non-SCM trackers.** Semantic aliases now cover GitHub/GitLab queue-like activity, but true queue state transitions still need connector-native models (Linear/Jira-style column/status moves).
+- **Native queue/state modeling for non-SCM trackers.** Semantic aliases now cover GitHub/GitLab queue-like activity, but true queue state transitions still need connector-native models (Linear/Jira-style column/status moves). Source of truth: [`2026-05-10-rupu-native-tracker-state-events-design.md`](./2026-05-10-rupu-native-tracker-state-events-design.md).
 - **Filter expression sandboxing.** `trigger.filter:` is minijinja. If an attacker can write a workflow file in `.rupu/`, they can already execute arbitrary code via `bash:` agents — so the filter sandbox isn't the threat boundary. Document this; don't sandbox.
