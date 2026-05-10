@@ -138,6 +138,7 @@ Use `autoflow:` when the same workflow file should also be runnable through:
 ```sh
 rupu autoflow run <name> <issue-ref>
 rupu autoflow tick
+rupu autoflow serve --repo github:your-org/your-repo
 ```
 
 Example:
@@ -199,6 +200,13 @@ Notes:
 - Matching precedence is deterministic: higher `priority` wins, then workflow name.
 - On later ticks, an idle lower-priority claim can be released and replaced by a higher-priority winner. Active or approval-paused claims are not stolen automatically.
 - Operator-facing commands surface that decision: `rupu autoflow status` lists contested issues, and `rupu autoflow claims` shows the selected priority plus losing contenders.
+- The same workflow file is portable across local scheduled mode, always-on local worker mode, and future cloud relay mode. The runtime contract is the persisted `RunEnvelope`, `WakeRecord`, `ArtifactManifest`, and `WorkerRecord` documented in `docs/using-rupu.md`.
+
+Deployment guidance:
+
+- use `rupu autoflow tick` when you want an OS scheduler to own cadence
+- use `rupu autoflow serve` when one local worker should stay online and consume due wakes continuously
+- use `rupu webhook serve` only when the machine is intentionally reachable or tunneled; laptop users should usually start with polling instead
 
 Typical pattern:
 

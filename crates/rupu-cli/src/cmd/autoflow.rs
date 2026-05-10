@@ -657,7 +657,10 @@ async fn explain(r#ref: &str) -> anyhow::Result<()> {
                             run.worker_id.as_deref().unwrap_or("-")
                         );
                         if let Some(source_wake_id) = run.source_wake_id.as_deref() {
-                            println!("source wake: {}", describe_wake_source(&global, &wake_store, source_wake_id));
+                            println!(
+                                "source wake: {}",
+                                describe_wake_source(&global, &wake_store, source_wake_id)
+                            );
                         }
                         if run.status == RunStatus::AwaitingApproval {
                             println!(
@@ -674,10 +677,7 @@ async fn explain(r#ref: &str) -> anyhow::Result<()> {
             } else {
                 println!("last run: -");
             }
-            println!(
-                "next action: {}",
-                next_action_summary(&claim)
-            );
+            println!("next action: {}", next_action_summary(&claim));
             if let Some(dispatch) = &claim.pending_dispatch {
                 println!(
                     "pending dispatch: {} target={} inputs={}",
@@ -801,11 +801,14 @@ async fn doctor(repo: Option<&str>) -> anyhow::Result<()> {
                 )),
             }
         }
-        let lock_path = claim_store.root.join(issue_key(&claim.issue_ref)).join(".lock");
+        let lock_path = claim_store
+            .root
+            .join(issue_key(&claim.issue_ref))
+            .join(".lock");
         if lock_path.exists() {
             match claim_store.read_active_lock(&claim.issue_ref) {
-                Ok(Some(lock)) if claim.status != ClaimStatus::Running => findings.push(
-                    DoctorFinding::new(
+                Ok(Some(lock)) if claim.status != ClaimStatus::Running => {
+                    findings.push(DoctorFinding::new(
                         &claim.issue_ref,
                         "stale_lock",
                         format!(
@@ -813,8 +816,8 @@ async fn doctor(repo: Option<&str>) -> anyhow::Result<()> {
                             lock.owner,
                             status_name(claim.status)
                         ),
-                    ),
-                ),
+                    ))
+                }
                 Err(error) => findings.push(DoctorFinding::new(
                     &claim.issue_ref,
                     "stale_lock",
@@ -825,7 +828,11 @@ async fn doctor(repo: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
-    for entry in std::fs::read_dir(&claim_store.root).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(&claim_store.root)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let issue_dir = entry.path();
         let lock_path = issue_dir.join(".lock");
         let claim_path = issue_dir.join("claim.toml");
@@ -836,7 +843,10 @@ async fn doctor(repo: Option<&str>) -> anyhow::Result<()> {
                     .and_then(|value| value.to_str())
                     .unwrap_or("unknown"),
                 "stale_lock",
-                format!("orphan active lock `{}` has no claim.toml", lock_path.display()),
+                format!(
+                    "orphan active lock `{}` has no claim.toml",
+                    lock_path.display()
+                ),
             ));
         }
     }
@@ -909,7 +919,10 @@ async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::
         let tracked = repo_store
             .load(&claim.repo_ref)?
             .ok_or_else(|| anyhow!("repo `{}` is not tracked", claim.repo_ref))?;
-        let branch = claim.branch.clone().unwrap_or_else(|| format!("rupu/{}", issue_dir_name(&claim.issue_ref)));
+        let branch = claim
+            .branch
+            .clone()
+            .unwrap_or_else(|| format!("rupu/{}", issue_dir_name(&claim.issue_ref)));
         let worktree = ensure_issue_worktree(
             Path::new(&tracked.preferred_path),
             &paths::autoflow_worktrees_dir(&global),
@@ -2865,6 +2878,7 @@ fn format_contenders(contenders: &[AutoflowContender]) -> String {
 mod tests {
     use super::*;
     use crate::cmd::autoflow_wake;
+    use crate::test_support::ENV_LOCK;
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use rupu_auth::in_memory::InMemoryResolver;
@@ -2872,9 +2886,6 @@ mod tests {
     use rupu_orchestrator::{RunRecord, StepKind, StepResultRecord};
     use rupu_providers::AuthMode;
     use std::io::Write;
-    use tokio::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     const COMPLETE_SCRIPT: &str = r#"
 [
@@ -4496,7 +4507,10 @@ steps:
         std::env::remove_var("RUPU_HOME");
 
         assert_eq!(restart.cycles, 1);
-        assert!(!lock_path.exists(), "serve lock should stay released after restart");
+        assert!(
+            !lock_path.exists(),
+            "serve lock should stay released after restart"
+        );
     }
 
     #[tokio::test]
@@ -4511,7 +4525,8 @@ steps:
         init_git_repo(&project_b);
 
         let server = MockServer::start();
-        let issues_rupu = github_fixture("issues_list_happy.json").replace("section9labs", "Section9Labs");
+        let issues_rupu =
+            github_fixture("issues_list_happy.json").replace("section9labs", "Section9Labs");
         let issues_other = issues_rupu.replace("rupu", "other-repo");
         server.mock(|when, then| {
             when.method(GET).path("/repos/Section9Labs/rupu/issues");
@@ -4520,7 +4535,8 @@ steps:
                 .body(issues_rupu);
         });
         server.mock(|when, then| {
-            when.method(GET).path("/repos/Section9Labs/other-repo/issues");
+            when.method(GET)
+                .path("/repos/Section9Labs/other-repo/issues");
             then.status(200)
                 .header("content-type", "application/json")
                 .body(issues_other);
@@ -4745,9 +4761,14 @@ steps:
             .unwrap();
         assert_eq!(claim.status, ClaimStatus::Claimed);
         assert_eq!(claim.last_summary.as_deref(), Some("phase queued"));
-        let dispatch = claim.pending_dispatch.expect("pending dispatch should persist");
+        let dispatch = claim
+            .pending_dispatch
+            .expect("pending dispatch should persist");
         assert_eq!(dispatch.workflow, "phase-delivery-cycle");
-        assert_eq!(dispatch.inputs.get("phase").map(String::as_str), Some("phase-1"));
+        assert_eq!(
+            dispatch.inputs.get("phase").map(String::as_str),
+            Some("phase-1")
+        );
 
         let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
         let due = wake_store.list_due(chrono::Utc::now()).unwrap();
@@ -4755,7 +4776,10 @@ steps:
         assert_eq!(due[0].source, rupu_runtime::WakeSource::AutoflowDispatch);
         assert_eq!(due[0].repo_ref, "github:Section9Labs/rupu");
         assert_eq!(due[0].entity.kind, WakeEntityKind::Issue);
-        assert_eq!(due[0].entity.ref_text, "github:Section9Labs/rupu/issues/123");
+        assert_eq!(
+            due[0].entity.ref_text,
+            "github:Section9Labs/rupu/issues/123"
+        );
         assert_eq!(due[0].event.id, "autoflow.dispatch.pending");
     }
 

@@ -29,8 +29,8 @@ fn run_against_anthropic_via_mock_seam() {
         .args(["run", "hello", "--mode", "bypass", "hi"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("provider: anthropic"))
-        .stdout(predicate::str::contains("Total: 11 input"));
+        .stdout(predicate::str::contains("(anthropic · claude-sonnet-4-6)"))
+        .stdout(predicate::str::contains("hi from mock"));
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn run_against_openai_via_mock_seam() {
         .args(["run", "hello", "--mode", "bypass", "hi"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("provider: openai"));
+        .stdout(predicate::str::contains("(openai · gpt-5)"));
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn run_against_gemini_via_mock_seam() {
         .args(["run", "hello", "--mode", "bypass", "hi"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("provider: gemini"));
+        .stdout(predicate::str::contains("(gemini · gemini-2.5-pro)"));
 }
 
 #[test]
@@ -75,5 +75,5 @@ fn run_against_copilot_via_mock_seam() {
         .args(["run", "hello", "--mode", "bypass", "hi"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("provider: copilot"));
+        .stdout(predicate::str::contains("(copilot · gpt-4o)"));
 }
