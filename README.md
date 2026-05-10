@@ -289,6 +289,9 @@ Structured `--format table|json|csv` is currently supported on:
 - `rupu autoflow claims`
 - `rupu autoflow wakes`
 
+If older standalone `rupu run` transcripts predate usage sidecars, repair them with
+`rupu usage backfill`.
+
 ---
 
 ## Architecture overview

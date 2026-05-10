@@ -237,6 +237,7 @@ rupu usage --repo github:your-org/your-repo
 rupu usage --issue github:your-org/your-repo/issues/42
 rupu usage --provider anthropic --model claude-sonnet-4-6
 rupu usage runs --worker worker_local_cli --backend local_checkout --trigger run_cli
+rupu usage backfill
 rupu usage runs --failed
 rupu usage runs --top-cost 20
 rupu --format json usage
@@ -268,6 +269,11 @@ Metadata-backed filters support:
 - `--worker worker_local_cli`
 - `--backend local_checkout`
 - `--trigger run_cli`
+
+If older standalone `rupu run` transcripts predate sidecars, backfill them with:
+
+- `rupu usage backfill`
+- `rupu --format json usage backfill`
 
 Structured `--format table|json|csv` is currently supported on report/list commands that already have stable row shapes:
 
