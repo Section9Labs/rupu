@@ -21,8 +21,12 @@ use rupu_orchestrator::{
     AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
     WorkflowOutputContract,
 };
-use rupu_runtime::{RunTriggerSource, WakeEntityKind, WakeStore, WakeStoreError};
+use rupu_runtime::{
+    RunTriggerSource, WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeRecord,
+    WakeSource, WakeStore, WakeStoreError,
+};
 use rupu_scm::{Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, RepoRef};
+use rupu_workspace::autoflow_claim_store::issue_key;
 use rupu_workspace::{
     ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
     AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
@@ -70,6 +74,32 @@ pub enum Action {
         /// Idle sleep between reconciliation passes, for example `10s`.
         #[arg(long, default_value = "10s")]
         idle_sleep: String,
+    },
+    /// Inspect queued and recently processed wakes.
+    Wakes(RepoFilterArgs),
+    /// Explain the current autonomous state for one issue.
+    Explain { r#ref: String },
+    /// Run consistency checks across claims, wakes, and runs.
+    Doctor(RepoFilterArgs),
+    /// Apply safe, bounded remediation to one issue claim.
+    Repair {
+        r#ref: String,
+        /// Explicitly release the claim after repair.
+        #[arg(long)]
+        release: bool,
+        /// Explicitly enqueue a follow-up wake after repair.
+        #[arg(long)]
+        requeue: bool,
+    },
+    /// Enqueue one manual wake for an issue.
+    Requeue {
+        r#ref: String,
+        /// Override the synthetic event id.
+        #[arg(long)]
+        event: Option<String>,
+        /// Delay wake visibility by a relative duration like `10m`.
+        #[arg(long)]
+        not_before: Option<String>,
     },
     /// Summarize persisted autoflow claim state.
     Status(RepoFilterArgs),
@@ -217,6 +247,19 @@ async fn handle_with_resolver(
             worker,
             idle_sleep,
         } => serve(repo.as_deref(), worker.as_deref(), &idle_sleep, resolver).await,
+        Action::Wakes(args) => wakes(args.repo.as_deref()).await,
+        Action::Explain { r#ref } => explain(&r#ref).await,
+        Action::Doctor(args) => doctor(args.repo.as_deref()).await,
+        Action::Repair {
+            r#ref,
+            release,
+            requeue,
+        } => repair(&r#ref, release, requeue).await,
+        Action::Requeue {
+            r#ref,
+            event,
+            not_before,
+        } => requeue(&r#ref, event.as_deref(), not_before.as_deref()).await,
         Action::Status(args) => status(args.repo.as_deref()).await,
         Action::Claims(args) => claims(args.repo.as_deref()).await,
         Action::Release { r#ref } => release(&r#ref).await,
@@ -501,6 +544,449 @@ async fn serve(
     Ok(())
 }
 
+async fn wakes(repo: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let repo_filter = normalize_repo_filter(repo)?;
+    let store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+    let queued = filter_wakes_by_repo(store.list_queued()?, repo_filter.as_deref());
+    let mut processed = filter_wakes_by_repo(store.list_processed()?, repo_filter.as_deref());
+    processed.sort_by(|left, right| {
+        right
+            .received_at
+            .cmp(&left.received_at)
+            .then_with(|| right.wake_id.cmp(&left.wake_id))
+    });
+    let recent_processed = processed.into_iter().take(10).collect::<Vec<_>>();
+
+    if queued.is_empty() && recent_processed.is_empty() {
+        println!("(no autoflow wakes)");
+        return Ok(());
+    }
+
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec![
+        "Wake",
+        "State",
+        "Source",
+        "Event",
+        "Entity",
+        "Not Before",
+        "Repo",
+    ]);
+    for wake in queued {
+        table.add_row(wake_row(&wake, "queued"));
+    }
+    for wake in recent_processed {
+        table.add_row(wake_row(&wake, "processed"));
+    }
+    println!("{table}");
+    Ok(())
+}
+
+async fn explain(r#ref: &str) -> anyhow::Result<()> {
+    let issue_ref = canonical_issue_ref(r#ref)?;
+    let global = paths::global_dir()?;
+    let claim_store = AutoflowClaimStore {
+        root: paths::autoflow_claims_dir(&global),
+    };
+    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+    let run_store = RunStore::new(global.join("runs"));
+    let claim = claim_store.load(&issue_ref)?;
+    let repo_ref = match claim.as_ref() {
+        Some(claim) => claim.repo_ref.clone(),
+        None => issue_ref_to_repo_ref(&issue_ref)
+            .map_err(|error| anyhow!("resolve repo ref for `{issue_ref}`: {error}"))?,
+    };
+    let queued = wakes_for_issue(
+        filter_wakes_by_repo(wake_store.list_queued()?, Some(&repo_ref)),
+        &issue_ref,
+    );
+    let mut processed = wakes_for_issue(
+        filter_wakes_by_repo(wake_store.list_processed()?, Some(&repo_ref)),
+        &issue_ref,
+    );
+    processed.sort_by(|left, right| right.received_at.cmp(&left.received_at));
+
+    println!("issue: {issue_ref}");
+    println!("repo: {repo_ref}");
+    match claim {
+        Some(claim) => {
+            println!("workflow: {}", claim.workflow);
+            println!("status: {}", status_name(claim.status));
+            println!(
+                "priority: {}",
+                selected_priority(&claim)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into())
+            );
+            println!("contenders: {}", format_contenders(&claim.contenders));
+            println!(
+                "workspace: {}",
+                claim.worktree_path.as_deref().unwrap_or("-")
+            );
+            println!("branch: {}", claim.branch.as_deref().unwrap_or("-"));
+            println!(
+                "claim owner: {}",
+                claim.claim_owner.as_deref().unwrap_or("-")
+            );
+            println!(
+                "lease expires: {}",
+                claim.lease_expires_at.as_deref().unwrap_or("-")
+            );
+            if let Some(lock) = claim_store.read_active_lock(&issue_ref)? {
+                println!(
+                    "active lock: owner={} acquired_at={} lease_expires={}",
+                    lock.owner,
+                    lock.acquired_at,
+                    lock.lease_expires_at.as_deref().unwrap_or("-")
+                );
+            } else {
+                println!("active lock: -");
+            }
+            if let Some(run_id) = claim.last_run_id.as_deref() {
+                println!("last run: {run_id}");
+                match run_store.load(run_id) {
+                    Ok(run) => {
+                        println!("last run status: {}", run.status.as_str());
+                        println!(
+                            "last run backend: {}",
+                            run.backend_id.as_deref().unwrap_or("-")
+                        );
+                        println!(
+                            "last run worker: {}",
+                            run.worker_id.as_deref().unwrap_or("-")
+                        );
+                        if let Some(source_wake_id) = run.source_wake_id.as_deref() {
+                            println!("source wake: {}", describe_wake_source(&global, &wake_store, source_wake_id));
+                        }
+                        if run.status == RunStatus::AwaitingApproval {
+                            println!(
+                                "approval gate: step={} expires={}",
+                                run.awaiting_step_id.as_deref().unwrap_or("-"),
+                                run.expires_at
+                                    .map(|value| value.to_rfc3339())
+                                    .unwrap_or_else(|| "-".into())
+                            );
+                        }
+                    }
+                    Err(error) => println!("last run status: missing ({error})"),
+                }
+            } else {
+                println!("last run: -");
+            }
+            println!(
+                "next action: {}",
+                next_action_summary(&claim)
+            );
+            if let Some(dispatch) = &claim.pending_dispatch {
+                println!(
+                    "pending dispatch: {} target={} inputs={}",
+                    dispatch.workflow,
+                    dispatch.target,
+                    format_inputs(&dispatch.inputs)
+                );
+            }
+            if let Some(next_retry_at) = claim.next_retry_at.as_deref() {
+                println!("next retry: {next_retry_at}");
+            }
+            if let Some(summary) = claim.last_summary.as_deref() {
+                println!("summary: {summary}");
+            }
+        }
+        None => {
+            println!("status: unclaimed");
+        }
+    }
+
+    if queued.is_empty() {
+        println!("queued wakes: -");
+    } else {
+        println!("queued wakes:");
+        for wake in queued {
+            println!(
+                "- {} {} {} not_before={}",
+                wake.wake_id,
+                wake_source_name(wake.source),
+                wake.event.id,
+                wake.not_before
+            );
+        }
+    }
+    if let Some(wake) = processed.first() {
+        println!(
+            "recent processed wake: {} {} {}",
+            wake.wake_id,
+            wake_source_name(wake.source),
+            wake.event.id
+        );
+    }
+    Ok(())
+}
+
+async fn doctor(repo: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let repo_filter = normalize_repo_filter(repo)?;
+    let repo_store = RepoRegistryStore {
+        root: paths::repos_dir(&global),
+    };
+    let claim_store = AutoflowClaimStore {
+        root: paths::autoflow_claims_dir(&global),
+    };
+    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+    let run_store = RunStore::new(global.join("runs"));
+    let mut findings = Vec::new();
+    let claims = filter_claims_by_repo(claim_store.list()?, repo_filter.as_deref());
+    let queued_wakes = filter_wakes_by_repo(wake_store.list_queued()?, repo_filter.as_deref());
+
+    for claim in &claims {
+        if repo_store.load(&claim.repo_ref)?.is_none() {
+            findings.push(DoctorFinding::new(
+                &claim.issue_ref,
+                "missing_repo_binding",
+                format!("repo `{}` is not tracked", claim.repo_ref),
+            ));
+        }
+        if !matches!(claim.status, ClaimStatus::Complete | ClaimStatus::Released)
+            && claim
+                .worktree_path
+                .as_deref()
+                .is_some_and(|path| !Path::new(path).exists())
+        {
+            findings.push(DoctorFinding::new(
+                &claim.issue_ref,
+                "missing_worktree",
+                format!(
+                    "workspace path `{}` does not exist",
+                    claim.worktree_path.as_deref().unwrap_or("-")
+                ),
+            ));
+        }
+        if let Some(manifest_path) = claim.artifact_manifest_path.as_deref() {
+            if !Path::new(manifest_path).exists() {
+                findings.push(DoctorFinding::new(
+                    &claim.issue_ref,
+                    "artifact_missing",
+                    format!("artifact manifest `{manifest_path}` does not exist"),
+                ));
+            }
+        }
+        if let Some(run_id) = claim.last_run_id.as_deref() {
+            match run_store.load(run_id) {
+                Ok(run) => {
+                    if run.issue_ref.as_deref() != Some(claim.issue_ref.as_str()) {
+                        findings.push(DoctorFinding::new(
+                            &claim.issue_ref,
+                            "claim_run_mismatch",
+                            format!(
+                                "run `{run_id}` is bound to `{}`",
+                                run.issue_ref.as_deref().unwrap_or("-")
+                            ),
+                        ));
+                    }
+                    if run.workflow_name != claim.workflow && claim.pending_dispatch.is_none() {
+                        findings.push(DoctorFinding::new(
+                            &claim.issue_ref,
+                            "claim_run_mismatch",
+                            format!(
+                                "claim workflow `{}` disagrees with run workflow `{}`",
+                                claim.workflow, run.workflow_name
+                            ),
+                        ));
+                    }
+                }
+                Err(error) => findings.push(DoctorFinding::new(
+                    &claim.issue_ref,
+                    "missing_run",
+                    format!("last run `{run_id}` could not be loaded: {error}"),
+                )),
+            }
+        }
+        let lock_path = claim_store.root.join(issue_key(&claim.issue_ref)).join(".lock");
+        if lock_path.exists() {
+            match claim_store.read_active_lock(&claim.issue_ref) {
+                Ok(Some(lock)) if claim.status != ClaimStatus::Running => findings.push(
+                    DoctorFinding::new(
+                        &claim.issue_ref,
+                        "stale_lock",
+                        format!(
+                            "active lock owned by `{}` remains while claim status is `{}`",
+                            lock.owner,
+                            status_name(claim.status)
+                        ),
+                    ),
+                ),
+                Err(error) => findings.push(DoctorFinding::new(
+                    &claim.issue_ref,
+                    "stale_lock",
+                    format!("active lock is unreadable: {error}"),
+                )),
+                _ => {}
+            }
+        }
+    }
+
+    for entry in std::fs::read_dir(&claim_store.root).into_iter().flatten().flatten() {
+        let issue_dir = entry.path();
+        let lock_path = issue_dir.join(".lock");
+        let claim_path = issue_dir.join("claim.toml");
+        if lock_path.is_file() && !claim_path.is_file() {
+            findings.push(DoctorFinding::new(
+                issue_dir
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("unknown"),
+                "stale_lock",
+                format!("orphan active lock `{}` has no claim.toml", lock_path.display()),
+            ));
+        }
+    }
+
+    for wake in &queued_wakes {
+        if let Some(problem) = invalid_wake_payload_detail(&wake_store, wake) {
+            findings.push(DoctorFinding::new(
+                &wake.entity.ref_text,
+                "invalid_wake_payload",
+                format!("wake `{}` {problem}", wake.wake_id),
+            ));
+        }
+    }
+
+    if findings.is_empty() {
+        println!("autoflow doctor: ok");
+        return Ok(());
+    }
+
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["Scope", "Problem", "Detail"]);
+    for finding in findings {
+        table.add_row(vec![
+            Cell::new(finding.scope),
+            Cell::new(finding.kind),
+            Cell::new(finding.detail),
+        ]);
+    }
+    println!("{table}");
+    Ok(())
+}
+
+async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::Result<()> {
+    if release && requeue_requested {
+        bail!("repair accepts at most one of `--release` or `--requeue`");
+    }
+
+    let issue_ref = canonical_issue_ref(r#ref)?;
+    let global = paths::global_dir()?;
+    let repo_store = RepoRegistryStore {
+        root: paths::repos_dir(&global),
+    };
+    let claim_store = AutoflowClaimStore {
+        root: paths::autoflow_claims_dir(&global),
+    };
+    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+    let Some(mut claim) = claim_store.load(&issue_ref)? else {
+        bail!("no autoflow claim for `{issue_ref}`");
+    };
+
+    let mut repairs = Vec::new();
+    let queued = wakes_for_issue(
+        filter_wakes_by_repo(wake_store.list_queued()?, Some(&claim.repo_ref)),
+        &issue_ref,
+    );
+    for wake in queued {
+        if invalid_wake_payload_detail(&wake_store, &wake).is_some() {
+            wake_store.delete(&wake.wake_id)?;
+            repairs.push(format!("deleted invalid queued wake {}", wake.wake_id));
+        }
+    }
+
+    if !release
+        && claim
+            .worktree_path
+            .as_deref()
+            .zip(claim.branch.as_deref())
+            .is_some_and(|(path, _)| !Path::new(path).exists())
+    {
+        let tracked = repo_store
+            .load(&claim.repo_ref)?
+            .ok_or_else(|| anyhow!("repo `{}` is not tracked", claim.repo_ref))?;
+        let branch = claim.branch.clone().unwrap_or_else(|| format!("rupu/{}", issue_dir_name(&claim.issue_ref)));
+        let worktree = ensure_issue_worktree(
+            Path::new(&tracked.preferred_path),
+            &paths::autoflow_worktrees_dir(&global),
+            &claim.repo_ref,
+            &claim.issue_ref,
+            &branch,
+            Some("HEAD"),
+        )?;
+        claim.worktree_path = Some(worktree.path.display().to_string());
+        claim.branch = Some(branch);
+        claim.updated_at = chrono::Utc::now().to_rfc3339();
+        claim_store.save(&claim)?;
+        repairs.push(format!(
+            "rebuilt worktree {}",
+            claim.worktree_path.as_deref().unwrap_or("-")
+        ));
+    }
+
+    if release {
+        cleanup_claim_artifacts(&repo_store, &claim)?;
+        claim_store.delete(&issue_ref)?;
+        repairs.push(format!("released claim {issue_ref}"));
+    } else if requeue_requested {
+        let wake = enqueue_issue_wake(
+            &wake_store,
+            WakeSource::Repair,
+            &claim.repo_ref,
+            &issue_ref,
+            "autoflow.repair.requeue",
+            chrono::Utc::now(),
+        )?;
+        repairs.push(format!("queued repair wake {}", wake.wake_id));
+    }
+
+    if repairs.is_empty() {
+        println!("no repairs applied for {issue_ref}");
+    } else {
+        println!("repaired {issue_ref}:");
+        for repair in repairs {
+            println!("- {repair}");
+        }
+    }
+    Ok(())
+}
+
+async fn requeue(r#ref: &str, event: Option<&str>, not_before: Option<&str>) -> anyhow::Result<()> {
+    let issue_ref = canonical_issue_ref(r#ref)?;
+    let global = paths::global_dir()?;
+    let claim_store = AutoflowClaimStore {
+        root: paths::autoflow_claims_dir(&global),
+    };
+    let repo_ref = claim_store
+        .load(&issue_ref)?
+        .map(|claim| claim.repo_ref)
+        .unwrap_or_else(|| issue_ref_to_repo_ref(&issue_ref).unwrap_or_else(|_| "-".into()));
+    if repo_ref == "-" {
+        bail!("could not resolve repo for `{issue_ref}`");
+    }
+    let when = match not_before {
+        Some(value) => chrono::Utc::now() + parse_duration(value)?,
+        None => chrono::Utc::now(),
+    };
+    let wake = enqueue_issue_wake(
+        &WakeStore::new(paths::autoflow_wakes_dir(&global)),
+        WakeSource::Manual,
+        &repo_ref,
+        &issue_ref,
+        event.unwrap_or("autoflow.manual.requeue"),
+        when,
+    )?;
+    println!(
+        "queued {} for {} not_before={}",
+        wake.wake_id, issue_ref, wake.not_before
+    );
+    Ok(())
+}
+
 async fn status(repo: Option<&str>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = AutoflowClaimStore {
@@ -663,6 +1149,148 @@ fn filter_claims_by_repo(
             .filter(|claim| claim.repo_ref == repo_ref)
             .collect(),
         None => claims,
+    }
+}
+
+fn filter_wakes_by_repo(wakes: Vec<WakeRecord>, repo_filter: Option<&str>) -> Vec<WakeRecord> {
+    match repo_filter {
+        Some(repo_ref) => wakes
+            .into_iter()
+            .filter(|wake| wake.repo_ref == repo_ref)
+            .collect(),
+        None => wakes,
+    }
+}
+
+fn wakes_for_issue(wakes: Vec<WakeRecord>, issue_ref: &str) -> Vec<WakeRecord> {
+    wakes
+        .into_iter()
+        .filter(|wake| {
+            wake.entity.kind == WakeEntityKind::Issue && wake.entity.ref_text == issue_ref
+        })
+        .collect()
+}
+
+fn wake_row(wake: &WakeRecord, state: &str) -> Vec<Cell> {
+    vec![
+        Cell::new(wake.wake_id.clone()),
+        Cell::new(state),
+        Cell::new(wake_source_name(wake.source)),
+        Cell::new(wake.event.id.clone()),
+        Cell::new(wake.entity.ref_text.clone()),
+        Cell::new(wake.not_before.clone()),
+        Cell::new(wake.repo_ref.clone()),
+    ]
+}
+
+fn wake_source_name(source: WakeSource) -> &'static str {
+    match source {
+        WakeSource::Manual => "manual",
+        WakeSource::CronPoll => "cron_poll",
+        WakeSource::Webhook => "webhook",
+        WakeSource::AutoflowDispatch => "dispatch",
+        WakeSource::Retry => "retry",
+        WakeSource::ApprovalResume => "approval_resume",
+        WakeSource::Repair => "repair",
+    }
+}
+
+fn issue_ref_to_repo_ref(issue_ref: &str) -> anyhow::Result<String> {
+    let issue = parse_issue_ref_text(issue_ref)?;
+    Ok(format!("{}:{}", issue.tracker, issue.project))
+}
+
+fn format_inputs(inputs: &BTreeMap<String, String>) -> String {
+    if inputs.is_empty() {
+        return "-".into();
+    }
+    inputs
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn describe_wake_source(global: &Path, wake_store: &WakeStore, wake_id: &str) -> String {
+    match wake_store.load(wake_id) {
+        Ok(wake) => {
+            let state = if paths::autoflow_wake_queue_dir(global)
+                .join(format!("{wake_id}.json"))
+                .is_file()
+            {
+                "queued"
+            } else if paths::autoflow_wake_processed_dir(global)
+                .join(format!("{wake_id}.json"))
+                .is_file()
+            {
+                "processed"
+            } else {
+                "unknown"
+            };
+            format!(
+                "{wake_id} [{state}] {} {}",
+                wake_source_name(wake.source),
+                wake.event.id
+            )
+        }
+        Err(error) => format!("{wake_id} (missing: {error})"),
+    }
+}
+
+fn invalid_wake_payload_detail(wake_store: &WakeStore, wake: &WakeRecord) -> Option<String> {
+    let payload_ref = wake.payload_ref.as_ref()?;
+    if !payload_ref.is_file() {
+        return Some(format!(
+            "references missing payload `{}`",
+            payload_ref.display()
+        ));
+    }
+    match wake_store.read_payload(&wake.wake_id) {
+        Ok(_) => None,
+        Err(error) => Some(format!("has unreadable payload: {error}")),
+    }
+}
+
+fn enqueue_issue_wake(
+    wake_store: &WakeStore,
+    source: WakeSource,
+    repo_ref: &str,
+    issue_ref: &str,
+    event_id: &str,
+    not_before: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<WakeRecord> {
+    Ok(wake_store.enqueue(WakeEnqueueRequest {
+        source,
+        repo_ref: repo_ref.to_string(),
+        entity: WakeEntity {
+            kind: WakeEntityKind::Issue,
+            ref_text: issue_ref.to_string(),
+        },
+        event: WakeEvent {
+            id: event_id.to_string(),
+            delivery_id: None,
+            dedupe_key: None,
+        },
+        payload: None,
+        received_at: chrono::Utc::now().to_rfc3339(),
+        not_before: not_before.to_rfc3339(),
+    })?)
+}
+
+#[derive(Debug)]
+struct DoctorFinding {
+    scope: String,
+    kind: &'static str,
+    detail: String,
+}
+
+impl DoctorFinding {
+    fn new(scope: impl Into<String>, kind: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            scope: scope.into(),
+            kind,
+            detail: detail.into(),
+        }
     }
 }
 

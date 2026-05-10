@@ -294,6 +294,28 @@ rupu autoflow serve --repo github:your-org/your-repo --worker laptop-01
 
 Use event or webhook wakeups only after the autonomous loop is stable on periodic ticks. Webhook mode still feeds back into the same autoflow runtime; it shortens wakeup latency but does not replace the periodic reconciliation loop. If you run `rupu webhook serve` from outside a repo checkout, attach the repo first so tracked repo workflows remain visible to the receiver.
 
+### Operator recovery workflow
+
+When an autonomous issue looks stuck, keep the operator loop narrow and deterministic:
+
+```sh
+rupu autoflow status --repo github:your-org/your-repo
+rupu autoflow wakes --repo github:your-org/your-repo
+rupu autoflow explain github:your-org/your-repo/issues/42
+rupu autoflow doctor --repo github:your-org/your-repo
+rupu autoflow repair github:your-org/your-repo/issues/42
+rupu autoflow requeue github:your-org/your-repo/issues/42 --event github.issue.reopened --not-before 5m
+```
+
+Use the tools in that order:
+
+- `status` tells you whether the repo is generally healthy or blocked on a few issues
+- `wakes` shows whether the issue is actually queued for another pass
+- `explain` gives the exact claim, run, wake, and dispatch context for one issue
+- `doctor` surfaces state mismatches before you mutate anything
+- `repair` applies bounded fixes such as rebuilding a missing worktree or dropping a broken queued wake
+- `requeue` asks for one more pass without waiting for the next natural wake source
+
 ---
 
 ## Why this decomposition is better than one giant autonomous workflow

@@ -211,6 +211,11 @@ rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
 rupu autoflow tick
 rupu autoflow serve --repo github:your-org/your-repo
 rupu autoflow serve --repo github:your-org/your-repo --worker team-mini-01
+rupu autoflow wakes --repo github:your-org/your-repo
+rupu autoflow explain github:your-org/your-repo/issues/42
+rupu autoflow doctor --repo github:your-org/your-repo
+rupu autoflow repair github:your-org/your-repo/issues/42
+rupu autoflow requeue github:your-org/your-repo/issues/42 --event github.issue.reopened --not-before 10m
 rupu autoflow status
 rupu autoflow status --repo github:your-org/your-repo
 rupu autoflow claims
@@ -320,6 +325,25 @@ Two useful shapes:
 - direct autoflow: owns one issue phase directly and returns `await_human` or `complete`
 
 See [workflow-format.md](workflow-format.md) for the `autoflow:` and `contracts:` schema and [examples/README.md](../examples/README.md) for copyable controller and direct examples.
+
+Operator recovery loop:
+
+- `rupu autoflow wakes --repo ...` shows queued vs recently processed wakes
+- `rupu autoflow explain <issue-ref>` shows the claim, last run, selected workflow, queued wakes, and pending dispatch for one issue
+- `rupu autoflow doctor --repo ...` scans for mismatched claim/run state, missing worktrees, missing repo bindings, stale locks, and invalid queued wake payloads
+- `rupu autoflow repair <issue-ref>` applies safe repairs such as rebuilding a missing worktree or dropping invalid queued wakes
+- `rupu autoflow requeue <issue-ref>` injects one manual wake when an operator wants another reconciliation pass without waiting for the next external event
+
+Typical operator session:
+
+```sh
+rupu autoflow status --repo github:your-org/your-repo
+rupu autoflow wakes --repo github:your-org/your-repo
+rupu autoflow explain github:your-org/your-repo/issues/42
+rupu autoflow doctor --repo github:your-org/your-repo
+rupu autoflow repair github:your-org/your-repo/issues/42
+rupu autoflow requeue github:your-org/your-repo/issues/42 --event github.issue.reopened --not-before 5m
+```
 
 Deployment modes:
 
