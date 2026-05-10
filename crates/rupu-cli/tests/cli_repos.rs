@@ -3,6 +3,8 @@
 //! These tests mutate process-global state (`RUPU_HOME`). Hold
 //! `ENV_LOCK` for the whole body of every test to serialize them.
 
+use assert_cmd::Command;
+use predicates::prelude::*;
 use tokio::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -107,4 +109,51 @@ async fn repos_prefer_switches_preferred_path() {
         repo_b.canonicalize().unwrap().display().to_string()
     );
     assert_eq!(tracked.known_paths.len(), 2);
+}
+
+#[tokio::test]
+async fn repos_tracked_supports_global_json_and_csv_output() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let repo = tmp.path().join("repo");
+    init_git_checkout(&repo, "git@github.com:Section9Labs/rupu.git");
+    std::env::set_var("RUPU_HOME", &home);
+
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "repos".into(),
+        "attach".into(),
+        "github:Section9Labs/rupu".into(),
+        repo.display().to_string(),
+    ])
+    .await;
+    assert_eq!(exit, std::process::ExitCode::from(0));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["--format", "json", "repos", "tracked"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"kind\": \"tracked_repos\""))
+        .stdout(predicate::str::contains(
+            "\"repo\": \"github:Section9Labs/rupu\"",
+        ));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["--format", "csv", "repos", "tracked"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "repo,preferred_path,known_paths,default_branch",
+        ))
+        .stdout(predicate::str::contains("github:Section9Labs/rupu"));
+
+    std::env::remove_var("RUPU_HOME");
 }

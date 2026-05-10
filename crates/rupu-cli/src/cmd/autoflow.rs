@@ -31,6 +31,7 @@ use rupu_workspace::{
     ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
     AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
 };
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -224,9 +225,86 @@ impl WakeHints {
     }
 }
 
-pub async fn handle(action: Action) -> ExitCode {
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowListRow {
+    name: String,
+    scope: String,
+    entity: String,
+    priority: i32,
+    repo: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowListReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<AutoflowListRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowWakeRow {
+    wake_id: String,
+    state: String,
+    source: String,
+    event: String,
+    entity: String,
+    not_before: String,
+    repo: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowWakesReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<AutoflowWakeRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowStatusRow {
+    status: String,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowContestedRow {
+    issue: String,
+    contenders: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowStatusReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<AutoflowStatusRow>,
+    contested: Vec<AutoflowContestedRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowClaimRow {
+    issue: String,
+    workflow: String,
+    priority: String,
+    status: String,
+    next: String,
+    pr: String,
+    summary: String,
+    contenders: String,
+    workspace: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowClaimsReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<AutoflowClaimRow>,
+}
+
+pub async fn handle(
+    action: Action,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> ExitCode {
     let resolver: Arc<dyn CredentialResolver> = Arc::new(KeychainResolver::new());
-    let result = handle_with_resolver(action, resolver).await;
+    let result = handle_with_resolver(action, resolver, global_format).await;
     match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => crate::output::diag::fail(e),
@@ -236,9 +314,10 @@ pub async fn handle(action: Action) -> ExitCode {
 async fn handle_with_resolver(
     action: Action,
     resolver: Arc<dyn CredentialResolver>,
+    global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
     match action {
-        Action::List(args) => list(args.repo.as_deref()).await,
+        Action::List(args) => list(args.repo.as_deref(), global_format).await,
         Action::Show { name, repo } => show(&name, repo.as_deref()).await,
         Action::Run { name, target, mode } => run(&name, &target, mode.as_deref(), resolver).await,
         Action::Tick => tick_with_resolver(resolver).await,
@@ -247,7 +326,7 @@ async fn handle_with_resolver(
             worker,
             idle_sleep,
         } => serve(repo.as_deref(), worker.as_deref(), &idle_sleep, resolver).await,
-        Action::Wakes(args) => wakes(args.repo.as_deref()).await,
+        Action::Wakes(args) => wakes(args.repo.as_deref(), global_format).await,
         Action::Explain { r#ref } => explain(&r#ref).await,
         Action::Doctor(args) => doctor(args.repo.as_deref()).await,
         Action::Repair {
@@ -260,13 +339,16 @@ async fn handle_with_resolver(
             event,
             not_before,
         } => requeue(&r#ref, event.as_deref(), not_before.as_deref()).await,
-        Action::Status(args) => status(args.repo.as_deref()).await,
-        Action::Claims(args) => claims(args.repo.as_deref()).await,
+        Action::Status(args) => status(args.repo.as_deref(), global_format).await,
+        Action::Claims(args) => claims(args.repo.as_deref(), global_format).await,
         Action::Release { r#ref } => release(&r#ref).await,
     }
 }
 
-async fn list(repo: Option<&str>) -> anyhow::Result<()> {
+async fn list(
+    repo: Option<&str>,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
     let repo_filter = normalize_repo_filter(repo)?;
     let entries = visible_autoflows()?;
     let entries = filter_visible_autoflows(entries, repo_filter.as_deref());
@@ -274,21 +356,56 @@ async fn list(repo: Option<&str>) -> anyhow::Result<()> {
         println!("(no autoflows)");
         return Ok(());
     }
+    let rows = entries
+        .iter()
+        .map(|entry| {
+            let autoflow = entry.autoflow()?;
+            Ok(AutoflowListRow {
+                name: entry.name.clone(),
+                scope: entry.scope.clone(),
+                entity: match autoflow.entity {
+                    rupu_orchestrator::AutoflowEntity::Issue => "issue".into(),
+                },
+                priority: autoflow.priority,
+                repo: entry.repo_ref.clone().unwrap_or_else(|| "-".into()),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let format =
+        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
+    crate::output::formats::ensure_supported(
+        "rupu autoflow list",
+        format,
+        &[
+            crate::output::formats::OutputFormat::Table,
+            crate::output::formats::OutputFormat::Json,
+            crate::output::formats::OutputFormat::Csv,
+        ],
+    )?;
+    if format != crate::output::formats::OutputFormat::Table {
+        let report = AutoflowListReport {
+            kind: "autoflow_list",
+            version: 1,
+            rows,
+        };
+        return match format {
+            crate::output::formats::OutputFormat::Json => {
+                crate::output::formats::print_json(&report)
+            }
+            crate::output::formats::OutputFormat::Csv => {
+                crate::output::formats::print_csv_rows(&report.rows)
+            }
+            crate::output::formats::OutputFormat::Table => Ok(()),
+        };
+    }
     println!(
         "{:<28} {:<8} {:<8} {:<8} REPO",
         "NAME", "SCOPE", "ENTITY", "PRIORITY"
     );
-    for entry in entries {
-        let autoflow = entry.autoflow()?;
+    for row in rows {
         println!(
             "{:<28} {:<8} {:<8} {:<8} {}",
-            entry.name,
-            entry.scope,
-            match autoflow.entity {
-                rupu_orchestrator::AutoflowEntity::Issue => "issue",
-            },
-            autoflow.priority,
-            entry.repo_ref.as_deref().unwrap_or("-")
+            row.name, row.scope, row.entity, row.priority, row.repo
         );
     }
     Ok(())
@@ -544,7 +661,10 @@ async fn serve(
     Ok(())
 }
 
-async fn wakes(repo: Option<&str>) -> anyhow::Result<()> {
+async fn wakes(
+    repo: Option<&str>,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let repo_filter = normalize_repo_filter(repo)?;
     let store = WakeStore::new(paths::autoflow_wakes_dir(&global));
@@ -562,6 +682,54 @@ async fn wakes(repo: Option<&str>) -> anyhow::Result<()> {
         println!("(no autoflow wakes)");
         return Ok(());
     }
+    let mut rows = queued
+        .into_iter()
+        .map(|wake| AutoflowWakeRow {
+            wake_id: wake.wake_id,
+            state: "queued".into(),
+            source: wake_source_name(wake.source).into(),
+            event: wake.event.id,
+            entity: wake.entity.ref_text,
+            not_before: wake.not_before,
+            repo: wake.repo_ref,
+        })
+        .collect::<Vec<_>>();
+    rows.extend(recent_processed.into_iter().map(|wake| AutoflowWakeRow {
+        wake_id: wake.wake_id,
+        state: "processed".into(),
+        source: wake_source_name(wake.source).into(),
+        event: wake.event.id,
+        entity: wake.entity.ref_text,
+        not_before: wake.not_before,
+        repo: wake.repo_ref,
+    }));
+    let format =
+        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
+    crate::output::formats::ensure_supported(
+        "rupu autoflow wakes",
+        format,
+        &[
+            crate::output::formats::OutputFormat::Table,
+            crate::output::formats::OutputFormat::Json,
+            crate::output::formats::OutputFormat::Csv,
+        ],
+    )?;
+    if format != crate::output::formats::OutputFormat::Table {
+        let report = AutoflowWakesReport {
+            kind: "autoflow_wakes",
+            version: 1,
+            rows,
+        };
+        return match format {
+            crate::output::formats::OutputFormat::Json => {
+                crate::output::formats::print_json(&report)
+            }
+            crate::output::formats::OutputFormat::Csv => {
+                crate::output::formats::print_csv_rows(&report.rows)
+            }
+            crate::output::formats::OutputFormat::Table => Ok(()),
+        };
+    }
 
     let mut table = crate::output::tables::new_table();
     table.set_header(vec![
@@ -573,11 +741,16 @@ async fn wakes(repo: Option<&str>) -> anyhow::Result<()> {
         "Not Before",
         "Repo",
     ]);
-    for wake in queued {
-        table.add_row(wake_row(&wake, "queued"));
-    }
-    for wake in recent_processed {
-        table.add_row(wake_row(&wake, "processed"));
+    for row in rows {
+        table.add_row(vec![
+            Cell::new(row.wake_id),
+            Cell::new(row.state),
+            Cell::new(row.source),
+            Cell::new(row.event),
+            Cell::new(row.entity),
+            Cell::new(row.not_before),
+            Cell::new(row.repo),
+        ]);
     }
     println!("{table}");
     Ok(())
@@ -1000,7 +1173,10 @@ async fn requeue(r#ref: &str, event: Option<&str>, not_before: Option<&str>) -> 
     Ok(())
 }
 
-async fn status(repo: Option<&str>) -> anyhow::Result<()> {
+async fn status(
+    repo: Option<&str>,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
@@ -1015,28 +1191,66 @@ async fn status(repo: Option<&str>) -> anyhow::Result<()> {
         println!("(no autoflow claims)");
         return Ok(());
     }
-    println!("{:<16} COUNT", "STATUS");
-    for (status, count) in counts {
-        println!("{status:<16} {count}");
-    }
+    let rows = counts
+        .into_iter()
+        .map(|(status, count)| AutoflowStatusRow {
+            status: status.into(),
+            count,
+        })
+        .collect::<Vec<_>>();
     let contested = claims
         .iter()
         .filter(|claim| claim.contenders.len() > 1)
+        .map(|claim| AutoflowContestedRow {
+            issue: claim.issue_ref.clone(),
+            contenders: format_contenders(&claim.contenders),
+        })
         .collect::<Vec<_>>();
+    let format =
+        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
+    crate::output::formats::ensure_supported(
+        "rupu autoflow status",
+        format,
+        &[
+            crate::output::formats::OutputFormat::Table,
+            crate::output::formats::OutputFormat::Json,
+            crate::output::formats::OutputFormat::Csv,
+        ],
+    )?;
+    if format != crate::output::formats::OutputFormat::Table {
+        let report = AutoflowStatusReport {
+            kind: "autoflow_status",
+            version: 1,
+            rows,
+            contested,
+        };
+        return match format {
+            crate::output::formats::OutputFormat::Json => {
+                crate::output::formats::print_json(&report)
+            }
+            crate::output::formats::OutputFormat::Csv => {
+                crate::output::formats::print_csv_rows(&report.rows)
+            }
+            crate::output::formats::OutputFormat::Table => Ok(()),
+        };
+    }
+    println!("{:<16} COUNT", "STATUS");
+    for row in &rows {
+        println!("{:<16} {}", row.status, row.count);
+    }
     if !contested.is_empty() {
         println!("\ncontested issues:");
         for claim in contested {
-            println!(
-                "- {} -> {}",
-                claim.issue_ref,
-                format_contenders(&claim.contenders)
-            );
+            println!("- {} -> {}", claim.issue, claim.contenders);
         }
     }
     Ok(())
 }
 
-async fn claims(repo: Option<&str>) -> anyhow::Result<()> {
+async fn claims(
+    repo: Option<&str>,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
@@ -1046,6 +1260,49 @@ async fn claims(repo: Option<&str>) -> anyhow::Result<()> {
     if claims.is_empty() {
         println!("(no autoflow claims)");
         return Ok(());
+    }
+    let rows = claims
+        .iter()
+        .map(|claim| AutoflowClaimRow {
+            issue: claim.issue_ref.clone(),
+            workflow: claim.workflow.clone(),
+            priority: selected_priority(claim)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            status: status_name(claim.status).into(),
+            next: next_action_summary(claim),
+            pr: claim.pr_url.clone().unwrap_or_else(|| "-".into()),
+            summary: claim_summary(claim),
+            contenders: format_contenders(&claim.contenders),
+            workspace: claim.worktree_path.clone().unwrap_or_else(|| "-".into()),
+        })
+        .collect::<Vec<_>>();
+    let format =
+        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
+    crate::output::formats::ensure_supported(
+        "rupu autoflow claims",
+        format,
+        &[
+            crate::output::formats::OutputFormat::Table,
+            crate::output::formats::OutputFormat::Json,
+            crate::output::formats::OutputFormat::Csv,
+        ],
+    )?;
+    if format != crate::output::formats::OutputFormat::Table {
+        let report = AutoflowClaimsReport {
+            kind: "autoflow_claims",
+            version: 1,
+            rows,
+        };
+        return match format {
+            crate::output::formats::OutputFormat::Json => {
+                crate::output::formats::print_json(&report)
+            }
+            crate::output::formats::OutputFormat::Csv => {
+                crate::output::formats::print_csv_rows(&report.rows)
+            }
+            crate::output::formats::OutputFormat::Table => Ok(()),
+        };
     }
 
     let mut table = crate::output::tables::new_table();
@@ -1060,24 +1317,17 @@ async fn claims(repo: Option<&str>) -> anyhow::Result<()> {
         "Contenders",
         "Workspace",
     ]);
-    for claim in claims {
-        let priority = selected_priority(&claim)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".into());
-        let next = next_action_summary(&claim);
-        let pr = claim.pr_url.clone().unwrap_or_else(|| "-".into());
-        let summary = claim_summary(&claim);
-        let contenders = format_contenders(&claim.contenders);
+    for claim in rows {
         table.add_row(vec![
-            Cell::new(claim.issue_ref),
+            Cell::new(claim.issue),
             Cell::new(claim.workflow),
-            Cell::new(priority),
-            Cell::new(status_name(claim.status)),
-            Cell::new(next),
-            Cell::new(pr),
-            Cell::new(summary),
-            Cell::new(contenders),
-            Cell::new(claim.worktree_path.unwrap_or_else(|| "-".into())),
+            Cell::new(claim.priority),
+            Cell::new(claim.status),
+            Cell::new(claim.next),
+            Cell::new(claim.pr),
+            Cell::new(claim.summary),
+            Cell::new(claim.contenders),
+            Cell::new(claim.workspace),
         ]);
     }
     println!("{table}");
@@ -1182,18 +1432,6 @@ fn wakes_for_issue(wakes: Vec<WakeRecord>, issue_ref: &str) -> Vec<WakeRecord> {
             wake.entity.kind == WakeEntityKind::Issue && wake.entity.ref_text == issue_ref
         })
         .collect()
-}
-
-fn wake_row(wake: &WakeRecord, state: &str) -> Vec<Cell> {
-    vec![
-        Cell::new(wake.wake_id.clone()),
-        Cell::new(state),
-        Cell::new(wake_source_name(wake.source)),
-        Cell::new(wake.event.id.clone()),
-        Cell::new(wake.entity.ref_text.clone()),
-        Cell::new(wake.not_before.clone()),
-        Cell::new(wake.repo_ref.clone()),
-    ]
 }
 
 fn wake_source_name(source: WakeSource) -> &'static str {

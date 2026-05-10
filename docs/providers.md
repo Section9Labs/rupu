@@ -152,8 +152,8 @@ By design — `--all` iterates every provider × mode. Use `--provider <name>` (
 
 ## Deferred / future
 
-- `rupu usage` aggregation subcommand — captured per-response in JSONL transcripts; aggregate UI ships with Slice D.
+- Richer usage visualization / dashboards beyond `rupu usage` — per-response usage is captured in JSONL transcripts and joined with workflow-run metadata today; future work is higher-level visualization, not the base reporting command.
 - Local-model provider (Ollama / llama.cpp) — out of scope for Slice B-1; planned for a later slice.
-- Cost calculation in dollars — token counts only today; price tables ship with Slice D.
+- Cost accuracy enhancements — `rupu usage` reports USD from built-in/default pricing tables today; users with strict accounting needs should override provider/model pricing in config.
 - Cross-provider model aliases (e.g., `model: smart`) — not planned; explicit model names are clearer.
 - Vendor-specific model features (Anthropic prompt-cache toggles, OpenAI structured-output mode, Gemini grounding) — adapters expose them as opaque pass-through fields where natural; no first-class rupu surface yet.
