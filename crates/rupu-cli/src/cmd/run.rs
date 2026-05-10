@@ -8,11 +8,16 @@
 
 use crate::paths;
 use crate::provider_factory;
+use crate::standalone_run_metadata::{
+    metadata_path_for_run, write_metadata, StandaloneRunMetadata,
+};
 use clap::Args as ClapArgs;
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_agent::{load_agent, parse_mode, resolve_mode, PermissionDecision};
+use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, ToolContext};
 use std::io::IsTerminal;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tracing::warn;
@@ -261,6 +266,38 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         PermissionMode::Readonly => "readonly",
     };
 
+    let backend_id = "local_checkout".to_string();
+    let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
+    let issue_ref = standalone_issue_ref(run_target.as_ref());
+    let workspace_strategy =
+        standalone_workspace_strategy(run_target.as_ref(), &workspace_path, args.tmp);
+    let worker_ctx = crate::cmd::workflow::default_execution_worker_context(WorkerKind::Cli, None);
+    let worker_record = crate::cmd::workflow::upsert_worker_record(
+        &global,
+        &worker_ctx,
+        &backend_id,
+        mode_str,
+        repo_ref.as_deref(),
+    )?;
+    let metadata = StandaloneRunMetadata {
+        version: StandaloneRunMetadata::VERSION,
+        run_id: run_id.clone(),
+        workspace_path: canonicalize_if_exists(&workspace_path),
+        project_root: project_root.clone(),
+        repo_ref,
+        issue_ref,
+        backend_id,
+        worker_id: Some(worker_record.worker_id.clone()),
+        trigger_source: "run_cli".into(),
+        target: if run_target.is_some() {
+            args.target.clone()
+        } else {
+            None
+        },
+        workspace_strategy,
+    };
+    write_metadata(&metadata_path_for_run(&transcripts, &run_id), &metadata)?;
+
     let decider: Arc<dyn PermissionDecider> = pick_decider(mode, Some(printer.multi_handle()));
 
     let opts = AgentRunOpts {
@@ -390,6 +427,69 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     println!("transcript: {}", transcript_path.display());
     let _ = result;
     Ok(())
+}
+
+fn canonicalize_if_exists(path: &Path) -> std::path::PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn standalone_repo_ref(
+    run_target: Option<&crate::run_target::RunTarget>,
+    workspace_path: &Path,
+) -> Option<String> {
+    match run_target {
+        Some(crate::run_target::RunTarget::Repo {
+            platform,
+            owner,
+            repo,
+            ..
+        })
+        | Some(crate::run_target::RunTarget::Pr {
+            platform,
+            owner,
+            repo,
+            ..
+        }) => Some(format!("{platform}:{owner}/{repo}")),
+        Some(crate::run_target::RunTarget::Issue {
+            tracker, project, ..
+        }) => Some(format!("{tracker}:{project}")),
+        None => crate::cmd::issues::autodetect_repo_from_path(workspace_path)
+            .ok()
+            .map(|repo| crate::cmd::issues::canonical_repo_ref(&repo)),
+    }
+}
+
+fn standalone_issue_ref(run_target: Option<&crate::run_target::RunTarget>) -> Option<String> {
+    match run_target {
+        Some(crate::run_target::RunTarget::Issue {
+            tracker,
+            project,
+            number,
+        }) => Some(format!("{tracker}:{project}/issues/{number}")),
+        _ => None,
+    }
+}
+
+fn standalone_workspace_strategy(
+    run_target: Option<&crate::run_target::RunTarget>,
+    workspace_path: &Path,
+    tmp: bool,
+) -> Option<String> {
+    let value = match run_target {
+        Some(crate::run_target::RunTarget::Repo { .. })
+        | Some(crate::run_target::RunTarget::Pr { .. })
+            if tmp =>
+        {
+            "temporary_clone"
+        }
+        Some(crate::run_target::RunTarget::Repo { .. })
+        | Some(crate::run_target::RunTarget::Pr { .. }) => "direct_clone",
+        _ if crate::cmd::issues::autodetect_repo_from_path(workspace_path).is_ok() => {
+            "direct_checkout"
+        }
+        _ => "direct_workspace",
+    };
+    Some(value.into())
 }
 
 fn pick_decider(
