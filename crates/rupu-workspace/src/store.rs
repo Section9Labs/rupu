@@ -52,7 +52,23 @@ impl WorkspaceStore {
         self.root.join(format!("{id}.toml"))
     }
 
-    fn list(&self) -> Result<Vec<Workspace>, StoreError> {
+    pub fn load(&self, id: &str) -> Result<Option<Workspace>, StoreError> {
+        let path = self.record_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path).map_err(|e| StoreError::Io {
+            action: format!("read_to_string {}", path.display()),
+            source: e,
+        })?;
+        let ws = toml::from_str(&text).map_err(|e| StoreError::Parse {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        Ok(Some(ws))
+    }
+
+    pub fn list(&self) -> Result<Vec<Workspace>, StoreError> {
         if !self.root.exists() {
             return Ok(vec![]);
         }

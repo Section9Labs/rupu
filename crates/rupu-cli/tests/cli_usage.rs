@@ -6,9 +6,28 @@ use rupu_runtime::{
     ExecutionRequest, RepoBinding, RunContext, RunEnvelope, RunKind, RunTrigger, RunTriggerSource,
     WorkflowBinding,
 };
-use rupu_transcript::{Event, JsonlWriter, RunMode};
+use rupu_transcript::{Event, JsonlReader, JsonlWriter, RunMode};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+
+fn init_git_checkout(path: &Path, origin_url: &str) {
+    let status = ProcessCommand::new("git")
+        .arg("init")
+        .arg("-b")
+        .arg("main")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let status = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["remote", "add", "origin", origin_url])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
 
 #[allow(clippy::too_many_arguments)]
 fn write_usage_transcript(
@@ -528,6 +547,84 @@ fn usage_supports_issue_worker_backend_and_trigger_filters() {
         .stdout(predicate::str::contains("run_cli"))
         .stdout(predicate::str::contains("local_checkout"))
         .stdout(predicate::str::contains("run_workflow_issue_43").not());
+}
+
+#[test]
+fn usage_backfill_creates_sidecars_for_old_standalone_transcripts() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join(".rupu");
+    let project = dir.path().join("project");
+    let transcripts = home.join("transcripts");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&transcripts).unwrap();
+    init_git_checkout(&project, "git@github.com:Section9Labs/rupu.git");
+
+    let store = rupu_workspace::WorkspaceStore {
+        root: home.join("workspaces"),
+    };
+    let workspace = rupu_workspace::upsert(&store, &project).unwrap();
+    let started_at = Utc::now();
+    let transcript_path = write_usage_transcript(
+        &transcripts,
+        "run_old_standalone",
+        "reviewer",
+        "anthropic",
+        "claude-sonnet-4-6",
+        started_at,
+        18,
+        6,
+    );
+    let events = JsonlReader::iter(&transcript_path)
+        .unwrap()
+        .map(|event| event.unwrap())
+        .collect::<Vec<_>>();
+    let mut writer = JsonlWriter::create(&transcript_path).unwrap();
+    writer
+        .write(&Event::RunStart {
+            run_id: "run_old_standalone".into(),
+            workspace_id: workspace.id.clone(),
+            agent: "reviewer".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            started_at,
+            mode: RunMode::Bypass,
+        })
+        .unwrap();
+    for event in events.into_iter().skip(1) {
+        writer.write(&event).unwrap();
+    }
+    writer.flush().unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&project)
+        .env("RUPU_HOME", &home)
+        .args(["usage", "backfill"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Backfilled"))
+        .stdout(predicate::str::contains("1"));
+
+    let metadata_path = rupu_cli::standalone_run_metadata::metadata_path_for_run(
+        &transcripts,
+        "run_old_standalone",
+    );
+    assert!(metadata_path.exists());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&project)
+        .env("RUPU_HOME", &home)
+        .args([
+            "usage",
+            "--group-by",
+            "agent",
+            "--repo",
+            "github:Section9Labs/rupu",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reviewer"));
 }
 
 #[test]

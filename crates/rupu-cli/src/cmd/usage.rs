@@ -3,7 +3,10 @@
 //! Default view: last 30 days, composite breakdown by `(provider, model, agent)`
 //! plus a summary table. Structured output supports `table`, `json`, and `csv`.
 
-use crate::cmd::usage_report::{UsageDataset, UsageFact, UsageFilter};
+use crate::cmd::usage_report::{
+    backfill_standalone_metadata, StandaloneMetadataBackfillStats, UsageDataset, UsageFact,
+    UsageFilter,
+};
 use crate::paths;
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
@@ -67,6 +70,8 @@ pub struct UsageScopeArgs {
 pub enum UsageCommand {
     /// Show per-run usage rows.
     Runs(UsageRunsArgs),
+    /// Backfill metadata sidecars for older standalone transcripts.
+    Backfill(UsageBackfillArgs),
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -82,6 +87,13 @@ pub struct UsageRunsArgs {
     /// Show only the N most expensive runs.
     #[arg(long)]
     pub top_cost: Option<usize>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct UsageBackfillArgs {
+    /// Rewrite existing standalone sidecars instead of skipping them.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -136,6 +148,13 @@ async fn run(
             run_args,
             format,
         ),
+        Some(UsageCommand::Backfill(backfill_args)) => render_backfill_view(
+            &global,
+            project_root.as_deref(),
+            &prefs,
+            backfill_args,
+            format,
+        ),
         None => render_breakdown_view(
             &global,
             project_root.as_deref(),
@@ -145,6 +164,34 @@ async fn run(
             args.group_by,
             format,
         ),
+    }
+}
+
+fn render_backfill_view(
+    global: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+    prefs: &crate::cmd::ui::UiPrefs,
+    args: UsageBackfillArgs,
+    format: crate::output::formats::OutputFormat,
+) -> anyhow::Result<()> {
+    let stats = backfill_standalone_metadata(global, project_root, args.force)?;
+    let report = UsageBackfillReport {
+        kind: "usage_backfill",
+        version: 1,
+        force: args.force,
+        summary: stats.clone(),
+        rows: vec![UsageBackfillRow::from_stats(&stats)],
+    };
+
+    match format {
+        crate::output::formats::OutputFormat::Table => {
+            print_backfill_table(&report, prefs);
+            Ok(())
+        }
+        crate::output::formats::OutputFormat::Json => crate::output::formats::print_json(&report),
+        crate::output::formats::OutputFormat::Csv => {
+            crate::output::formats::print_csv_rows(&report.rows)
+        }
     }
 }
 
@@ -462,6 +509,15 @@ struct UsageRunsReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct UsageBackfillReport {
+    kind: &'static str,
+    version: u8,
+    force: bool,
+    summary: StandaloneMetadataBackfillStats,
+    rows: Vec<UsageBackfillRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct UsageBreakdownRow {
     group: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -512,6 +568,29 @@ struct UsageRunRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
     cost_partial: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageBackfillRow {
+    scanned: u64,
+    referenced_workflow_transcripts: u64,
+    existing_sidecars: u64,
+    backfilled: u64,
+    unresolved_workspace: u64,
+    unreadable_transcripts: u64,
+}
+
+impl UsageBackfillRow {
+    fn from_stats(stats: &StandaloneMetadataBackfillStats) -> Self {
+        Self {
+            scanned: stats.scanned,
+            referenced_workflow_transcripts: stats.referenced_workflow_transcripts,
+            existing_sidecars: stats.existing_sidecars,
+            backfilled: stats.backfilled,
+            unresolved_workspace: stats.unresolved_workspace,
+            unreadable_transcripts: stats.unreadable_transcripts,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -991,6 +1070,40 @@ fn print_run_table(report: &UsageRunsReport, prefs: &crate::cmd::ui::UiPrefs) {
     println!("{table}");
     let no_pricing = report.summary.total_cost_usd.is_none();
     print_cost_note(no_pricing, report.summary.cost_partial);
+}
+
+fn print_backfill_table(report: &UsageBackfillReport, _prefs: &crate::cmd::ui::UiPrefs) {
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["METRIC", "VALUE"]);
+    table.add_row(vec![
+        Cell::new("Force"),
+        Cell::new(report.force.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Scanned"),
+        Cell::new(report.summary.scanned.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Backfilled"),
+        Cell::new(report.summary.backfilled.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Existing Sidecars"),
+        Cell::new(report.summary.existing_sidecars.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Workflow Transcripts"),
+        Cell::new(report.summary.referenced_workflow_transcripts.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Unresolved Workspace"),
+        Cell::new(report.summary.unresolved_workspace.to_string()),
+    ]);
+    table.add_row(vec![
+        Cell::new("Unreadable"),
+        Cell::new(report.summary.unreadable_transcripts.to_string()),
+    ]);
+    println!("{table}");
 }
 
 fn print_summary_table(

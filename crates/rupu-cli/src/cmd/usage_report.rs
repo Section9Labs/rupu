@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use rupu_orchestrator::{RunRecord, RunStore, StepResultRecord};
 use rupu_runtime::RunEnvelope;
 use rupu_transcript::{JsonlReader, TimeWindow, UsageRow};
+use rupu_workspace::WorkspaceStore;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -161,6 +162,16 @@ pub struct UsageDataset {
     pub runs: Vec<UsageRun>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StandaloneMetadataBackfillStats {
+    pub scanned: u64,
+    pub referenced_workflow_transcripts: u64,
+    pub existing_sidecars: u64,
+    pub backfilled: u64,
+    pub unresolved_workspace: u64,
+    pub unreadable_transcripts: u64,
+}
+
 impl UsageDataset {
     pub fn load(
         global_root: &Path,
@@ -182,14 +193,7 @@ impl UsageDataset {
             }
         }
 
-        let mut standalone_paths = BTreeSet::new();
-        if let Some(project_root) = project_root {
-            collect_jsonl(
-                &project_root.join(".rupu/transcripts"),
-                &mut standalone_paths,
-            );
-        }
-        collect_jsonl(&global_root.join("transcripts"), &mut standalone_paths);
+        let standalone_paths = standalone_transcript_paths(global_root, project_root);
 
         for path in standalone_paths {
             if referenced_paths.contains(&path) {
@@ -240,6 +244,46 @@ impl UsageDataset {
         runs.sort_by_key(|row| std::cmp::Reverse(row.started_at));
         Self { facts, runs }
     }
+}
+
+pub fn backfill_standalone_metadata(
+    global_root: &Path,
+    project_root: Option<&Path>,
+    force: bool,
+) -> anyhow::Result<StandaloneMetadataBackfillStats> {
+    let run_store = RunStore::new(global_root.join("runs"));
+    let workflow_runs = run_store.list()?;
+    let referenced_paths = referenced_transcript_paths(&run_store, &workflow_runs);
+    let workspace_store = WorkspaceStore {
+        root: global_root.join("workspaces"),
+    };
+    let mut stats = StandaloneMetadataBackfillStats::default();
+
+    for path in standalone_transcript_paths(global_root, project_root) {
+        stats.scanned += 1;
+        if referenced_paths.contains(&path) {
+            stats.referenced_workflow_transcripts += 1;
+            continue;
+        }
+        let Ok(summary) = JsonlReader::summary(&path) else {
+            stats.unreadable_transcripts += 1;
+            continue;
+        };
+        let metadata_path = load_standalone_metadata_path(&path, &summary.run_id)?;
+        if metadata_path.exists() && !force {
+            stats.existing_sidecars += 1;
+            continue;
+        }
+        let Some(workspace) = workspace_store.load(&summary.workspace_id)? else {
+            stats.unresolved_workspace += 1;
+            continue;
+        };
+        let metadata = backfill_metadata_from_workspace(&summary.run_id, &workspace);
+        crate::standalone_run_metadata::write_metadata(&metadata_path, &metadata)?;
+        stats.backfilled += 1;
+    }
+
+    Ok(stats)
 }
 
 fn build_runs(facts: &[UsageFact]) -> Vec<UsageRun> {
@@ -351,6 +395,21 @@ fn collect_jsonl(dir: &Path, out: &mut BTreeSet<PathBuf>) {
             out.insert(canonicalize_path(path));
         }
     }
+}
+
+fn standalone_transcript_paths(
+    global_root: &Path,
+    project_root: Option<&Path>,
+) -> BTreeSet<PathBuf> {
+    let mut standalone_paths = BTreeSet::new();
+    if let Some(project_root) = project_root {
+        collect_jsonl(
+            &project_root.join(".rupu/transcripts"),
+            &mut standalone_paths,
+        );
+    }
+    collect_jsonl(&global_root.join("transcripts"), &mut standalone_paths);
+    standalone_paths
 }
 
 fn canonicalize_path(path: PathBuf) -> PathBuf {
@@ -508,9 +567,65 @@ fn load_standalone_metadata(
     transcript_path: &Path,
     run_id: &str,
 ) -> Option<crate::standalone_run_metadata::StandaloneRunMetadata> {
-    let dir = transcript_path.parent()?;
-    let path = crate::standalone_run_metadata::metadata_path_for_run(dir, run_id);
+    let path = load_standalone_metadata_path(transcript_path, run_id).ok()?;
     crate::standalone_run_metadata::read_metadata(&path).ok()
+}
+
+fn load_standalone_metadata_path(transcript_path: &Path, run_id: &str) -> anyhow::Result<PathBuf> {
+    let dir = transcript_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "standalone transcript `{}` has no parent directory",
+            transcript_path.display()
+        )
+    })?;
+    Ok(crate::standalone_run_metadata::metadata_path_for_run(
+        dir, run_id,
+    ))
+}
+
+fn backfill_metadata_from_workspace(
+    run_id: &str,
+    workspace: &rupu_workspace::Workspace,
+) -> crate::standalone_run_metadata::StandaloneRunMetadata {
+    let workspace_path = PathBuf::from(&workspace.path);
+    let repo_ref = crate::cmd::issues::autodetect_repo_from_path(&workspace_path)
+        .ok()
+        .map(|repo| crate::cmd::issues::canonical_repo_ref(&repo))
+        .or_else(|| {
+            workspace
+                .repo_remote
+                .as_deref()
+                .and_then(crate::cmd::issues::parse_remote_url)
+                .map(|repo| crate::cmd::issues::canonical_repo_ref(&repo))
+        });
+    let project_root = crate::paths::project_root_for(&workspace_path)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            workspace_path
+                .join(".rupu")
+                .is_dir()
+                .then_some(workspace_path.clone())
+        });
+    let workspace_strategy = if repo_ref.is_some() {
+        Some("direct_checkout".to_string())
+    } else {
+        Some("direct_workspace".to_string())
+    };
+
+    crate::standalone_run_metadata::StandaloneRunMetadata {
+        version: crate::standalone_run_metadata::StandaloneRunMetadata::VERSION,
+        run_id: run_id.to_string(),
+        workspace_path,
+        project_root,
+        repo_ref,
+        issue_ref: None,
+        backend_id: "local_checkout".into(),
+        worker_id: None,
+        trigger_source: "run_cli".into(),
+        target: None,
+        workspace_strategy,
+    }
 }
 
 #[cfg(test)]
@@ -523,6 +638,25 @@ mod tests {
         RunTriggerSource, WorkflowBinding,
     };
     use rupu_transcript::{Event, JsonlWriter};
+    use std::process::Command;
+
+    fn init_git_checkout(path: &Path, origin_url: &str) {
+        let status = Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["remote", "add", "origin", origin_url])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn write_usage_transcript(
@@ -810,5 +944,122 @@ mod tests {
         assert_eq!(dataset.facts[0].provider, "openai");
         assert_eq!(dataset.facts[0].input_tokens, 30);
         assert_eq!(dataset.facts[0].output_tokens, 10);
+    }
+
+    #[test]
+    fn backfill_standalone_metadata_uses_workspace_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = temp.path().join(".rupu");
+        let transcripts = global.join("transcripts");
+        let workspace_root = temp.path().join("project");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        init_git_checkout(&workspace_root, "git@github.com:Section9Labs/rupu.git");
+
+        let store = rupu_workspace::WorkspaceStore {
+            root: global.join("workspaces"),
+        };
+        let workspace = rupu_workspace::upsert(&store, &workspace_root).unwrap();
+        let started_at = Utc::now();
+        write_usage_transcript(
+            &transcripts,
+            "run_backfill_01",
+            "reviewer",
+            "anthropic",
+            "claude-sonnet-4-6",
+            started_at,
+            10,
+            5,
+        );
+
+        let transcript_path = transcripts.join("run_backfill_01.jsonl");
+        let mut events = JsonlReader::iter(&transcript_path)
+            .unwrap()
+            .collect::<Vec<_>>();
+        let run_start = Event::RunStart {
+            run_id: "run_backfill_01".into(),
+            workspace_id: workspace.id.clone(),
+            agent: "reviewer".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            started_at,
+            mode: rupu_transcript::RunMode::Bypass,
+        };
+        events[0] = Ok(run_start);
+        let mut writer = JsonlWriter::create(&transcript_path).unwrap();
+        for event in events {
+            writer.write(&event.unwrap()).unwrap();
+        }
+        writer.flush().unwrap();
+
+        let stats = backfill_standalone_metadata(&global, None, false).unwrap();
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.backfilled, 1);
+        let metadata_path =
+            crate::standalone_run_metadata::metadata_path_for_run(&transcripts, "run_backfill_01");
+        let metadata = crate::standalone_run_metadata::read_metadata(&metadata_path).unwrap();
+        assert_eq!(
+            metadata.repo_ref.as_deref(),
+            Some("github:Section9Labs/rupu")
+        );
+        assert_eq!(metadata.backend_id, "local_checkout");
+        assert_eq!(metadata.trigger_source, "run_cli");
+        assert_eq!(
+            metadata.workspace_strategy.as_deref(),
+            Some("direct_checkout")
+        );
+        assert_eq!(metadata.worker_id, None);
+    }
+
+    #[test]
+    fn backfill_skips_workflow_referenced_transcripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = temp.path().join(".rupu");
+        let transcripts = global.join("transcripts");
+        let runs_root = global.join("runs");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::create_dir_all(&runs_root).unwrap();
+
+        let started_at = Utc::now();
+        let transcript_path = write_usage_transcript(
+            &transcripts,
+            "step_run_backfill",
+            "implementer",
+            "openai",
+            "gpt-5",
+            started_at,
+            12,
+            4,
+        );
+
+        let store = RunStore::new(runs_root);
+        store
+            .write_run_envelope(
+                "run_workflow_backfill",
+                &sample_envelope("run_workflow_backfill"),
+            )
+            .unwrap();
+        store
+            .create(
+                sample_run_record("run_workflow_backfill", started_at, &transcripts),
+                "name: phase-delivery-cycle\nsteps: []\n",
+            )
+            .unwrap();
+        store
+            .append_step_result(
+                "run_workflow_backfill",
+                &sample_step_result(&transcript_path),
+            )
+            .unwrap();
+
+        let stats = backfill_standalone_metadata(&global, None, false).unwrap();
+        assert_eq!(stats.scanned, 1);
+        assert_eq!(stats.referenced_workflow_transcripts, 1);
+        assert_eq!(stats.backfilled, 0);
+        let metadata_path = crate::standalone_run_metadata::metadata_path_for_run(
+            &transcripts,
+            "step_run_backfill",
+        );
+        assert!(!metadata_path.exists());
     }
 }
