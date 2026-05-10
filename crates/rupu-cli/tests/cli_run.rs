@@ -75,6 +75,7 @@ async fn rupu_run_writes_transcript_under_mock_provider() {
     let entries: Vec<_> = std::fs::read_dir(transcripts.path())
         .unwrap()
         .filter_map(|e| e.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         .collect();
     assert_eq!(entries.len(), 1, "expected exactly one transcript file");
     let summary = rupu_transcript::JsonlReader::summary(entries[0].path()).unwrap();
@@ -148,4 +149,37 @@ async fn rupu_run_auto_tracks_current_checkout() {
         tracked.preferred_path,
         project.path().canonicalize().unwrap().display().to_string()
     );
+
+    let transcript_path = std::fs::read_dir(global.child("transcripts").path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .expect("standalone transcript should exist");
+    let summary = rupu_transcript::JsonlReader::summary(&transcript_path).unwrap();
+    let metadata_path = rupu_cli::standalone_run_metadata::metadata_path_for_run(
+        global.child("transcripts").path(),
+        &summary.run_id,
+    );
+    let metadata = rupu_cli::standalone_run_metadata::read_metadata(&metadata_path).unwrap();
+    assert_eq!(metadata.run_id, summary.run_id);
+    assert_eq!(
+        metadata.repo_ref.as_deref(),
+        Some("github:Section9Labs/rupu")
+    );
+    assert_eq!(metadata.backend_id, "local_checkout");
+    assert_eq!(metadata.trigger_source, "run_cli");
+    assert_eq!(
+        metadata.workspace_strategy.as_deref(),
+        Some("direct_checkout")
+    );
+    assert!(metadata.target.is_none());
+    assert_eq!(
+        metadata.workspace_path,
+        project.path().canonicalize().unwrap()
+    );
+    assert!(metadata
+        .worker_id
+        .as_deref()
+        .is_some_and(|value| value.starts_with("worker_local_")));
 }
