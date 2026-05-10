@@ -1170,6 +1170,7 @@ pub(crate) async fn execute_autoflow_cycle(
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -1219,13 +1220,7 @@ pub(crate) async fn execute_autoflow_cycle(
                 repo_ref: Some(resolved.repo_ref.clone()),
                 wake_id: None,
                 event_id: None,
-                backend: Some(
-                    match workspace_strategy {
-                        AutoflowWorkspaceStrategy::Worktree => "local_worktree",
-                        AutoflowWorkspaceStrategy::InPlace => "local_checkout",
-                    }
-                    .to_string(),
-                ),
+                backend: Some("local_worktree".to_string()),
                 workspace_strategy: Some(
                     match workspace_strategy {
                         AutoflowWorkspaceStrategy::Worktree => "managed_worktree",
@@ -1247,6 +1242,10 @@ pub(crate) async fn execute_autoflow_cycle(
     match run_result {
         Ok(summary) => {
             claim.last_run_id = Some(summary.run_id.clone());
+            claim.artifact_manifest_path = summary
+                .artifact_manifest_path
+                .as_ref()
+                .map(|path| path.display().to_string());
             if summary.awaiting_step_id.is_some() {
                 claim.status = ClaimStatus::AwaitHuman;
                 claim.last_error = None;
@@ -1383,6 +1382,10 @@ fn apply_terminal_run_to_claim(
     claim.last_summary = outcome.summary.clone();
     claim.pr_url = outcome.pr_url.clone();
     claim.artifacts = outcome.artifacts.clone();
+    claim.artifact_manifest_path = run
+        .artifact_manifest_path
+        .as_ref()
+        .map(|path| path.display().to_string());
     claim.next_retry_at = None;
     claim.pending_dispatch = None;
 
@@ -2410,6 +2413,7 @@ steps:
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -2499,6 +2503,7 @@ steps:
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -2593,6 +2598,7 @@ steps:
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(
@@ -2630,6 +2636,7 @@ steps:
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some("2000-01-01T00:00:00Z".into()),
@@ -2662,6 +2669,7 @@ steps:
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some("2000-01-01T00:00:00Z".into()),
@@ -2730,6 +2738,7 @@ steps:
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -2875,6 +2884,10 @@ steps:
             issue_ref: Some("github:Section9Labs/rupu/issues/42".into()),
             issue: None,
             parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            source_wake_id: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -2910,6 +2923,7 @@ steps:
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -2993,6 +3007,10 @@ steps:
                     issue_ref: Some("github:Section9Labs/rupu/issues/42".into()),
                     issue: None,
                     parent_run_id: None,
+                    backend_id: None,
+                    worker_id: None,
+                    artifact_manifest_path: None,
+                    source_wake_id: None,
                 },
                 "name: controller\nsteps: []\n",
             )
@@ -3010,6 +3028,7 @@ steps:
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -3115,6 +3134,10 @@ steps:
                     issue_ref: Some("github:Section9Labs/rupu/issues/123".into()),
                     issue: None,
                     parent_run_id: None,
+                    backend_id: None,
+                    worker_id: None,
+                    artifact_manifest_path: None,
+                    source_wake_id: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -3136,6 +3159,7 @@ steps:
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(
@@ -3262,6 +3286,10 @@ steps:
                     issue_ref: Some("github:Section9Labs/rupu/issues/123".into()),
                     issue: None,
                     parent_run_id: None,
+                    backend_id: None,
+                    worker_id: None,
+                    artifact_manifest_path: None,
+                    source_wake_id: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -3303,6 +3331,7 @@ steps:
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(
@@ -3465,6 +3494,7 @@ steps:
                 last_summary: Some("phase 1 is ready".into()),
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(
@@ -3751,6 +3781,7 @@ steps:
                 last_summary: Some("waiting for external change".into()),
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(
@@ -3924,6 +3955,7 @@ steps:
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(
@@ -4070,6 +4102,7 @@ steps:
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(
@@ -4182,6 +4215,7 @@ steps:
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: None,
@@ -4433,6 +4467,7 @@ base_url = "{}"
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: None,
@@ -4596,6 +4631,7 @@ base_url = "{}"
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: Some(

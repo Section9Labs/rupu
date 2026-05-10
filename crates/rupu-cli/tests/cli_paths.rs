@@ -2,8 +2,8 @@ use assert_fs::prelude::*;
 use rupu_cli::paths::{
     autoflow_claims_dir, autoflow_event_cursors_dir, autoflow_wake_dedupe_dir,
     autoflow_wake_payloads_dir, autoflow_wake_processed_dir, autoflow_wake_queue_dir,
-    autoflow_wakes_dir, autoflow_worktrees_dir, autoflows_dir, global_dir, project_root_for,
-    repos_dir, transcripts_dir,
+    autoflow_wakes_dir, autoflow_workers_dir, autoflow_worktrees_dir, autoflows_dir, global_dir,
+    project_root_for, repos_dir, transcripts_dir,
 };
 
 #[test]
@@ -75,6 +75,10 @@ fn state_dirs_live_under_global_root() {
     assert_eq!(
         autoflow_worktrees_dir(tmp_global.path()),
         tmp_global.path().join("autoflows/worktrees")
+    );
+    assert_eq!(
+        autoflow_workers_dir(tmp_global.path()),
+        tmp_global.path().join("autoflows/workers")
     );
     assert_eq!(
         autoflow_event_cursors_dir(tmp_global.path()),

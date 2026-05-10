@@ -17,6 +17,7 @@ thiserror.workspace = true
 ulid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+rupu-runtime = { path = "../rupu-runtime" }
 
 [dev-dependencies]
 tempfile.workspace = true

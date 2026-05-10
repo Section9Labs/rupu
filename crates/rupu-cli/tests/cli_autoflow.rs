@@ -458,6 +458,12 @@ steps:
         .await
         .expect("permissive run should succeed");
     assert_eq!(summary.run_id, "run_explicit_permissive");
+    assert_eq!(summary.backend_id.as_deref(), Some("local_worktree"));
+    assert!(summary.worker_id.is_some(), "expected worker id in summary");
+    assert!(
+        summary.artifact_manifest_path.is_some(),
+        "expected artifact manifest path in summary"
+    );
     let envelope = rupu_orchestrator::RunStore::new(global.path().join("runs"))
         .read_run_envelope(&summary.run_id)
         .expect("run envelope should persist");
@@ -476,6 +482,23 @@ steps:
         .context
         .as_ref()
         .is_some_and(|context| context.issue_present));
+    assert_eq!(
+        envelope
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.assigned_worker_id.as_deref()),
+        summary.worker_id.as_deref()
+    );
+    let run_store = rupu_orchestrator::RunStore::new(global.path().join("runs"));
+    let manifest = run_store
+        .read_artifact_manifest(&summary.run_id)
+        .expect("artifact manifest should persist");
+    assert_eq!(manifest.backend_id, "local_worktree");
+    assert_eq!(manifest.worker_id, summary.worker_id);
+    assert!(manifest
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == rupu_runtime::ArtifactKind::StepTranscript));
 
     let strict_ctx = rupu_cli::cmd::workflow::ExplicitWorkflowRunContext {
         project_root: Some(project.path().to_path_buf()),
@@ -761,6 +784,7 @@ steps:
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
@@ -826,6 +850,7 @@ steps:
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: Some("2000-01-01T00:00:00Z".into()),
@@ -897,6 +922,7 @@ async fn autoflow_release_deletes_claim() {
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -946,6 +972,7 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
             artifacts: Some(serde_json::json!({
                 "review_packet": "docs/reviews/issue-42.json"
             })),
+            artifact_manifest_path: Some("/tmp/runs/run_123/artifact_manifest.json".into()),
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -1021,6 +1048,7 @@ fn autoflow_claims_filters_to_one_repo() {
                 last_summary: None,
                 pr_url: None,
                 artifacts: None,
+                artifact_manifest_path: None,
                 next_retry_at: None,
                 claim_owner: None,
                 lease_expires_at: None,
@@ -1070,6 +1098,7 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -1104,6 +1133,7 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -1157,6 +1187,7 @@ fn autoflow_status_filters_to_one_repo() {
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,
@@ -1178,6 +1209,7 @@ fn autoflow_status_filters_to_one_repo() {
             last_summary: None,
             pr_url: None,
             artifacts: None,
+            artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: None,
             lease_expires_at: None,

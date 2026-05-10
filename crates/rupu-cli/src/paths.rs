@@ -62,6 +62,11 @@ pub fn autoflow_worktrees_dir(global: &Path) -> PathBuf {
     autoflows_dir(global).join("worktrees")
 }
 
+/// Global autoflow worker registry directory.
+pub fn autoflow_workers_dir(global: &Path) -> PathBuf {
+    autoflows_dir(global).join("workers")
+}
+
 /// Global autoflow event cursor directory.
 pub fn autoflow_event_cursors_dir(global: &Path) -> PathBuf {
     autoflows_dir(global).join("event-cursors")

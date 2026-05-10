@@ -56,6 +56,8 @@ pub struct AutoflowClaimRecord {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub artifacts: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub artifact_manifest_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub next_retry_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub claim_owner: Option<String>,

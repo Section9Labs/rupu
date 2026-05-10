@@ -201,6 +201,27 @@ async fn workflow_run_executes_one_step_via_mock() {
     );
     assert_eq!(envelope.workflow.name, "hello-wf");
     assert_eq!(envelope.execution.permission_mode, "bypass");
+    assert_eq!(runs[0].backend_id.as_deref(), Some("local_worktree"));
+    assert!(runs[0].worker_id.is_some(), "expected persisted worker id");
+    assert!(
+        runs[0].artifact_manifest_path.is_some(),
+        "expected persisted artifact manifest path"
+    );
+    let manifest = run_store.read_artifact_manifest(&runs[0].id).unwrap();
+    assert_eq!(manifest.run_id, runs[0].id);
+    assert_eq!(manifest.backend_id, "local_worktree");
+    assert_eq!(manifest.worker_id, runs[0].worker_id);
+    assert!(manifest
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.kind == rupu_runtime::ArtifactKind::StepTranscript));
+
+    let worker_store = rupu_workspace::WorkerStore {
+        root: global.path().join("autoflows/workers"),
+    };
+    let workers = worker_store.list().unwrap();
+    assert_eq!(workers.len(), 1, "expected exactly one persisted worker");
+    assert_eq!(workers[0].worker_id, runs[0].worker_id.clone().unwrap());
 }
 
 #[tokio::test]

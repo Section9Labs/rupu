@@ -91,6 +91,8 @@ pub struct RunCorrelation {
 pub struct WorkerRequest {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub requested_worker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub assigned_worker_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +177,7 @@ mod tests {
             }),
             worker: Some(WorkerRequest {
                 requested_worker: Some("local".into()),
+                assigned_worker_id: Some("worker_local_cli".into()),
             }),
         };
 

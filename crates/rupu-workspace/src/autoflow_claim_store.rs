@@ -322,6 +322,7 @@ mod tests {
             artifacts: Some(serde_json::json!({
                 "review_packet": "docs/reviews/issue-42.json"
             })),
+            artifact_manifest_path: Some("/tmp/runs/run_123/artifact_manifest.json".into()),
             next_retry_at: None,
             claim_owner: Some("host:user:pid".into()),
             lease_expires_at: Some("2026-05-08T23:00:00Z".into()),

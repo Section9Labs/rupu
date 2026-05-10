@@ -356,6 +356,10 @@ pub async fn run_workflow(
                 issue_ref: opts.issue_ref.clone(),
                 issue: opts.issue.clone(),
                 parent_run_id: None,
+                backend_id: None,
+                worker_id: None,
+                artifact_manifest_path: None,
+                source_wake_id: None,
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {
