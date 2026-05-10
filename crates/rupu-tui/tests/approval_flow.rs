@@ -23,6 +23,10 @@ fn paused_record(dir: &std::path::Path) -> RunRecord {
         issue_ref: None,
         issue: None,
         parent_run_id: None,
+        backend_id: None,
+        worker_id: None,
+        artifact_manifest_path: None,
+        source_wake_id: None,
     }
 }
 

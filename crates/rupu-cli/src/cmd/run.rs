@@ -441,55 +441,6 @@ fn resolve_clone_dest(
     Ok((dest, None))
 }
 
-#[cfg(test)]
-mod resolve_clone_dest_tests {
-    use super::resolve_clone_dest;
-    use std::path::Path;
-
-    #[test]
-    fn tmp_returns_a_guarded_tmpdir() {
-        let cwd = Path::new("/tmp");
-        let (dest, guard) = resolve_clone_dest(cwd, "rupu", None, true).unwrap();
-        assert!(
-            guard.is_some(),
-            "tmp mode should hand back the TempDir guard"
-        );
-        assert!(dest.exists(), "TempDir should already exist on disk");
-    }
-
-    #[test]
-    fn default_uses_cwd_repo_and_refuses_when_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Default path: <tmp>/myrepo. Doesn't exist yet → ok.
-        let (dest, guard) = resolve_clone_dest(tmp.path(), "myrepo", None, false).unwrap();
-        assert_eq!(dest, tmp.path().join("myrepo"));
-        assert!(
-            guard.is_none(),
-            "default mode does not hold a TempDir guard"
-        );
-        // Now create it and re-run — should refuse.
-        std::fs::create_dir(&dest).unwrap();
-        let err = resolve_clone_dest(tmp.path(), "myrepo", None, false).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("already exists"), "got: {msg}");
-        assert!(msg.contains("--into"), "error should hint at --into: {msg}");
-        assert!(msg.contains("--tmp"), "error should hint at --tmp: {msg}");
-    }
-
-    #[test]
-    fn into_uses_explicit_path_and_refuses_when_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("custom-name");
-        // Doesn't exist → ok.
-        let (dest, guard) = resolve_clone_dest(tmp.path(), "rupu", Some(&target), false).unwrap();
-        assert_eq!(dest, target);
-        assert!(guard.is_none());
-        // Create it → second call refuses.
-        std::fs::create_dir(&target).unwrap();
-        assert!(resolve_clone_dest(tmp.path(), "rupu", Some(&target), false).is_err());
-    }
-}
-
 /// Readonly: deny writers (bash/write_file/edit_file), allow readers.
 struct ReadonlyDecider;
 impl PermissionDecider for ReadonlyDecider {
@@ -544,5 +495,50 @@ impl PermissionDecider for AskDecider {
             Some(m) => m.suspend(do_prompt),
             None => do_prompt(),
         }
+    }
+}
+
+#[cfg(test)]
+mod resolve_clone_dest_tests {
+    use super::resolve_clone_dest;
+    use std::path::Path;
+
+    #[test]
+    fn tmp_returns_a_guarded_tmpdir() {
+        let cwd = Path::new("/tmp");
+        let (dest, guard) = resolve_clone_dest(cwd, "rupu", None, true).unwrap();
+        assert!(
+            guard.is_some(),
+            "tmp mode should hand back the TempDir guard"
+        );
+        assert!(dest.exists(), "TempDir should already exist on disk");
+    }
+
+    #[test]
+    fn default_uses_cwd_repo_and_refuses_when_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dest, guard) = resolve_clone_dest(tmp.path(), "myrepo", None, false).unwrap();
+        assert_eq!(dest, tmp.path().join("myrepo"));
+        assert!(
+            guard.is_none(),
+            "default mode does not hold a TempDir guard"
+        );
+        std::fs::create_dir(&dest).unwrap();
+        let err = resolve_clone_dest(tmp.path(), "myrepo", None, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already exists"), "got: {msg}");
+        assert!(msg.contains("--into"), "error should hint at --into: {msg}");
+        assert!(msg.contains("--tmp"), "error should hint at --tmp: {msg}");
+    }
+
+    #[test]
+    fn into_uses_explicit_path_and_refuses_when_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("custom-name");
+        let (dest, guard) = resolve_clone_dest(tmp.path(), "rupu", Some(&target), false).unwrap();
+        assert_eq!(dest, target);
+        assert!(guard.is_none());
+        std::fs::create_dir(&target).unwrap();
+        assert!(resolve_clone_dest(tmp.path(), "rupu", Some(&target), false).is_err());
     }
 }

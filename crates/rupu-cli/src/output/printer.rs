@@ -207,6 +207,7 @@ impl LineStreamPrinter {
     /// 1. spinner glyph — auto-rotates via `enable_steady_tick`,
     /// 2. caller-supplied message — updated via [`Self::tick_with`],
     /// 3. elapsed time — auto-rendered via indicatif's `{elapsed}`.
+    ///
     /// Together they read as "this step is alive and N seconds in".
     pub fn start_ticker(&mut self, message: impl Into<String>) {
         if !self.is_tty {

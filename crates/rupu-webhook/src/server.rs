@@ -351,7 +351,7 @@ mod tests {
         AppState {
             github_secret: Some(Arc::new(b"secret".to_vec())),
             gitlab_token: None,
-            workflow_loader: Arc::new(|| Vec::new()),
+            workflow_loader: Arc::new(Vec::new),
             dispatcher: Arc::new(NoopDispatcher),
             observer: Some(observer),
         }

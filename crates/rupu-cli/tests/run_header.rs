@@ -44,7 +44,7 @@ fn run_line_stream_shows_token_count() {
     // Script with explicit token counts: 42 input, 7 output (total 49).
     let script = r#"[{"AssistantText":{"text":"hi","stop":"end_turn","input_tokens":42,"output_tokens":7}}]"#;
 
-    // Line-stream step footer: `✓ <run_id>  Xs · 49t`
+    // Line-stream step footer shows the full token label.
     Command::cargo_bin("rupu")
         .unwrap()
         .current_dir(&dir)
@@ -53,7 +53,7 @@ fn run_line_stream_shows_token_count() {
         .args(["run", "hello", "--mode", "bypass", "say hi"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("49t"));
+        .stdout(predicate::str::contains("49 tokens"));
 }
 
 #[test]

@@ -184,43 +184,6 @@ async fn show(run_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn one_line_preview_passes_short_text_through() {
-        assert_eq!(one_line_preview("hello", 60), "hello");
-    }
-
-    #[test]
-    fn one_line_preview_collapses_newlines_and_runs() {
-        // Multi-line chunk with leading + trailing whitespace and a
-        // double-newline paragraph break renders as one row.
-        assert_eq!(
-            one_line_preview("  hello\n\nworld   again  ", 60),
-            "hello world again"
-        );
-    }
-
-    #[test]
-    fn one_line_preview_truncates_with_ellipsis() {
-        let input = "a".repeat(80);
-        let out = one_line_preview(&input, 20);
-        // 19 a's + ellipsis = 20 chars.
-        assert!(out.ends_with('…'));
-        assert_eq!(out.chars().count(), 20);
-    }
-
-    #[test]
-    fn one_line_preview_empty_after_trim() {
-        // Whitespace-only input collapses to empty, which is then a
-        // valid (if uninformative) preview — caller decides whether to
-        // show it as "—" instead.
-        assert_eq!(one_line_preview("   \n\n  ", 60), "");
-    }
-}
-
 fn locate_transcript(run_id: &str) -> anyhow::Result<PathBuf> {
     let filename = format!("{run_id}.jsonl");
 
@@ -243,4 +206,35 @@ fn locate_transcript(run_id: &str) -> anyhow::Result<PathBuf> {
     }
 
     Err(anyhow::anyhow!("transcript not found: {run_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_line_preview_passes_short_text_through() {
+        assert_eq!(one_line_preview("hello", 60), "hello");
+    }
+
+    #[test]
+    fn one_line_preview_collapses_newlines_and_runs() {
+        assert_eq!(
+            one_line_preview("  hello\n\nworld   again  ", 60),
+            "hello world again"
+        );
+    }
+
+    #[test]
+    fn one_line_preview_truncates_with_ellipsis() {
+        let input = "a".repeat(80);
+        let out = one_line_preview(&input, 20);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 20);
+    }
+
+    #[test]
+    fn one_line_preview_empty_after_trim() {
+        assert_eq!(one_line_preview("   \n\n  ", 60), "");
+    }
 }

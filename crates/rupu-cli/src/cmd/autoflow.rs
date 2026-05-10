@@ -2457,7 +2457,7 @@ pub(crate) fn cleanup_terminal_claims(
 ) -> anyhow::Result<usize> {
     let mut cleaned = 0usize;
     for claim in claim_store.list()? {
-        if !repo_filter.is_none_or(|repo| claim.repo_ref == repo) {
+        if repo_filter.is_some_and(|repo| claim.repo_ref != repo) {
             continue;
         }
         if !matches!(claim.status, ClaimStatus::Complete | ClaimStatus::Released) {
