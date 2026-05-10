@@ -20,6 +20,7 @@ pub mod run;
 pub mod transcript;
 pub mod ui;
 pub mod usage;
+pub(crate) mod usage_report;
 pub mod watch;
 pub mod webhook;
 pub mod workflow;
