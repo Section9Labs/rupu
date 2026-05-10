@@ -313,6 +313,24 @@ rupu autoflow tick
 rupu autoflow serve --repo github:your-org/your-repo --worker laptop-01
 ```
 
+Autoflow runtime model:
+
+```mermaid
+flowchart LR
+    A[issue + repo policy] --> B[wake queue]
+    C[cron poll] --> B
+    D[webhook hint] --> B
+    E[manual requeue] --> B
+    B --> F[rupu autoflow tick]
+    B --> G[rupu autoflow serve]
+    F --> H[RunEnvelope]
+    G --> H
+    H --> I[local_worktree backend]
+    I --> J[run store]
+    I --> K[artifact manifest]
+    I --> L[claim state]
+```
+
 Operational visibility:
 
 - `rupu autoflow status` shows contested issues when more than one autoflow matches the same issue
@@ -351,6 +369,184 @@ Deployment modes:
 - **Dedicated always-on machine**: run `rupu autoflow serve` continuously and optionally pair it with `rupu webhook serve` for faster wake hints.
 - **Tunneled workstation**: advanced users can expose `rupu webhook serve` behind Tailscale, Cloudflare Tunnel, or ngrok, but this is optional and not the default local setup.
 - **Future cloud relay**: long term, `rupu.cloud` can receive webhooks and dispatch the same workflow envelopes back to local or cloud workers. The workflow files do not change for that transition.
+
+Typical commands by mode:
+
+- **Solo laptop**
+
+```sh
+rupu repos attach github:your-org/your-repo .
+rupu cron tick --only-events
+rupu autoflow serve --repo github:your-org/your-repo --worker laptop-01
+```
+
+- **Dedicated worker machine**
+
+```sh
+rupu repos attach github:your-org/your-repo /srv/rupu/your-repo
+RUPU_GITHUB_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
+rupu autoflow serve --repo github:your-org/your-repo --worker build-box-01
+```
+
+- **Tunneled workstation**
+
+```sh
+rupu repos attach github:your-org/your-repo .
+rupu webhook serve --addr 127.0.0.1:8080
+# expose the local port with your tunnel of choice
+rupu autoflow serve --repo github:your-org/your-repo --worker tunnel-laptop-01
+```
+
+- **Future hybrid cloud / local dispatch**
+
+```sh
+# webhook ingress and scheduling happen in rupu.cloud
+# a registered local worker still runs the same workflow files
+rupu autoflow serve --repo github:your-org/your-repo --worker local-worker-01
+```
+
+---
+
+## Portable runtime records
+
+Plan 2 makes the local CLI the reference implementation of four portable records. Future Slice E / `rupu.cloud` services should consume these shapes rather than inventing a second runtime protocol.
+
+### `RunEnvelope`
+
+Stored per run as `run_envelope.json`.
+
+```json
+{
+  "version": 1,
+  "run_id": "run_01JXYZ",
+  "kind": "workflow_run",
+  "workflow": {
+    "name": "phase-delivery-cycle",
+    "source_path": ".rupu/workflows/phase-delivery-cycle.yaml",
+    "fingerprint": "sha256:abc123"
+  },
+  "repo": {
+    "repo_ref": "github:Section9Labs/rupu",
+    "project_root": "/tmp/repo",
+    "workspace_id": "ws_01",
+    "workspace_path": "/tmp/repo"
+  },
+  "trigger": {
+    "source": "autoflow",
+    "wake_id": "wake_01",
+    "event_id": "github.pull_request.merged"
+  },
+  "inputs": {
+    "phase": "phase-2"
+  },
+  "context": {
+    "issue_ref": "github:Section9Labs/rupu/issues/42",
+    "target": "github:Section9Labs/rupu/issues/42",
+    "event_present": true,
+    "issue_present": true
+  },
+  "execution": {
+    "backend": "local_worktree",
+    "permission_mode": "bypass",
+    "workspace_strategy": "managed_worktree",
+    "strict_templates": true
+  },
+  "autoflow": {
+    "name": "issue-supervisor-dispatch",
+    "claim_id": "github:Section9Labs/rupu/issues/42",
+    "priority": 100
+  },
+  "correlation": {
+    "parent_run_id": "run_parent",
+    "dispatch_group_id": "dispatch_01"
+  },
+  "worker": {
+    "requested_worker": "local",
+    "assigned_worker_id": "worker_local_cli"
+  }
+}
+```
+
+### `WakeRecord`
+
+Stored under `~/.rupu/autoflows/wakes/queue/` or `processed/`.
+
+```json
+{
+  "version": 1,
+  "wake_id": "wake_01JXYZ",
+  "source": "webhook",
+  "repo_ref": "github:Section9Labs/rupu",
+  "entity": {
+    "kind": "issue",
+    "ref": "github:Section9Labs/rupu/issues/42"
+  },
+  "event": {
+    "id": "github.issue.labeled",
+    "delivery_id": "delivery-123",
+    "dedupe_key": "github:issue:labeled:42:delivery-123"
+  },
+  "payload_ref": "/Users/matt/.rupu/autoflows/wakes/payloads/wake_01JXYZ.json",
+  "received_at": "2026-05-10T03:00:00Z",
+  "not_before": "2026-05-10T03:00:00Z"
+}
+```
+
+### `ArtifactManifest`
+
+Stored per run as `artifact_manifest.json`.
+
+```json
+{
+  "version": 1,
+  "run_id": "run_01JXYZ",
+  "backend_id": "local_worktree",
+  "worker_id": "worker_local_cli",
+  "generated_at": "2026-05-10T03:05:00Z",
+  "artifacts": [
+    {
+      "id": "art_run",
+      "kind": "run_record",
+      "name": "run-record",
+      "producer": "run",
+      "local_path": "/tmp/runs/run_01/run.json"
+    },
+    {
+      "id": "art_outcome",
+      "kind": "summary",
+      "name": "autoflow-outcome",
+      "producer": "step.finalize",
+      "inline_json": {
+        "status": "await_human",
+        "summary": "draft PR opened"
+      }
+    }
+  ]
+}
+```
+
+### `WorkerRecord`
+
+Stored under `~/.rupu/autoflows/workers/`.
+
+```json
+{
+  "version": 1,
+  "worker_id": "worker_local_team-mini_cli",
+  "kind": "cli",
+  "name": "team-mini",
+  "host": "team-mini.local",
+  "capabilities": {
+    "backends": ["local_worktree"],
+    "scm_hosts": ["github"],
+    "permission_modes": ["bypass", "readonly"]
+  },
+  "registered_at": "2026-05-10T03:00:00Z",
+  "last_seen_at": "2026-05-10T03:22:00Z"
+}
+```
+
+These records are the contract boundary for future cloud or hybrid execution. The local CLI already writes them, so any later control plane should treat them as the source of truth.
 
 ---
 

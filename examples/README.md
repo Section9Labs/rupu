@@ -150,6 +150,40 @@ rupu autoflow show issue-supervisor-dispatch --repo github:your-org/your-repo
 rupu autoflow tick
 ```
 
+### Always-on local worker
+
+```sh
+rupu repos attach github:your-org/your-repo .
+rupu autoflow serve --repo github:your-org/your-repo --worker laptop-01
+```
+
+### Operator recovery loop
+
+```sh
+rupu autoflow status --repo github:your-org/your-repo
+rupu autoflow wakes --repo github:your-org/your-repo
+rupu autoflow explain github:your-org/your-repo/issues/42
+rupu autoflow doctor --repo github:your-org/your-repo
+rupu autoflow repair github:your-org/your-repo/issues/42
+rupu autoflow requeue github:your-org/your-repo/issues/42 --event github.issue.reopened --not-before 5m
+```
+
+### Deployment modes
+
+- **Solo local**: `rupu cron tick --only-events` plus `rupu autoflow serve`
+- **Dedicated worker machine**: `rupu webhook serve` plus `rupu autoflow serve --worker build-box-01`
+- **Tunneled workstation**: local `rupu webhook serve` behind Tailscale, Cloudflare Tunnel, or ngrok
+- **Future hybrid**: `rupu.cloud` owns ingress and scheduling; local workers still run the same `rupu autoflow serve` command
+
+Portable runtime records:
+
+- `RunEnvelope`
+- `WakeRecord`
+- `ArtifactManifest`
+- `WorkerRecord`
+
+See `docs/using-rupu.md` for the concrete JSON shapes that future cloud consumers should treat as the runtime contract.
+
 ---
 
 ## Notes

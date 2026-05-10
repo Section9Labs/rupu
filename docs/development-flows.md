@@ -242,11 +242,27 @@ Use the controller pattern for larger repos. It keeps repo-specific decision log
 
 Recommended model: use `rupu autoflow tick` when you want stateless scheduled reconciliation, or `rupu autoflow serve` when you want one always-on local worker that keeps consuming due wakes with lower latency.
 
+```mermaid
+flowchart TD
+    A[issue opens or changes] --> B[wake source]
+    B -->|poll| C[rupu cron tick --only-events]
+    B -->|webhook hint| D[rupu webhook serve]
+    C --> E[wake queue]
+    D --> E
+    E --> F[rupu autoflow tick]
+    E --> G[rupu autoflow serve]
+    F --> H[workflow run]
+    G --> H
+    H --> I[claim state updated]
+    I --> J[next retry, approval, or dispatch]
+```
+
 Pick the deployment mode that matches the machine:
 
 - **Laptop / workstation**: poll issues and events locally, then schedule `rupu autoflow tick` or leave `rupu autoflow serve` running in one terminal/session.
 - **Dedicated worker box**: run `rupu autoflow serve` continuously and pair it with `rupu webhook serve` if the box is reachable from the internet.
 - **Tunneled workstation**: advanced only; place `rupu webhook serve` behind Tailscale, Cloudflare Tunnel, or ngrok if you want webhook latency without a public VM.
+- **Hybrid future**: let `rupu.cloud` own ingress and scheduling, while one or more local workers continue to run `rupu autoflow serve` with the same workflow files and persistent worktrees.
 
 - macOS `launchd`: run every 5 or 10 minutes
 - Linux `systemd --user` timer or cron

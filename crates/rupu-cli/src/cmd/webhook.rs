@@ -267,6 +267,7 @@ fn decode_dispatch_key(value: &str) -> anyhow::Result<DispatchKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
     use rupu_webhook::{WebhookEvent, WebhookSource};
     use serde_json::json;
 
@@ -388,6 +389,7 @@ mod tests {
 
     #[test]
     fn load_workflows_includes_tracked_repo_project_workflows() {
+        let _guard = ENV_LOCK.blocking_lock();
         let tmp = tempfile::tempdir().unwrap();
         let global = tmp.path().join("home");
         let tracked_repo = tmp.path().join("tracked");

@@ -202,6 +202,7 @@ async fn build_copilot(
 #[cfg(test)]
 mod build_copilot_tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
@@ -209,6 +210,7 @@ mod build_copilot_tests {
 
     #[tokio::test]
     async fn build_copilot_returns_provider() {
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let resolver = InMemoryResolver::new();
         resolver
@@ -228,6 +230,7 @@ mod build_copilot_tests {
 #[cfg(test)]
 mod build_openai_tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
@@ -235,6 +238,7 @@ mod build_openai_tests {
 
     #[tokio::test]
     async fn build_openai_returns_provider() {
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let resolver = InMemoryResolver::new();
         resolver
@@ -252,6 +256,7 @@ mod build_openai_tests {
 
     #[tokio::test]
     async fn build_openai_missing_credential_errors() {
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let resolver = InMemoryResolver::new();
         // No credentials inserted — resolver returns missing-credential error.
@@ -266,6 +271,7 @@ mod build_openai_tests {
 #[cfg(test)]
 mod build_gemini_tests {
     use super::*;
+    use crate::test_support::ENV_LOCK;
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
@@ -273,6 +279,7 @@ mod build_gemini_tests {
 
     #[tokio::test]
     async fn build_gemini_with_api_key_returns_provider() {
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let resolver = InMemoryResolver::new();
         resolver
@@ -288,6 +295,7 @@ mod build_gemini_tests {
 
     #[tokio::test]
     async fn build_gemini_missing_credential_errors() {
+        let _guard = ENV_LOCK.lock().await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
         let resolver = InMemoryResolver::new();
         let result = build_for_provider("gemini", "gemini-2.5-pro", None, &resolver).await;

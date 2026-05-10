@@ -131,20 +131,23 @@ Slice B-1 captures `Event::Usage` per response in JSONL transcripts. A `rupu usa
 
 Has its own design spec: [`docs/superpowers/specs/2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md`](docs/superpowers/specs/2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md) and implementation plan: [`docs/superpowers/plans/2026-05-09-rupu-autoflow-plan-2-portable-runtime-and-serve.md`](docs/superpowers/plans/2026-05-09-rupu-autoflow-plan-2-portable-runtime-and-serve.md).
 
-**Status:** Design + implementation plan ready.
+**Status:** Shipped.
 
-**Scope:**
+**What landed:**
 - `rupu autoflow serve` built on the same reconciliation engine as `tick`
 - normalized wake queue with replay protection / delivery dedupe
 - versioned `RunEnvelope`, `WakeRecord`, `ArtifactManifest`, and `WorkerRecord`
 - execution backend boundary with `local_worktree` as the first backend
 - richer operator tooling (`wakes`, `explain`, `doctor`, `repair`, `requeue`)
+- deployment-mode and runtime-contract docs for future Slice E consumers
 
 **Post-Plan-2 backlog (future Slice E consumers):**
 - cloud control plane / remote API implementation
 - cloud worker backend
 - registered local worker dispatch from `rupu.cloud`
 - object-storage-backed artifact transport
+- remote secret / credential brokering for cloud execution
+- fleet-level worker scheduling, routing, and admission control
 - documented or partially automated tunnel / edge deployment recipes for `webhook serve` (for example Tailscale Funnel, Cloudflare Tunnel, ngrok)
 
 ## Gemini API-key support via AI Studio ✅ shipped

@@ -1,5 +1,7 @@
 # rupu Autoflow Plan 2 — Portable Runtime and Serve Mode
 
+> **Status (2026-05-10): Implemented.** This plan is now historical. The phased rollout landed through PRs `#150` through `#155`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the runtime portability layer on top of autoflow v1 so `rupu` gains an always-on local worker mode, a canonical run envelope, a normalized wake queue, a backend abstraction, and operator-grade inspection / repair commands without introducing a second workflow engine.
@@ -235,11 +237,11 @@ flowchart LR
 
 Plan 2 is done if:
 
-- [ ] `rupu autoflow serve` ships and clearly reuses the `tick` engine
-- [ ] a run envelope is persisted for workflow and autoflow execution paths
-- [ ] webhook, retry, manual, and follow-up dispatches share one wake queue model
-- [ ] webhook replay protection is enforced by queue dedupe
-- [ ] the local worktree runtime is a backend implementation, not the only runtime shape
-- [ ] runs emit artifact manifests and record worker/backend provenance
-- [ ] operators can inspect wakes and explain / doctor / requeue stuck work
-- [ ] the resulting contracts are explicit enough that a future `rupu.cloud` service could dispatch both cloud workers and registered local workers without replacing the workflow engine
+- [x] `rupu autoflow serve` ships and clearly reuses the `tick` engine
+- [x] a run envelope is persisted for workflow and autoflow execution paths
+- [x] webhook, retry, manual, and follow-up dispatches share one wake queue model
+- [x] webhook replay protection is enforced by queue dedupe
+- [x] the local worktree runtime is a backend implementation, not the only runtime shape
+- [x] runs emit artifact manifests and record worker/backend provenance
+- [x] operators can inspect wakes and explain / doctor / repair / requeue stuck work
+- [x] the resulting contracts are explicit enough that a future `rupu.cloud` service could dispatch both cloud workers and registered local workers without replacing the workflow engine

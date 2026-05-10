@@ -15,6 +15,13 @@ pub mod provider_factory;
 pub mod run_target;
 pub mod templates;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use tokio::sync::Mutex;
+
+    pub static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+}
+
 use clap::{CommandFactory, Parser, Subcommand};
 use std::process::ExitCode;
 
