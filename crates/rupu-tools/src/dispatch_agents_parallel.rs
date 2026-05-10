@@ -132,7 +132,10 @@ impl Tool for DispatchAgentsParallelTool {
                 if !seen.insert(req.id.clone()) {
                     return Ok(err_output(
                         started,
-                        format!("duplicate_id: `{}` appears more than once in `agents`", req.id),
+                        format!(
+                            "duplicate_id: `{}` appears more than once in `agents`",
+                            req.id
+                        ),
                     ));
                 }
             }
@@ -209,7 +212,8 @@ impl Tool for DispatchAgentsParallelTool {
             }));
         }
 
-        let mut entries: Vec<(usize, AgentRequest, Result<_, _>)> = Vec::with_capacity(handles.len());
+        let mut entries: Vec<(usize, AgentRequest, Result<_, _>)> =
+            Vec::with_capacity(handles.len());
         for handle in handles {
             match handle.await {
                 Ok(triple) => entries.push(triple),
@@ -308,7 +312,12 @@ mod tests {
             entries: impl IntoIterator<Item = (&'static str, Result<DispatchOutcome, DispatchError>)>,
         ) -> Self {
             Self {
-                scripted: Mutex::new(entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
+                scripted: Mutex::new(
+                    entries
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect(),
+                ),
             }
         }
 
@@ -366,11 +375,13 @@ mod tests {
     async fn errors_when_agents_list_empty() {
         let tool = DispatchAgentsParallelTool;
         let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher::new([]));
-        let ctx = ctx_with(Some(disp), Some(vec!["sec".into()]), Some("run_X".into()), 0);
-        let out = tool
-            .invoke(json!({ "agents": [] }), &ctx)
-            .await
-            .unwrap();
+        let ctx = ctx_with(
+            Some(disp),
+            Some(vec!["sec".into()]),
+            Some("run_X".into()),
+            0,
+        );
+        let out = tool.invoke(json!({ "agents": [] }), &ctx).await.unwrap();
         assert!(out.error.as_deref().unwrap().contains("no_agents"));
     }
 
@@ -381,7 +392,12 @@ mod tests {
             "sec",
             Ok(StubDispatcher::ok("sec", "ok", 1)),
         )]));
-        let ctx = ctx_with(Some(disp), Some(vec!["sec".into()]), Some("run_X".into()), 0);
+        let ctx = ctx_with(
+            Some(disp),
+            Some(vec!["sec".into()]),
+            Some("run_X".into()),
+            0,
+        );
         let out = tool
             .invoke(
                 json!({ "agents": [
@@ -403,7 +419,12 @@ mod tests {
             ("bad", Ok(StubDispatcher::ok("bad", "b", 1))),
         ]));
         // Only `sec` is in the allowlist — `bad` should trip the gate.
-        let ctx = ctx_with(Some(disp), Some(vec!["sec".into()]), Some("run_X".into()), 0);
+        let ctx = ctx_with(
+            Some(disp),
+            Some(vec!["sec".into()]),
+            Some("run_X".into()),
+            0,
+        );
         let out = tool
             .invoke(
                 json!({ "agents": [

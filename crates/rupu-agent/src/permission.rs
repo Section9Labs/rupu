@@ -228,4 +228,3 @@ impl<'w> PermissionPrompt<'static, 'w, std::io::Stderr> {
         }
     }
 }
-

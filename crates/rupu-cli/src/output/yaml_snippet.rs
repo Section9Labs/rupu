@@ -49,12 +49,13 @@ pub fn render_input_error(err: &RunWorkflowError, path: &Path, body: &str) -> St
         ),
         RunWorkflowError::UndeclaredInput { name } => (
             name,
-            format!("remove `--input {name}=...` or declare `{name}` under `inputs:` in the workflow"),
+            format!(
+                "remove `--input {name}=...` or declare `{name}` under `inputs:` in the workflow"
+            ),
         ),
-        RunWorkflowError::InputNotInEnum { name, allowed, .. } => (
-            name,
-            format!("expected one of: {}", allowed.join(", ")),
-        ),
+        RunWorkflowError::InputNotInEnum { name, allowed, .. } => {
+            (name, format!("expected one of: {}", allowed.join(", ")))
+        }
         RunWorkflowError::InputTypeMismatch { name, ty, .. } => {
             (name, format!("expected a {ty} value"))
         }
@@ -117,8 +118,7 @@ fn build_snippet(body: &str, name: &str) -> Option<SnippetBlock> {
                 return None;
             }
             let trimmed = l.trim_start();
-            if trimmed == target_prefix.trim_end_matches(':')
-                || trimmed.starts_with(&target_prefix)
+            if trimmed == target_prefix.trim_end_matches(':') || trimmed.starts_with(&target_prefix)
             {
                 Some(i)
             } else {

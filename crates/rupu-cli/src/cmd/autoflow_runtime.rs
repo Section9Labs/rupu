@@ -5,7 +5,9 @@ use crate::cmd::workflow::{
 use crate::paths;
 use anyhow::Context;
 use rupu_auth::CredentialResolver;
-use rupu_runtime::{WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeSource, WakeStore};
+use rupu_runtime::{
+    WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeSource, WakeStore,
+};
 use rupu_workspace::{
     AutoflowClaimRecord, AutoflowClaimStore, ClaimStatus, RepoRegistryStore, WorkerKind,
 };
@@ -395,7 +397,11 @@ pub(crate) async fn serve_with_resolver(
 ) -> anyhow::Result<ServeReport> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
-    let worker = ServeWorker::acquire(&global, options.worker_name.as_deref(), options.repo_filter.as_deref())?;
+    let worker = ServeWorker::acquire(
+        &global,
+        options.worker_name.as_deref(),
+        options.repo_filter.as_deref(),
+    )?;
     let mut report = ServeReport::default();
     let mut cycle_index = 0usize;
 
@@ -538,12 +544,15 @@ fn enqueue_follow_up_wake(
     Ok(())
 }
 
-fn follow_up_wake_request(claim: &AutoflowClaimRecord) -> anyhow::Result<Option<WakeEnqueueRequest>> {
+fn follow_up_wake_request(
+    claim: &AutoflowClaimRecord,
+) -> anyhow::Result<Option<WakeEnqueueRequest>> {
     let (source, event_id, not_before) = match claim.status {
         ClaimStatus::RetryBackoff => (
             WakeSource::Retry,
             "autoflow.retry.due",
-            claim.next_retry_at
+            claim
+                .next_retry_at
                 .clone()
                 .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
         ),
@@ -571,9 +580,7 @@ fn follow_up_wake_request(claim: &AutoflowClaimRecord) -> anyhow::Result<Option<
             delivery_id: None,
             dedupe_key: Some(format!(
                 "{}:{}:{}",
-                event_id,
-                claim.issue_ref,
-                claim.updated_at
+                event_id, claim.issue_ref, claim.updated_at
             )),
         },
         payload: None,
