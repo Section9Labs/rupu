@@ -27,7 +27,7 @@ use clap::Subcommand;
 use rupu_config::PollSourceEntry;
 use rupu_orchestrator::cron_schedule::{next_fire_after, parse_schedule, should_fire};
 use rupu_orchestrator::{annotate_event_payload, matching_event_id, TriggerKind, Workflow};
-use rupu_scm::{Platform, RepoRef};
+use rupu_scm::EventSourceRef;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -262,11 +262,11 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
 
     for source in &triggers_cfg.poll_sources {
         let source_ref = source.source();
-        let Some((platform, repo)) = parse_poll_source(source_ref) else {
-            warn!(source = %source_ref, "invalid poll_sources entry; expected `<platform>:<owner>/<repo>`");
+        let Ok(event_source) = source_ref.parse::<EventSourceRef>() else {
+            warn!(source = %source_ref, "invalid poll_sources entry");
             continue;
         };
-        let last_polled_file = last_polled_at_path(&cursors_root, platform, &repo);
+        let last_polled_file = last_polled_at_path(&cursors_root, &event_source);
         match poll_source_due(source, &last_polled_file, Utc::now()) {
             Ok(true) => {}
             Ok(false) => {
@@ -277,19 +277,21 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
                 warn!(source = %source_ref, error = %e, "invalid poll interval; polling anyway");
             }
         }
-        let Some(connector) = registry.events(platform) else {
+        let Some(connector) = registry.events_for_source(&event_source) else {
             info!(
                 source = %source_ref,
-                "no event connector for platform — run `rupu auth login --provider {}`",
-                platform.as_str()
+                "no event connector configured for trigger source"
             );
             continue;
         };
 
-        let cursor_file = cursor_path(&cursors_root, platform, &repo);
+        let cursor_file = cursor_path(&cursors_root, &event_source);
         let cursor = read_cursor(&cursor_file).ok();
 
-        let result = match connector.poll_events(&repo, cursor.as_deref(), max).await {
+        let result = match connector
+            .poll_events(&event_source, cursor.as_deref(), max)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!(source = %source_ref, error = %e, "poll_events failed; will retry next tick");
@@ -324,7 +326,7 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
                 else {
                     continue;
                 };
-                let event_payload = build_event_payload(event, platform, &matched_event_id);
+                let event_payload = build_event_payload(event, &matched_event_id);
                 if let Some(filter) = &wf.filter {
                     match evaluate_filter(filter, &event_payload) {
                         Ok(true) => {}
@@ -347,7 +349,12 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
                     }
                 }
 
-                let run_id = format!("evt-{}-{}-{}", wf.name, platform.as_str(), event.delivery);
+                let run_id = format!(
+                    "evt-{}-{}-{}",
+                    wf.name,
+                    source_slug(&event.source),
+                    event.delivery
+                );
 
                 if dry_run {
                     println!(
@@ -456,9 +463,9 @@ async fn events(no_color: bool) -> anyhow::Result<()> {
             .triggers
             .poll_sources
             .iter()
-            .filter_map(|s| parse_poll_source(s.source()))
-            .find_map(|(platform, repo)| {
-                let path = cursor_path(&cursors_root, platform, &repo);
+            .filter_map(|s| s.source().parse::<EventSourceRef>().ok())
+            .find_map(|source| {
+                let path = cursor_path(&cursors_root, &source);
                 read_cursor(&path).ok()
             })
             .unwrap_or_else(|| "(none)".into());
@@ -545,27 +552,6 @@ fn push_event(dir: &Path, into: &mut BTreeMap<String, EventWorkflow>) {
     }
 }
 
-fn parse_poll_source(s: &str) -> Option<(Platform, RepoRef)> {
-    let (platform_str, rest) = s.split_once(':')?;
-    let (owner, repo) = rest.split_once('/')?;
-    let platform = match platform_str {
-        "github" => Platform::Github,
-        "gitlab" => Platform::Gitlab,
-        _ => return None,
-    };
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((
-        platform,
-        RepoRef {
-            platform,
-            owner: owner.into(),
-            repo: repo.into(),
-        },
-    ))
-}
-
 fn format_poll_source_entry(source: &PollSourceEntry) -> String {
     match source.poll_interval() {
         Some(interval) => format!("{}@{interval}", source.source()),
@@ -573,11 +559,23 @@ fn format_poll_source_entry(source: &PollSourceEntry) -> String {
     }
 }
 
-/// `<global>/cron-state/event-cursors/<vendor>/<owner>--<repo>.cursor`.
-/// `--` separator avoids ambiguity if either name contains `/`.
-fn cursor_path(root: &Path, platform: Platform, repo: &RepoRef) -> PathBuf {
-    root.join(platform.as_str())
-        .join(format!("{}--{}.cursor", repo.owner, repo.repo))
+fn source_slug(source: &EventSourceRef) -> String {
+    let text = match source {
+        EventSourceRef::Repo { repo } => format!("repo-{}-{}", repo.owner, repo.repo),
+        EventSourceRef::TrackerProject { project, .. } => format!("project-{project}"),
+    };
+    text.chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect()
+}
+
+/// `<global>/cron-state/event-cursors/<vendor>/<source>.cursor`.
+fn cursor_path(root: &Path, source: &EventSourceRef) -> PathBuf {
+    root.join(source.vendor())
+        .join(format!("{}.cursor", source_slug(source)))
 }
 
 fn read_cursor(path: &Path) -> anyhow::Result<String> {
@@ -594,9 +592,9 @@ fn write_cursor(path: &Path, body: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn last_polled_at_path(root: &Path, platform: Platform, repo: &RepoRef) -> PathBuf {
-    root.join(platform.as_str())
-        .join(format!("{}--{}.last_polled", repo.owner, repo.repo))
+fn last_polled_at_path(root: &Path, source: &EventSourceRef) -> PathBuf {
+    root.join(source.vendor())
+        .join(format!("{}.last_polled", source_slug(source)))
 }
 
 fn read_last_polled_at(path: &Path) -> anyhow::Result<DateTime<Utc>> {
@@ -650,22 +648,38 @@ fn parse_relative_duration(value: &str) -> anyhow::Result<chrono::Duration> {
 
 /// Build the JSON value bound as `{{event.*}}` in step prompts +
 /// `when:` filters. Spec §7.
-fn build_event_payload(
-    ev: &rupu_scm::PolledEvent,
-    platform: Platform,
-    matched_event_id: &str,
-) -> serde_json::Value {
-    let owner = &ev.repo.owner;
-    let name = &ev.repo.repo;
+fn build_event_payload(ev: &rupu_scm::PolledEvent, matched_event_id: &str) -> serde_json::Value {
+    let (vendor, repo, source) = match &ev.source {
+        EventSourceRef::Repo { repo } => (
+            repo.platform.as_str(),
+            serde_json::json!({
+                "full_name": format!("{}/{}", repo.owner, repo.repo),
+                "owner": repo.owner,
+                "name": repo.repo,
+            }),
+            serde_json::json!({
+                "kind": "repo",
+                "vendor": repo.platform.as_str(),
+                "ref": format!("{}:{}/{}", repo.platform.as_str(), repo.owner, repo.repo),
+            }),
+        ),
+        EventSourceRef::TrackerProject { tracker, project } => (
+            tracker.as_str(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "kind": "tracker_project",
+                "vendor": tracker.as_str(),
+                "project": project,
+                "ref": format!("{}:{project}", tracker.as_str()),
+            }),
+        ),
+    };
     let base = serde_json::json!({
         "id": ev.id,
-        "vendor": platform.as_str(),
+        "vendor": vendor,
         "delivery": ev.delivery,
-        "repo": {
-            "full_name": format!("{owner}/{name}"),
-            "owner": owner,
-            "name": name,
-        },
+        "repo": repo,
+        "source": source,
         "payload": ev.payload,
     });
     annotate_event_payload(&base, &ev.id, matched_event_id)
@@ -789,7 +803,6 @@ fn write_last_fired(path: &Path, ts: DateTime<Utc>) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use rupu_config::PollSourceSpec;
-    use rupu_scm::{Platform, RepoRef};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -818,12 +831,12 @@ mod tests {
     #[test]
     fn poll_source_due_respects_last_polled_timestamp() {
         let tmp = TempDir::new().unwrap();
-        let repo = RepoRef {
-            platform: Platform::Github,
+        let repo = rupu_scm::RepoRef {
+            platform: rupu_scm::Platform::Github,
             owner: "Section9Labs".into(),
             repo: "rupu".into(),
         };
-        let path = last_polled_at_path(tmp.path(), Platform::Github, &repo);
+        let path = last_polled_at_path(tmp.path(), &repo.into());
         write_last_polled_at(&path, Utc::now() - chrono::Duration::minutes(3)).unwrap();
         let entry = PollSourceEntry::Detailed(PollSourceSpec {
             source: "github:Section9Labs/rupu".into(),
@@ -839,11 +852,13 @@ mod tests {
         let event = rupu_scm::PolledEvent {
             id: "github.issue.labeled".into(),
             delivery: "evt-123".into(),
-            repo: RepoRef {
-                platform: Platform::Github,
+            source: rupu_scm::RepoRef {
+                platform: rupu_scm::Platform::Github,
                 owner: "Section9Labs".into(),
                 repo: "rupu".into(),
-            },
+            }
+            .into(),
+            subject: None,
             payload: json!({
                 "payload": {
                     "action": "labeled",
@@ -851,10 +866,35 @@ mod tests {
                 }
             }),
         };
-        let payload = build_event_payload(&event, Platform::Github, "issue.queue_entered");
+        let payload = build_event_payload(&event, "issue.queue_entered");
         assert_eq!(payload["id"], "issue.queue_entered");
         assert_eq!(payload["canonical_id"], "github.issue.labeled");
         assert_eq!(payload["repo"]["full_name"], "Section9Labs/rupu");
         assert_eq!(payload["payload"]["payload"]["issue"]["number"], 42);
+    }
+
+    #[test]
+    fn build_event_payload_for_tracker_source_uses_source_block() {
+        let event = rupu_scm::PolledEvent {
+            id: "linear.issue.updated".into(),
+            delivery: "evt-456".into(),
+            source: rupu_scm::EventSourceRef::TrackerProject {
+                tracker: rupu_scm::IssueTracker::Linear,
+                project: "workspace-123".into(),
+            },
+            subject: None,
+            payload: json!({
+                "state": {
+                    "before": { "id": "todo" },
+                    "after": { "id": "in_progress" }
+                }
+            }),
+        };
+        let payload = build_event_payload(&event, "issue.state_changed");
+        assert_eq!(payload["id"], "issue.state_changed");
+        assert_eq!(payload["canonical_id"], "linear.issue.updated");
+        assert_eq!(payload["vendor"], "linear");
+        assert_eq!(payload["repo"], json!({}));
+        assert_eq!(payload["source"]["project"], "workspace-123");
     }
 }

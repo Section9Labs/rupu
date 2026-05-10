@@ -33,7 +33,9 @@ impl PollSourceEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PollSourceSpec {
-    /// Repo to poll. Format: `<platform>:<owner>/<repo>`.
+    /// Source to poll. Today shipped poll connectors accept repo sources
+    /// like `<platform>:<owner>/<repo>` and future tracker-native sources
+    /// such as `linear:<workspace-or-project>` and `jira:<project>`.
     pub source: String,
     /// Optional per-source cadence override like `1m`, `5m`, `1h`.
     /// When unset, the source is eligible on every `rupu cron tick`
@@ -44,8 +46,11 @@ pub struct PollSourceSpec {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TriggersConfig {
-    /// Repos to poll for event-triggered workflows. Format:
-    /// `<platform>:<owner>/<repo>` (e.g. `github:Section9Labs/rupu`).
+    /// Sources to poll for event-triggered workflows. Repo-backed
+    /// examples: `github:Section9Labs/rupu`, `gitlab:group/project`.
+    /// Tracker-native examples are reserved for future connectors,
+    /// e.g. `linear:<workspace-or-project>`, `jira:<project>`.
+    ///
     /// Each tick: rupu queries the corresponding `EventConnector`
     /// for events since the last persisted cursor.
     ///

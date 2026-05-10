@@ -13,6 +13,7 @@ use crate::connectors::gitlab::extras::GitlabExtras;
 use crate::connectors::{IssueConnector, RepoConnector};
 use crate::event_connector::EventConnector;
 use crate::platform::{IssueTracker, Platform};
+use crate::types::EventSourceRef;
 
 /// Registry that builds connectors from configured credentials.
 /// Connectors are discovered once during [`discover`] and cached
@@ -109,6 +110,18 @@ impl Registry {
     /// registered. Used by `rupu cron tick`'s polled-events tier.
     pub fn events(&self, p: Platform) -> Option<Arc<dyn EventConnector>> {
         self.event_connectors.get(&p).cloned()
+    }
+
+    /// Retrieve the EventConnector suitable for a trigger source.
+    pub fn events_for_source(&self, source: &EventSourceRef) -> Option<Arc<dyn EventConnector>> {
+        match source {
+            EventSourceRef::Repo { repo } => self.events(repo.platform),
+            EventSourceRef::TrackerProject { tracker, .. } => match tracker {
+                IssueTracker::Github => self.events(Platform::Github),
+                IssueTracker::Gitlab => self.events(Platform::Gitlab),
+                IssueTracker::Linear | IssueTracker::Jira => None,
+            },
+        }
     }
 
     /// Test/internal: register an `EventConnector` directly.

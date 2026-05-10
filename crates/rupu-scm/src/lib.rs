@@ -21,6 +21,7 @@ pub use event_connector::{EventConnector, EventPollResult, PolledEvent};
 pub use platform::{IssueTracker, Platform};
 pub use registry::Registry;
 pub use types::{
-    Branch, Comment, CreateIssue, CreatePr, Diff, FileContent, Issue, IssueFilter, IssueRef,
-    IssueState, PipelineTrigger, Pr, PrFilter, PrRef, PrState, Repo, RepoRef, WorkflowDispatch,
+    Branch, Comment, CreateIssue, CreatePr, Diff, EventSourceRef, EventSubjectRef, FileContent,
+    Issue, IssueFilter, IssueRef, IssueState, PipelineTrigger, Pr, PrFilter, PrRef, PrState, Repo,
+    RepoRef, WorkflowDispatch,
 };

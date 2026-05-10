@@ -20,7 +20,7 @@ use tracing::debug;
 use crate::error::{classify_scm_error, ScmError};
 use crate::event_connector::{EventConnector, EventPollResult, PolledEvent};
 use crate::platform::Platform;
-use crate::types::RepoRef;
+use crate::types::{EventSourceRef, EventSubjectRef, IssueRef, PrRef, RepoRef};
 
 pub struct GitlabEventConnector {
     http: reqwest::Client,
@@ -45,10 +45,18 @@ impl GitlabEventConnector {
 impl EventConnector for GitlabEventConnector {
     async fn poll_events(
         &self,
-        repo: &RepoRef,
+        source: &EventSourceRef,
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<EventPollResult, ScmError> {
+        let repo = match source {
+            EventSourceRef::Repo { repo } => repo,
+            _ => {
+                return Err(ScmError::BadRequest {
+                    message: "gitlab events polling only supports repo sources".to_string(),
+                });
+            }
+        };
         let cursor = parse_cursor(cursor);
 
         // First poll: emit nothing, set since = now.
@@ -146,10 +154,12 @@ impl EventConnector for GitlabEventConnector {
                     last_created_at = Some(dt.with_timezone(&Utc));
                 }
             }
+            let subject = gitlab_subject(repo, &id, raw_ev);
             events.push(PolledEvent {
                 id,
                 delivery,
-                repo: repo.clone(),
+                source: source.clone(),
+                subject,
                 payload: (*raw_ev).clone(),
             });
         }
@@ -160,6 +170,60 @@ impl EventConnector for GitlabEventConnector {
             next_cursor: encode_cursor(&Cursor { since: new_since }),
         })
     }
+}
+
+fn gitlab_subject(repo: &RepoRef, event_id: &str, raw_ev: &Value) -> Option<EventSubjectRef> {
+    if event_id.starts_with("gitlab.issue.") || event_id == "gitlab.comment" {
+        let number = raw_ev
+            .get("target_iid")
+            .and_then(|value| value.as_u64())
+            .or_else(|| {
+                raw_ev
+                    .get("object_attributes")
+                    .and_then(|obj| obj.get("iid"))
+                    .and_then(|value| value.as_u64())
+            })
+            .or_else(|| {
+                raw_ev
+                    .get("issue")
+                    .and_then(|issue| issue.get("iid"))
+                    .and_then(|value| value.as_u64())
+            })?;
+        return Some(EventSubjectRef::Issue {
+            issue: IssueRef {
+                tracker: crate::platform::IssueTracker::Gitlab,
+                project: format!("{}/{}", repo.owner, repo.repo),
+                number,
+            },
+        });
+    }
+    if event_id.starts_with("gitlab.mr.") {
+        let number = raw_ev
+            .get("target_iid")
+            .and_then(|value| value.as_u64())
+            .or_else(|| {
+                raw_ev
+                    .get("object_attributes")
+                    .and_then(|obj| obj.get("iid"))
+                    .and_then(|value| value.as_u64())
+            })
+            .or_else(|| {
+                raw_ev
+                    .get("merge_request")
+                    .and_then(|mr| mr.get("iid"))
+                    .and_then(|value| value.as_u64())
+            })?;
+        return Some(EventSubjectRef::Pr {
+            pr: PrRef {
+                repo: repo.clone(),
+                number: number as u32,
+            },
+        });
+    }
+    if event_id == "gitlab.push" {
+        return Some(EventSubjectRef::Repo { repo: repo.clone() });
+    }
+    None
 }
 
 #[derive(Debug, Clone, Default)]
@@ -310,7 +374,8 @@ mod tests {
     #[tokio::test]
     async fn first_poll_returns_empty_with_warmup_cursor() {
         let c = GitlabEventConnector::new("fake".into(), Some("http://127.0.0.1:1".into()));
-        let r = c.poll_events(&rr(), None, 50).await.unwrap();
+        let source: EventSourceRef = rr().into();
+        let r = c.poll_events(&source, None, 50).await.unwrap();
         assert_eq!(r.events.len(), 0);
         assert!(r.next_cursor.contains("since:"));
     }

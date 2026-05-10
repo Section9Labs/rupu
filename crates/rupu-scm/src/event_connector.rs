@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::error::ScmError;
-use crate::types::RepoRef;
+use crate::types::{EventSourceRef, EventSubjectRef};
 
 /// Result of one `poll_events` call.
 #[derive(Debug, Clone)]
@@ -44,9 +44,13 @@ pub struct PolledEvent {
     /// Vendor-side unique id for this delivery. Used by the dispatcher
     /// to derive a deterministic run-id for idempotent fires.
     pub delivery: String,
-    /// Repo this event came from. Forms part of the `{{event.repo.*}}`
-    /// template binding.
-    pub repo: RepoRef,
+    /// Source this event came from. Repo-backed sources populate
+    /// `event.repo.*`; tracker-backed sources populate `event.source.*`
+    /// and any normalized tracker-specific fields.
+    pub source: EventSourceRef,
+    /// Best-effort entity referenced by the delivery. Missing when the
+    /// vendor feed does not clearly identify a single issue / PR.
+    pub subject: Option<EventSubjectRef>,
     /// Vendor's raw payload, passed through unmodified. Templates can
     /// reach inside via `{{event.payload.*}}`.
     pub payload: Value,
@@ -54,7 +58,7 @@ pub struct PolledEvent {
 
 #[async_trait]
 pub trait EventConnector: Send + Sync {
-    /// Return events for `repo` strictly newer than `cursor`, oldest-
+    /// Return events for `source` strictly newer than `cursor`, oldest-
     /// first. `limit` caps the returned count to honor rate-limit
     /// budgets; on overflow the cursor advances to the last-emitted
     /// event so the next call resumes correctly.
@@ -65,7 +69,7 @@ pub trait EventConnector: Send + Sync {
     /// This matches the documented behavior in §15 of the spec.
     async fn poll_events(
         &self,
-        repo: &RepoRef,
+        source: &EventSourceRef,
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<EventPollResult, ScmError>;

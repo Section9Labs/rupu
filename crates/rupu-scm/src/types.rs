@@ -4,6 +4,8 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
 use crate::platform::{IssueTracker, Platform};
 
@@ -13,6 +15,104 @@ pub struct RepoRef {
     pub platform: Platform,
     pub owner: String,
     pub repo: String,
+}
+
+/// Generic event source for polled trigger feeds.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventSourceRef {
+    Repo {
+        repo: RepoRef,
+    },
+    TrackerProject {
+        tracker: IssueTracker,
+        project: String,
+    },
+}
+
+impl EventSourceRef {
+    pub fn vendor(&self) -> &'static str {
+        match self {
+            Self::Repo { repo } => repo.platform.as_str(),
+            Self::TrackerProject { tracker, .. } => tracker.as_str(),
+        }
+    }
+
+    pub fn repo(&self) -> Option<&RepoRef> {
+        match self {
+            Self::Repo { repo } => Some(repo),
+            Self::TrackerProject { .. } => None,
+        }
+    }
+
+    pub fn tracker(&self) -> Option<IssueTracker> {
+        match self {
+            Self::Repo { repo } => match repo.platform {
+                Platform::Github => Some(IssueTracker::Github),
+                Platform::Gitlab => Some(IssueTracker::Gitlab),
+            },
+            Self::TrackerProject { tracker, .. } => Some(*tracker),
+        }
+    }
+
+    pub fn source_ref_text(&self) -> String {
+        match self {
+            Self::Repo { repo } => {
+                format!("{}:{}/{}", repo.platform.as_str(), repo.owner, repo.repo)
+            }
+            Self::TrackerProject { tracker, project } => {
+                format!("{}:{project}", tracker.as_str())
+            }
+        }
+    }
+}
+
+impl fmt::Display for EventSourceRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.source_ref_text())
+    }
+}
+
+impl From<RepoRef> for EventSourceRef {
+    fn from(repo: RepoRef) -> Self {
+        Self::Repo { repo }
+    }
+}
+
+impl FromStr for EventSourceRef {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (kind, rest) = value
+            .split_once(':')
+            .ok_or_else(|| format!("invalid trigger source `{value}`"))?;
+        if rest.is_empty() {
+            return Err(format!("invalid trigger source `{value}`"));
+        }
+        match kind {
+            "github" | "gitlab" => {
+                let (owner, repo) = rest
+                    .rsplit_once('/')
+                    .ok_or_else(|| format!("invalid repo trigger source `{value}`"))?;
+                if owner.is_empty() || repo.is_empty() {
+                    return Err(format!("invalid repo trigger source `{value}`"));
+                }
+                let platform = Platform::from_str(kind)?;
+                Ok(Self::Repo {
+                    repo: RepoRef {
+                        platform,
+                        owner: owner.to_string(),
+                        repo: repo.to_string(),
+                    },
+                })
+            }
+            "linear" | "jira" => Ok(Self::TrackerProject {
+                tracker: IssueTracker::from_str(kind)?,
+                project: rest.to_string(),
+            }),
+            other => Err(format!("unknown trigger source kind: {other}")),
+        }
+    }
 }
 
 /// Reference to a pull/merge request.
@@ -30,6 +130,15 @@ pub struct IssueRef {
     /// "owner/repo". For Linear: workspace UUID. Etc.
     pub project: String,
     pub number: u64,
+}
+
+/// Best-effort subject identified for one polled event.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EventSubjectRef {
+    Repo { repo: RepoRef },
+    Issue { issue: IssueRef },
+    Pr { pr: PrRef },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +300,26 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let back: RepoRef = serde_json::from_str(&json).unwrap();
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn event_source_ref_parses_repo_and_nested_gitlab_group() {
+        let github = EventSourceRef::from_str("github:Section9Labs/rupu").unwrap();
+        assert_eq!(github.source_ref_text(), "github:Section9Labs/rupu");
+        let gitlab = EventSourceRef::from_str("gitlab:group/subgroup/repo").unwrap();
+        assert_eq!(gitlab.source_ref_text(), "gitlab:group/subgroup/repo");
+        let repo = gitlab.repo().unwrap();
+        assert_eq!(repo.owner, "group/subgroup");
+        assert_eq!(repo.repo, "repo");
+    }
+
+    #[test]
+    fn event_source_ref_parses_tracker_project() {
+        let linear = EventSourceRef::from_str("linear:workspace-123").unwrap();
+        assert_eq!(linear.vendor(), "linear");
+        assert_eq!(linear.source_ref_text(), "linear:workspace-123");
+        assert!(linear.repo().is_none());
+        assert_eq!(linear.tracker(), Some(IssueTracker::Linear));
     }
 
     #[test]
