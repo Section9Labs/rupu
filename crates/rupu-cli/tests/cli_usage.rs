@@ -56,6 +56,32 @@ fn write_usage_transcript(
     path
 }
 
+fn write_standalone_usage_metadata(
+    dir: &Path,
+    run_id: &str,
+    repo_ref: &str,
+    issue_ref: Option<&str>,
+) {
+    let path = rupu_cli::standalone_run_metadata::metadata_path_for_run(dir, run_id);
+    rupu_cli::standalone_run_metadata::write_metadata(
+        &path,
+        &rupu_cli::standalone_run_metadata::StandaloneRunMetadata {
+            version: rupu_cli::standalone_run_metadata::StandaloneRunMetadata::VERSION,
+            run_id: run_id.into(),
+            workspace_path: PathBuf::from("/tmp/repo"),
+            project_root: Some(PathBuf::from("/tmp/project")),
+            repo_ref: Some(repo_ref.into()),
+            issue_ref: issue_ref.map(str::to_owned),
+            backend_id: "local_checkout".into(),
+            worker_id: Some("worker_local_cli".into()),
+            trigger_source: "run_cli".into(),
+            target: issue_ref.map(str::to_owned),
+            workspace_strategy: Some("direct_checkout".into()),
+        },
+    )
+    .unwrap();
+}
+
 fn sample_run_record(
     id: &str,
     workflow_name: &str,
@@ -360,6 +386,67 @@ fn usage_group_by_workflow_and_repo_filter_use_run_metadata() {
         .success()
         .stdout(predicate::str::contains("phase-delivery-cycle"))
         .stdout(predicate::str::contains("code-review-panel").not());
+}
+
+#[test]
+fn usage_repo_filter_includes_standalone_runs_with_sidecar_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join(".rupu");
+    let project = dir.path().join("project");
+    let transcripts = home.join("transcripts");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&transcripts).unwrap();
+
+    write_usage_transcript(
+        &transcripts,
+        "run_standalone_repo",
+        "reviewer",
+        "anthropic",
+        "claude-sonnet-4-6",
+        Utc::now(),
+        24,
+        8,
+    );
+    write_standalone_usage_metadata(
+        &transcripts,
+        "run_standalone_repo",
+        "github:Section9Labs/rupu",
+        Some("github:Section9Labs/rupu/issues/42"),
+    );
+    write_usage_transcript(
+        &transcripts,
+        "run_standalone_other",
+        "planner",
+        "openai",
+        "gpt-5",
+        Utc::now(),
+        12,
+        5,
+    );
+    write_standalone_usage_metadata(
+        &transcripts,
+        "run_standalone_other",
+        "github:OtherOrg/other",
+        Some("github:OtherOrg/other/issues/9"),
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&project)
+        .env("RUPU_HOME", &home)
+        .args([
+            "usage",
+            "--group-by",
+            "agent",
+            "--repo",
+            "github:Section9Labs/rupu",
+            "--since",
+            "30d",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reviewer"))
+        .stdout(predicate::str::contains("planner").not());
 }
 
 #[test]
