@@ -27,7 +27,7 @@ Has its own design spec: [`docs/superpowers/specs/2026-05-07-rupu-workflow-trigg
 - ✅ Trigger glob matching on `trigger.event:` (`github.issue.*`) is shipped.
 - ✅ Extended semantic trigger vocabulary is shipped for queue/activity aliases such as `issue.queue_entered`, `issue.queue_changed`, and `pr.review_activity`.
 - ✅ Per-source polling cadence overrides are shipped via `[triggers].poll_sources = [{ source = "...", poll_interval = "5m" }]`.
-- ⏳ Remaining trigger vocabulary follow-on — native issue-tracker queue/state events for connectors that model queues directly (for example Linear/Jira-style board transitions).
+- ⏳ Native tracker state events (Linear/Jira-style workflow-state transitions) are the next trigger-vocabulary follow-on. Design: [`docs/superpowers/specs/2026-05-10-rupu-native-tracker-state-events-design.md`](docs/superpowers/specs/2026-05-10-rupu-native-tracker-state-events-design.md). Plan 1: [`docs/superpowers/plans/2026-05-10-rupu-native-tracker-state-events-plan-1-foundation-and-linear-webhooks.md`](docs/superpowers/plans/2026-05-10-rupu-native-tracker-state-events-plan-1-foundation-and-linear-webhooks.md).
 - ⏳ Plan 3 (future, Slice E) — rupu.cloud webhook relay; cloud-as-connector or cloud-as-stream consumption.
 
 ## Workflow Tier 2 — fan-out, panel steps, approval gates
