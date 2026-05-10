@@ -209,6 +209,8 @@ rupu autoflow show issue-supervisor-dispatch
 rupu autoflow show issue-supervisor-dispatch --repo github:your-org/your-repo
 rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
 rupu autoflow tick
+rupu autoflow serve --repo github:your-org/your-repo
+rupu autoflow serve --repo github:your-org/your-repo --worker team-mini-01
 rupu autoflow status
 rupu autoflow status --repo github:your-org/your-repo
 rupu autoflow claims
@@ -286,7 +288,9 @@ Typical pattern:
 - attach the repo once with `rupu repos attach`
 - declare `autoflow:` and `contracts:` in the workflow YAML
 - store schemas under `.rupu/contracts/`
-- run `rupu autoflow tick` from a scheduler
+- choose an operator mode:
+  - `rupu autoflow tick` from an OS scheduler
+  - `rupu autoflow serve` as one always-on local worker
 - set `[autoflow].cleanup_after` if you want completed claims and their worktrees pruned automatically
 
 Operational cleanup:
@@ -301,6 +305,7 @@ rupu autoflow show issue-supervisor-dispatch
 rupu autoflow show issue-supervisor-dispatch --repo github:your-org/your-repo
 rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
 rupu autoflow tick
+rupu autoflow serve --repo github:your-org/your-repo --worker laptop-01
 ```
 
 Operational visibility:
@@ -315,6 +320,13 @@ Two useful shapes:
 - direct autoflow: owns one issue phase directly and returns `await_human` or `complete`
 
 See [workflow-format.md](workflow-format.md) for the `autoflow:` and `contracts:` schema and [examples/README.md](../examples/README.md) for copyable controller and direct examples.
+
+Deployment modes:
+
+- **Laptop, no inbound internet**: use `[triggers].poll_sources` plus `rupu cron tick --only-events`, then run `rupu autoflow tick` on a schedule or keep `rupu autoflow serve` running locally for lower-latency claim execution.
+- **Dedicated always-on machine**: run `rupu autoflow serve` continuously and optionally pair it with `rupu webhook serve` for faster wake hints.
+- **Tunneled workstation**: advanced users can expose `rupu webhook serve` behind Tailscale, Cloudflare Tunnel, or ngrok, but this is optional and not the default local setup.
+- **Future cloud relay**: long term, `rupu.cloud` can receive webhooks and dispatch the same workflow envelopes back to local or cloud workers. The workflow files do not change for that transition.
 
 ---
 
@@ -378,11 +390,11 @@ Typical crontab split:
 RUPU_GITHUB_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
 ```
 
-Use webhook mode when you want lower latency or event types that polling does not expose.
+Use webhook mode when you want lower latency or event types that polling does not expose. Laptop users usually should not expose a local webhook receiver directly; start with polling and `rupu autoflow tick` or `rupu autoflow serve` instead.
 
 `rupu webhook serve` now looks beyond the current checkout: it can load project workflows from tracked repos under `rupu repos ...`, and it dispatches the exact matched workflow file rather than resolving by bare workflow name from the server's cwd.
 
-When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and `rupu autoflow tick` consumes it on the next cycle.
+When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and the next `rupu autoflow tick` or active `rupu autoflow serve` cycle consumes it.
 
 ---
 

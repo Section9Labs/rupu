@@ -453,6 +453,7 @@ steps:
         run_id_override: Some("run_explicit_permissive".into()),
         strict_templates: false,
         run_envelope_template: None,
+        worker: None,
     };
     let summary = rupu_cli::cmd::workflow::run_with_explicit_context("auto-wf", ctx)
         .await
@@ -519,6 +520,7 @@ steps:
         run_id_override: Some("run_explicit_strict".into()),
         strict_templates: true,
         run_envelope_template: None,
+        worker: None,
     };
     let err = rupu_cli::cmd::workflow::run_with_explicit_context("auto-wf", strict_ctx)
         .await

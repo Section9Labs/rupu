@@ -191,10 +191,11 @@ Fields:
 Notes:
 
 - `autoflow:` does not replace `trigger:`. `trigger:` still describes one-shot starts; `autoflow:` describes persistent ownership over time.
-- Workflow files remain usable with `rupu workflow run`; autoflow semantics activate only under `rupu autoflow ...`.
+- Workflow files remain usable with `rupu workflow run`; autoflow semantics activate only under `rupu autoflow run`, `rupu autoflow tick`, or `rupu autoflow serve`.
 - Autoflow execution accepts only `bypass` or `readonly` permission modes. `ask` and any other value are rejected.
 - `autoflow` template rendering is strict. Missing variables are a protocol error in autonomous mode.
-- `wake_on` becomes actionable only when `rupu autoflow tick` can see matching SCM events, typically via `[triggers].poll_sources` for the repo or via webhook wake hints recorded by `rupu webhook serve`.
+- `wake_on` becomes actionable only when the autoflow runtime can see matching SCM events, typically via `[triggers].poll_sources` for the repo or via webhook wake hints recorded by `rupu webhook serve`.
+- Most laptop users should start with polling plus `rupu autoflow tick` or `rupu autoflow serve`; public webhook exposure is optional and better suited to always-on or tunneled machines.
 - Matching precedence is deterministic: higher `priority` wins, then workflow name.
 - On later ticks, an idle lower-priority claim can be released and replaced by a higher-priority winner. Active or approval-paused claims are not stolen automatically.
 - Operator-facing commands surface that decision: `rupu autoflow status` lists contested issues, and `rupu autoflow claims` shows the selected priority plus losing contenders.
