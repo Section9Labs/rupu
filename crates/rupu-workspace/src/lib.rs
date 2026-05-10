@@ -21,6 +21,7 @@ pub mod worktree_layout;
 // change between skeleton and implementation.
 pub mod discover;
 pub mod store;
+pub mod worker_store;
 
 pub use autoflow_claim::{AutoflowClaimRecord, AutoflowContender, ClaimStatus, PendingDispatch};
 pub use autoflow_claim_store::{
@@ -34,4 +35,6 @@ pub use record::{new_id, Workspace};
 pub use repo_record::TrackedRepo;
 pub use repo_store::{repo_ref_key, RepoRegistryStore, RepoStoreError};
 pub use store::{upsert, StoreError, WorkspaceStore};
+pub use worker_store::{WorkerStore, WorkerStoreError};
 pub use worktree_layout::{issue_dir_name, issue_worktree_path, repo_dir_name};
+pub use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};

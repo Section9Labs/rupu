@@ -10,6 +10,7 @@
 //! <global>/runs/<run-id>/
 //!   ├── run.json           # RunRecord — status, inputs, event, timestamps, awaiting_*
 //!   ├── run_envelope.json  # RunEnvelope — portable execution request snapshot
+//!   ├── artifact_manifest.json # ArtifactManifest — portable output inventory
 //!   ├── workflow.yaml      # snapshot of the workflow body at run start
 //!   └── step_results.jsonl # one StepResultRecord per completed step (append-only)
 //! ```
@@ -25,7 +26,7 @@
 
 use crate::runner::{ItemResult, StepResult};
 use chrono::{DateTime, Utc};
-use rupu_runtime::RunEnvelope;
+use rupu_runtime::{ArtifactManifest, RunEnvelope};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -149,6 +150,18 @@ pub struct RunRecord {
     /// See `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<String>,
+    /// Concrete execution backend used for this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_id: Option<String>,
+    /// Worker identity that executed this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    /// Path to the persisted artifact manifest for this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_manifest_path: Option<PathBuf>,
+    /// Source wake id when this run came from the durable wake queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_wake_id: Option<String>,
 }
 
 /// Workflow-step shape, persisted alongside the result so the
@@ -383,6 +396,10 @@ impl RunStore {
         self.run_dir(run_id).join("run_envelope.json")
     }
 
+    fn artifact_manifest(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("artifact_manifest.json")
+    }
+
     /// Create the run directory and persist initial `run.json` and
     /// the workflow YAML snapshot. Returns the created `RunRecord`.
     ///
@@ -537,6 +554,45 @@ impl RunStore {
         }
         let body = std::fs::read(&path)?;
         Ok(serde_json::from_slice(&body)?)
+    }
+
+    pub fn run_json_path(&self, run_id: &str) -> PathBuf {
+        self.run_json(run_id)
+    }
+
+    pub fn workflow_snapshot_path(&self, run_id: &str) -> PathBuf {
+        self.workflow_snapshot(run_id)
+    }
+
+    pub fn run_envelope_path(&self, run_id: &str) -> PathBuf {
+        self.run_envelope(run_id)
+    }
+
+    pub fn write_artifact_manifest(
+        &self,
+        run_id: &str,
+        manifest: &ArtifactManifest,
+    ) -> Result<PathBuf, RunStoreError> {
+        let dir = self.run_dir(run_id);
+        if !dir.exists() {
+            return Err(RunStoreError::NotFound(run_id.to_string()));
+        }
+        let path = self.artifact_manifest(run_id);
+        write_atomic(&path, &serde_json::to_vec_pretty(manifest)?)?;
+        Ok(path)
+    }
+
+    pub fn read_artifact_manifest(&self, run_id: &str) -> Result<ArtifactManifest, RunStoreError> {
+        let path = self.artifact_manifest(run_id);
+        if !path.is_file() {
+            return Err(RunStoreError::NotFound(run_id.to_string()));
+        }
+        let body = std::fs::read(&path)?;
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    pub fn artifact_manifest_path(&self, run_id: &str) -> PathBuf {
+        self.artifact_manifest(run_id)
     }
 
     /// List every run currently on disk, newest-first by
@@ -743,8 +799,8 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use rupu_runtime::{
-        ExecutionRequest, RepoBinding, RunContext, RunEnvelope, RunKind, RunTrigger,
-        RunTriggerSource, WorkflowBinding,
+        ArtifactKind, ArtifactManifest, ArtifactRef, ExecutionRequest, RepoBinding, RunContext,
+        RunEnvelope, RunKind, RunTrigger, RunTriggerSource, WorkflowBinding,
     };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -769,6 +825,10 @@ mod tests {
             issue_ref: None,
             issue: None,
             parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            source_wake_id: None,
         }
     }
 
@@ -888,6 +948,39 @@ mod tests {
 
         let err = store.write_run_envelope(&rec.id, &envelope).unwrap_err();
         assert!(matches!(err, RunStoreError::AlreadyExists(id) if id == rec.id));
+    }
+
+    #[test]
+    fn write_and_read_artifact_manifest_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_artifacts_01");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let manifest = ArtifactManifest {
+            version: ArtifactManifest::VERSION,
+            run_id: rec.id.clone(),
+            backend_id: "local_worktree".into(),
+            worker_id: Some("worker_local_cli".into()),
+            generated_at: Utc::now().to_rfc3339(),
+            artifacts: vec![ArtifactRef {
+                id: "art_run".into(),
+                kind: ArtifactKind::RunRecord,
+                name: "run-record".into(),
+                producer: "run".into(),
+                local_path: Some(PathBuf::from("/tmp/run.json")),
+                uri: None,
+                inline_json: None,
+            }],
+        };
+
+        let written = store
+            .write_artifact_manifest(&rec.id, &manifest)
+            .unwrap();
+        assert_eq!(written, store.artifact_manifest_path(&rec.id));
+
+        let loaded = store.read_artifact_manifest(&rec.id).unwrap();
+        assert_eq!(loaded, manifest);
     }
 
     #[test]

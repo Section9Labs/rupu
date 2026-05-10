@@ -20,9 +20,11 @@ use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::RunWorkflowError;
 use rupu_runtime::{
-    AutoflowEnvelope, ExecutionRequest, RepoBinding, RunContext, RunCorrelation, RunEnvelope,
-    RunKind, RunTrigger, RunTriggerSource, WorkerRequest, WorkflowBinding,
+    ArtifactKind, ArtifactManifest, ArtifactRef, AutoflowEnvelope, ExecutionBackend,
+    ExecutionRequest, PreparedRun, RepoBinding, RunContext, RunCorrelation, RunEnvelope, RunKind,
+    RunResult, RunResultStatus, RunTrigger, RunTriggerSource, WorkerRequest, WorkflowBinding,
 };
+use rupu_workspace::{WorkerKind, WorkerRecord, WorkerStore};
 use sha2::{Digest, Sha256};
 
 /// Convert a typed `RunWorkflowError` to `anyhow::Error`. Input
@@ -952,6 +954,9 @@ fn locate_workflow(name: &str) -> anyhow::Result<PathBuf> {
 pub struct RunOutcomeSummary {
     pub run_id: String,
     pub awaiting_step_id: Option<String>,
+    pub artifact_manifest_path: Option<PathBuf>,
+    pub backend_id: Option<String>,
+    pub worker_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -986,6 +991,21 @@ pub struct RunEnvelopeTemplate {
     pub requested_worker: Option<String>,
     pub target: Option<String>,
     pub correlation: Option<RunCorrelation>,
+}
+
+struct LocalWorktreeBackend;
+
+impl ExecutionBackend for LocalWorktreeBackend {
+    fn id(&self) -> &'static str {
+        "local_worktree"
+    }
+
+    fn can_execute(&self, envelope: &RunEnvelope) -> bool {
+        matches!(
+            envelope.execution.backend.as_deref(),
+            None | Some("local_worktree") | Some("local_checkout")
+        )
+    }
 }
 
 /// Public wrapper around the workflow-run pipeline so other
@@ -1337,6 +1357,7 @@ fn build_run_envelope(
     workflow_body: &str,
     workflow_path: &Path,
     ctx: &ExplicitWorkflowRunContext,
+    worker_id: &str,
 ) -> RunEnvelope {
     let template = ctx.run_envelope_template.clone().unwrap_or_default();
     let repo_ref = template.repo_ref.clone().or_else(|| {
@@ -1377,7 +1398,7 @@ fn build_run_envelope(
             issue_present: ctx.issue.is_some(),
         }),
         execution: ExecutionRequest {
-            backend: template.backend,
+            backend: Some(template.backend.unwrap_or_else(|| "local_worktree".to_string())),
             permission_mode: ctx.mode.clone(),
             workspace_strategy: template.workspace_strategy,
             strict_templates: ctx.strict_templates,
@@ -1390,17 +1411,246 @@ fn build_run_envelope(
             priority: template.autoflow_priority.unwrap_or_default(),
         }),
         correlation: template.correlation,
-        worker: template
-            .requested_worker
-            .map(|requested_worker| WorkerRequest {
-                requested_worker: Some(requested_worker),
-            }),
+        worker: Some(WorkerRequest {
+            requested_worker: template.requested_worker,
+            assigned_worker_id: Some(worker_id.to_string()),
+        }),
     }
 }
 
 fn workflow_fingerprint(body: &str) -> String {
     let digest = Sha256::digest(body.as_bytes());
     format!("sha256:{}", hex::encode(digest))
+}
+
+fn local_worker_id() -> String {
+    let host = local_host_name();
+    format!(
+        "worker_local_{}_{}_cli",
+        sanitize_worker_component(&whoami::username()),
+        sanitize_worker_component(&host)
+    )
+}
+
+fn local_host_name() -> String {
+    whoami::fallible::hostname().unwrap_or_else(|_| "unknown-host".to_string())
+}
+
+fn sanitize_worker_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn repo_host_from_ref(repo_ref: Option<&str>) -> Option<String> {
+    repo_ref
+        .and_then(|value| value.split(':').next())
+        .map(ToOwned::to_owned)
+}
+
+fn upsert_local_worker_record(
+    global: &Path,
+    worker_id: &str,
+    backend_id: &str,
+    permission_mode: &str,
+    repo_ref: Option<&str>,
+) -> anyhow::Result<WorkerRecord> {
+    let store = WorkerStore {
+        root: paths::autoflow_workers_dir(global),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let existing = store
+        .load(worker_id)
+        .map_err(|e| anyhow::anyhow!("load worker record: {e}"))?;
+    let registered_at = existing
+        .as_ref()
+        .map(|record| record.registered_at.clone())
+        .unwrap_or_else(|| now.clone());
+    let mut capabilities = existing.map(|record| record.capabilities).unwrap_or_default();
+    if !capabilities.backends.iter().any(|value| value == backend_id) {
+        capabilities.backends.push(backend_id.to_string());
+        capabilities.backends.sort();
+    }
+    if !capabilities
+        .permission_modes
+        .iter()
+        .any(|value| value == permission_mode)
+    {
+        capabilities
+            .permission_modes
+            .push(permission_mode.to_string());
+        capabilities.permission_modes.sort();
+    }
+    if let Some(host) = repo_host_from_ref(repo_ref) {
+        if !capabilities.scm_hosts.iter().any(|value| value == &host) {
+            capabilities.scm_hosts.push(host);
+            capabilities.scm_hosts.sort();
+        }
+    }
+    let record = WorkerRecord {
+        version: WorkerRecord::VERSION,
+        worker_id: worker_id.to_string(),
+        kind: WorkerKind::Cli,
+        name: format!("{}@{}", whoami::username(), local_host_name()),
+        host: local_host_name(),
+        capabilities,
+        registered_at,
+        last_seen_at: now,
+    };
+    store
+        .save(&record)
+        .map_err(|e| anyhow::anyhow!("save worker record: {e}"))?;
+    Ok(record)
+}
+
+fn prepare_local_run(envelope: &RunEnvelope, worker_id: &str) -> anyhow::Result<PreparedRun> {
+    let backend = LocalWorktreeBackend;
+    if !backend.can_execute(envelope) {
+        let backend_id = envelope
+            .execution
+            .backend
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(anyhow::anyhow!(
+            "unsupported execution backend `{backend_id}` for local workflow invocation"
+        ));
+    }
+    let repo = envelope.repo.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("run envelope is missing repo binding for local workflow invocation")
+    })?;
+    Ok(PreparedRun {
+        version: PreparedRun::VERSION,
+        run_id: envelope.run_id.clone(),
+        backend_id: envelope
+            .execution
+            .backend
+            .clone()
+            .unwrap_or_else(|| backend.id().to_string()),
+        workspace_path: repo.workspace_path.clone(),
+        project_root: repo.project_root.clone(),
+        repo_ref: repo.repo_ref.clone(),
+        issue_ref: envelope.context.as_ref().and_then(|ctx| ctx.issue_ref.clone()),
+        workspace_strategy: envelope.execution.workspace_strategy.clone(),
+        worker_id: Some(worker_id.to_string()),
+    })
+}
+
+fn build_artifact_manifest(
+    run_store: &rupu_orchestrator::RunStore,
+    run: &rupu_orchestrator::RunRecord,
+    prepared: &PreparedRun,
+) -> anyhow::Result<ArtifactManifest> {
+    let mut manifest = ArtifactManifest::new(run.id.clone(), prepared.backend_id.clone());
+    manifest.worker_id = prepared.worker_id.clone();
+    manifest.artifacts.push(ArtifactRef {
+        id: "art_run_record".into(),
+        kind: ArtifactKind::RunRecord,
+        name: "run-record".into(),
+        producer: "run".into(),
+        local_path: Some(run_store.run_json_path(&run.id)),
+        uri: None,
+        inline_json: None,
+    });
+    manifest.artifacts.push(ArtifactRef {
+        id: "art_run_envelope".into(),
+        kind: ArtifactKind::RunEnvelope,
+        name: "run-envelope".into(),
+        producer: "run".into(),
+        local_path: Some(run_store.run_envelope_path(&run.id)),
+        uri: None,
+        inline_json: None,
+    });
+    manifest.artifacts.push(ArtifactRef {
+        id: "art_workflow_snapshot".into(),
+        kind: ArtifactKind::WorkflowSnapshot,
+        name: "workflow-snapshot".into(),
+        producer: "run".into(),
+        local_path: Some(run_store.workflow_snapshot_path(&run.id)),
+        uri: None,
+        inline_json: None,
+    });
+    for step in run_store.read_step_results(&run.id)? {
+        manifest.artifacts.push(ArtifactRef {
+            id: format!(
+                "art_step_{}_transcript",
+                sanitize_worker_component(&step.step_id)
+            ),
+            kind: ArtifactKind::StepTranscript,
+            name: format!("{} transcript", step.step_id),
+            producer: format!("step.{}", step.step_id),
+            local_path: Some(step.transcript_path.clone()),
+            uri: None,
+            inline_json: None,
+        });
+    }
+    manifest.artifacts.push(ArtifactRef {
+        id: "art_run_summary".into(),
+        kind: ArtifactKind::Summary,
+        name: "run-summary".into(),
+        producer: "run".into(),
+        local_path: None,
+        uri: None,
+        inline_json: Some(serde_json::json!({
+            "status": run.status.as_str(),
+            "awaiting_step_id": run.awaiting_step_id,
+            "error_message": run.error_message,
+            "issue_ref": run.issue_ref,
+            "workspace_id": run.workspace_id,
+        })),
+    });
+    Ok(manifest)
+}
+
+fn run_result_status(status: rupu_orchestrator::RunStatus) -> RunResultStatus {
+    match status {
+        rupu_orchestrator::RunStatus::AwaitingApproval => RunResultStatus::AwaitingApproval,
+        rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
+            RunResultStatus::Failed
+        }
+        rupu_orchestrator::RunStatus::Pending
+        | rupu_orchestrator::RunStatus::Running
+        | rupu_orchestrator::RunStatus::Completed => RunResultStatus::Completed,
+    }
+}
+
+fn persist_portable_run_metadata(
+    run_store: &rupu_orchestrator::RunStore,
+    prepared: &PreparedRun,
+    source_wake_id: Option<&str>,
+) -> anyhow::Result<Option<(PathBuf, RunResult)>> {
+    let Ok(mut run) = run_store.load(&prepared.run_id) else {
+        return Ok(None);
+    };
+    run.backend_id = Some(prepared.backend_id.clone());
+    run.worker_id = prepared.worker_id.clone();
+    run.source_wake_id = source_wake_id.map(ToOwned::to_owned);
+
+    let manifest = build_artifact_manifest(run_store, &run, prepared)?;
+    let manifest_path = run_store.write_artifact_manifest(&prepared.run_id, &manifest)?;
+    run.artifact_manifest_path = Some(manifest_path.clone());
+    run_store.update(&run)?;
+
+    let result = RunResult {
+        version: RunResult::VERSION,
+        run_id: run.id.clone(),
+        backend_id: prepared.backend_id.clone(),
+        status: run_result_status(run.status),
+        worker_id: prepared.worker_id.clone(),
+        source_wake_id: source_wake_id.map(ToOwned::to_owned),
+        artifact_manifest: Some(manifest),
+    };
+    Ok(Some((manifest_path, result)))
 }
 
 async fn execute_workflow_invocation(
@@ -1419,7 +1669,24 @@ async fn execute_workflow_invocation(
         .run_id_override
         .clone()
         .unwrap_or_else(|| format!("run_{}", Ulid::new()));
-    let run_envelope = build_run_envelope(run_id.clone(), &workflow, &body, &path, &ctx);
+    let worker_id = local_worker_id();
+    let run_envelope = build_run_envelope(run_id.clone(), &workflow, &body, &path, &ctx, &worker_id);
+    let backend_id = run_envelope
+        .execution
+        .backend
+        .clone()
+        .unwrap_or_else(|| "local_worktree".to_string());
+    let worker_record = upsert_local_worker_record(
+        &global,
+        &worker_id,
+        &backend_id,
+        &ctx.mode,
+        run_envelope
+            .repo
+            .as_ref()
+            .and_then(|repo| repo.repo_ref.as_deref()),
+    )?;
+    let prepared_run = prepare_local_run(&run_envelope, &worker_record.worker_id)?;
     let resolver = Arc::new(rupu_auth::KeychainResolver::new());
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = ctx
@@ -1502,7 +1769,7 @@ async fn execute_workflow_invocation(
         strict_templates,
     };
 
-    let result = if ctx.attach_ui {
+    let workflow_result = if ctx.attach_ui {
         let existing_run_ids: std::collections::BTreeSet<String> = list_run_dir_entries(&runs_dir);
         let runner_task = tokio::spawn(run_workflow(opts));
         let new_run_id = wait_for_new_run_dir(&runs_dir, &existing_run_ids, 2_000).await;
@@ -1605,6 +1872,13 @@ async fn execute_workflow_invocation(
             .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
     };
 
+    let artifact_manifest_path = persist_portable_run_metadata(
+        run_store_for_resume.as_ref(),
+        &prepared_run,
+        run_envelope.trigger.wake_id.as_deref(),
+    )?
+    .map(|(path, _)| path);
+
     if notify_issue_enabled {
         if let (Some(ref_text), Some(payload)) =
             (&issue_ref_text_for_notify, &issue_payload_for_notify)
@@ -1614,15 +1888,18 @@ async fn execute_workflow_invocation(
                 ref_text,
                 payload,
                 &workflow_name_for_notify,
-                &result,
+                &workflow_result,
             )
             .await;
         }
     }
 
     Ok(RunOutcomeSummary {
-        run_id: result.run_id,
-        awaiting_step_id: result.awaiting.map(|a| a.step_id),
+        run_id: workflow_result.run_id,
+        awaiting_step_id: workflow_result.awaiting.map(|a| a.step_id),
+        artifact_manifest_path,
+        backend_id: Some(prepared_run.backend_id.clone()),
+        worker_id: prepared_run.worker_id.clone(),
     })
 }
 
