@@ -8,6 +8,7 @@ use assert_cmd::Command;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
 use rupu_workspace::RepoRegistryStore;
+use std::collections::BTreeMap;
 use std::process::Command as ProcessCommand;
 use tokio::sync::Mutex;
 
@@ -96,6 +97,60 @@ fn track_repo(home: &assert_fs::fixture::ChildPath, repo_ref: &str, path: &std::
         root: home.path().join("repos"),
     };
     store.upsert(repo_ref, path, None, None).unwrap();
+}
+
+fn enqueue_issue_wake(
+    home: &std::path::Path,
+    repo_ref: &str,
+    issue_ref: &str,
+    event_id: &str,
+    payload: Option<serde_json::Value>,
+) -> rupu_runtime::WakeRecord {
+    rupu_runtime::WakeStore::new(home.join("autoflows/wakes"))
+        .enqueue(rupu_runtime::WakeEnqueueRequest {
+            source: rupu_runtime::WakeSource::Manual,
+            repo_ref: repo_ref.into(),
+            entity: rupu_runtime::WakeEntity {
+                kind: rupu_runtime::WakeEntityKind::Issue,
+                ref_text: issue_ref.into(),
+            },
+            event: rupu_runtime::WakeEvent {
+                id: event_id.into(),
+                delivery_id: None,
+                dedupe_key: None,
+            },
+            payload,
+            received_at: chrono::Utc::now().to_rfc3339(),
+            not_before: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap()
+}
+
+fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord {
+    rupu_orchestrator::RunRecord {
+        id: id.into(),
+        workflow_name: "issue-supervisor-dispatch".into(),
+        status: rupu_orchestrator::RunStatus::Pending,
+        inputs: BTreeMap::new(),
+        event: None,
+        workspace_id: "ws_1".into(),
+        workspace_path: std::path::PathBuf::from("/tmp/proj"),
+        transcript_dir: std::path::PathBuf::from("/tmp/proj/.rupu/transcripts"),
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+        error_message: None,
+        awaiting_step_id: None,
+        approval_prompt: None,
+        awaiting_since: None,
+        expires_at: None,
+        issue_ref: Some(issue_ref.into()),
+        issue: None,
+        parent_run_id: None,
+        backend_id: Some("local_worktree".into()),
+        worker_id: Some("worker_local_test_cli".into()),
+        artifact_manifest_path: None,
+        source_wake_id: None,
+    }
 }
 
 #[test]
@@ -1230,4 +1285,317 @@ fn autoflow_status_filters_to_one_repo() {
         .stdout(predicate::str::contains("claimed"))
         .stdout(predicate::str::contains("await_human").not())
         .stdout(predicate::str::contains("github:Section9Labs/okegu/issues/9").not());
+}
+
+#[test]
+fn autoflow_wakes_lists_queued_and_processed_rows() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let repo_ref = "github:Section9Labs/rupu";
+    let issue_ref = "github:Section9Labs/rupu/issues/42";
+    let queued = enqueue_issue_wake(&home, repo_ref, issue_ref, "github.issue.opened", None);
+    let processed = enqueue_issue_wake(
+        &home,
+        repo_ref,
+        issue_ref,
+        "github.issue.labeled",
+        Some(serde_json::json!({ "payload": { "issue": { "number": 42 } } })),
+    );
+    rupu_runtime::WakeStore::new(home.join("autoflows/wakes"))
+        .mark_processed(&processed.wake_id)
+        .unwrap();
+    enqueue_issue_wake(
+        &home,
+        "github:Section9Labs/okegu",
+        "github:Section9Labs/okegu/issues/9",
+        "github.issue.opened",
+        None,
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["autoflow", "wakes", "--repo", repo_ref])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Wake"))
+        .stdout(predicate::str::contains(&queued.wake_id))
+        .stdout(predicate::str::contains(&processed.wake_id))
+        .stdout(predicate::str::contains("queued"))
+        .stdout(predicate::str::contains("processed"))
+        .stdout(predicate::str::contains("github:Section9Labs/okegu/issues/9").not());
+}
+
+#[test]
+fn autoflow_explain_prints_claim_run_and_wake_context() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let issue_ref = "github:Section9Labs/rupu/issues/42";
+    let repo_ref = "github:Section9Labs/rupu";
+    let source_wake = enqueue_issue_wake(&home, repo_ref, issue_ref, "github.issue.labeled", None);
+    rupu_runtime::WakeStore::new(home.join("autoflows/wakes"))
+        .mark_processed(&source_wake.wake_id)
+        .unwrap();
+    enqueue_issue_wake(&home, repo_ref, issue_ref, "autoflow.dispatch.pending", None);
+
+    let run_store = rupu_orchestrator::RunStore::new(home.join("runs"));
+    let mut run = sample_run_record("run_123", issue_ref);
+    run.status = rupu_orchestrator::RunStatus::AwaitingApproval;
+    run.awaiting_step_id = Some("review".into());
+    run.expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(30));
+    run.source_wake_id = Some(source_wake.wake_id.clone());
+    run_store.create(run, "name: issue-supervisor-dispatch\nsteps: []\n").unwrap();
+
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.join("autoflows/claims"),
+    };
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: issue_ref.into(),
+            repo_ref: repo_ref.into(),
+            workflow: "issue-supervisor-dispatch".into(),
+            status: rupu_workspace::ClaimStatus::AwaitHuman,
+            worktree_path: Some("/tmp/rupu/issue-42".into()),
+            branch: Some("rupu/issue-42".into()),
+            last_run_id: Some("run_123".into()),
+            last_error: None,
+            last_summary: Some("waiting for review".into()),
+            pr_url: None,
+            artifacts: None,
+            artifact_manifest_path: None,
+            next_retry_at: None,
+            claim_owner: Some("worker_local_test_serve".into()),
+            lease_expires_at: Some(
+                (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
+            ),
+            pending_dispatch: Some(rupu_workspace::PendingDispatch {
+                workflow: "phase-delivery-cycle".into(),
+                target: issue_ref.into(),
+                inputs: BTreeMap::from([("phase".into(), "phase-1".into())]),
+            }),
+            contenders: vec![
+                rupu_workspace::AutoflowContender {
+                    workflow: "issue-supervisor-dispatch".into(),
+                    priority: 100,
+                    scope: Some("project".into()),
+                    selected: true,
+                },
+                rupu_workspace::AutoflowContender {
+                    workflow: "phase-ready".into(),
+                    priority: 50,
+                    scope: Some("project".into()),
+                    selected: false,
+                },
+            ],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["autoflow", "explain", issue_ref])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("issue: github:Section9Labs/rupu/issues/42"))
+        .stdout(predicate::str::contains("workflow: issue-supervisor-dispatch"))
+        .stdout(predicate::str::contains("last run: run_123"))
+        .stdout(predicate::str::contains("last run status: awaiting_approval"))
+        .stdout(predicate::str::contains("source wake:"))
+        .stdout(predicate::str::contains("approval gate: step=review"))
+        .stdout(predicate::str::contains("pending dispatch: phase-delivery-cycle"))
+        .stdout(predicate::str::contains("queued wakes:"))
+        .stdout(predicate::str::contains("recent processed wake:"));
+}
+
+#[test]
+fn autoflow_doctor_reports_state_problems() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let issue_ref = "github:Section9Labs/rupu/issues/42";
+    let repo_ref = "github:Section9Labs/missing";
+    let wake = enqueue_issue_wake(
+        &home,
+        repo_ref,
+        issue_ref,
+        "github.issue.opened",
+        Some(serde_json::json!({ "payload": { "issue": { "number": 42 } } })),
+    );
+    let payload_path = home
+        .join("autoflows/wakes/payloads")
+        .join(format!("{}.json", wake.wake_id));
+    std::fs::remove_file(&payload_path).unwrap();
+
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.join("autoflows/claims"),
+    };
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: issue_ref.into(),
+            repo_ref: repo_ref.into(),
+            workflow: "issue-supervisor-dispatch".into(),
+            status: rupu_workspace::ClaimStatus::Claimed,
+            worktree_path: Some("/tmp/does-not-exist".into()),
+            branch: Some("rupu/issue-42".into()),
+            last_run_id: Some("run_missing".into()),
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            artifact_manifest_path: Some("/tmp/manifest-missing.json".into()),
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+    let issue_dir = home
+        .join("autoflows/claims")
+        .join(rupu_workspace::autoflow_claim_store::issue_key(issue_ref));
+    std::fs::create_dir_all(&issue_dir).unwrap();
+    std::fs::write(
+        issue_dir.join(".lock"),
+        toml::to_string(&rupu_workspace::ActiveLockRecord {
+            owner: "worker_local_test_serve".into(),
+            acquired_at: chrono::Utc::now().to_rfc3339(),
+            lease_expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["autoflow", "doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("missing_repo_binding"))
+        .stdout(predicate::str::contains("missing_worktree"))
+        .stdout(predicate::str::contains("artifact_missing"))
+        .stdout(predicate::str::contains("missing_run"))
+        .stdout(predicate::str::contains("invalid_wake_payload"))
+        .stdout(predicate::str::contains("stale_lock"));
+}
+
+#[test]
+fn autoflow_repair_rebuilds_worktree_and_drops_invalid_wake() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let project = tmp.path().join("repo");
+    init_git_checkout(&project, "git@github.com:Section9Labs/rupu.git");
+    let repo_store = rupu_workspace::RepoRegistryStore {
+        root: home.join("repos"),
+    };
+    repo_store
+        .upsert(
+            "github:Section9Labs/rupu",
+            &project,
+            Some("git@github.com:Section9Labs/rupu.git"),
+            Some("main"),
+        )
+        .unwrap();
+    let issue_ref = "github:Section9Labs/rupu/issues/42";
+    let expected_worktree = rupu_workspace::issue_worktree_path(
+        &home.join("autoflows/worktrees"),
+        "github:Section9Labs/rupu",
+        issue_ref,
+    );
+    let wake = enqueue_issue_wake(
+        &home,
+        "github:Section9Labs/rupu",
+        issue_ref,
+        "github.issue.opened",
+        Some(serde_json::json!({ "payload": { "issue": { "number": 42 } } })),
+    );
+    std::fs::remove_file(
+        home.join("autoflows/wakes/payloads")
+            .join(format!("{}.json", wake.wake_id)),
+    )
+    .unwrap();
+
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.join("autoflows/claims"),
+    };
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: issue_ref.into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            workflow: "issue-supervisor-dispatch".into(),
+            status: rupu_workspace::ClaimStatus::Claimed,
+            worktree_path: Some(expected_worktree.display().to_string()),
+            branch: Some("rupu/issue-42".into()),
+            last_run_id: None,
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            artifact_manifest_path: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["autoflow", "repair", issue_ref])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted invalid queued wake"))
+        .stdout(predicate::str::contains("rebuilt worktree"));
+
+    let claim = claim_store.load(issue_ref).unwrap().unwrap();
+    assert!(std::path::Path::new(claim.worktree_path.as_deref().unwrap()).exists());
+    assert!(rupu_runtime::WakeStore::new(home.join("autoflows/wakes"))
+        .list_queued()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn autoflow_requeue_enqueues_manual_wake() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let issue_ref = "github:Section9Labs/rupu/issues/42";
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args([
+            "autoflow",
+            "requeue",
+            issue_ref,
+            "--event",
+            "github.issue.reopened",
+            "--not-before",
+            "10m",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("queued wake_"));
+
+    let queued = rupu_runtime::WakeStore::new(home.join("autoflows/wakes"))
+        .list_queued()
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].source, rupu_runtime::WakeSource::Manual);
+    assert_eq!(queued[0].event.id, "github.issue.reopened");
+    assert_eq!(queued[0].entity.ref_text, issue_ref);
 }

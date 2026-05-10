@@ -153,28 +153,43 @@ impl WakeStore {
     pub fn list_due(&self, now: DateTime<Utc>) -> Result<Vec<WakeRecord>, WakeStoreError> {
         self.ensure_dirs()?;
         let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir(self.queue_dir()) else {
-            return Ok(out);
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let record: WakeRecord = serde_json::from_slice(&std::fs::read(&path)?)?;
+        for record in self.list_records_in(&self.queue_dir())? {
             let not_before = parse_rfc3339(&record.not_before)?;
             if not_before <= now {
                 out.push(record);
             }
         }
-        out.sort_by(|left, right| {
-            left.not_before
-                .cmp(&right.not_before)
-                .then_with(|| left.received_at.cmp(&right.received_at))
-                .then_with(|| left.wake_id.cmp(&right.wake_id))
-        });
         Ok(out)
+    }
+
+    pub fn list_queued(&self) -> Result<Vec<WakeRecord>, WakeStoreError> {
+        self.ensure_dirs()?;
+        self.list_records_in(&self.queue_dir())
+    }
+
+    pub fn list_processed(&self) -> Result<Vec<WakeRecord>, WakeStoreError> {
+        self.ensure_dirs()?;
+        self.list_records_in(&self.processed_dir())
+    }
+
+    pub fn load(&self, wake_id: &str) -> Result<WakeRecord, WakeStoreError> {
+        self.ensure_dirs()?;
+        for path in [self.queue_path(wake_id), self.processed_path(wake_id)] {
+            if path.is_file() {
+                let body = std::fs::read(&path)?;
+                return Ok(serde_json::from_slice(&body)?);
+            }
+        }
+        Err(WakeStoreError::NotFound(wake_id.to_string()))
+    }
+
+    pub fn read_payload(&self, wake_id: &str) -> Result<Option<Value>, WakeStoreError> {
+        let record = self.load(wake_id)?;
+        let Some(payload_ref) = record.payload_ref else {
+            return Ok(None);
+        };
+        let body = std::fs::read(payload_ref)?;
+        Ok(Some(serde_json::from_slice(&body)?))
     }
 
     pub fn mark_processed(&self, wake_id: &str) -> Result<WakeRecord, WakeStoreError> {
@@ -206,6 +221,32 @@ impl WakeStore {
         record.not_before = not_before.to_rfc3339();
         write_atomic_json(&path, &record)?;
         Ok(record)
+    }
+
+    pub fn delete(&self, wake_id: &str) -> Result<Option<WakeRecord>, WakeStoreError> {
+        self.ensure_dirs()?;
+        let Some((path, record)) = [self.queue_path(wake_id), self.processed_path(wake_id)]
+            .into_iter()
+            .find_map(|path| {
+                if !path.is_file() {
+                    return None;
+                }
+                let body = std::fs::read(&path).ok()?;
+                let record: WakeRecord = serde_json::from_slice(&body).ok()?;
+                Some((path, record))
+            })
+        else {
+            return Ok(None);
+        };
+
+        std::fs::remove_file(&path)?;
+        if let Some(payload_ref) = &record.payload_ref {
+            let _ = std::fs::remove_file(payload_ref);
+        }
+        if let Some(dedupe_key) = record.event.dedupe_key.as_deref() {
+            let _ = std::fs::remove_file(self.dedupe_path(dedupe_key));
+        }
+        Ok(Some(record))
     }
 
     fn ensure_dirs(&self) -> Result<(), WakeStoreError> {
@@ -295,6 +336,30 @@ impl WakeStore {
             let _ = std::fs::remove_file(self.dedupe_path(dedupe_key));
         }
     }
+
+    fn list_records_in(&self, dir: &Path) -> Result<Vec<WakeRecord>, WakeStoreError> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(out);
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let body = std::fs::read(&path)?;
+            let record: WakeRecord = serde_json::from_slice(&body)?;
+            out.push(record);
+        }
+        out.sort_by(|left, right| {
+            left.not_before
+                .cmp(&right.not_before)
+                .then_with(|| left.received_at.cmp(&right.received_at))
+                .then_with(|| left.wake_id.cmp(&right.wake_id))
+        });
+        Ok(out)
+    }
 }
 
 fn write_atomic_json(path: &Path, value: &impl Serialize) -> Result<(), std::io::Error> {
@@ -383,6 +448,26 @@ mod tests {
         let due_later = store.list_due(future + Duration::seconds(1)).unwrap();
         assert_eq!(due_later.len(), 1);
         assert_eq!(due_later[0].wake_id, record.wake_id);
+    }
+
+    #[test]
+    fn load_list_processed_and_delete_round_trip() {
+        let tmp = tempdir().unwrap();
+        let store = WakeStore::new(tmp.path().to_path_buf());
+        let record = store.enqueue(sample_request()).unwrap();
+
+        assert_eq!(store.load(&record.wake_id).unwrap().wake_id, record.wake_id);
+        assert!(store.read_payload(&record.wake_id).unwrap().is_some());
+
+        store.mark_processed(&record.wake_id).unwrap();
+        let processed = store.list_processed().unwrap();
+        assert_eq!(processed.len(), 1);
+        assert_eq!(processed[0].wake_id, record.wake_id);
+
+        let deleted = store.delete(&record.wake_id).unwrap().unwrap();
+        assert_eq!(deleted.wake_id, record.wake_id);
+        assert!(store.list_processed().unwrap().is_empty());
+        assert!(store.load(&record.wake_id).is_err());
     }
 
     trait BoolExt {
