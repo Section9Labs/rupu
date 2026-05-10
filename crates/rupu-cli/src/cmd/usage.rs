@@ -6,14 +6,13 @@
 //! the optional `--since` / `--until` flags, and renders a table
 //! (or JSON when `--format json`).
 
+use crate::cmd::usage_report::UsageDataset;
 use crate::paths;
 use chrono::{DateTime, Utc};
 use clap::Args;
 use comfy_table::Cell;
-use rupu_transcript::{aggregate, TimeWindow, UsageRow};
+use rupu_transcript::{TimeWindow, UsageRow};
 use serde::Serialize;
-use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Args, Debug)]
@@ -61,14 +60,6 @@ async fn run(
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-    let mut unique_paths: BTreeSet<PathBuf> = BTreeSet::new();
-    if let Some(ref proj) = project_root {
-        collect_jsonl(&proj.join(".rupu/transcripts"), &mut unique_paths);
-    }
-    collect_jsonl(&global.join("transcripts"), &mut unique_paths);
-    let paths_to_scan = unique_paths.into_iter().collect::<Vec<_>>();
-
-    let rows = aggregate(&paths_to_scan, window);
 
     // Layered config supplies pricing overrides + UI prefs for the
     // colored cost cells. Failing to load the config files isn't
@@ -76,6 +67,8 @@ async fn run(
     // table and renders with no color overrides.
     let cfg = layered_config(&global, project_root.as_deref());
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None);
+    let dataset = UsageDataset::load(&global, project_root.as_deref(), window)?;
+    let rows = dataset.composite_rows();
     let format =
         crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
     crate::output::formats::ensure_supported(
@@ -144,25 +137,6 @@ fn parse_time_arg(s: &str) -> Result<DateTime<Utc>, String> {
     Ok(Utc::now() - dur)
 }
 
-fn collect_jsonl(dir: &std::path::Path, out: &mut BTreeSet<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-            match p.canonicalize() {
-                Ok(path) => {
-                    out.insert(path);
-                }
-                Err(_) => {
-                    out.insert(p);
-                }
-            }
-        }
-    }
-}
-
 fn print_table(
     rows: &[UsageRow],
     pricing: &rupu_config::PricingConfig,
@@ -189,27 +163,27 @@ fn print_table(
     let mut total_runs = 0u64;
     let mut total_cost = 0.0f64;
     let mut any_priced = false;
-    for r in rows {
-        let cost = crate::pricing::lookup(pricing, &r.provider, &r.model, &r.agent)
-            .map(|p| p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens));
-        if let Some(c) = cost {
-            total_cost += c;
+    for row in rows {
+        let cost = crate::pricing::lookup(pricing, &row.provider, &row.model, &row.agent)
+            .map(|price| price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens));
+        if let Some(value) = cost {
+            total_cost += value;
             any_priced = true;
         }
         table.add_row(vec![
-            Cell::new(&r.provider),
-            Cell::new(&r.model),
-            Cell::new(&r.agent),
-            Cell::new(format_count(r.input_tokens)),
-            Cell::new(format_count(r.output_tokens)),
-            Cell::new(format_count(r.cached_tokens)),
-            Cell::new(r.runs.to_string()),
+            Cell::new(&row.provider),
+            Cell::new(&row.model),
+            Cell::new(&row.agent),
+            Cell::new(format_count(row.input_tokens)),
+            Cell::new(format_count(row.output_tokens)),
+            Cell::new(format_count(row.cached_tokens)),
+            Cell::new(row.runs.to_string()),
             cost_cell(cost, prefs),
         ]);
-        total_in += r.input_tokens;
-        total_out += r.output_tokens;
-        total_cached += r.cached_tokens;
-        total_runs += r.runs;
+        total_in += row.input_tokens;
+        total_out += row.output_tokens;
+        total_cached += row.cached_tokens;
+        total_runs += row.runs;
     }
     table.add_row(vec![
         Cell::new("TOTAL"),
@@ -223,9 +197,6 @@ fn print_table(
     ]);
     println!("{table}");
     if !any_priced {
-        // Hint the user once at the bottom — only when literally
-        // nothing matched the price table, so configured users don't
-        // see noise.
         println!(
             "(no pricing data — add `[pricing.<provider>.\"<model>\"]` or \
              `[pricing.agents.<agent>]` to your config.toml to enable cost)",
