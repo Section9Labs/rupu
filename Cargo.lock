@@ -3502,6 +3502,7 @@ version = "0.5.4"
 dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
+ "security-framework-sys",
  "thiserror 2.0.18",
  "tracing",
 ]
