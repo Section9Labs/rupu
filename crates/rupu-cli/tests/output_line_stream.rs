@@ -68,7 +68,7 @@ fn run_line_stream_shows_assistant_content() {
         .stdout(predicate::str::contains("hello from agent"));
 }
 
-/// Token count appears in the step footer (`Xs · <N>t`).
+/// Token count appears in the step footer (`Xs · <N> tokens`).
 #[test]
 fn run_line_stream_token_count_in_footer() {
     let dir = tempfile::tempdir().unwrap();
@@ -87,7 +87,7 @@ fn run_line_stream_token_count_in_footer() {
         .assert()
         .success()
         // Footer shows total token count.
-        .stdout(predicate::str::contains("35t"));
+        .stdout(predicate::str::contains("35 tokens"));
 }
 
 /// `rupu run` prints no alt-screen escape sequences.
@@ -117,7 +117,7 @@ fn run_line_stream_no_ansi_on_pipe() {
     );
 }
 
-/// The step-start marker (`●`) and completion marker (`✓`) appear in output.
+/// The step-start spinner and completion marker appear in output.
 #[test]
 fn run_line_stream_step_glyphs() {
     let dir = tempfile::tempdir().unwrap();
@@ -134,7 +134,7 @@ fn run_line_stream_step_glyphs() {
         .assert()
         .success()
         // Running glyph in step_start line.
-        .stdout(predicate::str::contains("●"))
+        .stdout(predicate::str::contains("◐"))
         // Done glyph in step_done line.
         .stdout(predicate::str::contains("✓"));
 }
