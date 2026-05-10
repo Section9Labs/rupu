@@ -464,6 +464,7 @@ rupu autoflow serve --repo github:your-org/your-repo --worker laptop-01
 ```sh
 rupu repos attach github:your-org/your-repo /srv/rupu/your-repo
 RUPU_GITHUB_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
+RUPU_LINEAR_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
 rupu autoflow serve --repo github:your-org/your-repo --worker build-box-01
 ```
 
@@ -687,11 +688,14 @@ Typical crontab split:
 
 ```sh
 RUPU_GITHUB_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
+RUPU_LINEAR_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
 ```
 
 Use webhook mode when you want lower latency or event types that polling does not expose. Laptop users usually should not expose a local webhook receiver directly; start with polling and `rupu autoflow tick` or `rupu autoflow serve` instead.
 
 `rupu webhook serve` now looks beyond the current checkout: it can load project workflows from tracked repos under `rupu repos ...`, and it dispatches the exact matched workflow file rather than resolving by bare workflow name from the server's cwd.
+
+Linear issue webhooks are normalized before dispatch. Workflows can therefore target portable native tracker aliases such as `issue.state_changed` and `issue.entered_workflow_state` instead of manually unpacking Linear's raw `updatedFrom` structure in every `filter:`.
 
 When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and the next `rupu autoflow tick` or active `rupu autoflow serve` cycle consumes it.
 

@@ -1,7 +1,8 @@
-//! Webhook signature validation for GitHub + GitLab.
+//! Webhook signature validation for GitHub + GitLab + Linear.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
@@ -13,6 +14,8 @@ pub enum SignatureError {
     Malformed(String),
     #[error("signature mismatch")]
     Mismatch,
+    #[error("stale timestamp")]
+    StaleTimestamp,
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -62,6 +65,42 @@ pub fn verify_gitlab_token(
     }
 }
 
+/// Verify a Linear webhook signature and freshness window. Linear
+/// signs the exact raw request body with HMAC-SHA256 and delivers the
+/// hex digest in the `Linear-Signature` header. The payload also
+/// carries `webhookTimestamp` in milliseconds; we reject webhooks more
+/// than 60 seconds away from local wall clock to reduce replay risk.
+pub fn verify_linear_signature(
+    secret: &[u8],
+    body: &[u8],
+    signature_header: Option<&str>,
+    webhook_timestamp_ms: Option<i64>,
+) -> Result<(), SignatureError> {
+    let header = signature_header.ok_or(SignatureError::Missing)?;
+    let provided = hex::decode(header)
+        .map_err(|e| SignatureError::Malformed(format!("not valid hex: {e}")))?;
+
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret)
+        .map_err(|e| SignatureError::Malformed(format!("hmac init: {e}")))?;
+    mac.update(body);
+    let expected = mac.finalize().into_bytes();
+    if !bool::from(expected.as_slice().ct_eq(&provided)) {
+        return Err(SignatureError::Mismatch);
+    }
+
+    let ts = webhook_timestamp_ms
+        .ok_or_else(|| SignatureError::Malformed("missing webhookTimestamp in body".into()))?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default();
+    let skew_ms = (now_ms - ts).abs();
+    if skew_ms > 60_000 {
+        return Err(SignatureError::StaleTimestamp);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +146,36 @@ mod tests {
     fn gitlab_rejects_wrong_token() {
         let err = verify_gitlab_token(b"shared-secret", Some("nope")).unwrap_err();
         assert!(matches!(err, SignatureError::Mismatch));
+    }
+
+    #[test]
+    fn linear_round_trip_passes() {
+        let secret = b"linear-secret";
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let body = format!(r#"{{"type":"Issue","action":"update","webhookTimestamp":{ts}}}"#);
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+        mac.update(body.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+        verify_linear_signature(secret, body.as_bytes(), Some(&sig), Some(ts)).expect("match");
+    }
+
+    #[test]
+    fn linear_rejects_stale_timestamp() {
+        let secret = b"linear-secret";
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 120_000;
+        let body = format!(r#"{{"type":"Issue","action":"update","webhookTimestamp":{ts}}}"#);
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+        mac.update(body.as_bytes());
+        let sig = hex::encode(mac.finalize().into_bytes());
+        let err =
+            verify_linear_signature(secret, body.as_bytes(), Some(&sig), Some(ts)).unwrap_err();
+        assert!(matches!(err, SignatureError::StaleTimestamp));
     }
 }

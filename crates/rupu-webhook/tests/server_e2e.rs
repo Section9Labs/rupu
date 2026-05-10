@@ -57,12 +57,33 @@ steps:
     ("review-pr".into(), parse(yaml))
 }
 
+fn issue_state_workflow() -> (String, Workflow) {
+    let yaml = r#"name: linear-state
+trigger:
+  on: event
+  event: issue.entered_workflow_state
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+"#;
+    ("linear-state".into(), parse(yaml))
+}
+
 fn sign_github(secret: &[u8], body: &[u8]) -> String {
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
     mac.update(body);
     let digest = mac.finalize().into_bytes();
     format!("sha256={}", hex::encode(digest))
+}
+
+fn sign_linear(secret: &[u8], body: &[u8]) -> String {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+    mac.update(body);
+    hex::encode(mac.finalize().into_bytes())
 }
 
 #[tokio::test]
@@ -81,6 +102,7 @@ async fn signed_pr_opened_dispatches_matching_workflow() {
         addr,
         github_secret: Some(secret.to_vec()),
         gitlab_token: None,
+        linear_secret: None,
         workflow_loader: Arc::new(move || workflows.clone()),
         dispatcher: dispatcher_handle,
         observer: None,
@@ -144,6 +166,7 @@ async fn unsigned_request_returns_401() {
         addr,
         github_secret: Some(b"k".to_vec()),
         gitlab_token: None,
+        linear_secret: None,
         workflow_loader: Arc::new(move || workflows.clone()),
         dispatcher,
         observer: None,
@@ -167,5 +190,88 @@ async fn unsigned_request_returns_401() {
         .await
         .expect("post");
     assert_eq!(resp.status(), 401);
+    server.abort();
+}
+
+#[tokio::test]
+async fn signed_linear_issue_update_dispatches_matching_workflow() {
+    let secret = b"linear-secret";
+    let port = pick_free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+    let dispatcher = Arc::new(RecordingDispatcher {
+        calls: Mutex::new(Vec::new()),
+    });
+    let dispatcher_handle = dispatcher.clone();
+
+    let workflows = vec![issue_state_workflow()];
+    let config = WebhookConfig {
+        addr,
+        github_secret: None,
+        gitlab_token: None,
+        linear_secret: Some(secret.to_vec()),
+        workflow_loader: Arc::new(move || workflows.clone()),
+        dispatcher: dispatcher_handle,
+        observer: None,
+    };
+    let server = tokio::spawn(async move {
+        let _ = serve(config).await;
+    });
+
+    let url_health = format!("http://{addr}/healthz");
+    for _ in 0..50 {
+        if reqwest::get(&url_health).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let body = serde_json::json!({
+        "action": "update",
+        "type": "Issue",
+        "url": "https://linear.app/acme/issue/ENG-123",
+        "data": {
+            "id": "issue-1",
+            "identifier": "ENG-123",
+            "stateId": "state-in-progress",
+            "projectId": "project-core",
+            "cycleId": "cycle-42",
+            "teamId": "team-1"
+        },
+        "updatedFrom": {
+            "stateId": "state-todo"
+        },
+        "webhookTimestamp": ts,
+        "webhookId": "delivery-1"
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let sig = sign_linear(secret, &body_bytes);
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/webhook/linear"))
+        .header("linear-event", "Issue")
+        .header("linear-signature", &sig)
+        .header("content-type", "application/json")
+        .body(body_bytes)
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["event"], "linear.issue.updated");
+    assert_eq!(json["fired"][0]["name"], "linear-state");
+    assert_eq!(json["fired"][0]["fired"], true);
+
+    let calls = dispatcher.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "linear-state");
+    assert_eq!(calls[0].1["subject"]["ref"], "ENG-123");
+    assert_eq!(calls[0].1["state"]["category"], "workflow_state");
+    assert_eq!(calls[0].1["state"]["before"]["id"], "state-todo");
+    assert_eq!(calls[0].1["state"]["after"]["id"], "state-in-progress");
     server.abort();
 }

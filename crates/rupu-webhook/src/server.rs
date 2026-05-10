@@ -2,17 +2,20 @@
 //!
 //!   POST /webhook/github   — `x-hub-signature-256` HMAC-validated
 //!   POST /webhook/gitlab   — `x-gitlab-token` shared-secret validated
+//!   POST /webhook/linear   — `linear-signature` HMAC-validated
 //!   GET  /healthz          — liveness probe
 //!
-//! Both webhook routes return 401 on signature/token mismatch, 400
+//! Webhook routes return 401 on signature/token mismatch, 400
 //! on malformed payload, and 200 with a JSON summary of dispatched
 //! workflows on success (including the no-match case — `{ "fired": [] }`).
 //!
 //! `serve(config)` blocks the current task. Drop the future to stop.
 
 use crate::dispatch::{dispatch_event, DispatchedWorkflow, WorkflowDispatcher};
-use crate::event_vocab::{map_github_event, map_gitlab_event};
-use crate::signature::{verify_github_signature, verify_gitlab_token};
+use crate::event_vocab::{
+    map_github_event, map_gitlab_event, map_linear_event, normalize_linear_event_payload,
+};
+use crate::signature::{verify_github_signature, verify_gitlab_token, verify_linear_signature};
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
@@ -49,6 +52,7 @@ pub struct WebhookConfig {
     pub addr: SocketAddr,
     pub github_secret: Option<Vec<u8>>,
     pub gitlab_token: Option<Vec<u8>>,
+    pub linear_secret: Option<Vec<u8>>,
     /// Closure that returns the candidate workflows to consider on
     /// each request. Called fresh per request so authors can edit
     /// workflow files without restarting the server.
@@ -65,6 +69,7 @@ pub struct WebhookConfig {
 struct AppState {
     github_secret: Option<Arc<Vec<u8>>>,
     gitlab_token: Option<Arc<Vec<u8>>>,
+    linear_secret: Option<Arc<Vec<u8>>>,
     workflow_loader: Arc<dyn Fn() -> Vec<(String, Workflow)> + Send + Sync>,
     dispatcher: Arc<dyn WorkflowDispatcher>,
     observer: Option<Arc<dyn WebhookObserver>>,
@@ -74,6 +79,7 @@ struct AppState {
 pub enum WebhookSource {
     Github,
     Gitlab,
+    Linear,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +127,7 @@ pub async fn serve(config: WebhookConfig) -> Result<(), WebhookError> {
     let state = AppState {
         github_secret: config.github_secret.map(Arc::new),
         gitlab_token: config.gitlab_token.map(Arc::new),
+        linear_secret: config.linear_secret.map(Arc::new),
         workflow_loader: config.workflow_loader,
         dispatcher: config.dispatcher,
         observer: config.observer,
@@ -129,6 +136,7 @@ pub async fn serve(config: WebhookConfig) -> Result<(), WebhookError> {
         .route("/healthz", get(healthz))
         .route("/webhook/github", post(github_handler))
         .route("/webhook/gitlab", post(gitlab_handler))
+        .route("/webhook/linear", post(linear_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(config.addr)
@@ -286,6 +294,94 @@ async fn gitlab_handler(
     .into_response()
 }
 
+async fn linear_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let secret = match &state.linear_secret {
+        Some(s) => s.clone(),
+        None => {
+            warn!("linear webhook received but no secret configured; rejecting");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "linear secret not configured",
+            )
+                .into_response();
+        }
+    };
+
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")).into_response();
+        }
+    };
+
+    if let Err(e) = verify_linear_signature(
+        &secret,
+        &body,
+        headers
+            .get("linear-signature")
+            .and_then(|v| v.to_str().ok()),
+        payload.get("webhookTimestamp").and_then(|v| v.as_i64()),
+    ) {
+        warn!(error = %e, "linear signature verification failed");
+        return (StatusCode::UNAUTHORIZED, "signature mismatch").into_response();
+    }
+
+    let event_header = headers
+        .get("linear-event")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| payload.get("type").and_then(|value| value.as_str()))
+        .unwrap_or_default()
+        .to_string();
+
+    let Some(event_id) = map_linear_event(&event_header, &payload) else {
+        info!(event = %event_header, "unrecognized linear event; ignoring");
+        return Json(WebhookResponse {
+            event: None,
+            fired: vec![],
+        })
+        .into_response();
+    };
+
+    let normalized_payload = normalize_linear_event_payload(&payload);
+    observe_event(
+        state.observer.as_ref(),
+        WebhookEvent {
+            source: WebhookSource::Linear,
+            event_id: event_id.clone(),
+            delivery_id: headers
+                .get("linear-delivery")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+                .or_else(|| {
+                    payload
+                        .get("webhookId")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                }),
+            payload: normalized_payload.clone(),
+        },
+    )
+    .await;
+
+    let candidates = (state.workflow_loader)();
+    let fired = dispatch_event(
+        &event_id,
+        &normalized_payload,
+        &candidates,
+        state.dispatcher.as_ref(),
+    )
+    .await;
+    Json(WebhookResponse {
+        event: Some(event_id),
+        fired,
+    })
+    .into_response()
+}
+
 async fn observe_event(observer: Option<&Arc<dyn WebhookObserver>>, event: WebhookEvent) {
     let Some(observer) = observer else {
         return;
@@ -351,6 +447,7 @@ mod tests {
         AppState {
             github_secret: Some(Arc::new(b"secret".to_vec())),
             gitlab_token: None,
+            linear_secret: Some(Arc::new(b"linear-secret".to_vec())),
             workflow_loader: Arc::new(Vec::new),
             dispatcher: Arc::new(NoopDispatcher),
             observer: Some(observer),
@@ -420,5 +517,71 @@ mod tests {
         .into_response();
 
         assert_eq!(response_status(response), StatusCode::OK);
+    }
+
+    fn linear_signature(secret: &[u8], body: &[u8]) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret).expect("hmac");
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[tokio::test]
+    async fn linear_handler_notifies_observer_with_normalized_payload() {
+        let observer = Arc::new(RecordingObserver::default());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let body = format!(
+            r#"{{
+              "action":"update",
+              "type":"Issue",
+              "url":"https://linear.app/acme/issue/ENG-123",
+              "organizationId":"org-1",
+              "data":{{
+                "id":"issue-1",
+                "identifier":"ENG-123",
+                "stateId":"state-in-progress",
+                "projectId":"project-core",
+                "cycleId":"cycle-42",
+                "teamId":"team-1"
+              }},
+              "updatedFrom":{{
+                "stateId":"state-todo",
+                "projectId":"project-backlog",
+                "cycleId":"cycle-41"
+              }},
+              "webhookTimestamp":{ts},
+              "webhookId":"delivery-xyz"
+            }}"#
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("linear-event", "Issue".parse().unwrap());
+        headers.insert(
+            "linear-signature",
+            linear_signature(b"linear-secret", body.as_bytes())
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("linear-delivery", "delivery-xyz".parse().unwrap());
+
+        let response = linear_handler(
+            State(state_with_observer(observer.clone())),
+            headers,
+            Bytes::from(body.into_bytes()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response_status(response), StatusCode::OK);
+        let events = observer.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, WebhookSource::Linear);
+        assert_eq!(events[0].event_id, "linear.issue.updated");
+        assert_eq!(events[0].delivery_id.as_deref(), Some("delivery-xyz"));
+        assert_eq!(events[0].payload["subject"]["ref"], "ENG-123");
+        assert_eq!(events[0].payload["state"]["category"], "workflow_state");
+        assert_eq!(events[0].payload["project"]["after"]["id"], "project-core");
+        assert_eq!(events[0].payload["cycle"]["before"]["id"], "cycle-41");
     }
 }

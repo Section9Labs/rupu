@@ -273,9 +273,9 @@ This avoids forcing Linear/Jira into a fake repo model.
 
 ### Phase 2 — Linear webhook path
 
-- add Linear auth provider id
 - add `rupu webhook serve` support for Linear
 - map Linear `updatedFrom` issue webhooks onto normalized events
+- initial implementation may only know state / project / cycle IDs; named aliases improve automatically once a future connector can hydrate names
 
 ### Phase 3 — non-repo event sources
 
