@@ -64,10 +64,14 @@ pub struct UsageTotals {
 #[derive(Debug, Clone, Default)]
 pub struct UsageFilter {
     pub repo_ref: Option<String>,
+    pub issue_ref: Option<String>,
     pub workflow_name: Option<String>,
     pub agent: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub worker_id: Option<String>,
+    pub backend_id: Option<String>,
+    pub trigger_source: Option<String>,
     pub status: Option<String>,
     pub failed_only: bool,
 }
@@ -88,6 +92,13 @@ impl UsageFilter {
             .repo_ref
             .as_deref()
             .is_some_and(|repo_ref| fact.repo_ref.as_deref() != Some(repo_ref))
+        {
+            return false;
+        }
+        if self
+            .issue_ref
+            .as_deref()
+            .is_some_and(|issue_ref| fact.issue_ref.as_deref() != Some(issue_ref))
         {
             return false;
         }
@@ -116,6 +127,27 @@ impl UsageFilter {
             .model
             .as_deref()
             .is_some_and(|model| fact.model != model)
+        {
+            return false;
+        }
+        if self
+            .worker_id
+            .as_deref()
+            .is_some_and(|worker_id| fact.worker_id.as_deref() != Some(worker_id))
+        {
+            return false;
+        }
+        if self
+            .backend_id
+            .as_deref()
+            .is_some_and(|backend_id| fact.backend_id.as_deref() != Some(backend_id))
+        {
+            return false;
+        }
+        if self
+            .trigger_source
+            .as_deref()
+            .is_some_and(|trigger| fact.trigger_source.as_deref() != Some(trigger))
         {
             return false;
         }

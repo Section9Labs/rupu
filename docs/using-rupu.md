@@ -234,7 +234,9 @@ rupu --format csv autoflow wakes --repo github:your-org/your-repo
 rupu usage
 rupu usage --group-by workflow
 rupu usage --repo github:your-org/your-repo
+rupu usage --issue github:your-org/your-repo/issues/42
 rupu usage --provider anthropic --model claude-sonnet-4-6
+rupu usage runs --worker worker_local_cli --backend local_checkout --trigger run_cli
 rupu usage runs --failed
 rupu usage runs --top-cost 20
 rupu --format json usage
@@ -258,6 +260,14 @@ Run-level views support:
 - `rupu usage runs --failed`
 - `rupu usage runs --status completed`
 - `rupu usage runs --top-cost 20`
+
+Metadata-backed filters support:
+
+- `--repo github:your-org/your-repo`
+- `--issue github:your-org/your-repo/issues/42`
+- `--worker worker_local_cli`
+- `--backend local_checkout`
+- `--trigger run_cli`
 
 Structured `--format table|json|csv` is currently supported on report/list commands that already have stable row shapes:
 

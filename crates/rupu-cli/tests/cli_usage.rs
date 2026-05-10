@@ -450,6 +450,87 @@ fn usage_repo_filter_includes_standalone_runs_with_sidecar_metadata() {
 }
 
 #[test]
+fn usage_supports_issue_worker_backend_and_trigger_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join(".rupu");
+    let project = dir.path().join("project");
+    let transcripts = home.join("transcripts");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&transcripts).unwrap();
+
+    write_usage_transcript(
+        &transcripts,
+        "run_standalone_issue_42",
+        "reviewer",
+        "anthropic",
+        "claude-sonnet-4-6",
+        Utc::now(),
+        30,
+        12,
+    );
+    write_standalone_usage_metadata(
+        &transcripts,
+        "run_standalone_issue_42",
+        "github:Section9Labs/rupu",
+        Some("github:Section9Labs/rupu/issues/42"),
+    );
+    write_workflow_usage_run(
+        &home,
+        "run_workflow_issue_43",
+        "phase-delivery-cycle",
+        "github:Section9Labs/rupu/issues/43",
+        "github:Section9Labs/rupu",
+        RunStatus::Completed,
+        "implementer",
+        "openai",
+        "gpt-5",
+        Utc::now(),
+        45,
+        15,
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&project)
+        .env("RUPU_HOME", &home)
+        .args([
+            "usage",
+            "--group-by",
+            "agent",
+            "--issue",
+            "github:Section9Labs/rupu/issues/42",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reviewer"))
+        .stdout(predicate::str::contains("implementer").not());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&project)
+        .env("RUPU_HOME", &home)
+        .args([
+            "usage",
+            "runs",
+            "--worker",
+            "worker_local_cli",
+            "--backend",
+            "local_checkout",
+            "--trigger",
+            "run_cli",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run_standalone_issue_42"))
+        .stdout(predicate::str::contains(
+            "github:Section9Labs/rupu/issues/42",
+        ))
+        .stdout(predicate::str::contains("run_cli"))
+        .stdout(predicate::str::contains("local_checkout"))
+        .stdout(predicate::str::contains("run_workflow_issue_43").not());
+}
+
+#[test]
 fn usage_runs_support_failed_and_top_cost_views() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join(".rupu");

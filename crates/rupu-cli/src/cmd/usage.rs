@@ -37,6 +37,9 @@ pub struct UsageScopeArgs {
     /// Filter to one repo ref, for example `github:Section9Labs/rupu`.
     #[arg(long)]
     pub repo: Option<String>,
+    /// Filter to one issue ref, for example `github:Section9Labs/rupu/issues/42`.
+    #[arg(long)]
+    pub issue: Option<String>,
     /// Filter to one workflow name.
     #[arg(long)]
     pub workflow: Option<String>,
@@ -49,6 +52,15 @@ pub struct UsageScopeArgs {
     /// Filter to one model id.
     #[arg(long)]
     pub model: Option<String>,
+    /// Filter to one worker id.
+    #[arg(long)]
+    pub worker: Option<String>,
+    /// Filter to one backend id.
+    #[arg(long)]
+    pub backend: Option<String>,
+    /// Filter to one trigger source (`run_cli`, `workflow_cli`, `autoflow`, ...).
+    #[arg(long)]
+    pub trigger: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -275,10 +287,14 @@ fn resolve_window(scope: &UsageScopeArgs) -> anyhow::Result<ResolvedWindow> {
 fn scope_filter(scope: &UsageScopeArgs, status: Option<&str>, failed: bool) -> UsageFilter {
     UsageFilter {
         repo_ref: scope.repo.clone(),
+        issue_ref: scope.issue.clone(),
         workflow_name: scope.workflow.clone(),
         agent: scope.agent.clone(),
         provider: scope.provider.clone(),
         model: scope.model.clone(),
+        worker_id: scope.worker.clone(),
+        backend_id: scope.backend.clone(),
+        trigger_source: scope.trigger.clone(),
         status: status.map(str::to_string),
         failed_only: failed,
     }
@@ -376,6 +392,8 @@ struct UsageFiltersOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    issue: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     workflow: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
@@ -383,6 +401,12 @@ struct UsageFiltersOutput {
     provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
     failed_only: bool,
@@ -392,10 +416,14 @@ impl UsageFiltersOutput {
     fn from_scope(scope: &UsageScopeArgs, status: Option<&str>, failed_only: bool) -> Self {
         Self {
             repo: scope.repo.clone(),
+            issue: scope.issue.clone(),
             workflow: scope.workflow.clone(),
             agent: scope.agent.clone(),
             provider: scope.provider.clone(),
             model: scope.model.clone(),
+            worker: scope.worker.clone(),
+            backend: scope.backend.clone(),
+            trigger: scope.trigger.clone(),
             status: status.map(str::to_string),
             failed_only,
         }
@@ -473,6 +501,8 @@ struct UsageRunRow {
     worker: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger: Option<String>,
     providers: String,
     models: String,
     agents: String,
@@ -732,6 +762,7 @@ fn build_run_rows(
                 issue: run.issue_ref.clone(),
                 worker: run.worker_id.clone(),
                 backend: run.backend_id.clone(),
+                trigger: run.trigger_source.clone(),
                 providers: join_values(&run.providers),
                 models: join_values(&run.models),
                 agents: join_values(&run.agents),
@@ -925,8 +956,10 @@ fn print_run_table(report: &UsageRunsReport, prefs: &crate::cmd::ui::UiPrefs) {
         "STATUS",
         "WORKFLOW",
         "REPO",
+        "ISSUE",
         "WORKER",
         "BACKEND",
+        "TRIGGER",
         "PROVIDERS",
         "MODELS",
         "AGENTS",
@@ -942,8 +975,10 @@ fn print_run_table(report: &UsageRunsReport, prefs: &crate::cmd::ui::UiPrefs) {
             crate::output::tables::status_cell(&row.status, prefs),
             Cell::new(row.workflow.as_deref().unwrap_or("—")),
             Cell::new(row.repo.as_deref().unwrap_or("—")),
+            Cell::new(row.issue.as_deref().unwrap_or("—")),
             Cell::new(row.worker.as_deref().unwrap_or("—")),
             Cell::new(row.backend.as_deref().unwrap_or("—")),
+            Cell::new(row.trigger.as_deref().unwrap_or("—")),
             Cell::new(&row.providers),
             Cell::new(&row.models),
             Cell::new(&row.agents),
