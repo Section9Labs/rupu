@@ -36,6 +36,7 @@ serde_yaml = "0.9"
 schemars = { version = "0.8", features = ["chrono"] }
 jsonschema = "0.18"
 toml = "0.8"
+csv = "1"
 
 # Errors
 thiserror = "2"
