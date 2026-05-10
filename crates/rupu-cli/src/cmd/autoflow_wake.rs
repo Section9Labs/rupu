@@ -1,6 +1,6 @@
 use rupu_orchestrator::{annotate_event_payload, candidate_event_ids};
 use rupu_runtime::{WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeSource};
-use rupu_scm::{IssueTracker, Platform, PolledEvent};
+use rupu_scm::{EventSourceRef, EventSubjectRef, IssueRef, IssueTracker, Platform, PolledEvent};
 use rupu_webhook::{WebhookEvent, WebhookSource};
 use sha2::{Digest, Sha256};
 
@@ -48,12 +48,13 @@ pub fn wake_request_from_webhook(event: &WebhookEvent) -> Option<WakeEnqueueRequ
 }
 
 pub fn wake_requests_from_polled_event(event: &PolledEvent) -> Vec<WakeEnqueueRequest> {
-    let repo_ref = format!(
-        "{}:{}/{}",
-        event.repo.platform.as_str(),
-        event.repo.owner,
-        event.repo.repo
-    );
+    let Some(repo_ref) = repo_ref_from_polled_event(event) else {
+        return Vec::new();
+    };
+    let repo = event
+        .source
+        .repo()
+        .expect("repo_ref_from_polled_event only returns Some for repo sources");
     let issue_ref = extract_issue_ref_from_polled_event(event);
     let entity = issue_ref
         .clone()
@@ -77,9 +78,9 @@ pub fn wake_requests_from_polled_event(event: &PolledEvent) -> Vec<WakeEnqueueRe
                 delivery_id: Some(event.delivery.clone()),
                 dedupe_key: Some(format!(
                     "cron_poll:{}:{}:{}:{}:{}",
-                    event.repo.platform.as_str(),
-                    event.repo.owner,
-                    event.repo.repo,
+                    repo.platform.as_str(),
+                    repo.owner,
+                    repo.repo,
                     event.delivery,
                     matched_id
                 )),
@@ -99,12 +100,16 @@ pub fn wake_request_from_polled_event(event: &PolledEvent) -> WakeEnqueueRequest
 }
 
 pub fn extract_issue_ref_from_polled_event(event: &PolledEvent) -> Option<String> {
-    let tracker = match event.repo.platform {
+    if let Some(EventSubjectRef::Issue { issue }) = &event.subject {
+        return Some(format_issue_ref(issue));
+    }
+    let repo = event.source.repo()?;
+    let tracker = match repo.platform {
         Platform::Github => IssueTracker::Github,
         Platform::Gitlab => IssueTracker::Gitlab,
     };
-    let project = format!("{}/{}", event.repo.owner, event.repo.repo);
-    let number = match event.repo.platform {
+    let project = format!("{}/{}", repo.owner, repo.repo);
+    let number = match repo.platform {
         Platform::Github => {
             if !event.id.starts_with("github.issue.") {
                 return None;
@@ -205,17 +210,58 @@ fn normalized_webhook_payload(event: &WebhookEvent) -> serde_json::Value {
 }
 
 fn normalized_polled_payload(event: &PolledEvent) -> serde_json::Value {
+    let (vendor, repo_payload, source_payload) = match &event.source {
+        EventSourceRef::Repo { repo } => (
+            repo.platform.as_str(),
+            serde_json::json!({
+                "full_name": format!("{}/{}", repo.owner, repo.repo),
+                "owner": repo.owner,
+                "name": repo.repo,
+            }),
+            serde_json::json!({
+                "kind": "repo",
+                "vendor": repo.platform.as_str(),
+                "ref": format!("{}:{}/{}", repo.platform.as_str(), repo.owner, repo.repo),
+            }),
+        ),
+        EventSourceRef::TrackerProject { tracker, project } => (
+            tracker.as_str(),
+            serde_json::json!({}),
+            serde_json::json!({
+                "kind": "tracker_project",
+                "vendor": tracker.as_str(),
+                "project": project,
+                "ref": format!("{}:{project}", tracker.as_str()),
+            }),
+        ),
+    };
     serde_json::json!({
         "id": event.id,
-        "vendor": event.repo.platform.as_str(),
+        "vendor": vendor,
         "delivery": event.delivery,
-        "repo": {
-            "full_name": format!("{}/{}", event.repo.owner, event.repo.repo),
-            "owner": event.repo.owner,
-            "name": event.repo.repo,
-        },
+        "repo": repo_payload,
+        "source": source_payload,
         "payload": event.payload,
     })
+}
+
+fn repo_ref_from_polled_event(event: &PolledEvent) -> Option<String> {
+    let repo = event.source.repo()?;
+    Some(format!(
+        "{}:{}/{}",
+        repo.platform.as_str(),
+        repo.owner,
+        repo.repo
+    ))
+}
+
+fn format_issue_ref(issue: &IssueRef) -> String {
+    format!(
+        "{}:{}/issues/{}",
+        issue.tracker.as_str(),
+        issue.project,
+        issue.number
+    )
 }
 
 fn repo_ref_from_webhook_event(event: &WebhookEvent) -> Option<String> {
@@ -351,11 +397,13 @@ mod tests {
         let event = PolledEvent {
             id: "github.issue.opened".into(),
             delivery: "evt-123".into(),
-            repo: RepoRef {
+            source: RepoRef {
                 platform: Platform::Github,
                 owner: "Section9Labs".into(),
                 repo: "rupu".into(),
-            },
+            }
+            .into(),
+            subject: None,
             payload: json!({
                 "payload": {
                     "issue": { "number": 42 }
@@ -374,11 +422,13 @@ mod tests {
         let event = PolledEvent {
             id: "github.issue.labeled".into(),
             delivery: "evt-123".into(),
-            repo: RepoRef {
+            source: RepoRef {
                 platform: Platform::Github,
                 owner: "Section9Labs".into(),
                 repo: "rupu".into(),
-            },
+            }
+            .into(),
+            subject: None,
             payload: json!({
                 "payload": {
                     "issue": { "number": 42 },
@@ -394,5 +444,25 @@ mod tests {
         assert!(ids.contains(&"github.issue.labeled"));
         assert!(ids.contains(&"github.issue.queue_changed"));
         assert!(ids.contains(&"issue.queue_entered"));
+    }
+
+    #[test]
+    fn tracker_scoped_polled_events_do_not_emit_repo_wakes() {
+        let event = PolledEvent {
+            id: "linear.issue.updated".into(),
+            delivery: "evt-999".into(),
+            source: EventSourceRef::TrackerProject {
+                tracker: IssueTracker::Linear,
+                project: "workspace-123".into(),
+            },
+            subject: None,
+            payload: json!({
+                "state": {
+                    "before": { "id": "todo" },
+                    "after": { "id": "in_progress" }
+                }
+            }),
+        };
+        assert!(wake_requests_from_polled_event(&event).is_empty());
     }
 }

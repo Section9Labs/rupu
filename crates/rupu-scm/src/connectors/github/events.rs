@@ -24,7 +24,7 @@ use tracing::debug;
 use crate::error::{classify_scm_error, ScmError};
 use crate::event_connector::{EventConnector, EventPollResult, PolledEvent};
 use crate::platform::Platform;
-use crate::types::RepoRef;
+use crate::types::{EventSourceRef, EventSubjectRef, IssueRef, PrRef, RepoRef};
 
 /// Wraps a single shared `reqwest::Client` + the user's GitHub token.
 /// Multiple repos share one connector instance; each call is scoped to
@@ -54,10 +54,18 @@ impl GithubEventConnector {
 impl EventConnector for GithubEventConnector {
     async fn poll_events(
         &self,
-        repo: &RepoRef,
+        source: &EventSourceRef,
         cursor: Option<&str>,
         limit: u32,
     ) -> Result<EventPollResult, ScmError> {
+        let repo = match source {
+            EventSourceRef::Repo { repo } => repo,
+            _ => {
+                return Err(ScmError::BadRequest {
+                    message: "github events polling only supports repo sources".to_string(),
+                });
+            }
+        };
         let cursor = parse_cursor(cursor);
 
         // First poll: emit nothing, set since = now. Avoids stampede
@@ -174,11 +182,13 @@ impl EventConnector for GithubEventConnector {
                     last_created_at = Some(dt.with_timezone(&Utc));
                 }
             }
+            let subject = github_subject(repo, &id, raw_ev);
 
             events.push(PolledEvent {
                 id,
                 delivery,
-                repo: repo.clone(),
+                source: source.clone(),
+                subject,
                 payload: raw_ev.clone(),
             });
         }
@@ -194,6 +204,44 @@ impl EventConnector for GithubEventConnector {
             next_cursor,
         })
     }
+}
+
+fn github_subject(repo: &RepoRef, event_id: &str, raw_ev: &Value) -> Option<EventSubjectRef> {
+    if event_id.starts_with("github.issue.") {
+        let number = raw_ev
+            .get("payload")
+            .and_then(|payload| payload.get("issue"))
+            .and_then(|issue| issue.get("number"))
+            .and_then(|value| value.as_u64())?;
+        return Some(EventSubjectRef::Issue {
+            issue: IssueRef {
+                tracker: crate::platform::IssueTracker::Github,
+                project: format!("{}/{}", repo.owner, repo.repo),
+                number,
+            },
+        });
+    }
+    if event_id.starts_with("github.pr.") {
+        let number = raw_ev
+            .get("payload")
+            .and_then(|payload| {
+                payload
+                    .get("pull_request")
+                    .and_then(|pr| pr.get("number"))
+                    .or_else(|| payload.get("number"))
+            })
+            .and_then(|value| value.as_u64())?;
+        return Some(EventSubjectRef::Pr {
+            pr: PrRef {
+                repo: repo.clone(),
+                number: number as u32,
+            },
+        });
+    }
+    if event_id == "github.push" {
+        return Some(EventSubjectRef::Repo { repo: repo.clone() });
+    }
+    None
 }
 
 #[derive(Debug, Clone, Default)]
@@ -432,7 +480,8 @@ mod tests {
     async fn first_poll_returns_empty_with_warmup_cursor() {
         // No HTTP call: empty cursor short-circuits at the top of poll_events.
         let c = GithubEventConnector::new("fake".into(), Some("http://127.0.0.1:1".into()));
-        let r = c.poll_events(&rr(), None, 50).await.unwrap();
+        let source: EventSourceRef = rr().into();
+        let r = c.poll_events(&source, None, 50).await.unwrap();
         assert_eq!(r.events.len(), 0);
         // next_cursor includes a since= timestamp.
         assert!(r.next_cursor.contains("since:"));

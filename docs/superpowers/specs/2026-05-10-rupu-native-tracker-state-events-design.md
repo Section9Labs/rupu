@@ -246,20 +246,17 @@ The named aliases are preferred where possible. They are easier to read and safe
 
 ## 7. Important architectural constraint
 
-The current polled-event abstraction is repo-shaped:
+This was repo-shaped at the start:
 
-- `poll_sources` assumes `<platform>:<owner>/<repo>`
-- `EventConnector::poll_events` takes `RepoRef`
+- `poll_sources` assumed `<platform>:<owner>/<repo>`
+- `EventConnector::poll_events` took `RepoRef`
 
-That fits GitHub/GitLab repo events, but it does **not** fit Linear or Jira cleanly because their native workflow-state events are tracker/project shaped, not repo shaped.
+That foundation is now generalized in code to a source model that can represent both:
 
-So the implementation order must be:
+- repo sources (`github:owner/repo`, `gitlab:group/project`)
+- tracker-project sources (`linear:<workspace-or-project>`, `jira:<project>`)
 
-1. freeze the normalized event contract
-2. land webhook-native tracker support first
-3. generalize the poll-source abstraction afterward
-
-This avoids forcing Linear/Jira into a fake repo model.
+That means future Linear/Jira polling no longer requires a fake repo model. The remaining work is connector-specific transport and payload hydration, not another core trigger-shape rewrite.
 
 ---
 

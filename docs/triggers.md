@@ -108,6 +108,15 @@ poll_sources = [
 
 This is an operational control only. It does not change workflow matching semantics; it only decides whether a source is due to be polled on a given `rupu cron tick --only-events`.
 
+The source model is now generic enough for future tracker-native polling too:
+
+- `github:owner/repo`
+- `gitlab:group/project`
+- `linear:<workspace-or-project>` (reserved for future polling connector)
+- `jira:<project>` (reserved for future polling connector)
+
+Today, the shipped polled connectors are still GitHub/GitLab repo feeds. Linear native state events are available through `rupu webhook serve`; the generic poll-source model is groundwork for adding non-repo tracker polling later without changing workflow YAML again.
+
 ### 2. Write the workflow
 
 ```yaml
@@ -327,6 +336,8 @@ steps:
 ```
 
 Secrets are read from environment variables — never config files, never the keychain. Webhook secrets are operational secrets and belong in your process supervisor's environment block.
+
+Important current limit: Linear native state events are **webhook-ingress only** right now. `poll_sources = ["linear:..."]` parses and stores cleanly, but no Linear polling connector ships yet.
 
 Bind to `127.0.0.1` and front with a TLS-terminating reverse proxy in production. rupu does not terminate TLS itself.
 

@@ -198,7 +198,9 @@ A `[triggers]` section in `config.toml` (project shadows global) gates which pol
 
 ```toml
 [triggers]
-# Repos to poll for event triggers. Format: "<platform>:<owner>/<repo>".
+# Sources to poll for event triggers. Repo-backed examples:
+# "<platform>:<owner>/<repo>". Future tracker-native examples:
+# "linear:<workspace-or-project>", "jira:<project>".
 # Each tick: rupu queries the connector for events since the last cursor.
 poll_sources = [
   "github:Section9Labs/rupu",

@@ -25,7 +25,7 @@ use rupu_runtime::{
     RunTriggerSource, WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeRecord,
     WakeSource, WakeStore, WakeStoreError,
 };
-use rupu_scm::{Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, RepoRef};
+use rupu_scm::{EventSourceRef, Issue, IssueFilter, IssueRef, IssueState, IssueTracker};
 use rupu_workspace::autoflow_claim_store::issue_key;
 use rupu_workspace::{
     ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
@@ -1805,11 +1805,11 @@ async fn enqueue_polled_wakes(
         let Some(source) = resolved.cfg.triggers.poll_source(&repo_ref) else {
             continue;
         };
-        let Some((platform, repo)) = parse_poll_source(&repo_ref) else {
+        let Ok(event_source) = repo_ref.parse::<EventSourceRef>() else {
             warn!(repo_ref, "invalid autoflow repo ref for wake polling");
             continue;
         };
-        let last_polled_file = autoflow_last_polled_at_path(&cursors_root, platform, &repo);
+        let last_polled_file = autoflow_last_polled_at_path(&cursors_root, &event_source);
         match autoflow_poll_source_due(source, &last_polled_file, chrono::Utc::now()) {
             Ok(true) => {}
             Ok(false) => continue,
@@ -1818,17 +1818,20 @@ async fn enqueue_polled_wakes(
             }
         }
         let registry = Arc::new(rupu_scm::Registry::discover(resolver, &resolved.cfg).await);
-        let Some(connector) = registry.events(platform) else {
+        let Some(connector) = registry.events_for_source(&event_source) else {
             warn!(
                 repo_ref,
                 "no event connector configured for autoflow wake polling"
             );
             continue;
         };
-        let cursor_file = autoflow_cursor_path(&cursors_root, platform, &repo);
+        let cursor_file = autoflow_cursor_path(&cursors_root, &event_source);
         let cursor = read_cursor(&cursor_file).ok();
         let max = resolved.cfg.triggers.effective_max_events_per_tick();
-        let polled = match connector.poll_events(&repo, cursor.as_deref(), max).await {
+        let polled = match connector
+            .poll_events(&event_source, cursor.as_deref(), max)
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
                 warn!(repo_ref, error = %err, "failed to poll autoflow wake events");
@@ -2920,35 +2923,27 @@ fn parse_repo_ref(repo_ref: &str) -> anyhow::Result<(IssueTracker, String)> {
     ))
 }
 
-fn parse_poll_source(source: &str) -> Option<(Platform, RepoRef)> {
-    let (platform_str, rest) = source.split_once(':')?;
-    let (owner, repo) = rest.split_once('/')?;
-    let platform = match platform_str {
-        "github" => Platform::Github,
-        "gitlab" => Platform::Gitlab,
-        _ => return None,
+fn source_slug(source: &EventSourceRef) -> String {
+    let text = match source {
+        EventSourceRef::Repo { repo } => format!("repo-{}-{}", repo.owner, repo.repo),
+        EventSourceRef::TrackerProject { project, .. } => format!("project-{project}"),
     };
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((
-        platform,
-        RepoRef {
-            platform,
-            owner: owner.into(),
-            repo: repo.into(),
-        },
-    ))
+    text.chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect()
 }
 
-fn autoflow_cursor_path(root: &Path, platform: Platform, repo: &RepoRef) -> PathBuf {
-    root.join(platform.as_str())
-        .join(format!("{}--{}.cursor", repo.owner, repo.repo))
+fn autoflow_cursor_path(root: &Path, source: &EventSourceRef) -> PathBuf {
+    root.join(source.vendor())
+        .join(format!("{}.cursor", source_slug(source)))
 }
 
-fn autoflow_last_polled_at_path(root: &Path, platform: Platform, repo: &RepoRef) -> PathBuf {
-    root.join(platform.as_str())
-        .join(format!("{}--{}.last_polled", repo.owner, repo.repo))
+fn autoflow_last_polled_at_path(root: &Path, source: &EventSourceRef) -> PathBuf {
+    root.join(source.vendor())
+        .join(format!("{}.last_polled", source_slug(source)))
 }
 
 fn read_cursor(path: &Path) -> anyhow::Result<String> {
@@ -3319,15 +3314,16 @@ base_url = "{base_url}"
 
     #[test]
     fn github_issue_polled_event_maps_to_issue_ref() {
-        let repo = RepoRef {
-            platform: Platform::Github,
+        let repo = rupu_scm::RepoRef {
+            platform: rupu_scm::Platform::Github,
             owner: "Section9Labs".into(),
             repo: "rupu".into(),
         };
         let event = rupu_scm::PolledEvent {
             id: "github.issue.labeled".into(),
             delivery: "evt_1".into(),
-            repo,
+            source: repo.into(),
+            subject: None,
             payload: serde_json::json!({
                 "payload": {
                     "action": "labeled",
@@ -3343,15 +3339,16 @@ base_url = "{base_url}"
 
     #[test]
     fn github_pr_polled_event_does_not_fake_issue_ref() {
-        let repo = RepoRef {
-            platform: Platform::Github,
+        let repo = rupu_scm::RepoRef {
+            platform: rupu_scm::Platform::Github,
             owner: "Section9Labs".into(),
             repo: "rupu".into(),
         };
         let event = rupu_scm::PolledEvent {
             id: "github.pr.closed".into(),
             delivery: "evt_2".into(),
-            repo,
+            source: repo.into(),
+            subject: None,
             payload: serde_json::json!({
                 "payload": {
                     "action": "closed",
@@ -5385,11 +5382,12 @@ steps:
 
         let cursor_file = autoflow_cursor_path(
             &paths::autoflow_event_cursors_dir(&global),
-            Platform::Github,
-            &RepoRef {
-                platform: Platform::Github,
-                owner: "Section9Labs".into(),
-                repo: "rupu".into(),
+            &rupu_scm::EventSourceRef::Repo {
+                repo: rupu_scm::RepoRef {
+                    platform: rupu_scm::Platform::Github,
+                    owner: "Section9Labs".into(),
+                    repo: "rupu".into(),
+                },
             },
         );
         write_cursor(&cursor_file, "etag:|since:2026-05-08T19:00:00Z").unwrap();
