@@ -171,7 +171,10 @@ impl UsageDataset {
             }
             let rows =
                 rupu_transcript::aggregate(std::slice::from_ref(&path), TimeWindow::default());
-            let metadata = StandaloneUsageMetadata::from_summary(&summary);
+            let metadata = StandaloneUsageMetadata::from_summary(
+                &summary,
+                load_standalone_metadata(&path, &summary.run_id),
+            );
             facts.extend(rows.iter().map(|row| metadata.to_fact(row)));
         }
 
@@ -408,10 +411,18 @@ struct StandaloneUsageMetadata {
     run_id: String,
     started_at: DateTime<Utc>,
     status: String,
+    repo_ref: Option<String>,
+    issue_ref: Option<String>,
+    worker_id: Option<String>,
+    backend_id: Option<String>,
+    trigger_source: Option<String>,
 }
 
 impl StandaloneUsageMetadata {
-    fn from_summary(summary: &rupu_transcript::RunSummary) -> Self {
+    fn from_summary(
+        summary: &rupu_transcript::RunSummary,
+        metadata: Option<crate::standalone_run_metadata::StandaloneRunMetadata>,
+    ) -> Self {
         Self {
             run_id: summary.run_id.clone(),
             started_at: summary.started_at,
@@ -420,6 +431,11 @@ impl StandaloneUsageMetadata {
                 rupu_transcript::RunStatus::Error => "failed".into(),
                 rupu_transcript::RunStatus::Aborted => "aborted".into(),
             },
+            repo_ref: metadata.as_ref().and_then(|value| value.repo_ref.clone()),
+            issue_ref: metadata.as_ref().and_then(|value| value.issue_ref.clone()),
+            worker_id: metadata.as_ref().and_then(|value| value.worker_id.clone()),
+            backend_id: metadata.as_ref().map(|value| value.backend_id.clone()),
+            trigger_source: metadata.map(|value| value.trigger_source),
         }
     }
 
@@ -430,11 +446,11 @@ impl StandaloneUsageMetadata {
             started_at: self.started_at,
             status: self.status.clone(),
             workflow_name: None,
-            repo_ref: None,
-            issue_ref: None,
-            worker_id: None,
-            backend_id: None,
-            trigger_source: Some("standalone_run".into()),
+            repo_ref: self.repo_ref.clone(),
+            issue_ref: self.issue_ref.clone(),
+            worker_id: self.worker_id.clone(),
+            backend_id: self.backend_id.clone(),
+            trigger_source: self.trigger_source.clone(),
             provider: row.provider.clone(),
             model: row.model.clone(),
             agent: row.agent.clone(),
@@ -454,6 +470,15 @@ fn trigger_name(envelope: &RunEnvelope) -> String {
         rupu_runtime::RunTriggerSource::Autoflow => "autoflow",
     }
     .to_string()
+}
+
+fn load_standalone_metadata(
+    transcript_path: &Path,
+    run_id: &str,
+) -> Option<crate::standalone_run_metadata::StandaloneRunMetadata> {
+    let dir = transcript_path.parent()?;
+    let path = crate::standalone_run_metadata::metadata_path_for_run(dir, run_id);
+    crate::standalone_run_metadata::read_metadata(&path).ok()
 }
 
 #[cfg(test)]
@@ -601,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn dataset_loads_standalone_run_usage() {
+    fn dataset_loads_standalone_run_usage_without_sidecar() {
         let temp = tempfile::tempdir().unwrap();
         let global = temp.path().join(".rupu");
         let transcripts = global.join("transcripts");
@@ -625,7 +650,70 @@ mod tests {
         assert_eq!(dataset.runs[0].providers, vec!["anthropic"]);
         assert_eq!(dataset.facts[0].agent, "reviewer");
         assert_eq!(dataset.facts[0].input_tokens, 10);
+        assert!(dataset.facts[0].repo_ref.is_none());
+        assert!(dataset.facts[0].worker_id.is_none());
         assert_eq!(dataset.runs.len(), 1);
+    }
+
+    #[test]
+    fn dataset_loads_standalone_run_usage_with_sidecar_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = temp.path().join(".rupu");
+        let transcripts = global.join("transcripts");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let started_at = Utc::now();
+        write_usage_transcript(
+            &transcripts,
+            "run_standalone_02",
+            "reviewer",
+            "anthropic",
+            "claude-sonnet-4-6",
+            started_at,
+            14,
+            6,
+        );
+        let metadata_path = crate::standalone_run_metadata::metadata_path_for_run(
+            &transcripts,
+            "run_standalone_02",
+        );
+        crate::standalone_run_metadata::write_metadata(
+            &metadata_path,
+            &crate::standalone_run_metadata::StandaloneRunMetadata {
+                version: crate::standalone_run_metadata::StandaloneRunMetadata::VERSION,
+                run_id: "run_standalone_02".into(),
+                workspace_path: PathBuf::from("/tmp/repo"),
+                project_root: Some(PathBuf::from("/tmp/project")),
+                repo_ref: Some("github:Section9Labs/rupu".into()),
+                issue_ref: Some("github:Section9Labs/rupu/issues/42".into()),
+                backend_id: "local_checkout".into(),
+                worker_id: Some("worker_local_cli".into()),
+                trigger_source: "run_cli".into(),
+                target: Some("github:Section9Labs/rupu/issues/42".into()),
+                workspace_strategy: Some("direct_checkout".into()),
+            },
+        )
+        .unwrap();
+
+        let dataset = UsageDataset::load(&global, None, TimeWindow::default()).unwrap();
+        assert_eq!(dataset.runs.len(), 1);
+        assert_eq!(dataset.facts.len(), 1);
+        assert_eq!(
+            dataset.facts[0].repo_ref.as_deref(),
+            Some("github:Section9Labs/rupu")
+        );
+        assert_eq!(
+            dataset.facts[0].issue_ref.as_deref(),
+            Some("github:Section9Labs/rupu/issues/42")
+        );
+        assert_eq!(
+            dataset.facts[0].worker_id.as_deref(),
+            Some("worker_local_cli")
+        );
+        assert_eq!(
+            dataset.facts[0].backend_id.as_deref(),
+            Some("local_checkout")
+        );
+        assert_eq!(dataset.facts[0].trigger_source.as_deref(), Some("run_cli"));
     }
 
     #[test]
