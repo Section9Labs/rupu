@@ -27,7 +27,9 @@ pub trait CredentialResolver: Send + Sync {
 // ── KeychainResolver ─────────────────────────────────────────────────────────
 
 use crate::backend::ProviderId;
-use crate::keychain_layout::{key_for, legacy_key_for, KeychainKey};
+#[cfg(not(target_os = "macos"))]
+use crate::keychain_layout::KeychainKey;
+use crate::keychain_layout::{key_for, legacy_key_for};
 use crate::stored::StoredCredential;
 use std::path::PathBuf;
 
@@ -145,6 +147,7 @@ impl KeychainResolver {
         Self { storage }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn entry(&self, key: &KeychainKey) -> Result<keyring::Entry> {
         match &self.storage {
             Storage::Keyring { service } => keyring::Entry::new(service, &key.account)
@@ -203,15 +206,20 @@ impl KeychainResolver {
         let key = key_for(p, mode);
         let json = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
         match &self.storage {
-            Storage::Keyring { .. } => {
-                let entry = self.entry(&key)?;
-                entry
-                    .set_password(&json)
-                    .map_err(|e| anyhow::anyhow!("keychain set: {e}"))?;
-                // Best-effort: pre-populate the keychain ACL with rupu's identity
-                // so the first subsequent read doesn't trigger an "Always Allow"
-                // prompt. Non-fatal on failure; warning-logged inside the helper.
-                crate::keyring::try_add_self_to_acl(&key.account);
+            Storage::Keyring { service } => {
+                #[cfg(target_os = "macos")]
+                {
+                    rupu_keychain_acl::set_generic_password(service, &key.account, json.as_bytes())
+                        .map_err(|e| anyhow::anyhow!("keychain set: {e}"))?;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let entry = self.entry(&key)?;
+                    entry
+                        .set_password(&json)
+                        .map_err(|e| anyhow::anyhow!("keychain set: {e}"))?;
+                    crate::keyring::try_add_self_to_acl(&key.account);
+                }
             }
             Storage::JsonFile { path } => {
                 let mut map = Self::read_file_map(path)?;
@@ -225,12 +233,22 @@ impl KeychainResolver {
     pub async fn forget(&self, p: ProviderId, mode: AuthMode) -> Result<()> {
         let key = key_for(p, mode);
         match &self.storage {
-            Storage::Keyring { .. } => {
-                let entry = self.entry(&key)?;
-                match entry.delete_credential() {
-                    Ok(()) => Ok(()),
-                    Err(keyring::Error::NoEntry) => Ok(()),
-                    Err(e) => Err(anyhow::anyhow!("keychain delete: {e}")),
+            Storage::Keyring { service } => {
+                #[cfg(target_os = "macos")]
+                {
+                    match rupu_keychain_acl::delete_generic_password(service, &key.account) {
+                        Ok(()) | Err(rupu_keychain_acl::AclError::NotFound { .. }) => Ok(()),
+                        Err(e) => Err(anyhow::anyhow!("keychain delete: {e}")),
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let entry = self.entry(&key)?;
+                    match entry.delete_credential() {
+                        Ok(()) => Ok(()),
+                        Err(keyring::Error::NoEntry) => Ok(()),
+                        Err(e) => Err(anyhow::anyhow!("keychain delete: {e}")),
+                    }
                 }
             }
             Storage::JsonFile { path } => {
@@ -246,24 +264,56 @@ impl KeychainResolver {
     fn read(&self, p: ProviderId, mode: AuthMode) -> Result<Option<StoredCredential>> {
         let key = key_for(p, mode);
         match &self.storage {
-            Storage::Keyring { .. } => match self.entry(&key)?.get_password() {
-                Ok(s) => Ok(Some(parse_stored_credential(&s, mode)?)),
-                Err(keyring::Error::NoEntry) => {
-                    // Slice A legacy fallback: try the old single-key shape
-                    // (treated as api-key). Only relevant for ApiKey lookups.
-                    if mode == AuthMode::ApiKey {
-                        let lk = legacy_key_for(p);
-                        match self.entry(&lk)?.get_password() {
-                            Ok(s) => Ok(Some(StoredCredential::api_key(s))),
-                            Err(keyring::Error::NoEntry) => Ok(None),
-                            Err(e) => Err(anyhow::anyhow!("keychain legacy read: {e}")),
+            Storage::Keyring { service } => {
+                #[cfg(target_os = "macos")]
+                {
+                    match rupu_keychain_acl::get_generic_password(service, &key.account) {
+                        Ok(bytes) => {
+                            let s = String::from_utf8(bytes)
+                                .map_err(|e| anyhow::anyhow!("keychain read: {e}"))?;
+                            Ok(Some(parse_stored_credential(&s, mode)?))
                         }
-                    } else {
-                        Ok(None)
+                        Err(rupu_keychain_acl::AclError::NotFound { .. }) => {
+                            if mode == AuthMode::ApiKey {
+                                let lk = legacy_key_for(p);
+                                match rupu_keychain_acl::get_generic_password(service, &lk.account)
+                                {
+                                    Ok(bytes) => {
+                                        let s = String::from_utf8(bytes).map_err(|e| {
+                                            anyhow::anyhow!("keychain legacy read: {e}")
+                                        })?;
+                                        Ok(Some(StoredCredential::api_key(s)))
+                                    }
+                                    Err(rupu_keychain_acl::AclError::NotFound { .. }) => Ok(None),
+                                    Err(e) => Err(anyhow::anyhow!("keychain legacy read: {e}")),
+                                }
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        Err(e) => Err(anyhow::anyhow!("keychain read: {e}")),
                     }
                 }
-                Err(e) => Err(anyhow::anyhow!("keychain read: {e}")),
-            },
+                #[cfg(not(target_os = "macos"))]
+                {
+                    match self.entry(&key)?.get_password() {
+                        Ok(s) => Ok(Some(parse_stored_credential(&s, mode)?)),
+                        Err(keyring::Error::NoEntry) => {
+                            if mode == AuthMode::ApiKey {
+                                let lk = legacy_key_for(p);
+                                match self.entry(&lk)?.get_password() {
+                                    Ok(s) => Ok(Some(StoredCredential::api_key(s))),
+                                    Err(keyring::Error::NoEntry) => Ok(None),
+                                    Err(e) => Err(anyhow::anyhow!("keychain legacy read: {e}")),
+                                }
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        Err(e) => Err(anyhow::anyhow!("keychain read: {e}")),
+                    }
+                }
+            }
             Storage::JsonFile { path } => {
                 let map = Self::read_file_map(path)?;
                 match map.get(&key.account) {

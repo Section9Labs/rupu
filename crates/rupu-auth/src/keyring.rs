@@ -25,17 +25,19 @@ pub(crate) const SERVICE: &str = "rupu";
 /// Best-effort: add the running rupu binary to the keychain item's ACL
 /// so subsequent reads don't trigger the macOS "Always Allow" prompt.
 ///
-/// **Disabled in v0.3.x.** The legacy `SecAccess` approach in
+/// **Legacy-only no-op.** The modern CLI credential path now bypasses
+/// `keyring` on macOS and creates items with `kSecAttrAccess`
+/// pre-populated, so it never calls this helper. The legacy
+/// `KeyringBackend` still writes via `keyring`, and the retrofit
+/// approach in
 /// `rupu-keychain-acl` retrofits the ACL onto items that the modern
 /// `SecItemAdd` (used by the `keyring` crate) created with different
 /// semantics. The retrofit ITSELF prompts twice (Find for the item +
 /// SetAccess for the new ACL), so calling it actually made login go
-/// from 1 prompt to 3 in field testing. The proper fix is bypassing
-/// `keyring` on macOS and calling `SecItemAdd` directly with
-/// `kSecAttrAccess` pre-set — tracked separately in TODO.md.
+/// from 1 prompt to 3 in field testing.
 ///
-/// Until then this is a no-op on every platform, restoring the
-/// pre-L3 behavior.
+/// Leaving this as a no-op avoids regressing that legacy path until it
+/// is also migrated off `keyring`.
 pub(crate) fn try_add_self_to_acl(_account: &str) {
     // Intentional no-op. See docstring.
 }
