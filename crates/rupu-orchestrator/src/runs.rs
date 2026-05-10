@@ -974,9 +974,7 @@ mod tests {
             }],
         };
 
-        let written = store
-            .write_artifact_manifest(&rec.id, &manifest)
-            .unwrap();
+        let written = store.write_artifact_manifest(&rec.id, &manifest).unwrap();
         assert_eq!(written, store.artifact_manifest_path(&rec.id));
 
         let loaded = store.read_artifact_manifest(&rec.id).unwrap();

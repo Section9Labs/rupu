@@ -96,14 +96,11 @@ impl AgentDispatcher for CliAgentDispatcher {
         parent_depth: u32,
     ) -> Result<DispatchOutcome, DispatchError> {
         let project_agents_parent = self.project_root.as_ref().map(|p| p.join(".rupu"));
-        let spec = rupu_agent::load_agent(
-            &self.global,
-            project_agents_parent.as_deref(),
-            agent_name,
-        )
-        .map_err(|_| DispatchError::AgentNotFound {
-            agent: agent_name.to_string(),
-        })?;
+        let spec =
+            rupu_agent::load_agent(&self.global, project_agents_parent.as_deref(), agent_name)
+                .map_err(|_| DispatchError::AgentNotFound {
+                    agent: agent_name.to_string(),
+                })?;
 
         let (sub_run_id, transcript_path) = self
             .run_store

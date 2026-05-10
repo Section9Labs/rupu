@@ -1408,7 +1408,11 @@ fn build_run_envelope(
             issue_present: ctx.issue.is_some(),
         }),
         execution: ExecutionRequest {
-            backend: Some(template.backend.unwrap_or_else(|| "local_worktree".to_string())),
+            backend: Some(
+                template
+                    .backend
+                    .unwrap_or_else(|| "local_worktree".to_string()),
+            ),
             permission_mode: ctx.mode.clone(),
             workspace_strategy: template.workspace_strategy,
             strict_templates: ctx.strict_templates,
@@ -1502,8 +1506,14 @@ pub(crate) fn upsert_worker_record(
         .as_ref()
         .map(|record| record.registered_at.clone())
         .unwrap_or_else(|| now.clone());
-    let mut capabilities = existing.map(|record| record.capabilities).unwrap_or_default();
-    if !capabilities.backends.iter().any(|value| value == backend_id) {
+    let mut capabilities = existing
+        .map(|record| record.capabilities)
+        .unwrap_or_default();
+    if !capabilities
+        .backends
+        .iter()
+        .any(|value| value == backend_id)
+    {
         capabilities.backends.push(backend_id.to_string());
         capabilities.backends.sort();
     }
@@ -1565,7 +1575,10 @@ fn prepare_local_run(envelope: &RunEnvelope, worker_id: &str) -> anyhow::Result<
         workspace_path: repo.workspace_path.clone(),
         project_root: repo.project_root.clone(),
         repo_ref: repo.repo_ref.clone(),
-        issue_ref: envelope.context.as_ref().and_then(|ctx| ctx.issue_ref.clone()),
+        issue_ref: envelope
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.issue_ref.clone()),
         workspace_strategy: envelope.execution.workspace_strategy.clone(),
         worker_id: Some(worker_id.to_string()),
     })
@@ -1698,7 +1711,8 @@ async fn execute_workflow_invocation(
         .worker
         .clone()
         .unwrap_or_else(|| default_execution_worker_context(WorkerKind::Cli, None));
-    let run_envelope = build_run_envelope(run_id.clone(), &workflow, &body, &path, &ctx, &worker_ctx);
+    let run_envelope =
+        build_run_envelope(run_id.clone(), &workflow, &body, &path, &ctx, &worker_ctx);
     let backend_id = run_envelope
         .execution
         .backend

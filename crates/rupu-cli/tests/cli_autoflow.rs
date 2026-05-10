@@ -1340,7 +1340,13 @@ fn autoflow_explain_prints_claim_run_and_wake_context() {
     rupu_runtime::WakeStore::new(home.join("autoflows/wakes"))
         .mark_processed(&source_wake.wake_id)
         .unwrap();
-    enqueue_issue_wake(&home, repo_ref, issue_ref, "autoflow.dispatch.pending", None);
+    enqueue_issue_wake(
+        &home,
+        repo_ref,
+        issue_ref,
+        "autoflow.dispatch.pending",
+        None,
+    );
 
     let run_store = rupu_orchestrator::RunStore::new(home.join("runs"));
     let mut run = sample_run_record("run_123", issue_ref);
@@ -1348,7 +1354,9 @@ fn autoflow_explain_prints_claim_run_and_wake_context() {
     run.awaiting_step_id = Some("review".into());
     run.expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(30));
     run.source_wake_id = Some(source_wake.wake_id.clone());
-    run_store.create(run, "name: issue-supervisor-dispatch\nsteps: []\n").unwrap();
+    run_store
+        .create(run, "name: issue-supervisor-dispatch\nsteps: []\n")
+        .unwrap();
 
     let claim_store = rupu_workspace::AutoflowClaimStore {
         root: home.join("autoflows/claims"),
@@ -1369,9 +1377,7 @@ fn autoflow_explain_prints_claim_run_and_wake_context() {
             artifact_manifest_path: None,
             next_retry_at: None,
             claim_owner: Some("worker_local_test_serve".into()),
-            lease_expires_at: Some(
-                (chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339(),
-            ),
+            lease_expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(3)).to_rfc3339()),
             pending_dispatch: Some(rupu_workspace::PendingDispatch {
                 workflow: "phase-delivery-cycle".into(),
                 target: issue_ref.into(),
@@ -1401,13 +1407,21 @@ fn autoflow_explain_prints_claim_run_and_wake_context() {
         .args(["autoflow", "explain", issue_ref])
         .assert()
         .success()
-        .stdout(predicate::str::contains("issue: github:Section9Labs/rupu/issues/42"))
-        .stdout(predicate::str::contains("workflow: issue-supervisor-dispatch"))
+        .stdout(predicate::str::contains(
+            "issue: github:Section9Labs/rupu/issues/42",
+        ))
+        .stdout(predicate::str::contains(
+            "workflow: issue-supervisor-dispatch",
+        ))
         .stdout(predicate::str::contains("last run: run_123"))
-        .stdout(predicate::str::contains("last run status: awaiting_approval"))
+        .stdout(predicate::str::contains(
+            "last run status: awaiting_approval",
+        ))
         .stdout(predicate::str::contains("source wake:"))
         .stdout(predicate::str::contains("approval gate: step=review"))
-        .stdout(predicate::str::contains("pending dispatch: phase-delivery-cycle"))
+        .stdout(predicate::str::contains(
+            "pending dispatch: phase-delivery-cycle",
+        ))
         .stdout(predicate::str::contains("queued wakes:"))
         .stdout(predicate::str::contains("recent processed wake:"));
 }

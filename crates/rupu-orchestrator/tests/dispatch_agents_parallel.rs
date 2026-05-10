@@ -181,10 +181,7 @@ impl StepFactory for ParallelFactory {
                 bash_env_allowlist: Vec::new(),
                 bash_timeout_secs: 120,
                 dispatcher: Some(self.dispatcher.clone()),
-                dispatchable_agents: Some(vec![
-                    "security-reviewer".into(),
-                    "perf-reviewer".into(),
-                ]),
+                dispatchable_agents: Some(vec!["security-reviewer".into(), "perf-reviewer".into()]),
                 parent_run_id: parent_run_id_for_ctx,
                 depth: 0,
             },
@@ -201,10 +198,7 @@ impl StepFactory for ParallelFactory {
             anthropic_speed: None,
             parent_run_id: None,
             depth: 0,
-            dispatchable_agents: Some(vec![
-                "security-reviewer".into(),
-                "perf-reviewer".into(),
-            ]),
+            dispatchable_agents: Some(vec!["security-reviewer".into(), "perf-reviewer".into()]),
         }
     }
 }

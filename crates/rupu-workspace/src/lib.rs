@@ -34,7 +34,7 @@ pub use discover::{discover, DiscoverError, Discovery};
 pub use record::{new_id, Workspace};
 pub use repo_record::TrackedRepo;
 pub use repo_store::{repo_ref_key, RepoRegistryStore, RepoStoreError};
+pub use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};
 pub use store::{upsert, StoreError, WorkspaceStore};
 pub use worker_store::{WorkerStore, WorkerStoreError};
 pub use worktree_layout::{issue_dir_name, issue_worktree_path, repo_dir_name};
-pub use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};

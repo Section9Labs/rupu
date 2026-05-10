@@ -492,14 +492,13 @@ fn render_child_item(
     // Read the full transcript (file is complete by the time we
     // see it). Empty/missing transcripts produce a header+immediate
     // footer with no body.
-    let events: Vec<TxEvent> = if !item.transcript_path.as_os_str().is_empty()
-        && item.transcript_path.exists()
-    {
-        let mut tailer = TranscriptTailer::new(&item.transcript_path);
-        tailer.drain()
-    } else {
-        Vec::new()
-    };
+    let events: Vec<TxEvent> =
+        if !item.transcript_path.as_os_str().is_empty() && item.transcript_path.exists() {
+            let mut tailer = TranscriptTailer::new(&item.transcript_path);
+            tailer.drain()
+        } else {
+            Vec::new()
+        };
 
     // Extract provider / model from the first RunStart for the meta tail.
     // Agent name isn't used as the headline — the per-item label
@@ -775,12 +774,12 @@ fn render_one_child(headline: &str, outcome: &serde_json::Value, printer: &mut L
     let success = outcome["ok"].as_bool().unwrap_or(true);
     let dispatch_error = outcome["error"].as_str();
 
-    let events: Vec<TxEvent> = if !transcript_path.as_os_str().is_empty() && transcript_path.exists()
-    {
-        TranscriptTailer::new(&transcript_path).drain()
-    } else {
-        Vec::new()
-    };
+    let events: Vec<TxEvent> =
+        if !transcript_path.as_os_str().is_empty() && transcript_path.exists() {
+            TranscriptTailer::new(&transcript_path).drain()
+        } else {
+            Vec::new()
+        };
 
     let (provider, model) = events
         .iter()
@@ -866,7 +865,9 @@ fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
 
     match tool {
         // ── built-in tools ───────────────────────────────────────────
-        "bash" => s_str("command").map(|s| truncate(s, 72)).unwrap_or_default(),
+        "bash" => s_str("command")
+            .map(|s| truncate(s, 72))
+            .unwrap_or_default(),
         "write_file" | "edit_file" => s_str("path").unwrap_or_default(),
         "read_file" => s_str("path").unwrap_or_default(),
 

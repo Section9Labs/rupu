@@ -138,8 +138,11 @@ impl Tool for DispatchAgentTool {
         };
 
         let child_prompt = match i.inputs {
-            Some(inputs) if !inputs.is_null() && !inputs.as_object().is_some_and(|o| o.is_empty()) => {
-                let pretty = serde_json::to_string_pretty(&inputs).unwrap_or_else(|_| inputs.to_string());
+            Some(inputs)
+                if !inputs.is_null() && !inputs.as_object().is_some_and(|o| o.is_empty()) =>
+            {
+                let pretty =
+                    serde_json::to_string_pretty(&inputs).unwrap_or_else(|_| inputs.to_string());
                 format!("{}\n\nInputs (JSON):\n{}", i.prompt, pretty)
             }
             _ => i.prompt,
@@ -164,7 +167,8 @@ impl Tool for DispatchAgentTool {
                     "sub_run_id": outcome.sub_run_id,
                 });
                 Ok(ToolOutput {
-                    stdout: serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()),
+                    stdout: serde_json::to_string_pretty(&body)
+                        .unwrap_or_else(|_| body.to_string()),
                     error: None,
                     duration_ms: started.elapsed().as_millis() as u64,
                     derived: None,
@@ -254,7 +258,12 @@ mod tests {
         let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher {
             return_output: "ok".into(),
         });
-        let ctx = ctx_with(Some(disp), Some(vec!["reviewer".into()]), Some("run_X".into()), 0);
+        let ctx = ctx_with(
+            Some(disp),
+            Some(vec!["reviewer".into()]),
+            Some("run_X".into()),
+            0,
+        );
         let out = tool
             .invoke(json!({ "agent": "intruder", "prompt": "hi" }), &ctx)
             .await
@@ -295,7 +304,12 @@ mod tests {
         let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher {
             return_output: "child output".into(),
         });
-        let ctx = ctx_with(Some(disp), Some(vec!["reviewer".into()]), Some("run_X".into()), 0);
+        let ctx = ctx_with(
+            Some(disp),
+            Some(vec!["reviewer".into()]),
+            Some("run_X".into()),
+            0,
+        );
         let out = tool
             .invoke(json!({ "agent": "reviewer", "prompt": "hi" }), &ctx)
             .await
@@ -307,7 +321,10 @@ mod tests {
         assert_eq!(parsed["output"], "child output");
         assert_eq!(parsed["sub_run_id"], "sub_TEST");
         assert_eq!(parsed["tokens_used"], 42);
-        assert!(parsed["transcript_path"].as_str().unwrap().contains("sub_TEST"));
+        assert!(parsed["transcript_path"]
+            .as_str()
+            .unwrap()
+            .contains("sub_TEST"));
         assert_eq!(parsed["findings"], json!([]));
     }
 
@@ -317,7 +334,12 @@ mod tests {
         let disp: Arc<dyn AgentDispatcher> = Arc::new(StubDispatcher {
             return_output: "ok".into(),
         });
-        let ctx = ctx_with(Some(disp), Some(vec!["reviewer".into()]), Some("run_X".into()), 0);
+        let ctx = ctx_with(
+            Some(disp),
+            Some(vec!["reviewer".into()]),
+            Some("run_X".into()),
+            0,
+        );
         let out = tool
             .invoke(
                 json!({ "agent": "reviewer", "prompt": "review", "inputs": { "subject": "x" } }),

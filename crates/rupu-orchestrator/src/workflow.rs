@@ -1069,7 +1069,9 @@ fn scan_step_refs(template: &str) -> Vec<(String, Option<String>)> {
             continue;
         }
         // SAFETY: id_start..j is a contiguous ASCII identifier slice.
-        let step_id = std::str::from_utf8(&bytes[id_start..j]).unwrap().to_string();
+        let step_id = std::str::from_utf8(&bytes[id_start..j])
+            .unwrap()
+            .to_string();
         let field = if j < bytes.len() && bytes[j] == b'.' {
             let f_start = j + 1;
             let mut k = f_start;

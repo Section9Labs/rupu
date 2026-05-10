@@ -136,7 +136,9 @@ impl LineStreamPrinter {
         // the documented fallback. The width is treated as static for
         // the run — handling SIGWINCH mid-stream would force a
         // re-layout that the line-stream model doesn't support.
-        let term_width = terminal::size().map(|(w, _)| w).unwrap_or(FALLBACK_TERM_WIDTH);
+        let term_width = terminal::size()
+            .map(|(w, _)| w)
+            .unwrap_or(FALLBACK_TERM_WIDTH);
         let prefs = crate::output::diag::prefs_for_diag(false);
         Self {
             indent: 0,
@@ -242,9 +244,7 @@ impl LineStreamPrinter {
         pb.set_style(
             ProgressStyle::with_template(&template)
                 .unwrap_or_else(|_| ProgressStyle::default_spinner())
-                .tick_strings(&[
-                    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-                ]),
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
         );
         pb.set_message(message.into());
         // ~80 ms per tick reads as a smooth pulse without flooding
@@ -387,12 +387,7 @@ impl LineStreamPrinter {
     /// the parent frame so child iterations can render at indent+1.
     /// `kind_label` is the YAML keyword (`for_each`, `parallel`) so
     /// the operator can correlate the rendered shape to the workflow.
-    pub fn fanout_start(
-        &mut self,
-        step_id: &str,
-        kind_label: &str,
-        count: usize,
-    ) -> SpinnerHandle {
+    pub fn fanout_start(&mut self, step_id: &str, kind_label: &str, count: usize) -> SpinnerHandle {
         self.step_start = Some(std::time::Instant::now());
 
         let mut buf = String::new();
