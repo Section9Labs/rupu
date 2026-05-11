@@ -317,9 +317,16 @@ RUPU_LINEAR_WEBHOOK_SECRET=<your-linear-webhook-secret> \
   rupu webhook serve --addr 0.0.0.0:8080
 ```
 
+Jira Cloud issue webhooks use the same server:
+
+```sh
+RUPU_JIRA_WEBHOOK_SECRET=<your-jira-webhook-secret> \
+  rupu webhook serve --addr 0.0.0.0:8080
+```
+
 Same workflow YAML; same event vocabulary. The webhook receiver:
 
-- Validates `X-Hub-Signature-256` (GitHub), `X-Gitlab-Token` (GitLab), or `Linear-Signature` + `webhookTimestamp` freshness (Linear).
+- Validates `X-Hub-Signature-256` (GitHub), `X-Gitlab-Token` (GitLab), `Linear-Signature` + `webhookTimestamp` freshness (Linear), or `X-Hub-Signature` (Jira Cloud).
 - Maps the raw vendor delivery onto the rupu event id.
 - Fires matching workflows with `{{event.*}}` populated.
 
@@ -341,9 +348,30 @@ steps:
       After:  {{ event.state.after.id }}
 ```
 
+Jira issue updates are normalized the same way, but the transition source is `changelog.items`:
+
+```yaml
+name: jira-review-ready
+trigger:
+  on: event
+  event: issue.entered_workflow_state.ready_for_review
+  filter: "{{ event.vendor == 'jira' and event.subject.ref == 'ENG-123' }}"
+
+steps:
+  - id: review
+    agent: reviewer
+    prompt: |
+      Jira issue {{ event.subject.ref }} entered review.
+      Before: {{ event.state.before.name }}
+      After:  {{ event.state.after.name }}
+```
+
 Secrets are read from environment variables — never config files, never the keychain. Webhook secrets are operational secrets and belong in your process supervisor's environment block.
 
-Important current limit: Linear polling is available for event-triggered workflows, but autoflow ownership is still repo-backed. `poll_sources = ["linear:<team-id>"]` participates in `rupu cron tick` and the event trigger path; it does not yet give autoflows a tracker-native claim/ownership model.
+Important current limits:
+
+- Linear polling is available for event-triggered workflows, but autoflow ownership is still repo-backed. `poll_sources = ["linear:<team-id>"]` participates in `rupu cron tick` and the event trigger path; it does not yet give autoflows a tracker-native claim/ownership model.
+- Jira native state support is currently webhook-only. `jira:<project>` polling is still future work.
 
 Bind to `127.0.0.1` and front with a TLS-terminating reverse proxy in production. rupu does not terminate TLS itself.
 

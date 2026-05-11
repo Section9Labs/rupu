@@ -1,4 +1,4 @@
-//! Webhook signature validation for GitHub + GitLab + Linear.
+//! Webhook signature validation for GitHub + GitLab + Linear + Jira.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -46,6 +46,18 @@ pub fn verify_github_signature(
     } else {
         Err(SignatureError::Mismatch)
     }
+}
+
+/// Verify a Jira webhook signature. Jira Cloud signs webhook payloads
+/// using the same WebSub-style `sha256=<hex>` HMAC format it documents
+/// for `X-Hub-Signature`, so the verification rules are identical to
+/// GitHub's header format even though the header name differs.
+pub fn verify_jira_signature(
+    secret: &[u8],
+    body: &[u8],
+    signature_header: Option<&str>,
+) -> Result<(), SignatureError> {
+    verify_github_signature(secret, body, signature_header)
 }
 
 /// Verify a GitLab webhook token. GitLab's model is a shared-secret
@@ -135,6 +147,14 @@ mod tests {
             let err = verify_github_signature(b"k", b"body", Some(bad)).unwrap_err();
             assert!(matches!(err, SignatureError::Malformed(_)), "for {bad}");
         }
+    }
+
+    #[test]
+    fn jira_round_trip_passes() {
+        let secret = b"It's a Secret to Everybody";
+        let body = b"Hello World!";
+        let sig = "sha256=a4771c39fbe90f317c7824e83ddef3caae9cb3d976c214ace1f2937e133263c9";
+        verify_jira_signature(secret, body, Some(sig)).expect("expected match");
     }
 
     #[test]

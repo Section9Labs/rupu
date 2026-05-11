@@ -343,6 +343,7 @@ impl KeychainResolver {
             "github" => Ok(ProviderId::Github),
             "gitlab" => Ok(ProviderId::Gitlab),
             "linear" => Ok(ProviderId::Linear),
+            "jira" => Ok(ProviderId::Jira),
             "local" => Ok(ProviderId::Local),
             other => anyhow::bail!("unknown provider: {other}"),
         }
@@ -665,6 +666,10 @@ mod parse_stored_credential_tests {
         assert_eq!(
             KeychainResolver::parse_provider("linear").unwrap(),
             ProviderId::Linear,
+        );
+        assert_eq!(
+            KeychainResolver::parse_provider("jira").unwrap(),
+            ProviderId::Jira,
         );
     }
 }

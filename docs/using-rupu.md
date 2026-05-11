@@ -704,6 +704,7 @@ The first poll warms a local snapshot for that team and emits zero events. Later
 ```sh
 RUPU_GITHUB_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
 RUPU_LINEAR_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
+RUPU_JIRA_WEBHOOK_SECRET=... rupu webhook serve --addr 0.0.0.0:8080
 ```
 
 Use webhook mode when you want lower latency or event types that polling does not expose. Laptop users usually should not expose a local webhook receiver directly; start with polling and `rupu autoflow tick` or `rupu autoflow serve` instead.
@@ -711,6 +712,14 @@ Use webhook mode when you want lower latency or event types that polling does no
 `rupu webhook serve` now looks beyond the current checkout: it can load project workflows from tracked repos under `rupu repos ...`, and it dispatches the exact matched workflow file rather than resolving by bare workflow name from the server's cwd.
 
 Linear issue webhooks are normalized before dispatch. Workflows can therefore target portable native tracker aliases such as `issue.state_changed` and `issue.entered_workflow_state` instead of manually unpacking Linear's raw `updatedFrom` structure in every `filter:`.
+
+Jira Cloud issue webhooks are normalized too. `jira:issue_updated` changelog transitions become portable aliases such as `issue.entered_workflow_state.ready_for_review`, `issue.sprint_changed`, and `issue.priority_changed`.
+
+Current boundary:
+
+- Linear supports both webhook and `poll_sources = ["linear:<team-id>"]`.
+- Jira native state support is webhook-only for now; polling is not shipped yet.
+- Neither tracker has tracker-native autoflow claim ownership yet; autoflow execution is still repo-backed.
 
 When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and the next `rupu autoflow tick` or active `rupu autoflow serve` cycle consumes it.
 

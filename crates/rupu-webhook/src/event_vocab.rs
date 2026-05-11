@@ -17,6 +17,7 @@
 //!   gitlab.issue.opened
 //!   gitlab.push
 //!   linear.issue.updated
+//!   jira.issue.updated
 //!
 //! Workflow-side glob matching *is* supported by the orchestrator.
 //! This module only maps raw vendor deliveries onto canonical rupu
@@ -124,6 +125,19 @@ pub fn map_linear_event(event_header: &str, payload: &Value) -> Option<String> {
     }
 }
 
+/// Map a Jira webhook delivery to a rupu event id. Jira Cloud issue
+/// webhooks are changelog-shaped: `jira:issue_updated` carries the
+/// field transitions, while `jira:issue_created` / `jira:issue_deleted`
+/// describe lifecycle edges.
+pub fn map_jira_event(event_header: &str, _payload: &Value) -> Option<String> {
+    match event_header {
+        "jira:issue_created" => Some("jira.issue.opened".into()),
+        "jira:issue_updated" => Some("jira.issue.updated".into()),
+        "jira:issue_deleted" => Some("jira.issue.deleted".into()),
+        _ => None,
+    }
+}
+
 /// Normalize a Linear Issue webhook payload into the shape expected by
 /// the orchestrator's native tracker state alias layer. Raw vendor
 /// payload is preserved at `payload`.
@@ -217,6 +231,66 @@ pub fn normalize_linear_event_payload(payload: &Value) -> Value {
     out
 }
 
+/// Normalize a Jira issue webhook payload into the shape expected by
+/// the orchestrator's native tracker state alias layer. Field-level
+/// transitions are read from `changelog.items`; raw vendor payload is
+/// preserved at `payload`.
+pub fn normalize_jira_event_payload(payload: &Value) -> Value {
+    let issue = payload.get("issue").and_then(Value::as_object);
+    let fields = issue
+        .and_then(|issue| issue.get("fields"))
+        .and_then(Value::as_object);
+
+    let issue_id = issue
+        .and_then(|issue| issue.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let issue_ref = issue
+        .and_then(|issue| issue.get("key"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let issue_url = issue
+        .and_then(|issue| issue.get("self"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let current_project = fields.and_then(|fields| fields.get("project"));
+
+    let mut out = json!({
+        "vendor": "jira",
+        "subject": {
+            "kind": "issue",
+            "id": issue_id,
+            "ref": issue_ref,
+            "url": issue_url,
+        },
+        "actor": payload.get("user").cloned().unwrap_or(Value::Null),
+        "tenant": {
+            "base_url": payload.get("baseUrl").cloned().unwrap_or(Value::Null),
+        },
+        "context": {
+            "project": current_project.cloned().unwrap_or(Value::Null),
+            "issue_type": fields.and_then(|fields| fields.get("issuetype")).cloned().unwrap_or(Value::Null),
+        },
+        "payload": payload.clone(),
+    });
+
+    if let Some(state) = jira_transition_from_changelog(payload, JiraChangeKind::Status) {
+        out["state"] = state;
+    }
+    if let Some(project) = jira_transition_from_changelog(payload, JiraChangeKind::Project) {
+        out["project"] = project;
+    }
+    if let Some(sprint) = jira_transition_from_changelog(payload, JiraChangeKind::Sprint) {
+        out["sprint"] = sprint;
+    }
+    if let Some(priority) = jira_transition_from_changelog(payload, JiraChangeKind::Priority) {
+        out["priority"] = priority;
+    }
+
+    out
+}
+
 fn transition_object(
     before: Option<&Value>,
     after: Option<&Value>,
@@ -259,6 +333,124 @@ fn blocked_flag(value: &Value) -> bool {
         Value::Bool(flag) => *flag,
         Value::Number(number) => number.as_i64().unwrap_or_default() > 0,
         _ => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum JiraChangeKind {
+    Status,
+    Project,
+    Sprint,
+    Priority,
+}
+
+fn jira_transition_from_changelog(payload: &Value, kind: JiraChangeKind) -> Option<Value> {
+    let item = payload
+        .get("changelog")
+        .and_then(|value| value.get("items"))
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| jira_change_item_matches(item, kind))?;
+    let before = jira_change_endpoint(item.get("from"), item.get("fromString"));
+    let after = jira_change_endpoint(item.get("to"), item.get("toString"));
+    if before == after {
+        return None;
+    }
+
+    let mut transition = json!({
+        "before": before,
+        "after": after,
+    });
+    if let Some(category) = jira_change_category(kind) {
+        transition["category"] = Value::String(category.to_string());
+    }
+    Some(transition)
+}
+
+fn jira_change_item_matches(item: &Value, kind: JiraChangeKind) -> bool {
+    let field = item
+        .get("field")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let field_id = item
+        .get("fieldId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match kind {
+        JiraChangeKind::Status => field == "status" || field_id == "status",
+        JiraChangeKind::Project => field == "project" || field_id == "project",
+        JiraChangeKind::Sprint => field == "sprint" || field_id == "sprint",
+        JiraChangeKind::Priority => field == "priority" || field_id == "priority",
+    }
+}
+
+fn jira_change_category(kind: JiraChangeKind) -> Option<&'static str> {
+    match kind {
+        JiraChangeKind::Status => Some("workflow_state"),
+        JiraChangeKind::Project => Some("project"),
+        JiraChangeKind::Sprint => Some("sprint"),
+        JiraChangeKind::Priority => None,
+    }
+}
+
+fn jira_change_endpoint(id: Option<&Value>, text: Option<&Value>) -> Value {
+    let mut object = serde_json::Map::new();
+    if let Some(id) = id.and_then(value_as_scalar_string) {
+        object.insert("id".into(), Value::String(id));
+    }
+    if let Some(text) = text.and_then(Value::as_str) {
+        if let Some(parsed) = parse_jira_named_transition(text) {
+            for (key, value) in parsed {
+                object.insert(key, value);
+            }
+        } else if !text.trim().is_empty() {
+            object.insert("name".into(), Value::String(text.to_string()));
+        }
+    }
+    Value::Object(object)
+}
+
+fn value_as_scalar_string(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_jira_named_transition(text: &str) -> Option<Vec<(String, Value)>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bracketed = trimmed
+        .split_once('[')
+        .and_then(|(_, rest)| rest.rsplit_once(']'))
+        .map(|(inside, _)| inside)
+        .unwrap_or(trimmed);
+    if !bracketed.contains('=') {
+        return None;
+    }
+    let mut out = Vec::new();
+    for token in bracketed.split(',') {
+        let (raw_key, raw_value) = token.split_once('=')?;
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        if key.eq_ignore_ascii_case("id") && !value.is_empty() {
+            out.push(("id".into(), Value::String(value.to_string())));
+        } else if key.eq_ignore_ascii_case("name") && !value.is_empty() {
+            out.push(("name".into(), Value::String(value.to_string())));
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -389,6 +581,22 @@ mod tests {
     }
 
     #[test]
+    fn jira_issue_events() {
+        assert_eq!(
+            map_jira_event("jira:issue_created", &json!({})),
+            Some("jira.issue.opened".into())
+        );
+        assert_eq!(
+            map_jira_event("jira:issue_updated", &json!({})),
+            Some("jira.issue.updated".into())
+        );
+        assert_eq!(
+            map_jira_event("jira:issue_deleted", &json!({})),
+            Some("jira.issue.deleted".into())
+        );
+    }
+
+    #[test]
     fn linear_issue_update_normalizes_transition_fields() {
         let payload = json!({
             "action": "update",
@@ -425,5 +633,60 @@ mod tests {
         assert_eq!(normalized["priority"]["after"]["id"], 1);
         assert_eq!(normalized["blocked"], true);
         assert_eq!(normalized["payload"]["data"]["identifier"], "ENG-123");
+    }
+
+    #[test]
+    fn jira_issue_update_normalizes_changelog_transitions() {
+        let payload = json!({
+            "timestamp": 1731430163000u64,
+            "webhookEvent": "jira:issue_updated",
+            "user": { "accountId": "user-1", "displayName": "Matt" },
+            "issue": {
+                "id": "10001",
+                "self": "https://acme.atlassian.net/rest/api/3/issue/10001",
+                "key": "ENG-123",
+                "fields": {
+                    "project": { "id": "10000", "key": "ENG", "name": "Engineering" },
+                    "issuetype": { "id": "10004", "name": "Task" }
+                }
+            },
+            "changelog": {
+                "items": [
+                    {
+                        "field": "status",
+                        "fieldId": "status",
+                        "from": "3",
+                        "fromString": "To Do",
+                        "to": "4",
+                        "toString": "In Progress"
+                    },
+                    {
+                        "field": "Sprint",
+                        "from": "41",
+                        "fromString": "com.atlassian.greenhopper.service.sprint.Sprint[id=41,name=Sprint 41]",
+                        "to": "42",
+                        "toString": "com.atlassian.greenhopper.service.sprint.Sprint[id=42,name=Sprint 42]"
+                    },
+                    {
+                        "field": "priority",
+                        "fieldId": "priority",
+                        "from": "2",
+                        "fromString": "Medium",
+                        "to": "1",
+                        "toString": "High"
+                    }
+                ]
+            }
+        });
+
+        let normalized = normalize_jira_event_payload(&payload);
+        assert_eq!(normalized["subject"]["ref"], "ENG-123");
+        assert_eq!(normalized["state"]["category"], "workflow_state");
+        assert_eq!(normalized["state"]["before"]["id"], "3");
+        assert_eq!(normalized["state"]["after"]["name"], "In Progress");
+        assert_eq!(normalized["sprint"]["before"]["name"], "Sprint 41");
+        assert_eq!(normalized["sprint"]["after"]["id"], "42");
+        assert_eq!(normalized["priority"]["after"]["name"], "High");
+        assert_eq!(normalized["payload"]["issue"]["key"], "ENG-123");
     }
 }

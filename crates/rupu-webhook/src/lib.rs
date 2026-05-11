@@ -1,7 +1,7 @@
 //! Webhook receiver for `trigger.on: event` workflows.
 //!
 //! Long-running HTTP server (axum) that listens for SCM-vendor
-//! webhooks (GitHub, GitLab, Linear), validates the signature, maps the
+//! webhooks (GitHub, GitLab, Linear, Jira), validates the signature, maps the
 //! incoming payload to a stable rupu event identifier
 //! (`github.pr.opened`, `github.issue.created`, etc.), evaluates
 //! each candidate workflow's optional `filter:` expression against
@@ -15,6 +15,8 @@
 //! - **GitLab**: simple shared-secret comparison against the
 //!   `x-gitlab-token` header. (GitLab's webhook UI does not offer
 //!   HMAC; the shared-secret model is what their docs prescribe.)
+//! - **Jira Cloud**: HMAC-SHA256 in the WebSub-style
+//!   `x-hub-signature` header (`sha256=<hex>`).
 //!
 //! Filter evaluation: `filter:` is a minijinja expression rendered
 //! against `{ "event": <payload> }`. Falsy result skips the
@@ -36,11 +38,13 @@ pub mod signature;
 
 pub use dispatch::{dispatch_event, DispatchOutcome, DispatchedWorkflow, WorkflowDispatcher};
 pub use event_vocab::{
-    map_github_event, map_gitlab_event, map_linear_event, normalize_linear_event_payload,
+    map_github_event, map_gitlab_event, map_jira_event, map_linear_event,
+    normalize_jira_event_payload, normalize_linear_event_payload,
 };
 pub use server::{
     serve, WebhookConfig, WebhookError, WebhookEvent, WebhookObserver, WebhookSource,
 };
 pub use signature::{
-    verify_github_signature, verify_gitlab_token, verify_linear_signature, SignatureError,
+    verify_github_signature, verify_gitlab_token, verify_jira_signature, verify_linear_signature,
+    SignatureError,
 };

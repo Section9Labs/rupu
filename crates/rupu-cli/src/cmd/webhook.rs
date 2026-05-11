@@ -8,6 +8,7 @@
 //!   RUPU_GITHUB_WEBHOOK_SECRET   (HMAC-SHA256 secret for GitHub)
 //!   RUPU_GITLAB_WEBHOOK_TOKEN    (shared-secret token for GitLab)
 //!   RUPU_LINEAR_WEBHOOK_SECRET   (HMAC-SHA256 secret for Linear)
+//!   RUPU_JIRA_WEBHOOK_SECRET     (HMAC-SHA256 secret for Jira Cloud)
 //!
 //! Any may be unset; the corresponding endpoint then returns
 //! 503 (service-unavailable) so the operator knows the route is
@@ -66,10 +67,17 @@ async fn serve_cmd(addr: SocketAddr) -> anyhow::Result<()> {
     let linear_secret = std::env::var("RUPU_LINEAR_WEBHOOK_SECRET")
         .ok()
         .map(|s| s.into_bytes());
-    if github_secret.is_none() && gitlab_token.is_none() && linear_secret.is_none() {
+    let jira_secret = std::env::var("RUPU_JIRA_WEBHOOK_SECRET")
+        .ok()
+        .map(|s| s.into_bytes());
+    if github_secret.is_none()
+        && gitlab_token.is_none()
+        && linear_secret.is_none()
+        && jira_secret.is_none()
+    {
         anyhow::bail!(
-            "none of RUPU_GITHUB_WEBHOOK_SECRET, RUPU_GITLAB_WEBHOOK_TOKEN, or \
-             RUPU_LINEAR_WEBHOOK_SECRET is set; \
+            "none of RUPU_GITHUB_WEBHOOK_SECRET, RUPU_GITLAB_WEBHOOK_TOKEN, \
+             RUPU_LINEAR_WEBHOOK_SECRET, or RUPU_JIRA_WEBHOOK_SECRET is set; \
              at least one webhook endpoint must be configured"
         );
     }
@@ -79,6 +87,7 @@ async fn serve_cmd(addr: SocketAddr) -> anyhow::Result<()> {
         github_secret,
         gitlab_token,
         linear_secret,
+        jira_secret,
         workflow_loader: Arc::new(load_workflows),
         dispatcher: Arc::new(CliDispatcher),
         observer: Some(Arc::new(CliWebhookObserver { global })),

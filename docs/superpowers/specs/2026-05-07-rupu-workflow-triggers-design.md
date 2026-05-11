@@ -200,7 +200,7 @@ A `[triggers]` section in `config.toml` (project shadows global) gates which pol
 [triggers]
 # Sources to poll for event triggers. Repo-backed examples:
 # "<platform>:<owner>/<repo>". Tracker-native examples:
-# "linear:<team-id>". Jira remains future work.
+# "linear:<team-id>". Jira polling remains future work; Jira webhook ingress is shipped separately.
 # Each tick: rupu queries the connector for events since the last cursor.
 poll_sources = [
   "github:Section9Labs/rupu",

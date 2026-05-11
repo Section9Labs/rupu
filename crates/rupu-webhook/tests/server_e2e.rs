@@ -71,6 +71,20 @@ steps:
     ("linear-state".into(), parse(yaml))
 }
 
+fn jira_state_workflow() -> (String, Workflow) {
+    let yaml = r#"name: jira-state
+trigger:
+  on: event
+  event: issue.entered_workflow_state
+steps:
+  - id: a
+    agent: a
+    actions: []
+    prompt: hi
+"#;
+    ("jira-state".into(), parse(yaml))
+}
+
 fn sign_github(secret: &[u8], body: &[u8]) -> String {
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
@@ -84,6 +98,14 @@ fn sign_linear(secret: &[u8], body: &[u8]) -> String {
     let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
     mac.update(body);
     hex::encode(mac.finalize().into_bytes())
+}
+
+fn sign_jira(secret: &[u8], body: &[u8]) -> String {
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret).unwrap();
+    mac.update(body);
+    let digest = mac.finalize().into_bytes();
+    format!("sha256={}", hex::encode(digest))
 }
 
 #[tokio::test]
@@ -103,6 +125,7 @@ async fn signed_pr_opened_dispatches_matching_workflow() {
         github_secret: Some(secret.to_vec()),
         gitlab_token: None,
         linear_secret: None,
+        jira_secret: None,
         workflow_loader: Arc::new(move || workflows.clone()),
         dispatcher: dispatcher_handle,
         observer: None,
@@ -167,6 +190,7 @@ async fn unsigned_request_returns_401() {
         github_secret: Some(b"k".to_vec()),
         gitlab_token: None,
         linear_secret: None,
+        jira_secret: None,
         workflow_loader: Arc::new(move || workflows.clone()),
         dispatcher,
         observer: None,
@@ -210,6 +234,7 @@ async fn signed_linear_issue_update_dispatches_matching_workflow() {
         github_secret: None,
         gitlab_token: None,
         linear_secret: Some(secret.to_vec()),
+        jira_secret: None,
         workflow_loader: Arc::new(move || workflows.clone()),
         dispatcher: dispatcher_handle,
         observer: None,
@@ -273,5 +298,94 @@ async fn signed_linear_issue_update_dispatches_matching_workflow() {
     assert_eq!(calls[0].1["state"]["category"], "workflow_state");
     assert_eq!(calls[0].1["state"]["before"]["id"], "state-todo");
     assert_eq!(calls[0].1["state"]["after"]["id"], "state-in-progress");
+    server.abort();
+}
+
+#[tokio::test]
+async fn signed_jira_issue_update_dispatches_matching_workflow() {
+    let secret = b"jira-secret";
+    let port = pick_free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+    let dispatcher = Arc::new(RecordingDispatcher {
+        calls: Mutex::new(Vec::new()),
+    });
+    let dispatcher_handle = dispatcher.clone();
+
+    let workflows = vec![jira_state_workflow()];
+    let config = WebhookConfig {
+        addr,
+        github_secret: None,
+        gitlab_token: None,
+        linear_secret: None,
+        jira_secret: Some(secret.to_vec()),
+        workflow_loader: Arc::new(move || workflows.clone()),
+        dispatcher: dispatcher_handle,
+        observer: None,
+    };
+    let server = tokio::spawn(async move {
+        let _ = serve(config).await;
+    });
+
+    let url_health = format!("http://{addr}/healthz");
+    for _ in 0..50 {
+        if reqwest::get(&url_health).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let body = serde_json::json!({
+        "timestamp": 1731430163000u64,
+        "webhookEvent": "jira:issue_updated",
+        "user": { "accountId": "user-1", "displayName": "Matt" },
+        "issue": {
+            "id": "10001",
+            "self": "https://acme.atlassian.net/rest/api/3/issue/10001",
+            "key": "ENG-123",
+            "fields": {
+                "project": { "id": "10000", "key": "ENG", "name": "Engineering" },
+                "issuetype": { "id": "10004", "name": "Task" }
+            }
+        },
+        "changelog": {
+            "items": [
+                {
+                    "field": "status",
+                    "fieldId": "status",
+                    "from": "3",
+                    "fromString": "To Do",
+                    "to": "4",
+                    "toString": "Ready For Review"
+                }
+            ]
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let sig = sign_jira(secret, &body_bytes);
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/webhook/jira"))
+        .header("x-atlassian-webhook-event", "jira:issue_updated")
+        .header("x-atlassian-webhook-identifier", "delivery-1")
+        .header("x-hub-signature", &sig)
+        .header("content-type", "application/json")
+        .body(body_bytes)
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["event"], "jira.issue.updated");
+    assert_eq!(json["fired"][0]["name"], "jira-state");
+    assert_eq!(json["fired"][0]["fired"], true);
+
+    let calls = dispatcher.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "jira-state");
+    assert_eq!(calls[0].1["subject"]["ref"], "ENG-123");
+    assert_eq!(calls[0].1["state"]["category"], "workflow_state");
+    assert_eq!(calls[0].1["state"]["before"]["name"], "To Do");
+    assert_eq!(calls[0].1["state"]["after"]["name"], "Ready For Review");
     server.abort();
 }
