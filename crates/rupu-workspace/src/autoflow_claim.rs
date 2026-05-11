@@ -39,6 +39,18 @@ pub struct AutoflowContender {
 pub struct AutoflowClaimRecord {
     pub issue_ref: String,
     pub repo_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub issue_display_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub issue_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub issue_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub issue_state_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub issue_tracker: Option<String>,
     pub workflow: String,
     pub status: ClaimStatus,
     #[serde(skip_serializing_if = "Option::is_none", default)]

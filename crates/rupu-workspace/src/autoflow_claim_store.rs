@@ -311,6 +311,12 @@ mod tests {
         let rec = AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: Some("github:Section9Labs/rupu".into()),
+            issue_display_ref: Some("42".into()),
+            issue_title: Some("finish autoflow".into()),
+            issue_url: Some("https://github.com/Section9Labs/rupu/issues/42".into()),
+            issue_state_name: Some("open".into()),
+            issue_tracker: Some("github".into()),
             workflow: "issue-supervisor-dispatch".into(),
             status: ClaimStatus::Claimed,
             worktree_path: Some("/tmp/ws".into()),
