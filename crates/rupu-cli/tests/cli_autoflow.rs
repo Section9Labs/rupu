@@ -126,6 +126,109 @@ fn enqueue_issue_wake(
         .unwrap()
 }
 
+fn seed_monitor_state(home: &std::path::Path) {
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.join("autoflows/claims"),
+    };
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: "linear:eng-team/issues/42".into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: Some("linear:eng-team".into()),
+            issue_display_ref: Some("ENG-42".into()),
+            issue_title: Some("Monitor me".into()),
+            issue_url: Some("https://linear.app/acme/issue/ENG-42".into()),
+            issue_state_name: Some("In Review".into()),
+            issue_tracker: Some("linear".into()),
+            workflow: "tracker-controller".into(),
+            status: rupu_workspace::ClaimStatus::AwaitHuman,
+            worktree_path: Some("/tmp/rupu/eng-42".into()),
+            branch: Some("rupu/eng-42".into()),
+            last_run_id: Some("run_123".into()),
+            last_error: None,
+            last_summary: Some("Awaiting approval".into()),
+            pr_url: Some("https://github.com/Section9Labs/rupu/pull/42".into()),
+            artifacts: None,
+            artifact_manifest_path: Some("/tmp/runs/run_123/artifact_manifest.json".into()),
+            next_retry_at: None,
+            claim_owner: Some("matt:pid-123".into()),
+            lease_expires_at: Some("2026-05-11T11:00:00Z".into()),
+            pending_dispatch: None,
+            contenders: vec![rupu_workspace::AutoflowContender {
+                workflow: "tracker-controller".into(),
+                priority: 100,
+                scope: Some("project".into()),
+                selected: true,
+            }],
+            updated_at: "2026-05-11T10:05:00Z".into(),
+        })
+        .unwrap();
+
+    let worker_store = rupu_workspace::WorkerStore {
+        root: home.join("autoflows/workers"),
+    };
+    worker_store
+        .save(&rupu_runtime::WorkerRecord {
+            version: rupu_runtime::WorkerRecord::VERSION,
+            worker_id: "worker_local_laptop-01_serve".into(),
+            kind: rupu_runtime::WorkerKind::AutoflowServe,
+            name: "laptop-01".into(),
+            host: "laptop.local".into(),
+            capabilities: rupu_runtime::WorkerCapabilities {
+                backends: vec!["local_worktree".into()],
+                scm_hosts: vec!["github".into(), "linear".into()],
+                permission_modes: vec!["bypass".into(), "readonly".into()],
+            },
+            registered_at: "2026-05-11T10:00:00Z".into(),
+            last_seen_at: "2026-05-11T10:05:03Z".into(),
+        })
+        .unwrap();
+
+    let history_store = rupu_runtime::AutoflowHistoryStore::new(home.join("autoflows/history"));
+    let mut cycle = rupu_runtime::AutoflowCycleRecord::new(
+        rupu_runtime::AutoflowCycleMode::Serve,
+        chrono::DateTime::parse_from_rfc3339("2026-05-11T10:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    );
+    cycle.worker_id = Some("worker_local_laptop-01_serve".into());
+    cycle.worker_name = Some("laptop-01".into());
+    cycle.repo_filter = Some("github:Section9Labs/rupu".into());
+    cycle.finished_at = "2026-05-11T10:05:03Z".into();
+    cycle.ran_cycles = 1;
+    cycle.events = vec![
+        rupu_runtime::AutoflowCycleEvent {
+            kind: rupu_runtime::AutoflowCycleEventKind::ClaimAcquired,
+            issue_ref: Some("linear:eng-team/issues/42".into()),
+            issue_display_ref: Some("ENG-42".into()),
+            repo_ref: Some("github:Section9Labs/rupu".into()),
+            source_ref: Some("linear:eng-team".into()),
+            workflow: Some("tracker-controller".into()),
+            detail: Some("claimed".into()),
+            ..Default::default()
+        },
+        rupu_runtime::AutoflowCycleEvent {
+            kind: rupu_runtime::AutoflowCycleEventKind::RunLaunched,
+            issue_ref: Some("linear:eng-team/issues/42".into()),
+            issue_display_ref: Some("ENG-42".into()),
+            repo_ref: Some("github:Section9Labs/rupu".into()),
+            workflow: Some("tracker-controller".into()),
+            run_id: Some("run_123".into()),
+            detail: Some("run launched".into()),
+            ..Default::default()
+        },
+    ];
+    history_store.save(&cycle).unwrap();
+
+    enqueue_issue_wake(
+        home,
+        "github:Section9Labs/rupu",
+        "linear:eng-team/issues/42",
+        "issue.entered_workflow_state.ready_for_review",
+        None,
+    );
+}
+
 fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord {
     rupu_orchestrator::RunRecord {
         id: id.into(),
@@ -371,6 +474,64 @@ steps:
         .stdout(predicate::str::contains(
             "github:Section9Labs/rupu/issues/42",
         ));
+}
+
+#[test]
+fn autoflow_monitor_shows_workers_claims_and_recent_activity() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    seed_monitor_state(&home);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["autoflow", "monitor", "--repo", "github:Section9Labs/rupu"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("workers:"))
+        .stdout(predicate::str::contains("claims:"))
+        .stdout(predicate::str::contains("recent activity:"))
+        .stdout(predicate::str::contains("wakes:"))
+        .stdout(predicate::str::contains("laptop-01"))
+        .stdout(predicate::str::contains("ENG-42"))
+        .stdout(predicate::str::contains("tracker-controller"))
+        .stdout(predicate::str::contains("run_launched"));
+}
+
+#[test]
+fn autoflow_monitor_supports_structured_json_output() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    seed_monitor_state(&home);
+
+    let output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args([
+            "--format",
+            "json",
+            "autoflow",
+            "monitor",
+            "--repo",
+            "github:Section9Labs/rupu",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let body = String::from_utf8(output).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["kind"], "autoflow_monitor");
+    assert_eq!(value["workers"][0]["worker"], "laptop-01");
+    assert_eq!(value["claims"][0]["workflow"], "tracker-controller");
+    assert_eq!(value["activity"][0]["issue"], "ENG-42");
+    assert_eq!(value["wakes"]["queued"], 1);
 }
 
 #[test]

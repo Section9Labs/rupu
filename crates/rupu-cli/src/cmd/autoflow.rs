@@ -22,8 +22,9 @@ use rupu_orchestrator::{
     WorkflowOutputContract,
 };
 use rupu_runtime::{
-    RunTriggerSource, WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeRecord,
-    WakeSource, WakeStore, WakeStoreError,
+    AutoflowCycleEvent, AutoflowCycleRecord, AutoflowHistoryStore, RunTriggerSource,
+    WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeRecord, WakeSource, WakeStore,
+    WakeStoreError,
 };
 use rupu_scm::{EventSourceRef, Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform};
 use rupu_workspace::autoflow_claim_store::issue_key;
@@ -81,6 +82,21 @@ pub enum Action {
     },
     /// Inspect queued and recently processed wakes.
     Wakes(RepoFilterArgs),
+    /// Show a live operator view across workers, claims, wakes, and recent activity.
+    Monitor {
+        /// Limit results to one repo target, for example `github:owner/repo`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Limit results to one worker id or display name.
+        #[arg(long)]
+        worker: Option<String>,
+        /// Refresh the table view until interrupted.
+        #[arg(long)]
+        watch: bool,
+        /// Refresh interval for `--watch`, for example `2s`.
+        #[arg(long, default_value = "2s")]
+        interval: String,
+    },
     /// Explain the current autonomous state for one issue.
     Explain {
         r#ref: String,
@@ -327,6 +343,45 @@ struct AutoflowClaimsReport {
     rows: Vec<AutoflowClaimRow>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowMonitorWorkerRow {
+    worker: String,
+    kind: String,
+    last_seen: String,
+    last_cycle: String,
+    repo_scope: String,
+    ran: usize,
+    failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowMonitorActivityRow {
+    at: String,
+    worker: String,
+    event: String,
+    issue: String,
+    workflow: String,
+    repo: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowMonitorWakeSummary {
+    queued: usize,
+    due: usize,
+    processed_recent: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowMonitorReport {
+    kind: &'static str,
+    version: u8,
+    workers: Vec<AutoflowMonitorWorkerRow>,
+    claims: Vec<AutoflowClaimRow>,
+    activity: Vec<AutoflowMonitorActivityRow>,
+    wakes: AutoflowMonitorWakeSummary,
+}
+
 pub async fn handle(
     action: Action,
     global_format: Option<crate::output::formats::OutputFormat>,
@@ -360,6 +415,21 @@ async fn handle_with_resolver(
             idle_sleep,
         } => serve(repo.as_deref(), worker.as_deref(), &idle_sleep, resolver).await,
         Action::Wakes(args) => wakes(args.repo.as_deref(), global_format).await,
+        Action::Monitor {
+            repo,
+            worker,
+            watch,
+            interval,
+        } => {
+            monitor(
+                repo.as_deref(),
+                worker.as_deref(),
+                watch,
+                &interval,
+                global_format,
+            )
+            .await
+        }
         Action::Explain { r#ref, repo } => explain(&r#ref, repo.as_deref()).await,
         Action::Doctor(args) => doctor(args.repo.as_deref()).await,
         Action::Repair {
@@ -789,6 +859,333 @@ async fn wakes(
     }
     println!("{table}");
     Ok(())
+}
+
+async fn monitor(
+    repo: Option<&str>,
+    worker: Option<&str>,
+    watch: bool,
+    interval: &str,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
+    let format =
+        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
+    crate::output::formats::ensure_supported(
+        "rupu autoflow monitor",
+        format,
+        &[
+            crate::output::formats::OutputFormat::Table,
+            crate::output::formats::OutputFormat::Json,
+        ],
+    )?;
+    if watch && format != crate::output::formats::OutputFormat::Table {
+        bail!("`rupu autoflow monitor --watch` only supports table output");
+    }
+
+    let refresh = parse_duration(interval)?
+        .to_std()
+        .map_err(|_| anyhow!("monitor interval must be non-negative"))?;
+    let repo_filter = normalize_repo_filter(repo)?;
+
+    if !watch {
+        let report = build_monitor_report(repo_filter.as_deref(), worker)?;
+        return print_monitor_report(&report, format);
+    }
+
+    loop {
+        let report = build_monitor_report(repo_filter.as_deref(), worker)?;
+        render_monitor_watch_frame(&report)?;
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(refresh) => {}
+        }
+    }
+    Ok(())
+}
+
+fn build_monitor_report(
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+) -> anyhow::Result<AutoflowMonitorReport> {
+    let global = paths::global_dir()?;
+    let claim_store = AutoflowClaimStore {
+        root: paths::autoflow_claims_dir(&global),
+    };
+    let history_store = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
+    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+    let worker_store = rupu_workspace::WorkerStore {
+        root: paths::autoflow_workers_dir(&global),
+    };
+
+    let claims = filter_claims_by_repo(claim_store.list()?, repo_filter);
+    let cycles = filter_monitor_cycles(history_store.list_recent(100)?, repo_filter, worker_filter);
+    let latest_by_worker = latest_cycle_by_worker(&cycles);
+
+    let mut workers = worker_store
+        .list()?
+        .into_iter()
+        .filter(|record| worker_filter_matches(worker_filter, &record.worker_id, &record.name))
+        .filter_map(|record| {
+            let cycle = latest_by_worker
+                .get(record.worker_id.as_str())
+                .or_else(|| latest_by_worker.get(record.name.as_str()));
+            if repo_filter.is_some() && cycle.is_none() {
+                return None;
+            }
+            Some(AutoflowMonitorWorkerRow {
+                worker: record.name,
+                kind: match record.kind {
+                    rupu_workspace::WorkerKind::Cli => "cli".into(),
+                    rupu_workspace::WorkerKind::AutoflowServe => "autoflow_serve".into(),
+                },
+                last_seen: record.last_seen_at,
+                last_cycle: cycle
+                    .map(|cycle| cycle.started_at.clone())
+                    .unwrap_or_else(|| "-".into()),
+                repo_scope: cycle
+                    .and_then(|cycle| cycle.repo_filter.clone())
+                    .unwrap_or_else(|| "-".into()),
+                ran: cycle.map(|cycle| cycle.ran_cycles).unwrap_or_default(),
+                failed: cycle.map(|cycle| cycle.failed_cycles).unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    workers.sort_by(|left, right| left.worker.cmp(&right.worker));
+
+    let claim_rows = claims
+        .iter()
+        .map(|claim| AutoflowClaimRow {
+            issue: claim.issue_ref.clone(),
+            issue_display: claim.issue_display_ref.clone(),
+            tracker: claim.issue_tracker.clone(),
+            state: claim.issue_state_name.clone(),
+            source: claim.source_ref.clone(),
+            repo: claim.repo_ref.clone(),
+            workflow: claim.workflow.clone(),
+            priority: selected_priority(claim)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            status: status_name(claim.status).into(),
+            next: next_action_summary(claim),
+            branch: claim.branch.clone().unwrap_or_else(|| "-".into()),
+            pr: claim.pr_url.clone().unwrap_or_else(|| "-".into()),
+            summary: claim_summary(claim),
+            contenders: format_contenders(&claim.contenders),
+            workspace: claim.worktree_path.clone().unwrap_or_else(|| "-".into()),
+        })
+        .collect::<Vec<_>>();
+
+    let activity = cycles
+        .iter()
+        .flat_map(|cycle| {
+            cycle
+                .events
+                .iter()
+                .map(move |event| AutoflowMonitorActivityRow {
+                    at: cycle.finished_at.clone(),
+                    worker: cycle
+                        .worker_name
+                        .clone()
+                        .or_else(|| cycle.worker_id.clone())
+                        .unwrap_or_else(|| "-".into()),
+                    event: monitor_event_name(event),
+                    issue: event
+                        .issue_display_ref
+                        .clone()
+                        .or_else(|| event.issue_ref.clone())
+                        .unwrap_or_else(|| "-".into()),
+                    workflow: event.workflow.clone().unwrap_or_else(|| "-".into()),
+                    repo: event.repo_ref.clone().unwrap_or_else(|| "-".into()),
+                    detail: event.detail.clone().unwrap_or_else(|| "-".into()),
+                })
+        })
+        .take(20)
+        .collect::<Vec<_>>();
+
+    let queued = filter_wakes_by_repo(wake_store.list_queued()?, repo_filter);
+    let due = filter_wakes_by_repo(wake_store.list_due(chrono::Utc::now())?, repo_filter);
+    let processed_recent = filter_wakes_by_repo(wake_store.list_processed()?, repo_filter).len();
+
+    Ok(AutoflowMonitorReport {
+        kind: "autoflow_monitor",
+        version: 1,
+        workers,
+        claims: claim_rows,
+        activity,
+        wakes: AutoflowMonitorWakeSummary {
+            queued: queued.len(),
+            due: due.len(),
+            processed_recent,
+        },
+    })
+}
+
+fn print_monitor_report(
+    report: &AutoflowMonitorReport,
+    format: crate::output::formats::OutputFormat,
+) -> anyhow::Result<()> {
+    match format {
+        crate::output::formats::OutputFormat::Json => crate::output::formats::print_json(report),
+        crate::output::formats::OutputFormat::Table => render_monitor_tables(report),
+        crate::output::formats::OutputFormat::Csv => unreachable!("csv not supported"),
+    }
+}
+
+fn render_monitor_watch_frame(report: &AutoflowMonitorReport) -> anyhow::Result<()> {
+    print!("\x1B[2J\x1B[H");
+    println!(
+        "rupu autoflow monitor  refreshed={}  claims={}  workers={}  queued_wakes={}",
+        chrono::Utc::now().to_rfc3339(),
+        report.claims.len(),
+        report.workers.len(),
+        report.wakes.queued
+    );
+    println!();
+    render_monitor_tables(report)
+}
+
+fn render_monitor_tables(report: &AutoflowMonitorReport) -> anyhow::Result<()> {
+    println!("workers:");
+    if report.workers.is_empty() {
+        println!("(no workers)");
+    } else {
+        let mut workers = crate::output::tables::new_table();
+        workers.set_header(vec![
+            "Worker",
+            "Kind",
+            "Last Seen",
+            "Last Cycle",
+            "Repo Scope",
+            "Ran",
+            "Failed",
+        ]);
+        for row in &report.workers {
+            workers.add_row(vec![
+                Cell::new(&row.worker),
+                Cell::new(&row.kind),
+                Cell::new(&row.last_seen),
+                Cell::new(&row.last_cycle),
+                Cell::new(&row.repo_scope),
+                Cell::new(row.ran),
+                Cell::new(row.failed),
+            ]);
+        }
+        println!("{workers}");
+    }
+
+    println!("\nclaims:");
+    if report.claims.is_empty() {
+        println!("(no claims)");
+    } else {
+        let mut claims = crate::output::tables::new_table();
+        claims.set_header(vec![
+            "Issue", "Source", "State", "Workflow", "Status", "Repo", "Branch", "Next",
+        ]);
+        for row in &report.claims {
+            claims.add_row(vec![
+                Cell::new(row.issue_display.as_deref().unwrap_or(&row.issue)),
+                Cell::new(row.source.as_deref().unwrap_or("-")),
+                Cell::new(row.state.as_deref().unwrap_or("-")),
+                Cell::new(&row.workflow),
+                Cell::new(&row.status),
+                Cell::new(&row.repo),
+                Cell::new(&row.branch),
+                Cell::new(&row.next),
+            ]);
+        }
+        println!("{claims}");
+    }
+
+    println!("\nrecent activity:");
+    if report.activity.is_empty() {
+        println!("(no recent activity)");
+    } else {
+        let mut activity = crate::output::tables::new_table();
+        activity.set_header(vec![
+            "At", "Worker", "Event", "Issue", "Workflow", "Repo", "Detail",
+        ]);
+        for row in &report.activity {
+            activity.add_row(vec![
+                Cell::new(&row.at),
+                Cell::new(&row.worker),
+                Cell::new(&row.event),
+                Cell::new(&row.issue),
+                Cell::new(&row.workflow),
+                Cell::new(&row.repo),
+                Cell::new(&row.detail),
+            ]);
+        }
+        println!("{activity}");
+    }
+
+    println!(
+        "\nwakes: queued={} due={} processed_recent={}",
+        report.wakes.queued, report.wakes.due, report.wakes.processed_recent
+    );
+    Ok(())
+}
+
+fn filter_monitor_cycles(
+    cycles: Vec<AutoflowCycleRecord>,
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+) -> Vec<AutoflowCycleRecord> {
+    cycles
+        .into_iter()
+        .filter(|cycle| {
+            repo_filter.is_none_or(|filter| {
+                cycle.repo_filter.as_deref() == Some(filter)
+                    || cycle
+                        .events
+                        .iter()
+                        .any(|event| event.repo_ref.as_deref() == Some(filter))
+            })
+        })
+        .filter(|cycle| {
+            worker_filter_matches(
+                worker_filter,
+                cycle.worker_id.as_deref().unwrap_or(""),
+                cycle.worker_name.as_deref().unwrap_or(""),
+            )
+        })
+        .collect()
+}
+
+fn latest_cycle_by_worker(cycles: &[AutoflowCycleRecord]) -> BTreeMap<&str, &AutoflowCycleRecord> {
+    let mut out = BTreeMap::new();
+    for cycle in cycles {
+        if let Some(worker_id) = cycle.worker_id.as_deref() {
+            out.entry(worker_id).or_insert(cycle);
+        }
+        if let Some(worker_name) = cycle.worker_name.as_deref() {
+            out.entry(worker_name).or_insert(cycle);
+        }
+    }
+    out
+}
+
+fn worker_filter_matches(filter: Option<&str>, worker_id: &str, worker_name: &str) -> bool {
+    filter.is_none_or(|filter| filter == worker_id || filter == worker_name)
+}
+
+fn monitor_event_name(event: &AutoflowCycleEvent) -> String {
+    match event.kind {
+        rupu_runtime::AutoflowCycleEventKind::WakeConsumed => "wake_consumed",
+        rupu_runtime::AutoflowCycleEventKind::WakeSkipped => "wake_skipped",
+        rupu_runtime::AutoflowCycleEventKind::ClaimAcquired => "claim_acquired",
+        rupu_runtime::AutoflowCycleEventKind::ClaimReleased => "claim_released",
+        rupu_runtime::AutoflowCycleEventKind::ClaimTakeover => "claim_takeover",
+        rupu_runtime::AutoflowCycleEventKind::RunLaunched => "run_launched",
+        rupu_runtime::AutoflowCycleEventKind::AwaitingHuman => "awaiting_human",
+        rupu_runtime::AutoflowCycleEventKind::AwaitingExternal => "awaiting_external",
+        rupu_runtime::AutoflowCycleEventKind::RetryScheduled => "retry_scheduled",
+        rupu_runtime::AutoflowCycleEventKind::DispatchQueued => "dispatch_queued",
+        rupu_runtime::AutoflowCycleEventKind::CleanupPerformed => "cleanup_performed",
+        rupu_runtime::AutoflowCycleEventKind::CycleSkipped => "cycle_skipped",
+        rupu_runtime::AutoflowCycleEventKind::CycleFailed => "cycle_failed",
+    }
+    .into()
 }
 
 async fn explain(r#ref: &str, repo: Option<&str>) -> anyhow::Result<()> {
