@@ -85,3 +85,36 @@ async fn linear_event_connector_built_when_credential_present() {
         })
         .is_some());
 }
+
+#[tokio::test]
+async fn jira_event_connector_built_when_credential_present() {
+    use rupu_auth::backend::ProviderId;
+    use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::stored::StoredCredential;
+    use rupu_providers::AuthMode;
+    use rupu_scm::EventSourceRef;
+
+    let resolver = InMemoryResolver::new();
+    resolver
+        .put(
+            ProviderId::Jira,
+            AuthMode::ApiKey,
+            StoredCredential::api_key("matt@example.com:api-token"),
+        )
+        .await;
+    let mut cfg = rupu_config::Config::default();
+    cfg.scm.platforms.insert(
+        "jira".into(),
+        rupu_config::ScmPlatformConfig {
+            base_url: Some("https://acme.atlassian.net".into()),
+            ..Default::default()
+        },
+    );
+    let r = Registry::discover(&resolver, &cfg).await;
+    assert!(r
+        .events_for_source(&EventSourceRef::TrackerProject {
+            tracker: IssueTracker::Jira,
+            project: "ENG".into(),
+        })
+        .is_some());
+}

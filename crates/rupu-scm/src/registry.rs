@@ -103,6 +103,17 @@ impl Registry {
             }
         }
 
+        // Jira events.
+        match crate::connectors::jira::events::try_build(resolver, cfg).await {
+            Ok(Some(c)) => {
+                reg.tracker_event_connectors.insert(IssueTracker::Jira, c);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "jira events: connector build failed; skipping");
+            }
+        }
+
         reg
     }
 

@@ -699,6 +699,32 @@ rupu auth login --provider linear --mode api-key
 
 The first poll warms a local snapshot for that team and emits zero events. Later polls diff the snapshot and emit `linear.issue.opened` plus normalized `linear.issue.updated` state-transition events.
 
+Jira can participate in the same polled tier. Use the explicit source form when you want the config to be self-contained:
+
+```toml
+[triggers]
+poll_sources = ["jira:acme.atlassian.net/ENG"]
+```
+
+Or set the site once and use short project keys:
+
+```toml
+[scm.jira]
+base_url = "https://acme.atlassian.net"
+
+[triggers]
+poll_sources = ["jira:ENG"]
+```
+
+Authenticate with a Jira Cloud email and API token stored as one API-key credential:
+
+```sh
+printf '%s' 'matt@example.com:atlassian_api_token' | \
+  rupu auth login --provider jira --mode api-key
+```
+
+The first poll warms a local snapshot for that project and emits zero events. Later polls emit `jira.issue.opened` and normalized `jira.issue.updated` events with workflow-state, priority, project, and sprint transitions.
+
 ### Webhook-driven workflows
 
 ```sh
@@ -718,7 +744,7 @@ Jira Cloud issue webhooks are normalized too. `jira:issue_updated` changelog tra
 Current boundary:
 
 - Linear supports both webhook and `poll_sources = ["linear:<team-id>"]`.
-- Jira native state support is webhook-only for now; polling is not shipped yet.
+- Jira supports both webhook and `poll_sources = ["jira:<site>/<project>"]` or `poll_sources = ["jira:<project>"]` when `[scm.jira].base_url` is configured.
 - Neither tracker has tracker-native autoflow claim ownership yet; autoflow execution is still repo-backed.
 
 When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and the next `rupu autoflow tick` or active `rupu autoflow serve` cycle consumes it.

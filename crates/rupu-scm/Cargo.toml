@@ -26,6 +26,7 @@ git2.workspace = true
 lru.workspace = true
 rand.workspace = true
 dirs.workspace = true
+base64.workspace = true
 
 # In-workspace
 rupu-auth = { path = "../rupu-auth" }
