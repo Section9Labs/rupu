@@ -139,8 +139,13 @@ rupu mcp serve --transport stdio
 | Polled event triggers  |   ✅   |   ✅   |
 | Webhook event triggers |   ✅   |   ✅   |
 
-Linear and Jira issue trackers are designed-in but not shipped in this
-release; see [TODO.md](TODO.md) for the deferred-feature list.
+Linear and Jira now ship as native trigger sources:
+
+- webhook ingress for normalized tracker state events
+- polling via `poll_sources = ["linear:<team-id>"]`
+- polling via `poll_sources = ["jira:<site>/<project>"]` or `["jira:<project>"]` with `[scm.jira].base_url`
+
+They are not full repo / PR backends, and tracker-native autoflow ownership is still pending.
 
 ### Workflow triggers
 
@@ -267,7 +272,7 @@ rupu transcript {list, show}          Browse JSONL transcripts
 rupu issues {list, show, run}         Issue-tracker surface (auto-detects from cwd)
 rupu repos list                       List configured-platform repositories
 rupu cron {list, tick, events}        Cron + polled-event trigger runtime
-rupu webhook serve [--addr]           Long-lived webhook receiver for GitHub / GitLab / Linear
+rupu webhook serve [--addr]           Long-lived webhook receiver for GitHub / GitLab / Linear / Jira
 rupu mcp serve [--transport]          Expose rupu's tools to MCP clients
 rupu auth {login, logout, status}     Provider credential management
 rupu models {list, refresh}           Browse / refresh discovered model lists
