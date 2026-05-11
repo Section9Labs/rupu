@@ -370,12 +370,30 @@ steps:
       After:  {{ event.state.after.name }}
 ```
 
+GitHub Projects v2 item updates can drive the same workflow aliases when an issue-backed project item's `Status` field changes:
+
+```yaml
+name: github-project-review-ready
+trigger:
+  on: event
+  event: issue.entered_workflow_state.ready_for_review
+  filter: "{{ event.vendor == 'github' and event.subject.ref == 'github:Section9Labs/rupu/issues/42' }}"
+
+steps:
+  - id: review
+    agent: reviewer
+    prompt: |
+      GitHub Project item for {{ event.subject.ref }} entered review.
+      Before: {{ event.state.before.name }}
+      After:  {{ event.state.after.name }}
+```
+
 Secrets are read from environment variables — never config files, never the keychain. Webhook secrets are operational secrets and belong in your process supervisor's environment block.
 
 Important current limits:
 
-- Linear polling is available for event-triggered workflows, but autoflow ownership is still repo-backed. `poll_sources = ["linear:<team-id>"]` participates in `rupu cron tick` and the event trigger path; it does not yet give autoflows a tracker-native claim/ownership model.
-- Jira polling is available for event-triggered workflows too, but autoflow ownership is still repo-backed. `poll_sources = ["jira:<site>/<project>"]` and short `jira:<project>` sources participate in `rupu cron tick`; they do not yet give autoflows a tracker-native claim/ownership model.
+- GitHub Projects native state mapping is webhook-only. There is no `poll_sources = [...]` form for Projects yet.
+- GitHub Projects currently maps issue-backed project items into portable `issue.*` aliases. Pull-request and draft-issue items still come through as `github.project_item.*` without issue-native alias expansion.
 
 Bind to `127.0.0.1` and front with a TLS-terminating reverse proxy in production. rupu does not terminate TLS itself.
 

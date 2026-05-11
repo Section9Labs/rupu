@@ -748,10 +748,13 @@ Linear issue webhooks are normalized before dispatch. Workflows can therefore ta
 
 Jira Cloud issue webhooks are normalized too. `jira:issue_updated` changelog transitions become portable aliases such as `issue.entered_workflow_state.ready_for_review`, `issue.sprint_changed`, and `issue.priority_changed`.
 
+GitHub Projects v2 item webhooks are normalized too. When an organization-level `projects_v2_item` event changes an issue item's `Status` field, workflows can target the same portable aliases such as `issue.entered_workflow_state.ready_for_review` and `issue.state_changed.todo.to.in_progress`.
+
 Current boundary:
 
 - Linear supports both webhook and `poll_sources = ["linear:<team-id>"]`.
 - Jira supports both webhook and `poll_sources = ["jira:<site>/<project>"]` or `poll_sources = ["jira:<project>"]` when `[scm.jira].base_url` is configured.
+- GitHub Projects v2 native state mapping is webhook-only for now, through the standard GitHub webhook receiver and the `projects_v2_item` organization webhook event. GitHub still marks Projects webhooks as public preview.
 - Both trackers now support tracker-native autoflow claim ownership while still executing repo-bound workflows and worktrees.
 
 When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and the next `rupu autoflow tick` or active `rupu autoflow serve` cycle consumes it.

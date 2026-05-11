@@ -15,7 +15,7 @@
 use crate::dispatch::{dispatch_event, DispatchedWorkflow, WorkflowDispatcher};
 use crate::event_vocab::{
     map_github_event, map_gitlab_event, map_jira_event, map_linear_event,
-    normalize_jira_event_payload, normalize_linear_event_payload,
+    normalize_github_event_payload, normalize_jira_event_payload, normalize_linear_event_payload,
 };
 use crate::signature::{
     verify_github_signature, verify_gitlab_token, verify_jira_signature, verify_linear_signature,
@@ -212,6 +212,8 @@ async fn github_handler(
         .into_response();
     };
 
+    let normalized_payload = normalize_github_event_payload(&event_header, &payload);
+
     observe_event(
         state.observer.as_ref(),
         WebhookEvent {
@@ -221,13 +223,19 @@ async fn github_handler(
                 .get("x-github-delivery")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
-            payload: payload.clone(),
+            payload: normalized_payload.clone(),
         },
     )
     .await;
 
     let candidates = (state.workflow_loader)();
-    let fired = dispatch_event(&event_id, &payload, &candidates, state.dispatcher.as_ref()).await;
+    let fired = dispatch_event(
+        &event_id,
+        &normalized_payload,
+        &candidates,
+        state.dispatcher.as_ref(),
+    )
+    .await;
     Json(WebhookResponse {
         event: Some(event_id),
         fired,
@@ -744,5 +752,74 @@ mod tests {
         assert_eq!(events[0].payload["subject"]["ref"], "ENG-123");
         assert_eq!(events[0].payload["state"]["category"], "workflow_state");
         assert_eq!(events[0].payload["state"]["after"]["name"], "In Progress");
+    }
+
+    #[tokio::test]
+    async fn github_projects_handler_notifies_observer_with_normalized_payload() {
+        let observer = Arc::new(RecordingObserver::default());
+        let body = r#"{
+          "action": "edited",
+          "organization": { "login": "Section9Labs" },
+          "projects_v2": { "node_id": "PVT_kwDOA", "title": "Delivery" },
+          "projects_v2_item": {
+            "id": "PVTI_lADOA",
+            "project_node_id": "PVT_kwDOA",
+            "content_type": "Issue",
+            "content": {
+              "__typename": "Issue",
+              "node_id": "I_kwDOA",
+              "number": 42,
+              "html_url": "https://github.com/Section9Labs/rupu/issues/42",
+              "repository": { "full_name": "Section9Labs/rupu" }
+            },
+            "field_value": {
+              "field_type": "single_select",
+              "optionId": "opt-ready",
+              "name": "Ready For Review",
+              "field": { "name": "Status" }
+            }
+          },
+          "changes": {
+            "field_value": {
+              "field_type": "single_select",
+              "optionId": "opt-progress",
+              "name": "In Progress",
+              "field": { "name": "Status" }
+            }
+          }
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "projects_v2_item".parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            github_signature(b"secret", body.as_bytes())
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-github-delivery", "delivery-xyz".parse().unwrap());
+
+        let response = github_handler(
+            State(state_with_observer(observer.clone())),
+            headers,
+            Bytes::from(body.as_bytes().to_vec()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response_status(response), StatusCode::OK);
+        let events = observer.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source, WebhookSource::Github);
+        assert_eq!(events[0].event_id, "github.project_item.updated");
+        assert_eq!(events[0].delivery_id.as_deref(), Some("delivery-xyz"));
+        assert_eq!(
+            events[0].payload["subject"]["ref"],
+            "github:Section9Labs/rupu/issues/42"
+        );
+        assert_eq!(events[0].payload["state"]["category"], "workflow_state");
+        assert_eq!(
+            events[0].payload["state"]["after"]["name"],
+            "Ready For Review"
+        );
     }
 }

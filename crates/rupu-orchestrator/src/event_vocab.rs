@@ -505,10 +505,19 @@ fn native_issue_event_kind(
     payload: &Value,
 ) -> Option<(String, NativeIssueEventKind)> {
     let parts: Vec<&str> = canonical_id.split('.').collect();
-    if parts.len() != 3 || parts[1] != "issue" {
-        return None;
-    }
-    let vendor = parts[0];
+    let vendor = match parts.as_slice() {
+        [vendor, "issue", _verb] => *vendor,
+        [vendor, "project_item", _verb]
+            if payload
+                .get("subject")
+                .and_then(|subject| subject.get("kind"))
+                .and_then(Value::as_str)
+                == Some("issue") =>
+        {
+            *vendor
+        }
+        _ => return None,
+    };
     let kind = match parts[2] {
         "updated"
             if payload.get("state").is_some()
@@ -517,6 +526,15 @@ fn native_issue_event_kind(
                 || payload.get("sprint").is_some()
                 || payload.get("priority").is_some()
                 || payload.get("blocked").is_some() =>
+        {
+            NativeIssueEventKind::Updated
+        }
+        "created" | "archived" | "restored"
+            if payload.get("project").is_some()
+                || payload.get("state").is_some()
+                || payload.get("priority").is_some()
+                || payload.get("cycle").is_some()
+                || payload.get("sprint").is_some() =>
         {
             NativeIssueEventKind::Updated
         }
@@ -709,5 +727,26 @@ mod tests {
         assert!(aliases.contains(&"issue.entered_workflow_state.in_progress".to_string()));
         assert!(aliases.contains(&"issue.cycle_changed".to_string()));
         assert!(aliases.contains(&"issue.entered_cycle.sprint_42".to_string()));
+    }
+
+    #[test]
+    fn github_project_item_updated_derives_issue_native_aliases() {
+        let payload = json!({
+            "subject": {
+                "kind": "issue",
+                "ref": "github:Section9Labs/rupu/issues/42"
+            },
+            "state": {
+                "category": "workflow_state",
+                "before": { "name": "Todo" },
+                "after": { "name": "Ready For Review" }
+            }
+        });
+        let candidates = candidate_event_ids("github.project_item.updated", &payload);
+        assert!(candidates.contains(&"github.project_item.updated".to_string()));
+        assert!(candidates.contains(&"issue.state_changed".to_string()));
+        assert!(candidates.contains(&"issue.entered_workflow_state.ready_for_review".to_string()));
+        assert!(candidates
+            .contains(&"github.issue.workflow_state_changed.todo.to.ready_for_review".to_string()));
     }
 }

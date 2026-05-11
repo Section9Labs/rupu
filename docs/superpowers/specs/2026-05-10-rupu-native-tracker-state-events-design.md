@@ -256,7 +256,7 @@ That foundation is now generalized in code to a source model that can represent 
 - repo sources (`github:owner/repo`, `gitlab:group/project`)
 - tracker-project sources (`linear:<team-id>`, `jira:<project>`)
 
-That means Linear and Jira polling no longer require a fake repo model. The remaining work is richer connector-side payload hydration, GitHub Projects mapping, and tracker-native autoflow ownership, not another core trigger-shape rewrite.
+That means Linear and Jira polling no longer require a fake repo model. The remaining work is richer connector-side payload hydration and future tracker families or GitHub Projects polling, not another core trigger-shape rewrite.
 
 ---
 
