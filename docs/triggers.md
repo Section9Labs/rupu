@@ -108,14 +108,20 @@ poll_sources = [
 
 This is an operational control only. It does not change workflow matching semantics; it only decides whether a source is due to be polled on a given `rupu cron tick --only-events`.
 
-The source model is now generic enough for future tracker-native polling too:
+The source model is now generic enough for both repo and tracker-native polling:
 
 - `github:owner/repo`
 - `gitlab:group/project`
-- `linear:<workspace-or-project>` (reserved for future polling connector)
+- `linear:<team-id>`
 - `jira:<project>` (reserved for future polling connector)
 
-Today, the shipped polled connectors are still GitHub/GitLab repo feeds. Linear native state events are available through `rupu webhook serve`; the generic poll-source model is groundwork for adding non-repo tracker polling later without changing workflow YAML again.
+Today, shipped polled connectors are:
+
+- GitHub repo feeds
+- GitLab repo feeds
+- Linear team feeds via `linear:<team-id>`
+
+Linear polling is team-scoped because Linear issues belong to one team and carry team-native workflow states. The first poll warms a local snapshot and emits zero events; later polls diff that snapshot to emit `linear.issue.opened` and normalized `linear.issue.updated` events.
 
 ### 2. Write the workflow
 
@@ -337,7 +343,7 @@ steps:
 
 Secrets are read from environment variables — never config files, never the keychain. Webhook secrets are operational secrets and belong in your process supervisor's environment block.
 
-Important current limit: Linear native state events are **webhook-ingress only** right now. `poll_sources = ["linear:..."]` parses and stores cleanly, but no Linear polling connector ships yet.
+Important current limit: Linear polling is available for event-triggered workflows, but autoflow ownership is still repo-backed. `poll_sources = ["linear:<team-id>"]` participates in `rupu cron tick` and the event trigger path; it does not yet give autoflows a tracker-native claim/ownership model.
 
 Bind to `127.0.0.1` and front with a TLS-terminating reverse proxy in production. rupu does not terminate TLS itself.
 

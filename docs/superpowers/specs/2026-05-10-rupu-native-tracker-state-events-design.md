@@ -254,7 +254,7 @@ This was repo-shaped at the start:
 That foundation is now generalized in code to a source model that can represent both:
 
 - repo sources (`github:owner/repo`, `gitlab:group/project`)
-- tracker-project sources (`linear:<workspace-or-project>`, `jira:<project>`)
+- tracker-project sources (`linear:<team-id>`, `jira:<project>`)
 
 That means future Linear/Jira polling no longer requires a fake repo model. The remaining work is connector-specific transport and payload hydration, not another core trigger-shape rewrite.
 

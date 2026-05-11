@@ -21,6 +21,7 @@ pub enum ProviderId {
     Local,
     Github,
     Gitlab,
+    Linear,
 }
 
 impl ProviderId {
@@ -35,6 +36,7 @@ impl ProviderId {
             Self::Local => "local",
             Self::Github => "github",
             Self::Gitlab => "gitlab",
+            Self::Linear => "linear",
         }
     }
 }
@@ -109,5 +111,10 @@ mod scm_provider_id_tests {
         assert_eq!(json, "\"github\"");
         let p: ProviderId = serde_json::from_str(&json).unwrap();
         assert_eq!(p, ProviderId::Github);
+    }
+
+    #[test]
+    fn linear_string_form() {
+        assert_eq!(ProviderId::Linear.as_str(), "linear");
     }
 }

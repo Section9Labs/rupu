@@ -240,6 +240,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             state_is_verifier: false,
             include_state_in_token_body: false,
         }),
+        ProviderId::Linear => None,
     }
 }
 

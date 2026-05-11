@@ -5,6 +5,7 @@
 
 pub mod github;
 pub mod gitlab;
+pub mod linear;
 
 use std::path::Path;
 

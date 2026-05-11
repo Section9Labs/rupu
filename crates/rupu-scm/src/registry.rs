@@ -25,6 +25,7 @@ pub struct Registry {
     repo_connectors: HashMap<Platform, Arc<dyn RepoConnector>>,
     issue_connectors: HashMap<IssueTracker, Arc<dyn IssueConnector>>,
     event_connectors: HashMap<Platform, Arc<dyn EventConnector>>,
+    tracker_event_connectors: HashMap<IssueTracker, Arc<dyn EventConnector>>,
     github_extras: Option<Arc<GithubExtras>>,
     gitlab_extras: Option<Arc<GitlabExtras>>,
 }
@@ -91,6 +92,17 @@ impl Registry {
             }
         }
 
+        // Linear events.
+        match crate::connectors::linear::events::try_build(resolver, cfg).await {
+            Ok(Some(c)) => {
+                reg.tracker_event_connectors.insert(IssueTracker::Linear, c);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "linear events: connector build failed; skipping");
+            }
+        }
+
         reg
     }
 
@@ -116,11 +128,15 @@ impl Registry {
     pub fn events_for_source(&self, source: &EventSourceRef) -> Option<Arc<dyn EventConnector>> {
         match source {
             EventSourceRef::Repo { repo } => self.events(repo.platform),
-            EventSourceRef::TrackerProject { tracker, .. } => match tracker {
-                IssueTracker::Github => self.events(Platform::Github),
-                IssueTracker::Gitlab => self.events(Platform::Gitlab),
-                IssueTracker::Linear | IssueTracker::Jira => None,
-            },
+            EventSourceRef::TrackerProject { tracker, .. } => self
+                .tracker_event_connectors
+                .get(tracker)
+                .cloned()
+                .or_else(|| match tracker {
+                    IssueTracker::Github => self.events(Platform::Github),
+                    IssueTracker::Gitlab => self.events(Platform::Gitlab),
+                    IssueTracker::Linear | IssueTracker::Jira => None,
+                }),
         }
     }
 

@@ -235,14 +235,26 @@ fn normalized_polled_payload(event: &PolledEvent) -> serde_json::Value {
             }),
         ),
     };
-    serde_json::json!({
-        "id": event.id,
-        "vendor": vendor,
-        "delivery": event.delivery,
-        "repo": repo_payload,
-        "source": source_payload,
-        "payload": event.payload,
-    })
+    let mut base = match event.payload.clone() {
+        serde_json::Value::Object(map) => serde_json::Value::Object(map),
+        other => serde_json::json!({ "payload": other }),
+    };
+    let object = base.as_object_mut().expect("object after normalization");
+    object.insert("id".into(), serde_json::Value::String(event.id.clone()));
+    object.insert(
+        "vendor".into(),
+        serde_json::Value::String(vendor.to_string()),
+    );
+    object.insert(
+        "delivery".into(),
+        serde_json::Value::String(event.delivery.clone()),
+    );
+    object.insert("repo".into(), repo_payload);
+    object.insert("source".into(), source_payload);
+    object
+        .entry("payload")
+        .or_insert_with(|| event.payload.clone());
+    base
 }
 
 fn repo_ref_from_polled_event(event: &PolledEvent) -> Option<String> {

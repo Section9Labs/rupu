@@ -53,6 +53,7 @@ impl InMemoryResolver {
             "local" => Ok(ProviderId::Local),
             "github" => Ok(ProviderId::Github),
             "gitlab" => Ok(ProviderId::Gitlab),
+            "linear" => Ok(ProviderId::Linear),
             other => Err(anyhow!("unknown provider: {other}")),
         }
     }
