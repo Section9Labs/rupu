@@ -3618,6 +3618,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "dirs",
  "git2",
  "http 1.4.0",
  "httpmock",

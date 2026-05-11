@@ -684,6 +684,21 @@ Typical crontab split:
 */5 * * * * rupu cron tick --only-events
 ```
 
+Linear can also participate in the polled tier without a public webhook endpoint:
+
+```toml
+[triggers]
+poll_sources = ["linear:72b2a2dc-6f4f-4423-9d34-24b5bd10634a"]
+```
+
+Authenticate once with:
+
+```sh
+rupu auth login --provider linear --mode api-key
+```
+
+The first poll warms a local snapshot for that team and emits zero events. Later polls diff the snapshot and emit `linear.issue.opened` plus normalized `linear.issue.updated` state-transition events.
+
 ### Webhook-driven workflows
 
 ```sh

@@ -342,6 +342,7 @@ impl KeychainResolver {
             "copilot" => Ok(ProviderId::Copilot),
             "github" => Ok(ProviderId::Github),
             "gitlab" => Ok(ProviderId::Gitlab),
+            "linear" => Ok(ProviderId::Linear),
             "local" => Ok(ProviderId::Local),
             other => anyhow::bail!("unknown provider: {other}"),
         }
@@ -660,6 +661,10 @@ mod parse_stored_credential_tests {
         assert_eq!(
             KeychainResolver::parse_provider("gitlab").unwrap(),
             ProviderId::Gitlab,
+        );
+        assert_eq!(
+            KeychainResolver::parse_provider("linear").unwrap(),
+            ProviderId::Linear,
         );
     }
 }

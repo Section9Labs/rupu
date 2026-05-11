@@ -674,14 +674,25 @@ fn build_event_payload(ev: &rupu_scm::PolledEvent, matched_event_id: &str) -> se
             }),
         ),
     };
-    let base = serde_json::json!({
-        "id": ev.id,
-        "vendor": vendor,
-        "delivery": ev.delivery,
-        "repo": repo,
-        "source": source,
-        "payload": ev.payload,
-    });
+    let mut base = match ev.payload.clone() {
+        serde_json::Value::Object(map) => serde_json::Value::Object(map),
+        other => serde_json::json!({ "payload": other }),
+    };
+    let object = base.as_object_mut().expect("object after normalization");
+    object.insert("id".into(), serde_json::Value::String(ev.id.clone()));
+    object.insert(
+        "vendor".into(),
+        serde_json::Value::String(vendor.to_string()),
+    );
+    object.insert(
+        "delivery".into(),
+        serde_json::Value::String(ev.delivery.clone()),
+    );
+    object.insert("repo".into(), repo);
+    object.insert("source".into(), source);
+    object
+        .entry("payload")
+        .or_insert_with(|| ev.payload.clone());
     annotate_event_payload(&base, &ev.id, matched_event_id)
 }
 
@@ -870,7 +881,7 @@ mod tests {
         assert_eq!(payload["id"], "issue.queue_entered");
         assert_eq!(payload["canonical_id"], "github.issue.labeled");
         assert_eq!(payload["repo"]["full_name"], "Section9Labs/rupu");
-        assert_eq!(payload["payload"]["payload"]["issue"]["number"], 42);
+        assert_eq!(payload["payload"]["issue"]["number"], 42);
     }
 
     #[test]
@@ -896,5 +907,7 @@ mod tests {
         assert_eq!(payload["vendor"], "linear");
         assert_eq!(payload["repo"], json!({}));
         assert_eq!(payload["source"]["project"], "workspace-123");
+        assert_eq!(payload["state"]["before"]["id"], "todo");
+        assert_eq!(payload["state"]["after"]["id"], "in_progress");
     }
 }
