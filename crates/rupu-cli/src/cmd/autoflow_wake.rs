@@ -51,10 +51,15 @@ pub fn wake_requests_from_polled_event(event: &PolledEvent) -> Vec<WakeEnqueueRe
     let Some(repo_ref) = repo_ref_from_polled_event(event) else {
         return Vec::new();
     };
-    let repo = event
-        .source
-        .repo()
-        .expect("repo_ref_from_polled_event only returns Some for repo sources");
+    wake_requests_from_polled_event_for_repo(event, &repo_ref)
+}
+
+pub fn wake_requests_from_polled_event_for_repo(
+    event: &PolledEvent,
+    repo_ref: &str,
+) -> Vec<WakeEnqueueRequest> {
+    let repo_ref = repo_ref.to_string();
+    let repo = event.source.repo().cloned();
     let issue_ref = extract_issue_ref_from_polled_event(event);
     let entity = issue_ref
         .clone()
@@ -76,14 +81,17 @@ pub fn wake_requests_from_polled_event(event: &PolledEvent) -> Vec<WakeEnqueueRe
             event: WakeEvent {
                 id: matched_id.clone(),
                 delivery_id: Some(event.delivery.clone()),
-                dedupe_key: Some(format!(
-                    "cron_poll:{}:{}:{}:{}:{}",
-                    repo.platform.as_str(),
-                    repo.owner,
-                    repo.repo,
-                    event.delivery,
-                    matched_id
-                )),
+                dedupe_key: Some(match &repo {
+                    Some(repo) => format!(
+                        "cron_poll:{}:{}:{}:{}:{}",
+                        repo.platform.as_str(),
+                        repo.owner,
+                        repo.repo,
+                        event.delivery,
+                        matched_id
+                    ),
+                    None => format!("cron_poll:{}:{}:{}", repo_ref, event.delivery, matched_id),
+                }),
             },
             payload: Some(annotate_event_payload(&payload, &event.id, &matched_id)),
             received_at: chrono::Utc::now().to_rfc3339(),
@@ -477,5 +485,41 @@ mod tests {
             }),
         };
         assert!(wake_requests_from_polled_event(&event).is_empty());
+    }
+
+    #[test]
+    fn tracker_scoped_polled_events_can_bind_to_repo_wakes() {
+        let event = PolledEvent {
+            id: "jira.issue.updated".into(),
+            delivery: "evt-1000".into(),
+            source: EventSourceRef::TrackerProject {
+                tracker: IssueTracker::Jira,
+                project: "127.0.0.1/ENG".into(),
+            },
+            subject: Some(EventSubjectRef::Issue {
+                issue: IssueRef {
+                    tracker: IssueTracker::Jira,
+                    project: "127.0.0.1/ENG".into(),
+                    number: 42,
+                },
+            }),
+            payload: json!({
+                "state": {
+                    "before": { "id": "todo" },
+                    "after": { "id": "in_progress" }
+                }
+            }),
+        };
+        let wakes = wake_requests_from_polled_event_for_repo(&event, "github:Section9Labs/rupu");
+        assert!(!wakes.is_empty());
+        assert_eq!(wakes[0].repo_ref, "github:Section9Labs/rupu");
+        assert_eq!(wakes[0].entity.kind, WakeEntityKind::Issue);
+        assert_eq!(wakes[0].entity.ref_text, "jira:127.0.0.1/ENG/issues/42");
+        assert!(wakes[0]
+            .event
+            .dedupe_key
+            .as_deref()
+            .unwrap()
+            .contains("github:Section9Labs/rupu"));
     }
 }

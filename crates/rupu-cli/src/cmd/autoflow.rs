@@ -1,6 +1,6 @@
 //! `rupu autoflow ...` — manual/autonomous workflow entrypoints.
 
-use super::autoflow_wake::wake_requests_from_polled_event;
+use super::autoflow_wake::wake_requests_from_polled_event_for_repo;
 use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref as canonical_repo_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
@@ -25,7 +25,7 @@ use rupu_runtime::{
     RunTriggerSource, WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeRecord,
     WakeSource, WakeStore, WakeStoreError,
 };
-use rupu_scm::{EventSourceRef, Issue, IssueFilter, IssueRef, IssueState, IssueTracker};
+use rupu_scm::{EventSourceRef, Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform};
 use rupu_workspace::autoflow_claim_store::issue_key;
 use rupu_workspace::{
     ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
@@ -1836,22 +1836,33 @@ async fn enqueue_polled_wakes(
     paths::ensure_dir(&cursors_root)?;
     let store = WakeStore::new(paths::autoflow_wakes_dir(global));
 
-    let mut unique_repos: BTreeMap<String, &ResolvedAutoflowWorkflow> = BTreeMap::new();
+    let mut workflows_by_source: BTreeMap<String, Vec<&ResolvedAutoflowWorkflow>> = BTreeMap::new();
     for resolved in discovered {
         if resolved.autoflow()?.wake_on.is_empty() {
             continue;
         }
-        unique_repos
-            .entry(resolved.repo_ref.clone())
-            .or_insert(resolved);
-    }
-
-    for (repo_ref, resolved) in unique_repos {
-        let Some(source) = resolved.cfg.triggers.poll_source(&repo_ref) else {
+        let Ok(source_ref) = resolved_source_ref_text(resolved) else {
+            warn!(workflow = %resolved.name, repo_ref = %resolved.repo_ref, "invalid autoflow source; skipping wake polling");
             continue;
         };
-        let Ok(event_source) = repo_ref.parse::<EventSourceRef>() else {
-            warn!(repo_ref, "invalid autoflow repo ref for wake polling");
+        workflows_by_source
+            .entry(source_ref)
+            .or_default()
+            .push(resolved);
+    }
+
+    for (source_ref, workflows) in workflows_by_source {
+        let Some((source, resolved)) = workflows.iter().find_map(|resolved| {
+            resolved
+                .cfg
+                .triggers
+                .poll_source(&source_ref)
+                .map(|source| (source, *resolved))
+        }) else {
+            continue;
+        };
+        let Ok(event_source) = source_ref.parse::<EventSourceRef>() else {
+            warn!(source_ref, "invalid autoflow source for wake polling");
             continue;
         };
         let last_polled_file = autoflow_last_polled_at_path(&cursors_root, &event_source);
@@ -1859,13 +1870,13 @@ async fn enqueue_polled_wakes(
             Ok(true) => {}
             Ok(false) => continue,
             Err(err) => {
-                warn!(repo_ref, error = %err, "invalid autoflow poll interval; polling anyway");
+                warn!(source_ref, error = %err, "invalid autoflow poll interval; polling anyway");
             }
         }
         let registry = Arc::new(rupu_scm::Registry::discover(resolver, &resolved.cfg).await);
         let Some(connector) = registry.events_for_source(&event_source) else {
             warn!(
-                repo_ref,
+                source_ref,
                 "no event connector configured for autoflow wake polling"
             );
             continue;
@@ -1879,31 +1890,37 @@ async fn enqueue_polled_wakes(
         {
             Ok(result) => result,
             Err(err) => {
-                warn!(repo_ref, error = %err, "failed to poll autoflow wake events");
+                warn!(source_ref, error = %err, "failed to poll autoflow wake events");
                 continue;
             }
         };
         if let Err(err) = write_cursor(&cursor_file, &polled.next_cursor) {
             warn!(
-                repo_ref,
+                source_ref,
                 error = %err,
                 "failed to persist autoflow wake cursor; events may be replayed on next tick"
             );
         }
         if let Err(err) = write_last_polled_at(&last_polled_file, chrono::Utc::now()) {
             warn!(
-                repo_ref,
+                source_ref,
                 error = %err,
                 "failed to persist autoflow last-polled timestamp; source may poll early next tick"
             );
         }
+        let bound_repo_refs = workflows
+            .iter()
+            .map(|resolved| resolved.repo_ref.clone())
+            .collect::<BTreeSet<_>>();
         for event in polled.events {
-            for request in wake_requests_from_polled_event(&event) {
-                match store.enqueue(request) {
-                    Ok(_) => {}
-                    Err(WakeStoreError::DuplicateDedupeKey(_)) => {}
-                    Err(err) => {
-                        warn!(repo_ref, error = %err, "failed to enqueue polled autoflow wake");
+            for repo_ref in &bound_repo_refs {
+                for request in wake_requests_from_polled_event_for_repo(&event, repo_ref) {
+                    match store.enqueue(request) {
+                        Ok(_) => {}
+                        Err(WakeStoreError::DuplicateDedupeKey(_)) => {}
+                        Err(err) => {
+                            warn!(repo_ref, source_ref, error = %err, "failed to enqueue polled autoflow wake");
+                        }
                     }
                 }
             }
@@ -1933,10 +1950,17 @@ pub(crate) async fn collect_issue_matches(
     let mut out = Vec::new();
     for resolved in discovered {
         let autoflow = resolved.autoflow()?;
-        let (tracker, project) = parse_repo_ref(&resolved.repo_ref)?;
+        let source_ref = match resolved_event_source(resolved) {
+            Ok(source_ref) => source_ref,
+            Err(err) => {
+                warn!(workflow = %resolved.name, repo_ref = %resolved.repo_ref, error = %err, "skipping autoflow because source resolution failed");
+                continue;
+            }
+        };
+        let (tracker, project) = issue_discovery_target(&source_ref);
         let registry = Arc::new(rupu_scm::Registry::discover(resolver, &resolved.cfg).await);
         let Some(connector) = registry.issues(tracker) else {
-            warn!(repo_ref = %resolved.repo_ref, workflow = %resolved.name, "skipping autoflow because no issue connector is configured");
+            warn!(source = %source_ref, repo_ref = %resolved.repo_ref, workflow = %resolved.name, "skipping autoflow because no issue connector is configured");
             continue;
         };
 
@@ -1944,7 +1968,7 @@ pub(crate) async fn collect_issue_matches(
         let mut issues = match connector.list_issues(&project, filter).await {
             Ok(issues) => issues,
             Err(err) => {
-                warn!(repo_ref = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping autoflow because issue listing failed");
+                warn!(source = %source_ref, repo_ref = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping autoflow because issue listing failed");
                 continue;
             }
         };
@@ -2102,7 +2126,7 @@ pub(crate) async fn execute_autoflow_cycle(
     worker: Option<ExecutionWorkerContext>,
 ) -> anyhow::Result<()> {
     let autoflow = resolved.autoflow()?;
-    let issue_payload = issue_payload(issue)?;
+    let issue_payload = issue_payload(&resolved.cfg, issue)?;
     let workspace_strategy = resolve_workspace_strategy(&resolved.cfg.autoflow, autoflow);
     let branch = resolve_branch_name(
         autoflow
@@ -2173,18 +2197,16 @@ pub(crate) async fn execute_autoflow_cycle(
             contenders: vec![],
             updated_at: chrono::Utc::now().to_rfc3339(),
         });
-    claim.source_ref = Some(
+    claim.source_ref = Some(resolved_source_ref_text(resolved).unwrap_or_else(|_| {
         autoflow
             .source
             .clone()
-            .unwrap_or_else(|| resolved.repo_ref.clone()),
-    );
-    claim.issue_display_ref = Some(issue.r.number.to_string());
+            .unwrap_or_else(|| resolved.repo_ref.clone())
+    }));
+    claim.issue_display_ref = Some(issue_display_ref(issue));
     claim.issue_title = Some(issue.title.clone());
-    claim.issue_state_name = Some(match issue.state {
-        IssueState::Open => "open".into(),
-        IssueState::Closed => "closed".into(),
-    });
+    claim.issue_url = issue_url(&resolved.cfg, issue);
+    claim.issue_state_name = Some(issue_state_name(issue).to_string());
     claim.issue_tracker = Some(issue.r.tracker.as_str().to_string());
     claim.workflow = resolved.workflow.name.clone();
     claim.status = ClaimStatus::Running;
@@ -2742,15 +2764,22 @@ fn resolve_autoflow_from_path(
     })
 }
 
-fn issue_payload(issue: &Issue) -> anyhow::Result<serde_json::Value> {
+fn issue_payload(cfg: &Config, issue: &Issue) -> anyhow::Result<serde_json::Value> {
     let mut value = serde_json::to_value(issue)?;
     if let Some(obj) = value.as_object_mut() {
         obj.entry("number")
             .or_insert_with(|| serde_json::json!(issue.r.number));
+        obj.entry("ref")
+            .or_insert_with(|| serde_json::json!(format_issue_ref(&issue.r)));
         obj.entry("project")
             .or_insert_with(|| serde_json::json!(issue.r.project));
         obj.entry("tracker")
             .or_insert_with(|| serde_json::json!(issue.r.tracker.to_string()));
+        obj.entry("state_name")
+            .or_insert_with(|| serde_json::json!(issue_state_name(issue)));
+        if let Some(url) = issue_url(cfg, issue) {
+            obj.entry("url").or_insert_with(|| serde_json::json!(url));
+        }
     }
     Ok(value)
 }
@@ -2977,14 +3006,31 @@ pub(crate) fn parse_issue_ref_text(value: &str) -> anyhow::Result<IssueRef> {
     })
 }
 
-fn parse_repo_ref(repo_ref: &str) -> anyhow::Result<(IssueTracker, String)> {
-    let (tracker, project) = repo_ref
-        .split_once(':')
-        .ok_or_else(|| anyhow!("invalid repo ref `{repo_ref}`"))?;
-    Ok((
-        IssueTracker::from_str(tracker).map_err(|err| anyhow!(err))?,
-        project.to_string(),
-    ))
+fn resolved_source_ref_text(resolved: &ResolvedAutoflowWorkflow) -> anyhow::Result<String> {
+    Ok(resolved
+        .autoflow()?
+        .source
+        .clone()
+        .unwrap_or_else(|| resolved.repo_ref.clone()))
+}
+
+fn resolved_event_source(resolved: &ResolvedAutoflowWorkflow) -> anyhow::Result<EventSourceRef> {
+    resolved_source_ref_text(resolved)?
+        .parse()
+        .map_err(|err: String| anyhow!(err))
+}
+
+fn issue_discovery_target(source: &EventSourceRef) -> (IssueTracker, String) {
+    match source {
+        EventSourceRef::Repo { repo } => (
+            match repo.platform {
+                Platform::Github => IssueTracker::Github,
+                Platform::Gitlab => IssueTracker::Gitlab,
+            },
+            format!("{}/{}", repo.owner, repo.repo),
+        ),
+        EventSourceRef::TrackerProject { tracker, project } => (*tracker, project.clone()),
+    }
 }
 
 fn source_slug(source: &EventSourceRef) -> String {
@@ -3061,6 +3107,53 @@ fn format_issue_ref(issue_ref: &IssueRef) -> String {
         "{}:{}/issues/{}",
         issue_ref.tracker, issue_ref.project, issue_ref.number
     )
+}
+
+fn issue_display_ref(issue: &Issue) -> String {
+    match issue.r.tracker {
+        IssueTracker::Jira => {
+            let project_key = issue
+                .r
+                .project
+                .rsplit('/')
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&issue.r.project);
+            format!("{project_key}-{}", issue.r.number)
+        }
+        _ => issue.r.number.to_string(),
+    }
+}
+
+fn issue_state_name(issue: &Issue) -> &'static str {
+    match issue.state {
+        IssueState::Open => "open",
+        IssueState::Closed => "closed",
+    }
+}
+
+fn issue_url(cfg: &Config, issue: &Issue) -> Option<String> {
+    match issue.r.tracker {
+        IssueTracker::Github => Some(format!(
+            "https://github.com/{}/issues/{}",
+            issue.r.project, issue.r.number
+        )),
+        IssueTracker::Jira => {
+            let project_key = issue.r.project.rsplit('/').next()?;
+            let base_url = cfg
+                .scm
+                .platforms
+                .get("jira")
+                .and_then(|platform| platform.base_url.as_deref())?;
+            Some(format!(
+                "{}/browse/{}-{}",
+                base_url.trim_end_matches('/'),
+                project_key,
+                issue.r.number
+            ))
+        }
+        IssueTracker::Gitlab | IssueTracker::Linear => None,
+    }
 }
 
 fn issue_repo_ref(issue_ref: &IssueRef) -> String {
@@ -3224,7 +3317,7 @@ mod tests {
     use super::*;
     use crate::cmd::autoflow_wake;
     use crate::test_support::ENV_LOCK;
-    use httpmock::Method::GET;
+    use httpmock::Method::{GET, POST};
     use httpmock::MockServer;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::StoredCredential;
@@ -3362,6 +3455,41 @@ base_url = "{base_url}"
         .unwrap()
     }
 
+    fn jira_issue_response(
+        key: &str,
+        status_category_key: &str,
+        labels: &[&str],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("id-{key}"),
+            "key": key,
+            "self": format!("https://acme.atlassian.net/rest/api/3/issue/{key}"),
+            "fields": {
+                "summary": format!("Issue {key}"),
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [{
+                        "type": "paragraph",
+                        "content": [{ "type": "text", "text": format!("Description for {key}") }]
+                    }]
+                },
+                "labels": labels,
+                "status": {
+                    "id": format!("status-{status_category_key}"),
+                    "name": if status_category_key == "done" { "Done" } else { "In Progress" },
+                    "statusCategory": {
+                        "key": status_category_key,
+                        "name": if status_category_key == "done" { "Done" } else { "In Progress" }
+                    }
+                },
+                "reporter": { "displayName": "matt" },
+                "created": "2026-05-10T00:00:00.000+0000",
+                "updated": "2026-05-10T01:00:00.000+0000"
+            }
+        })
+    }
+
     #[test]
     fn parse_duration_accepts_supported_units() {
         assert_eq!(
@@ -3400,6 +3528,126 @@ base_url = "{base_url}"
             canonical_autoflow_issue_ref("github:Section9Labs/rupu/issues/42").unwrap(),
             "github:Section9Labs/rupu/issues/42"
         );
+    }
+
+    #[tokio::test]
+    async fn tick_discovers_and_executes_tracker_native_jira_source() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        let server = MockServer::start_async().await;
+        init_git_repo(&project);
+
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/rest/api/3/search/jql")
+                .header_exists("authorization")
+                .body_contains(
+                    "\"project = \\\"ENG\\\" AND statusCategory != Done ORDER BY updated DESC\"",
+                );
+            then.status(200).json_body(serde_json::json!({
+                "issues": [jira_issue_response("ENG-42", "indeterminate", &["bug"])],
+                "nextPageToken": null
+            }));
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  source: jira:ENG
+  priority: 100
+  selector:
+    states: ["open"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.ref }} tracker={{ issue.tracker }} state={{ issue.state_name }}"
+"#,
+        );
+        std::fs::write(
+            project.join(".rupu/config.toml"),
+            format!(
+                r#"[autoflow]
+enabled = true
+permission_mode = "bypass"
+strict_templates = true
+
+[scm.jira]
+base_url = "{}"
+"#,
+                server.base_url()
+            ),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Jira,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("matt@example.com:api-token"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        tick_with_resolver(resolver).await.unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        let claim = claim_store
+            .load("jira:127.0.0.1/ENG/issues/42")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.repo_ref, "github:Section9Labs/rupu");
+        assert_eq!(claim.source_ref.as_deref(), Some("jira:ENG"));
+        assert_eq!(claim.issue_display_ref.as_deref(), Some("ENG-42"));
+        assert_eq!(
+            claim.issue_url.as_deref(),
+            Some(format!("{}/browse/ENG-42", server.base_url()).as_str())
+        );
+        assert_eq!(claim.issue_tracker.as_deref(), Some("jira"));
+        assert_eq!(claim.status, ClaimStatus::Complete);
+        assert!(claim.last_run_id.is_some());
     }
 
     #[test]
