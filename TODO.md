@@ -160,9 +160,8 @@ Has its own design spec: [`docs/superpowers/specs/2026-05-11-rupu-autoflow-obser
 **Status:** Proposed.
 
 **Planned order:**
-- durable cycle/event history for `tick` and `serve`
-- `rupu autoflow monitor`
-- `rupu autoflow history`
+- ✅ Autoflow observability Plan 1 shipped: durable cycle/event history for `tick` / `serve`, `rupu autoflow monitor`, `rupu autoflow history`, and explain/claims/status drilldown polish. See `docs/superpowers/plans/2026-05-11-rupu-autoflow-observability-plan-1.md`.
+- Future-only follow-on: add a lightweight TUI over the same history model if `monitor --watch` proves insufficient in real operator use.
 - `explain` / `claims` / `watch` handoff polish
 
 ## Gemini API-key support via AI Studio ✅ shipped

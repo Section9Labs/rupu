@@ -376,6 +376,18 @@ steps:
             updated_at: chrono::Utc::now().to_rfc3339(),
         })
         .unwrap();
+    seed_issue_history(IssueHistorySeed {
+        home: home.path(),
+        issue_ref,
+        repo_ref: "github:Section9Labs/rupu",
+        issue_display_ref: Some("ENG-42"),
+        source_ref: Some("github:Section9Labs/rupu"),
+        workflow: "controller",
+        worker_name: "laptop-01",
+        event_kind: rupu_runtime::AutoflowCycleEventKind::RunLaunched,
+        run_id: Some("run_usage"),
+        detail: "run launched",
+    });
     enqueue_issue_wake(
         home.path(),
         "github:Section9Labs/rupu",
@@ -427,7 +439,9 @@ steps:
             "\"repo\": \"github:Section9Labs/rupu\"",
         ))
         .stdout(predicate::str::contains("\"branch\": \"rupu/issue-42\""))
-        .stdout(predicate::str::contains("\"workflow\": \"controller\""));
+        .stdout(predicate::str::contains("\"workflow\": \"controller\""))
+        .stdout(predicate::str::contains("\"last_event\": \"run_launched\""))
+        .stdout(predicate::str::contains("\"last_run\": \"run_usage\""));
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -452,6 +466,7 @@ steps:
         .stdout(predicate::str::contains(
             "\"repo\": \"github:Section9Labs/rupu\"",
         ))
+        .stdout(predicate::str::contains("\"last_event\": \"run_launched\""))
         .stdout(predicate::str::contains("\"await_external\""));
 
     Command::cargo_bin("rupu")
@@ -1490,6 +1505,18 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
             updated_at: chrono::Utc::now().to_rfc3339(),
         })
         .unwrap();
+    seed_issue_history(IssueHistorySeed {
+        home: &home,
+        issue_ref,
+        repo_ref: "github:Section9Labs/rupu",
+        issue_display_ref: Some("ENG-42"),
+        source_ref: Some("linear:eng-team"),
+        workflow: "controller",
+        worker_name: "laptop-01",
+        event_kind: rupu_runtime::AutoflowCycleEventKind::RunLaunched,
+        run_id: Some("run_123"),
+        detail: "run launched",
+    });
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -1501,6 +1528,9 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
         .stdout(predicate::str::contains("State"))
         .stdout(predicate::str::contains("Repo"))
         .stdout(predicate::str::contains("Branch"))
+        .stdout(predicate::str::contains("Run"))
+        .stdout(predicate::str::contains("Last Event"))
+        .stdout(predicate::str::contains("Last Cycle"))
         .stdout(predicate::str::contains("Priority"))
         .stdout(predicate::str::contains("PR"))
         .stdout(predicate::str::contains("Summary"))
@@ -1511,6 +1541,8 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
         .stdout(predicate::str::contains("controller"))
         .stdout(predicate::str::contains("github:Section9Labs/rupu"))
         .stdout(predicate::str::contains("rupu/eng-42"))
+        .stdout(predicate::str::contains("run_123"))
+        .stdout(predicate::str::contains("run_launched"))
         .stdout(predicate::str::contains(
             "https://github.com/Section9Labs/rupu/pull/42",
         ))
@@ -1574,7 +1606,6 @@ fn autoflow_claims_filters_to_one_repo() {
             })
             .unwrap();
     }
-
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
@@ -1585,6 +1616,50 @@ fn autoflow_claims_filters_to_one_repo() {
             "github:Section9Labs/rupu/issues/42",
         ))
         .stdout(predicate::str::contains("github:Section9Labs/okegu/issues/9").not());
+}
+
+struct IssueHistorySeed<'a> {
+    home: &'a std::path::Path,
+    issue_ref: &'a str,
+    repo_ref: &'a str,
+    issue_display_ref: Option<&'a str>,
+    source_ref: Option<&'a str>,
+    workflow: &'a str,
+    worker_name: &'a str,
+    event_kind: rupu_runtime::AutoflowCycleEventKind,
+    run_id: Option<&'a str>,
+    detail: &'a str,
+}
+
+fn seed_issue_history(seed: IssueHistorySeed<'_>) {
+    let history_store =
+        rupu_runtime::AutoflowHistoryStore::new(seed.home.join("autoflows/history"));
+    let mut cycle = rupu_runtime::AutoflowCycleRecord::new(
+        rupu_runtime::AutoflowCycleMode::Serve,
+        chrono::DateTime::parse_from_rfc3339("2026-05-11T10:05:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+    );
+    cycle.worker_id = Some(format!(
+        "worker_local_{}_serve",
+        seed.worker_name.replace('-', "_")
+    ));
+    cycle.worker_name = Some(seed.worker_name.into());
+    cycle.repo_filter = Some(seed.repo_ref.into());
+    cycle.finished_at = "2026-05-11T10:05:03Z".into();
+    cycle.ran_cycles = 1;
+    cycle.events = vec![rupu_runtime::AutoflowCycleEvent {
+        kind: seed.event_kind,
+        issue_ref: Some(seed.issue_ref.into()),
+        issue_display_ref: seed.issue_display_ref.map(str::to_owned),
+        repo_ref: Some(seed.repo_ref.into()),
+        source_ref: seed.source_ref.map(str::to_owned),
+        workflow: Some(seed.workflow.into()),
+        run_id: seed.run_id.map(str::to_owned),
+        detail: Some(seed.detail.into()),
+        ..Default::default()
+    }];
+    history_store.save(&cycle).unwrap();
 }
 
 #[test]
@@ -1637,6 +1712,18 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
             updated_at: chrono::Utc::now().to_rfc3339(),
         })
         .unwrap();
+    seed_issue_history(IssueHistorySeed {
+        home: &home,
+        issue_ref: "github:Section9Labs/rupu/issues/42",
+        repo_ref: "github:Section9Labs/rupu",
+        issue_display_ref: Some("ENG-42"),
+        source_ref: Some("linear:eng-team"),
+        workflow: "controller",
+        worker_name: "laptop-01",
+        event_kind: rupu_runtime::AutoflowCycleEventKind::RunLaunched,
+        run_id: Some("run_123"),
+        detail: "run launched",
+    });
     claim_store
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/43".into(),
@@ -1670,7 +1757,6 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
             updated_at: chrono::Utc::now().to_rfc3339(),
         })
         .unwrap();
-
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", &home)
@@ -1685,6 +1771,7 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
         .stdout(predicate::str::contains("linear:eng-team"))
         .stdout(predicate::str::contains("In Review"))
         .stdout(predicate::str::contains("github:Section9Labs/rupu"))
+        .stdout(predicate::str::contains("recent=run_launched"))
         .stdout(predicate::str::contains("*controller[100]"))
         .stdout(predicate::str::contains("phase-ready[50]"));
 }
@@ -1754,6 +1841,18 @@ fn autoflow_status_filters_to_one_repo() {
             updated_at: chrono::Utc::now().to_rfc3339(),
         })
         .unwrap();
+    seed_issue_history(IssueHistorySeed {
+        home: &home,
+        issue_ref: "github:Section9Labs/rupu/issues/42",
+        repo_ref: "github:Section9Labs/rupu",
+        issue_display_ref: None,
+        source_ref: None,
+        workflow: "issue-supervisor-dispatch",
+        worker_name: "laptop-01",
+        event_kind: rupu_runtime::AutoflowCycleEventKind::RunLaunched,
+        run_id: Some("run_123"),
+        detail: "run launched",
+    });
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -1885,6 +1984,18 @@ fn autoflow_explain_prints_claim_run_and_wake_context() {
             updated_at: chrono::Utc::now().to_rfc3339(),
         })
         .unwrap();
+    seed_issue_history(IssueHistorySeed {
+        home: &home,
+        issue_ref,
+        repo_ref,
+        issue_display_ref: None,
+        source_ref: None,
+        workflow: "issue-supervisor-dispatch",
+        worker_name: "laptop-01",
+        event_kind: rupu_runtime::AutoflowCycleEventKind::RunLaunched,
+        run_id: Some("run_123"),
+        detail: "run launched",
+    });
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -1899,6 +2010,7 @@ fn autoflow_explain_prints_claim_run_and_wake_context() {
             "workflow: issue-supervisor-dispatch",
         ))
         .stdout(predicate::str::contains("last run: run_123"))
+        .stdout(predicate::str::contains("watch hint: rupu watch run_123"))
         .stdout(predicate::str::contains(
             "last run status: awaiting_approval",
         ))
@@ -1908,7 +2020,9 @@ fn autoflow_explain_prints_claim_run_and_wake_context() {
             "pending dispatch: phase-delivery-cycle",
         ))
         .stdout(predicate::str::contains("queued wakes:"))
-        .stdout(predicate::str::contains("recent processed wake:"));
+        .stdout(predicate::str::contains("recent processed wake:"))
+        .stdout(predicate::str::contains("recent cycle events:"))
+        .stdout(predicate::str::contains("run_launched"));
 }
 
 #[test]
