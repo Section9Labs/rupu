@@ -8,7 +8,7 @@ use std::process::ExitCode;
 pub enum Action {
     /// Store credentials for a provider.
     Login {
-        /// Provider name (anthropic | openai | gemini | copilot | github | gitlab | linear | local).
+        /// Provider name (anthropic | openai | gemini | copilot | github | gitlab | linear | jira | local).
         #[arg(long)]
         provider: String,
         /// Authentication mode.
@@ -105,6 +105,7 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
         "github" => Ok(ProviderId::Github),
         "gitlab" => Ok(ProviderId::Gitlab),
         "linear" => Ok(ProviderId::Linear),
+        "jira" => Ok(ProviderId::Jira),
         "local" => Ok(ProviderId::Local),
         _ => Err(anyhow::anyhow!("unknown provider: {s}")),
     }
@@ -229,6 +230,7 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
             ProviderId::Github,
             ProviderId::Gitlab,
             ProviderId::Linear,
+            ProviderId::Jira,
             ProviderId::Local,
         ] {
             for m in [
@@ -341,6 +343,7 @@ async fn status() -> anyhow::Result<()> {
         ("github", ProviderId::Github),
         ("gitlab", ProviderId::Gitlab),
         ("linear", ProviderId::Linear),
+        ("jira", ProviderId::Jira),
     ] {
         let api_present = resolver.peek(pid, rupu_providers::AuthMode::ApiKey).await;
         let api_cell = if api_present {
@@ -405,6 +408,7 @@ mod parse_provider_tests {
         assert_eq!(parse_provider("github").unwrap(), ProviderId::Github);
         assert_eq!(parse_provider("gitlab").unwrap(), ProviderId::Gitlab);
         assert_eq!(parse_provider("linear").unwrap(), ProviderId::Linear);
+        assert_eq!(parse_provider("jira").unwrap(), ProviderId::Jira);
         assert_eq!(parse_provider("local").unwrap(), ProviderId::Local);
     }
 

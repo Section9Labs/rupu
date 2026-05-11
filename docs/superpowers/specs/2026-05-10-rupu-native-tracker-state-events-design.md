@@ -1,6 +1,6 @@
 # rupu Native Tracker State Events — Design
 
-**Status:** Approved for implementation  
+**Status:** In implementation — foundation, Linear webhook/polling, and Jira webhook shipped
 **Date:** 2026-05-10  
 **Companion specs:** [`2026-05-07-rupu-workflow-triggers-design.md`](./2026-05-07-rupu-workflow-triggers-design.md), [`2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md`](./2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md)
 
@@ -280,10 +280,12 @@ That means future Linear/Jira polling no longer requires a fake repo model. The 
 - add tracker/project event source references
 - support Linear polling if the API surface is good enough
 
-### Phase 4 — Jira webhook path
+### Phase 4 — Jira webhook path ✅ shipped
 
-- add Jira auth provider id
-- map `jira:issue_updated` changelog events to normalized transitions
+- `rupu webhook serve` accepts Jira Cloud deliveries on `/webhook/jira`
+- validates `X-Hub-Signature`
+- maps `jira:issue_updated` changelog events to normalized transitions
+- emits native aliases such as `issue.entered_workflow_state.ready_for_review`
 
 ### Phase 5 — GitHub Projects mapping
 

@@ -1,6 +1,6 @@
 # rupu Native Tracker State Events — Plan 1
 
-**Status:** Proposed  
+**Status:** Historical — implemented, with follow-on Jira webhook ingress landed afterward
 **Date:** 2026-05-10  
 **Companion spec:** [`../specs/2026-05-10-rupu-native-tracker-state-events-design.md`](../specs/2026-05-10-rupu-native-tracker-state-events-design.md)
 

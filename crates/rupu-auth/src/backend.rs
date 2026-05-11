@@ -22,6 +22,7 @@ pub enum ProviderId {
     Github,
     Gitlab,
     Linear,
+    Jira,
 }
 
 impl ProviderId {
@@ -37,6 +38,7 @@ impl ProviderId {
             Self::Github => "github",
             Self::Gitlab => "gitlab",
             Self::Linear => "linear",
+            Self::Jira => "jira",
         }
     }
 }
@@ -116,5 +118,10 @@ mod scm_provider_id_tests {
     #[test]
     fn linear_string_form() {
         assert_eq!(ProviderId::Linear.as_str(), "linear");
+    }
+
+    #[test]
+    fn jira_string_form() {
+        assert_eq!(ProviderId::Jira.as_str(), "jira");
     }
 }

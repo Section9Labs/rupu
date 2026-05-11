@@ -241,6 +241,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             include_state_in_token_body: false,
         }),
         ProviderId::Linear => None,
+        ProviderId::Jira => None,
     }
 }
 
