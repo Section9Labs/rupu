@@ -571,6 +571,7 @@ name: issue-supervisor-dispatch
 autoflow:
   enabled: true
   entity: issue
+  source: linear:72b2a2dc-6f4f-4423-9d34-24b5bd10634a
   priority: 100
   selector:
     states: [open]
@@ -608,6 +609,10 @@ steps:
     let wf = Workflow::parse(s).expect("autoflow should parse");
     let autoflow = wf.autoflow.as_ref().expect("autoflow");
     assert!(autoflow.enabled);
+    assert_eq!(
+        autoflow.source.as_deref(),
+        Some("linear:72b2a2dc-6f4f-4423-9d34-24b5bd10634a")
+    );
     assert_eq!(autoflow.priority, 100);
     assert_eq!(autoflow.selector.labels_all, vec!["autoflow"]);
     assert_eq!(autoflow.selector.labels_any, vec!["bug", "urgent"]);
