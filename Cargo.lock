@@ -3617,6 +3617,7 @@ version = "0.5.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "dirs",
  "git2",

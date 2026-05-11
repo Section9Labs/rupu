@@ -256,7 +256,7 @@ That foundation is now generalized in code to a source model that can represent 
 - repo sources (`github:owner/repo`, `gitlab:group/project`)
 - tracker-project sources (`linear:<team-id>`, `jira:<project>`)
 
-That means future Linear/Jira polling no longer requires a fake repo model. The remaining work is connector-specific transport and payload hydration, not another core trigger-shape rewrite.
+That means Linear and Jira polling no longer require a fake repo model. The remaining work is richer connector-side payload hydration, GitHub Projects mapping, and tracker-native autoflow ownership, not another core trigger-shape rewrite.
 
 ---
 
@@ -274,7 +274,7 @@ That means future Linear/Jira polling no longer requires a fake repo model. The 
 - map Linear `updatedFrom` issue webhooks onto normalized events
 - initial implementation may only know state / project / cycle IDs; named aliases improve automatically once a future connector can hydrate names
 
-### Phase 3 — non-repo event sources
+### Phase 3 — non-repo event sources ✅ shipped
 
 - generalize poll sources away from repo-only scope
 - add tracker/project event source references
@@ -287,7 +287,15 @@ That means future Linear/Jira polling no longer requires a fake repo model. The 
 - maps `jira:issue_updated` changelog events to normalized transitions
 - emits native aliases such as `issue.entered_workflow_state.ready_for_review`
 
-### Phase 5 — GitHub Projects mapping
+### Phase 5 — Jira polling ✅ shipped
+
+- `rupu cron tick` accepts `jira:<site>/<project>` sources
+- `jira:<project>` also works when `[scm.jira].base_url` is configured
+- first poll warms a project snapshot and emits zero events
+- later polls emit `jira.issue.opened` and normalized `jira.issue.updated`
+- initial transitions cover workflow state, project, priority, and sprint
+
+### Phase 6 — GitHub Projects mapping
 
 - map Projects field/column transitions into the same normalized shape
 - treat this as lower priority because the upstream model is less clean

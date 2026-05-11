@@ -320,6 +320,12 @@ mod tests {
         assert_eq!(linear.source_ref_text(), "linear:workspace-123");
         assert!(linear.repo().is_none());
         assert_eq!(linear.tracker(), Some(IssueTracker::Linear));
+
+        let jira = EventSourceRef::from_str("jira:acme.atlassian.net/ENG").unwrap();
+        assert_eq!(jira.vendor(), "jira");
+        assert_eq!(jira.source_ref_text(), "jira:acme.atlassian.net/ENG");
+        assert!(jira.repo().is_none());
+        assert_eq!(jira.tracker(), Some(IssueTracker::Jira));
     }
 
     #[test]

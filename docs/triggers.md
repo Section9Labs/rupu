@@ -113,15 +113,19 @@ The source model is now generic enough for both repo and tracker-native polling:
 - `github:owner/repo`
 - `gitlab:group/project`
 - `linear:<team-id>`
-- `jira:<project>` (reserved for future polling connector)
+- `jira:<site>/<project>`
+- `jira:<project>` when `[scm.jira].base_url` is configured
 
 Today, shipped polled connectors are:
 
 - GitHub repo feeds
 - GitLab repo feeds
 - Linear team feeds via `linear:<team-id>`
+- Jira project feeds via `jira:<site>/<project>` or `jira:<project>` with `[scm.jira].base_url`
 
 Linear polling is team-scoped because Linear issues belong to one team and carry team-native workflow states. The first poll warms a local snapshot and emits zero events; later polls diff that snapshot to emit `linear.issue.opened` and normalized `linear.issue.updated` events.
+
+Jira polling is project-scoped. It also uses a local snapshot diff, so the first poll warms the snapshot and emits zero events; later polls emit `jira.issue.opened` and `jira.issue.updated` when Jira issue fields actually change. Normalized transitions currently cover workflow state, priority, project, and sprint changes.
 
 ### 2. Write the workflow
 
