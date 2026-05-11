@@ -42,7 +42,8 @@ pub use event_vocab::{
     normalize_jira_event_payload, normalize_linear_event_payload,
 };
 pub use server::{
-    serve, WebhookConfig, WebhookError, WebhookEvent, WebhookObserver, WebhookSource,
+    serve, GithubProjectsHydrator, WebhookConfig, WebhookError, WebhookEvent, WebhookObserver,
+    WebhookSource,
 };
 pub use signature::{
     verify_github_signature, verify_gitlab_token, verify_jira_signature, verify_linear_signature,

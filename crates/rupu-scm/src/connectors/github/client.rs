@@ -16,6 +16,7 @@ use lru::LruCache;
 use octocrab::Octocrab;
 use rupu_providers::concurrency;
 use tokio::sync::Semaphore;
+use url::Url;
 
 use crate::error::{classify_scm_error, ScmError};
 use crate::platform::Platform;
@@ -28,6 +29,7 @@ const MAX_RETRIES: u32 = 5;
 pub struct GithubClient {
     pub(crate) inner: Octocrab,
     pub(crate) token: String,
+    graphql_url: String,
     semaphore: Arc<Semaphore>,
     cache: Arc<Mutex<LruCache<String, CacheEntry>>>,
 }
@@ -40,6 +42,7 @@ struct CacheEntry {
 
 impl GithubClient {
     pub fn new(token: String, base_url: Option<String>, max_concurrency: Option<usize>) -> Self {
+        let graphql_url = graphql_url_for(base_url.as_deref()).expect("valid github graphql url");
         let mut builder = Octocrab::builder().personal_token(token.clone());
         if let Some(url) = base_url {
             builder = builder.base_uri(url).expect("valid base_url");
@@ -52,6 +55,7 @@ impl GithubClient {
         Self {
             inner,
             token,
+            graphql_url,
             semaphore,
             cache,
         }
@@ -126,6 +130,78 @@ impl GithubClient {
         )
     }
 
+    /// Execute a GitHub GraphQL query against the authenticated API.
+    /// Returns the `data` object on success.
+    pub async fn graphql_json(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<serde_json::Value, ScmError> {
+        let query = query.to_string();
+        let variables = variables.clone();
+        let url = self.graphql_url.clone();
+        let token = self.token.clone();
+
+        self.with_retry(|| {
+            let query = query.clone();
+            let variables = variables.clone();
+            let url = url.clone();
+            let token = token.clone();
+            async move {
+                let _permit = self.permit().await;
+                let http = reqwest::Client::builder().build().map_err(|e| {
+                    ScmError::Network(anyhow::anyhow!("github graphql client: {e}"))
+                })?;
+                let resp = http
+                    .post(&url)
+                    .header(reqwest::header::USER_AGENT, "rupu/0")
+                    .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                    .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+                    .json(&serde_json::json!({
+                        "query": query,
+                        "variables": variables,
+                    }))
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ScmError::Network(anyhow::anyhow!("github graphql request: {e}"))
+                    })?;
+
+                let status = resp.status().as_u16();
+                let headers = resp.headers().clone();
+                let body: serde_json::Value = resp.json().await.map_err(|e| {
+                    ScmError::Transient(anyhow::anyhow!("github graphql decode: {e}"))
+                })?;
+
+                if status >= 400 {
+                    let message = graphql_error_message(&body)
+                        .unwrap_or_else(|| "github graphql request failed".to_string());
+                    return Err(classify_scm_error(
+                        Platform::Github,
+                        status,
+                        &message,
+                        &headers,
+                    ));
+                }
+
+                if body
+                    .get("errors")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|errors| !errors.is_empty())
+                {
+                    let message = graphql_error_message(&body)
+                        .unwrap_or_else(|| "github graphql returned errors".to_string());
+                    return Err(ScmError::Transient(anyhow::anyhow!(
+                        "github graphql: {message}"
+                    )));
+                }
+
+                Ok(body.get("data").cloned().unwrap_or(serde_json::Value::Null))
+            }
+        })
+        .await
+    }
+
     /// Run `f` with retry-with-backoff. Recoverable RateLimited /
     /// Transient errors are retried up to MAX_RETRIES with exponential
     /// jitter (cap 60s). Unrecoverable errors abort immediately.
@@ -156,6 +232,45 @@ impl GithubClient {
             }
         }
     }
+}
+
+fn graphql_url_for(base_url: Option<&str>) -> Result<String, url::ParseError> {
+    let Some(base_url) = base_url else {
+        return Ok("https://api.github.com/graphql".to_string());
+    };
+    let mut url = Url::parse(base_url)?;
+    let path = url.path().trim_end_matches('/');
+    let graphql_path = if path == "/api/v3" {
+        "/api/graphql".to_string()
+    } else if path == "/api" {
+        "/graphql".to_string()
+    } else if path.is_empty() || path == "/" {
+        if url.domain() == Some("api.github.com") {
+            "/graphql".to_string()
+        } else {
+            "/api/graphql".to_string()
+        }
+    } else {
+        format!("{path}/graphql")
+    };
+    url.set_path(&graphql_path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn graphql_error_message(body: &serde_json::Value) -> Option<String> {
+    body.get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            body.get("errors")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|errors| errors.first())
+                .and_then(|error| error.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 fn backoff(attempt: u32) -> Duration {
@@ -209,5 +324,63 @@ pub fn classify_octocrab_error(err: octocrab::Error) -> ScmError {
             ScmError::Network(anyhow::anyhow!("github transport: {err}"))
         }
         other => ScmError::Transient(anyhow::anyhow!("github: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    #[test]
+    fn graphql_url_defaults_to_public_github() {
+        assert_eq!(
+            graphql_url_for(None).unwrap(),
+            "https://api.github.com/graphql"
+        );
+        assert_eq!(
+            graphql_url_for(Some("https://api.github.com")).unwrap(),
+            "https://api.github.com/graphql"
+        );
+    }
+
+    #[test]
+    fn graphql_url_maps_enterprise_rest_root() {
+        assert_eq!(
+            graphql_url_for(Some("https://ghe.example.com/api/v3")).unwrap(),
+            "https://ghe.example.com/api/graphql"
+        );
+    }
+
+    #[tokio::test]
+    async fn graphql_json_posts_query_and_returns_data() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/api/graphql")
+                .header("authorization", "Bearer ghp_test")
+                .json_body(json!({
+                    "query": "query Test($id: ID!) { node(id: $id) { __typename } }",
+                    "variables": { "id": "node-1" }
+                }));
+            then.status(200).json_body(json!({
+                "data": {
+                    "node": { "__typename": "Issue" }
+                }
+            }));
+        });
+
+        let client = GithubClient::new("ghp_test".into(), Some(server.base_url()), Some(2));
+        let data = client
+            .graphql_json(
+                "query Test($id: ID!) { node(id: $id) { __typename } }",
+                json!({ "id": "node-1" }),
+            )
+            .await
+            .expect("graphql ok");
+
+        mock.assert();
+        assert_eq!(data["node"]["__typename"], "Issue");
     }
 }

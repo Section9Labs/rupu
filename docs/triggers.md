@@ -394,6 +394,7 @@ Important current limits:
 
 - GitHub Projects native state mapping is webhook-only. There is no `poll_sources = [...]` form for Projects yet.
 - GitHub Projects currently maps issue-backed project items into portable `issue.*` aliases. Pull-request and draft-issue items still come through as `github.project_item.*` without issue-native alias expansion.
+- Sparse `projects_v2_item` deliveries are best-effort hydrated through the configured GitHub credential before normalization. That restores project title, repository, issue number, and field/option names when GitHub omits them from the webhook body.
 
 Bind to `127.0.0.1` and front with a TLS-terminating reverse proxy in production. rupu does not terminate TLS itself.
 

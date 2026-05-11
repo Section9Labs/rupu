@@ -58,6 +58,10 @@ pub struct WebhookConfig {
     pub gitlab_token: Option<Vec<u8>>,
     pub linear_secret: Option<Vec<u8>>,
     pub jira_secret: Option<Vec<u8>>,
+    /// Optional best-effort enricher for sparse GitHub Projects item
+    /// payloads. Used to restore project / field / option names so
+    /// portable named aliases still match.
+    pub github_projects_hydrator: Option<Arc<dyn GithubProjectsHydrator>>,
     /// Closure that returns the candidate workflows to consider on
     /// each request. Called fresh per request so authors can edit
     /// workflow files without restarting the server.
@@ -76,6 +80,7 @@ struct AppState {
     gitlab_token: Option<Arc<Vec<u8>>>,
     linear_secret: Option<Arc<Vec<u8>>>,
     jira_secret: Option<Arc<Vec<u8>>>,
+    github_projects_hydrator: Option<Arc<dyn GithubProjectsHydrator>>,
     workflow_loader: Arc<dyn Fn() -> Vec<(String, Workflow)> + Send + Sync>,
     dispatcher: Arc<dyn WorkflowDispatcher>,
     observer: Option<Arc<dyn WebhookObserver>>,
@@ -100,6 +105,11 @@ pub struct WebhookEvent {
 #[async_trait]
 pub trait WebhookObserver: Send + Sync {
     async fn observe(&self, event: &WebhookEvent) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+pub trait GithubProjectsHydrator: Send + Sync {
+    async fn hydrate(&self, payload: &Value) -> anyhow::Result<Value>;
 }
 
 #[derive(Serialize)]
@@ -136,6 +146,7 @@ pub async fn serve(config: WebhookConfig) -> Result<(), WebhookError> {
         gitlab_token: config.gitlab_token.map(Arc::new),
         linear_secret: config.linear_secret.map(Arc::new),
         jira_secret: config.jira_secret.map(Arc::new),
+        github_projects_hydrator: config.github_projects_hydrator,
         workflow_loader: config.workflow_loader,
         dispatcher: config.dispatcher,
         observer: config.observer,
@@ -212,7 +223,13 @@ async fn github_handler(
         .into_response();
     };
 
-    let normalized_payload = normalize_github_event_payload(&event_header, &payload);
+    let source_payload = maybe_hydrate_github_projects_payload(
+        state.github_projects_hydrator.as_ref(),
+        &event_header,
+        &payload,
+    )
+    .await;
+    let normalized_payload = normalize_github_event_payload(&event_header, &source_payload);
 
     observe_event(
         state.observer.as_ref(),
@@ -241,6 +258,26 @@ async fn github_handler(
         fired,
     })
     .into_response()
+}
+
+async fn maybe_hydrate_github_projects_payload(
+    hydrator: Option<&Arc<dyn GithubProjectsHydrator>>,
+    event_header: &str,
+    payload: &Value,
+) -> Value {
+    if event_header != "projects_v2_item" {
+        return payload.clone();
+    }
+    let Some(hydrator) = hydrator else {
+        return payload.clone();
+    };
+    match hydrator.hydrate(payload).await {
+        Ok(enriched) => enriched,
+        Err(err) => {
+            warn!(error = %err, "github projects payload hydration failed");
+            payload.clone()
+        }
+    }
 }
 
 async fn gitlab_handler(
@@ -524,6 +561,10 @@ mod tests {
         fail: bool,
     }
 
+    struct RecordingHydrator {
+        payload: Value,
+    }
+
     #[async_trait]
     impl WebhookObserver for RecordingObserver {
         async fn observe(&self, event: &WebhookEvent) -> anyhow::Result<()> {
@@ -532,6 +573,13 @@ mod tests {
                 anyhow::bail!("boom");
             }
             Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl GithubProjectsHydrator for RecordingHydrator {
+        async fn hydrate(&self, _payload: &Value) -> anyhow::Result<Value> {
+            Ok(self.payload.clone())
         }
     }
 
@@ -547,10 +595,20 @@ mod tests {
             gitlab_token: None,
             linear_secret: Some(Arc::new(b"linear-secret".to_vec())),
             jira_secret: Some(Arc::new(b"jira-secret".to_vec())),
+            github_projects_hydrator: None,
             workflow_loader: Arc::new(Vec::new),
             dispatcher: Arc::new(NoopDispatcher),
             observer: Some(observer),
         }
+    }
+
+    fn state_with_observer_and_hydrator(
+        observer: Arc<dyn WebhookObserver>,
+        hydrator: Arc<dyn GithubProjectsHydrator>,
+    ) -> AppState {
+        let mut state = state_with_observer(observer);
+        state.github_projects_hydrator = Some(hydrator);
+        state
     }
 
     fn response_status(response: Response) -> StatusCode {
@@ -817,6 +875,96 @@ mod tests {
             "github:Section9Labs/rupu/issues/42"
         );
         assert_eq!(events[0].payload["state"]["category"], "workflow_state");
+        assert_eq!(
+            events[0].payload["state"]["after"]["name"],
+            "Ready For Review"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_projects_handler_uses_optional_hydrator() {
+        let observer = Arc::new(RecordingObserver::default());
+        let hydrator = Arc::new(RecordingHydrator {
+            payload: serde_json::json!({
+              "action": "edited",
+              "organization": { "login": "Section9Labs" },
+              "projects_v2": { "node_id": "PVT_kwDOA", "title": "Delivery" },
+              "projects_v2_item": {
+                "id": "PVTI_lADOA",
+                "project_node_id": "PVT_kwDOA",
+                "content_type": "Issue",
+                "content": {
+                  "__typename": "Issue",
+                  "node_id": "I_kwDOA",
+                  "number": 42,
+                  "html_url": "https://github.com/Section9Labs/rupu/issues/42",
+                  "repository": { "full_name": "Section9Labs/rupu" }
+                },
+                "field_value": {
+                  "field_type": "single_select",
+                  "optionId": "opt-ready",
+                  "name": "Ready For Review",
+                  "field": { "name": "Status" }
+                }
+              },
+              "changes": {
+                "field_value": {
+                  "field_type": "single_select",
+                  "optionId": "opt-progress",
+                  "name": "In Progress",
+                  "field": { "name": "Status" }
+                }
+              }
+            }),
+        });
+        let body = r#"{
+          "action": "edited",
+          "organization": { "login": "Section9Labs" },
+          "projects_v2_item": {
+            "id": "PVTI_lADOA",
+            "project_node_id": "PVT_kwDOA",
+            "content_type": "Issue",
+            "field_value": {
+              "field_type": "single_select",
+              "optionId": "opt-ready"
+            }
+          },
+          "changes": {
+            "field_value": {
+              "field_type": "single_select",
+              "optionId": "opt-progress"
+            }
+          }
+        }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert("x-github-event", "projects_v2_item".parse().unwrap());
+        headers.insert(
+            "x-hub-signature-256",
+            github_signature(b"secret", body.as_bytes())
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("x-github-delivery", "delivery-hydrated".parse().unwrap());
+
+        let response = github_handler(
+            State(state_with_observer_and_hydrator(
+                observer.clone(),
+                hydrator.clone(),
+            )),
+            headers,
+            Bytes::from(body.as_bytes().to_vec()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response_status(response), StatusCode::OK);
+        let events = observer.events.lock().unwrap();
+        assert_eq!(events[0].delivery_id.as_deref(), Some("delivery-hydrated"));
+        assert_eq!(
+            events[0].payload["subject"]["ref"],
+            "github:Section9Labs/rupu/issues/42"
+        );
+        assert_eq!(events[0].payload["state"]["before"]["name"], "In Progress");
         assert_eq!(
             events[0].payload["state"]["after"]["name"],
             "Ready For Review"
