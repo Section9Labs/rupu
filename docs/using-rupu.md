@@ -750,11 +750,13 @@ Jira Cloud issue webhooks are normalized too. `jira:issue_updated` changelog tra
 
 GitHub Projects v2 item webhooks are normalized too. When an organization-level `projects_v2_item` event changes an issue item's `Status` field, workflows can target the same portable aliases such as `issue.entered_workflow_state.ready_for_review` and `issue.state_changed.todo.to.in_progress`.
 
+If the webhook delivery is sparse, `rupu webhook serve` can enrich the payload through the configured GitHub credential. That restores project titles, issue numbers, repository names, and select/iteration field names before alias matching, so the same workflow filters keep working even when GitHub omits those names from the delivery body.
+
 Current boundary:
 
 - Linear supports both webhook and `poll_sources = ["linear:<team-id>"]`.
 - Jira supports both webhook and `poll_sources = ["jira:<site>/<project>"]` or `poll_sources = ["jira:<project>"]` when `[scm.jira].base_url` is configured.
-- GitHub Projects v2 native state mapping is webhook-only for now, through the standard GitHub webhook receiver and the `projects_v2_item` organization webhook event. GitHub still marks Projects webhooks as public preview.
+- GitHub Projects v2 native state mapping is webhook-only for now, through the standard GitHub webhook receiver and the `projects_v2_item` organization webhook event. GitHub still marks Projects webhooks as public preview, but `rupu webhook serve` now hydrates sparse deliveries when a GitHub auth token is configured.
 - Both trackers now support tracker-native autoflow claim ownership while still executing repo-bound workflows and worktrees.
 
 When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and the next `rupu autoflow tick` or active `rupu autoflow serve` cycle consumes it.
