@@ -3733,6 +3733,16 @@ fn push_resolved_autoflow_paths(
         if !matches!(ext, Some("yaml" | "yml")) {
             continue;
         }
+        let body = std::fs::read_to_string(&path)?;
+        let workflow = Workflow::parse(&body)?;
+        if !workflow
+            .autoflow
+            .as_ref()
+            .map(|autoflow| autoflow.enabled)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let resolved = resolve_autoflow_from_path(
             global,
             path,

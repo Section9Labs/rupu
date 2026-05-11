@@ -733,6 +733,17 @@ steps:
     prompt: hi
 "#,
     );
+    write_agent_and_workflow(
+        &project,
+        "manual-only",
+        r#"name: manual-only
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
     track_repo(&home, "github:Section9Labs/rupu", project.path());
 
     Command::cargo_bin("rupu")
@@ -743,7 +754,8 @@ steps:
         .assert()
         .success()
         .stdout(predicate::str::contains("controller"))
-        .stdout(predicate::str::contains("github:Section9Labs/rupu"));
+        .stdout(predicate::str::contains("github:Section9Labs/rupu"))
+        .stdout(predicate::str::contains("manual-only").not());
 }
 
 #[test]
