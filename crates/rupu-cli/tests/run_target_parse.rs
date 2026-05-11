@@ -84,6 +84,32 @@ fn parses_gitlab_issue() {
 }
 
 #[test]
+fn parses_linear_issue() {
+    let t = parse_run_target("linear:team-123/issues/42").unwrap();
+    assert_eq!(
+        t,
+        RunTarget::Issue {
+            tracker: IssueTracker::Linear,
+            project: "team-123".into(),
+            number: 42,
+        }
+    );
+}
+
+#[test]
+fn parses_jira_issue() {
+    let t = parse_run_target("jira:acme.atlassian.net/ENG/issues/42").unwrap();
+    assert_eq!(
+        t,
+        RunTarget::Issue {
+            tracker: IssueTracker::Jira,
+            project: "acme.atlassian.net/ENG".into(),
+            number: 42,
+        }
+    );
+}
+
+#[test]
 fn rejects_unknown_platform() {
     assert!(parse_run_target("bitbucket:foo/bar").is_err());
 }

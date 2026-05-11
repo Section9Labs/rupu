@@ -78,6 +78,7 @@ async fn linear_event_connector_built_when_credential_present() {
         .await;
     let cfg = rupu_config::Config::default();
     let r = Registry::discover(&resolver, &cfg).await;
+    assert!(r.issues(IssueTracker::Linear).is_some());
     assert!(r
         .events_for_source(&EventSourceRef::TrackerProject {
             tracker: IssueTracker::Linear,
