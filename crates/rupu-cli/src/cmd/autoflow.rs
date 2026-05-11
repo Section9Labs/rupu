@@ -328,6 +328,10 @@ struct AutoflowContestedRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
     repo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_cycle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_event: Option<String>,
     contenders: String,
 }
 
@@ -360,6 +364,9 @@ struct AutoflowClaimRow {
     summary: String,
     contenders: String,
     workspace: String,
+    last_cycle: String,
+    last_event: String,
+    last_run: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -433,6 +440,22 @@ struct AutoflowHistoryReport {
     rows: Vec<AutoflowHistoryRow>,
 }
 
+#[derive(Debug, Clone)]
+struct RecentIssueActivity {
+    at: String,
+    event: String,
+    run_id: Option<String>,
+}
+
+struct AutoflowHistoryQuery<'a> {
+    issue_filter: Option<&'a str>,
+    repo_filter: Option<&'a str>,
+    source_filter: Option<&'a str>,
+    worker_filter: Option<&'a str>,
+    event_filter: Option<&'a str>,
+    limit: usize,
+}
+
 pub async fn handle(
     action: Action,
     global_format: Option<crate::output::formats::OutputFormat>,
@@ -491,18 +514,15 @@ async fn handle_with_resolver(
             watch,
             interval,
         } => {
-            history(
-                r#ref.as_deref(),
-                repo.as_deref(),
-                source.as_deref(),
-                worker.as_deref(),
-                event.as_deref(),
+            let query = AutoflowHistoryQuery {
+                issue_filter: r#ref.as_deref(),
+                repo_filter: repo.as_deref(),
+                source_filter: source.as_deref(),
+                worker_filter: worker.as_deref(),
+                event_filter: event.as_deref(),
                 limit,
-                watch,
-                &interval,
-                global_format,
-            )
-            .await
+            };
+            history(query, watch, &interval, global_format).await
         }
         Action::Explain { r#ref, repo } => explain(&r#ref, repo.as_deref()).await,
         Action::Doctor(args) => doctor(args.repo.as_deref()).await,
@@ -979,12 +999,7 @@ async fn monitor(
 }
 
 async fn history(
-    issue_filter: Option<&str>,
-    repo: Option<&str>,
-    source_filter: Option<&str>,
-    worker: Option<&str>,
-    event_filter: Option<&str>,
-    limit: usize,
+    query: AutoflowHistoryQuery<'_>,
     watch: bool,
     interval: &str,
     global_format: Option<crate::output::formats::OutputFormat>,
@@ -1007,29 +1022,19 @@ async fn history(
     let refresh = parse_duration(interval)?
         .to_std()
         .map_err(|_| anyhow!("history interval must be non-negative"))?;
-    let repo_filter = normalize_repo_filter(repo)?;
+    let repo_filter = normalize_repo_filter(query.repo_filter)?;
+    let query = AutoflowHistoryQuery {
+        repo_filter: repo_filter.as_deref(),
+        ..query
+    };
 
     if !watch {
-        let report = build_history_report(
-            issue_filter,
-            repo_filter.as_deref(),
-            source_filter,
-            worker,
-            event_filter,
-            limit,
-        )?;
+        let report = build_history_report(&query)?;
         return print_history_report(&report, format);
     }
 
     loop {
-        let report = build_history_report(
-            issue_filter,
-            repo_filter.as_deref(),
-            source_filter,
-            worker,
-            event_filter,
-            limit,
-        )?;
+        let report = build_history_report(&query)?;
         render_history_watch_frame(&report)?;
 
         tokio::select! {
@@ -1056,6 +1061,7 @@ fn build_monitor_report(
 
     let claims = filter_claims_by_repo(claim_store.list()?, repo_filter);
     let cycles = filter_monitor_cycles(history_store.list_recent(100)?, repo_filter, worker_filter);
+    let recent = recent_activity_map_from_cycles(&cycles);
     let latest_by_worker = latest_cycle_by_worker(&cycles);
 
     let mut workers = worker_store
@@ -1109,6 +1115,19 @@ fn build_monitor_report(
             summary: claim_summary(claim),
             contenders: format_contenders(&claim.contenders),
             workspace: claim.worktree_path.clone().unwrap_or_else(|| "-".into()),
+            last_cycle: recent
+                .get(&claim.issue_ref)
+                .map(|activity| activity.at.clone())
+                .unwrap_or_else(|| "-".into()),
+            last_event: recent
+                .get(&claim.issue_ref)
+                .map(|activity| activity.event.clone())
+                .unwrap_or_else(|| "-".into()),
+            last_run: recent
+                .get(&claim.issue_ref)
+                .and_then(|activity| activity.run_id.clone())
+                .or_else(|| claim.last_run_id.clone())
+                .unwrap_or_else(|| "-".into()),
         })
         .collect::<Vec<_>>();
 
@@ -1157,22 +1176,44 @@ fn build_monitor_report(
     })
 }
 
-fn build_history_report(
-    issue_filter: Option<&str>,
-    repo_filter: Option<&str>,
-    source_filter: Option<&str>,
-    worker_filter: Option<&str>,
-    event_filter: Option<&str>,
-    limit: usize,
-) -> anyhow::Result<AutoflowHistoryReport> {
+fn build_history_report(query: &AutoflowHistoryQuery<'_>) -> anyhow::Result<AutoflowHistoryReport> {
     let global = paths::global_dir()?;
     let history_store = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
-    let cycles = filter_monitor_cycles(history_store.list_recent(200)?, repo_filter, worker_filter);
+    let cycles = filter_monitor_cycles(
+        history_store.list_recent(200)?,
+        query.repo_filter,
+        query.worker_filter,
+    );
     let total_cycles = cycles.len();
-    let mut rows = cycles
+    let mut rows = history_rows_from_cycles(
+        &cycles,
+        query.issue_filter,
+        query.source_filter,
+        query.event_filter,
+    );
+    let total_events = rows.len();
+    if rows.len() > query.limit {
+        rows.truncate(query.limit);
+    }
+    Ok(AutoflowHistoryReport {
+        kind: "autoflow_history",
+        version: 1,
+        total_cycles,
+        total_events,
+        rows,
+    })
+}
+
+fn history_rows_from_cycles(
+    cycles: &[AutoflowCycleRecord],
+    issue_filter: Option<&str>,
+    source_filter: Option<&str>,
+    event_filter: Option<&str>,
+) -> Vec<AutoflowHistoryRow> {
+    cycles
         .iter()
         .flat_map(|cycle| {
-            cycle.events.iter().filter_map(move |event| {
+            cycle.events.iter().rev().filter_map(move |event| {
                 let event_name = monitor_event_name(event);
                 let issue = event
                     .issue_display_ref
@@ -1210,7 +1251,7 @@ fn build_history_report(
                         rupu_runtime::AutoflowCycleMode::Serve => "serve".into(),
                     },
                     worker,
-                    event: event_name.into(),
+                    event: event_name.to_string(),
                     issue,
                     source,
                     workflow,
@@ -1221,18 +1262,35 @@ fn build_history_report(
                 })
             })
         })
-        .collect::<Vec<_>>();
-    let total_events = rows.len();
-    if rows.len() > limit {
-        rows.truncate(limit);
+        .collect()
+}
+
+fn recent_activity_by_issue(
+    history_store: &AutoflowHistoryStore,
+    repo_filter: Option<&str>,
+) -> anyhow::Result<BTreeMap<String, RecentIssueActivity>> {
+    let cycles = filter_monitor_cycles(history_store.list_recent(200)?, repo_filter, None);
+    Ok(recent_activity_map_from_cycles(&cycles))
+}
+
+fn recent_activity_map_from_cycles(
+    cycles: &[AutoflowCycleRecord],
+) -> BTreeMap<String, RecentIssueActivity> {
+    let mut out = BTreeMap::new();
+    for cycle in cycles {
+        for event in cycle.events.iter().rev() {
+            let Some(issue_ref) = event.issue_ref.as_ref() else {
+                continue;
+            };
+            out.entry(issue_ref.clone())
+                .or_insert_with(|| RecentIssueActivity {
+                    at: cycle.finished_at.clone(),
+                    event: monitor_event_name(event).to_string(),
+                    run_id: event.run_id.clone(),
+                });
+        }
     }
-    Ok(AutoflowHistoryReport {
-        kind: "autoflow_history",
-        version: 1,
-        total_cycles,
-        total_events,
-        rows,
-    })
+    out
 }
 
 fn print_monitor_report(
@@ -1462,6 +1520,7 @@ async fn explain(r#ref: &str, repo: Option<&str>) -> anyhow::Result<()> {
     };
     let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
     let run_store = RunStore::new(global.join("runs"));
+    let history_store = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
     let claim = claim_store.load(&issue_ref)?;
     let issue_ref_parsed = parse_issue_ref_text(&issue_ref)?;
     let source_matches = if claim.is_none() {
@@ -1482,6 +1541,15 @@ async fn explain(r#ref: &str, repo: Option<&str>) -> anyhow::Result<()> {
         &issue_ref,
     );
     processed.sort_by(|left, right| right.received_at.cmp(&left.received_at));
+    let recent_history = history_rows_from_cycles(
+        &filter_monitor_cycles(history_store.list_recent(200)?, Some(&repo_ref), None),
+        Some(&issue_ref),
+        None,
+        None,
+    )
+    .into_iter()
+    .take(5)
+    .collect::<Vec<_>>();
 
     println!("issue: {issue_ref}");
     println!("repo: {repo_ref}");
@@ -1539,6 +1607,7 @@ async fn explain(r#ref: &str, repo: Option<&str>) -> anyhow::Result<()> {
             }
             if let Some(run_id) = claim.last_run_id.as_deref() {
                 println!("last run: {run_id}");
+                println!("watch hint: rupu watch {run_id}");
                 match run_store.load(run_id) {
                     Ok(run) => {
                         println!("last run status: {}", run.status.as_str());
@@ -1630,6 +1699,17 @@ async fn explain(r#ref: &str, repo: Option<&str>) -> anyhow::Result<()> {
             wake_source_name(wake.source),
             wake.event.id
         );
+    }
+    if recent_history.is_empty() {
+        println!("recent cycle events: -");
+    } else {
+        println!("recent cycle events:");
+        for row in recent_history {
+            println!(
+                "- {} {} workflow={} run={} detail={}",
+                row.at, row.event, row.workflow, row.run, row.detail
+            );
+        }
     }
     Ok(())
 }
@@ -1919,8 +1999,10 @@ async fn status(
     let store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
+    let history_store = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
     let repo_filter = normalize_repo_filter(repo)?;
     let claims = filter_claims_by_repo(store.list()?, repo_filter.as_deref());
+    let recent = recent_activity_by_issue(&history_store, repo_filter.as_deref())?;
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for claim in &claims {
         *counts.entry(status_name(claim.status)).or_insert(0) += 1;
@@ -1946,6 +2028,12 @@ async fn status(
             state: claim.issue_state_name.clone(),
             source: claim.source_ref.clone(),
             repo: claim.repo_ref.clone(),
+            last_cycle: recent
+                .get(&claim.issue_ref)
+                .map(|activity| activity.at.clone()),
+            last_event: recent
+                .get(&claim.issue_ref)
+                .map(|activity| activity.event.clone()),
             contenders: format_contenders(&claim.contenders),
         })
         .collect::<Vec<_>>();
@@ -1991,9 +2079,14 @@ async fn status(
                 .or(claim.tracker.as_deref())
                 .unwrap_or("-");
             let state = claim.state.as_deref().unwrap_or("-");
+            let recent = match (claim.last_event.as_deref(), claim.last_cycle.as_deref()) {
+                (Some(event), Some(at)) => format!(" | recent={} @ {}", event, at),
+                (Some(event), None) => format!(" | recent={event}"),
+                _ => String::new(),
+            };
             println!(
-                "- {} [{} | {} | {}] -> {}",
-                issue, source, state, claim.repo, claim.contenders
+                "- {} [{} | {} | {}{}] -> {}",
+                issue, source, state, claim.repo, recent, claim.contenders
             );
         }
     }
@@ -2008,8 +2101,10 @@ async fn claims(
     let store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
+    let history_store = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
     let repo_filter = normalize_repo_filter(repo)?;
     let claims = filter_claims_by_repo(store.list()?, repo_filter.as_deref());
+    let recent = recent_activity_by_issue(&history_store, repo_filter.as_deref())?;
     if claims.is_empty() {
         println!("(no autoflow claims)");
         return Ok(());
@@ -2034,6 +2129,19 @@ async fn claims(
             summary: claim_summary(claim),
             contenders: format_contenders(&claim.contenders),
             workspace: claim.worktree_path.clone().unwrap_or_else(|| "-".into()),
+            last_cycle: recent
+                .get(&claim.issue_ref)
+                .map(|activity| activity.at.clone())
+                .unwrap_or_else(|| "-".into()),
+            last_event: recent
+                .get(&claim.issue_ref)
+                .map(|activity| activity.event.clone())
+                .unwrap_or_else(|| "-".into()),
+            last_run: recent
+                .get(&claim.issue_ref)
+                .and_then(|activity| activity.run_id.clone())
+                .or_else(|| claim.last_run_id.clone())
+                .unwrap_or_else(|| "-".into()),
         })
         .collect::<Vec<_>>();
     let format =
@@ -2074,6 +2182,9 @@ async fn claims(
         "Status",
         "Repo",
         "Branch",
+        "Run",
+        "Last Event",
+        "Last Cycle",
         "Next",
         "PR",
         "Summary",
@@ -2095,6 +2206,9 @@ async fn claims(
             Cell::new(claim.status),
             Cell::new(claim.repo),
             Cell::new(claim.branch),
+            Cell::new(claim.last_run),
+            Cell::new(claim.last_event),
+            Cell::new(claim.last_cycle),
             Cell::new(claim.next),
             Cell::new(claim.pr),
             Cell::new(claim.summary),

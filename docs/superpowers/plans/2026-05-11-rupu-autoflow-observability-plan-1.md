@@ -1,7 +1,7 @@
 # rupu Autoflow Observability — Plan 1
 
 **Date:** 2026-05-11
-**Status:** Proposed
+**Status:** Implemented
 **Companion docs:** [Autoflow observability design](../specs/2026-05-11-rupu-autoflow-observability-design.md), [Autoflow Plan 2](../specs/2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md), [Tracker-native ownership design](../specs/2026-05-10-rupu-tracker-native-autoflow-ownership-design.md)
 
 ---
@@ -210,3 +210,14 @@ Plan 1 is complete when:
 - `rupu autoflow history` gives a coherent durable operator history
 - `explain` and `claims` can point operators into `rupu watch <run_id>`
 - repo-backed and tracker-native autoflows are equally visible through the CLI
+
+## Closeout
+
+Shipped in sequence:
+
+- PR 1: durable cycle/event history foundation
+- PR 2: `rupu autoflow monitor`
+- PR 3: `rupu autoflow history`
+- PR 4: explain / claims / status drilldown polish and `rupu watch <run_id>` handoff
+
+The optional watch-mode / TUI follow-on is deferred. `rupu autoflow monitor --watch` is sufficient for the current CLI operator loop, so there is no active Plan 1 PR 5.

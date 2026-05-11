@@ -1,7 +1,7 @@
 # rupu Autoflow Observability Design
 
 **Date:** 2026-05-11
-**Status:** Design
+**Status:** Shipped
 **Companion docs:** [Autoflow v1 design](./2026-05-08-rupu-autoflow-design.md), [Autoflow Plan 2](./2026-05-09-rupu-autoflow-plan-2-portable-runtime-design.md), [Tracker-native ownership design](./2026-05-10-rupu-tracker-native-autoflow-ownership-design.md), [Workflow triggers design](./2026-05-07-rupu-workflow-triggers-design.md), [Slice C design](./2026-05-05-rupu-slice-c-tui-design.md)
 
 ---
@@ -488,6 +488,16 @@ The same cycle/event history model can later back:
 That is why the durable record comes first.
 
 Without it, cloud observability would be a second implementation.
+
+---
+
+## 14. Current shipped boundary
+
+- durable cycle/event history is shipped
+- `rupu autoflow monitor` is shipped
+- `rupu autoflow history` is shipped
+- `explain` / `claims` / `status` now expose recent change context and `rupu watch <run_id>` handoff
+- a dedicated TUI over this model remains optional follow-on work, not an active gap
 
 ---
 

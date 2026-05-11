@@ -263,6 +263,8 @@ For tracker-native issues such as Linear or Jira, `rupu autoflow run` and `rupu 
 
 `rupu autoflow history` is the durable event stream over the same cycle records. Use it when you need to answer what happened recently, export recent run launches or retries, or isolate one issue / worker / source over time.
 
+`rupu autoflow explain` now includes the most recent cycle events for one issue and a direct `rupu watch <run_id>` handoff when a last run exists. `rupu autoflow claims` and `rupu autoflow status` also surface recent change context so operators can see the last event without leaving the summary views.
+
 ### Inspect usage and structured reports
 
 ```sh

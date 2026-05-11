@@ -69,7 +69,7 @@ pub struct UsageScopeArgs {
 #[derive(Subcommand, Debug)]
 pub enum UsageCommand {
     /// Show per-run usage rows.
-    Runs(UsageRunsArgs),
+    Runs(Box<UsageRunsArgs>),
     /// Backfill metadata sidecars for older standalone transcripts.
     Backfill(UsageBackfillArgs),
 }
@@ -145,7 +145,7 @@ async fn run(
             project_root.as_deref(),
             &cfg,
             &prefs,
-            run_args,
+            *run_args,
             format,
         ),
         Some(UsageCommand::Backfill(backfill_args)) => render_backfill_view(
