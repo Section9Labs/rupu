@@ -217,6 +217,7 @@ fn supports_structured_output(command: &Cmd) -> bool {
             }
             | Cmd::Autoflow {
                 action: cmd::autoflow::Action::List(_)
+                    | cmd::autoflow::Action::History { .. }
                     | cmd::autoflow::Action::Monitor { .. }
                     | cmd::autoflow::Action::Wakes(_)
                     | cmd::autoflow::Action::Status(_)

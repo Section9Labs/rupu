@@ -535,6 +535,85 @@ fn autoflow_monitor_supports_structured_json_output() {
 }
 
 #[test]
+fn autoflow_history_shows_recent_events() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    seed_monitor_state(&home);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args([
+            "autoflow",
+            "history",
+            "linear:eng-team/issues/42",
+            "--repo",
+            "github:Section9Labs/rupu",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run_launched"))
+        .stdout(predicate::str::contains("claim_acquired"))
+        .stdout(predicate::str::contains("ENG-42"))
+        .stdout(predicate::str::contains("laptop-01"));
+}
+
+#[test]
+fn autoflow_history_supports_json_and_csv_output() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    seed_monitor_state(&home);
+
+    let json_output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args([
+            "--format",
+            "json",
+            "autoflow",
+            "history",
+            "--repo",
+            "github:Section9Labs/rupu",
+            "--event",
+            "run_launched",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&json_output).unwrap();
+    assert_eq!(value["kind"], "autoflow_history");
+    assert_eq!(value["rows"][0]["event"], "run_launched");
+    assert_eq!(value["rows"][0]["run"], "run_123");
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args([
+            "--format",
+            "csv",
+            "autoflow",
+            "history",
+            "--repo",
+            "github:Section9Labs/rupu",
+            "--event",
+            "run_launched",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "at,cycle_id,mode,worker,event,issue,source,workflow,repo,run,wake,detail",
+        ))
+        .stdout(predicate::str::contains("run_launched"))
+        .stdout(predicate::str::contains("run_123"));
+}
+
+#[test]
 fn autoflow_show_prints_resolved_metadata_and_body() {
     let _guard = ENV_LOCK.blocking_lock();
 

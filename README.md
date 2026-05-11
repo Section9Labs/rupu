@@ -292,6 +292,7 @@ Structured `--format table|json|csv` is currently supported on:
 - `rupu repos tracked`
 - `rupu autoflow list`
 - `rupu autoflow monitor` (`table` and `json`)
+- `rupu autoflow history`
 - `rupu autoflow status`
 - `rupu autoflow claims`
 - `rupu autoflow wakes`

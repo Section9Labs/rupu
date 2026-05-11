@@ -97,6 +97,32 @@ pub enum Action {
         #[arg(long, default_value = "2s")]
         interval: String,
     },
+    /// Show durable autoflow cycle and event history.
+    History {
+        /// Optional issue ref filter, for example `linear:eng-team/issues/42`.
+        r#ref: Option<String>,
+        /// Limit results to one repo target, for example `github:owner/repo`.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Limit results to one source target, for example `linear:eng-team`.
+        #[arg(long)]
+        source: Option<String>,
+        /// Limit results to one worker id or display name.
+        #[arg(long)]
+        worker: Option<String>,
+        /// Limit results to one event kind, for example `run_launched`.
+        #[arg(long)]
+        event: Option<String>,
+        /// Maximum number of history rows to show.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Refresh the table view until interrupted.
+        #[arg(long)]
+        watch: bool,
+        /// Refresh interval for `--watch`, for example `2s`.
+        #[arg(long, default_value = "2s")]
+        interval: String,
+    },
     /// Explain the current autonomous state for one issue.
     Explain {
         r#ref: String,
@@ -382,6 +408,31 @@ struct AutoflowMonitorReport {
     wakes: AutoflowMonitorWakeSummary,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowHistoryRow {
+    at: String,
+    cycle_id: String,
+    mode: String,
+    worker: String,
+    event: String,
+    issue: String,
+    source: String,
+    workflow: String,
+    repo: String,
+    run: String,
+    wake: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowHistoryReport {
+    kind: &'static str,
+    version: u8,
+    total_cycles: usize,
+    total_events: usize,
+    rows: Vec<AutoflowHistoryRow>,
+}
+
 pub async fn handle(
     action: Action,
     global_format: Option<crate::output::formats::OutputFormat>,
@@ -424,6 +475,29 @@ async fn handle_with_resolver(
             monitor(
                 repo.as_deref(),
                 worker.as_deref(),
+                watch,
+                &interval,
+                global_format,
+            )
+            .await
+        }
+        Action::History {
+            r#ref,
+            repo,
+            source,
+            worker,
+            event,
+            limit,
+            watch,
+            interval,
+        } => {
+            history(
+                r#ref.as_deref(),
+                repo.as_deref(),
+                source.as_deref(),
+                worker.as_deref(),
+                event.as_deref(),
+                limit,
                 watch,
                 &interval,
                 global_format,
@@ -904,6 +978,68 @@ async fn monitor(
     Ok(())
 }
 
+async fn history(
+    issue_filter: Option<&str>,
+    repo: Option<&str>,
+    source_filter: Option<&str>,
+    worker: Option<&str>,
+    event_filter: Option<&str>,
+    limit: usize,
+    watch: bool,
+    interval: &str,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
+    let format =
+        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
+    crate::output::formats::ensure_supported(
+        "rupu autoflow history",
+        format,
+        &[
+            crate::output::formats::OutputFormat::Table,
+            crate::output::formats::OutputFormat::Json,
+            crate::output::formats::OutputFormat::Csv,
+        ],
+    )?;
+    if watch && format != crate::output::formats::OutputFormat::Table {
+        bail!("`rupu autoflow history --watch` only supports table output");
+    }
+
+    let refresh = parse_duration(interval)?
+        .to_std()
+        .map_err(|_| anyhow!("history interval must be non-negative"))?;
+    let repo_filter = normalize_repo_filter(repo)?;
+
+    if !watch {
+        let report = build_history_report(
+            issue_filter,
+            repo_filter.as_deref(),
+            source_filter,
+            worker,
+            event_filter,
+            limit,
+        )?;
+        return print_history_report(&report, format);
+    }
+
+    loop {
+        let report = build_history_report(
+            issue_filter,
+            repo_filter.as_deref(),
+            source_filter,
+            worker,
+            event_filter,
+            limit,
+        )?;
+        render_history_watch_frame(&report)?;
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(refresh) => {}
+        }
+    }
+    Ok(())
+}
+
 fn build_monitor_report(
     repo_filter: Option<&str>,
     worker_filter: Option<&str>,
@@ -1021,6 +1157,84 @@ fn build_monitor_report(
     })
 }
 
+fn build_history_report(
+    issue_filter: Option<&str>,
+    repo_filter: Option<&str>,
+    source_filter: Option<&str>,
+    worker_filter: Option<&str>,
+    event_filter: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<AutoflowHistoryReport> {
+    let global = paths::global_dir()?;
+    let history_store = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
+    let cycles = filter_monitor_cycles(history_store.list_recent(200)?, repo_filter, worker_filter);
+    let total_cycles = cycles.len();
+    let mut rows = cycles
+        .iter()
+        .flat_map(|cycle| {
+            cycle.events.iter().filter_map(move |event| {
+                let event_name = monitor_event_name(event);
+                let issue = event
+                    .issue_display_ref
+                    .clone()
+                    .or_else(|| event.issue_ref.clone())
+                    .unwrap_or_else(|| "-".into());
+                let issue_ref = event.issue_ref.as_deref().unwrap_or("");
+                let source = event.source_ref.clone().unwrap_or_else(|| "-".into());
+                let worker = cycle
+                    .worker_name
+                    .clone()
+                    .or_else(|| cycle.worker_id.clone())
+                    .unwrap_or_else(|| "-".into());
+                let repo = event.repo_ref.clone().unwrap_or_else(|| "-".into());
+                let workflow = event.workflow.clone().unwrap_or_else(|| "-".into());
+                let run = event.run_id.clone().unwrap_or_else(|| "-".into());
+                let wake = event
+                    .wake_id
+                    .clone()
+                    .or_else(|| event.wake_event_id.clone())
+                    .unwrap_or_else(|| "-".into());
+                let detail = event.detail.clone().unwrap_or_else(|| "-".into());
+                let source_match = source_filter.is_none_or(|filter| filter == source);
+                let issue_match =
+                    issue_filter.is_none_or(|filter| filter == issue_ref || filter == issue);
+                let event_match = event_filter.is_none_or(|filter| filter == event_name);
+                if !(source_match && issue_match && event_match) {
+                    return None;
+                }
+                Some(AutoflowHistoryRow {
+                    at: cycle.finished_at.clone(),
+                    cycle_id: cycle.cycle_id.clone(),
+                    mode: match cycle.mode {
+                        rupu_runtime::AutoflowCycleMode::Tick => "tick".into(),
+                        rupu_runtime::AutoflowCycleMode::Serve => "serve".into(),
+                    },
+                    worker,
+                    event: event_name.into(),
+                    issue,
+                    source,
+                    workflow,
+                    repo,
+                    run,
+                    wake,
+                    detail,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let total_events = rows.len();
+    if rows.len() > limit {
+        rows.truncate(limit);
+    }
+    Ok(AutoflowHistoryReport {
+        kind: "autoflow_history",
+        version: 1,
+        total_cycles,
+        total_events,
+        rows,
+    })
+}
+
 fn print_monitor_report(
     report: &AutoflowMonitorReport,
     format: crate::output::formats::OutputFormat,
@@ -1029,6 +1243,19 @@ fn print_monitor_report(
         crate::output::formats::OutputFormat::Json => crate::output::formats::print_json(report),
         crate::output::formats::OutputFormat::Table => render_monitor_tables(report),
         crate::output::formats::OutputFormat::Csv => unreachable!("csv not supported"),
+    }
+}
+
+fn print_history_report(
+    report: &AutoflowHistoryReport,
+    format: crate::output::formats::OutputFormat,
+) -> anyhow::Result<()> {
+    match format {
+        crate::output::formats::OutputFormat::Json => crate::output::formats::print_json(report),
+        crate::output::formats::OutputFormat::Csv => {
+            crate::output::formats::print_csv_rows(&report.rows)
+        }
+        crate::output::formats::OutputFormat::Table => render_history_table(report),
     }
 }
 
@@ -1043,6 +1270,19 @@ fn render_monitor_watch_frame(report: &AutoflowMonitorReport) -> anyhow::Result<
     );
     println!();
     render_monitor_tables(report)
+}
+
+fn render_history_watch_frame(report: &AutoflowHistoryReport) -> anyhow::Result<()> {
+    print!("\x1B[2J\x1B[H");
+    println!(
+        "rupu autoflow history  refreshed={}  cycles={}  events={}  rows={}",
+        chrono::Utc::now().to_rfc3339(),
+        report.total_cycles,
+        report.total_events,
+        report.rows.len()
+    );
+    println!();
+    render_history_table(report)
 }
 
 fn render_monitor_tables(report: &AutoflowMonitorReport) -> anyhow::Result<()> {
@@ -1123,6 +1363,32 @@ fn render_monitor_tables(report: &AutoflowMonitorReport) -> anyhow::Result<()> {
         "\nwakes: queued={} due={} processed_recent={}",
         report.wakes.queued, report.wakes.due, report.wakes.processed_recent
     );
+    Ok(())
+}
+
+fn render_history_table(report: &AutoflowHistoryReport) -> anyhow::Result<()> {
+    if report.rows.is_empty() {
+        println!("(no history)");
+        return Ok(());
+    }
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec![
+        "At", "Event", "Issue", "Source", "Workflow", "Repo", "Worker", "Run", "Detail",
+    ]);
+    for row in &report.rows {
+        table.add_row(vec![
+            Cell::new(&row.at),
+            Cell::new(&row.event),
+            Cell::new(&row.issue),
+            Cell::new(&row.source),
+            Cell::new(&row.workflow),
+            Cell::new(&row.repo),
+            Cell::new(&row.worker),
+            Cell::new(&row.run),
+            Cell::new(&row.detail),
+        ]);
+    }
+    println!("{table}");
     Ok(())
 }
 
