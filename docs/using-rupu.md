@@ -233,6 +233,7 @@ rupu autoflow run tracker-controller jira:ENG/issues/42 --repo github:your-org/y
 rupu autoflow tick
 rupu autoflow serve --repo github:your-org/your-repo
 rupu autoflow serve --repo github:your-org/your-repo --worker team-mini-01
+rupu autoflow serve --repo github:your-org/your-repo --quiet
 rupu autoflow monitor --repo github:your-org/your-repo
 rupu --format json autoflow monitor --repo github:your-org/your-repo
 rupu autoflow history --repo github:your-org/your-repo
@@ -259,7 +260,7 @@ For tracker-native issues such as Linear or Jira, `rupu autoflow run` and `rupu 
 
 `rupu autoflow claims` now surfaces the tracker source, tracker state, bound repo, and active branch for each claim. `rupu autoflow status` includes the same tracker-native context for contested issues so you can see why a claim is attached before dropping into `explain`.
 
-`rupu autoflow monitor` is the live operator view over persisted autoflow cycle history. It shows current workers, active claims, recent reconciliation activity, and wake pressure. Use the default table output for local watching, or `rupu --format json autoflow monitor` when you want the same state for automation.
+`rupu autoflow serve` now uses that same live operator view by default when attached to a terminal, so one interactive terminal is enough for most users. Use `--quiet` when you want the old daemon-style behavior with no live dashboard. `rupu autoflow monitor` remains useful as a second read-only view or when you want the same state without starting a worker. Use `rupu --format json autoflow monitor` when you want structured output for automation.
 
 `rupu autoflow history` is the durable event stream over the same cycle records. Use it when you need to answer what happened recently, export recent run launches or retries, or isolate one issue / worker / source over time.
 
@@ -444,7 +445,8 @@ See [workflow-format.md](workflow-format.md) for the `autoflow:` and `contracts:
 
 Operator recovery loop:
 
-- `rupu autoflow monitor --repo ...` shows current workers, active claims, recent cycle activity, and wake pressure
+- `rupu autoflow serve --repo ...` shows the live issue lifecycle directly in one terminal when interactive
+- `rupu autoflow monitor --repo ...` shows the same current workers, active claims, recent cycle activity, and wake pressure as a read-only operator view
 - `rupu autoflow history --repo ...` shows the recent durable event stream, with filters for issue, source, worker, and event kind
 - `rupu autoflow wakes --repo ...` shows queued vs recently processed wakes
 - `rupu autoflow explain <issue-ref>` shows the claim, last run, selected workflow, queued wakes, and pending dispatch for one issue

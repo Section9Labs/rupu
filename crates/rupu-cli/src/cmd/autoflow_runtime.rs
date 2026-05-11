@@ -454,10 +454,22 @@ pub(crate) async fn tick_with_options(
     result
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn serve_with_resolver(
     resolver: Arc<dyn CredentialResolver>,
     options: ServeOptions,
 ) -> anyhow::Result<ServeReport> {
+    serve_with_resolver_and_hook(resolver, options, |_, _| Ok(())).await
+}
+
+pub(crate) async fn serve_with_resolver_and_hook<F>(
+    resolver: Arc<dyn CredentialResolver>,
+    options: ServeOptions,
+    mut on_cycle: F,
+) -> anyhow::Result<ServeReport>
+where
+    F: FnMut(&ServeReport, &TickReport) -> anyhow::Result<()>,
+{
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let worker = ServeWorker::acquire(
@@ -481,6 +493,7 @@ pub(crate) async fn serve_with_resolver(
         .await?;
         report.cycles += 1;
         accumulate_tick_report(&mut report.total, &tick);
+        on_cycle(&report, &tick)?;
 
         if options.max_cycles.is_some_and(|max| cycle_index >= max) {
             break;

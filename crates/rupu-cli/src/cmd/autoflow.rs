@@ -34,6 +34,7 @@ use rupu_workspace::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -79,6 +80,9 @@ pub enum Action {
         /// Idle sleep between reconciliation passes, for example `10s`.
         #[arg(long, default_value = "10s")]
         idle_sleep: String,
+        /// Suppress the live interactive serve view.
+        #[arg(long)]
+        quiet: bool,
     },
     /// Inspect queued and recently processed wakes.
     Wakes(RepoFilterArgs),
@@ -487,7 +491,17 @@ async fn handle_with_resolver(
             repo,
             worker,
             idle_sleep,
-        } => serve(repo.as_deref(), worker.as_deref(), &idle_sleep, resolver).await,
+            quiet,
+        } => {
+            serve(
+                repo.as_deref(),
+                worker.as_deref(),
+                &idle_sleep,
+                quiet,
+                resolver,
+            )
+            .await
+        }
         Action::Wakes(args) => wakes(args.repo.as_deref(), global_format).await,
         Action::Monitor {
             repo,
@@ -833,22 +847,39 @@ async fn serve(
     repo: Option<&str>,
     worker: Option<&str>,
     idle_sleep: &str,
+    quiet: bool,
     resolver: Arc<dyn CredentialResolver>,
 ) -> anyhow::Result<()> {
     let repo_filter = normalize_repo_filter(repo)?;
     let idle_sleep = parse_duration(idle_sleep)?
         .to_std()
         .map_err(|_| anyhow!("idle sleep must be non-negative"))?;
-    let report = crate::cmd::autoflow_runtime::serve_with_resolver(
+    let live_view = std::io::stdout().is_terminal() && !quiet;
+    let report = crate::cmd::autoflow_runtime::serve_with_resolver_and_hook(
         resolver,
         crate::cmd::autoflow_runtime::ServeOptions {
-            repo_filter,
+            repo_filter: repo_filter.clone(),
             worker_name: worker.map(ToOwned::to_owned),
             idle_sleep,
             max_cycles: None,
         },
+        |report, last_tick| {
+            if !live_view {
+                return Ok(());
+            }
+            render_serve_watch_frame(
+                report,
+                last_tick,
+                repo_filter.as_deref(),
+                worker,
+                idle_sleep,
+            )
+        },
     )
     .await?;
+    if live_view {
+        println!();
+    }
     println!(
         "autoflow serve stopped after {} cycle(s): ran={} skipped={} failed={} cleaned={}",
         report.cycles,
@@ -1328,6 +1359,34 @@ fn render_monitor_watch_frame(report: &AutoflowMonitorReport) -> anyhow::Result<
     );
     println!();
     render_monitor_tables(report)
+}
+
+fn render_serve_watch_frame(
+    report: &crate::cmd::autoflow_runtime::ServeReport,
+    last_tick: &crate::cmd::autoflow_runtime::TickReport,
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+    idle_sleep: std::time::Duration,
+) -> anyhow::Result<()> {
+    let monitor = build_monitor_report(repo_filter, worker_filter)?;
+    print!("\x1B[2J\x1B[H");
+    println!(
+        "rupu autoflow serve  refreshed={}  repo={}  worker={}  cycles={}  last_cycle(ran={} skipped={} failed={} polled={} webhook={})  idle_sleep={}s  Ctrl-C to stop",
+        chrono::Utc::now().to_rfc3339(),
+        repo_filter.unwrap_or("(all)"),
+        worker_filter.unwrap_or("(auto)"),
+        report.cycles,
+        last_tick.ran_cycles,
+        last_tick.skipped_cycles,
+        last_tick.failed_cycles,
+        last_tick.polled_event_count,
+        last_tick.webhook_event_count,
+        idle_sleep.as_secs_f32(),
+    );
+    println!();
+    render_monitor_tables(&monitor)?;
+    std::io::stdout().flush()?;
+    Ok(())
 }
 
 fn render_history_watch_frame(report: &AutoflowHistoryReport) -> anyhow::Result<()> {
@@ -6391,6 +6450,113 @@ steps:
             !lock_path.exists(),
             "serve lock should stay released after restart"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_hook_receives_per_cycle_reports() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        let body = github_fixture("issues_list_happy.json").replace("section9labs", "Section9Labs");
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/issues");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(body);
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  priority: 100
+  selector:
+    states: ["open"]
+    labels_all: ["bug"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.number }}"
+"#,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_capture = Arc::clone(&seen);
+        let report = crate::cmd::autoflow_runtime::serve_with_resolver_and_hook(
+            resolver,
+            crate::cmd::autoflow_runtime::ServeOptions {
+                repo_filter: Some("github:Section9Labs/rupu".into()),
+                worker_name: Some("team-mini-01".into()),
+                idle_sleep: std::time::Duration::from_millis(1),
+                max_cycles: Some(1),
+            },
+            move |report, tick| {
+                let seen_capture = Arc::clone(&seen_capture);
+                seen_capture.lock().unwrap().push((
+                    report.cycles,
+                    tick.ran_cycles,
+                    tick.failed_cycles,
+                ));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        assert_eq!(report.cycles, 1);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.as_slice(), &[(1, 1, 0)]);
     }
 
     #[tokio::test]
