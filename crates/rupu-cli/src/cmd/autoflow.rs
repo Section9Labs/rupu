@@ -230,6 +230,7 @@ struct AutoflowListRow {
     name: String,
     scope: String,
     entity: String,
+    source: String,
     priority: i32,
     repo: String,
 }
@@ -366,6 +367,7 @@ async fn list(
                 entity: match autoflow.entity {
                     rupu_orchestrator::AutoflowEntity::Issue => "issue".into(),
                 },
+                source: autoflow.source.clone().unwrap_or_else(|| "-".into()),
                 priority: autoflow.priority,
                 repo: entry.repo_ref.clone().unwrap_or_else(|| "-".into()),
             })
@@ -399,13 +401,13 @@ async fn list(
         };
     }
     println!(
-        "{:<28} {:<8} {:<8} {:<8} REPO",
-        "NAME", "SCOPE", "ENTITY", "PRIORITY"
+        "{:<28} {:<8} {:<8} {:<36} {:<8} REPO",
+        "NAME", "SCOPE", "ENTITY", "SOURCE", "PRIORITY"
     );
     for row in rows {
         println!(
-            "{:<28} {:<8} {:<8} {:<8} {}",
-            row.name, row.scope, row.entity, row.priority, row.repo
+            "{:<28} {:<8} {:<8} {:<36} {:<8} {}",
+            row.name, row.scope, row.entity, row.source, row.priority, row.repo
         );
     }
     Ok(())
@@ -457,6 +459,9 @@ async fn show(name: &str, repo: Option<&str>) -> anyhow::Result<()> {
             rupu_orchestrator::AutoflowEntity::Issue => "issue",
         }
     );
+    if let Some(source) = autoflow.source.as_deref() {
+        println!("source: {source}");
+    }
     println!(
         "workspace: {}",
         autoflow

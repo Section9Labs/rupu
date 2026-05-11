@@ -230,6 +230,8 @@ pub struct Autoflow {
     #[serde(default)]
     pub entity: AutoflowEntity,
     #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
     pub priority: i32,
     #[serde(default)]
     pub selector: AutoflowSelector,

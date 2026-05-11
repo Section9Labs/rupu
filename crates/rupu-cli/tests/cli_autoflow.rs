@@ -167,6 +167,7 @@ fn autoflow_list_shows_only_enabled_workflows() {
         r#"name: controller
 autoflow:
   enabled: true
+  source: jira:acme.atlassian.net/ENG
   priority: 100
 steps:
   - id: decide
@@ -198,6 +199,7 @@ steps:
         .stdout(predicate::str::contains("controller"))
         .stdout(predicate::str::contains("project"))
         .stdout(predicate::str::contains("issue"))
+        .stdout(predicate::str::contains("jira:acme.atlassian.net/ENG"))
         .stdout(predicate::str::contains("100"))
         .stdout(predicate::str::contains("manual-only").not());
 }
@@ -362,6 +364,7 @@ fn autoflow_show_prints_resolved_metadata_and_body() {
         r#"name: controller
 autoflow:
   enabled: true
+  source: linear:72b2a2dc-6f4f-4423-9d34-24b5bd10634a
   priority: 100
   selector:
     states: ["open"]
@@ -403,6 +406,9 @@ steps:
         .success()
         .stdout(predicate::str::contains("priority: 100"))
         .stdout(predicate::str::contains("entity: issue"))
+        .stdout(predicate::str::contains(
+            "source: linear:72b2a2dc-6f4f-4423-9d34-24b5bd10634a",
+        ))
         .stdout(predicate::str::contains("workspace: worktree"))
         .stdout(predicate::str::contains(
             "workspace branch: rupu/issue-{{ issue.number }}-{{ inputs.phase }}",
