@@ -12,17 +12,19 @@ PR, nested namespaces, rate-limit headers).
 |-------------------------------------|:------:|:------:|:------:|:----:|
 | Repos (list, get, branches)         |   ✅   |   ✅   |   —    |   —  |
 | PRs / MRs (read, comment, create)   |   ✅   |   ✅   |   —    |   —  |
-| Issues (read, comment, create, transition) | ✅ |   ✅   |  v0.3  | v0.3 |
+| Issues (read, comment, create, transition) | ✅ |   ✅   |   —    |   —  |
 | Workflow / pipeline trigger         |   ✅   |   ✅   |   —    |   —  |
 | `clone_to` (local checkout)         |   ✅   |   ✅   |   —    |   —  |
 | File read by ref                    |   ✅   |   ✅   |   —    |   —  |
 | API surface                         |  REST  |  REST  |   —    |   —  |
 
+Linear and Jira currently participate through **native trigger sources** (webhook + polling), not through the MCP `issues.*` tool surface yet.
+
 ## Auth
 
 > New project? Run `rupu init --with-samples` to seed `.rupu/agents/scm-pr-review.md` and the rest of the curated templates.
 
-`rupu auth login --provider <github|gitlab> --mode <api-key|sso>` stores tokens
+`rupu auth login --provider <github|gitlab|linear|jira> --mode <api-key|sso>` stores tokens
 in the OS keychain. Same flow as Slice B-1's LLM-provider auth; `rupu auth status`
 picks up SCM rows automatically.
 
@@ -33,6 +35,15 @@ scopes:
 |----------|-----------------------------------------------------|
 | GitHub   | `read:user`, `repo`, `workflow`, `gist`, `read:org` |
 | GitLab   | `api`, `read_user`, `read_repository`, `write_repository` |
+
+Linear and Jira currently use API-key mode only:
+
+| Platform | Current use |
+|----------|-------------|
+| Linear   | native trigger polling / webhook normalization |
+| Jira     | native trigger polling / webhook normalization |
+
+For Jira Cloud polling, store the credential as `<email>:<api_token>` in one API-key secret.
 
 ## Target syntax
 

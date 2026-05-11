@@ -1170,8 +1170,7 @@ rupu mcp serve --transport stdio
 | Workflows / pipelines |   ✅   |   ✅   |
 | Clone to local   |   ✅   |   ✅   |
 
-Linear and Jira issue trackers are designed-in but not shipped in this
-release; see [TODO.md](TODO.md) for the deferred-feature list.
+Historical note: this line was true when the plan was written. Current `main` now ships Linear and Jira as native trigger sources (webhook + polling), but tracker-native autoflow ownership remains deferred.
 ```
 
 - [ ] **Step 2: Commit**

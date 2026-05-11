@@ -375,7 +375,7 @@ Secrets are read from environment variables — never config files, never the ke
 Important current limits:
 
 - Linear polling is available for event-triggered workflows, but autoflow ownership is still repo-backed. `poll_sources = ["linear:<team-id>"]` participates in `rupu cron tick` and the event trigger path; it does not yet give autoflows a tracker-native claim/ownership model.
-- Jira native state support is currently webhook-only. `jira:<project>` polling is still future work.
+- Jira polling is available for event-triggered workflows too, but autoflow ownership is still repo-backed. `poll_sources = ["jira:<site>/<project>"]` and short `jira:<project>` sources participate in `rupu cron tick`; they do not yet give autoflows a tracker-native claim/ownership model.
 
 Bind to `127.0.0.1` and front with a TLS-terminating reverse proxy in production. rupu does not terminate TLS itself.
 
