@@ -93,6 +93,19 @@ impl Registry {
         }
 
         // Linear events.
+        match crate::connectors::linear::try_build(resolver, cfg).await {
+            Ok(Some(issues)) => {
+                reg.issue_connectors.insert(IssueTracker::Linear, issues);
+            }
+            Ok(None) => {
+                info!("linear: no credentials configured; skipping issue connector");
+            }
+            Err(e) => {
+                warn!(error = %e, "linear: issue connector build failed; skipping");
+            }
+        }
+
+        // Linear events.
         match crate::connectors::linear::events::try_build(resolver, cfg).await {
             Ok(Some(c)) => {
                 reg.tracker_event_connectors.insert(IssueTracker::Linear, c);

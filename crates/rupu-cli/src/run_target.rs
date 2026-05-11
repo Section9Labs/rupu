@@ -49,24 +49,23 @@ pub fn parse_run_target(s: &str) -> Result<RunTarget, RunTargetParseError> {
     let (platform_str, rest) = s
         .split_once(':')
         .ok_or_else(|| RunTargetParseError::BadShape(s.into()))?;
-    let platform = Platform::from_str(platform_str)
-        .map_err(|_| RunTargetParseError::UnknownPlatform(platform_str.into()))?;
 
-    // Issue form: <project>/issues/<N>
+    // Issue form: <project>/issues/<N> for any supported issue tracker.
     if let Some((project, num_part)) = rest.rsplit_once("/issues/") {
         let number: u64 = num_part
             .parse()
             .map_err(|_| RunTargetParseError::BadNumber(num_part.into()))?;
-        let tracker = match platform {
-            Platform::Github => IssueTracker::Github,
-            Platform::Gitlab => IssueTracker::Gitlab,
-        };
+        let tracker = IssueTracker::from_str(platform_str)
+            .map_err(|_| RunTargetParseError::UnknownPlatform(platform_str.into()))?;
         return Ok(RunTarget::Issue {
             tracker,
             project: project.to_string(),
             number,
         });
     }
+
+    let platform = Platform::from_str(platform_str)
+        .map_err(|_| RunTargetParseError::UnknownPlatform(platform_str.into()))?;
 
     // PR form: <path>#<N> (github) or <path>!<N> (gitlab MR)
     let (path, number_opt): (&str, Option<u32>) = if let Some((p, n)) = rest.split_once('#') {

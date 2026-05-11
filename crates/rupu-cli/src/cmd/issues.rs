@@ -359,7 +359,7 @@ pub(crate) fn resolve_issue_ref(s: &str) -> anyhow::Result<IssueRef> {
         });
     }
 
-    // Full run-target syntax — let the existing parser handle it.
+    // Full run-target syntax — accept any supported issue tracker.
     if let Ok(crate::run_target::RunTarget::Issue {
         tracker,
         project,
@@ -388,7 +388,7 @@ pub(crate) fn resolve_issue_ref(s: &str) -> anyhow::Result<IssueRef> {
     }
 
     anyhow::bail!(
-        "could not parse issue ref `{s}` — expected `<platform>:<owner>/<repo>/issues/<N>`, \
+        "could not parse issue ref `{s}` — expected `<tracker>:<project>/issues/<N>`, \
          `<owner>/<repo>#<N>`, or just `<N>` (with cwd autodetect)"
     )
 }
@@ -575,6 +575,19 @@ mod tests {
         assert_eq!(r.tracker, IssueTracker::Github);
         assert_eq!(r.project, "Section9Labs/rupu");
         assert_eq!(r.number, 42);
+    }
+
+    #[test]
+    fn resolve_issue_ref_tracker_native_form() {
+        let linear = resolve_issue_ref("linear:team-123/issues/42").unwrap();
+        assert_eq!(linear.tracker, IssueTracker::Linear);
+        assert_eq!(linear.project, "team-123");
+        assert_eq!(linear.number, 42);
+
+        let jira = resolve_issue_ref("jira:acme.atlassian.net/ENG/issues/7").unwrap();
+        assert_eq!(jira.tracker, IssueTracker::Jira);
+        assert_eq!(jira.project, "acme.atlassian.net/ENG");
+        assert_eq!(jira.number, 7);
     }
 
     #[test]
