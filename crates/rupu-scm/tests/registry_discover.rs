@@ -112,6 +112,7 @@ async fn jira_event_connector_built_when_credential_present() {
         },
     );
     let r = Registry::discover(&resolver, &cfg).await;
+    assert!(r.issues(IssueTracker::Jira).is_some());
     assert!(r
         .events_for_source(&EventSourceRef::TrackerProject {
             tracker: IssueTracker::Jira,

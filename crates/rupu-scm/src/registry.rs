@@ -116,6 +116,19 @@ impl Registry {
             }
         }
 
+        // Jira issues.
+        match crate::connectors::jira::try_build(resolver, cfg).await {
+            Ok(Some(issues)) => {
+                reg.issue_connectors.insert(IssueTracker::Jira, issues);
+            }
+            Ok(None) => {
+                info!("jira: no credentials configured; skipping issue connector");
+            }
+            Err(e) => {
+                warn!(error = %e, "jira: issue connector build failed; skipping");
+            }
+        }
+
         // Jira events.
         match crate::connectors::jira::events::try_build(resolver, cfg).await {
             Ok(Some(c)) => {
