@@ -253,6 +253,8 @@ rupu --format csv autoflow wakes --repo github:your-org/your-repo
 
 For tracker-native issues such as Linear or Jira, `rupu autoflow run` and `rupu autoflow explain` resolve the bound repo from visible autoflows. Pass `--repo` when more than one repo is bound to the same tracker source.
 
+`rupu autoflow claims` now surfaces the tracker source, tracker state, bound repo, and active branch for each claim. `rupu autoflow status` includes the same tracker-native context for contested issues so you can see why a claim is attached before dropping into `explain`.
+
 ### Inspect usage and structured reports
 
 ```sh
@@ -418,6 +420,7 @@ Operational visibility:
 
 - `rupu autoflow status` shows contested issues when more than one autoflow matches the same issue
 - `rupu autoflow claims` shows the selected workflow priority and the losing contenders, for example `*issue-supervisor-dispatch[100], phase-ready-autoflow[50]`
+- tracker-native claims include source and state context such as `linear:eng-team` / `In Review`, plus the bound repo and branch that will execute the work
 - if a higher-priority autoflow starts matching later, `rupu autoflow tick` can hand ownership to it once the old claim is idle; active or approval-paused claims stay put until they finish or are released
 
 Two useful shapes:
