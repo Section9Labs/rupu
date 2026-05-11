@@ -316,6 +316,14 @@ steps:
             "\"issue\": \"github:Section9Labs/rupu/issues/42\"",
         ))
         .stdout(predicate::str::contains("\"issue_display\": \"ENG-42\""))
+        .stdout(predicate::str::contains(
+            "\"source\": \"github:Section9Labs/rupu\"",
+        ))
+        .stdout(predicate::str::contains("\"state\": \"In Review\""))
+        .stdout(predicate::str::contains(
+            "\"repo\": \"github:Section9Labs/rupu\"",
+        ))
+        .stdout(predicate::str::contains("\"branch\": \"rupu/issue-42\""))
         .stdout(predicate::str::contains("\"workflow\": \"controller\""));
 
     Command::cargo_bin("rupu")
@@ -333,6 +341,14 @@ steps:
         .success()
         .stdout(predicate::str::contains("\"kind\": \"autoflow_status\""))
         .stdout(predicate::str::contains("\"contested\""))
+        .stdout(predicate::str::contains("\"issue_display\": \"ENG-42\""))
+        .stdout(predicate::str::contains(
+            "\"source\": \"github:Section9Labs/rupu\"",
+        ))
+        .stdout(predicate::str::contains("\"state\": \"In Review\""))
+        .stdout(predicate::str::contains(
+            "\"repo\": \"github:Section9Labs/rupu\"",
+        ))
         .stdout(predicate::str::contains("\"await_external\""));
 
     Command::cargo_bin("rupu")
@@ -1204,7 +1220,7 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::Claimed,
             worktree_path: Some("/tmp/rupu/issue-42".into()),
-            branch: None,
+            branch: Some("rupu/eng-42".into()),
             last_run_id: Some("run_123".into()),
             last_error: None,
             last_summary: Some("Draft PR opened and ready for review".into()),
@@ -1241,12 +1257,20 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
         .args(["autoflow", "claims"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("Source"))
+        .stdout(predicate::str::contains("State"))
+        .stdout(predicate::str::contains("Repo"))
+        .stdout(predicate::str::contains("Branch"))
         .stdout(predicate::str::contains("Priority"))
         .stdout(predicate::str::contains("PR"))
         .stdout(predicate::str::contains("Summary"))
         .stdout(predicate::str::contains("Contenders"))
         .stdout(predicate::str::contains("ENG-42"))
+        .stdout(predicate::str::contains("linear:eng-team"))
+        .stdout(predicate::str::contains("In Review"))
         .stdout(predicate::str::contains("controller"))
+        .stdout(predicate::str::contains("github:Section9Labs/rupu"))
+        .stdout(predicate::str::contains("rupu/eng-42"))
         .stdout(predicate::str::contains(
             "https://github.com/Section9Labs/rupu/pull/42",
         ))
@@ -1336,16 +1360,16 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
-            source_ref: None,
-            issue_display_ref: None,
-            issue_title: None,
-            issue_url: None,
-            issue_state_name: None,
-            issue_tracker: None,
+            source_ref: Some("linear:eng-team".into()),
+            issue_display_ref: Some("ENG-42".into()),
+            issue_title: Some("Tracker-native claim".into()),
+            issue_url: Some("https://linear.app/acme/issue/ENG-42".into()),
+            issue_state_name: Some("In Review".into()),
+            issue_tracker: Some("linear".into()),
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::Claimed,
             worktree_path: Some("/tmp/rupu/issue-42".into()),
-            branch: None,
+            branch: Some("rupu/eng-42".into()),
             last_run_id: Some("run_123".into()),
             last_error: None,
             last_summary: None,
@@ -1417,9 +1441,10 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
         .stdout(predicate::str::contains("claimed"))
         .stdout(predicate::str::contains("await_human"))
         .stdout(predicate::str::contains("contested issues:"))
-        .stdout(predicate::str::contains(
-            "github:Section9Labs/rupu/issues/42",
-        ))
+        .stdout(predicate::str::contains("ENG-42"))
+        .stdout(predicate::str::contains("linear:eng-team"))
+        .stdout(predicate::str::contains("In Review"))
+        .stdout(predicate::str::contains("github:Section9Labs/rupu"))
         .stdout(predicate::str::contains("*controller[100]"))
         .stdout(predicate::str::contains("phase-ready[50]"));
 }

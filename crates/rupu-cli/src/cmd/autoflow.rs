@@ -277,6 +277,15 @@ struct AutoflowStatusRow {
 #[derive(Debug, Clone, Serialize)]
 struct AutoflowContestedRow {
     issue: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue_display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    repo: String,
     contenders: String,
 }
 
@@ -293,10 +302,18 @@ struct AutoflowClaimRow {
     issue: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     issue_display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    repo: String,
     workflow: String,
     priority: String,
     status: String,
     next: String,
+    branch: String,
     pr: String,
     summary: String,
     contenders: String,
@@ -1261,6 +1278,11 @@ async fn status(
         .filter(|claim| claim.contenders.len() > 1)
         .map(|claim| AutoflowContestedRow {
             issue: claim.issue_ref.clone(),
+            issue_display: claim.issue_display_ref.clone(),
+            tracker: claim.issue_tracker.clone(),
+            state: claim.issue_state_name.clone(),
+            source: claim.source_ref.clone(),
+            repo: claim.repo_ref.clone(),
             contenders: format_contenders(&claim.contenders),
         })
         .collect::<Vec<_>>();
@@ -1278,7 +1300,7 @@ async fn status(
     if format != crate::output::formats::OutputFormat::Table {
         let report = AutoflowStatusReport {
             kind: "autoflow_status",
-            version: 1,
+            version: 2,
             rows,
             contested,
         };
@@ -1299,7 +1321,17 @@ async fn status(
     if !contested.is_empty() {
         println!("\ncontested issues:");
         for claim in contested {
-            println!("- {} -> {}", claim.issue, claim.contenders);
+            let issue = claim.issue_display.as_deref().unwrap_or(&claim.issue);
+            let source = claim
+                .source
+                .as_deref()
+                .or(claim.tracker.as_deref())
+                .unwrap_or("-");
+            let state = claim.state.as_deref().unwrap_or("-");
+            println!(
+                "- {} [{} | {} | {}] -> {}",
+                issue, source, state, claim.repo, claim.contenders
+            );
         }
     }
     Ok(())
@@ -1324,12 +1356,17 @@ async fn claims(
         .map(|claim| AutoflowClaimRow {
             issue: claim.issue_ref.clone(),
             issue_display: claim.issue_display_ref.clone(),
+            tracker: claim.issue_tracker.clone(),
+            state: claim.issue_state_name.clone(),
+            source: claim.source_ref.clone(),
+            repo: claim.repo_ref.clone(),
             workflow: claim.workflow.clone(),
             priority: selected_priority(claim)
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".into()),
             status: status_name(claim.status).into(),
             next: next_action_summary(claim),
+            branch: claim.branch.clone().unwrap_or_else(|| "-".into()),
             pr: claim.pr_url.clone().unwrap_or_else(|| "-".into()),
             summary: claim_summary(claim),
             contenders: format_contenders(&claim.contenders),
@@ -1350,7 +1387,7 @@ async fn claims(
     if format != crate::output::formats::OutputFormat::Table {
         let report = AutoflowClaimsReport {
             kind: "autoflow_claims",
-            version: 1,
+            version: 2,
             rows,
         };
         return match format {
@@ -1367,26 +1404,38 @@ async fn claims(
     let mut table = crate::output::tables::new_table();
     table.set_header(vec![
         "Issue",
+        "Source",
+        "State",
         "Workflow",
         "Priority",
         "Status",
+        "Repo",
+        "Branch",
         "Next",
         "PR",
         "Summary",
         "Contenders",
-        "Workspace",
     ]);
     for claim in rows {
         table.add_row(vec![
             Cell::new(claim.issue_display.as_deref().unwrap_or(&claim.issue)),
+            Cell::new(
+                claim
+                    .source
+                    .as_deref()
+                    .or(claim.tracker.as_deref())
+                    .unwrap_or("-"),
+            ),
+            Cell::new(claim.state.as_deref().unwrap_or("-")),
             Cell::new(claim.workflow),
             Cell::new(claim.priority),
             Cell::new(claim.status),
+            Cell::new(claim.repo),
+            Cell::new(claim.branch),
             Cell::new(claim.next),
             Cell::new(claim.pr),
             Cell::new(claim.summary),
             Cell::new(claim.contenders),
-            Cell::new(claim.workspace),
         ]);
     }
     println!("{table}");
