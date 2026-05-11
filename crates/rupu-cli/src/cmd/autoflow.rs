@@ -3594,6 +3594,7 @@ mod tests {
     use rupu_auth::StoredCredential;
     use rupu_orchestrator::{RunRecord, StepKind, StepResultRecord};
     use rupu_providers::AuthMode;
+    use rupu_runtime::{AutoflowCycleEventKind, AutoflowCycleMode, AutoflowHistoryStore};
     use std::io::Write;
 
     const COMPLETE_SCRIPT: &str = r#"
@@ -3919,6 +3920,22 @@ base_url = "{}"
         assert_eq!(claim.issue_tracker.as_deref(), Some("jira"));
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
+
+        let history_store = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
+        let recent = history_store.list_recent(5).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].mode, AutoflowCycleMode::Tick);
+        assert_eq!(recent[0].ran_cycles, 1);
+        assert!(recent[0]
+            .events
+            .iter()
+            .any(|event| event.kind == AutoflowCycleEventKind::ClaimAcquired
+                && event.issue_ref.as_deref() == Some("jira:127.0.0.1/ENG/issues/42")));
+        assert!(recent[0]
+            .events
+            .iter()
+            .any(|event| event.kind == AutoflowCycleEventKind::RunLaunched
+                && event.issue_ref.as_deref() == Some("jira:127.0.0.1/ENG/issues/42")));
     }
 
     #[tokio::test]
@@ -5558,6 +5575,25 @@ steps:
             .permission_modes
             .iter()
             .any(|value| value == "readonly"));
+
+        let history_store = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
+        let recent = history_store.list_recent(5).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].mode, AutoflowCycleMode::Serve);
+        assert_eq!(
+            recent[0].worker_id.as_deref(),
+            Some(worker_ctx.worker_id.as_str())
+        );
+        assert_eq!(recent[0].worker_name.as_deref(), Some("team-mini-01"));
+        assert_eq!(
+            recent[0].repo_filter.as_deref(),
+            Some("github:Section9Labs/rupu")
+        );
+        assert!(recent[0]
+            .events
+            .iter()
+            .any(|event| event.kind == AutoflowCycleEventKind::RunLaunched
+                && event.issue_ref.as_deref() == Some("github:Section9Labs/rupu/issues/123")));
 
         std::env::set_var("RUPU_HOME", &global);
         let restart = crate::cmd::autoflow_runtime::serve_with_resolver(

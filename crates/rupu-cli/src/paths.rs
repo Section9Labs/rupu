@@ -77,6 +77,11 @@ pub fn autoflow_wakes_dir(global: &Path) -> PathBuf {
     autoflows_dir(global).join("wakes")
 }
 
+/// Global autoflow cycle/event history root.
+pub fn autoflow_history_dir(global: &Path) -> PathBuf {
+    autoflows_dir(global).join("history")
+}
+
 /// Global queued autoflow wake-record directory.
 pub fn autoflow_wake_queue_dir(global: &Path) -> PathBuf {
     autoflow_wakes_dir(global).join("queue")

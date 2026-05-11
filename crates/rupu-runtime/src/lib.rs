@@ -1,10 +1,15 @@
 mod artifacts;
+mod autoflow_history;
 mod backend;
 mod run_envelope;
 mod wake;
 mod worker;
 
 pub use artifacts::{ArtifactKind, ArtifactManifest, ArtifactRef};
+pub use autoflow_history::{
+    AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,
+    AutoflowHistoryStore, AutoflowHistoryStoreError,
+};
 pub use backend::{ExecutionBackend, PreparedRun, RunResult, RunResultStatus};
 pub use run_envelope::{
     AutoflowEnvelope, ExecutionRequest, RepoBinding, RunContext, RunCorrelation, RunEnvelope,

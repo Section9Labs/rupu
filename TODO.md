@@ -153,6 +153,18 @@ Has its own design spec: [`docs/superpowers/specs/2026-05-09-rupu-autoflow-plan-
 - fleet-level worker scheduling, routing, and admission control
 - documented or partially automated tunnel / edge deployment recipes for `webhook serve` (for example Tailscale Funnel, Cloudflare Tunnel, ngrok)
 
+## Autoflow observability
+
+Has its own design spec: [`docs/superpowers/specs/2026-05-11-rupu-autoflow-observability-design.md`](docs/superpowers/specs/2026-05-11-rupu-autoflow-observability-design.md) and implementation plan: [`docs/superpowers/plans/2026-05-11-rupu-autoflow-observability-plan-1.md`](docs/superpowers/plans/2026-05-11-rupu-autoflow-observability-plan-1.md).
+
+**Status:** Proposed.
+
+**Planned order:**
+- durable cycle/event history for `tick` and `serve`
+- `rupu autoflow monitor`
+- `rupu autoflow history`
+- `explain` / `claims` / `watch` handoff polish
+
 ## Gemini API-key support via AI Studio ✅ shipped
 
 Added `GeminiVariant::AiStudio` to the existing `GoogleGeminiClient` (rather than a separate `GoogleGeminiAiStudioClient`) so the OAuth and api-key paths share the body builder + response parser. Variant-specific branches handle the different URL pattern (`v1beta/models/{model}:generateContent`), `x-goog-api-key` header, request-body shape (no Cloud Code Assist `project` / `requestId` wrapping), and skipped token refresh. Wired through `provider_factory::build_gemini` so `rupu auth login --provider gemini --mode api-key --key AIzaSy...` followed by `rupu run --provider gemini ...` works end-to-end.
