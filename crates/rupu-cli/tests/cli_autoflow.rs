@@ -236,6 +236,12 @@ steps:
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: issue_ref.into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: Some("github:Section9Labs/rupu".into()),
+            issue_display_ref: Some("ENG-42".into()),
+            issue_title: Some("Tracker-native claim".into()),
+            issue_url: Some("https://linear.app/acme/issue/ENG-42".into()),
+            issue_state_name: Some("In Review".into()),
+            issue_tracker: Some("linear".into()),
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::AwaitExternal,
             worktree_path: Some("/tmp/rupu/issue-42".into()),
@@ -309,6 +315,7 @@ steps:
         .stdout(predicate::str::contains(
             "\"issue\": \"github:Section9Labs/rupu/issues/42\"",
         ))
+        .stdout(predicate::str::contains("\"issue_display\": \"ENG-42\""))
         .stdout(predicate::str::contains("\"workflow\": \"controller\""));
 
     Command::cargo_bin("rupu")
@@ -984,6 +991,12 @@ steps:
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::AwaitExternal,
             worktree_path: Some("/tmp/rupu/issue-42".into()),
@@ -1050,6 +1063,12 @@ steps:
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::Blocked,
             worktree_path: Some("/tmp/rupu/issue-42".into()),
@@ -1122,6 +1141,12 @@ async fn autoflow_release_deletes_claim() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: issue_ref.into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "auto-wf".into(),
             status: rupu_workspace::ClaimStatus::Claimed,
             worktree_path: Some(worktree.path.display().to_string()),
@@ -1170,6 +1195,12 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: issue_ref.into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: Some("linear:eng-team".into()),
+            issue_display_ref: Some("ENG-42".into()),
+            issue_title: Some("Tracker-native claim".into()),
+            issue_url: Some("https://linear.app/acme/issue/ENG-42".into()),
+            issue_state_name: Some("In Review".into()),
+            issue_tracker: Some("linear".into()),
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::Claimed,
             worktree_path: Some("/tmp/rupu/issue-42".into()),
@@ -1214,6 +1245,7 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
         .stdout(predicate::str::contains("PR"))
         .stdout(predicate::str::contains("Summary"))
         .stdout(predicate::str::contains("Contenders"))
+        .stdout(predicate::str::contains("ENG-42"))
         .stdout(predicate::str::contains("controller"))
         .stdout(predicate::str::contains(
             "https://github.com/Section9Labs/rupu/pull/42",
@@ -1248,6 +1280,12 @@ fn autoflow_claims_filters_to_one_repo() {
             .save(&rupu_workspace::AutoflowClaimRecord {
                 issue_ref: issue_ref.into(),
                 repo_ref: repo_ref.into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "controller".into(),
                 status: rupu_workspace::ClaimStatus::Claimed,
                 worktree_path: Some("/tmp/rupu/issue".into()),
@@ -1298,6 +1336,12 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::Claimed,
             worktree_path: Some("/tmp/rupu/issue-42".into()),
@@ -1333,6 +1377,12 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/43".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::AwaitHuman,
             worktree_path: Some("/tmp/rupu/issue-43".into()),
@@ -1387,6 +1437,12 @@ fn autoflow_status_filters_to_one_repo() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::Claimed,
             worktree_path: Some("/tmp/rupu/issue-42".into()),
@@ -1409,6 +1465,12 @@ fn autoflow_status_filters_to_one_repo() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/okegu/issues/9".into(),
             repo_ref: "github:Section9Labs/okegu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "controller".into(),
             status: rupu_workspace::ClaimStatus::AwaitHuman,
             worktree_path: Some("/tmp/rupu/issue-9".into()),
@@ -1517,6 +1579,12 @@ fn autoflow_explain_prints_claim_run_and_wake_context() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: issue_ref.into(),
             repo_ref: repo_ref.into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "issue-supervisor-dispatch".into(),
             status: rupu_workspace::ClaimStatus::AwaitHuman,
             worktree_path: Some("/tmp/rupu/issue-42".into()),
@@ -1579,6 +1647,68 @@ fn autoflow_explain_prints_claim_run_and_wake_context() {
 }
 
 #[test]
+fn autoflow_explain_supports_tracker_native_issue_refs() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let claim_store = rupu_workspace::AutoflowClaimStore {
+        root: home.join("autoflows/claims"),
+    };
+    let issue_ref = "linear:eng-team/issues/42";
+    claim_store
+        .save(&rupu_workspace::AutoflowClaimRecord {
+            issue_ref: issue_ref.into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: Some("linear:eng-team".into()),
+            issue_display_ref: Some("ENG-42".into()),
+            issue_title: Some("Tracker-native claim".into()),
+            issue_url: Some("https://linear.app/acme/issue/ENG-42".into()),
+            issue_state_name: Some("In Progress".into()),
+            issue_tracker: Some("linear".into()),
+            workflow: "tracker-controller".into(),
+            status: rupu_workspace::ClaimStatus::AwaitExternal,
+            worktree_path: Some("/tmp/rupu/eng-42".into()),
+            branch: Some("rupu/eng-42".into()),
+            last_run_id: None,
+            last_error: None,
+            last_summary: Some("waiting for tracker transition".into()),
+            pr_url: None,
+            artifacts: None,
+            artifact_manifest_path: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![rupu_workspace::AutoflowContender {
+                workflow: "tracker-controller".into(),
+                priority: 100,
+                scope: Some("source".into()),
+                selected: true,
+            }],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["autoflow", "explain", issue_ref])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("issue: linear:eng-team/issues/42"))
+        .stdout(predicate::str::contains("repo: github:Section9Labs/rupu"))
+        .stdout(predicate::str::contains("issue display: ENG-42"))
+        .stdout(predicate::str::contains("issue tracker: linear"))
+        .stdout(predicate::str::contains("issue state: In Progress"))
+        .stdout(predicate::str::contains("source: linear:eng-team"))
+        .stdout(predicate::str::contains(
+            "issue url: https://linear.app/acme/issue/ENG-42",
+        ))
+        .stdout(predicate::str::contains("workflow: tracker-controller"));
+}
+
+#[test]
 fn autoflow_doctor_reports_state_problems() {
     let _guard = ENV_LOCK.blocking_lock();
 
@@ -1605,6 +1735,12 @@ fn autoflow_doctor_reports_state_problems() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: issue_ref.into(),
             repo_ref: repo_ref.into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "issue-supervisor-dispatch".into(),
             status: rupu_workspace::ClaimStatus::Claimed,
             worktree_path: Some("/tmp/does-not-exist".into()),
@@ -1697,6 +1833,12 @@ fn autoflow_repair_rebuilds_worktree_and_drops_invalid_wake() {
         .save(&rupu_workspace::AutoflowClaimRecord {
             issue_ref: issue_ref.into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "issue-supervisor-dispatch".into(),
             status: rupu_workspace::ClaimStatus::Claimed,
             worktree_path: Some(expected_worktree.display().to_string()),

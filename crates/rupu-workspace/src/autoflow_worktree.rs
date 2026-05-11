@@ -193,6 +193,13 @@ mod tests {
             .status()
             .unwrap()
             .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["config", "commit.gpgsign", "false"])
+            .status()
+            .unwrap()
+            .success());
         std::fs::write(path.join("README.md"), "hello\n").unwrap();
         assert!(Command::new("git")
             .arg("-C")

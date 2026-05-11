@@ -2,7 +2,7 @@
 
 use super::autoflow_wake::wake_requests_from_polled_event;
 use crate::cmd::completers::workflow_names;
-use crate::cmd::issues::canonical_issue_ref;
+use crate::cmd::issues::canonical_issue_ref as canonical_repo_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::workflow::{
     locate_workflow_in, run_with_explicit_context, ExecutionWorkerContext,
@@ -283,6 +283,8 @@ struct AutoflowStatusReport {
 #[derive(Debug, Clone, Serialize)]
 struct AutoflowClaimRow {
     issue: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue_display: Option<String>,
     workflow: String,
     priority: String,
     status: String,
@@ -542,7 +544,7 @@ async fn run(
     resolver: Arc<dyn CredentialResolver>,
 ) -> anyhow::Result<()> {
     let issue_ref = parse_full_issue_target(target)?;
-    let issue_ref_text = canonical_issue_ref(target)?;
+    let issue_ref_text = canonical_autoflow_issue_ref(target)?;
     let repo_ref = issue_repo_ref(&issue_ref);
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -762,7 +764,7 @@ async fn wakes(
 }
 
 async fn explain(r#ref: &str) -> anyhow::Result<()> {
-    let issue_ref = canonical_issue_ref(r#ref)?;
+    let issue_ref = canonical_autoflow_issue_ref(r#ref)?;
     let global = paths::global_dir()?;
     let claim_store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
@@ -789,6 +791,24 @@ async fn explain(r#ref: &str) -> anyhow::Result<()> {
     println!("repo: {repo_ref}");
     match claim {
         Some(claim) => {
+            if let Some(display_ref) = claim.issue_display_ref.as_deref() {
+                println!("issue display: {display_ref}");
+            }
+            if let Some(title) = claim.issue_title.as_deref() {
+                println!("issue title: {title}");
+            }
+            if let Some(tracker) = claim.issue_tracker.as_deref() {
+                println!("issue tracker: {tracker}");
+            }
+            if let Some(state_name) = claim.issue_state_name.as_deref() {
+                println!("issue state: {state_name}");
+            }
+            if let Some(source_ref) = claim.source_ref.as_deref() {
+                println!("source: {source_ref}");
+            }
+            if let Some(issue_url) = claim.issue_url.as_deref() {
+                println!("issue url: {issue_url}");
+            }
             println!("workflow: {}", claim.workflow);
             println!("status: {}", status_name(claim.status));
             println!(
@@ -1062,7 +1082,7 @@ async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::
         bail!("repair accepts at most one of `--release` or `--requeue`");
     }
 
-    let issue_ref = canonical_issue_ref(r#ref)?;
+    let issue_ref = canonical_autoflow_issue_ref(r#ref)?;
     let global = paths::global_dir()?;
     let repo_store = RepoRegistryStore {
         root: paths::repos_dir(&global),
@@ -1147,7 +1167,7 @@ async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::
 }
 
 async fn requeue(r#ref: &str, event: Option<&str>, not_before: Option<&str>) -> anyhow::Result<()> {
-    let issue_ref = canonical_issue_ref(r#ref)?;
+    let issue_ref = canonical_autoflow_issue_ref(r#ref)?;
     let global = paths::global_dir()?;
     let claim_store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
@@ -1270,6 +1290,7 @@ async fn claims(
         .iter()
         .map(|claim| AutoflowClaimRow {
             issue: claim.issue_ref.clone(),
+            issue_display: claim.issue_display_ref.clone(),
             workflow: claim.workflow.clone(),
             priority: selected_priority(claim)
                 .map(|value| value.to_string())
@@ -1324,7 +1345,7 @@ async fn claims(
     ]);
     for claim in rows {
         table.add_row(vec![
-            Cell::new(claim.issue),
+            Cell::new(claim.issue_display.as_deref().unwrap_or(&claim.issue)),
             Cell::new(claim.workflow),
             Cell::new(claim.priority),
             Cell::new(claim.status),
@@ -1340,7 +1361,7 @@ async fn claims(
 }
 
 async fn release(r#ref: &str) -> anyhow::Result<()> {
-    let issue_ref = canonical_issue_ref(r#ref)?;
+    let issue_ref = canonical_autoflow_issue_ref(r#ref)?;
     let global = paths::global_dir()?;
     let repo_store = RepoRegistryStore {
         root: paths::repos_dir(&global),
@@ -1451,9 +1472,28 @@ fn wake_source_name(source: WakeSource) -> &'static str {
     }
 }
 
+fn canonical_autoflow_issue_ref(value: &str) -> anyhow::Result<String> {
+    if let Ok(issue) = parse_issue_ref_text(value) {
+        return Ok(format!(
+            "{}:{}/issues/{}",
+            issue.tracker.as_str(),
+            issue.project,
+            issue.number
+        ));
+    }
+    canonical_repo_issue_ref(value)
+}
+
 fn issue_ref_to_repo_ref(issue_ref: &str) -> anyhow::Result<String> {
     let issue = parse_issue_ref_text(issue_ref)?;
-    Ok(format!("{}:{}", issue.tracker, issue.project))
+    match issue.tracker {
+        IssueTracker::Github | IssueTracker::Gitlab => {
+            Ok(format!("{}:{}", issue.tracker, issue.project))
+        }
+        IssueTracker::Linear | IssueTracker::Jira => Err(anyhow!(
+            "tracker issue `{issue_ref}` does not imply a repo binding"
+        )),
+    }
 }
 
 fn format_inputs(inputs: &BTreeMap<String, String>) -> String {
@@ -2110,6 +2150,12 @@ pub(crate) async fn execute_autoflow_cycle(
         .unwrap_or(AutoflowClaimRecord {
             issue_ref: issue_ref_text.to_string(),
             repo_ref: resolved.repo_ref.clone(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: resolved.workflow.name.clone(),
             status: ClaimStatus::Claimed,
             worktree_path: None,
@@ -2127,6 +2173,19 @@ pub(crate) async fn execute_autoflow_cycle(
             contenders: vec![],
             updated_at: chrono::Utc::now().to_rfc3339(),
         });
+    claim.source_ref = Some(
+        autoflow
+            .source
+            .clone()
+            .unwrap_or_else(|| resolved.repo_ref.clone()),
+    );
+    claim.issue_display_ref = Some(issue.r.number.to_string());
+    claim.issue_title = Some(issue.title.clone());
+    claim.issue_state_name = Some(match issue.state {
+        IssueState::Open => "open".into(),
+        IssueState::Closed => "closed".into(),
+    });
+    claim.issue_tracker = Some(issue.r.tracker.as_str().to_string());
     claim.workflow = resolved.workflow.name.clone();
     claim.status = ClaimStatus::Running;
     claim.worktree_path = Some(workspace_path.display().to_string());
@@ -2340,7 +2399,7 @@ fn apply_terminal_run_to_claim(
     claim.pending_dispatch = None;
 
     if let Some(dispatch) = outcome.dispatch {
-        let target = canonical_issue_ref(&dispatch.target)?;
+        let target = canonical_autoflow_issue_ref(&dispatch.target)?;
         if target != claim.issue_ref {
             bail!(
                 "autoflow dispatch target `{}` does not match claimed issue `{}`",
@@ -3318,6 +3377,32 @@ base_url = "{base_url}"
     }
 
     #[test]
+    fn issue_ref_to_repo_ref_rejects_tracker_native_refs() {
+        assert_eq!(
+            issue_ref_to_repo_ref("github:Section9Labs/rupu/issues/42").unwrap(),
+            "github:Section9Labs/rupu"
+        );
+        assert!(issue_ref_to_repo_ref("linear:team-123/issues/42").is_err());
+        assert!(issue_ref_to_repo_ref("jira:acme.atlassian.net/ENG/issues/42").is_err());
+    }
+
+    #[test]
+    fn canonical_autoflow_issue_ref_accepts_tracker_native_refs() {
+        assert_eq!(
+            canonical_autoflow_issue_ref("linear:team-123/issues/42").unwrap(),
+            "linear:team-123/issues/42"
+        );
+        assert_eq!(
+            canonical_autoflow_issue_ref("jira:acme.atlassian.net/ENG/issues/42").unwrap(),
+            "jira:acme.atlassian.net/ENG/issues/42"
+        );
+        assert_eq!(
+            canonical_autoflow_issue_ref("github:Section9Labs/rupu/issues/42").unwrap(),
+            "github:Section9Labs/rupu/issues/42"
+        );
+    }
+
+    #[test]
     fn github_issue_polled_event_maps_to_issue_ref() {
         let repo = rupu_scm::RepoRef {
             platform: rupu_scm::Platform::Github,
@@ -3395,6 +3480,12 @@ steps:
         let claim = AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "issue-supervisor-dispatch".into(),
             status: ClaimStatus::AwaitExternal,
             worktree_path: None,
@@ -3485,6 +3576,12 @@ steps:
         let claim = AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "issue-supervisor-dispatch".into(),
             status: ClaimStatus::Complete,
             worktree_path: None,
@@ -3580,6 +3677,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: issue_ref.into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "controller".into(),
                 status: ClaimStatus::AwaitExternal,
                 worktree_path: None,
@@ -3618,6 +3721,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: issue_ref.into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "controller".into(),
                 status: ClaimStatus::AwaitExternal,
                 worktree_path: None,
@@ -3651,6 +3760,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: issue_ref.into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "controller".into(),
                 status: ClaimStatus::Blocked,
                 worktree_path: None,
@@ -3720,6 +3835,12 @@ steps:
         let mut claim = AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "issue-supervisor-dispatch".into(),
             status: ClaimStatus::AwaitExternal,
             worktree_path: None,
@@ -3905,6 +4026,12 @@ steps:
         let mut claim = AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "controller".into(),
             status: ClaimStatus::Running,
             worktree_path: None,
@@ -4010,6 +4137,12 @@ steps:
         let mut claim = AutoflowClaimRecord {
             issue_ref: "github:Section9Labs/rupu/issues/42".into(),
             repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
             workflow: "controller".into(),
             status: ClaimStatus::AwaitHuman,
             worktree_path: None,
@@ -4141,6 +4274,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: "github:Section9Labs/rupu/issues/123".into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "issue-supervisor-dispatch".into(),
                 status: ClaimStatus::AwaitHuman,
                 worktree_path: Some(project.display().to_string()),
@@ -4313,6 +4452,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: "github:Section9Labs/rupu/issues/123".into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "issue-supervisor-dispatch".into(),
                 status: ClaimStatus::AwaitHuman,
                 worktree_path: Some(project.display().to_string()),
@@ -4476,6 +4621,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: issue_ref.into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "issue-supervisor-dispatch".into(),
                 status: ClaimStatus::Claimed,
                 worktree_path: Some(project.display().to_string()),
@@ -5190,6 +5341,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: "github:Section9Labs/rupu/issues/123".into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "issue-supervisor-dispatch".into(),
                 status: ClaimStatus::AwaitExternal,
                 worktree_path: Some(project.display().to_string()),
@@ -5364,6 +5521,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: "github:Section9Labs/rupu/issues/123".into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "issue-supervisor-dispatch".into(),
                 status: ClaimStatus::AwaitExternal,
                 worktree_path: Some(project.display().to_string()),
@@ -5512,6 +5675,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: "github:Section9Labs/rupu/issues/123".into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "issue-supervisor-dispatch".into(),
                 status: ClaimStatus::AwaitExternal,
                 worktree_path: Some(project.display().to_string()),
@@ -5625,6 +5794,12 @@ steps:
             .save(&AutoflowClaimRecord {
                 issue_ref: issue_ref.into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "issue-supervisor-dispatch".into(),
                 status: ClaimStatus::Complete,
                 worktree_path: Some(worktree.path.display().to_string()),
@@ -5877,6 +6052,12 @@ base_url = "{}"
             .save(&AutoflowClaimRecord {
                 issue_ref: "github:Section9Labs/rupu/issues/123".into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "issue-supervisor-dispatch".into(),
                 status: ClaimStatus::Complete,
                 worktree_path: Some(project.display().to_string()),
@@ -6041,6 +6222,12 @@ base_url = "{}"
             .save(&AutoflowClaimRecord {
                 issue_ref: "github:Section9Labs/rupu/issues/123".into(),
                 repo_ref: "github:Section9Labs/rupu".into(),
+                source_ref: None,
+                issue_display_ref: None,
+                issue_title: None,
+                issue_url: None,
+                issue_state_name: None,
+                issue_tracker: None,
                 workflow: "issue-supervisor-dispatch".into(),
                 status: ClaimStatus::AwaitExternal,
                 worktree_path: Some(project.display().to_string()),
