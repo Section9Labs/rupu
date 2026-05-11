@@ -58,6 +58,9 @@ pub enum Action {
         /// Issue target in full run-target form:
         /// `github:owner/repo/issues/42` or `gitlab:group/project/issues/9`.
         target: String,
+        /// Limit resolution to one bound repo.
+        #[arg(long)]
+        repo: Option<String>,
         /// Override permission mode (`bypass` | `readonly`).
         #[arg(long)]
         mode: Option<String>,
@@ -79,7 +82,12 @@ pub enum Action {
     /// Inspect queued and recently processed wakes.
     Wakes(RepoFilterArgs),
     /// Explain the current autonomous state for one issue.
-    Explain { r#ref: String },
+    Explain {
+        r#ref: String,
+        /// Limit resolution to one bound repo.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Run consistency checks across claims, wakes, and runs.
     Doctor(RepoFilterArgs),
     /// Apply safe, bounded remediation to one issue claim.
@@ -322,7 +330,12 @@ async fn handle_with_resolver(
     match action {
         Action::List(args) => list(args.repo.as_deref(), global_format).await,
         Action::Show { name, repo } => show(&name, repo.as_deref()).await,
-        Action::Run { name, target, mode } => run(&name, &target, mode.as_deref(), resolver).await,
+        Action::Run {
+            name,
+            target,
+            repo,
+            mode,
+        } => run(&name, &target, repo.as_deref(), mode.as_deref(), resolver).await,
         Action::Tick => tick_with_resolver(resolver).await,
         Action::Serve {
             repo,
@@ -330,7 +343,7 @@ async fn handle_with_resolver(
             idle_sleep,
         } => serve(repo.as_deref(), worker.as_deref(), &idle_sleep, resolver).await,
         Action::Wakes(args) => wakes(args.repo.as_deref(), global_format).await,
-        Action::Explain { r#ref } => explain(&r#ref).await,
+        Action::Explain { r#ref, repo } => explain(&r#ref, repo.as_deref()).await,
         Action::Doctor(args) => doctor(args.repo.as_deref()).await,
         Action::Repair {
             r#ref,
@@ -540,25 +553,23 @@ async fn show(name: &str, repo: Option<&str>) -> anyhow::Result<()> {
 async fn run(
     name: &str,
     target: &str,
+    repo: Option<&str>,
     mode: Option<&str>,
     resolver: Arc<dyn CredentialResolver>,
 ) -> anyhow::Result<()> {
     let issue_ref = parse_full_issue_target(target)?;
-    let issue_ref_text = canonical_autoflow_issue_ref(target)?;
-    let repo_ref = issue_repo_ref(&issue_ref);
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
-    let repo_store = RepoRegistryStore {
-        root: paths::repos_dir(&global),
-    };
-    let resolved = resolve_autoflow_workflow_for_repo(&global, &repo_store, &repo_ref, name)?;
+    let resolved = resolve_autoflow_workflow_for_issue(&global, name, &issue_ref, repo)?;
     let _ =
         resolve_autoflow_permission_mode(mode, resolved.cfg.autoflow.permission_mode.as_deref())?;
     let claim_store = AutoflowClaimStore {
         root: paths::autoflow_claims_dir(&global),
     };
+    let fetch_ref = issue_ref_for_autoflow(&issue_ref, &resolved)?;
+    let issue = fetch_issue(&resolved.cfg, resolver.as_ref(), &fetch_ref).await?;
+    let issue_ref_text = format_issue_ref(&issue.r);
     ensure_manual_run_can_take_claim(&claim_store, &issue_ref_text)?;
-    let issue = fetch_issue(&resolved.cfg, resolver.as_ref(), &issue_ref).await?;
     execute_autoflow_cycle(
         &global,
         &claim_store,
@@ -763,7 +774,7 @@ async fn wakes(
     Ok(())
 }
 
-async fn explain(r#ref: &str) -> anyhow::Result<()> {
+async fn explain(r#ref: &str, repo: Option<&str>) -> anyhow::Result<()> {
     let issue_ref = canonical_autoflow_issue_ref(r#ref)?;
     let global = paths::global_dir()?;
     let claim_store = AutoflowClaimStore {
@@ -772,10 +783,15 @@ async fn explain(r#ref: &str) -> anyhow::Result<()> {
     let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
     let run_store = RunStore::new(global.join("runs"));
     let claim = claim_store.load(&issue_ref)?;
+    let issue_ref_parsed = parse_issue_ref_text(&issue_ref)?;
+    let source_matches = if claim.is_none() {
+        visible_autoflow_matches_for_issue(&issue_ref_parsed, repo)?
+    } else {
+        Vec::new()
+    };
     let repo_ref = match claim.as_ref() {
         Some(claim) => claim.repo_ref.clone(),
-        None => issue_ref_to_repo_ref(&issue_ref)
-            .map_err(|error| anyhow!("resolve repo ref for `{issue_ref}`: {error}"))?,
+        None => resolve_repo_binding_for_issue(&issue_ref_parsed, repo)?,
     };
     let queued = wakes_for_issue(
         filter_wakes_by_repo(wake_store.list_queued()?, Some(&repo_ref)),
@@ -893,6 +909,23 @@ async fn explain(r#ref: &str) -> anyhow::Result<()> {
         }
         None => {
             println!("status: unclaimed");
+            if let Some(source) = source_matches
+                .first()
+                .and_then(|entry| entry.autoflow().ok())
+                .and_then(|autoflow| autoflow.source.as_deref())
+            {
+                println!("source: {source}");
+            }
+            if !source_matches.is_empty() {
+                println!(
+                    "candidate workflows: {}",
+                    source_matches
+                        .iter()
+                        .map(|entry| entry.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         }
     }
 
@@ -1396,6 +1429,130 @@ fn visible_autoflow_matches(
             .then_with(|| left.workflow_path.cmp(&right.workflow_path))
     });
     Ok(entries)
+}
+
+fn visible_autoflow_matches_for_issue(
+    issue_ref: &IssueRef,
+    repo: Option<&str>,
+) -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
+    let repo_filter = normalize_repo_filter(repo)?;
+    let mut entries = visible_autoflows()?
+        .into_iter()
+        .filter(|entry| issue_matches_visible_source(issue_ref, entry))
+        .collect::<Vec<_>>();
+    entries = filter_visible_autoflows(entries, repo_filter.as_deref());
+    entries.sort_by(|left, right| {
+        left.repo_ref
+            .cmp(&right.repo_ref)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.scope.cmp(&right.scope))
+            .then_with(|| left.workflow_path.cmp(&right.workflow_path))
+    });
+    Ok(entries)
+}
+
+fn issue_matches_visible_source(issue_ref: &IssueRef, entry: &VisibleAutoflowWorkflow) -> bool {
+    let Ok(autoflow) = entry.autoflow() else {
+        return false;
+    };
+    if let Some(source) = autoflow.source.as_deref() {
+        return source_matches_issue_ref(source, issue_ref);
+    }
+    entry
+        .repo_ref
+        .as_deref()
+        .is_some_and(|repo_ref| repo_ref_matches_issue_ref(repo_ref, issue_ref))
+}
+
+fn source_matches_issue_ref(source: &str, issue_ref: &IssueRef) -> bool {
+    let Ok(source_ref) = source.parse::<EventSourceRef>() else {
+        return false;
+    };
+    match source_ref {
+        EventSourceRef::Repo { repo } => match issue_ref.tracker {
+            IssueTracker::Github => {
+                repo.platform == Platform::Github
+                    && issue_ref.project == format!("{}/{}", repo.owner, repo.repo)
+            }
+            IssueTracker::Gitlab => {
+                repo.platform == Platform::Gitlab
+                    && issue_ref.project == format!("{}/{}", repo.owner, repo.repo)
+            }
+            IssueTracker::Linear | IssueTracker::Jira => false,
+        },
+        EventSourceRef::TrackerProject { tracker, project } => {
+            tracker == issue_ref.tracker
+                && match tracker {
+                    IssueTracker::Jira => {
+                        project == issue_ref.project
+                            || (!project.contains('/')
+                                && issue_ref
+                                    .project
+                                    .rsplit('/')
+                                    .next()
+                                    .is_some_and(|suffix| suffix == project))
+                    }
+                    IssueTracker::Github | IssueTracker::Gitlab | IssueTracker::Linear => {
+                        project == issue_ref.project
+                    }
+                }
+        }
+    }
+}
+
+fn repo_ref_matches_issue_ref(repo_ref: &str, issue_ref: &IssueRef) -> bool {
+    issue_ref_to_repo_ref(&format_issue_ref(issue_ref))
+        .map(|expected| expected == repo_ref)
+        .unwrap_or(false)
+}
+
+fn resolve_repo_binding_for_issue(
+    issue_ref: &IssueRef,
+    repo: Option<&str>,
+) -> anyhow::Result<String> {
+    let issue_ref_text = format_issue_ref(issue_ref);
+    if let Some(repo) = normalize_repo_filter(repo)? {
+        return Ok(repo);
+    }
+    if let Ok(repo_ref) = issue_ref_to_repo_ref(&issue_ref_text) {
+        return Ok(repo_ref);
+    }
+    let matches = visible_autoflow_matches_for_issue(issue_ref, None)?;
+    let repos = matches
+        .iter()
+        .filter_map(|entry| entry.repo_ref.clone())
+        .collect::<BTreeSet<_>>();
+    match repos.len() {
+        0 => bail!("no visible autoflow is bound to tracker issue `{issue_ref_text}`"),
+        1 => Ok(repos.into_iter().next().expect("one repo binding")),
+        _ => bail!(
+            "multiple repo bindings are visible for tracker issue `{issue_ref_text}`: {}\npass `--repo <platform>:<owner>/<repo>` to disambiguate",
+            repos.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+fn issue_ref_for_autoflow(
+    issue_ref: &IssueRef,
+    resolved: &ResolvedAutoflowWorkflow,
+) -> anyhow::Result<IssueRef> {
+    let autoflow = resolved.autoflow()?;
+    let Some(source) = autoflow.source.as_deref() else {
+        return Ok(issue_ref.clone());
+    };
+    if issue_ref.tracker != IssueTracker::Jira || !source_matches_issue_ref(source, issue_ref) {
+        return Ok(issue_ref.clone());
+    }
+    let Ok(EventSourceRef::TrackerProject { tracker, project }) = source.parse::<EventSourceRef>()
+    else {
+        return Ok(issue_ref.clone());
+    };
+    if tracker != IssueTracker::Jira {
+        return Ok(issue_ref.clone());
+    }
+    let mut adjusted = issue_ref.clone();
+    adjusted.project = project;
+    Ok(adjusted)
 }
 
 fn normalize_repo_filter(repo: Option<&str>) -> anyhow::Result<Option<String>> {
@@ -2730,6 +2887,75 @@ pub(crate) fn resolve_autoflow_workflow_for_repo(
     )
 }
 
+fn resolve_autoflow_workflow_for_issue(
+    global: &Path,
+    name: &str,
+    issue_ref: &IssueRef,
+    repo: Option<&str>,
+) -> anyhow::Result<ResolvedAutoflowWorkflow> {
+    let matches = visible_autoflow_matches_for_issue(issue_ref, repo)?
+        .into_iter()
+        .filter(|entry| entry.name == name)
+        .collect::<Vec<_>>();
+    let entry = match matches.as_slice() {
+        [] => {
+            let issue_ref_text = format_issue_ref(issue_ref);
+            match repo {
+                Some(repo) => bail!(
+                    "no autoflow named `{name}` is visible for issue `{issue_ref_text}` and repo `{repo}`"
+                ),
+                None => bail!("no autoflow named `{name}` is visible for issue `{issue_ref_text}`"),
+            }
+        }
+        [entry] => entry.clone(),
+        many => {
+            let mut options = many
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "- {} ({}, {})",
+                        entry.repo_ref.as_deref().unwrap_or("-"),
+                        entry.scope,
+                        entry.workflow_path.display()
+                    )
+                })
+                .collect::<Vec<_>>();
+            options.sort();
+            bail!(
+                "multiple autoflows named `{name}` are visible for issue `{}`:\n{}\npass `--repo <platform>:<owner>/<repo>` to disambiguate",
+                format_issue_ref(issue_ref),
+                options.join("\n")
+            );
+        }
+    };
+    resolve_visible_autoflow_workflow(global, &entry)
+}
+
+fn resolve_visible_autoflow_workflow(
+    global: &Path,
+    entry: &VisibleAutoflowWorkflow,
+) -> anyhow::Result<ResolvedAutoflowWorkflow> {
+    let repo_ref = entry
+        .repo_ref
+        .clone()
+        .ok_or_else(|| anyhow!("autoflow `{}` is missing a repo binding", entry.name))?;
+    let preferred_checkout = entry
+        .preferred_checkout
+        .clone()
+        .or_else(|| entry.project_root.clone())
+        .ok_or_else(|| anyhow!("autoflow `{}` is missing a preferred checkout", entry.name))?;
+    let cfg = resolve_config(global, entry.project_root.as_deref())?;
+    resolve_autoflow_from_path(
+        global,
+        entry.workflow_path.clone(),
+        entry.scope.clone(),
+        entry.project_root.clone(),
+        repo_ref,
+        preferred_checkout,
+        cfg,
+    )
+}
+
 fn resolve_autoflow_from_path(
     _global: &Path,
     workflow_path: PathBuf,
@@ -2986,9 +3212,9 @@ fn parse_full_issue_target(target: &str) -> anyhow::Result<IssueRef> {
             project,
             number,
         }),
-        _ => bail!(
-            "autoflow run requires an issue target in `<platform>:<owner>/<repo>/issues/<N>` form"
-        ),
+        _ => {
+            bail!("autoflow run requires an issue target in `<platform>:<project>/issues/<N>` form")
+        }
     }
 }
 
@@ -3154,10 +3380,6 @@ fn issue_url(cfg: &Config, issue: &Issue) -> Option<String> {
         }
         IssueTracker::Gitlab | IssueTracker::Linear => None,
     }
-}
-
-fn issue_repo_ref(issue_ref: &IssueRef) -> String {
-    format!("{}:{}", issue_ref.tracker, issue_ref.project)
 }
 
 fn resolve_workspace_strategy(
@@ -3648,6 +3870,115 @@ base_url = "{}"
         assert_eq!(claim.issue_tracker.as_deref(), Some("jira"));
         assert_eq!(claim.status, ClaimStatus::Complete);
         assert!(claim.last_run_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn manual_run_resolves_tracker_native_issue_from_visible_source() {
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        let server = MockServer::start_async().await;
+        let original_cwd = std::env::current_dir().unwrap();
+        init_git_repo(&project);
+
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/rest/api/3/issue/ENG-42")
+                .header_exists("authorization");
+            then.status(200)
+                .json_body(jira_issue_response("ENG-42", "indeterminate", &["bug"]));
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "issue-supervisor-dispatch",
+            r#"name: issue-supervisor-dispatch
+autoflow:
+  enabled: true
+  source: jira:ENG
+  priority: 100
+  selector:
+    states: ["open"]
+  claim:
+    ttl: "3h"
+  workspace:
+    strategy: worktree
+    branch: "rupu/issue-{{ issue.number }}"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "issue={{ issue.ref }} source={{ issue.tracker }}"
+"#,
+        );
+        std::fs::write(
+            project.join(".rupu/config.toml"),
+            format!(
+                r#"[autoflow]
+enabled = true
+repo = "github:Section9Labs/rupu"
+permission_mode = "bypass"
+strict_templates = true
+
+[scm.jira]
+base_url = "{}"
+"#,
+                server.base_url()
+            ),
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(&global).unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Jira,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("matt@example.com:api-token"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+        std::env::set_current_dir(&project).unwrap();
+
+        run(
+            "issue-supervisor-dispatch",
+            "jira:127.0.0.1/ENG/issues/42",
+            None,
+            None,
+            resolver,
+        )
+        .await
+        .unwrap();
+
+        std::env::set_current_dir(original_cwd).unwrap();
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        let claim = claim_store
+            .load("jira:127.0.0.1/ENG/issues/42")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.repo_ref, "github:Section9Labs/rupu");
+        assert_eq!(claim.source_ref.as_deref(), Some("jira:ENG"));
+        assert_eq!(claim.issue_display_ref.as_deref(), Some("ENG-42"));
+        assert_eq!(claim.status, ClaimStatus::Complete);
     }
 
     #[test]

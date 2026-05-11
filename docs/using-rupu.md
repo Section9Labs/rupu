@@ -229,11 +229,13 @@ rupu autoflow list --repo github:your-org/your-repo
 rupu autoflow show issue-supervisor-dispatch
 rupu autoflow show issue-supervisor-dispatch --repo github:your-org/your-repo
 rupu autoflow run issue-supervisor-dispatch github:your-org/your-repo/issues/42
+rupu autoflow run tracker-controller jira:ENG/issues/42 --repo github:your-org/your-repo
 rupu autoflow tick
 rupu autoflow serve --repo github:your-org/your-repo
 rupu autoflow serve --repo github:your-org/your-repo --worker team-mini-01
 rupu autoflow wakes --repo github:your-org/your-repo
 rupu autoflow explain github:your-org/your-repo/issues/42
+rupu autoflow explain linear:eng-team/issues/42 --repo github:your-org/your-repo
 rupu autoflow doctor --repo github:your-org/your-repo
 rupu autoflow repair github:your-org/your-repo/issues/42
 rupu autoflow requeue github:your-org/your-repo/issues/42 --event github.issue.reopened --not-before 10m
@@ -248,6 +250,8 @@ rupu --format csv autoflow wakes --repo github:your-org/your-repo
 `rupu autoflow list`, `show`, `status`, and `claims` inspect tracked repos, not just the current working directory. Use `rupu repos attach` first if you want to inspect autoflows from outside a checkout, and pass `--repo` when you want to narrow output to one tracked repo.
 
 `rupu autoflow run ...` does not steal a live or blocked claim from another autoflow cycle. If the issue is already owned, let `rupu autoflow tick` reconcile it or release the claim first.
+
+For tracker-native issues such as Linear or Jira, `rupu autoflow run` and `rupu autoflow explain` resolve the bound repo from visible autoflows. Pass `--repo` when more than one repo is bound to the same tracker source.
 
 ### Inspect usage and structured reports
 
@@ -745,7 +749,7 @@ Current boundary:
 
 - Linear supports both webhook and `poll_sources = ["linear:<team-id>"]`.
 - Jira supports both webhook and `poll_sources = ["jira:<site>/<project>"]` or `poll_sources = ["jira:<project>"]` when `[scm.jira].base_url` is configured.
-- Neither tracker has tracker-native autoflow claim ownership yet; autoflow execution is still repo-backed.
+- Both trackers now support tracker-native autoflow claim ownership while still executing repo-bound workflows and worktrees.
 
 When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queues `autoflow.wake_on` hints. The webhook receiver does not run the autoflow itself; it records the hint and the next `rupu autoflow tick` or active `rupu autoflow serve` cycle consumes it.
 

@@ -144,8 +144,9 @@ Linear and Jira now ship as native trigger sources:
 - webhook ingress for normalized tracker state events
 - polling via `poll_sources = ["linear:<team-id>"]`
 - polling via `poll_sources = ["jira:<site>/<project>"]` or `["jira:<project>"]` with `[scm.jira].base_url`
+- tracker-native autoflow ownership for repo-bound autonomous execution
 
-They are not full repo / PR backends, and tracker-native autoflow ownership is still pending.
+They are not full repo / PR backends.
 
 ### Workflow triggers
 
