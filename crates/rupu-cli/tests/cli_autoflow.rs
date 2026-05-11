@@ -1709,6 +1709,56 @@ fn autoflow_explain_supports_tracker_native_issue_refs() {
 }
 
 #[test]
+fn autoflow_explain_resolves_unclaimed_tracker_native_issue_from_visible_source() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child("home");
+    home.create_dir_all().unwrap();
+    let project = assert_fs::TempDir::new().unwrap();
+    init_git_checkout(project.path(), "git@github.com:Section9Labs/rupu.git");
+    write_agent_and_workflow(
+        &project,
+        "tracker-controller",
+        r#"name: tracker-controller
+autoflow:
+  enabled: true
+  source: linear:eng-team
+  priority: 100
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
+    project
+        .child(".rupu/config.toml")
+        .write_str(
+            r#"[autoflow]
+enabled = true
+repo = "github:Section9Labs/rupu"
+"#,
+        )
+        .unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .current_dir(project.path())
+        .args(["autoflow", "explain", "linear:eng-team/issues/42"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("issue: linear:eng-team/issues/42"))
+        .stdout(predicate::str::contains("repo: github:Section9Labs/rupu"))
+        .stdout(predicate::str::contains("status: unclaimed"))
+        .stdout(predicate::str::contains("source: linear:eng-team"))
+        .stdout(predicate::str::contains(
+            "candidate workflows: tracker-controller",
+        ));
+}
+
+#[test]
 fn autoflow_doctor_reports_state_problems() {
     let _guard = ENV_LOCK.blocking_lock();
 
