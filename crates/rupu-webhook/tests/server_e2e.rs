@@ -389,3 +389,100 @@ async fn signed_jira_issue_update_dispatches_matching_workflow() {
     assert_eq!(calls[0].1["state"]["after"]["name"], "Ready For Review");
     server.abort();
 }
+
+#[tokio::test]
+async fn signed_github_projects_item_dispatches_matching_workflow() {
+    let secret = b"test-secret-for-rupu-webhook-receiver";
+    let port = pick_free_port();
+    let addr: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
+
+    let dispatcher = Arc::new(RecordingDispatcher {
+        calls: Mutex::new(Vec::new()),
+    });
+    let dispatcher_handle = dispatcher.clone();
+
+    let workflows = vec![issue_state_workflow()];
+    let config = WebhookConfig {
+        addr,
+        github_secret: Some(secret.to_vec()),
+        gitlab_token: None,
+        linear_secret: None,
+        jira_secret: None,
+        workflow_loader: Arc::new(move || workflows.clone()),
+        dispatcher: dispatcher_handle,
+        observer: None,
+    };
+    let server = tokio::spawn(async move {
+        let _ = serve(config).await;
+    });
+
+    let url_health = format!("http://{addr}/healthz");
+    for _ in 0..50 {
+        if reqwest::get(&url_health).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let body = serde_json::json!({
+        "action": "edited",
+        "organization": { "login": "Section9Labs" },
+        "projects_v2": { "node_id": "PVT_kwDOA", "title": "Delivery" },
+        "projects_v2_item": {
+            "id": "PVTI_lADOA",
+            "project_node_id": "PVT_kwDOA",
+            "content_type": "Issue",
+            "content": {
+                "__typename": "Issue",
+                "node_id": "I_kwDOA",
+                "number": 42,
+                "html_url": "https://github.com/Section9Labs/rupu/issues/42",
+                "repository": { "full_name": "Section9Labs/rupu" }
+            },
+            "field_value": {
+                "field_type": "single_select",
+                "optionId": "opt-ready",
+                "name": "Ready For Review",
+                "field": { "name": "Status" }
+            }
+        },
+        "changes": {
+            "field_value": {
+                "field_type": "single_select",
+                "optionId": "opt-progress",
+                "name": "In Progress",
+                "field": { "name": "Status" }
+            }
+        }
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let sig = sign_github(secret, &body_bytes);
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/webhook/github"))
+        .header("x-github-event", "projects_v2_item")
+        .header("x-github-delivery", "delivery-projects-1")
+        .header("x-hub-signature-256", sig)
+        .header("content-type", "application/json")
+        .body(body_bytes)
+        .send()
+        .await
+        .expect("post");
+    assert_eq!(resp.status(), 200);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["event"], "github.project_item.updated");
+    assert_eq!(json["fired"][0]["name"], "linear-state");
+    assert_eq!(json["fired"][0]["fired"], true);
+
+    let calls = dispatcher.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "linear-state");
+    assert_eq!(
+        calls[0].1["subject"]["ref"],
+        "github:Section9Labs/rupu/issues/42"
+    );
+    assert_eq!(calls[0].1["state"]["category"], "workflow_state");
+    assert_eq!(calls[0].1["state"]["before"]["name"], "In Progress");
+    assert_eq!(calls[0].1["state"]["after"]["name"], "Ready For Review");
+    server.abort();
+}

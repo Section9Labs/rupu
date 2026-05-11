@@ -11,6 +11,7 @@
 //!   github.issue.opened
 //!   github.issue.closed
 //!   github.issue.commented
+//!   github.project_item.updated
 //!   github.push
 //!   gitlab.mr.opened
 //!   gitlab.mr.merged
@@ -71,9 +72,26 @@ pub fn map_github_event(event_header: &str, payload: &Value) -> Option<String> {
         ("issues", Some("demilestoned")) => Some("github.issue.demilestoned".into()),
         ("issue_comment", Some("created")) => Some("github.issue.commented".into()),
         ("issue_comment", Some("edited")) => Some("github.issue.comment_edited".into()),
+        ("projects_v2_item", Some("created")) => Some("github.project_item.created".into()),
+        ("projects_v2_item", Some("edited")) => Some("github.project_item.updated".into()),
+        ("projects_v2_item", Some("archived")) => Some("github.project_item.archived".into()),
+        ("projects_v2_item", Some("restored")) => Some("github.project_item.restored".into()),
+        ("projects_v2_status_update", Some("created")) => {
+            Some("github.project.status_update.created".into())
+        }
         ("push", _) => Some("github.push".into()),
         ("ping", _) => Some("github.ping".into()),
         _ => None,
+    }
+}
+
+/// Normalize GitHub Projects v2 item events into the native tracker-state
+/// payload shape expected by the orchestrator alias layer. Other GitHub
+/// webhook events are returned unchanged.
+pub fn normalize_github_event_payload(event_header: &str, payload: &Value) -> Value {
+    match event_header {
+        "projects_v2_item" => normalize_github_projects_item_payload(payload),
+        _ => payload.clone(),
     }
 }
 
@@ -311,6 +329,301 @@ fn transition_object(
     Some(value)
 }
 
+fn normalize_github_projects_item_payload(payload: &Value) -> Value {
+    let item = payload
+        .get("projects_v2_item")
+        .or_else(|| payload.get("project_v2_item"));
+    let content = item.and_then(|item| item.get("content"));
+    let subject_kind = github_project_subject_kind(item, content);
+    let subject = json!({
+        "kind": subject_kind,
+        "id": github_project_subject_id(content, item).unwrap_or_default(),
+        "ref": github_project_subject_ref(content, payload, &subject_kind).unwrap_or_default(),
+        "url": github_project_subject_url(content).unwrap_or(Value::Null),
+    });
+
+    let mut out = json!({
+        "vendor": "github",
+        "subject": subject,
+        "organization": payload.get("organization").cloned().unwrap_or(Value::Null),
+        "project": github_project_membership_transition(payload),
+        "payload": payload.clone(),
+    });
+
+    if let Some(field_transition) = github_project_field_transition(payload) {
+        match github_project_field_category(payload, &field_transition) {
+            Some("workflow_state") => {
+                let mut transition = field_transition;
+                transition["category"] = Value::String("workflow_state".into());
+                out["state"] = transition;
+                out.as_object_mut().map(|obj| obj.remove("project"));
+            }
+            Some("priority") => {
+                out["priority"] = field_transition;
+                out.as_object_mut().map(|obj| obj.remove("project"));
+            }
+            Some("cycle") => {
+                out["cycle"] = field_transition;
+                out.as_object_mut().map(|obj| obj.remove("project"));
+            }
+            Some("sprint") => {
+                out["sprint"] = field_transition;
+                out.as_object_mut().map(|obj| obj.remove("project"));
+            }
+            _ => {}
+        }
+    }
+
+    if out["project"].is_null() {
+        out.as_object_mut().map(|obj| obj.remove("project"));
+    }
+
+    out
+}
+
+fn github_project_subject_kind(item: Option<&Value>, content: Option<&Value>) -> String {
+    content
+        .and_then(|content| {
+            content
+                .get("__typename")
+                .or_else(|| content.get("type"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            item.and_then(|item| item.get("content_type"))
+                .and_then(Value::as_str)
+        })
+        .map(|kind| match kind {
+            "Issue" => "issue",
+            "PullRequest" => "pull_request",
+            "DraftIssue" => "draft_issue",
+            other => other,
+        })
+        .unwrap_or("project_item")
+        .to_string()
+}
+
+fn github_project_subject_id(content: Option<&Value>, item: Option<&Value>) -> Option<String> {
+    content
+        .and_then(|content| {
+            content
+                .get("node_id")
+                .or_else(|| content.get("id"))
+                .and_then(value_as_scalar_string)
+        })
+        .or_else(|| {
+            item.and_then(|item| {
+                item.get("content_node_id")
+                    .or_else(|| item.get("content_id"))
+                    .and_then(value_as_scalar_string)
+            })
+        })
+}
+
+fn github_project_subject_ref(
+    content: Option<&Value>,
+    payload: &Value,
+    subject_kind: &str,
+) -> Option<String> {
+    if subject_kind != "issue" && subject_kind != "pull_request" {
+        return None;
+    }
+    let number = content
+        .and_then(|content| content.get("number"))
+        .and_then(Value::as_u64)?;
+    let repo_full_name = content
+        .and_then(|content| content.get("repository"))
+        .and_then(|repo| repo.get("full_name"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("repository")
+                .and_then(|repo| repo.get("full_name"))
+                .and_then(Value::as_str)
+        })?;
+    let noun = if subject_kind == "issue" {
+        "issues"
+    } else {
+        "pulls"
+    };
+    Some(format!("github:{repo_full_name}/{noun}/{number}"))
+}
+
+fn github_project_subject_url(content: Option<&Value>) -> Option<Value> {
+    content
+        .and_then(|content| {
+            content
+                .get("html_url")
+                .or_else(|| content.get("url"))
+                .or_else(|| content.get("resourcePath"))
+        })
+        .cloned()
+}
+
+fn github_project_membership_transition(payload: &Value) -> Value {
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let current = github_project_object(payload);
+    match action {
+        "created" | "restored" => json!({
+            "before": Value::Null,
+            "after": current.unwrap_or(Value::Null),
+        }),
+        "archived" => json!({
+            "before": current.unwrap_or(Value::Null),
+            "after": Value::Null,
+        }),
+        _ => Value::Null,
+    }
+}
+
+fn github_project_object(payload: &Value) -> Option<Value> {
+    let item = payload
+        .get("projects_v2_item")
+        .or_else(|| payload.get("project_v2_item"));
+    let project = payload
+        .get("projects_v2")
+        .or_else(|| item.and_then(|item| item.get("project")))
+        .cloned();
+    let id = project
+        .as_ref()
+        .and_then(|project| project.get("node_id").or_else(|| project.get("id")))
+        .and_then(value_as_scalar_string)
+        .or_else(|| {
+            item.and_then(|item| {
+                item.get("project_node_id")
+                    .or_else(|| item.get("project_id"))
+                    .and_then(value_as_scalar_string)
+            })
+        });
+    let name = project
+        .as_ref()
+        .and_then(|project| {
+            project
+                .get("title")
+                .or_else(|| project.get("name"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string);
+    if id.is_none() && name.is_none() {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    if let Some(id) = id {
+        out.insert("id".into(), Value::String(id));
+    }
+    if let Some(name) = name {
+        out.insert("name".into(), Value::String(name));
+    }
+    Some(Value::Object(out))
+}
+
+fn github_project_field_transition(payload: &Value) -> Option<Value> {
+    let item = payload
+        .get("projects_v2_item")
+        .or_else(|| payload.get("project_v2_item"))?;
+    let before = payload
+        .get("changes")
+        .and_then(|changes| changes.get("field_value"))
+        .and_then(github_project_field_endpoint)?;
+    let after = item
+        .get("field_value")
+        .and_then(github_project_field_endpoint)?;
+    if before == after {
+        return None;
+    }
+    Some(json!({
+        "before": before,
+        "after": after,
+    }))
+}
+
+fn github_project_field_category(payload: &Value, transition: &Value) -> Option<&'static str> {
+    let item = payload
+        .get("projects_v2_item")
+        .or_else(|| payload.get("project_v2_item"));
+    let field_value = item.and_then(|item| item.get("field_value"));
+    let field_type = field_value
+        .and_then(|value| {
+            value
+                .get("field_type")
+                .or_else(|| value.get("data_type"))
+                .or_else(|| value.get("__typename"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let field_name = field_value
+        .and_then(|value| {
+            value
+                .get("field")
+                .and_then(|field| field.get("name"))
+                .or_else(|| value.get("field_name"))
+        })
+        .and_then(Value::as_str)
+        .or_else(|| {
+            transition
+                .get("after")
+                .and_then(|value| value.get("field_name"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if field_type.contains("iteration") || field_name == "iteration" {
+        return Some("cycle");
+    }
+    if field_name == "sprint" {
+        return Some("sprint");
+    }
+    if field_name == "priority" {
+        return Some("priority");
+    }
+    if field_type.contains("single_select")
+        && matches!(
+            field_name.as_str(),
+            "status" | "state" | "workflow" | "workflow state"
+        )
+    {
+        return Some("workflow_state");
+    }
+    None
+}
+
+fn github_project_field_endpoint(value: &Value) -> Option<Value> {
+    let mut out = serde_json::Map::new();
+    if let Some(id) = value
+        .get("option_id")
+        .or_else(|| value.get("optionId"))
+        .or_else(|| value.get("id"))
+        .and_then(value_as_scalar_string)
+    {
+        out.insert("id".into(), Value::String(id));
+    }
+    if let Some(name) = value
+        .get("name")
+        .or_else(|| value.get("title"))
+        .and_then(Value::as_str)
+    {
+        out.insert("name".into(), Value::String(name.to_string()));
+    }
+    if let Some(field_name) = value
+        .get("field")
+        .and_then(|field| field.get("name"))
+        .or_else(|| value.get("field_name"))
+        .and_then(Value::as_str)
+    {
+        out.insert("field_name".into(), Value::String(field_name.to_string()));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Value::Object(out))
+    }
+}
+
 fn stateish_value(value: Option<&Value>) -> Option<Value> {
     let value = value?;
     match value {
@@ -504,6 +817,23 @@ mod tests {
     }
 
     #[test]
+    fn github_projects_item_events() {
+        for (action, expected) in [
+            ("created", "github.project_item.created"),
+            ("edited", "github.project_item.updated"),
+            ("archived", "github.project_item.archived"),
+            ("restored", "github.project_item.restored"),
+        ] {
+            let payload = json!({ "action": action });
+            assert_eq!(
+                map_github_event("projects_v2_item", &payload),
+                Some(expected.into()),
+                "for action={action}"
+            );
+        }
+    }
+
+    #[test]
     fn github_unknown_event_is_none() {
         let payload = json!({ "action": "speculated" });
         assert!(map_github_event("never_heard_of_it", &payload).is_none());
@@ -633,6 +963,75 @@ mod tests {
         assert_eq!(normalized["priority"]["after"]["id"], 1);
         assert_eq!(normalized["blocked"], true);
         assert_eq!(normalized["payload"]["data"]["identifier"], "ENG-123");
+    }
+
+    #[test]
+    fn github_projects_item_normalizes_workflow_state_transition() {
+        let payload = json!({
+            "action": "edited",
+            "organization": { "login": "Section9Labs" },
+            "projects_v2": { "node_id": "PVT_kwDOA", "title": "Delivery" },
+            "projects_v2_item": {
+                "id": "PVTI_lADOA",
+                "project_node_id": "PVT_kwDOA",
+                "content_type": "Issue",
+                "content": {
+                    "__typename": "Issue",
+                    "node_id": "I_kwDOA",
+                    "number": 42,
+                    "html_url": "https://github.com/Section9Labs/rupu/issues/42",
+                    "repository": { "full_name": "Section9Labs/rupu" }
+                },
+                "field_value": {
+                    "field_type": "single_select",
+                    "optionId": "opt-in-progress",
+                    "name": "In Progress",
+                    "field": { "name": "Status" }
+                }
+            },
+            "changes": {
+                "field_value": {
+                    "field_type": "single_select",
+                    "optionId": "opt-todo",
+                    "name": "Todo",
+                    "field": { "name": "Status" }
+                }
+            }
+        });
+        let normalized = normalize_github_event_payload("projects_v2_item", &payload);
+        assert_eq!(normalized["vendor"], "github");
+        assert_eq!(normalized["subject"]["kind"], "issue");
+        assert_eq!(
+            normalized["subject"]["ref"],
+            "github:Section9Labs/rupu/issues/42"
+        );
+        assert_eq!(normalized["state"]["before"]["name"], "Todo");
+        assert_eq!(normalized["state"]["after"]["name"], "In Progress");
+        assert_eq!(normalized["state"]["category"], "workflow_state");
+    }
+
+    #[test]
+    fn github_projects_item_created_normalizes_project_membership() {
+        let payload = json!({
+            "action": "created",
+            "projects_v2": { "node_id": "PVT_kwDOA", "title": "Delivery Board" },
+            "projects_v2_item": {
+                "id": "PVTI_lADOA",
+                "project_node_id": "PVT_kwDOA",
+                "content_type": "Issue",
+                "content": {
+                    "__typename": "Issue",
+                    "node_id": "I_kwDOA",
+                    "number": 42,
+                    "html_url": "https://github.com/Section9Labs/rupu/issues/42",
+                    "repository": { "full_name": "Section9Labs/rupu" }
+                }
+            }
+        });
+        let normalized = normalize_github_event_payload("projects_v2_item", &payload);
+        assert_eq!(normalized["project"]["before"], Value::Null);
+        assert_eq!(normalized["project"]["after"]["id"], "PVT_kwDOA");
+        assert_eq!(normalized["project"]["after"]["name"], "Delivery Board");
     }
 
     #[test]
