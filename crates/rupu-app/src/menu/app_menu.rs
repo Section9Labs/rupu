@@ -39,7 +39,8 @@ fn open_workspace_window(dir: &std::path::Path, cx: &mut App) {
     match Workspace::open(dir) {
         Ok(workspace) => {
             tracing::info!(id = %workspace.manifest.id, path = ?dir, "open workspace");
-            WorkspaceWindow::open(workspace, cx);
+            let app_executor = crate::executor::build_executor(&workspace);
+            WorkspaceWindow::open(workspace, app_executor, cx);
         }
         Err(e) => {
             tracing::error!(?dir, %e, "failed to open workspace");

@@ -27,6 +27,10 @@ pub mod tool_registry;
 pub use action::{ActionEnvelope, ActionValidator};
 pub use loader::{load_agent, load_agents, AgentLoadError};
 pub use permission::{parse_mode, resolve_mode, PermissionDecision, PermissionPrompt};
-pub use runner::{run_agent, AgentRunOpts, OnToolCallCallback, RunError, RunResult};
+pub use runner::{
+    run_agent, AgentRunOpts, BypassDecider, MockProvider, OnToolCallCallback, RunError, RunResult,
+    ScriptedTurn,
+};
+pub use rupu_providers::types::StopReason;
 pub use spec::{AgentSpec, AgentSpecParseError};
 pub use tool_registry::{default_tool_registry, ToolRegistry};

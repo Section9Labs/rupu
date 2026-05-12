@@ -1,7 +1,7 @@
 //! rupu.app — native macOS desktop app.
 
 use gpui::App;
-use rupu_app::{menu, window::WorkspaceWindow, workspace::Workspace};
+use rupu_app::{executor, menu, window::WorkspaceWindow, workspace::Workspace};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -28,7 +28,8 @@ fn main() {
             match Workspace::open(&dir) {
                 Ok(workspace) => {
                     tracing::info!(id = %workspace.manifest.id, "opened workspace from CLI arg");
-                    WorkspaceWindow::open(workspace, cx);
+                    let app_executor = executor::build_executor(&workspace);
+                    WorkspaceWindow::open(workspace, app_executor, cx);
                 }
                 Err(e) => {
                     tracing::error!(?dir, %e, "failed to open workspace from CLI arg");

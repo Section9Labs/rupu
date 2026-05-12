@@ -16,14 +16,18 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 directories.workspace = true
+dirs.workspace = true
 futures-util.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 notify.workspace = true
+rupu-agent = { path = "../rupu-agent" }
 rupu-app-canvas = { path = "../rupu-app-canvas" }
 rupu-orchestrator = { path = "../rupu-orchestrator" }
+rupu-tools = { path = "../rupu-tools" }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }

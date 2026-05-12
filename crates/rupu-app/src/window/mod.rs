@@ -3,25 +3,35 @@
 pub mod sidebar;
 pub mod titlebar;
 
+use crate::executor::AppExecutor;
 use crate::palette;
 use crate::workspace::Workspace;
 use gpui::{
     div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, Window,
     WindowBounds, WindowHandle, WindowOptions,
 };
+use std::path::PathBuf;
+use std::sync::Arc;
 
 pub struct WorkspaceWindow {
     pub workspace: Workspace,
+    /// Executor singleton — used to check for active runs and subscribe
+    /// to their event streams. Populated at window-open time.
+    pub app_executor: Arc<AppExecutor>,
     /// Live run state for the currently displayed workflow. `None`
-    /// when no run is active (D-2 static display). Task 15 populates
-    /// this from the AppExecutor event stream.
+    /// when no run is active (D-2 static display). Populated by
+    /// `on_workflow_clicked` from the AppExecutor event stream.
     pub run_model: Option<crate::run_model::RunModel>,
 }
 
 impl WorkspaceWindow {
     /// Open a new top-level window for the given workspace. The
     /// window owns the workspace handle for its lifetime.
-    pub fn open(workspace: Workspace, cx: &mut App) -> WindowHandle<Self> {
+    pub fn open(
+        workspace: Workspace,
+        app_executor: Arc<AppExecutor>,
+        cx: &mut App,
+    ) -> WindowHandle<Self> {
         let bounds = Bounds::centered(None, size(px(1240.0), px(800.0)), cx);
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -31,10 +41,52 @@ impl WorkspaceWindow {
         cx.open_window(opts, |_window, cx| {
             cx.new(|_cx| WorkspaceWindow {
                 workspace,
+                app_executor,
                 run_model: None,
             })
         })
         .expect("open workspace window")
+    }
+
+    /// Called when the user selects a workflow in the sidebar. Checks
+    /// for an active run; if one exists, subscribes to its event stream
+    /// and updates `run_model` as events arrive.
+    pub fn on_workflow_clicked(&mut self, workflow_path: PathBuf, cx: &mut Context<Self>) {
+        let active = self.app_executor.list_active_runs(Some(workflow_path.clone()));
+        if let Some(run) = active.into_iter().next() {
+            self.run_model = Some(crate::run_model::RunModel::new(
+                run.id.clone(),
+                workflow_path,
+            ));
+            let app_executor = self.app_executor.clone();
+            let run_id = run.id.clone();
+            cx.spawn(async move |this, cx| {
+                match app_executor.attach(&run_id).await {
+                    Ok(mut stream) => {
+                        use futures_util::StreamExt;
+                        while let Some(ev) = stream.next().await {
+                            let update_result = this.update(cx, |this, cx| {
+                                if let Some(m) = this.run_model.take() {
+                                    this.run_model = Some(m.apply(&ev));
+                                }
+                                cx.notify();
+                            });
+                            if update_result.is_err() {
+                                // Window was closed; stop draining.
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(run_id = %run_id, %e, "failed to attach to run stream");
+                    }
+                }
+            })
+            .detach();
+        } else {
+            self.run_model = None;
+        }
+        cx.notify();
     }
 }
 

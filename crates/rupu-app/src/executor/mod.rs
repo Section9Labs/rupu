@@ -3,6 +3,7 @@
 //! and disk-tail; mirrors approve/reject/cancel to the right backend.
 
 pub mod attach;
+pub mod step_factory;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use rupu_orchestrator::runner::StepFactory;
 use rupu_orchestrator::runs::{RunRecord, RunStore};
 
 use crate::executor::attach::attach_stream;
+use crate::workspace::Workspace;
 
 pub struct AppExecutor {
     inner: Arc<InProcessExecutor>,
@@ -97,4 +99,31 @@ impl AppExecutor {
     ) -> Result<(), rupu_orchestrator::executor::ExecutorError> {
         self.inner.cancel(run_id).await
     }
+}
+
+/// Construct the per-workspace `AppExecutor`. The `RunStore` root
+/// follows the same convention as the orchestrator CLI:
+/// `<data_local_dir>/rupu/runs`. If `dirs::data_local_dir()` fails
+/// (unlikely outside unit tests) we fall back to `/tmp/rupu/runs` so
+/// the app still launches.
+pub fn build_executor(workspace: &Workspace) -> Arc<AppExecutor> {
+    let runs_root = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("rupu")
+        .join("runs");
+
+    let run_store = Arc::new(RunStore::new(runs_root.clone()));
+    let workspace_path = std::path::PathBuf::from(&workspace.manifest.path);
+    let transcript_dir = runs_root.join("transcripts");
+
+    let factory: Arc<dyn StepFactory> =
+        Arc::new(step_factory::AppStepFactory { workspace_path: workspace_path.clone() });
+
+    Arc::new(AppExecutor::new(
+        run_store,
+        factory,
+        workspace.manifest.id.clone(),
+        workspace_path,
+        transcript_dir,
+    ))
 }
