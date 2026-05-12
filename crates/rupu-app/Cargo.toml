@@ -1,0 +1,30 @@
+[package]
+name = "rupu-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "rupu-app"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+directories.workspace = true
+gpui.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+ulid.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+
+[lints]
+workspace = true

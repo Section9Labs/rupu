@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rupu-app",
     "crates/rupu-transcript",
     "crates/rupu-runtime",
     "crates/rupu-config",
@@ -23,6 +24,7 @@ version = "0.5.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/section9labs/rupu"
+authors = ["Section9Labs"]
 rust-version = "1.88"
 
 [workspace.dependencies]
