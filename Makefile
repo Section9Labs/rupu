@@ -120,9 +120,14 @@ tui-smoke:
 app-smoke:
 	@cargo build --release -p rupu-app
 	@FIXTURE="$$(pwd)/crates/rupu-app/tests/fixtures/sample-workspace"; \
-	OUTPUT=$$(timeout 4 ./target/release/rupu-app "$$FIXTURE" 2>&1 || true); \
+	OUTPUT=$$(sh -c './target/release/rupu-app "'"$$FIXTURE"'" & sleep 4; kill $$! 2>/dev/null' 2>&1 || true); \
 	if echo "$$OUTPUT" | grep -qE 'panic|panicked'; then \
 		echo "app-smoke FAIL — panic in output:"; \
+		echo "$$OUTPUT"; \
+		exit 1; \
+	fi; \
+	if ! echo "$$OUTPUT" | grep -q 'opened workspace'; then \
+		echo "app-smoke FAIL — expected 'opened workspace' log line missing:"; \
 		echo "$$OUTPUT"; \
 		exit 1; \
 	fi
