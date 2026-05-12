@@ -11,6 +11,7 @@ pub mod action_protocol;
 pub mod cron_schedule;
 pub mod event_match;
 pub mod event_vocab;
+pub mod executor;
 pub mod runner;
 pub mod runs;
 pub mod templates;
