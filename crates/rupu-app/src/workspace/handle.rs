@@ -1,8 +1,8 @@
 //! `Workspace` handle — the runtime object the GPUI window layers
 //! consume. Wraps a `WorkspaceManifest` with its discovered project
 //! + global asset sets. Constructing a handle is a fallible IO
-//! operation (manifest load/create + asset walk); the GPUI window
-//! constructor calls `open` and bails on error.
+//!   operation (manifest load/create + asset walk); the GPUI window
+//!   constructor calls `open` and bails on error.
 
 use crate::workspace::{
     discovery::{self, AssetSet},
