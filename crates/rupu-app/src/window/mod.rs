@@ -6,7 +6,7 @@ pub mod titlebar;
 use crate::palette;
 use crate::workspace::Workspace;
 use gpui::{
-    div, prelude::*, px, size, App, AnyElement, Bounds, Context, IntoElement, Render, Window,
+    div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, Window,
     WindowBounds, WindowHandle, WindowOptions,
 };
 
@@ -74,20 +74,14 @@ fn render_main_for_workflow(asset: &crate::workspace::Asset) -> AnyElement {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(path = ?asset.path, %e, "read workflow");
-            return render_main_error(format!(
-                "failed to read {}: {e}",
-                asset.path.display()
-            ));
+            return render_main_error(format!("failed to read {}: {e}", asset.path.display()));
         }
     };
     let wf = match Workflow::parse(&body) {
         Ok(w) => w,
         Err(e) => {
             tracing::warn!(path = ?asset.path, %e, "parse workflow");
-            return render_main_error(format!(
-                "failed to parse {}: {e}",
-                asset.path.display()
-            ));
+            return render_main_error(format!("failed to parse {}: {e}", asset.path.display()));
         }
     };
 

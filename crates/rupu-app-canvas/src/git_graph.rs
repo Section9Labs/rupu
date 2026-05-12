@@ -136,17 +136,16 @@ fn emit_panel_step(rows: &mut Vec<GraphRow>, step_id: &str, panelists: &[String]
             GraphCell::Space(1),
             GraphCell::Label(step_id.to_string()),
             GraphCell::Space(2),
-            GraphCell::Meta(format!("panel · {n} panelist{}", if n == 1 { "" } else { "s" })),
+            GraphCell::Meta(format!(
+                "panel · {n} panelist{}",
+                if n == 1 { "" } else { "s" }
+            )),
         ],
     });
 
     // Spacer: │ │
     rows.push(GraphRow {
-        cells: vec![
-            GraphCell::Pipe(s),
-            GraphCell::Space(1),
-            GraphCell::Pipe(s),
-        ],
+        cells: vec![GraphCell::Pipe(s), GraphCell::Space(1), GraphCell::Pipe(s)],
     });
 
     // One row per panelist: │ ●─ <agent>
@@ -165,11 +164,7 @@ fn emit_panel_step(rows: &mut Vec<GraphRow>, step_id: &str, panelists: &[String]
 
     // Spacer: │ │
     rows.push(GraphRow {
-        cells: vec![
-            GraphCell::Pipe(s),
-            GraphCell::Space(1),
-            GraphCell::Pipe(s),
-        ],
+        cells: vec![GraphCell::Pipe(s), GraphCell::Space(1), GraphCell::Pipe(s)],
     });
 
     // Close row: │ ◄─╯
@@ -221,15 +216,28 @@ steps:
 "#,
         );
         let rows = render_rows(&wf);
-        assert_eq!(rows.len(), 5, "expected 3 step + 2 connector = 5 rows, got: {rows:#?}");
+        assert_eq!(
+            rows.len(),
+            5,
+            "expected 3 step + 2 connector = 5 rows, got: {rows:#?}"
+        );
 
         // Row 0: step a (bullet + space + label + space + meta)
-        assert!(matches!(rows[0].cells[0], GraphCell::Bullet(NodeStatus::Waiting)));
-        assert!(rows[0].cells.iter().any(|c| matches!(c, GraphCell::Label(s) if s == "a")));
+        assert!(matches!(
+            rows[0].cells[0],
+            GraphCell::Bullet(NodeStatus::Waiting)
+        ));
+        assert!(rows[0]
+            .cells
+            .iter()
+            .any(|c| matches!(c, GraphCell::Label(s) if s == "a")));
 
         // Row 1: spine connector
         assert_eq!(rows[1].cells.len(), 1);
-        assert!(matches!(rows[1].cells[0], GraphCell::Pipe(NodeStatus::Waiting)));
+        assert!(matches!(
+            rows[1].cells[0],
+            GraphCell::Pipe(NodeStatus::Waiting)
+        ));
     }
 
     #[test]
@@ -269,16 +277,37 @@ steps:
 
         // The panel header should be at index 2 (after classify + connector).
         let header = &rows[2];
-        assert!(matches!(header.cells[0], GraphCell::Branch(BranchGlyph::Mid, _)));
-        assert!(matches!(header.cells[1], GraphCell::Branch(BranchGlyph::Top, _)));
-        assert!(header.cells.iter().any(|c| matches!(c, GraphCell::Label(s) if s == "review_panel")));
-        assert!(header.cells.iter().any(|c| matches!(c, GraphCell::Meta(s) if s.contains("3 panelist"))));
+        assert!(matches!(
+            header.cells[0],
+            GraphCell::Branch(BranchGlyph::Mid, _)
+        ));
+        assert!(matches!(
+            header.cells[1],
+            GraphCell::Branch(BranchGlyph::Top, _)
+        ));
+        assert!(header
+            .cells
+            .iter()
+            .any(|c| matches!(c, GraphCell::Label(s) if s == "review_panel")));
+        assert!(header
+            .cells
+            .iter()
+            .any(|c| matches!(c, GraphCell::Meta(s) if s.contains("3 panelist"))));
 
         // The close row at the end of the panel must contain Merge + Bot
-        let close = rows.iter().rev().find(|r| {
-            r.cells.iter().any(|c| matches!(c, GraphCell::Branch(BranchGlyph::Merge, _)))
-        }).expect("merge close row");
-        assert!(close.cells.iter().any(|c| matches!(c, GraphCell::Branch(BranchGlyph::Bot, _))));
+        let close = rows
+            .iter()
+            .rev()
+            .find(|r| {
+                r.cells
+                    .iter()
+                    .any(|c| matches!(c, GraphCell::Branch(BranchGlyph::Merge, _)))
+            })
+            .expect("merge close row");
+        assert!(close
+            .cells
+            .iter()
+            .any(|c| matches!(c, GraphCell::Branch(BranchGlyph::Bot, _))));
     }
 
     #[test]
@@ -295,7 +324,13 @@ steps:
         );
         let rows = render_rows(&wf);
         assert_eq!(rows.len(), 1);
-        assert!(matches!(rows[0].cells[0], GraphCell::Bullet(NodeStatus::Waiting)));
-        assert!(rows[0].cells.iter().any(|c| matches!(c, GraphCell::Label(s) if s == "x")));
+        assert!(matches!(
+            rows[0].cells[0],
+            GraphCell::Bullet(NodeStatus::Waiting)
+        ));
+        assert!(rows[0]
+            .cells
+            .iter()
+            .any(|c| matches!(c, GraphCell::Label(s) if s == "x")));
     }
 }

@@ -41,15 +41,15 @@ impl NodeStatus {
     /// palette in rupu-cli/output/palette.rs + rupu-app/src/palette.rs.
     pub fn rgb(self) -> (u8, u8, u8) {
         match self {
-            Self::Waiting => (82, 82, 91),       // slate-500 (dim)
-            Self::Active => (59, 130, 246),      // blue-500
-            Self::Working => (59, 130, 246),     // blue-500
-            Self::Complete => (34, 197, 94),     // green-500
-            Self::Failed => (239, 68, 68),       // red-500
-            Self::SoftFailed => (202, 138, 4),   // yellow-600
-            Self::Awaiting => (251, 191, 36),    // amber-400
-            Self::Retrying => (124, 58, 237),    // brand-500
-            Self::Skipped => (203, 213, 225),    // slate-300
+            Self::Waiting => (82, 82, 91),     // slate-500 (dim)
+            Self::Active => (59, 130, 246),    // blue-500
+            Self::Working => (59, 130, 246),   // blue-500
+            Self::Complete => (34, 197, 94),   // green-500
+            Self::Failed => (239, 68, 68),     // red-500
+            Self::SoftFailed => (202, 138, 4), // yellow-600
+            Self::Awaiting => (251, 191, 36),  // amber-400
+            Self::Retrying => (124, 58, 237),  // brand-500
+            Self::Skipped => (203, 213, 225),  // slate-300
         }
     }
 }

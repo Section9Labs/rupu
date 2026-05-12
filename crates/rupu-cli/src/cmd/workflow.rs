@@ -1848,7 +1848,8 @@ async fn execute_workflow_invocation(
                 let attach_opts_for_attach = attach_opts.clone();
                 let shared_printer_for_attach = shared_printer.clone();
                 let outcome_result = tokio::task::spawn_blocking(move || {
-                    let printer_store = rupu_orchestrator::RunStore::new(runs_dir_for_attach.clone());
+                    let printer_store =
+                        rupu_orchestrator::RunStore::new(runs_dir_for_attach.clone());
                     if let Some(shared_printer) = shared_printer_for_attach {
                         let mut printer = shared_printer
                             .lock()
@@ -1896,10 +1897,9 @@ async fn execute_workflow_invocation(
                         break result;
                     }
                     AttachOutcome::Approved { awaited_step_id } => {
-                        let prior_records =
-                            run_store_for_resume.read_step_results(&current_run_id).map_err(|e| {
-                                anyhow::anyhow!("read step results for resume: {e}")
-                            })?;
+                        let prior_records = run_store_for_resume
+                            .read_step_results(&current_run_id)
+                            .map_err(|e| anyhow::anyhow!("read step results for resume: {e}"))?;
                         let prior_count = prior_records.len();
                         let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
                             .iter()

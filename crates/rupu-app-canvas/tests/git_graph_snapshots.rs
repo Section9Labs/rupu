@@ -14,7 +14,8 @@ fn fixture(yaml: &str) -> Workflow {
 
 #[test]
 fn snapshot_linear_3_steps() {
-    let wf = fixture(r#"
+    let wf = fixture(
+        r#"
 name: linear3
 steps:
   - id: classify
@@ -29,14 +30,16 @@ steps:
     agent: publisher
     actions: []
     prompt: hi
-"#);
+"#,
+    );
     let rows = render_rows(&wf);
     insta::assert_yaml_snapshot!("linear_3_steps", rows);
 }
 
 #[test]
 fn snapshot_panel_with_3_panelists() {
-    let wf = fixture(r#"
+    let wf = fixture(
+        r#"
 name: review
 steps:
   - id: classify
@@ -55,21 +58,24 @@ steps:
     agent: findings-aggregator
     actions: []
     prompt: hi
-"#);
+"#,
+    );
     let rows = render_rows(&wf);
     insta::assert_yaml_snapshot!("panel_with_3_panelists", rows);
 }
 
 #[test]
 fn snapshot_single_linear_step() {
-    let wf = fixture(r#"
+    let wf = fixture(
+        r#"
 name: single
 steps:
   - id: hello
     agent: greeter
     actions: []
     prompt: hi
-"#);
+"#,
+    );
     let rows = render_rows(&wf);
     insta::assert_yaml_snapshot!("single_linear_step", rows);
 }
