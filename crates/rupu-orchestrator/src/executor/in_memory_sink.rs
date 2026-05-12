@@ -43,12 +43,15 @@ mod tests {
         let sink = InMemorySink::with_capacity(16);
         let mut a = sink.subscribe();
         let mut b = sink.subscribe();
-        sink.emit("r", &Event::StepStarted {
-            run_id: "r".into(),
-            step_id: "s".into(),
-            kind: StepKind::Linear,
-            agent: None,
-        });
+        sink.emit(
+            "r",
+            &Event::StepStarted {
+                run_id: "r".into(),
+                step_id: "s".into(),
+                kind: StepKind::Linear,
+                agent: None,
+            },
+        );
         let ev_a = a.recv().await.expect("a recv");
         let ev_b = b.recv().await.expect("b recv");
         assert_eq!(ev_a.run_id(), "r");
@@ -58,11 +61,14 @@ mod tests {
     #[tokio::test]
     async fn no_subscribers_drops_silently() {
         let sink = InMemorySink::with_capacity(16);
-        sink.emit("r", &Event::StepStarted {
-            run_id: "r".into(),
-            step_id: "s".into(),
-            kind: StepKind::Linear,
-            agent: None,
-        });
+        sink.emit(
+            "r",
+            &Event::StepStarted {
+                run_id: "r".into(),
+                step_id: "s".into(),
+                kind: StepKind::Linear,
+                agent: None,
+            },
+        );
     }
 }

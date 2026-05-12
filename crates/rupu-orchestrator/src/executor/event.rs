@@ -96,7 +96,11 @@ mod tests {
         let json = serde_json::to_string(&ev).expect("serialize");
         let back: Event = serde_json::from_str(&json).expect("deserialize");
         match back {
-            Event::RunStarted { event_version, run_id, .. } => {
+            Event::RunStarted {
+                event_version,
+                run_id,
+                ..
+            } => {
                 assert_eq!(event_version, 1);
                 assert_eq!(run_id, "run_01J0");
             }

@@ -649,7 +649,11 @@ mod on_tool_call_tests {
         run_agent(opts).await.expect("agent run succeeds");
 
         let log = calls.lock().unwrap();
-        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
+        assert_eq!(
+            log.len(),
+            1,
+            "expected exactly one on_tool_call, got {log:?}"
+        );
         assert!(
             log[0].starts_with("s1:"),
             "expected step_id 's1' prefix, got {}",

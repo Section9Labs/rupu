@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 use crate::executor::errors::ExecutorError;
 use crate::executor::sink::{EventSink, FanOutSink};
 use crate::executor::{Event, InMemorySink, JsonlSink};
-use crate::runs::{ApprovalError, RunRecord, RunStatus, RunStore};
 use crate::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
+use crate::runs::{ApprovalError, RunRecord, RunStatus, RunStore};
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Event> + Send>>;
 
@@ -266,9 +266,7 @@ impl WorkflowExecutor for InProcessExecutor {
                     }
                 }
                 RunFilter::ByStatus(s) => &rec.status == s,
-                RunFilter::Active => {
-                    active_ids.contains(&rec.id) && !rec.status.is_terminal()
-                }
+                RunFilter::Active => active_ids.contains(&rec.id) && !rec.status.is_terminal(),
             })
             .collect()
     }
@@ -282,8 +280,7 @@ impl WorkflowExecutor for InProcessExecutor {
         drop(runs);
 
         let rx = state.in_memory.subscribe();
-        let stream = BroadcastStream::new(rx)
-            .filter_map(|res| async move { res.ok() });
+        let stream = BroadcastStream::new(rx).filter_map(|res| async move { res.ok() });
         Ok(Box::pin(stream))
     }
 

@@ -57,8 +57,14 @@ impl RunModel {
                     self.focused_step_last_set = Some(chrono::Utc::now());
                 }
             }
-            Event::StepCompleted { step_id, success, .. } => {
-                let status = if *success { NodeStatus::Complete } else { NodeStatus::SoftFailed };
+            Event::StepCompleted {
+                step_id, success, ..
+            } => {
+                let status = if *success {
+                    NodeStatus::Complete
+                } else {
+                    NodeStatus::SoftFailed
+                };
                 self.nodes.insert(step_id.clone(), status);
                 if self.active_step.as_deref() == Some(step_id) {
                     self.active_step = None;

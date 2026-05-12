@@ -116,8 +116,9 @@ pub fn build_executor(workspace: &Workspace) -> Arc<AppExecutor> {
     let workspace_path = std::path::PathBuf::from(&workspace.manifest.path);
     let transcript_dir = runs_root.join("transcripts");
 
-    let factory: Arc<dyn StepFactory> =
-        Arc::new(step_factory::AppStepFactory { workspace_path: workspace_path.clone() });
+    let factory: Arc<dyn StepFactory> = Arc::new(step_factory::AppStepFactory {
+        workspace_path: workspace_path.clone(),
+    });
 
     Arc::new(AppExecutor::new(
         run_store,

@@ -83,7 +83,11 @@ pub fn render(
     pane.into_any_element()
 }
 
-fn approval_bar(step_id: &str, on_approve: ApproveCallback, on_reject: RejectCallback) -> AnyElement {
+fn approval_bar(
+    step_id: &str,
+    on_approve: ApproveCallback,
+    on_reject: RejectCallback,
+) -> AnyElement {
     let approve_step = step_id.to_string();
     let reject_step = step_id.to_string();
     div()
@@ -119,12 +123,7 @@ fn approval_bar(step_id: &str, on_approve: ApproveCallback, on_reject: RejectCal
                 .child("Reject")
                 .cursor_pointer()
                 .on_click(move |_event, window, cx| {
-                    on_reject(
-                        reject_step.clone(),
-                        "rejected via UI".into(),
-                        window,
-                        cx,
-                    );
+                    on_reject(reject_step.clone(), "rejected via UI".into(), window, cx);
                 }),
         )
         .into_any_element()

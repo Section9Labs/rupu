@@ -825,9 +825,7 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         let runs_dir = global.join("runs");
         let events_path = runs_dir.join(run_id).join("events.jsonl");
         match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
-            Ok(sink) => {
-                Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>)
-            }
+            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to open events.jsonl for resume; continuing without event sink");
                 None
@@ -1819,9 +1817,7 @@ async fn execute_workflow_invocation(
     let event_sink_for_run = {
         let events_path = runs_dir.join(&run_id).join("events.jsonl");
         match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
-            Ok(sink) => {
-                Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>)
-            }
+            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to create events.jsonl; continuing without event sink");
                 None
@@ -1944,9 +1940,8 @@ async fn execute_workflow_invocation(
                         let resume_event_sink = {
                             let events_path = runs_dir.join(&current_run_id).join("events.jsonl");
                             match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
-                                Ok(sink) => Some(
-                                    Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>
-                                ),
+                                Ok(sink) => Some(Arc::new(sink)
+                                    as Arc<dyn rupu_orchestrator::executor::EventSink>),
                                 Err(e) => {
                                     tracing::warn!(
                                         error = %e,

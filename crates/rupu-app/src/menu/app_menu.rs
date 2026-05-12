@@ -5,7 +5,16 @@ use crate::window::WorkspaceWindow;
 use crate::workspace::Workspace;
 use gpui::{actions, App, KeyBinding, Menu, MenuItem};
 
-actions!(rupu_app, [NewWorkspace, OpenWorkspace, Quit, ApproveFocused, RejectFocused]);
+actions!(
+    rupu_app,
+    [
+        NewWorkspace,
+        OpenWorkspace,
+        Quit,
+        ApproveFocused,
+        RejectFocused
+    ]
+);
 
 /// Register the menu and wire its action handlers. Call once on app boot.
 pub fn install(cx: &mut App) {

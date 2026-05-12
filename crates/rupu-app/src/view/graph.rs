@@ -63,7 +63,9 @@ fn render_row(row: &GraphRow, on_approve: ApproveCallback) -> AnyElement {
             .child(div().w(px(12.0))) // spacer before pill
             .child(
                 div()
-                    .id(gpui::SharedString::from(format!("approve-inline-{step_id}")))
+                    .id(gpui::SharedString::from(format!(
+                        "approve-inline-{step_id}"
+                    )))
                     .px(px(8.0))
                     .py(px(2.0))
                     .bg(palette::COMPLETE)

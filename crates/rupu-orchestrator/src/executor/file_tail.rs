@@ -10,8 +10,8 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::Stream;
@@ -62,27 +62,21 @@ impl FileTailRunSource {
         let tx_for_watcher = tx.clone();
         let path_for_watcher = path_buf.clone();
         let offset_for_watcher = offset.clone();
-        let mut watcher = notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| {
-                if let Ok(evt) = res {
-                    if matches!(
-                        evt.kind,
-                        notify::EventKind::Modify(_) | notify::EventKind::Create(_)
-                    ) {
-                        // Only react if the changed path is our file
-                        let touches_target = evt.paths.iter().any(|p| p == &path_for_watcher);
-                        if !touches_target {
-                            return;
-                        }
-                        drain_new_bytes(
-                            &path_for_watcher,
-                            &offset_for_watcher,
-                            &tx_for_watcher,
-                        );
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(evt) = res {
+                if matches!(
+                    evt.kind,
+                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                ) {
+                    // Only react if the changed path is our file
+                    let touches_target = evt.paths.iter().any(|p| p == &path_for_watcher);
+                    if !touches_target {
+                        return;
                     }
+                    drain_new_bytes(&path_for_watcher, &offset_for_watcher, &tx_for_watcher);
                 }
-            },
-        )
+            }
+        })
         .map_err(std::io::Error::other)?;
 
         watcher
@@ -112,11 +106,7 @@ impl FileTailRunSource {
 }
 
 /// Synchronous drain called from the notify callback thread.
-fn drain_new_bytes(
-    path: &Path,
-    offset: &Arc<AtomicU64>,
-    tx: &mpsc::Sender<Event>,
-) {
+fn drain_new_bytes(path: &Path, offset: &Arc<AtomicU64>, tx: &mpsc::Sender<Event>) {
     let Ok(bytes) = std::fs::read(path) else {
         return;
     };
@@ -134,11 +124,7 @@ fn drain_new_bytes(
 }
 
 /// Async drain called from the polling fallback task.
-async fn drain_new_bytes_async(
-    path: &Path,
-    offset: &Arc<AtomicU64>,
-    tx: &mpsc::Sender<Event>,
-) {
+async fn drain_new_bytes_async(path: &Path, offset: &Arc<AtomicU64>, tx: &mpsc::Sender<Event>) {
     let Ok(bytes) = std::fs::read(path) else {
         return;
     };

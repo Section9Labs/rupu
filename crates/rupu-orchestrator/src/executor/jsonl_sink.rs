@@ -22,10 +22,7 @@ impl JsonlSink {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),
@@ -79,18 +76,24 @@ mod tests {
         let path = dir.path().join("events.jsonl");
         let sink = JsonlSink::create(&path).expect("create");
 
-        sink.emit("r", &Event::StepStarted {
-            run_id: "r".into(),
-            step_id: "s1".into(),
-            kind: StepKind::Linear,
-            agent: None,
-        });
-        sink.emit("r", &Event::StepCompleted {
-            run_id: "r".into(),
-            step_id: "s1".into(),
-            success: true,
-            duration_ms: 17,
-        });
+        sink.emit(
+            "r",
+            &Event::StepStarted {
+                run_id: "r".into(),
+                step_id: "s1".into(),
+                kind: StepKind::Linear,
+                agent: None,
+            },
+        );
+        sink.emit(
+            "r",
+            &Event::StepCompleted {
+                run_id: "r".into(),
+                step_id: "s1".into(),
+                success: true,
+                duration_ms: 17,
+            },
+        );
         drop(sink);
 
         let body = std::fs::read_to_string(&path).expect("read");
@@ -105,12 +108,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("events.jsonl");
         let sink = JsonlSink::create(&path).expect("create");
-        sink.emit("r", &Event::StepStarted {
-            run_id: "r".into(),
-            step_id: "s1".into(),
-            kind: StepKind::Linear,
-            agent: Some("classifier".into()),
-        });
+        sink.emit(
+            "r",
+            &Event::StepStarted {
+                run_id: "r".into(),
+                step_id: "s1".into(),
+                kind: StepKind::Linear,
+                agent: Some("classifier".into()),
+            },
+        );
         drop(sink);
         let body = std::fs::read_to_string(&path).unwrap();
         let ev: Event = serde_json::from_str(body.lines().next().unwrap()).unwrap();

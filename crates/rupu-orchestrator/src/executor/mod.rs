@@ -8,18 +8,18 @@
 
 pub mod errors;
 pub mod event;
-pub mod sink;
-pub mod jsonl_sink;
+pub mod file_tail;
 pub mod in_memory_sink;
 pub mod in_process;
-pub mod file_tail;
+pub mod jsonl_sink;
+pub mod sink;
 
 pub use errors::ExecutorError;
 pub use event::Event;
-pub use jsonl_sink::JsonlSink;
-pub use in_memory_sink::InMemorySink;
-pub use sink::{EventSink, FanOutSink};
 pub use file_tail::FileTailRunSource;
+pub use in_memory_sink::InMemorySink;
 pub use in_process::{
     EventStream, InProcessExecutor, RunFilter, RunHandle, WorkflowExecutor, WorkflowRunOpts,
 };
+pub use jsonl_sink::JsonlSink;
+pub use sink::{EventSink, FanOutSink};

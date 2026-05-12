@@ -4,8 +4,8 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::Stream;
@@ -64,22 +64,20 @@ impl TranscriptTail {
         let tx_for_watcher = tx.clone();
         let path_for_watcher = path_buf.clone();
         let offset_for_watcher = offset.clone();
-        let mut watcher = notify::recommended_watcher(
-            move |res: notify::Result<notify::Event>| {
-                if let Ok(evt) = res {
-                    if matches!(
-                        evt.kind,
-                        notify::EventKind::Modify(_) | notify::EventKind::Create(_)
-                    ) {
-                        let touches_target = evt.paths.iter().any(|p| p == &path_for_watcher);
-                        if !touches_target {
-                            return;
-                        }
-                        drain_new(&path_for_watcher, &offset_for_watcher, &tx_for_watcher);
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if let Ok(evt) = res {
+                if matches!(
+                    evt.kind,
+                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                ) {
+                    let touches_target = evt.paths.iter().any(|p| p == &path_for_watcher);
+                    if !touches_target {
+                        return;
                     }
+                    drain_new(&path_for_watcher, &offset_for_watcher, &tx_for_watcher);
                 }
-            },
-        )
+            }
+        })
         .map_err(std::io::Error::other)?;
 
         watcher
@@ -100,7 +98,10 @@ impl TranscriptTail {
             }
         });
 
-        Ok(Self { rx, _watcher: watcher })
+        Ok(Self {
+            rx,
+            _watcher: watcher,
+        })
     }
 }
 

@@ -63,7 +63,9 @@ impl WorkspaceWindow {
     /// for an active run; if one exists, subscribes to its event stream
     /// and updates `run_model` as events arrive.
     pub fn on_workflow_clicked(&mut self, workflow_path: PathBuf, cx: &mut Context<Self>) {
-        let active = self.app_executor.list_active_runs(Some(workflow_path.clone()));
+        let active = self
+            .app_executor
+            .list_active_runs(Some(workflow_path.clone()));
         if let Some(run) = active.into_iter().next() {
             self.run_model = Some(crate::run_model::RunModel::new(
                 run.id.clone(),
@@ -230,7 +232,9 @@ impl WorkspaceWindow {
     /// Called when the user clicks the Run button in the toolbar.
     /// Starts a new workflow run and subscribes to its event stream.
     pub fn handle_run_clicked(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.current_workflow_path() else { return };
+        let Some(path) = self.current_workflow_path() else {
+            return;
+        };
         let app_exec = self.app_executor.clone();
         let this = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
@@ -286,15 +290,16 @@ impl Render for WorkspaceWindow {
                 })
                 .ok();
             });
-        let on_reject: RejectCallback =
-            Arc::new(move |step_id: String, reason: String, window: &mut Window, cx: &mut App| {
+        let on_reject: RejectCallback = Arc::new(
+            move |step_id: String, reason: String, window: &mut Window, cx: &mut App| {
                 let _ = window;
                 weak2
                     .update(cx, |this, cx| {
                         this.handle_reject(step_id, reason, cx);
                     })
                     .ok();
-            });
+            },
+        );
 
         // Build active-run map for the sidebar status dots. We query the
         // executor once per frame for all workflows in the project asset list.
@@ -306,7 +311,9 @@ impl Render for WorkspaceWindow {
             .chain(self.workspace.global_assets.workflows.iter())
             .filter_map(|asset| {
                 let runs = self.app_executor.list_active_runs(Some(asset.path.clone()));
-                runs.into_iter().next().map(|r| (asset.path.clone(), r.status))
+                runs.into_iter()
+                    .next()
+                    .map(|r| (asset.path.clone(), r.status))
             })
             .collect();
 
@@ -331,10 +338,7 @@ impl Render for WorkspaceWindow {
         // Keyboard approval shortcuts — `a` to approve, `r` to reject.
         // Only fire when `focused_step` is Some and Awaiting; the guard is
         // inside handle_approve / handle_reject.
-        let focused_for_approve = self
-            .run_model
-            .as_ref()
-            .and_then(|m| m.focused_step.clone());
+        let focused_for_approve = self.run_model.as_ref().and_then(|m| m.focused_step.clone());
         let focused_for_reject = focused_for_approve.clone();
         let on_approve_kb = cx.listener(move |this, _: &ApproveFocused, _window, cx| {
             if let Some(step) = &focused_for_approve {

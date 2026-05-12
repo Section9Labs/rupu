@@ -110,12 +110,14 @@ fn render_section(
     } else {
         let mut list = div().flex().flex_col().gap(px(2.0));
         for asset in items {
-            let dot_color = active_runs.get(&asset.path).and_then(|status| match status {
-                RunStatus::Running => Some(palette::RUNNING),
-                RunStatus::AwaitingApproval => Some(palette::AWAITING),
-                RunStatus::Failed => Some(palette::FAILED),
-                _ => None,
-            });
+            let dot_color = active_runs
+                .get(&asset.path)
+                .and_then(|status| match status {
+                    RunStatus::Running => Some(palette::RUNNING),
+                    RunStatus::AwaitingApproval => Some(palette::AWAITING),
+                    RunStatus::Failed => Some(palette::FAILED),
+                    _ => None,
+                });
 
             let mut row = div()
                 .flex()
@@ -124,20 +126,10 @@ fn render_section(
                 .gap(px(4.0))
                 .text_xs()
                 .text_color(palette::TEXT_MUTED)
-                .child(
-                    div()
-                        .flex_1()
-                        .child(asset.name.clone()),
-                );
+                .child(div().flex_1().child(asset.name.clone()));
 
             if let Some(color) = dot_color {
-                row = row.child(
-                    div()
-                        .w(px(8.0))
-                        .h(px(8.0))
-                        .rounded_full()
-                        .bg(color),
-                );
+                row = row.child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(color));
             }
 
             list = list.child(row);

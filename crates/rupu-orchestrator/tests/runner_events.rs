@@ -135,17 +135,18 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         events.len(),
         6,
         "expected 6 events for a two-step run, got {:?}",
-        events
-            .iter()
-            .map(|e| format!("{e:?}"))
-            .collect::<Vec<_>>()
+        events.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>()
     );
 
     // Verify ordering: StepStarted always precedes its StepCompleted.
     assert!(matches!(events[1], Event::StepStarted { step_id: ref s, .. } if s == "alpha"));
-    assert!(matches!(events[2], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "alpha"));
+    assert!(
+        matches!(events[2], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "alpha")
+    );
     assert!(matches!(events[3], Event::StepStarted { step_id: ref s, .. } if s == "beta"));
-    assert!(matches!(events[4], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "beta"));
+    assert!(
+        matches!(events[4], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "beta")
+    );
 }
 
 #[tokio::test]
@@ -193,10 +194,13 @@ steps:
     //              StepSkipped(never), RunCompleted.
     assert!(matches!(events.first(), Some(Event::RunStarted { .. })));
     assert!(matches!(events.last(), Some(Event::RunCompleted { .. })));
-    let has_skipped = events.iter().any(|e| {
-        matches!(e, Event::StepSkipped { step_id, .. } if step_id == "never")
-    });
-    assert!(has_skipped, "expected StepSkipped for 'never' step, got: {events:?}");
+    let has_skipped = events
+        .iter()
+        .any(|e| matches!(e, Event::StepSkipped { step_id, .. } if step_id == "never"));
+    assert!(
+        has_skipped,
+        "expected StepSkipped for 'never' step, got: {events:?}"
+    );
 }
 
 #[tokio::test]

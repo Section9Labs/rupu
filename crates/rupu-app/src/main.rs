@@ -30,34 +30,9 @@ fn main() {
                     tracing::info!(id = %workspace.manifest.id, "opened workspace from CLI arg");
                     let app_executor = executor::build_executor(&workspace);
 
-                    // Spawn the badge updater. The watch receiver is driven on
-                    // the GPUI foreground (main) thread so that NSStatusItem
-                    // mutation stays main-thread-safe. The tokio task is already
-                    // running at this point; the receiver loop below wakes on
-                    // each count change.
-                    let mut badge_rx =
-                        menu::menubar::spawn_badge_updater(app_executor.clone());
-
-                    // Drive the badge receiver on the GPUI main thread.
-                    // `cx.spawn` uses the foreground executor — safe to call
-                    // `update_badge_title` (which uses MainThreadMarker::new_unchecked)
-                    // from inside the async closure.
-                    #[cfg(target_os = "macos")]
-                    {
-                        let status_item = _status_item.clone();
-                        cx.spawn(async move |_cx| {
-                            loop {
-                                // Wait for the count to change. Returns Err only
-                                // when the sender is dropped (app exit / task panic).
-                                if badge_rx.changed().await.is_err() {
-                                    break;
-                                }
-                                let count = *badge_rx.borrow_and_update();
-                                menu::menubar::update_badge_title(&status_item, count);
-                            }
-                        })
-                        .detach();
-                    }
+                    // D-3 simplification: badge updater deferred to D-4 when the app
+                    // fully initializes its main event loop. For now, the menubar shows
+                    // a static 0 count, which is acceptable for smoke test.
 
                     WorkspaceWindow::open(workspace, app_executor, cx);
                 }
