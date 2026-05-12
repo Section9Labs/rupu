@@ -11,6 +11,5 @@
 pub mod git_graph;
 pub mod node_status;
 
-// re-enabled by Task 3 once the items exist.
-// pub use git_graph::{render_rows, BranchGlyph, GraphCell, GraphRow};
-// pub use node_status::NodeStatus;
+pub use git_graph::{render_rows, BranchGlyph, GraphCell, GraphRow};
+pub use node_status::NodeStatus;
