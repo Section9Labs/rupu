@@ -3,4 +3,5 @@
 //! lives in main.rs.
 
 pub mod palette;
+pub mod window;
 pub mod workspace;
