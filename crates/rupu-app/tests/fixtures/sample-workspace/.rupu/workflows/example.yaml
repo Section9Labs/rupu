@@ -1,0 +1,6 @@
+name: example
+description: D-1 smoke fixture — content is not parsed by the app shell.
+steps:
+  - id: hello
+    agent: example
+    prompt: hi
