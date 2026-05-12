@@ -15,3 +15,4 @@ pub mod in_process;
 pub mod file_tail;
 
 pub use errors::ExecutorError;
+pub use event::Event;
