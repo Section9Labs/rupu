@@ -8,6 +8,7 @@ use crate::menu::app_menu::{ApproveFocused, RejectFocused};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
+use crate::window::sidebar::ActiveRunMap;
 use crate::workspace::Workspace;
 use gpui::{
     div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, WeakEntity,
@@ -213,6 +214,58 @@ impl WorkspaceWindow {
         })
         .detach();
     }
+
+    /// Returns the path of the workflow currently displayed in the main area,
+    /// i.e. the first workflow in the project asset list. D-3 simplification:
+    /// the app always shows `workflows.first()`; a later task will add
+    /// per-row click selection.
+    pub fn current_workflow_path(&self) -> Option<PathBuf> {
+        self.workspace
+            .project_assets
+            .workflows
+            .first()
+            .map(|a| a.path.clone())
+    }
+
+    /// Called when the user clicks the Run button in the toolbar.
+    /// Starts a new workflow run and subscribes to its event stream.
+    pub fn handle_run_clicked(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.current_workflow_path() else { return };
+        let app_exec = self.app_executor.clone();
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            match app_exec.start_workflow(path.clone()).await {
+                Ok(run_id) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.run_model = Some(crate::run_model::RunModel::new(
+                            run_id.clone(),
+                            path.clone(),
+                        ));
+                        cx.notify();
+                    });
+                    // Subscribe to the new run's event stream and apply events.
+                    if let Ok(mut stream) = app_exec.attach(&run_id).await {
+                        use futures_util::StreamExt;
+                        while let Some(ev) = stream.next().await {
+                            let res = this.update(cx, |this, cx| {
+                                if let Some(m) = this.run_model.take() {
+                                    this.run_model = Some(m.apply(&ev));
+                                }
+                                cx.notify();
+                            });
+                            if res.is_err() {
+                                break; // window closed
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "start_workflow failed");
+                }
+            }
+        })
+        .detach();
+    }
 }
 
 impl Render for WorkspaceWindow {
@@ -243,14 +296,35 @@ impl Render for WorkspaceWindow {
                     .ok();
             });
 
+        // Build active-run map for the sidebar status dots. We query the
+        // executor once per frame for all workflows in the project asset list.
+        let active_run_map: ActiveRunMap = self
+            .workspace
+            .project_assets
+            .workflows
+            .iter()
+            .chain(self.workspace.global_assets.workflows.iter())
+            .filter_map(|asset| {
+                let runs = self.app_executor.list_active_runs(Some(asset.path.clone()));
+                runs.into_iter().next().map(|r| (asset.path.clone(), r.status))
+            })
+            .collect();
+
         let main_area = match self.workspace.project_assets.workflows.first() {
-            Some(asset) => render_main_for_workflow(
-                asset,
-                run_model.as_ref(),
-                &transcript_lines,
-                on_approve.clone(),
-                on_reject.clone(),
-            ),
+            Some(asset) => {
+                let wf_path = asset.path.clone();
+                let has_active = active_run_map.contains_key(&wf_path);
+                let weak_run = cx.weak_entity();
+                render_main_for_workflow(
+                    asset,
+                    run_model.as_ref(),
+                    &transcript_lines,
+                    on_approve.clone(),
+                    on_reject.clone(),
+                    has_active,
+                    weak_run,
+                )
+            }
             None => render_main_placeholder(),
         };
 
@@ -287,7 +361,7 @@ impl Render for WorkspaceWindow {
                     .flex()
                     .flex_row()
                     .flex_1()
-                    .child(sidebar::render(&self.workspace))
+                    .child(sidebar::render(&self.workspace, &active_run_map))
                     .child(main_area),
             )
     }
@@ -310,6 +384,8 @@ fn render_main_for_workflow(
     transcript_lines: &[TranscriptLine],
     on_approve: ApproveCallback,
     on_reject: RejectCallback,
+    has_active_run: bool,
+    weak: WeakEntity<WorkspaceWindow>,
 ) -> AnyElement {
     use rupu_orchestrator::Workflow;
 
@@ -331,17 +407,64 @@ fn render_main_for_workflow(
     let default_model = crate::run_model::RunModel::new(String::new(), asset.path.clone());
     let model = run_model.unwrap_or(&default_model);
 
+    // Toolbar: workflow name on the left, Run button on the right.
+    // The Run button is greyed and non-interactive when a run is already active.
+    let run_btn_bg = if has_active_run {
+        palette::BG_SIDEBAR
+    } else {
+        palette::RUNNING
+    };
+    let mut run_btn = div()
+        .id("run-workflow")
+        .px(px(12.0))
+        .py(px(6.0))
+        .bg(run_btn_bg)
+        .text_color(palette::TEXT_PRIMARY)
+        .child("Run");
+    if !has_active_run {
+        run_btn = run_btn.cursor_pointer().on_click(move |_ev, _window, cx| {
+            weak.update(cx, |this, cx| {
+                this.handle_run_clicked(cx);
+            })
+            .ok();
+        });
+    }
+
+    let toolbar = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .px(px(24.0))
+        .py(px(8.0))
+        .bg(palette::BG_PRIMARY)
+        .border_b_1()
+        .border_color(palette::BORDER)
+        .child(
+            div()
+                .flex_1()
+                .text_color(palette::TEXT_PRIMARY)
+                .child(wf.name.clone()),
+        )
+        .child(run_btn);
+
     div()
         .flex_1()
         .flex()
-        .flex_row()
-        .child(crate::view::graph::render(&wf, model, on_approve.clone()))
-        .child(crate::view::drilldown::render(
-            model,
-            transcript_lines,
-            on_approve,
-            on_reject,
-        ))
+        .flex_col()
+        .child(toolbar)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .child(crate::view::graph::render(&wf, model, on_approve.clone()))
+                .child(crate::view::drilldown::render(
+                    model,
+                    transcript_lines,
+                    on_approve,
+                    on_reject,
+                )),
+        )
         .into_any_element()
 }
 
