@@ -1,0 +1,76 @@
+---
+source: crates/rupu-app-canvas/tests/git_graph_snapshots.rs
+assertion_line: 60
+expression: rows
+---
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: classify
+    - Space: 2
+    - Meta: classifier
+- cells:
+    - Pipe: waiting
+- cells:
+    - Branch:
+        - Mid
+        - waiting
+    - Branch:
+        - Top
+        - waiting
+    - Space: 1
+    - Label: review_panel
+    - Space: 2
+    - Meta: panel · 3 panelists
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Pipe: waiting
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Bullet: waiting
+    - Branch:
+        - Mid
+        - waiting
+    - Space: 1
+    - Label: security-reviewer
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Bullet: waiting
+    - Branch:
+        - Mid
+        - waiting
+    - Space: 1
+    - Label: perf-reviewer
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Bullet: waiting
+    - Branch:
+        - Mid
+        - waiting
+    - Space: 1
+    - Label: style-reviewer
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Pipe: waiting
+- cells:
+    - Pipe: waiting
+    - Space: 1
+    - Branch:
+        - Merge
+        - waiting
+    - Branch:
+        - Bot
+        - waiting
+- cells:
+    - Pipe: waiting
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: aggregate
+    - Space: 2
+    - Meta: findings-aggregator

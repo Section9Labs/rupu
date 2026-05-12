@@ -1,0 +1,27 @@
+---
+source: crates/rupu-app-canvas/tests/git_graph_snapshots.rs
+assertion_line: 34
+expression: rows
+---
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: classify
+    - Space: 2
+    - Meta: classifier
+- cells:
+    - Pipe: waiting
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: review
+    - Space: 2
+    - Meta: reviewer
+- cells:
+    - Pipe: waiting
+- cells:
+    - Bullet: waiting
+    - Space: 2
+    - Label: publish
+    - Space: 2
+    - Meta: publisher
