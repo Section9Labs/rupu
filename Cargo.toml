@@ -113,6 +113,13 @@ assert_cmd = "2"
 predicates = "3"
 httpmock = "0.7"
 
+# Native macOS app (Slice D)
+gpui = { git = "https://github.com/zed-industries/zed.git", rev = "1a2e50e3f222ae7d223acf718d2e8384a9b7fbe6" }
+directories = "5"
+objc2 = "0.5"
+objc2-app-kit = "0.2"
+objc2-foundation = "0.2"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
