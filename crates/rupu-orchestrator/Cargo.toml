@@ -23,6 +23,7 @@ minijinja.workspace = true
 ulid.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
+futures-util.workspace = true
 
 # In-workspace
 rupu-agent = { path = "../rupu-agent" }

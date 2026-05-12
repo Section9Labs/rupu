@@ -19,3 +19,6 @@ pub use event::Event;
 pub use jsonl_sink::JsonlSink;
 pub use in_memory_sink::InMemorySink;
 pub use sink::{EventSink, FanOutSink};
+pub use in_process::{
+    EventStream, InProcessExecutor, RunFilter, RunHandle, WorkflowExecutor, WorkflowRunOpts,
+};
