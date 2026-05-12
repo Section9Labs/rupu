@@ -1,0 +1,58 @@
+[package]
+name = "rupu-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "rupu_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rupu-app"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+directories.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+ulid.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = [
+    "NSApplication",
+    "NSButton",
+    "NSControl",
+    "NSOpenPanel",
+    "NSPanel",
+    "NSResponder",
+    "NSSavePanel",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+    "NSWindow",
+] }
+objc2-foundation.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serial_test.workspace = true
+
+# rupu-app calls into Apple's AppKit via objc2 raw bindings on macOS
+# (NSStatusItem menubar stub). The FFI module opts in via
+# #[allow(unsafe_code)]. All other crates remain "forbid".
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

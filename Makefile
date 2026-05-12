@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync gh-build bump fmt lint test gates tui-smoke clean help
+.PHONY: build release sign-dev sign-release run install sync gh-build bump fmt lint test gates tui-smoke app-smoke clean help
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -114,6 +114,20 @@ tui-smoke:
 	@sh -c 'RUPU_TUI_DEFAULT_VIEW=tree ./target/release/rupu watch run_smoke --replay --pace=5 & PID=$$; sleep 5; kill $$PID 2>/dev/null || true; wait $$PID 2>/dev/null' || true
 	@echo "tui-smoke OK"
 
+# rupu.app — headless smoke test. Builds the binary, launches it
+# against the bundled fixture workspace, waits 4 seconds for the
+# window to render, then SIGTERMs. Asserts no panic on stderr.
+app-smoke:
+	@cargo build --release -p rupu-app
+	@FIXTURE="$$(pwd)/crates/rupu-app/tests/fixtures/sample-workspace"; \
+	OUTPUT=$$(timeout 4 ./target/release/rupu-app "$$FIXTURE" 2>&1 || true); \
+	if echo "$$OUTPUT" | grep -qE 'panic|panicked'; then \
+		echo "app-smoke FAIL — panic in output:"; \
+		echo "$$OUTPUT"; \
+		exit 1; \
+	fi
+	@echo "app-smoke OK"
+
 help:
 	@echo "rupu Makefile targets:"
 	@echo ""
@@ -131,6 +145,7 @@ help:
 	@echo "  test           cargo test --workspace"
 	@echo "  gates          fmt + lint + test (same as the release-ready check)"
 	@echo "  tui-smoke      headless 5-second TUI smoke against bundled fixture"
+	@echo "  app-smoke      headless 4-second app smoke against bundled fixture"
 	@echo "  clean          cargo clean"
 	@echo ""
 	@echo "Refresh-my-install flow:  make sync && make install"

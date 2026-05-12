@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rupu-app",
     "crates/rupu-transcript",
     "crates/rupu-runtime",
     "crates/rupu-config",
@@ -23,6 +24,7 @@ version = "0.5.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/section9labs/rupu"
+authors = ["Section9Labs"]
 rust-version = "1.88"
 
 [workspace.dependencies]
@@ -112,6 +114,15 @@ assert_fs = "1"
 assert_cmd = "2"
 predicates = "3"
 httpmock = "0.7"
+serial_test = "3"
+
+# Native macOS app (Slice D)
+gpui = { git = "https://github.com/zed-industries/zed.git", rev = "1a2e50e3f222ae7d223acf718d2e8384a9b7fbe6" }
+gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "1a2e50e3f222ae7d223acf718d2e8384a9b7fbe6", features = ["runtime_shaders"] }
+directories = "5"
+objc2 = "0.5"
+objc2-app-kit = "0.2"
+objc2-foundation = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
