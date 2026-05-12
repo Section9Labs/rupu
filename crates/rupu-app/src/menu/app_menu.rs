@@ -3,9 +3,9 @@
 
 use crate::window::WorkspaceWindow;
 use crate::workspace::Workspace;
-use gpui::{actions, App, Menu, MenuItem};
+use gpui::{actions, App, KeyBinding, Menu, MenuItem};
 
-actions!(rupu_app, [NewWorkspace, OpenWorkspace, Quit]);
+actions!(rupu_app, [NewWorkspace, OpenWorkspace, Quit, ApproveFocused, RejectFocused]);
 
 /// Register the menu and wire its action handlers. Call once on app boot.
 pub fn install(cx: &mut App) {
@@ -17,6 +17,14 @@ pub fn install(cx: &mut App) {
             MenuItem::action("Quit rupu", Quit),
         ]),
     )])]);
+
+    // Keyboard shortcuts for approval — `a` to approve, `r` to reject.
+    // These only fire when a step is focused and in the Awaiting state;
+    // the guard lives in the WorkspaceWindow render's on_action handlers.
+    cx.bind_keys(vec![
+        KeyBinding::new("a", ApproveFocused, None),
+        KeyBinding::new("r", RejectFocused, None),
+    ]);
 
     cx.on_action(|_: &NewWorkspace, cx| {
         if let Some(dir) = pick_directory_modal("Choose a directory for the new workspace") {

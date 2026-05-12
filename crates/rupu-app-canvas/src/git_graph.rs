@@ -28,6 +28,21 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphRow {
     pub cells: Vec<GraphCell>,
+    /// If this row represents a named step, this is its `(step_id, status)`.
+    /// `None` for pure-connector rows (spine pipes, panel spacers, merge lines).
+    pub anchor: Option<(String, NodeStatus)>,
+}
+
+impl GraphRow {
+    /// Return the anchor step id, if any.
+    pub fn anchor_step_id(&self) -> Option<&str> {
+        self.anchor.as_ref().map(|(id, _)| id.as_str())
+    }
+
+    /// Return the anchor step status, if any.
+    pub fn anchor_status(&self) -> Option<NodeStatus> {
+        self.anchor.as_ref().map(|(_, status)| *status)
+    }
 }
 
 /// One typed cell within a row. The renderer maps each variant to a
@@ -140,7 +155,10 @@ fn emit_linear_step<F: Fn(&str) -> NodeStatus>(
         cells.push(GraphCell::Space(2));
         cells.push(GraphCell::Meta(meta));
     }
-    rows.push(GraphRow { cells });
+    rows.push(GraphRow {
+        cells,
+        anchor: Some((step_id.to_string(), status)),
+    });
 }
 
 /// Emit a panel block: header row + spacer + one row per panelist + spacer + close row.
@@ -170,6 +188,7 @@ fn emit_panel_step<F: Fn(&str) -> NodeStatus>(
                 if n == 1 { "" } else { "s" }
             )),
         ],
+        anchor: Some((step_id.to_string(), panel_status)),
     });
 
     // Spacer: │ │
@@ -179,6 +198,7 @@ fn emit_panel_step<F: Fn(&str) -> NodeStatus>(
             GraphCell::Space(1),
             GraphCell::Pipe(panel_status),
         ],
+        anchor: None,
     });
 
     // One row per panelist: │ ●─ <agent>
@@ -194,6 +214,7 @@ fn emit_panel_step<F: Fn(&str) -> NodeStatus>(
                 GraphCell::Space(1),
                 GraphCell::Label(agent.clone()),
             ],
+            anchor: Some((agent.clone(), panelist_status)),
         });
     }
 
@@ -204,6 +225,7 @@ fn emit_panel_step<F: Fn(&str) -> NodeStatus>(
             GraphCell::Space(1),
             GraphCell::Pipe(panel_status),
         ],
+        anchor: None,
     });
 
     // Close row: │ ◄─╯
@@ -214,6 +236,7 @@ fn emit_panel_step<F: Fn(&str) -> NodeStatus>(
             GraphCell::Branch(BranchGlyph::Merge, panel_status),
             GraphCell::Branch(BranchGlyph::Bot, panel_status),
         ],
+        anchor: None,
     });
 }
 
@@ -221,6 +244,7 @@ fn emit_panel_step<F: Fn(&str) -> NodeStatus>(
 fn spine_only() -> GraphRow {
     GraphRow {
         cells: vec![GraphCell::Pipe(NodeStatus::Waiting)],
+        anchor: None,
     }
 }
 

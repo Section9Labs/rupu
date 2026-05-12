@@ -4,6 +4,7 @@
 //! (no col×row grid for D-2 — that lives in D-6's Canvas view).
 
 use crate::palette;
+use crate::view::ApproveCallback;
 use gpui::{div, prelude::*, px, AnyElement, IntoElement, Rgba};
 use rupu_app_canvas::{GraphCell, GraphRow, NodeStatus};
 use rupu_orchestrator::Workflow;
@@ -13,7 +14,14 @@ use rupu_orchestrator::Workflow;
 /// `model`. For a static (no live run) view, pass a default
 /// `RunModel` whose `nodes` map is empty — all nodes render as
 /// `Waiting`.
-pub fn render(workflow: &Workflow, model: &crate::run_model::RunModel) -> impl IntoElement {
+///
+/// `on_approve` is invoked with the `step_id` when the user clicks
+/// the approve button on an awaiting node.
+pub fn render(
+    workflow: &Workflow,
+    model: &crate::run_model::RunModel,
+    on_approve: ApproveCallback,
+) -> impl IntoElement {
     let rows = rupu_app_canvas::render_rows(workflow, |id| {
         model.nodes.get(id).copied().unwrap_or(NodeStatus::Waiting)
     });
@@ -28,13 +36,13 @@ pub fn render(workflow: &Workflow, model: &crate::run_model::RunModel) -> impl I
         .gap(px(2.0));
 
     for row in &rows {
-        container = container.child(render_row(row));
+        container = container.child(render_row(row, on_approve.clone()));
     }
 
     container
 }
 
-fn render_row(row: &GraphRow) -> AnyElement {
+fn render_row(row: &GraphRow, on_approve: ApproveCallback) -> AnyElement {
     let mut hbox = div()
         .flex()
         .flex_row()
@@ -46,6 +54,28 @@ fn render_row(row: &GraphRow) -> AnyElement {
 
     for cell in &row.cells {
         hbox = hbox.child(render_cell(cell));
+    }
+
+    // Append an inline approve pill button when this row is an Awaiting anchor.
+    if let Some((step_id, NodeStatus::Awaiting)) = &row.anchor {
+        let step_id = step_id.clone();
+        hbox = hbox
+            .child(div().w(px(12.0))) // spacer before pill
+            .child(
+                div()
+                    .id(gpui::SharedString::from(format!("approve-inline-{step_id}")))
+                    .px(px(8.0))
+                    .py(px(2.0))
+                    .bg(palette::COMPLETE)
+                    .text_color(palette::TEXT_PRIMARY)
+                    .text_sm()
+                    .font_family("Menlo")
+                    .child("✓ Approve")
+                    .cursor_pointer()
+                    .on_click(move |_event, window, cx| {
+                        on_approve(step_id.clone(), window, cx);
+                    }),
+            );
     }
 
     hbox.into_any_element()

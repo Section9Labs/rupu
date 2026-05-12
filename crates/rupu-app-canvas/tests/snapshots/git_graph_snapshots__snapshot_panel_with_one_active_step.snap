@@ -8,8 +8,12 @@ expression: rows
     - Label: classify
     - Space: 2
     - Meta: classifier
+  anchor:
+    - classify
+    - complete
 - cells:
     - Pipe: waiting
+  anchor: ~
 - cells:
     - Branch:
         - Mid
@@ -21,10 +25,14 @@ expression: rows
     - Label: review_panel
     - Space: 2
     - Meta: panel · 2 panelists
+  anchor:
+    - review_panel
+    - active
 - cells:
     - Pipe: active
     - Space: 1
     - Pipe: active
+  anchor: ~
 - cells:
     - Pipe: active
     - Space: 1
@@ -34,6 +42,9 @@ expression: rows
         - working
     - Space: 1
     - Label: sec
+  anchor:
+    - sec
+    - working
 - cells:
     - Pipe: active
     - Space: 1
@@ -43,10 +54,14 @@ expression: rows
         - waiting
     - Space: 1
     - Label: perf
+  anchor:
+    - perf
+    - waiting
 - cells:
     - Pipe: active
     - Space: 1
     - Pipe: active
+  anchor: ~
 - cells:
     - Pipe: active
     - Space: 1
@@ -56,3 +71,4 @@ expression: rows
     - Branch:
         - Bot
         - active
+  anchor: ~

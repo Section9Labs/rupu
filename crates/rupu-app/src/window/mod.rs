@@ -4,12 +4,14 @@ pub mod sidebar;
 pub mod titlebar;
 
 use crate::executor::AppExecutor;
+use crate::menu::app_menu::{ApproveFocused, RejectFocused};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
+use crate::view::{ApproveCallback, RejectCallback};
 use crate::workspace::Workspace;
 use gpui::{
-    div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, Window,
-    WindowBounds, WindowHandle, WindowOptions,
+    div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, WeakEntity,
+    Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -163,14 +165,113 @@ impl WorkspaceWindow {
     }
 }
 
+impl WorkspaceWindow {
+    /// Approve the awaiting step in the currently active run.
+    /// `step_id` is passed for forward-compatibility (the executor currently
+    /// operates at run granularity — the awaiting step is unambiguous).
+    pub fn handle_approve(&mut self, step_id: String, cx: &mut Context<Self>) {
+        let Some(model) = &self.run_model else { return };
+        // Guard: only fire when the step is actually Awaiting.
+        if model
+            .nodes
+            .get(&step_id)
+            .copied()
+            .unwrap_or(rupu_app_canvas::NodeStatus::Waiting)
+            != rupu_app_canvas::NodeStatus::Awaiting
+        {
+            return;
+        }
+        let run_id = model.run_id.clone();
+        let app_exec = self.app_executor.clone();
+        cx.spawn(async move |_this, _cx| {
+            if let Err(e) = app_exec.approve(&run_id, "rupu.app").await {
+                tracing::error!(error = %e, run_id = %run_id, "approve failed");
+            }
+        })
+        .detach();
+    }
+
+    /// Reject the awaiting step in the currently active run.
+    pub fn handle_reject(&mut self, step_id: String, reason: String, cx: &mut Context<Self>) {
+        let Some(model) = &self.run_model else { return };
+        // Guard: only fire when the step is actually Awaiting.
+        if model
+            .nodes
+            .get(&step_id)
+            .copied()
+            .unwrap_or(rupu_app_canvas::NodeStatus::Waiting)
+            != rupu_app_canvas::NodeStatus::Awaiting
+        {
+            return;
+        }
+        let run_id = model.run_id.clone();
+        let app_exec = self.app_executor.clone();
+        cx.spawn(async move |_this, _cx| {
+            if let Err(e) = app_exec.reject(&run_id, &reason).await {
+                tracing::error!(error = %e, run_id = %run_id, "reject failed");
+            }
+        })
+        .detach();
+    }
+}
+
 impl Render for WorkspaceWindow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let run_model = self.run_model.clone();
         let transcript_lines = self.transcript_lines.clone();
+
+        // Build approve / reject callbacks via WeakEntity so the closures
+        // can update `self` when invoked from click handlers. WeakEntity
+        // is Send + 'static, making it suitable for Arc<dyn Fn(...)> callbacks.
+        let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let weak2 = weak.clone();
+        let on_approve: ApproveCallback =
+            Arc::new(move |step_id: String, window: &mut Window, cx: &mut App| {
+                let _ = window;
+                weak.update(cx, |this, cx| {
+                    this.handle_approve(step_id, cx);
+                })
+                .ok();
+            });
+        let on_reject: RejectCallback =
+            Arc::new(move |step_id: String, reason: String, window: &mut Window, cx: &mut App| {
+                let _ = window;
+                weak2
+                    .update(cx, |this, cx| {
+                        this.handle_reject(step_id, reason, cx);
+                    })
+                    .ok();
+            });
+
         let main_area = match self.workspace.project_assets.workflows.first() {
-            Some(asset) => render_main_for_workflow(asset, run_model.as_ref(), &transcript_lines),
+            Some(asset) => render_main_for_workflow(
+                asset,
+                run_model.as_ref(),
+                &transcript_lines,
+                on_approve.clone(),
+                on_reject.clone(),
+            ),
             None => render_main_placeholder(),
         };
+
+        // Keyboard approval shortcuts — `a` to approve, `r` to reject.
+        // Only fire when `focused_step` is Some and Awaiting; the guard is
+        // inside handle_approve / handle_reject.
+        let focused_for_approve = self
+            .run_model
+            .as_ref()
+            .and_then(|m| m.focused_step.clone());
+        let focused_for_reject = focused_for_approve.clone();
+        let on_approve_kb = cx.listener(move |this, _: &ApproveFocused, _window, cx| {
+            if let Some(step) = &focused_for_approve {
+                this.handle_approve(step.clone(), cx);
+            }
+        });
+        let on_reject_kb = cx.listener(move |this, _: &RejectFocused, _window, cx| {
+            if let Some(step) = &focused_for_reject {
+                this.handle_reject(step.clone(), "rejected via keyboard".into(), cx);
+            }
+        });
 
         div()
             .size_full()
@@ -178,6 +279,8 @@ impl Render for WorkspaceWindow {
             .text_color(palette::TEXT_PRIMARY)
             .flex()
             .flex_col()
+            .on_action(on_approve_kb)
+            .on_action(on_reject_kb)
             .child(titlebar::render(&self.workspace))
             .child(
                 div()
@@ -205,6 +308,8 @@ fn render_main_for_workflow(
     asset: &crate::workspace::Asset,
     run_model: Option<&crate::run_model::RunModel>,
     transcript_lines: &[TranscriptLine],
+    on_approve: ApproveCallback,
+    on_reject: RejectCallback,
 ) -> AnyElement {
     use rupu_orchestrator::Workflow;
 
@@ -230,8 +335,13 @@ fn render_main_for_workflow(
         .flex_1()
         .flex()
         .flex_row()
-        .child(crate::view::graph::render(&wf, model))
-        .child(crate::view::drilldown::render(model, transcript_lines))
+        .child(crate::view::graph::render(&wf, model, on_approve.clone()))
+        .child(crate::view::drilldown::render(
+            model,
+            transcript_lines,
+            on_approve,
+            on_reject,
+        ))
         .into_any_element()
 }
 

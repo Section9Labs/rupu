@@ -1,6 +1,5 @@
 ---
 source: crates/rupu-app-canvas/tests/git_graph_snapshots.rs
-assertion_line: 74
 expression: rows
 ---
 - cells:
@@ -9,3 +8,6 @@ expression: rows
     - Label: hello
     - Space: 2
     - Meta: greeter
+  anchor:
+    - hello
+    - waiting
