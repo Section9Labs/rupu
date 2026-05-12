@@ -4,6 +4,7 @@
 pub mod executor;
 pub mod menu;
 pub mod palette;
+pub mod run_model;
 pub mod view;
 pub mod window;
 pub mod workspace;
