@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rupu-app-canvas",
     "crates/rupu-app",
     "crates/rupu-transcript",
     "crates/rupu-runtime",

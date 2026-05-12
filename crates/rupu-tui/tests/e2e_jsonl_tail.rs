@@ -68,6 +68,10 @@ fn tail_emits_run_update_when_run_json_changes() {
         worker_id: None,
         artifact_manifest_path: None,
         source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
     };
     std::fs::write(
         dir.path().join("run.json"),

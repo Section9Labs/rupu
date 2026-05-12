@@ -15,16 +15,18 @@ name = "rupu-app"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
 chrono.workspace = true
 directories.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
+rupu-app-canvas = { path = "../rupu-app-canvas" }
+rupu-orchestrator = { path = "../rupu-orchestrator" }
 serde = { workspace = true, features = ["derive"] }
 toml.workspace = true
-ulid.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ulid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

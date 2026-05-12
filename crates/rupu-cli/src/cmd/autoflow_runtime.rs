@@ -2,8 +2,8 @@ use crate::cmd::autoflow as legacy;
 use crate::cmd::workflow::{
     default_execution_worker_context, upsert_worker_record, ExecutionWorkerContext,
 };
-use crate::output::LineStreamPrinter;
 use crate::output::workflow_printer::tool_summary;
+use crate::output::LineStreamPrinter;
 use crate::paths;
 use anyhow::Context;
 use rupu_auth::CredentialResolver;

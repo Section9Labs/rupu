@@ -132,6 +132,10 @@ fn sample_run_record(
         worker_id: Some("worker_local_cli".into()),
         artifact_manifest_path: None,
         source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
     }
 }
 
