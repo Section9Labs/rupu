@@ -5,6 +5,7 @@ pub mod titlebar;
 
 use crate::executor::AppExecutor;
 use crate::palette;
+use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::workspace::Workspace;
 use gpui::{
     div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, Window,
@@ -22,6 +23,12 @@ pub struct WorkspaceWindow {
     /// when no run is active (D-2 static display). Populated by
     /// `on_workflow_clicked` from the AppExecutor event stream.
     pub run_model: Option<crate::run_model::RunModel>,
+    /// Buffered lines from the focused step's transcript JSONL.
+    /// Reset when a new transcript tail is started.
+    /// Simplification (D-3): the tail is spawned for the first focused
+    /// step only and not re-spawned on focus changes. A follow-up task
+    /// will add cancellation + re-spawn.
+    pub transcript_lines: Vec<TranscriptLine>,
 }
 
 impl WorkspaceWindow {
@@ -43,6 +50,7 @@ impl WorkspaceWindow {
                 workspace,
                 app_executor,
                 run_model: None,
+                transcript_lines: Vec::new(),
             })
         })
         .expect("open workspace window")
@@ -60,20 +68,85 @@ impl WorkspaceWindow {
             ));
             let app_executor = self.app_executor.clone();
             let run_id = run.id.clone();
+            let run_store = self.app_executor.run_store().clone();
             cx.spawn(async move |this, cx| {
                 match app_executor.attach(&run_id).await {
                     Ok(mut stream) => {
                         use futures_util::StreamExt;
                         while let Some(ev) = stream.next().await {
-                            let update_result = this.update(cx, |this, cx| {
+                            // Apply the event and capture whether focused_step
+                            // was just set for the first time.
+                            let maybe_transcript_path = this.update(cx, |this, cx| {
+                                let prev_focused = this
+                                    .run_model
+                                    .as_ref()
+                                    .and_then(|m| m.focused_step.clone());
                                 if let Some(m) = this.run_model.take() {
                                     this.run_model = Some(m.apply(&ev));
                                 }
+                                let new_focused = this
+                                    .run_model
+                                    .as_ref()
+                                    .and_then(|m| m.focused_step.clone());
                                 cx.notify();
+                                // Return the transcript path only if focus was
+                                // just set for the first time (prev None, now Some).
+                                // D-3 simplification: no re-spawn on subsequent
+                                // focus changes; that polish is deferred.
+                                if prev_focused.is_none() {
+                                    if let Some(step_id) = &new_focused {
+                                        // Use active_step_transcript_path from the
+                                        // RunRecord when present; otherwise derive
+                                        // from convention: <runs_root>/<run_id>/
+                                        // transcripts/<step_id>.jsonl.
+                                        let authoritative = run_store
+                                            .load(&run_id)
+                                            .ok()
+                                            .and_then(|r| r.active_step_transcript_path);
+                                        let path = authoritative.unwrap_or_else(|| {
+                                            run_store
+                                                .run_json_path(&run_id)
+                                                .parent()
+                                                .expect("run dir exists")
+                                                .join("transcripts")
+                                                .join(format!("{step_id}.jsonl"))
+                                        });
+                                        return Some(path);
+                                    }
+                                }
+                                None
                             });
-                            if update_result.is_err() {
-                                // Window was closed; stop draining.
-                                break;
+
+                            match maybe_transcript_path {
+                                Err(_) => break, // window closed
+                                Ok(Some(path)) => {
+                                    // Spawn the transcript tail for this step.
+                                    // Clone the weak handle and the AsyncApp so the
+                                    // inner future can push lines to the UI.
+                                    let this2 = this.clone();
+                                    let mut cx2 = cx.clone();
+                                    cx.spawn(async move |_cx| {
+                                        match TranscriptTail::open(&path).await {
+                                            Ok(mut tail) => {
+                                                use futures_util::StreamExt;
+                                                while let Some(line) = tail.next().await {
+                                                    let res = this2.update(&mut cx2, |this, cx| {
+                                                        this.transcript_lines.push(line);
+                                                        cx.notify();
+                                                    });
+                                                    if res.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(%e, path = ?path, "transcript tail open failed");
+                                            }
+                                        }
+                                    })
+                                    .detach();
+                                }
+                                Ok(None) => {} // no new focus
                             }
                         }
                     }
@@ -93,8 +166,9 @@ impl WorkspaceWindow {
 impl Render for WorkspaceWindow {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let run_model = self.run_model.clone();
+        let transcript_lines = self.transcript_lines.clone();
         let main_area = match self.workspace.project_assets.workflows.first() {
-            Some(asset) => render_main_for_workflow(asset, run_model.as_ref()),
+            Some(asset) => render_main_for_workflow(asset, run_model.as_ref(), &transcript_lines),
             None => render_main_placeholder(),
         };
 
@@ -130,6 +204,7 @@ fn render_main_placeholder() -> AnyElement {
 fn render_main_for_workflow(
     asset: &crate::workspace::Asset,
     run_model: Option<&crate::run_model::RunModel>,
+    transcript_lines: &[TranscriptLine],
 ) -> AnyElement {
     use rupu_orchestrator::Workflow;
 
@@ -153,7 +228,10 @@ fn render_main_for_workflow(
 
     div()
         .flex_1()
+        .flex()
+        .flex_row()
         .child(crate::view::graph::render(&wf, model))
+        .child(crate::view::drilldown::render(model, transcript_lines))
         .into_any_element()
 }
 

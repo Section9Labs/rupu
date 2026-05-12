@@ -4,4 +4,6 @@
 //! data structure. D-2 ships `graph` (vertical git-graph). D-5 / D-6
 //! / D-8 add YAML / Canvas / Transcript.
 
+pub mod drilldown;
 pub mod graph;
+pub mod transcript_tail;
