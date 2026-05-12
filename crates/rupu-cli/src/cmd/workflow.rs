@@ -4,7 +4,7 @@
 //! `<project>/.rupu/workflows/*.yaml`; project entries shadow global by
 //! filename. `show` prints the YAML body. `run` parses the workflow,
 //! builds a [`StepFactory`] that wires real providers via
-//! [`provider_factory::build_for_provider`], and dispatches
+//! [`rupu_runtime::provider_factory::build_for_provider`], and dispatches
 //! [`rupu_orchestrator::run_workflow`].
 //!
 //! The factory carries a clone of the parsed [`Workflow`] so each
@@ -12,13 +12,13 @@
 
 use crate::cmd::completers::workflow_names;
 use crate::paths;
-use crate::provider_factory;
 use async_trait::async_trait;
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts, StepFactory};
 use rupu_orchestrator::RunWorkflowError;
+use rupu_runtime::provider_factory;
 use rupu_runtime::{
     ArtifactKind, ArtifactManifest, ArtifactRef, AutoflowEnvelope, ExecutionBackend,
     ExecutionRequest, PreparedRun, RepoBinding, RunContext, RunCorrelation, RunEnvelope, RunKind,
@@ -805,7 +805,7 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         Arc::clone(&store),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
-    let factory = Arc::new(CliStepFactory {
+    let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
         project_root: project_root.clone(),
@@ -1790,7 +1790,7 @@ async fn execute_workflow_invocation(
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
-    let factory = Arc::new(CliStepFactory {
+    let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
         project_root: ctx.project_root.clone(),
@@ -2101,12 +2101,12 @@ async fn post_run_summary_to_issue(
 
 /// `StepFactory` impl that resolves each step's `agent:` against
 /// the project- and global-scope `agents/` dirs and constructs a
-/// real provider via [`provider_factory::build_for_provider`].
+/// real provider via [`rupu_runtime::provider_factory::build_for_provider`].
 ///
 /// `mcp_registry` is built once in the `run` function and shared
 /// across all steps; this avoids redundant credential probes and
 /// ensures consistent SCM tool availability throughout the workflow.
-struct CliStepFactory {
+pub struct DefaultStepFactory {
     workflow: Workflow,
     global: PathBuf,
     project_root: Option<PathBuf>,
@@ -2126,7 +2126,7 @@ struct CliStepFactory {
 }
 
 #[async_trait]
-impl StepFactory for CliStepFactory {
+impl StepFactory for DefaultStepFactory {
     async fn build_opts_for_step(
         &self,
         step_id: &str,

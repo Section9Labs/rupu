@@ -11,7 +11,6 @@ pub mod logging;
 pub mod output;
 pub mod paths;
 pub mod pricing;
-pub mod provider_factory;
 pub mod run_target;
 pub mod standalone_run_metadata;
 pub mod templates;

@@ -1,7 +1,7 @@
 //! `AppStepFactory` — minimal D-3 smoke factory for the native app.
 //!
 //! Production-quality provider wiring (keychain, OAuth, SCM registry)
-//! lives in `CliStepFactory` in `rupu-cli`. For D-3 the app needs a
+//! lives in `DefaultStepFactory` in `rupu-cli`. For D-3 the app needs a
 //! `StepFactory` that satisfies the trait contract so `AppExecutor::new`
 //! can be constructed; real provider wiring follows in a later slice
 //! when the app gains its own credential flow.

@@ -1,8 +1,8 @@
 use rupu_auth::backend::ProviderId;
 use rupu_auth::in_memory::InMemoryResolver;
 use rupu_auth::stored::StoredCredential;
-use rupu_cli::provider_factory::build_for_provider;
 use rupu_providers::AuthMode;
+use rupu_runtime::provider_factory::build_for_provider;
 
 /// Test-only seam consumed by `build_anthropic` to redirect the Anthropic
 /// Messages endpoint at an httpmock server. Mirrors the

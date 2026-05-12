@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+publish = false
 
 [lints]
 workspace = true
@@ -17,7 +19,19 @@ ulid.workspace = true
 sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+
+# In-workspace (needed by provider_factory)
+rupu-providers = { path = "../rupu-providers" }
+rupu-auth = { path = "../rupu-auth" }
+rupu-agent = { path = "../rupu-agent" }
 
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+rupu-auth = { path = "../rupu-auth" }
+rupu-providers = { path = "../rupu-providers" }
