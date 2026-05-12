@@ -18,6 +18,7 @@ path = "src/main.rs"
 chrono.workspace = true
 directories.workspace = true
 gpui.workspace = true
+gpui_platform.workspace = true
 serde = { workspace = true, features = ["derive"] }
 toml.workspace = true
 ulid.workspace = true
