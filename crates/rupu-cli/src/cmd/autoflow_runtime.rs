@@ -2,20 +2,25 @@ use crate::cmd::autoflow as legacy;
 use crate::cmd::workflow::{
     default_execution_worker_context, upsert_worker_record, ExecutionWorkerContext,
 };
+use crate::output::LineStreamPrinter;
+use crate::output::workflow_printer::tool_summary;
 use crate::paths;
 use anyhow::Context;
 use rupu_auth::CredentialResolver;
+use rupu_orchestrator::RunStore;
 use rupu_runtime::{
     AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleMode, AutoflowCycleRecord,
     AutoflowHistoryStore, WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeSource,
     WakeStore,
 };
+use rupu_transcript::{Event as TranscriptEvent, JsonlReader};
 use rupu_workspace::{
     AutoflowClaimRecord, AutoflowClaimStore, ClaimStatus, RepoRegistryStore, WorkerKind,
 };
+use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickReport {
@@ -28,18 +33,26 @@ pub struct TickReport {
     pub cleaned_claims: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
+pub struct TickOutcome {
+    pub report: TickReport,
+    pub cycle: AutoflowCycleRecord,
+}
+
+#[derive(Clone, Default)]
 pub struct TickOptions {
     pub repo_filter: Option<String>,
     pub worker: Option<ExecutionWorkerContext>,
+    pub shared_printer: Option<Arc<Mutex<LineStreamPrinter>>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ServeOptions {
     pub repo_filter: Option<String>,
     pub worker_name: Option<String>,
     pub idle_sleep: std::time::Duration,
     pub max_cycles: Option<usize>,
+    pub shared_printer: Option<Arc<Mutex<LineStreamPrinter>>>,
 }
 
 impl Default for ServeOptions {
@@ -49,6 +62,7 @@ impl Default for ServeOptions {
             worker_name: None,
             idle_sleep: std::time::Duration::from_secs(10),
             max_cycles: None,
+            shared_printer: None,
         }
     }
 }
@@ -59,16 +73,88 @@ pub struct ServeReport {
     pub total: TickReport,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LiveCycleRecorder {
+    history_store: AutoflowHistoryStore,
+    seed: AutoflowCycleRecord,
+    events: Arc<Mutex<Vec<AutoflowCycleEvent>>>,
+    appended: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl LiveCycleRecorder {
+    fn new(history_store: AutoflowHistoryStore, seed: AutoflowCycleRecord) -> Self {
+        Self {
+            history_store,
+            seed,
+            events: Arc::new(Mutex::new(Vec::new())),
+            appended: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+
+    pub(crate) fn record_event(&self, event: AutoflowCycleEvent) -> anyhow::Result<()> {
+        let key = cycle_event_key(&event);
+        {
+            let appended = self
+                .appended
+                .lock()
+                .map_err(|_| anyhow::anyhow!("live cycle recorder poisoned"))?;
+            if appended.contains(&key) {
+                return Ok(());
+            }
+        }
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("live cycle recorder poisoned"))?;
+        events.push(event.clone());
+        dedupe_cycle_events(&mut events);
+        drop(events);
+        self.history_store
+            .append_cycle_event(&self.seed, event, chrono::Utc::now())?;
+        self.appended
+            .lock()
+            .map_err(|_| anyhow::anyhow!("live cycle recorder poisoned"))?
+            .insert(key);
+        Ok(())
+    }
+
+    fn snapshot_events(&self) -> Vec<AutoflowCycleEvent> {
+        self.events
+            .lock()
+            .map(|events| events.clone())
+            .unwrap_or_default()
+    }
+
+    fn append_missing_events(&self, cycle: &AutoflowCycleRecord) -> anyhow::Result<()> {
+        let mut appended = self
+            .appended
+            .lock()
+            .map_err(|_| anyhow::anyhow!("live cycle recorder poisoned"))?;
+        for event in &cycle.events {
+            let key = cycle_event_key(event);
+            if appended.contains(&key) {
+                continue;
+            }
+            self.history_store
+                .append_cycle_event(cycle, event.clone(), chrono::Utc::now())?;
+            appended.insert(key);
+        }
+        Ok(())
+    }
+}
+
 pub(crate) async fn tick_with_resolver(
     resolver: Arc<dyn CredentialResolver>,
 ) -> anyhow::Result<TickReport> {
-    tick_with_options(resolver, TickOptions::default()).await
+    Ok(tick_with_options(resolver, TickOptions::default())
+        .await?
+        .report)
 }
 
 pub(crate) async fn tick_with_options(
     resolver: Arc<dyn CredentialResolver>,
     options: TickOptions,
-) -> anyhow::Result<TickReport> {
+) -> anyhow::Result<TickOutcome> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let tick_started_at = chrono::Utc::now();
@@ -80,6 +166,13 @@ pub(crate) async fn tick_with_options(
         cycle_record.worker_name = Some(worker.name.clone());
     }
 
+    let serve_mode = matches!(cycle_mode(&options), AutoflowCycleMode::Serve);
+    let live_cycle_recorder = serve_mode.then(|| {
+        Arc::new(LiveCycleRecorder::new(
+            history_store.clone(),
+            cycle_record.clone(),
+        ))
+    });
     let result: anyhow::Result<TickReport> = async {
         let repo_store = RepoRegistryStore {
             root: paths::repos_dir(&global),
@@ -259,31 +352,57 @@ pub(crate) async fn tick_with_options(
                                 );
                                 return Ok(false);
                             }
-                            resolved = legacy::resolve_autoflow_workflow_for_repo(
-                                &global,
-                                &repo_store,
-                                &current.repo_ref,
-                                &dispatch.workflow,
-                            )?;
                             let issue = legacy::fetch_issue(
                                 &resolved.cfg,
                                 resolver.as_ref(),
                                 &legacy::parse_issue_ref_text(&issue_ref_text)?,
                             )
                             .await?;
-                            legacy::execute_autoflow_cycle(
+                            if legacy::workflow_declares_autoflow_for_repo(
                                 &global,
-                                &claim_store,
-                                &resolved,
-                                &issue,
-                                &issue_ref_text,
-                                None,
-                                false,
-                                dispatch.inputs,
-                                current.contenders.clone(),
-                                options.worker.clone(),
-                            )
-                            .await?;
+                                &repo_store,
+                                &current.repo_ref,
+                                &dispatch.workflow,
+                            )? {
+                                resolved = legacy::resolve_autoflow_workflow_for_repo(
+                                    &global,
+                                    &repo_store,
+                                    &current.repo_ref,
+                                    &dispatch.workflow,
+                                )?;
+                                legacy::execute_autoflow_cycle(
+                                    &global,
+                                    &claim_store,
+                                    &resolved,
+                                    &issue,
+                                    &issue_ref_text,
+                                    None,
+                                    serve_mode,
+                                    dispatch.inputs,
+                                    current.contenders.clone(),
+                                    options.worker.clone(),
+                                    options.shared_printer.clone(),
+                                    live_cycle_recorder.clone(),
+                                )
+                                .await?;
+                            } else {
+                                legacy::execute_pending_dispatch_workflow(
+                                    &global,
+                                    &repo_store,
+                                    &claim_store,
+                                    &resolved,
+                                    &mut current,
+                                    &issue,
+                                    &issue_ref_text,
+                                    &dispatch.workflow,
+                                    dispatch.inputs,
+                                    serve_mode,
+                                    options.worker.clone(),
+                                    options.shared_printer.clone(),
+                                    live_cycle_recorder.clone(),
+                                )
+                                .await?;
+                            }
                             enqueue_follow_up_wake(&global, &claim_store, &issue_ref_text)?;
                             legacy::adjust_active_claim_count(
                                 &mut active_claim_counts,
@@ -312,10 +431,12 @@ pub(crate) async fn tick_with_options(
                                 &issue,
                                 &issue_ref_text,
                                 None,
-                                false,
+                                serve_mode,
                                 BTreeMap::new(),
                                 current.contenders.clone(),
                                 options.worker.clone(),
+                                options.shared_printer.clone(),
+                                live_cycle_recorder.clone(),
                             )
                             .await?;
                             enqueue_follow_up_wake(&global, &claim_store, &issue_ref_text)?;
@@ -358,7 +479,7 @@ pub(crate) async fn tick_with_options(
                     &winner.issue,
                     &winner.issue_ref_text,
                     None,
-                    false,
+                    serve_mode,
                     BTreeMap::new(),
                     legacy::active_or_fallback_contenders(
                         &contenders,
@@ -366,6 +487,8 @@ pub(crate) async fn tick_with_options(
                         &winner.resolved.workflow.name,
                     ),
                     options.worker.clone(),
+                    options.shared_printer.clone(),
+                    live_cycle_recorder.clone(),
                 )
                 .await?;
                 enqueue_follow_up_wake(&global, &claim_store, &winner.issue_ref_text)?;
@@ -388,6 +511,7 @@ pub(crate) async fn tick_with_options(
                 after_claim.as_ref(),
                 repo_hint.as_deref(),
                 workflow_hint.as_deref(),
+                &global,
             );
 
             match issue_result {
@@ -395,13 +519,23 @@ pub(crate) async fn tick_with_options(
                 Ok(false) => report.skipped_cycles += 1,
                 Err(error) => {
                     report.failed_cycles += 1;
-                    tracing::warn!(
-                        issue_ref = %issue_ref_text,
-                        repo_ref = repo_hint.as_deref().unwrap_or("-"),
-                        workflow = workflow_hint.as_deref().unwrap_or("-"),
-                        %error,
-                        "autoflow tick failed for issue"
-                    );
+                    if serve_mode {
+                        tracing::debug!(
+                            issue_ref = %issue_ref_text,
+                            repo_ref = repo_hint.as_deref().unwrap_or("-"),
+                            workflow = workflow_hint.as_deref().unwrap_or("-"),
+                            %error,
+                            "autoflow tick failed for issue"
+                        );
+                    } else {
+                        tracing::warn!(
+                            issue_ref = %issue_ref_text,
+                            repo_ref = repo_hint.as_deref().unwrap_or("-"),
+                            workflow = workflow_hint.as_deref().unwrap_or("-"),
+                            %error,
+                            "autoflow tick failed for issue"
+                        );
+                    }
                     resync_active_claim_counts(
                         &claim_store,
                         &mut active_claim_counts,
@@ -447,17 +581,74 @@ pub(crate) async fn tick_with_options(
             });
         }
     }
+    if let Some(recorder) = live_cycle_recorder.as_ref() {
+        cycle_record.events.extend(recorder.snapshot_events());
+        dedupe_cycle_events(&mut cycle_record.events);
+        if let Err(error) = recorder.append_missing_events(&cycle_record) {
+            tracing::warn!(
+                %error,
+                cycle_id = %cycle_record.cycle_id,
+                "failed to append autoflow event history"
+            );
+        }
+    } else {
+        for event in &cycle_record.events {
+            if let Err(error) =
+                history_store.append_cycle_event(&cycle_record, event.clone(), chrono::Utc::now())
+            {
+                tracing::warn!(
+                    %error,
+                    cycle_id = %cycle_record.cycle_id,
+                    "failed to append autoflow event history"
+                );
+            }
+        }
+    }
     if let Err(error) = history_store.save(&cycle_record) {
         tracing::warn!(%error, cycle_id = %cycle_record.cycle_id, "failed to persist autoflow cycle history");
     }
 
-    result
+    result.map(|report| TickOutcome {
+        report,
+        cycle: cycle_record,
+    })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn serve_with_resolver(
     resolver: Arc<dyn CredentialResolver>,
     options: ServeOptions,
 ) -> anyhow::Result<ServeReport> {
+    serve_with_resolver_and_hook(resolver, options, |_, _, _| Ok(())).await
+}
+
+pub(crate) async fn serve_with_resolver_and_hook<F>(
+    resolver: Arc<dyn CredentialResolver>,
+    options: ServeOptions,
+    mut on_cycle: F,
+) -> anyhow::Result<ServeReport>
+where
+    F: FnMut(&ServeReport, &TickReport, &AutoflowCycleRecord) -> anyhow::Result<()>,
+{
+    serve_with_resolver_and_hooks(
+        resolver,
+        options,
+        || Ok(()),
+        move |report, tick, cycle| on_cycle(report, tick, cycle),
+    )
+    .await
+}
+
+pub(crate) async fn serve_with_resolver_and_hooks<F, G>(
+    resolver: Arc<dyn CredentialResolver>,
+    options: ServeOptions,
+    mut on_cycle_start: G,
+    mut on_cycle: F,
+) -> anyhow::Result<ServeReport>
+where
+    F: FnMut(&ServeReport, &TickReport, &AutoflowCycleRecord) -> anyhow::Result<()>,
+    G: FnMut() -> anyhow::Result<()>,
+{
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let worker = ServeWorker::acquire(
@@ -471,22 +662,27 @@ pub(crate) async fn serve_with_resolver(
     loop {
         cycle_index += 1;
         worker.heartbeat(options.repo_filter.as_deref())?;
+        on_cycle_start()?;
         let tick = tick_with_options(
             Arc::clone(&resolver),
             TickOptions {
                 repo_filter: options.repo_filter.clone(),
                 worker: Some(worker.execution_worker()),
+                shared_printer: options.shared_printer.clone(),
             },
         )
         .await?;
+        let tick_report = tick.report;
+        let cycle_record = tick.cycle;
         report.cycles += 1;
-        accumulate_tick_report(&mut report.total, &tick);
+        accumulate_tick_report(&mut report.total, &tick_report);
+        on_cycle(&report, &tick_report, &cycle_record)?;
 
         if options.max_cycles.is_some_and(|max| cycle_index >= max) {
             break;
         }
 
-        let sleep_for = if tick.ran_cycles > 0 || tick.failed_cycles > 0 {
+        let sleep_for = if tick_report.ran_cycles > 0 || tick_report.failed_cycles > 0 {
             std::cmp::min(options.idle_sleep, std::time::Duration::from_millis(250))
         } else {
             options.idle_sleep
@@ -548,6 +744,7 @@ fn append_issue_history_events(
     after: Option<&AutoflowClaimRecord>,
     repo_hint: Option<&str>,
     workflow_hint: Option<&str>,
+    global: &Path,
 ) {
     if let Err(error) = issue_result {
         events.push(AutoflowCycleEvent {
@@ -606,6 +803,7 @@ fn append_issue_history_events(
             status: Some(claim_status_name(after.status).to_string()),
             ..Default::default()
         });
+        append_run_action_events(events, global, issue_ref_text, after);
     }
 
     if before.and_then(|claim| claim.pending_dispatch.as_ref()) != after.pending_dispatch.as_ref()
@@ -662,6 +860,269 @@ fn append_issue_history_events(
             });
         }
     }
+}
+
+fn append_run_action_events(
+    events: &mut Vec<AutoflowCycleEvent>,
+    global: &Path,
+    issue_ref_text: &str,
+    claim: &AutoflowClaimRecord,
+) {
+    let Some(run_id) = claim.last_run_id.as_deref() else {
+        return;
+    };
+    let run_store = RunStore::new(global.join("runs"));
+    let Ok(rows) = run_store.read_step_results(run_id) else {
+        return;
+    };
+    let mut seen_paths = BTreeSet::new();
+    for row in rows {
+        append_transcript_action_events(
+            events,
+            issue_ref_text,
+            claim,
+            run_id,
+            &row.transcript_path,
+            &mut seen_paths,
+        );
+        for item in row.items {
+            append_transcript_action_events(
+                events,
+                issue_ref_text,
+                claim,
+                run_id,
+                &item.transcript_path,
+                &mut seen_paths,
+            );
+        }
+    }
+    if let Some(pr_url) = claim.pr_url.as_deref() {
+        let pr_already_recorded = events.iter().any(|event| {
+            event.kind == AutoflowCycleEventKind::PullRequestOpened
+                && event.run_id.as_deref() == Some(run_id)
+        });
+        if !pr_already_recorded {
+            events.push(AutoflowCycleEvent {
+                kind: AutoflowCycleEventKind::PullRequestOpened,
+                issue_ref: Some(issue_ref_text.to_string()),
+                issue_display_ref: claim.issue_display_ref.clone(),
+                repo_ref: Some(claim.repo_ref.clone()),
+                source_ref: claim.source_ref.clone(),
+                workflow: Some(claim.workflow.clone()),
+                run_id: Some(run_id.to_string()),
+                status: Some("open".into()),
+                detail: Some(pr_url.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+}
+
+fn append_transcript_action_events(
+    events: &mut Vec<AutoflowCycleEvent>,
+    issue_ref_text: &str,
+    claim: &AutoflowClaimRecord,
+    run_id: &str,
+    transcript_path: &Path,
+    seen_paths: &mut BTreeSet<PathBuf>,
+) {
+    if transcript_path.as_os_str().is_empty() || !transcript_path.exists() {
+        return;
+    }
+    if !seen_paths.insert(transcript_path.to_path_buf()) {
+        return;
+    }
+    let Ok(iter) = JsonlReader::iter(transcript_path) else {
+        return;
+    };
+    let mut pending = BTreeMap::<String, (String, JsonValue)>::new();
+    for event in iter.flatten() {
+        match event {
+            TranscriptEvent::ToolCall {
+                call_id,
+                tool,
+                input,
+                ..
+            } if is_promoted_autoflow_tool(&tool) => {
+                pending.insert(call_id, (tool, input));
+            }
+            TranscriptEvent::ToolResult { call_id, error, .. } => {
+                let Some((tool, input)) = pending.remove(&call_id) else {
+                    continue;
+                };
+                if error.is_some() {
+                    continue;
+                }
+                if let Some(action_event) =
+                    promoted_autoflow_tool_event(&tool, &input, claim, run_id, issue_ref_text)
+                {
+                    events.push(action_event);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_promoted_autoflow_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "issues.comment" | "issues.update_state" | "scm.prs.create"
+    )
+}
+
+pub(crate) fn promoted_autoflow_tool_event(
+    tool: &str,
+    input: &JsonValue,
+    claim: &AutoflowClaimRecord,
+    run_id: &str,
+    issue_ref_text: &str,
+) -> Option<AutoflowCycleEvent> {
+    let issue_ref = issue_target_ref(input, claim).unwrap_or_else(|| issue_ref_text.to_string());
+    let issue_display_ref = if issue_ref == issue_ref_text {
+        claim.issue_display_ref.clone()
+    } else {
+        issue_target_display(input)
+    };
+    let mut event = AutoflowCycleEvent {
+        issue_ref: Some(issue_ref),
+        issue_display_ref,
+        repo_ref: Some(claim.repo_ref.clone()),
+        source_ref: claim.source_ref.clone(),
+        workflow: Some(claim.workflow.clone()),
+        run_id: Some(run_id.to_string()),
+        ..Default::default()
+    };
+    match tool {
+        "issues.comment" => {
+            event.kind = AutoflowCycleEventKind::IssueCommented;
+            event.detail = comment_preview(input)
+                .or_else(|| Some(tool_summary(tool, input)))
+                .filter(|detail| !detail.is_empty());
+            Some(event)
+        }
+        "issues.update_state" => {
+            let state = input.get("state").and_then(|value| value.as_str())?;
+            event.kind = AutoflowCycleEventKind::IssueStateChanged;
+            event.status = Some(state.to_string());
+            event.detail = issue_state_detail(state);
+            Some(event)
+        }
+        "scm.prs.create" => {
+            event.kind = AutoflowCycleEventKind::PullRequestOpened;
+            event.status = Some(
+                if input
+                    .get("draft")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    "draft".into()
+                } else {
+                    "open".into()
+                },
+            );
+            event.detail = pull_request_detail(input)
+                .or_else(|| Some(tool_summary(tool, input)))
+                .filter(|detail| !detail.is_empty());
+            Some(event)
+        }
+        _ => None,
+    }
+}
+
+fn issue_target_ref(input: &JsonValue, claim: &AutoflowClaimRecord) -> Option<String> {
+    let project = input.get("project").and_then(|value| value.as_str())?;
+    let number = input.get("number").and_then(|value| value.as_u64())?;
+    let tracker = input
+        .get("tracker")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            claim
+                .issue_ref
+                .split_once(':')
+                .map(|(tracker, _)| tracker.to_string())
+        })?;
+    Some(format!("{tracker}:{project}/issues/{number}"))
+}
+
+fn issue_target_display(input: &JsonValue) -> Option<String> {
+    let project = input.get("project").and_then(|value| value.as_str())?;
+    let number = input.get("number").and_then(|value| value.as_u64())?;
+    Some(format!("{project}#{number}"))
+}
+
+fn comment_preview(input: &JsonValue) -> Option<String> {
+    let body = input.get("body").and_then(|value| value.as_str())?;
+    let first_line = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    if first_line.is_empty() {
+        return None;
+    }
+    Some(format!("comment: {}", truncate_detail(first_line, 96)))
+}
+
+fn issue_state_detail(state: &str) -> Option<String> {
+    match state {
+        "closed" | "open" => None,
+        other if !other.trim().is_empty() => Some(format!("state {}", truncate_detail(other, 48))),
+        _ => None,
+    }
+}
+
+fn pull_request_detail(input: &JsonValue) -> Option<String> {
+    let title = input
+        .get("title")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let base = input
+        .get("base")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let draft = input
+        .get("draft")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let mut parts = Vec::new();
+    if !title.trim().is_empty() {
+        parts.push(truncate_detail(title.trim(), 72));
+    }
+    if !base.trim().is_empty() {
+        parts.push(format!("→ {}", truncate_detail(base.trim(), 24)));
+    }
+    if draft {
+        parts.push("draft".into());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("  ·  "))
+    }
+}
+
+fn truncate_detail(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
+fn dedupe_cycle_events(events: &mut Vec<AutoflowCycleEvent>) {
+    let mut seen = BTreeSet::new();
+    events.retain(|event| {
+        let key = cycle_event_key(event);
+        seen.insert(key)
+    });
+}
+
+fn cycle_event_key(event: &AutoflowCycleEvent) -> String {
+    serde_json::to_string(event).unwrap_or_default()
 }
 
 fn claim_status_name(status: ClaimStatus) -> &'static str {
@@ -852,4 +1313,226 @@ fn resync_active_claim_counts(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use rupu_orchestrator::{RunRecord, RunStatus, StepKind, StepResultRecord};
+    use rupu_transcript::{Event, JsonlWriter, RunMode, RunStatus as TranscriptRunStatus};
+
+    #[test]
+    fn append_issue_history_events_promotes_tool_actions_from_run_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        std::fs::create_dir_all(global.join("runs")).unwrap();
+        std::fs::create_dir_all(global.join("transcripts")).unwrap();
+
+        let run_store = RunStore::new(global.join("runs"));
+        run_store
+            .create(
+                RunRecord {
+                    id: "run_123".into(),
+                    workflow_name: "storefront-feature-delivery".into(),
+                    status: RunStatus::Completed,
+                    inputs: BTreeMap::new(),
+                    event: None,
+                    workspace_id: "ws_1".into(),
+                    workspace_path: tmp.path().join("repo"),
+                    transcript_dir: global.join("transcripts"),
+                    started_at: Utc::now(),
+                    finished_at: Some(Utc::now()),
+                    error_message: None,
+                    awaiting_step_id: None,
+                    approval_prompt: None,
+                    awaiting_since: None,
+                    expires_at: None,
+                    issue_ref: Some("github:Section9Labs/rupu-sandbox-gh/issues/10".into()),
+                    issue: None,
+                    parent_run_id: None,
+                    backend_id: None,
+                    worker_id: None,
+                    artifact_manifest_path: None,
+                    source_wake_id: None,
+                    active_step_id: None,
+                    active_step_kind: None,
+                    active_step_agent: None,
+                    active_step_transcript_path: None,
+                },
+                "name: demo\nsteps: []\n",
+            )
+            .unwrap();
+
+        let transcript_path = global.join("transcripts/run_123_step.jsonl");
+        let mut writer = JsonlWriter::create(&transcript_path).unwrap();
+        writer
+            .write(&Event::RunStart {
+                run_id: "step_run_1".into(),
+                workspace_id: "ws_1".into(),
+                agent: "builder".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                started_at: Utc::now(),
+                mode: RunMode::Bypass,
+            })
+            .unwrap();
+        writer
+            .write(&Event::ToolCall {
+                call_id: "call_comment".into(),
+                tool: "issues.comment".into(),
+                input: serde_json::json!({
+                    "project": "Section9Labs/rupu-sandbox-gh",
+                    "number": 10,
+                    "body": "Started implementation for the cart drawer.\n\nMore detail follows."
+                }),
+            })
+            .unwrap();
+        writer
+            .write(&Event::ToolResult {
+                call_id: "call_comment".into(),
+                output: "ok".into(),
+                error: None,
+                duration_ms: 12,
+            })
+            .unwrap();
+        writer
+            .write(&Event::ToolCall {
+                call_id: "call_close".into(),
+                tool: "issues.update_state".into(),
+                input: serde_json::json!({
+                    "project": "Section9Labs/rupu-sandbox-gh",
+                    "number": 10,
+                    "state": "closed"
+                }),
+            })
+            .unwrap();
+        writer
+            .write(&Event::ToolResult {
+                call_id: "call_close".into(),
+                output: "ok".into(),
+                error: None,
+                duration_ms: 5,
+            })
+            .unwrap();
+        writer
+            .write(&Event::ToolCall {
+                call_id: "call_pr".into(),
+                tool: "scm.prs.create".into(),
+                input: serde_json::json!({
+                    "owner": "Section9Labs",
+                    "repo": "rupu-sandbox-gh",
+                    "title": "Add cart drawer and checkout summary",
+                    "base": "main",
+                    "draft": true
+                }),
+            })
+            .unwrap();
+        writer
+            .write(&Event::ToolResult {
+                call_id: "call_pr".into(),
+                output: "https://github.com/Section9Labs/rupu-sandbox-gh/pull/10".into(),
+                error: None,
+                duration_ms: 20,
+            })
+            .unwrap();
+        writer
+            .write(&Event::RunComplete {
+                run_id: "step_run_1".into(),
+                status: TranscriptRunStatus::Ok,
+                total_tokens: 100,
+                duration_ms: 1000,
+                error: None,
+            })
+            .unwrap();
+        writer.flush().unwrap();
+
+        run_store
+            .append_step_result(
+                "run_123",
+                &StepResultRecord {
+                    step_id: "implement".into(),
+                    run_id: "step_run_1".into(),
+                    transcript_path,
+                    output: "{\"status\":\"complete\"}".into(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: "implement issue 10".into(),
+                    kind: StepKind::Linear,
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let before = AutoflowClaimRecord {
+            issue_ref: "github:Section9Labs/rupu-sandbox-gh/issues/10".into(),
+            repo_ref: "github:Section9Labs/rupu-sandbox-gh".into(),
+            source_ref: Some("github:Section9Labs/rupu-sandbox-gh".into()),
+            issue_display_ref: Some("10".into()),
+            issue_title: Some("cart drawer".into()),
+            issue_url: None,
+            issue_state_name: Some("open".into()),
+            issue_tracker: Some("github".into()),
+            workflow: "storefront-feature-delivery".into(),
+            status: ClaimStatus::Claimed,
+            worktree_path: None,
+            branch: Some("storefront/issue-10".into()),
+            last_run_id: None,
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            artifact_manifest_path: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: None,
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let after = AutoflowClaimRecord {
+            last_run_id: Some("run_123".into()),
+            pr_url: Some("https://github.com/Section9Labs/rupu-sandbox-gh/pull/10".into()),
+            status: ClaimStatus::Complete,
+            ..before.clone()
+        };
+
+        let mut events = Vec::new();
+        append_issue_history_events(
+            &mut events,
+            &Ok(true),
+            &after.issue_ref,
+            Some(&before),
+            Some(&after),
+            Some(&after.repo_ref),
+            Some(&after.workflow),
+            &global,
+        );
+
+        assert!(events.iter().any(|event| {
+            event.kind == AutoflowCycleEventKind::RunLaunched
+                && event.run_id.as_deref() == Some("run_123")
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == AutoflowCycleEventKind::IssueCommented
+                && event.detail.as_deref()
+                    == Some("comment: Started implementation for the cart drawer.")
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == AutoflowCycleEventKind::IssueStateChanged
+                && event.status.as_deref() == Some("closed")
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == AutoflowCycleEventKind::PullRequestOpened
+                && event.status.as_deref() == Some("draft")
+                && event
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("Add cart drawer"))
+        }));
+    }
 }

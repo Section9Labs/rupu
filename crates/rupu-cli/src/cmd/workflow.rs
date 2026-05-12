@@ -49,9 +49,10 @@ fn to_anyhow_with_input_snippet(
 use rupu_orchestrator::Workflow;
 use rupu_tools::ToolContext;
 use std::collections::BTreeMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -966,7 +967,7 @@ pub struct ExecutionWorkerContext {
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExplicitWorkflowRunContext {
     pub project_root: Option<PathBuf>,
     pub workspace_path: PathBuf,
@@ -984,6 +985,8 @@ pub struct ExplicitWorkflowRunContext {
     pub strict_templates: bool,
     pub run_envelope_template: Option<RunEnvelopeTemplate>,
     pub worker: Option<ExecutionWorkerContext>,
+    pub live_event_hook: Option<crate::output::workflow_printer::LiveWorkflowEventHook>,
+    pub shared_printer: Option<Arc<Mutex<crate::output::LineStreamPrinter>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1279,6 +1282,8 @@ async fn run_with_outcome(
             strict_templates: false,
             run_envelope_template: None,
             worker: None,
+            live_event_hook: None,
+            shared_printer: None,
         },
     )
     .await
@@ -1344,6 +1349,8 @@ async fn run_path_with_outcome(
             strict_templates: false,
             run_envelope_template: None,
             worker: None,
+            live_event_hook: None,
+            shared_printer: None,
         },
     )
     .await
@@ -1807,106 +1814,131 @@ async fn execute_workflow_invocation(
         run_store: Some(run_store),
         workflow_yaml: Some(body.clone()),
         resume_from: None,
-        run_id_override: Some(run_id),
+        run_id_override: Some(run_id.clone()),
         strict_templates,
     };
 
     let workflow_result = if ctx.attach_ui {
-        let existing_run_ids: std::collections::BTreeSet<String> = list_run_dir_entries(&runs_dir);
         let runner_task = tokio::spawn(run_workflow(opts));
-        let new_run_id = wait_for_new_run_dir(&runs_dir, &existing_run_ids, 2_000).await;
+        let rid = run_id.clone();
 
-        if let Some(ref rid) = new_run_id {
-            if ctx.use_canvas {
-                if let Err(e) = rupu_tui::run_attached(rid.clone(), runs_dir.clone()) {
-                    eprintln!("rupu: TUI exited early: {e}");
-                }
-                runner_task
-                    .await
-                    .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-                    .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
-            } else {
-                let printer_store = rupu_orchestrator::RunStore::new(runs_dir.clone());
-                let mut printer = crate::output::LineStreamPrinter::new();
-                let mut attach_opts = crate::output::workflow_printer::AttachOpts::default();
-                let mut current_runner = runner_task;
-
-                loop {
-                    let outcome = match crate::output::workflow_printer::attach_and_print_with(
-                        name,
-                        rid,
-                        &runs_dir,
-                        &transcripts_dir_snapshot,
-                        &mut printer,
-                        &printer_store,
-                        attach_opts,
-                    ) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            eprintln!("rupu: printer error: {e}");
-                            crate::output::workflow_printer::AttachOutcome::Detached
-                        }
-                    };
-
-                    let result = current_runner
-                        .await
-                        .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-                        .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?;
-
-                    use crate::output::workflow_printer::AttachOutcome;
-                    match outcome {
-                        AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
-                            break result;
-                        }
-                        AttachOutcome::Approved { awaited_step_id } => {
-                            let prior_records =
-                                run_store_for_resume.read_step_results(rid).map_err(|e| {
-                                    anyhow::anyhow!("read step results for resume: {e}")
-                                })?;
-                            let prior_count = prior_records.len();
-                            let prior_step_results: Vec<rupu_orchestrator::StepResult> =
-                                prior_records
-                                    .iter()
-                                    .map(rupu_orchestrator::StepResult::from)
-                                    .collect();
-                            let resume = rupu_orchestrator::ResumeState {
-                                run_id: rid.clone(),
-                                prior_step_results,
-                                approved_step_id: awaited_step_id,
-                            };
-                            let factory_dyn: Arc<dyn rupu_orchestrator::StepFactory> =
-                                factory_for_resume.clone();
-                            let resume_opts = OrchestratorRunOpts {
-                                workflow: workflow_for_resume.clone(),
-                                inputs: inputs_for_resume.clone(),
-                                workspace_id: workspace_id_for_resume.clone(),
-                                workspace_path: workspace_path_for_resume.clone(),
-                                transcript_dir: transcripts_for_resume.clone(),
-                                factory: factory_dyn,
-                                event: event_for_resume.clone(),
-                                issue: issue_for_resume.clone(),
-                                issue_ref: issue_ref_for_resume.clone(),
-                                run_store: Some(Arc::clone(&run_store_for_resume)),
-                                workflow_yaml: Some(body_for_resume.clone()),
-                                resume_from: Some(resume),
-                                run_id_override: None,
-                                strict_templates,
-                            };
-                            current_runner = tokio::spawn(run_workflow(resume_opts));
-                            attach_opts = crate::output::workflow_printer::AttachOpts {
-                                skip_header: true,
-                                skip_count: prior_count,
-                            };
-                            let _ = result;
-                        }
-                    }
-                }
+        if ctx.use_canvas {
+            if let Err(e) = rupu_tui::run_attached(rid.clone(), runs_dir.clone()) {
+                eprintln!("rupu: TUI exited early: {e}");
             }
-        } else {
             runner_task
                 .await
                 .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
                 .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
+        } else {
+            let mut attach_opts = crate::output::workflow_printer::AttachOpts {
+                skip_header: false,
+                skip_count: 0,
+                live_event_hook: ctx.live_event_hook.clone(),
+            };
+            let mut current_runner = runner_task;
+            let mut current_run_id = rid.clone();
+            let shared_printer = ctx.shared_printer.clone();
+
+            loop {
+                let name_owned = name.to_string();
+                let rid_for_attach = current_run_id.clone();
+                let runs_dir_for_attach = runs_dir.clone();
+                let transcripts_for_attach = transcripts_dir_snapshot.clone();
+                let attach_opts_for_attach = attach_opts.clone();
+                let shared_printer_for_attach = shared_printer.clone();
+                let outcome_result = tokio::task::spawn_blocking(move || {
+                    let printer_store = rupu_orchestrator::RunStore::new(runs_dir_for_attach.clone());
+                    if let Some(shared_printer) = shared_printer_for_attach {
+                        let mut printer = shared_printer
+                            .lock()
+                            .map_err(|_| io::Error::other("shared printer poisoned"))?;
+                        crate::output::workflow_printer::attach_and_print_with(
+                            &name_owned,
+                            &rid_for_attach,
+                            &runs_dir_for_attach,
+                            &transcripts_for_attach,
+                            &mut printer,
+                            &printer_store,
+                            attach_opts_for_attach,
+                        )
+                    } else {
+                        let mut printer = crate::output::LineStreamPrinter::new();
+                        crate::output::workflow_printer::attach_and_print_with(
+                            &name_owned,
+                            &rid_for_attach,
+                            &runs_dir_for_attach,
+                            &transcripts_for_attach,
+                            &mut printer,
+                            &printer_store,
+                            attach_opts_for_attach,
+                        )
+                    }
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("workflow printer task panicked: {e}"))?;
+                let outcome = match outcome_result {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("rupu: printer error: {e}");
+                        crate::output::workflow_printer::AttachOutcome::Detached
+                    }
+                };
+
+                let result = current_runner
+                    .await
+                    .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
+                    .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?;
+
+                use crate::output::workflow_printer::AttachOutcome;
+                match outcome {
+                    AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
+                        break result;
+                    }
+                    AttachOutcome::Approved { awaited_step_id } => {
+                        let prior_records =
+                            run_store_for_resume.read_step_results(&current_run_id).map_err(|e| {
+                                anyhow::anyhow!("read step results for resume: {e}")
+                            })?;
+                        let prior_count = prior_records.len();
+                        let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
+                            .iter()
+                            .map(rupu_orchestrator::StepResult::from)
+                            .collect();
+                        let resume = rupu_orchestrator::ResumeState {
+                            run_id: current_run_id.clone(),
+                            prior_step_results,
+                            approved_step_id: awaited_step_id,
+                        };
+                        let factory_dyn: Arc<dyn rupu_orchestrator::StepFactory> =
+                            factory_for_resume.clone();
+                        let resume_opts = OrchestratorRunOpts {
+                            workflow: workflow_for_resume.clone(),
+                            inputs: inputs_for_resume.clone(),
+                            workspace_id: workspace_id_for_resume.clone(),
+                            workspace_path: workspace_path_for_resume.clone(),
+                            transcript_dir: transcripts_for_resume.clone(),
+                            factory: factory_dyn,
+                            event: event_for_resume.clone(),
+                            issue: issue_for_resume.clone(),
+                            issue_ref: issue_ref_for_resume.clone(),
+                            run_store: Some(Arc::clone(&run_store_for_resume)),
+                            workflow_yaml: Some(body_for_resume.clone()),
+                            resume_from: Some(resume),
+                            run_id_override: None,
+                            strict_templates,
+                        };
+                        current_runner = tokio::spawn(run_workflow(resume_opts));
+                        current_run_id = result.run_id.clone();
+                        attach_opts = crate::output::workflow_printer::AttachOpts {
+                            skip_header: true,
+                            skip_count: prior_count,
+                            live_event_hook: ctx.live_event_hook.clone(),
+                        };
+                        let _ = result;
+                    }
+                }
+            }
         }
     } else {
         run_workflow(opts)
@@ -2024,50 +2056,6 @@ async fn post_run_summary_to_issue(
             ref_text,
             "notifyIssue: posting comment failed"
         );
-    }
-}
-
-/// Collect the names of all `run_<ULID>` subdirectories currently
-/// present in `runs_dir`. Used to diff before/after spawning the
-/// workflow runner so we can identify the new run's directory.
-fn list_run_dir_entries(runs_dir: &std::path::Path) -> std::collections::BTreeSet<String> {
-    let Ok(rd) = std::fs::read_dir(runs_dir) else {
-        return std::collections::BTreeSet::new();
-    };
-    rd.flatten()
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            if name.starts_with("run_") {
-                Some(name)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Poll `runs_dir` until a subdirectory appears that was not in
-/// `before`. Returns the new run id or `None` if `timeout_ms` expires
-/// before anything shows up.
-async fn wait_for_new_run_dir(
-    runs_dir: &std::path::Path,
-    before: &std::collections::BTreeSet<String>,
-    timeout_ms: u64,
-) -> Option<String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        if let Ok(rd) = std::fs::read_dir(runs_dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name().into_string().unwrap_or_default();
-                if name.starts_with("run_") && !before.contains(&name) {
-                    return Some(name);
-                }
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 

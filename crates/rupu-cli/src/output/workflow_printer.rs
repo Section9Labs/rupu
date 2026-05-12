@@ -1,8 +1,9 @@
 //! Workflow run → line-stream printer wiring.
 //!
 //! `WorkflowPrinter` drives a `LineStreamPrinter` from a live workflow run:
-//! it polls `step_results.jsonl` for new completed steps and tails each
-//! step's JSONL transcript file as events arrive.
+//! it polls `run.json` for the active step so it can attach to that
+//! transcript immediately, and it also watches `step_results.jsonl` for
+//! completed-step metadata / fan-out summaries.
 //!
 //! Layout assumption (matches the orchestrator's on-disk format):
 //! - `runs_dir/<run_id>/run.json` — status + metadata.
@@ -18,12 +19,16 @@
 //! `approval_prompt` method and then calls back into the run-store to
 //! approve or reject based on the user's response.
 
-use super::{printer::LineStreamPrinter, SpinnerHandle, TranscriptTailer};
-use rupu_orchestrator::{FindingRecord, ItemResultRecord, StepKind, StepResultRecord};
+use super::{
+    palette::Status as UiStatus, printer::LineStreamPrinter, SpinnerHandle, TranscriptTailer,
+};
+use rupu_orchestrator::{FindingRecord, ItemResultRecord, RunRecord, StepKind, StepResultRecord};
 use rupu_transcript::Event as TxEvent;
+use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Poll interval between run-status checks.
@@ -45,6 +50,7 @@ enum InFlightDispatch {
 /// Per-step printer state for a non-panel (linear) step.
 struct StepState {
     tailer: TranscriptTailer,
+    run_id: String,
     step_id: String,
     agent: Option<String>,
     provider: Option<String>,
@@ -56,7 +62,28 @@ struct StepState {
     /// `ToolResult`. Other tool calls (bash, read_file, …) bypass this
     /// map and use the existing `printer.tool_call` summary line.
     dispatches: BTreeMap<String, InFlightDispatch>,
+    promoted_actions: BTreeMap<String, (String, JsonValue)>,
 }
+
+#[derive(Debug, Clone)]
+pub enum LiveWorkflowEvent {
+    ToolSucceeded {
+        run_id: String,
+        step_id: String,
+        tool: String,
+        input: JsonValue,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveWorkflowRender {
+    pub status: UiStatus,
+    pub label: String,
+    pub detail: Option<String>,
+}
+
+pub type LiveWorkflowEventHook =
+    Arc<dyn Fn(&LiveWorkflowEvent) -> Option<LiveWorkflowRender> + Send + Sync>;
 
 /// What `attach_and_print` returned. The caller decides what to do next:
 /// `Done` and `Detached` and `Rejected` are terminal; `Approved` carries
@@ -80,7 +107,7 @@ pub enum AttachOutcome {
 
 /// Optional knobs for `attach_and_print`. Defaults preserve the
 /// pre-resume behavior (print header, start from the first step record).
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub struct AttachOpts {
     /// When `true`, skip printing the workflow header. Used on resume
     /// attaches where the header is already on screen from the original
@@ -90,6 +117,8 @@ pub struct AttachOpts {
     /// before rendering. Used on resume to avoid re-printing prior steps
     /// that the user already saw.
     pub skip_count: usize,
+    /// Optional sideband hook for selected live transcript events.
+    pub live_event_hook: Option<LiveWorkflowEventHook>,
 }
 
 /// Drive `printer` from a live or recently-finished workflow run.
@@ -182,6 +211,11 @@ pub fn attach_and_print_with(
     let mut opened: BTreeSet<PathBuf> = BTreeSet::new();
 
     loop {
+        let record = load_run_record(&run_json);
+        if let Some(ref record) = record {
+            ensure_active_step_attached(record, &mut opened, &mut steps, printer, &mut step_count);
+        }
+
         drain_step_results(
             &step_results_log,
             transcript_dir,
@@ -195,11 +229,17 @@ pub fn attach_and_print_with(
         for step in &mut steps {
             let events = step.tailer.drain();
             for ev in events {
-                process_event(ev, step, printer, &mut total_tokens);
+                process_event(
+                    ev,
+                    step,
+                    printer,
+                    &mut total_tokens,
+                    opts.live_event_hook.as_ref(),
+                );
             }
         }
 
-        let record = match load_run_record(&run_json) {
+        let record = match record {
             Some(r) => r,
             None => {
                 std::thread::sleep(Duration::from_millis(POLL_MS));
@@ -214,19 +254,18 @@ pub fn attach_and_print_with(
         // ticker down (which happens inside `process_event` above).
         printer.start_ticker("running…");
 
-        let status = record["status"].as_str().unwrap_or("unknown");
-        match status {
-            "awaiting_approval" => {
+        match record.status {
+            rupu_orchestrator::RunStatus::AwaitingApproval => {
                 flush_all_tailers(&mut steps, printer, &mut total_tokens);
 
-                let step_id = record["awaiting_step_id"]
-                    .as_str()
-                    .unwrap_or("approval_gate")
-                    .to_string();
-                let prompt = record["approval_prompt"]
-                    .as_str()
-                    .unwrap_or("Approve this step?")
-                    .to_string();
+                let step_id = record
+                    .awaiting_step_id
+                    .clone()
+                    .unwrap_or_else(|| "approval_gate".to_string());
+                let prompt = record
+                    .approval_prompt
+                    .clone()
+                    .unwrap_or_else(|| "Approve this step?".to_string());
 
                 // Tear down the workflow-level ticker before the
                 // approval prompt — the prompt reads from stdin and
@@ -281,7 +320,7 @@ pub fn attach_and_print_with(
                     }
                 }
             }
-            "completed" => {
+            rupu_orchestrator::RunStatus::Completed => {
                 std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
                 drain_step_results(
                     &step_results_log,
@@ -294,25 +333,20 @@ pub fn attach_and_print_with(
                 );
                 flush_all_tailers(&mut steps, printer, &mut total_tokens);
 
-                let duration_ms = record["finished_at"]
-                    .as_str()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|fin| {
-                        (fin.with_timezone(&chrono::Utc) - started_at)
-                            .num_milliseconds()
-                            .max(0) as u64
-                    })
+                let duration_ms = record
+                    .finished_at
+                    .map(|fin| (fin - started_at).num_milliseconds().max(0) as u64)
                     .unwrap_or(0);
                 let dur = Duration::from_millis(duration_ms);
                 printer.stop_ticker();
                 printer.workflow_done(workflow_name, run_id, dur, total_tokens);
                 return Ok(AttachOutcome::Done);
             }
-            "failed" | "rejected" => {
+            rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
                 std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
                 flush_all_tailers(&mut steps, printer, &mut total_tokens);
 
-                let err = record["error_message"].as_str().unwrap_or("unknown error");
+                let err = record.error_message.as_deref().unwrap_or("unknown error");
                 printer.stop_ticker();
                 printer.workflow_failed(workflow_name, run_id, err);
                 return Ok(AttachOutcome::Done);
@@ -326,9 +360,53 @@ pub fn attach_and_print_with(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-fn load_run_record(run_json: &Path) -> Option<serde_json::Value> {
+fn load_run_record(run_json: &Path) -> Option<RunRecord> {
     let bytes = std::fs::read(run_json).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn ensure_active_step_attached(
+    record: &RunRecord,
+    opened: &mut BTreeSet<PathBuf>,
+    steps: &mut Vec<StepState>,
+    printer: &mut LineStreamPrinter,
+    step_count: &mut usize,
+) {
+    if !matches!(record.status, rupu_orchestrator::RunStatus::Running) {
+        return;
+    }
+    let Some(step_id) = record.active_step_id.as_deref() else {
+        return;
+    };
+    if !matches!(record.active_step_kind, None | Some(StepKind::Linear)) {
+        return;
+    }
+    let Some(transcript_path) = record.active_step_transcript_path.clone() else {
+        return;
+    };
+    if opened.contains(&transcript_path) {
+        return;
+    }
+
+    if *step_count > 0 {
+        printer.phase_separator();
+    }
+    *step_count += 1;
+
+    opened.insert(transcript_path.clone());
+    let tailer = TranscriptTailer::new(&transcript_path);
+    let spinner = printer.step_start(step_id, record.active_step_agent.as_deref(), None, None);
+    steps.push(StepState {
+        tailer,
+        run_id: record.id.clone(),
+        step_id: step_id.to_string(),
+        agent: record.active_step_agent.clone(),
+        provider: None,
+        model: None,
+        spinner: Some(spinner),
+        dispatches: BTreeMap::new(),
+        promoted_actions: BTreeMap::new(),
+    });
 }
 
 /// Walk `step_results.jsonl` and return findings grouped by source step,
@@ -416,12 +494,14 @@ fn drain_step_results(
                 let spinner = printer.step_start(&rec.step_id, None, None, None);
                 steps.push(StepState {
                     tailer,
+                    run_id: rec.run_id.clone(),
                     step_id: rec.step_id.clone(),
                     agent: None,
                     provider: None,
                     model: None,
                     spinner: Some(spinner),
                     dispatches: BTreeMap::new(),
+                    promoted_actions: BTreeMap::new(),
                 });
             }
         }
@@ -636,6 +716,7 @@ fn process_event(
     step: &mut StepState,
     printer: &mut LineStreamPrinter,
     total_tokens: &mut u64,
+    live_event_hook: Option<&LiveWorkflowEventHook>,
 ) {
     match ev {
         TxEvent::RunStart {
@@ -673,21 +754,51 @@ fn process_event(
                 step.dispatches.insert(call_id, InFlightDispatch::Parallel);
             }
             _ => {
+                if is_promoted_live_tool(&tool) {
+                    step.promoted_actions
+                        .insert(call_id.clone(), (tool.clone(), input.clone()));
+                }
                 let summary = summarize_tool_input(&tool, &input);
                 printer.tool_call(&tool, &summary);
             }
         },
         TxEvent::ToolResult {
-            call_id, output, ..
-        } => match step.dispatches.remove(&call_id) {
-            Some(InFlightDispatch::Single { agent }) => {
-                render_dispatch_child(&agent, &output, printer);
+            call_id,
+            output,
+            error,
+            ..
+        } => {
+            match step.dispatches.remove(&call_id) {
+                Some(InFlightDispatch::Single { agent }) => {
+                    render_dispatch_child(&agent, &output, printer);
+                }
+                Some(InFlightDispatch::Parallel) => {
+                    render_dispatch_children(&output, printer);
+                }
+                None => {}
             }
-            Some(InFlightDispatch::Parallel) => {
-                render_dispatch_children(&output, printer);
+            if error.is_none() {
+                if let Some((tool, input)) = step.promoted_actions.remove(&call_id) {
+                    if let Some(hook) = live_event_hook {
+                        let event = LiveWorkflowEvent::ToolSucceeded {
+                            run_id: step.run_id.clone(),
+                            step_id: step.step_id.clone(),
+                            tool,
+                            input,
+                        };
+                        if let Some(render) = hook(&event) {
+                            printer.sideband_event(
+                                render.status,
+                                &render.label,
+                                render.detail.as_deref(),
+                            );
+                        }
+                    }
+                }
+            } else {
+                step.promoted_actions.remove(&call_id);
             }
-            None => {}
-        },
+        }
         TxEvent::RunComplete {
             status,
             total_tokens: tokens,
@@ -712,6 +823,13 @@ fn process_event(
         }
         _ => {}
     }
+}
+
+fn is_promoted_live_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "issues.comment" | "issues.update_state" | "scm.prs.create"
+    )
 }
 
 /// Render a `dispatch_agent` child as an indent+1 callout under the
@@ -826,7 +944,7 @@ fn flush_all_tailers(
     for step in steps.iter_mut() {
         let events = step.tailer.drain();
         for ev in events {
-            process_event(ev, step, printer, total_tokens);
+            process_event(ev, step, printer, total_tokens, None);
         }
         if let Some(spinner) = step.spinner.take() {
             spinner.stop();
@@ -911,7 +1029,7 @@ fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
 
         // ── MCP issues.* tools ───────────────────────────────────────
         "issues.list" => s_str("project").unwrap_or_default(),
-        "issues.get" | "issues.comment" | "issues.update_state" => {
+        "issues.get" => {
             let project = s_str("project").unwrap_or_default();
             let n = input.get("number").and_then(|v| v.as_u64());
             match (project.is_empty(), n) {
@@ -920,6 +1038,29 @@ fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
                 (true, Some(n)) => format!("#{n}"),
                 _ => String::new(),
             }
+        }
+        "issues.comment" => {
+            let project = s_str("project").unwrap_or_default();
+            let n = input.get("number").and_then(|v| v.as_u64());
+            let target = match (project.is_empty(), n) {
+                (false, Some(n)) => format!("{project}#{n}"),
+                (false, None) => project,
+                (true, Some(n)) => format!("#{n}"),
+                _ => "issue".to_string(),
+            };
+            format!("commented on {target}")
+        }
+        "issues.update_state" => {
+            let project = s_str("project").unwrap_or_default();
+            let n = input.get("number").and_then(|v| v.as_u64());
+            let state = s_str("state").unwrap_or_else(|| "updated".into());
+            let target = match (project.is_empty(), n) {
+                (false, Some(n)) => format!("{project}#{n}"),
+                (false, None) => project,
+                (true, Some(n)) => format!("#{n}"),
+                _ => "issue".to_string(),
+            };
+            format!("{target} → {state}")
         }
         "issues.create" => {
             let project = s_str("project").unwrap_or_default();
@@ -948,6 +1089,41 @@ fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+
+    fn sample_run_record() -> RunRecord {
+        RunRecord {
+            id: "run_test".into(),
+            workflow_name: "demo".into(),
+            status: rupu_orchestrator::RunStatus::Running,
+            inputs: BTreeMap::new(),
+            event: None,
+            workspace_id: "ws".into(),
+            workspace_path: PathBuf::from("/tmp/ws"),
+            transcript_dir: PathBuf::from("/tmp/transcripts"),
+            started_at: Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+        }
+    }
 
     #[test]
     fn item_input_label_strings_pass_through() {
@@ -990,5 +1166,151 @@ mod tests {
     fn non_empty_filters_blank() {
         assert_eq!(non_empty("anthropic"), Some("anthropic"));
         assert_eq!(non_empty(""), None);
+    }
+
+    #[test]
+    fn tool_summary_makes_issue_comment_explicit() {
+        let input = serde_json::json!({"project":"Section9Labs/rupu-sandbox-gh","number":8});
+        assert_eq!(
+            tool_summary("issues.comment", &input),
+            "commented on Section9Labs/rupu-sandbox-gh#8"
+        );
+    }
+
+    #[test]
+    fn tool_summary_makes_issue_state_change_explicit() {
+        let input = serde_json::json!({"project":"Section9Labs/rupu-sandbox-gh","number":8,"state":"closed"});
+        assert_eq!(
+            tool_summary("issues.update_state", &input),
+            "Section9Labs/rupu-sandbox-gh#8 → closed"
+        );
+    }
+
+    #[test]
+    fn process_event_emits_live_hook_for_promoted_tool_success() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("step.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_hook = Arc::clone(&captured);
+        let hook: LiveWorkflowEventHook = Arc::new(move |event| {
+            let LiveWorkflowEvent::ToolSucceeded { tool, input, .. } = event;
+            captured_hook.lock().unwrap().push(format!(
+                "{}:{}",
+                tool,
+                input
+                    .get("state")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("ok")
+            ));
+            Some(LiveWorkflowRender {
+                status: UiStatus::Working,
+                label: "updated".into(),
+                detail: None,
+            })
+        });
+        let mut step = StepState {
+            tailer: TranscriptTailer::new(&transcript),
+            run_id: "run_live".into(),
+            step_id: "finish".into(),
+            agent: None,
+            provider: None,
+            model: None,
+            spinner: None,
+            dispatches: BTreeMap::new(),
+            promoted_actions: BTreeMap::new(),
+        };
+        let mut printer = LineStreamPrinter::new();
+        let mut total_tokens = 0u64;
+
+        process_event(
+            TxEvent::ToolCall {
+                call_id: "call_1".into(),
+                tool: "issues.update_state".into(),
+                input: serde_json::json!({
+                    "project":"Section9Labs/rupu-sandbox-gh",
+                    "number":8,
+                    "state":"closed"
+                }),
+            },
+            &mut step,
+            &mut printer,
+            &mut total_tokens,
+            Some(&hook),
+        );
+        process_event(
+            TxEvent::ToolResult {
+                call_id: "call_1".into(),
+                output: "ok".into(),
+                error: None,
+                duration_ms: 1,
+            },
+            &mut step,
+            &mut printer,
+            &mut total_tokens,
+            Some(&hook),
+        );
+
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            &["issues.update_state:closed".to_string()]
+        );
+    }
+
+    #[test]
+    fn active_step_attach_opens_linear_transcript_before_step_result() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("step.jsonl");
+        let mut record = sample_run_record();
+        record.active_step_id = Some("implement".into());
+        record.active_step_kind = Some(StepKind::Linear);
+        record.active_step_agent = Some("builder".into());
+        record.active_step_transcript_path = Some(transcript.clone());
+
+        let mut opened = BTreeSet::new();
+        let mut steps = Vec::new();
+        let mut printer = LineStreamPrinter::new();
+        let mut step_count = 0usize;
+
+        ensure_active_step_attached(
+            &record,
+            &mut opened,
+            &mut steps,
+            &mut printer,
+            &mut step_count,
+        );
+
+        assert!(opened.contains(&transcript));
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].step_id, "implement");
+        assert_eq!(steps[0].agent.as_deref(), Some("builder"));
+        assert_eq!(step_count, 1);
+    }
+
+    #[test]
+    fn active_step_attach_ignores_non_linear_steps() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("step.jsonl");
+        let mut record = sample_run_record();
+        record.active_step_id = Some("fanout".into());
+        record.active_step_kind = Some(StepKind::ForEach);
+        record.active_step_transcript_path = Some(transcript);
+
+        let mut opened = BTreeSet::new();
+        let mut steps = Vec::new();
+        let mut printer = LineStreamPrinter::new();
+        let mut step_count = 0usize;
+
+        ensure_active_step_attached(
+            &record,
+            &mut opened,
+            &mut steps,
+            &mut printer,
+            &mut step_count,
+        );
+
+        assert!(opened.is_empty());
+        assert!(steps.is_empty());
+        assert_eq!(step_count, 0);
     }
 }

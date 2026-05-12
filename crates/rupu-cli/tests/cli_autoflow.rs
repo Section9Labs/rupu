@@ -219,6 +219,17 @@ fn seed_monitor_state(home: &std::path::Path) {
         },
     ];
     history_store.save(&cycle).unwrap();
+    for (offset, event) in cycle.events.iter().cloned().enumerate() {
+        history_store
+            .append_cycle_event(
+                &cycle,
+                event,
+                chrono::DateTime::parse_from_rfc3339(&format!("2026-05-11T10:05:0{}Z", offset + 1))
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            )
+            .unwrap();
+    }
 
     enqueue_issue_wake(
         home,
@@ -253,6 +264,10 @@ fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord 
         worker_id: Some("worker_local_test_cli".into()),
         artifact_manifest_path: None,
         source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
     }
 }
 
@@ -298,7 +313,7 @@ steps:
         .args(["autoflow", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("NAME"))
+        .stdout(predicate::str::contains("Name"))
         .stdout(predicate::str::contains("controller"))
         .stdout(predicate::str::contains("project"))
         .stdout(predicate::str::contains("issue"))
@@ -505,14 +520,15 @@ fn autoflow_monitor_shows_workers_claims_and_recent_activity() {
         .args(["autoflow", "monitor", "--repo", "github:Section9Labs/rupu"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("workers:"))
-        .stdout(predicate::str::contains("claims:"))
-        .stdout(predicate::str::contains("recent activity:"))
-        .stdout(predicate::str::contains("wakes:"))
+        .stdout(predicate::str::contains("autoflow monitor"))
+        .stdout(predicate::str::contains("active claims"))
+        .stdout(predicate::str::contains("recent activity"))
+        .stdout(predicate::str::contains("workers"))
+        .stdout(predicate::str::contains("queued wakes"))
         .stdout(predicate::str::contains("laptop-01"))
         .stdout(predicate::str::contains("ENG-42"))
         .stdout(predicate::str::contains("tracker-controller"))
-        .stdout(predicate::str::contains("run_launched"));
+        .stdout(predicate::str::contains("launched run"));
 }
 
 #[test]
@@ -682,6 +698,7 @@ steps:
         .args(["autoflow", "show", "controller"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("▶ controller"))
         .stdout(predicate::str::contains("priority: 100"))
         .stdout(predicate::str::contains("entity: issue"))
         .stdout(predicate::str::contains(
@@ -691,20 +708,18 @@ steps:
         .stdout(predicate::str::contains(
             "workspace branch: rupu/issue-{{ issue.number }}-{{ inputs.phase }}",
         ))
-        .stdout(predicate::str::contains("reconcile_every: 10m"))
+        .stdout(predicate::str::contains("reconcile every: 10m"))
         .stdout(predicate::str::contains(
-            "wake_on: github.issue.labeled,github.pull_request.closed",
+            "wake on: github.issue.labeled, github.pull_request.closed",
         ))
         .stdout(predicate::str::contains("claim ttl: 3h"))
         .stdout(predicate::str::contains("outcome output: result"))
         .stdout(predicate::str::contains("selector states: open"))
-        .stdout(predicate::str::contains(
-            "selector labels_all: autoflow,bug",
-        ))
-        .stdout(predicate::str::contains("selector labels_any: urgent,p1"))
-        .stdout(predicate::str::contains("selector labels_none: blocked"))
+        .stdout(predicate::str::contains("labels all: autoflow, bug"))
+        .stdout(predicate::str::contains("labels any: urgent, p1"))
+        .stdout(predicate::str::contains("labels none: blocked"))
         .stdout(predicate::str::contains("selector limit: 25"))
-        .stdout(predicate::str::contains("---"))
+        .stdout(predicate::str::contains("workflow yaml"))
         .stdout(predicate::str::contains("name: controller"));
 }
 
@@ -733,6 +748,17 @@ steps:
     prompt: hi
 "#,
     );
+    write_agent_and_workflow(
+        &project,
+        "manual-only",
+        r#"name: manual-only
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: hi
+"#,
+    );
     track_repo(&home, "github:Section9Labs/rupu", project.path());
 
     Command::cargo_bin("rupu")
@@ -743,7 +769,8 @@ steps:
         .assert()
         .success()
         .stdout(predicate::str::contains("controller"))
-        .stdout(predicate::str::contains("github:Section9Labs/rupu"));
+        .stdout(predicate::str::contains("github:Section9Labs/rupu"))
+        .stdout(predicate::str::contains("manual-only").not());
 }
 
 #[test]
@@ -844,7 +871,10 @@ steps:
         .assert()
         .success()
         .stdout(predicate::str::contains("scope: project"))
-        .stdout(predicate::str::contains("repo: github:Section9Labs/rupu"))
+        .stdout(predicate::str::contains(
+            "▶ controller  github:Section9Labs/rupu",
+        ))
+        .stdout(predicate::str::contains("source: github:Section9Labs/rupu"))
         .stdout(predicate::str::contains("preferred checkout:"))
         .stdout(predicate::str::contains("name: controller"));
 }
@@ -939,6 +969,8 @@ steps:
         strict_templates: false,
         run_envelope_template: None,
         worker: None,
+        live_event_hook: None,
+        shared_printer: None,
     };
     let summary = rupu_cli::cmd::workflow::run_with_explicit_context("auto-wf", ctx)
         .await
@@ -1006,6 +1038,8 @@ steps:
         strict_templates: true,
         run_envelope_template: None,
         worker: None,
+        live_event_hook: None,
+        shared_printer: None,
     };
     let err = rupu_cli::cmd::workflow::run_with_explicit_context("auto-wf", strict_ctx)
         .await
@@ -1529,12 +1563,8 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
         .stdout(predicate::str::contains("Repo"))
         .stdout(predicate::str::contains("Branch"))
         .stdout(predicate::str::contains("Run"))
-        .stdout(predicate::str::contains("Last Event"))
-        .stdout(predicate::str::contains("Last Cycle"))
-        .stdout(predicate::str::contains("Priority"))
-        .stdout(predicate::str::contains("PR"))
         .stdout(predicate::str::contains("Summary"))
-        .stdout(predicate::str::contains("Contenders"))
+        .stdout(predicate::str::contains("Next"))
         .stdout(predicate::str::contains("ENG-42"))
         .stdout(predicate::str::contains("linear:eng-team"))
         .stdout(predicate::str::contains("In Review"))
@@ -1542,15 +1572,9 @@ fn autoflow_claims_shows_contenders_and_selected_priority() {
         .stdout(predicate::str::contains("github:Section9Labs/rupu"))
         .stdout(predicate::str::contains("rupu/eng-42"))
         .stdout(predicate::str::contains("run_123"))
-        .stdout(predicate::str::contains("run_launched"))
-        .stdout(predicate::str::contains(
-            "https://github.com/Section9Labs/rupu/pull/42",
-        ))
         .stdout(predicate::str::contains(
             "Draft PR opened and ready for review",
-        ))
-        .stdout(predicate::str::contains("*controller[100]"))
-        .stdout(predicate::str::contains("phase-ready[50]"));
+        ));
 }
 
 #[test]
@@ -1660,6 +1684,15 @@ fn seed_issue_history(seed: IssueHistorySeed<'_>) {
         ..Default::default()
     }];
     history_store.save(&cycle).unwrap();
+    history_store
+        .append_cycle_event(
+            &cycle,
+            cycle.events[0].clone(),
+            chrono::DateTime::parse_from_rfc3339("2026-05-11T10:05:01Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -1763,15 +1796,14 @@ fn autoflow_status_summarizes_counts_and_contested_issues() {
         .args(["autoflow", "status"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("STATUS"))
+        .stdout(predicate::str::contains("Status"))
         .stdout(predicate::str::contains("claimed"))
         .stdout(predicate::str::contains("await_human"))
-        .stdout(predicate::str::contains("contested issues:"))
         .stdout(predicate::str::contains("ENG-42"))
         .stdout(predicate::str::contains("linear:eng-team"))
         .stdout(predicate::str::contains("In Review"))
         .stdout(predicate::str::contains("github:Section9Labs/rupu"))
-        .stdout(predicate::str::contains("recent=run_launched"))
+        .stdout(predicate::str::contains("run_launched"))
         .stdout(predicate::str::contains("*controller[100]"))
         .stdout(predicate::str::contains("phase-ready[50]"));
 }

@@ -360,6 +360,10 @@ pub async fn run_workflow(
                 worker_id: None,
                 artifact_manifest_path: None,
                 source_wake_id: None,
+                active_step_id: None,
+                active_step_kind: None,
+                active_step_agent: None,
+                active_step_transcript_path: None,
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {
@@ -403,6 +407,10 @@ pub async fn run_workflow(
                 record.approval_prompt = None;
                 record.awaiting_since = None;
                 record.expires_at = None;
+                record.active_step_id = None;
+                record.active_step_kind = None;
+                record.active_step_agent = None;
+                record.active_step_transcript_path = None;
             }
             Ok(InnerOutcome::Paused {
                 step_id,
@@ -416,6 +424,10 @@ pub async fn run_workflow(
                 record.awaiting_since = Some(now);
                 record.expires_at =
                     timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
+                record.active_step_id = None;
+                record.active_step_kind = None;
+                record.active_step_agent = None;
+                record.active_step_transcript_path = None;
                 // Don't set finished_at — the run hasn't ended.
                 awaiting = Some(AwaitingInfo {
                     step_id: step_id.clone(),
@@ -427,6 +439,10 @@ pub async fn run_workflow(
                 record.status = crate::runs::RunStatus::Failed;
                 record.finished_at = Some(chrono::Utc::now());
                 record.error_message = Some(e.to_string());
+                record.active_step_id = None;
+                record.active_step_kind = None;
+                record.active_step_agent = None;
+                record.active_step_transcript_path = None;
             }
         }
         if let Err(persist_err) = store.update(record) {
@@ -571,6 +587,7 @@ async fn run_steps_inner(
 
         let effective_continue_on_error =
             step.continue_on_error.unwrap_or(workflow_default_continue);
+        persist_active_step(opts, run_id, step, None);
 
         let result = if step.panel.is_some() {
             run_panel_step(step, &ctx, opts, effective_continue_on_error).await?
@@ -579,9 +596,10 @@ async fn run_steps_inner(
         } else if step.for_each.is_some() {
             run_fanout_step(step, &ctx, opts, effective_continue_on_error).await?
         } else {
-            run_linear_step(step, &ctx, opts, effective_continue_on_error).await?
+            run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await?
         };
         persist_step_result(opts, run_id, &result);
+        clear_active_step(opts, run_id, &step.id);
         step_results.push(result);
     }
     Ok(InnerOutcome::Done)
@@ -670,10 +688,65 @@ fn base_context_for_step(
     ctx
 }
 
+fn step_kind_for_run_record(step: &Step) -> crate::runs::StepKind {
+    if step.panel.is_some() {
+        crate::runs::StepKind::Panel
+    } else if step.parallel.is_some() {
+        crate::runs::StepKind::Parallel
+    } else if step.for_each.is_some() {
+        crate::runs::StepKind::ForEach
+    } else {
+        crate::runs::StepKind::Linear
+    }
+}
+
+fn persist_active_step(
+    opts: &OrchestratorRunOpts,
+    workflow_run_id: &str,
+    step: &Step,
+    transcript_path: Option<PathBuf>,
+) {
+    let Some(store) = &opts.run_store else { return };
+    if workflow_run_id.is_empty() {
+        return;
+    }
+    let Ok(mut record) = store.load(workflow_run_id) else {
+        return;
+    };
+    record.active_step_id = Some(step.id.clone());
+    record.active_step_kind = Some(step_kind_for_run_record(step));
+    record.active_step_agent = step.agent.clone();
+    record.active_step_transcript_path = transcript_path;
+    if let Err(e) = store.update(&record) {
+        warn!(step = %step.id, error = %e, "failed to persist active step");
+    }
+}
+
+fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id: &str) {
+    let Some(store) = &opts.run_store else { return };
+    if workflow_run_id.is_empty() {
+        return;
+    }
+    let Ok(mut record) = store.load(workflow_run_id) else {
+        return;
+    };
+    if record.active_step_id.as_deref() != Some(step_id) {
+        return;
+    }
+    record.active_step_id = None;
+    record.active_step_kind = None;
+    record.active_step_agent = None;
+    record.active_step_transcript_path = None;
+    if let Err(e) = store.update(&record) {
+        warn!(step = %step_id, error = %e, "failed to clear active step");
+    }
+}
+
 /// Single-shot linear step: render the prompt, build agent opts via
 /// the factory, run the agent, capture final assistant text, return
 /// a `StepResult`.
 async fn run_linear_step(
+    workflow_run_id: &str,
     step: &Step,
     ctx: &StepContext,
     opts: &OrchestratorRunOpts,
@@ -696,6 +769,7 @@ async fn run_linear_step(
         })?;
     let run_id = format!("run_{}", Ulid::new());
     let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+    persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
 
     let outcome = dispatch_one(
         &opts.factory,
