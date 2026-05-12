@@ -83,11 +83,11 @@ impl FileTailRunSource {
                 }
             },
         )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
         watcher
             .watch(&parent, RecursiveMode::NonRecursive)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         // --- polling fallback (250 ms) ---
         // Covers kqueue gaps where notify doesn't fire for appends.
