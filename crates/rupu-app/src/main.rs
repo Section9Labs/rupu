@@ -10,19 +10,10 @@ fn main() {
         )
         .init();
 
-    // For D-1 development: open whichever directory the user passes
-    // as the first CLI arg, or fall back to cwd. The proper "File >
-    // Open Workspace…" picker lands in Task 15.
-    let project_dir = std::env::args()
-        .nth(1)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-
-    let workspace = Workspace::open(&project_dir).expect("open workspace");
-    tracing::info!(id = %workspace.manifest.id, "opened workspace");
-
-    gpui_platform::application().run(move |cx: &mut App| {
+    gpui_platform::application().run(|cx: &mut App| {
         cx.activate(true);
+
+        menu::app_menu::install(cx);
 
         // Install the menubar status item. Keep the retain alive for
         // the lifetime of the app loop — dropping it removes the
@@ -30,6 +21,19 @@ fn main() {
         #[cfg(target_os = "macos")]
         let _status_item = menu::menubar::install();
 
-        WorkspaceWindow::open(workspace, cx);
+        // If a directory was passed on the command line, open it
+        // immediately. Otherwise wait for the user to pick via File menu.
+        if let Some(arg) = std::env::args().nth(1) {
+            let dir = std::path::PathBuf::from(arg);
+            match Workspace::open(&dir) {
+                Ok(workspace) => {
+                    tracing::info!(id = %workspace.manifest.id, "opened workspace from CLI arg");
+                    WorkspaceWindow::open(workspace, cx);
+                }
+                Err(e) => {
+                    tracing::error!(?dir, %e, "failed to open workspace from CLI arg");
+                }
+            }
+        }
     });
 }

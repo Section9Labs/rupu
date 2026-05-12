@@ -29,13 +29,18 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = [
+    "NSApplication",
     "NSButton",
     "NSControl",
+    "NSOpenPanel",
+    "NSPanel",
     "NSResponder",
+    "NSSavePanel",
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",
     "NSView",
+    "NSWindow",
 ] }
 objc2-foundation.workspace = true
 
