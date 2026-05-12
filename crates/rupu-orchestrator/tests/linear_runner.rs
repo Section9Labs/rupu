@@ -98,6 +98,7 @@ async fn second_step_sees_first_step_output_via_template() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -144,6 +145,7 @@ async fn event_payload_is_visible_in_step_prompts() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 1);
@@ -199,6 +201,7 @@ async fn issue_payload_is_visible_in_step_prompts_and_when_filters() {
         resume_from: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -260,6 +263,7 @@ async fn for_each_dispatches_one_item_per_line_and_binds_loop_metadata() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -321,6 +325,7 @@ async fn for_each_accepts_a_json_array_of_objects() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -363,6 +368,7 @@ async fn for_each_pulls_items_from_workflow_inputs_with_max_parallel_cap() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -466,6 +472,7 @@ async fn for_each_continue_on_error_records_failures_and_keeps_going() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let fan = &res.step_results[0];
@@ -510,6 +517,7 @@ async fn for_each_without_continue_on_error_aborts_workflow_on_first_failure() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -567,6 +575,7 @@ async fn parallel_dispatches_each_sub_step_with_its_own_agent_and_prompt() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
@@ -630,6 +639,7 @@ async fn parallel_continue_on_error_records_per_sub_step_failures() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let triage = &res.step_results[0];
@@ -674,6 +684,7 @@ async fn parallel_without_continue_on_error_aborts_with_sub_step_id_in_message()
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let err = run_workflow(opts).await.expect_err("should abort");
     let msg = err.to_string();
@@ -719,6 +730,7 @@ async fn run_store_records_run_metadata_and_per_step_rows() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(!res.run_id.is_empty(), "run_id should be populated");
@@ -785,6 +797,7 @@ async fn run_store_marks_run_failed_with_error_message() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let _ = run_workflow(opts).await.expect_err("workflow should fail");
 
@@ -830,6 +843,7 @@ async fn no_run_store_skips_persistence_and_emits_empty_run_id() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(
@@ -884,6 +898,7 @@ async fn approval_gate_pauses_run_and_persists_awaiting_state() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
 
@@ -944,6 +959,7 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let run_id = res.run_id.clone();
@@ -983,6 +999,7 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         }),
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
 
@@ -1054,6 +1071,7 @@ steps:
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     assert!(res.awaiting.is_none());
@@ -1171,6 +1189,7 @@ async fn panel_step_runs_panelists_in_parallel_and_aggregates_findings() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1238,6 +1257,7 @@ steps:
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let summary_prompt = &res.step_results[1].rendered_prompt;
@@ -1285,6 +1305,7 @@ steps:
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1420,6 +1441,7 @@ async fn panel_gate_loops_with_fixer_until_severity_clears() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1472,6 +1494,7 @@ async fn panel_gate_marks_unresolved_when_max_iterations_exhausted() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1529,6 +1552,7 @@ steps:
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let panel = &res.step_results[0];
@@ -1592,6 +1616,7 @@ async fn approval_with_timeout_seconds_persists_awaiting_since_and_expires_at() 
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let info = res.awaiting.expect("workflow should pause");
@@ -1649,6 +1674,7 @@ steps:
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
     let res = run_workflow(opts).await.unwrap();
     let info = res.awaiting.unwrap();

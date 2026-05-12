@@ -836,6 +836,7 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         resume_from: Some(resume),
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
 
     let result = run_workflow(opts).await?;
@@ -1816,6 +1817,7 @@ async fn execute_workflow_invocation(
         resume_from: None,
         run_id_override: Some(run_id.clone()),
         strict_templates,
+        event_sink: None,
     };
 
     let workflow_result = if ctx.attach_ui {
@@ -1927,6 +1929,7 @@ async fn execute_workflow_invocation(
                             resume_from: Some(resume),
                             run_id_override: None,
                             strict_templates,
+                            event_sink: None,
                         };
                         current_runner = tokio::spawn(run_workflow(resume_opts));
                         current_run_id = result.run_id.clone();

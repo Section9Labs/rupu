@@ -217,6 +217,7 @@ async fn parent_step_dispatches_child_and_sees_its_output() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -358,6 +359,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
 
     run_workflow(opts).await.expect("workflow runs");
