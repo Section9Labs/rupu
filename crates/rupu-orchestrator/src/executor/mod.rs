@@ -16,3 +16,4 @@ pub mod file_tail;
 
 pub use errors::ExecutorError;
 pub use event::Event;
+pub use sink::{EventSink, FanOutSink};
