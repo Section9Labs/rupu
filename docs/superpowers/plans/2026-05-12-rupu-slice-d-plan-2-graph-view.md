@@ -2,34 +2,47 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Port the Slice C TUI canvas auto-layout into a new pure-Rust crate `rupu-app-canvas`, then render any workflow YAML in `rupu.app`'s main area as a static vertical git-graph — boxy card nodes with edges between them, drawn in GPUI. No live data, no executor wiring — those land in D-3.
+**Goal:** Render any workflow YAML in `rupu.app`'s main area as a **vertical git-graph timeline** using the `●/│/├/╭/╰/◄` glyph vocabulary from the line-stream printer and the brainstorm mockups. Linear chains, panel fan-outs (3+ panelists branching off a parent rail and merging back), and the cross-pipe + corner-bend characters all draw correctly. All nodes render in the default `Waiting` status — D-3 brings them alive with executor events.
 
-**Architecture:** New crate `rupu-app-canvas` holds the GPUI-independent layer: `NodeStatus` enum, `Position` + `layout_canvas()` (depth-by-edges), `CanvasModel` struct, and `derive_edges_from_workflow` that consumes `rupu-orchestrator::Workflow`. Snapshot-testable with insta — no GPUI dep needed. `rupu-app` gains `view/graph.rs`, a GPUI view that consumes a `CanvasModel` and paints cards + edges + dotted backdrop. The `WorkspaceWindow`'s main area picks the first project workflow on open and renders its Graph view; if no workflow exists, the existing "Open a workflow from the sidebar" placeholder remains.
+**Architecture:** New crate `rupu-app-canvas` holds the pure-Rust, GPUI-independent layer that walks a `rupu_orchestrator::Workflow` and emits a structured `Vec<GraphRow>`. Each row is a sequence of typed cells (pipe, branch glyph, bullet, label, meta) carrying its own status color. Snapshot-tested with insta — no GPUI dep, easy to lock the row sequence for representative workflow shapes. `rupu-app` gains `view/graph.rs`: a GPUI view that renders each `GraphRow` as a horizontal flex of monospace text spans, painting each cell with its color.
 
-**Tech Stack:** Rust 2021, GPUI (already pinned), `rupu-orchestrator` (for `Workflow` type), `insta` for snapshot tests (already in workspace deps from Slice C). No new external dependencies.
+**Tech Stack:** Rust 2021, GPUI (already pinned), `rupu-orchestrator` (for `Workflow` / `WorkflowStep` / `Panel` types), `insta` for snapshot tests (already in workspace deps). No new external dependencies.
 
 ---
 
 ## Spec reference
 
 - Spec: `docs/superpowers/specs/2026-05-11-rupu-slice-d-app-design.md` §7.1 (Graph view) + §10 (D-2 line)
-- Slice C source to port from:
-  - `crates/rupu-tui/src/view/layout.rs` — `layout_canvas` + `layout_tree`
-  - `crates/rupu-tui/src/state/edges.rs` — `derive_edges`
-  - `crates/rupu-tui/src/state/node.rs` — `NodeStatus` enum
-  - `crates/rupu-tui/src/view/palette.rs` — status color mapping
+- Brainstorm mockups: `.superpowers/brainstorm/35768-1778550913/content/workspace-shell-v1.html` and `views.html` (Graph view section). The canonical visual:
+
+```
+●  classify_input            ✓ done
+│
+│      ╭─●─ security_review   ✓ done · 1 finding
+├──────┤
+│      ├─●─ perf_review       ◐ running
+│      ╰─●─ style_review      ⊘ skipped
+│ ◄────╯
+│
+●  aggregate_findings        ⏸ awaiting approval
+```
 
 D-2 scope (spec §10): "Graph view widget — port Slice C TUI's canvas auto-layout to GPUI; render any workflow YAML; no live data yet."
 
-Out of scope for this plan (later sub-slices):
-- Live data binding (D-3: `WorkflowExecutor`/`EventSink` traits make node statuses light up in real time)
-- Approval / reject UI on nodes (D-3)
-- Click-to-select with a focused-node drill-down pane (D-3)
-- Other views — Canvas (D-6), Transcript (D-8), YAML (D-5)
-- View picker UI (deferred — Graph is the only view in D-2 so no picker yet)
-- Pane splits (D-2 keeps the single-pane main area)
-- Tab strip (D-5 / D-6 introduce real tab content; D-2 just renders directly into the main area)
-- Workflow selection from sidebar clicks (deferred to D-3 alongside event binding)
+What this plan ports vs. builds new:
+- **Lift from rupu-tui:** the `NodeStatus` enum (verbatim) and the status-color mapping (translated from `owo_colors::Rgb` to RGB tuples for the GPUI layer to convert).
+- **Build new:** the git-graph row emitter. Slice C's actual TUI canvas uses ratatui `Block` cards, NOT ASCII git-graph. The vertical-spine git-graph the spec describes is the **line-stream printer's** vocabulary (from `rupu-cli::output::printer::LineStreamPrinter`). We port that vocabulary — pipes, branch glyphs, bullets — to a structured row model that's render-target-agnostic.
+
+Out of scope for this plan (deliberate — later sub-slices):
+- Live data (D-3: `WorkflowExecutor` + `EventSink` traits → node statuses update in real time)
+- Status pulse animations on active nodes (D-3 — needs live data first)
+- Approve/reject UI (D-3)
+- Click-to-focus + per-pane drill-down (D-3)
+- ForEach and Parallel fan-out rendering (D-3 — Panel is the headline case for D-2 and the only fan-out kind the mockup showed; ForEach/Parallel render as a single linear-style row with their kind label until D-3)
+- Other views: Canvas (D-6 — that's the Okesu-style boxy-card layout with horizontal flow), Transcript (D-8), YAML (D-5)
+- View picker UI (deferred until there's more than one view to pick — D-5+)
+- Pane splits, tab strip (D-5/D-6)
+- Sidebar workflow click handlers (D-3 — D-2 auto-renders the first project workflow)
 
 ---
 
@@ -42,14 +55,14 @@ crates/rupu-app-canvas/
   Cargo.toml                              # pure-Rust deps
   src/
     lib.rs                                # module hub + re-exports
-    node_status.rs                        # NodeStatus enum + RGB color mapping
-    layout.rs                             # Position + layout_canvas + layout_tree
-    edges.rs                              # derive_edges_from_workflow (consumes rupu-orchestrator::Workflow)
-    model.rs                              # CanvasModel: nodes BTreeMap + edges Vec
+    node_status.rs                        # NodeStatus enum + RGB color mapping (lifted from rupu-tui)
+    git_graph.rs                          # GraphRow / GraphCell types + render_rows(&Workflow)
   tests/
-    snapshots/                            # insta snapshot dir
-    layout_snapshots.rs                   # insta-tested layout outputs for sample workflows
+    snapshots/                            # insta snapshot dir (committed)
+    git_graph_snapshots.rs                # locks row output for 3 representative workflow shapes
 ```
+
+Note: `layout_canvas` / `layout_tree` from Slice C are intentionally NOT ported in this plan. They produce a `BTreeMap<id, (col, row)>` grid which is the right primitive for D-6's Canvas view (Okesu-style boxy cards) but NOT for D-2's git-graph (which is a single-column tree-walk render). D-6 will port them when actually needed.
 
 **Modified `crates/rupu-app/`:**
 
@@ -60,30 +73,28 @@ crates/rupu-app/
     lib.rs                                # add `pub mod view;`
     view/
       mod.rs                              # module hub
-      graph.rs                            # GPUI Graph view (CanvasModel → painted elements)
+      graph.rs                            # GPUI Graph view (GraphRow → monospace text spans)
     window/mod.rs                         # main-area: render Graph for first project workflow
 ```
 
-The split is deliberate: `rupu-app-canvas` stays GPUI-free so layout regressions can be snapshot-tested at high speed. `rupu-app::view::graph` is GPUI-only — just paints from a pre-computed model.
-
-Total tasks below: 12 (1 scaffold + 4 data layer + 1 wiring + 2 GPUI + 1 polish + 3 closeout).
+Total tasks below: 10 (1 scaffold + 4 data layer + 1 wiring + 2 GPUI + 2 closeout).
 
 ---
 
 ## Task 1: Scaffold `rupu-app-canvas` crate
 
 **Files:**
-- Modify: `Cargo.toml` (workspace root, add `rupu-app-canvas` to members + `insta` already in workspace deps; confirm by inspection)
+- Modify: `Cargo.toml` (workspace root, add `rupu-app-canvas` to `[workspace] members`)
 - Create: `crates/rupu-app-canvas/Cargo.toml`
-- Create: `crates/rupu-app-canvas/src/lib.rs`
+- Create: `crates/rupu-app-canvas/src/lib.rs` (module hub stub)
 
 - [ ] **Step 1: Confirm `insta` is in workspace deps**
 
 ```bash
-grep -A1 '^insta' Cargo.toml | head -3
+grep '^insta' Cargo.toml | head -2
 ```
 
-Expected: `insta = "1"` (or similar). It is already in workspace deps from Slice C. If for some reason it isn't, add `insta = { version = "1", features = ["yaml"] }` to `[workspace.dependencies]`.
+Expected: a line like `insta = { version = "1", features = ["yaml"] }`. It's already in workspace deps from Slice C. If missing for any reason, add it.
 
 - [ ] **Step 2: Add `rupu-app-canvas` to workspace members**
 
@@ -111,42 +122,48 @@ insta.workspace = true
 workspace = true
 ```
 
-- [ ] **Step 4: Create `crates/rupu-app-canvas/src/lib.rs` (module hub only)**
+- [ ] **Step 4: Create `crates/rupu-app-canvas/src/lib.rs` (module hub)**
 
 ```rust
-//! Pure-Rust view layer for rupu.app's Graph / Canvas / Transcript /
-//! YAML views. Consumes a `Workflow` from rupu-orchestrator, produces
-//! a `CanvasModel` that GPUI views can paint without re-implementing
-//! the layout algorithm.
+//! Pure-Rust view layer for rupu.app's Graph view (D-2). The git-
+//! graph renderer walks a `rupu_orchestrator::Workflow` and emits a
+//! `Vec<GraphRow>` — a structured sequence of typed cells (pipe,
+//! branch glyph, bullet, label, meta). GPUI views in `rupu-app`
+//! consume the rows; this crate stays GPUI-free so the row layer
+//! can be locked with insta snapshots at native test speed.
 //!
-//! Snapshot-testable without booting GPUI: tests in `tests/` use
-//! `insta` to lock the layout output for sample workflows.
+//! D-6 (Canvas view) will add `layout_canvas` / `layout_tree`
+//! grid primitives lifted from rupu-tui; D-2 doesn't need them.
 
-pub mod edges;
-pub mod layout;
-pub mod model;
+pub mod git_graph;
 pub mod node_status;
 
-pub use edges::derive_edges_from_workflow;
-pub use layout::{layout_canvas, layout_tree, Position};
-pub use model::{CanvasModel, NodeView};
+pub use git_graph::{render_rows, BranchGlyph, GraphCell, GraphRow};
 pub use node_status::NodeStatus;
 ```
 
 - [ ] **Step 5: Build to verify scaffold**
 
-```bash
-cd /Users/matt/Code/Oracle/rupu
-cargo build -p rupu-app-canvas
+Empty placeholder files (`node_status.rs`, `git_graph.rs`) need to exist so the lib.rs `pub mod` declarations don't fail. Create them with a one-line comment:
+
+```rust
+// crates/rupu-app-canvas/src/node_status.rs
+// Implemented in Task 2.
 ```
 
-Expected: builds (likely a lot of warnings about unused modules — that's OK; tasks 2-5 fill them in).
+```rust
+// crates/rupu-app-canvas/src/git_graph.rs
+// Implemented in Task 3.
+```
 
-If `cargo build` complains about missing modules (because we declared them in lib.rs but haven't created the files yet), that's expected. Either:
-- Create empty `node_status.rs` / `layout.rs` / `edges.rs` / `model.rs` files as placeholders to make the build pass for this task, with `// implemented in Task N` comments inside
-- Or skip the build verification here and combine it with Task 2's build
+Then:
 
-The plan-author preference: create empty placeholder files for clean per-task builds.
+```bash
+cd /Users/matt/Code/Oracle/rupu
+cargo build -p rupu-app-canvas 2>&1 | tail -5
+```
+
+Expected: builds (will warn that lib.rs's `pub use` references missing items — but the placeholder files exist so `pub mod` succeeds; cargo's warning is non-fatal until Task 2). If it errors hard (unresolved imports in lib.rs), comment out the `pub use` lines temporarily and uncomment them after Task 3 finishes. Either approach is fine.
 
 - [ ] **Step 6: Commit**
 
@@ -162,15 +179,15 @@ git commit -m "feat(rupu-app-canvas): scaffold crate + module hub"
 **Files:**
 - Modify: `crates/rupu-app-canvas/src/node_status.rs`
 
-- [ ] **Step 1: Write the failing tests first (TDD)**
+The `NodeStatus` enum lifts from `rupu-tui/src/state/node.rs`. The RGB mapping mirrors the Okesu palette already in `rupu-cli/src/output/palette.rs` and `rupu-app/src/palette.rs` so all three surfaces (CLI, app, canvas) draw the same green for "complete", red for "failed", etc.
 
-The full content (tests live in the same file). Replace any placeholder in `node_status.rs` with:
+- [ ] **Step 1: Replace placeholder with full module**
 
 ```rust
-//! Status of one DAG node. Lifted from rupu-tui's NodeStatus with
-//! one addition: this version returns RGB tuples for status colors
-//! so the consuming GPUI layer can convert to `gpui::Rgba` without
-//! pulling GPUI into this crate.
+//! Status of one DAG node. Lifted from rupu-tui::state::NodeStatus
+//! with one addition: this version returns RGB tuples for status
+//! colors so the consuming GPUI layer (rupu-app) can convert to
+//! `gpui::Rgba` without pulling GPUI into this crate.
 
 use serde::{Deserialize, Serialize};
 
@@ -191,7 +208,7 @@ pub enum NodeStatus {
 
 impl NodeStatus {
     /// Single-glyph identifier matching the line-stream printer's
-    /// status palette: `◐`, `●`, `✓`, `✗`, `⏸`, `⊘`.
+    /// vocabulary: `○ ● ◐ ✓ ✗ ⏸ ⊘ ↻`.
     pub fn glyph(self) -> char {
         match self {
             Self::Waiting => '○',
@@ -206,12 +223,11 @@ impl NodeStatus {
         }
     }
 
-    /// Foreground color as a 24-bit RGB tuple. Maps to the Okesu
-    /// palette already used by rupu-cli/output/palette.rs and
-    /// rupu-app/src/palette.rs.
+    /// Foreground color as a 24-bit RGB tuple. Mirrors the Okesu
+    /// palette in rupu-cli/output/palette.rs + rupu-app/src/palette.rs.
     pub fn rgb(self) -> (u8, u8, u8) {
         match self {
-            Self::Waiting => (82, 82, 91),       // slate-500 dim
+            Self::Waiting => (82, 82, 91),       // slate-500 (dim)
             Self::Active => (59, 130, 246),      // blue-500
             Self::Working => (59, 130, 246),     // blue-500
             Self::Complete => (34, 197, 94),     // green-500
@@ -242,17 +258,25 @@ mod tests {
     fn default_is_waiting() {
         assert_eq!(NodeStatus::default(), NodeStatus::Waiting);
     }
+
+    #[test]
+    fn waiting_glyph_is_hollow_circle() {
+        // The empty/pending state is `○` (hollow), so an
+        // unstarted workflow doesn't look like every node is
+        // running. Active/Working share `●`/`◐` once data flows.
+        assert_eq!(NodeStatus::Waiting.glyph(), '○');
+    }
 }
 ```
 
-- [ ] **Step 2: Build + run tests**
+- [ ] **Step 2: Run tests**
 
 ```bash
 cd /Users/matt/Code/Oracle/rupu
 cargo test -p rupu-app-canvas node_status
 ```
 
-Expected: 3 tests pass.
+Expected: 4 tests pass.
 
 - [ ] **Step 3: Commit**
 
@@ -263,343 +287,239 @@ git commit -m "feat(rupu-app-canvas): NodeStatus enum + RGB color mapping"
 
 ---
 
-## Task 3: `layout_canvas` function + snapshot test
+## Task 3: `git_graph` module — row emitter
 
 **Files:**
-- Modify: `crates/rupu-app-canvas/src/layout.rs`
-- Create: `crates/rupu-app-canvas/tests/layout_snapshots.rs`
+- Modify: `crates/rupu-app-canvas/src/git_graph.rs`
 
-- [ ] **Step 1: Port `layout.rs` from rupu-tui**
+This is the heart of the plan. Walks a `Workflow` in declaration order, emits a `Vec<GraphRow>` where each row is a sequence of typed cells in left-to-right order:
 
-The Slice C source at `crates/rupu-tui/src/view/layout.rs` is 88 lines and already pure. Copy it verbatim with the following modifications:
-- Module-level doc-comment that points at this crate's purpose
-- Make `Position::col` and `Position::row` `u16` (unchanged — keep the existing type)
-- Add `#[derive(Serialize, Deserialize)]` to `Position` (to enable snapshot testing via serialized output)
-- Add `Hash` derive to `Position` (useful if maps key on it later)
+- `Pipe(NodeStatus)` — a `│` vertical bar (status drives color)
+- `Branch(BranchGlyph, NodeStatus)` — `├─` / `╭─` / `╰─` / `◄─` / `─┤` (branch into / out of fan-out)
+- `Bullet(NodeStatus)` — the `●` (or status-glyph) marker for a step
+- `Label(String)` — the step id / agent name
+- `Meta(String)` — dim meta text (agent name, "panel · N panelists")
+- `Space(u16)` — a run of spaces (for column alignment)
 
-Full file content for `crates/rupu-app-canvas/src/layout.rs`:
+Each row is rendered by the GPUI view in Task 6 as a horizontal flex of monospace text spans.
 
-```rust
-//! Layout algorithms for the Graph view. Pure functions:
-//! `layout_canvas` produces a column×row position per node id by
-//! propagating depth along edges; `layout_tree` produces a pre-order
-//! DFS with indent depth.
+D-2 emits rows for two step kinds: **Linear** (agent + prompt) and **Panel** (N panelists). ForEach and Parallel render as a single linear-shaped row with their kind in the meta (e.g. `for_each · N items`) — D-3+ adds proper fan-out for them.
 
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Position {
-    pub col: u16,
-    pub row: u16,
-}
-
-/// Place each node at column = its depth from the root, row =
-/// position among siblings at the same column. Topology only —
-/// no manual positions.
-pub fn layout_canvas(node_ids: &[&str], edges: &[(String, String)]) -> BTreeMap<String, Position> {
-    let mut depth: BTreeMap<&str, u16> = BTreeMap::new();
-    for id in node_ids {
-        depth.insert(id, 0);
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (parent, child) in edges {
-            let parent_d = *depth.get(parent.as_str()).unwrap_or(&0);
-            let child_d = *depth.get(child.as_str()).unwrap_or(&0);
-            if child_d <= parent_d {
-                depth.insert(child.as_str(), parent_d + 1);
-                changed = true;
-            }
-        }
-    }
-
-    let mut by_col: BTreeMap<u16, Vec<&str>> = BTreeMap::new();
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    for id in node_ids {
-        if seen.insert(id) {
-            by_col
-                .entry(*depth.get(id).unwrap_or(&0))
-                .or_default()
-                .push(id);
-        }
-    }
-
-    let mut out = BTreeMap::new();
-    for (col, ids) in by_col {
-        for (row, id) in ids.into_iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
-            // Upper bound: workflows with >65535 fan-out children is impossible
-            out.insert(
-                id.to_string(),
-                Position {
-                    col,
-                    row: row as u16,
-                },
-            );
-        }
-    }
-    out
-}
-
-/// Pre-order DFS yielding (step_id, indent_depth) for tree view.
-/// Currently unused by D-2 (Graph only) but included so D-N tree
-/// view doesn't need a second port pass.
-pub fn layout_tree(node_ids: &[&str], edges: &[(String, String)]) -> Vec<(String, u16)> {
-    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut has_parent: BTreeSet<&str> = BTreeSet::new();
-    for (p, c) in edges {
-        children.entry(p.as_str()).or_default().push(c.as_str());
-        has_parent.insert(c.as_str());
-    }
-    let roots: Vec<&str> = node_ids
-        .iter()
-        .copied()
-        .filter(|id| !has_parent.contains(id))
-        .collect();
-
-    let mut out = Vec::new();
-    fn dfs<'a>(
-        node: &'a str,
-        depth: u16,
-        children: &BTreeMap<&'a str, Vec<&'a str>>,
-        out: &mut Vec<(String, u16)>,
-    ) {
-        out.push((node.to_string(), depth));
-        if let Some(kids) = children.get(node) {
-            for kid in kids {
-                let next_depth = if kids.len() == 1 { depth } else { depth + 1 };
-                dfs(kid, next_depth, children, out);
-            }
-        }
-    }
-    for r in roots {
-        dfs(r, 0, &children, &mut out);
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn linear_chain_layout_is_one_per_column() {
-        // a → b → c → d
-        let ids = ["a", "b", "c", "d"];
-        let edges = vec![
-            ("a".into(), "b".into()),
-            ("b".into(), "c".into()),
-            ("c".into(), "d".into()),
-        ];
-        let pos = layout_canvas(&ids, &edges);
-        assert_eq!(pos["a"], Position { col: 0, row: 0 });
-        assert_eq!(pos["b"], Position { col: 1, row: 0 });
-        assert_eq!(pos["c"], Position { col: 2, row: 0 });
-        assert_eq!(pos["d"], Position { col: 3, row: 0 });
-    }
-
-    #[test]
-    fn fan_out_places_children_in_same_column() {
-        // a → b, a → c, a → d (b/c/d are siblings)
-        let ids = ["a", "b", "c", "d"];
-        let edges = vec![
-            ("a".into(), "b".into()),
-            ("a".into(), "c".into()),
-            ("a".into(), "d".into()),
-        ];
-        let pos = layout_canvas(&ids, &edges);
-        assert_eq!(pos["a"].col, 0);
-        assert_eq!(pos["b"].col, 1);
-        assert_eq!(pos["c"].col, 1);
-        assert_eq!(pos["d"].col, 1);
-        // Rows are 0/1/2 in some order
-        let rows: BTreeSet<u16> = ["b", "c", "d"].iter().map(|id| pos[*id].row).collect();
-        assert_eq!(rows, BTreeSet::from([0, 1, 2]));
-    }
-}
-```
-
-- [ ] **Step 2: Build + run unit tests**
-
-```bash
-cd /Users/matt/Code/Oracle/rupu
-cargo test -p rupu-app-canvas layout
-```
-
-Expected: 2 inline tests pass.
-
-- [ ] **Step 3: Create snapshot test file**
-
-`crates/rupu-app-canvas/tests/layout_snapshots.rs`:
+- [ ] **Step 1: Implement `git_graph.rs` with TDD**
 
 ```rust
-//! Integration tests: locks layout output for a few representative
-//! workflow shapes via insta snapshots. If the layout algorithm
-//! drifts, these tests catch it.
+//! Walk a `Workflow` and emit a structured `Vec<GraphRow>` for the
+//! git-graph view. Each row is a sequence of typed cells; the GPUI
+//! renderer in `rupu-app::view::graph` paints them as monospace
+//! text spans.
+//!
+//! Visual model (vertical spine, `●/│/├/╭/╰/◄` glyphs):
+//!
+//! ```text
+//! ●  classify_input        waiting
+//! │
+//! ├─╭─ review_panel        panel · 3 panelists
+//! │ │
+//! │ ●─ security-reviewer   waiting
+//! │ ●─ perf-reviewer       waiting
+//! │ ●─ style-reviewer      waiting
+//! │ │
+//! │ ◄─╯
+//! │
+//! ●  post_to_issue         waiting
+//! ```
 
-use rupu_app_canvas::{layout_canvas, layout_tree};
-
-#[test]
-fn snapshot_linear_5_steps() {
-    let ids = ["classify", "fetch", "transform", "verify", "publish"];
-    let edges: Vec<(String, String)> = ids
-        .windows(2)
-        .map(|w| (w[0].to_string(), w[1].to_string()))
-        .collect();
-    let pos = layout_canvas(&ids, &edges);
-    let tree = layout_tree(&ids, &edges);
-    insta::assert_yaml_snapshot!("linear_5_steps", (pos, tree));
-}
-
-#[test]
-fn snapshot_diamond_4_steps() {
-    // start fans to A and B, both merge into end:
-    //   start → A → end
-    //   start → B → end
-    let ids = ["start", "A", "B", "end"];
-    let edges = vec![
-        ("start".to_string(), "A".to_string()),
-        ("start".to_string(), "B".to_string()),
-        ("A".to_string(), "end".to_string()),
-        ("B".to_string(), "end".to_string()),
-    ];
-    let pos = layout_canvas(&ids, &edges);
-    let tree = layout_tree(&ids, &edges);
-    insta::assert_yaml_snapshot!("diamond_4_steps", (pos, tree));
-}
-```
-
-- [ ] **Step 4: Run snapshot tests to seed the snapshots**
-
-```bash
-cd /Users/matt/Code/Oracle/rupu
-INSTA_UPDATE=auto cargo test -p rupu-app-canvas --test layout_snapshots
-```
-
-Expected: 2 tests pass; insta creates `crates/rupu-app-canvas/tests/snapshots/layout_snapshots__linear_5_steps.snap` and `..__diamond_4_steps.snap`. The `.snap` files now exist; commit them.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/rupu-app-canvas/src/layout.rs crates/rupu-app-canvas/tests
-git commit -m "feat(rupu-app-canvas): layout_canvas + layout_tree (ported from rupu-tui) + snapshot tests"
-```
-
----
-
-## Task 4: `CanvasModel` + `derive_edges_from_workflow`
-
-**Files:**
-- Modify: `crates/rupu-app-canvas/src/edges.rs`
-- Modify: `crates/rupu-app-canvas/src/model.rs`
-
-- [ ] **Step 1: Implement `edges.rs`**
-
-```rust
-//! Derive parent→child edges from a `rupu_orchestrator::Workflow`.
-//! Ported from `rupu-tui::state::edges::derive_edges` — for D-2 we
-//! handle the v0 spec shape: linear chain of `steps`. Fan-out steps
-//! (`for_each:` / `parallel:` / `panel:`) treat each child as a
-//! sibling of the fan-out node visually (drawn as a vertical drop in
-//! canvas mode). D-N can expand to richer edges as the spec
-//! evolves.
-
-use rupu_orchestrator::Workflow;
-
-/// Return parent→child step-id edges in workflow declaration order.
-pub fn derive_edges_from_workflow(wf: &Workflow) -> Vec<(String, String)> {
-    let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
-    ids.windows(2)
-        .map(|w| (w[0].to_string(), w[1].to_string()))
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_workflow_has_no_edges() {
-        let wf = parse_test_workflow("name: empty\nsteps: []");
-        assert!(derive_edges_from_workflow(&wf).is_empty());
-    }
-
-    #[test]
-    fn three_step_workflow_yields_two_edges() {
-        let wf = parse_test_workflow(
-            "name: three\nsteps:\n  - id: a\n    agent: a\n    actions: []\n    prompt: hi\n  - id: b\n    agent: b\n    actions: []\n    prompt: hi\n  - id: c\n    agent: c\n    actions: []\n    prompt: hi\n",
-        );
-        let edges = derive_edges_from_workflow(&wf);
-        assert_eq!(edges.len(), 2);
-        assert_eq!(edges[0], ("a".into(), "b".into()));
-        assert_eq!(edges[1], ("b".into(), "c".into()));
-    }
-
-    fn parse_test_workflow(yaml: &str) -> Workflow {
-        Workflow::parse(yaml).expect("test workflow parses")
-    }
-}
-```
-
-- [ ] **Step 2: Implement `model.rs`**
-
-```rust
-//! `CanvasModel` — the data layer the GPUI Graph view consumes.
-//! Built from a `Workflow` once at workflow-open time; for D-2 all
-//! nodes carry `NodeStatus::Waiting`. D-3 will mutate node statuses
-//! in response to `EventSink` events.
-
-use crate::edges::derive_edges_from_workflow;
 use crate::node_status::NodeStatus;
 use rupu_orchestrator::Workflow;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
 
-/// One node's data as known to the canvas. Position is computed by
-/// `layout::layout_canvas` separately and not stored here.
-#[derive(Debug, Clone)]
-pub struct NodeView {
-    pub step_id: String,
-    pub agent: String,
-    pub status: NodeStatus,
+/// One row of the git-graph rendering. The GPUI renderer paints
+/// cells left-to-right in monospace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphRow {
+    pub cells: Vec<GraphCell>,
 }
 
-/// Complete model for one workflow's Graph view.
-#[derive(Debug, Clone)]
-pub struct CanvasModel {
-    /// Nodes keyed by step_id, sorted by id (BTreeMap → deterministic).
-    pub nodes: BTreeMap<String, NodeView>,
-    /// Parent→child edges in declaration order.
-    pub edges: Vec<(String, String)>,
-    /// Step ids in declaration order (so renderers can preserve YAML order
-    /// when laying out columns/rows of equal depth).
-    pub step_order: Vec<String>,
+/// One typed cell within a row. The renderer maps each variant to a
+/// short monospace string (1-2 chars) + a foreground color.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphCell {
+    /// A `│` vertical bar (parent rail). Color = status of the step
+    /// whose lifetime this row falls within.
+    Pipe(NodeStatus),
+    /// A branch glyph (see `BranchGlyph` for the variants). Color =
+    /// status of the step that owns this branch.
+    Branch(BranchGlyph, NodeStatus),
+    /// A `●` (or status-specific glyph) marking a step's row.
+    Bullet(NodeStatus),
+    /// Run of `n` literal space characters. Used for column-aligning
+    /// the label after the bullet/branch.
+    Space(u16),
+    /// The step's identifier or panelist agent name.
+    Label(String),
+    /// Dim meta text following the label (kind label, panelist count,
+    /// etc.). Renderer paints this in `palette::TEXT_DIMMEST`.
+    Meta(String),
 }
 
-impl CanvasModel {
-    /// Build a model from a parsed workflow. All node statuses default
-    /// to `Waiting` — D-3 will mutate them as events arrive.
-    pub fn from_workflow(wf: &Workflow) -> Self {
-        let mut nodes = BTreeMap::new();
-        let mut step_order = Vec::with_capacity(wf.steps.len());
-        for step in &wf.steps {
-            step_order.push(step.id.clone());
-            nodes.insert(
-                step.id.clone(),
-                NodeView {
-                    step_id: step.id.clone(),
-                    agent: step.agent.clone().unwrap_or_default(),
-                    status: NodeStatus::Waiting,
-                },
-            );
+/// Branch glyph vocabulary, named for visual orientation. Each
+/// variant maps to a 2-character string in the renderer:
+/// - `Top` → `╭─` (top-left corner, opens a fan-out)
+/// - `Mid` → `├─` (mid-T, branches off a continuing spine)
+/// - `Bot` → `╰─` (bottom-left corner, closes a fan-out)
+/// - `Merge` → `◄─` (merge-back arrow back to the parent spine)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BranchGlyph {
+    Top,
+    Mid,
+    Bot,
+    Merge,
+}
+
+impl BranchGlyph {
+    /// Render as a 2-character monospace string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "╭─",
+            Self::Mid => "├─",
+            Self::Bot => "╰─",
+            Self::Merge => "◄─",
         }
-        let edges = derive_edges_from_workflow(wf);
-        Self {
-            nodes,
-            edges,
-            step_order,
+    }
+}
+
+/// Top-level entry point: render the workflow as rows. All node
+/// statuses default to `Waiting` — D-3 will inject live statuses.
+pub fn render_rows(wf: &Workflow) -> Vec<GraphRow> {
+    let mut rows = Vec::new();
+    let total = wf.steps.len();
+
+    for (i, step) in wf.steps.iter().enumerate() {
+        let is_last = i == total - 1;
+
+        // Connector row (a `│` spine) BEFORE every step except the
+        // first — keeps the vertical thread continuous between rows.
+        if i > 0 {
+            rows.push(spine_only());
         }
+
+        if let Some(panel) = &step.panel {
+            emit_panel_step(&mut rows, &step.id, &panel.panelists);
+        } else if step.parallel.is_some() {
+            // Parallel: rendered as a single linear-shaped row with
+            // the kind in meta. Proper sub-step branching lands in D-3.
+            let n = step.parallel.as_ref().map(|p| p.len()).unwrap_or(0);
+            emit_linear_step(&mut rows, &step.id, format!("parallel · {n} sub-steps"));
+        } else if step.for_each.is_some() {
+            // ForEach: same — proper per-item branching lands in D-3.
+            emit_linear_step(&mut rows, &step.id, "for_each · runtime fan-out".into());
+        } else {
+            // Plain linear step. agent may be None if the step uses
+            // some other mode (dispatch agent in-prompt etc.); render
+            // a blank meta in that case.
+            let agent = step.agent.as_deref().unwrap_or("").to_string();
+            emit_linear_step(&mut rows, &step.id, agent);
+        }
+
+        let _ = is_last; // currently unused — kept for D-3 close-row logic
+    }
+
+    rows
+}
+
+/// Emit a single linear-step row: `● <step_id>   <meta>`.
+fn emit_linear_step(rows: &mut Vec<GraphRow>, step_id: &str, meta: String) {
+    let mut cells = Vec::new();
+    cells.push(GraphCell::Bullet(NodeStatus::Waiting));
+    cells.push(GraphCell::Space(2));
+    cells.push(GraphCell::Label(step_id.to_string()));
+    if !meta.is_empty() {
+        cells.push(GraphCell::Space(2));
+        cells.push(GraphCell::Meta(meta));
+    }
+    rows.push(GraphRow { cells });
+}
+
+/// Emit a panel block: header row + one row per panelist + close row.
+///
+/// ```text
+/// ├─╭─ <step_id>   panel · <N> panelists
+/// │ │
+/// │ ●─ <panelist[0]>
+/// │ ●─ <panelist[1]>
+/// │ ●─ <panelist[2]>
+/// │ │
+/// │ ◄─╯
+/// ```
+///
+/// The leading `│` on each panelist row is the WORKFLOW spine
+/// (continues through this panel). The `╭─/●─/●─/◄─╯` characters
+/// indent in to mark panel membership.
+fn emit_panel_step(rows: &mut Vec<GraphRow>, step_id: &str, panelists: &[String]) {
+    let s = NodeStatus::Waiting;
+    let n = panelists.len();
+
+    // Header: ├─╭─ <step_id>   panel · N panelists
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Branch(BranchGlyph::Mid, s),
+            GraphCell::Branch(BranchGlyph::Top, s),
+            GraphCell::Space(1),
+            GraphCell::Label(step_id.to_string()),
+            GraphCell::Space(2),
+            GraphCell::Meta(format!("panel · {n} panelist{}", if n == 1 { "" } else { "s" })),
+        ],
+    });
+
+    // Spacer: │ │
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(s),
+            GraphCell::Space(1),
+            GraphCell::Pipe(s),
+        ],
+    });
+
+    // One row per panelist: │ ●─ <agent>
+    for agent in panelists {
+        rows.push(GraphRow {
+            cells: vec![
+                GraphCell::Pipe(s),
+                GraphCell::Space(1),
+                GraphCell::Bullet(s),
+                GraphCell::Branch(BranchGlyph::Mid, s),
+                GraphCell::Space(1),
+                GraphCell::Label(agent.clone()),
+            ],
+        });
+    }
+
+    // Spacer: │ │
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(s),
+            GraphCell::Space(1),
+            GraphCell::Pipe(s),
+        ],
+    });
+
+    // Close row: │ ◄─╯
+    // The merge arrow + bottom corner reconnect the panel sub-spine
+    // back to the workflow spine.
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(s),
+            GraphCell::Space(1),
+            GraphCell::Branch(BranchGlyph::Merge, s),
+            GraphCell::Branch(BranchGlyph::Bot, s),
+        ],
+    });
+}
+
+/// A `│` connector row used between steps.
+fn spine_only() -> GraphRow {
+    GraphRow {
+        cells: vec![GraphCell::Pipe(NodeStatus::Waiting)],
     }
 }
 
@@ -608,36 +528,175 @@ mod tests {
     use super::*;
     use rupu_orchestrator::Workflow;
 
+    fn parse(yaml: &str) -> Workflow {
+        Workflow::parse(yaml).expect("test workflow parses")
+    }
+
     #[test]
-    fn from_workflow_populates_nodes_and_edges() {
-        let yaml = "name: rev\nsteps:\n  - id: classify\n    agent: classifier\n    actions: []\n    prompt: hi\n  - id: review\n    agent: security-reviewer\n    actions: []\n    prompt: hi\n";
-        let wf = Workflow::parse(yaml).unwrap();
-        let model = CanvasModel::from_workflow(&wf);
-        assert_eq!(model.nodes.len(), 2);
-        assert_eq!(model.edges.len(), 1);
-        assert_eq!(model.step_order, vec!["classify", "review"]);
-        assert_eq!(model.nodes["classify"].agent, "classifier");
-        assert_eq!(model.nodes["review"].status, NodeStatus::Waiting);
+    fn linear_3_step_workflow_emits_5_rows() {
+        // 3 step rows + 2 connector rows = 5 total
+        let wf = parse(
+            "name: t\nsteps:\n\
+             \x20  - id: a\n    agent: aa\n    actions: []\n    prompt: hi\n\
+             \x20  - id: b\n    agent: bb\n    actions: []\n    prompt: hi\n\
+             \x20  - id: c\n    agent: cc\n    actions: []\n    prompt: hi\n",
+        );
+        let rows = render_rows(&wf);
+        assert_eq!(rows.len(), 5, "expected 3 step + 2 connector = 5 rows, got: {rows:#?}");
+
+        // Row 0: step a (bullet + label + meta)
+        assert!(matches!(rows[0].cells[0], GraphCell::Bullet(NodeStatus::Waiting)));
+        assert!(rows[0].cells.iter().any(|c| matches!(c, GraphCell::Label(s) if s == "a")));
+
+        // Row 1: spine connector
+        assert_eq!(rows[1].cells.len(), 1);
+        assert!(matches!(rows[1].cells[0], GraphCell::Pipe(NodeStatus::Waiting)));
+    }
+
+    #[test]
+    fn panel_step_emits_header_plus_panelists_plus_close() {
+        let wf = parse(
+            "name: r\nsteps:\n\
+             \x20  - id: classify\n    agent: classifier\n    actions: []\n    prompt: hi\n\
+             \x20  - id: review_panel\n    panel:\n      panelists:\n        - security-reviewer\n        - perf-reviewer\n        - style-reviewer\n",
+        );
+        let rows = render_rows(&wf);
+
+        // 1 row (classify) + 1 connector + 6 rows (header + spacer + 3 panelists + spacer + close)
+        // = 8 rows total
+        assert_eq!(rows.len(), 9, "expected 8 rows; got {rows:#?}");
+
+        // The panel header should be at index 2 (after classify + connector).
+        // Header = Branch(Mid) + Branch(Top) + Space + Label(review_panel) + Space + Meta(panel · 3 panelists)
+        let header = &rows[2];
+        assert!(matches!(header.cells[0], GraphCell::Branch(BranchGlyph::Mid, _)));
+        assert!(matches!(header.cells[1], GraphCell::Branch(BranchGlyph::Top, _)));
+        assert!(header.cells.iter().any(|c| matches!(c, GraphCell::Label(s) if s == "review_panel")));
+        assert!(header.cells.iter().any(|c| matches!(c, GraphCell::Meta(s) if s.contains("3 panelist"))));
+
+        // The close row at the end of the panel must contain Merge + Bot
+        let close = rows.iter().rev().find(|r| {
+            r.cells.iter().any(|c| matches!(c, GraphCell::Branch(BranchGlyph::Merge, _)))
+        }).expect("merge close row");
+        assert!(close.cells.iter().any(|c| matches!(c, GraphCell::Branch(BranchGlyph::Bot, _))));
+    }
+
+    #[test]
+    fn empty_workflow_emits_no_rows() {
+        let wf = parse("name: e\nsteps: []\n");
+        assert!(render_rows(&wf).is_empty());
     }
 }
 ```
 
-- [ ] **Step 3: Build + run all tests**
+The test YAML uses `\x20  - id:` (the YAML continuation uses spaces, which `\x20` makes explicit so the source doesn't get hosed by an editor that strips leading whitespace). If the parser complains about the formatting, normal `  ` (4-space leading indent) in a raw string works too.
+
+- [ ] **Step 2: Run tests**
 
 ```bash
 cd /Users/matt/Code/Oracle/rupu
-cargo test -p rupu-app-canvas
+cargo test -p rupu-app-canvas git_graph
 ```
 
-Expected: previous tests still pass + 3 new (2 edges + 1 model). Total 6+ tests including snapshots.
+Expected: 3 tests pass.
 
-Note: `Workflow::parse` may reject the minimal test YAML if the orchestrator's parser requires fields we didn't include. If the test fails with a parse error, look at the parser's required fields and add them to the test YAML (e.g. an explicit empty `inputs:` section, or `actions:` per-step). The test bodies above use `actions: []` and `prompt: hi` per the existing pattern in `rupu-orchestrator`'s own parse tests.
+If the panel YAML parse fails because the orchestrator's `Workflow::parse` requires extra fields on panel steps (e.g. `prompt:` or `actions:` at the step level), adjust the test YAML — match `rupu-orchestrator`'s own parse tests for panel steps.
+
+If the test counts are off because the orchestrator adds implicit metadata or your panel rendering decision differs slightly (e.g. spacer rows vs. no spacers), recount and update the assertions to match the implementation — the *shape* is what's load-bearing, not specific row counts.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/rupu-app-canvas/src/git_graph.rs
+git commit -m "feat(rupu-app-canvas): git_graph row emitter (linear + panel)"
+```
+
+---
+
+## Task 4: Snapshot tests for representative workflow shapes
+
+**Files:**
+- Create: `crates/rupu-app-canvas/tests/git_graph_snapshots.rs`
+
+Insta snapshots lock the exact row output for representative workflows. If anyone tweaks the row-emission logic, snapshot diffs immediately surface visual drift.
+
+- [ ] **Step 1: Create the integration test file**
+
+```rust
+//! Snapshot tests for rupu-app-canvas's git-graph row emitter.
+//!
+//! Each test parses a representative workflow YAML, runs
+//! `render_rows`, and snapshots the result via insta. The .snap
+//! files are committed alongside the test so visual changes show
+//! up as PR diffs.
+
+use rupu_app_canvas::render_rows;
+use rupu_orchestrator::Workflow;
+
+fn fixture(name: &str) -> Workflow {
+    Workflow::parse(name).expect("fixture workflow parses")
+}
+
+#[test]
+fn snapshot_linear_3_steps() {
+    let wf = fixture(
+        "name: linear3\nsteps:\n\
+         \x20  - id: classify\n    agent: classifier\n    actions: []\n    prompt: hi\n\
+         \x20  - id: review\n    agent: reviewer\n    actions: []\n    prompt: hi\n\
+         \x20  - id: publish\n    agent: publisher\n    actions: []\n    prompt: hi\n",
+    );
+    let rows = render_rows(&wf);
+    insta::assert_yaml_snapshot!("linear_3_steps", rows);
+}
+
+#[test]
+fn snapshot_panel_with_3_panelists() {
+    let wf = fixture(
+        "name: review\nsteps:\n\
+         \x20  - id: classify\n    agent: classifier\n    actions: []\n    prompt: hi\n\
+         \x20  - id: review_panel\n    panel:\n      panelists:\n        - security-reviewer\n        - perf-reviewer\n        - style-reviewer\n\
+         \x20  - id: aggregate\n    agent: findings-aggregator\n    actions: []\n    prompt: hi\n",
+    );
+    let rows = render_rows(&wf);
+    insta::assert_yaml_snapshot!("panel_with_3_panelists", rows);
+}
+
+#[test]
+fn snapshot_single_linear_step() {
+    let wf = fixture(
+        "name: single\nsteps:\n\
+         \x20  - id: hello\n    agent: greeter\n    actions: []\n    prompt: hi\n",
+    );
+    let rows = render_rows(&wf);
+    insta::assert_yaml_snapshot!("single_linear_step", rows);
+}
+```
+
+- [ ] **Step 2: Seed the snapshots**
+
+```bash
+cd /Users/matt/Code/Oracle/rupu
+INSTA_UPDATE=auto cargo test -p rupu-app-canvas --test git_graph_snapshots
+```
+
+Expected: 3 tests pass; insta creates `crates/rupu-app-canvas/tests/snapshots/git_graph_snapshots__linear_3_steps.snap` etc.
+
+- [ ] **Step 3: Eyeball the snapshots**
+
+```bash
+cat crates/rupu-app-canvas/tests/snapshots/git_graph_snapshots__panel_with_3_panelists.snap
+```
+
+Confirm the row sequence reads like the canonical visual at the top of this plan:
+- classify → spine → panel header (Mid+Top branch) → spacer → 3 panelist rows → spacer → close (Merge+Bot) → spine → aggregate
+
+If the snapshot looks wrong, fix the implementation in Task 3 and re-seed.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/rupu-app-canvas/src
-git commit -m "feat(rupu-app-canvas): CanvasModel::from_workflow + derive_edges_from_workflow"
+git add crates/rupu-app-canvas/tests
+git commit -m "test(rupu-app-canvas): insta snapshots for linear + panel + single workflows"
 ```
 
 ---
@@ -645,29 +704,27 @@ git commit -m "feat(rupu-app-canvas): CanvasModel::from_workflow + derive_edges_
 ## Task 5: Wire `rupu-app-canvas` into `rupu-app`
 
 **Files:**
-- Modify: `crates/rupu-app/Cargo.toml` (add `rupu-app-canvas` + `rupu-orchestrator` to `[dependencies]`)
+- Modify: `crates/rupu-app/Cargo.toml` (add `rupu-app-canvas` + `rupu-orchestrator` deps)
 - Modify: `crates/rupu-app/src/lib.rs` (add `pub mod view;`)
-- Create: `crates/rupu-app/src/view/mod.rs` (stub — populated in Task 6)
+- Create: `crates/rupu-app/src/view/mod.rs`
+- Create: `crates/rupu-app/src/view/graph.rs` (stub — populated in Task 6)
 
-- [ ] **Step 1: Add dependencies to `rupu-app/Cargo.toml`**
+- [ ] **Step 1: Add deps to `crates/rupu-app/Cargo.toml`**
 
-In `crates/rupu-app/Cargo.toml`, add to `[dependencies]` (alphabetical position):
+In `[dependencies]`, add (alphabetical position):
 
 ```toml
 rupu-app-canvas = { path = "../rupu-app-canvas" }
 rupu-orchestrator.workspace = true
 ```
 
-The `rupu-app-canvas` dep uses a path reference rather than `workspace = true` because the crate isn't (and shouldn't be) in `[workspace.dependencies]` — it's a private internal crate.
+`rupu-app-canvas` uses a path reference (not workspace = true) because it's a private internal crate, not in `[workspace.dependencies]`.
 
-- [ ] **Step 2: Add `pub mod view;` to lib.rs**
-
-`crates/rupu-app/src/lib.rs`:
+- [ ] **Step 2: Update `crates/rupu-app/src/lib.rs`**
 
 ```rust
 //! rupu.app library — exposed so integration tests can reach the
-//! pure-data modules (workspace, palette). The binary entry point
-//! lives in main.rs.
+//! pure-data modules (workspace, palette, view).
 
 pub mod menu;
 pub mod palette;
@@ -676,30 +733,24 @@ pub mod window;
 pub mod workspace;
 ```
 
-- [ ] **Step 3: Create the view module hub**
-
-`crates/rupu-app/src/view/mod.rs`:
+- [ ] **Step 3: Create `crates/rupu-app/src/view/mod.rs`**
 
 ```rust
 //! GPUI views for the rupu.app main area.
 //!
-//! Each view is a thin GPUI wrapper around a `rupu-app-canvas` model.
-//! D-2 ships `graph` (the static git-graph). D-5 / D-6 / D-8 add
-//! YAML / Canvas / Transcript.
+//! Each view is a thin GPUI wrapper around a `rupu-app-canvas`
+//! data structure. D-2 ships `graph` (vertical git-graph). D-5 / D-6
+//! / D-8 add YAML / Canvas / Transcript.
 
 pub mod graph;
 ```
 
-(File `view/graph.rs` is created in Task 6.)
-
-- [ ] **Step 4: Stub `view/graph.rs` so the build passes for this task**
-
-`crates/rupu-app/src/view/graph.rs`:
+- [ ] **Step 4: Stub `crates/rupu-app/src/view/graph.rs`**
 
 ```rust
 //! Graph view — populated in Task 6.
 
-// Stub. Task 6 replaces this with the GPUI Graph view.
+// Stub. Task 6 replaces this with the GPUI git-graph renderer.
 ```
 
 - [ ] **Step 5: Build**
@@ -709,7 +760,7 @@ cd /Users/matt/Code/Oracle/rupu
 cargo build -p rupu-app
 ```
 
-Expected: builds; `rupu-app-canvas` becomes a transitive dep of `rupu-app`. No new symbols used yet.
+Expected: builds cleanly.
 
 - [ ] **Step 6: Commit**
 
@@ -720,154 +771,131 @@ git commit -m "feat(rupu-app): wire rupu-app-canvas as a dep + view module hub"
 
 ---
 
-## Task 6: GPUI Graph view
+## Task 6: GPUI git-graph renderer
 
 **Files:**
-- Modify: `crates/rupu-app/src/view/graph.rs` (replace stub with real Graph view)
+- Modify: `crates/rupu-app/src/view/graph.rs`
 
-- [ ] **Step 1: Implement the Graph view**
+Renders a `Vec<GraphRow>` as a column of monospace rows. Each row is a flex of styled text spans — one span per `GraphCell`. Cells have their own foreground color (status-driven for Pipe/Branch/Bullet, TEXT_PRIMARY for Label, TEXT_DIMMEST for Meta).
 
-`crates/rupu-app/src/view/graph.rs`:
+- [ ] **Step 1: Replace the stub with the GPUI renderer**
 
 ```rust
-//! Graph view — GPUI renderer for a `rupu_app_canvas::CanvasModel`.
-//! Static rendering for D-2: a vertical column of card nodes (one
-//! per workflow step) connected by 1px edges, drawn on a dotted
-//! backdrop. No animation (Tasks D-3+ will add live status pulses);
-//! all nodes render in their `Waiting` glyph + dim color.
+//! Graph view — GPUI renderer for `Vec<GraphRow>` from
+//! `rupu-app-canvas::render_rows`. Each row becomes a horizontal
+//! flex of styled monospace text spans. Layout is pure tree-walk
+//! (no col×row grid for D-2 — that lives in D-6's Canvas view).
 
 use crate::palette;
-use gpui::{div, prelude::*, px, AnyElement, IntoElement};
-use rupu_app_canvas::{layout_canvas, CanvasModel, NodeView, Position};
+use gpui::{div, prelude::*, px, AnyElement, IntoElement, Rgba};
+use rupu_app_canvas::{BranchGlyph, GraphCell, GraphRow, NodeStatus};
+use rupu_orchestrator::Workflow;
 
-/// Card dimensions (in pixels). Vertical column layout: cards stack
-/// top-to-bottom, edges drop between them. Each card is wide enough
-/// to show step_id + agent name without truncation for typical 12-32
-/// char step ids.
-const CARD_W: f32 = 240.0;
-const CARD_H: f32 = 72.0;
-const COL_GAP: f32 = 56.0;
-const ROW_GAP: f32 = 32.0;
+/// Top-level entry point: render a parsed `Workflow` as the git-
+/// graph view.
+pub fn render(workflow: &Workflow) -> impl IntoElement {
+    let rows = rupu_app_canvas::render_rows(workflow);
 
-/// Top-level entry point: render a `CanvasModel` as a GPUI element.
-/// Layout is computed inline; the model carries node data + edges,
-/// `layout_canvas` resolves positions, then we paint cards + edges.
-pub fn render(model: &CanvasModel) -> impl IntoElement {
-    let ids: Vec<&str> = model.step_order.iter().map(|s| s.as_str()).collect();
-    let positions = layout_canvas(&ids, &model.edges);
-
-    let mut canvas = div()
+    let mut container = div()
         .size_full()
         .bg(palette::BG_PRIMARY)
-        .relative()
-        .overflow_hidden();
+        .px(px(24.0))
+        .py(px(20.0))
+        .flex()
+        .flex_col()
+        .gap(px(2.0));
 
-    // Cards. Edges are deferred to Task D-3 (need proper SVG/path
-    // painting; for D-2 the columnar drop is implied by vertical
-    // card stacking with no horizontal offset between steps).
-    for id in &model.step_order {
-        let node = match model.nodes.get(id) {
-            Some(n) => n,
-            None => continue,
-        };
-        let pos = match positions.get(id) {
-            Some(p) => *p,
-            None => continue,
-        };
-        canvas = canvas.child(render_card(node, pos));
+    for row in &rows {
+        container = container.child(render_row(row));
     }
 
-    canvas
+    container
 }
 
-fn render_card(node: &NodeView, pos: Position) -> AnyElement {
-    let x = pos.col as f32 * (CARD_W + COL_GAP) + COL_GAP;
-    let y = pos.row as f32 * (CARD_H + ROW_GAP) + ROW_GAP;
+fn render_row(row: &GraphRow) -> AnyElement {
+    let mut hbox = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .text_sm()
+        // Monospace font so the glyphs line up vertically across rows.
+        // GPUI honors the font_family setter — the exact name varies
+        // by host. "Menlo" is a macOS system mono that ships ubiquitously.
+        .font_family("Menlo");
 
-    let glyph = node.status.glyph();
-    let (r, g, b) = node.status.rgb();
-    let status_color = gpui::Rgba {
+    for cell in &row.cells {
+        hbox = hbox.child(render_cell(cell));
+    }
+
+    hbox.into_any_element()
+}
+
+fn render_cell(cell: &GraphCell) -> AnyElement {
+    match cell {
+        GraphCell::Pipe(status) => {
+            div().text_color(status_rgba(*status)).child("│").into_any_element()
+        }
+        GraphCell::Branch(glyph, status) => {
+            div()
+                .text_color(status_rgba(*status))
+                .child(glyph.as_str().to_string())
+                .into_any_element()
+        }
+        GraphCell::Bullet(status) => {
+            // Use the status glyph (●, ◐, ✓, ✗, ⏸, ⊘, ↻, ○) rather than a
+            // fixed `●` — that way Waiting renders as ○ (hollow) so an
+            // unstarted workflow doesn't look like it's mid-run.
+            div()
+                .text_color(status_rgba(*status))
+                .child(status.glyph().to_string())
+                .into_any_element()
+        }
+        GraphCell::Space(n) => div().child(" ".repeat(*n as usize)).into_any_element(),
+        GraphCell::Label(s) => div()
+            .text_color(palette::TEXT_PRIMARY)
+            .child(s.clone())
+            .into_any_element(),
+        GraphCell::Meta(s) => div()
+            .text_color(palette::TEXT_DIMMEST)
+            .child(s.clone())
+            .into_any_element(),
+    }
+}
+
+fn status_rgba(status: NodeStatus) -> Rgba {
+    let (r, g, b) = status.rgb();
+    Rgba {
         r: r as f32 / 255.0,
         g: g as f32 / 255.0,
         b: b as f32 / 255.0,
         a: 1.0,
-    };
-
-    div()
-        .absolute()
-        .left(px(x))
-        .top(px(y))
-        .w(px(CARD_W))
-        .h(px(CARD_H))
-        .bg(palette::BG_SIDEBAR)
-        .border_1()
-        .border_color(palette::BORDER)
-        .border_l_2()
-        .border_color(status_color)
-        .rounded(px(6.0))
-        .px(px(14.0))
-        .py(px(10.0))
-        .flex()
-        .flex_col()
-        .gap(px(4.0))
-        .child(
-            // Header row: step_id + status glyph
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(palette::TEXT_PRIMARY)
-                        .child(node.step_id.clone()),
-                )
-                .child(
-                    div()
-                        .text_color(status_color)
-                        .text_sm()
-                        .child(glyph.to_string()),
-                ),
-        )
-        .child(
-            // Subtitle row: agent name + status label (e.g. "waiting")
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.0))
-                .text_xs()
-                .text_color(palette::TEXT_DIMMEST)
-                .child(div().child(node.agent.clone()))
-                .child(div().child("·"))
-                .child(div().child(format!("{:?}", node.status).to_lowercase())),
-        )
-        .into_any_element()
+    }
 }
 ```
 
-Notes on the implementation choices:
-- The plan punts edge-drawing to D-3. D-2 is "static graph that proves nodes appear in the right positions"; edges between cards are visually implied by the vertical stacking. D-3 will introduce proper edge painting (probably via GPUI's `canvas` paintable element).
-- Card colors lift from the existing `palette` module — no new color constants.
-- `node.status.glyph()` and `node.status.rgb()` are functions on `NodeStatus` from Task 2.
-- All nodes start in `Waiting` (gray), so the graph for D-2 looks subdued — that's intentional. D-3 lights it up.
+### GPUI API adaptations to expect
+
+GPUI is pre-1.0; the methods called above (`.font_family()`, `.gap()`, `.items_center()`) work at our pinned commit but the names may shift. Same caveat as prior tasks. If something doesn't compile, look at the actual gpui::styled trait for the correct method name. Common alternatives:
+- `.font_family(name)` — may be `.font(name)` or `.text_family(name)`
+- `.gap(px(N))` — confirmed to exist (used in Task 11 of Plan 1)
+- `.items_center()` — confirmed
+
+If `Rgba` isn't constructible by field literal at this commit (it was in Task 3 of Plan 1, so should still work), use whatever constructor pattern Task 3 of Plan 1 settled on.
 
 - [ ] **Step 2: Build**
 
 ```bash
 cd /Users/matt/Code/Oracle/rupu
-cargo build -p rupu-app
+cargo build -p rupu-app 2>&1 | tail -10
 ```
 
-Expected: builds. If gpui complains about missing trait methods (`.absolute()` / `.relative()` / `.overflow_hidden()` / `.border_l_2()`), check the actual gpui::styled API at the pinned commit; some may have different names. Adapt.
+Expected: builds. Iterate on any GPUI API drift.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add crates/rupu-app/src/view/graph.rs
-git commit -m "feat(rupu-app): Graph view — static cards laid out by canvas-layout"
+git commit -m "feat(rupu-app): Graph view — render GraphRow vec as monospace text spans"
 ```
 
 ---
@@ -877,21 +905,17 @@ git commit -m "feat(rupu-app): Graph view — static cards laid out by canvas-la
 **Files:**
 - Modify: `crates/rupu-app/src/window/mod.rs`
 
+Replace the centered "Open a workflow from the sidebar." placeholder with: if there's at least one project workflow, parse it and render the Graph view; otherwise keep the placeholder.
+
 - [ ] **Step 1: Update `window/mod.rs`**
 
-Currently the main area renders a centered placeholder ("Open a workflow from the sidebar."). Replace that with: if there's at least one project workflow, render the Graph view of the first one; otherwise keep the placeholder.
-
-In `crates/rupu-app/src/window/mod.rs`, find the part of the `render` impl that builds the main area (the `div().flex_1()...` block) and replace with:
+Find the current `Render for WorkspaceWindow` impl. Replace the main-area child block:
 
 ```rust
 impl Render for WorkspaceWindow {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // Pick the first project workflow (if any) and render its
-        // Graph view in the main area. Workflow YAML is parsed
-        // lazily on render; failures fall back to a small inline
-        // error message. D-3 will introduce real sidebar selection.
         let main_area = match self.workspace.project_assets.workflows.first() {
-            Some(asset) => render_main_for_workflow(asset, &self.workspace),
+            Some(asset) => render_main_for_workflow(asset),
             None => render_main_placeholder(),
         };
 
@@ -924,11 +948,7 @@ fn render_main_placeholder() -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn render_main_for_workflow(
-    asset: &crate::workspace::Asset,
-    _workspace: &crate::workspace::Workspace,
-) -> gpui::AnyElement {
-    use rupu_app_canvas::CanvasModel;
+fn render_main_for_workflow(asset: &crate::workspace::Asset) -> gpui::AnyElement {
     use rupu_orchestrator::Workflow;
 
     let body = match std::fs::read_to_string(&asset.path) {
@@ -945,11 +965,10 @@ fn render_main_for_workflow(
             return render_main_error(format!("failed to parse {}: {e}", asset.path.display()));
         }
     };
-    let model = CanvasModel::from_workflow(&wf);
 
     div()
         .flex_1()
-        .child(crate::view::graph::render(&model))
+        .child(crate::view::graph::render(&wf))
         .into_any_element()
 }
 
@@ -965,13 +984,7 @@ fn render_main_error(msg: String) -> gpui::AnyElement {
 }
 ```
 
-Also: add the necessary imports at the top of `window/mod.rs`. The exact set depends on what's already there, but you'll likely need:
-
-```rust
-use gpui::{div, prelude::*, IntoElement, Render};
-```
-
-(Add `Render` and `Context`/`Window` types as needed for the trait impl.)
+Add necessary imports at the top if missing — likely `IntoElement` and `Render` from gpui::prelude.
 
 - [ ] **Step 2: Build + smoke run**
 
@@ -981,9 +994,19 @@ cargo build -p rupu-app
 timeout 5 cargo run -p rupu-app -- /Users/matt/Code/Oracle/rupu || true
 ```
 
-Expected: the binary opens a window. The main area now shows the first project workflow's steps as a vertical column of cards (probably from `.rupu/workflows/*.yaml`), each card showing step_id + agent + a dim "waiting" status. No panic on stderr.
+Expected: window opens; main area shows the git-graph of the first project workflow from `<repo>/.rupu/workflows/*.yaml` (whichever sorts first alphabetically). Vertical spine of ○/│ pipes, with the step ids + agent meta along the right. If the rupu repo has the `review-and-file-issues` panel workflow checked in, eyeball that to confirm the panel header (├─╭─) + 3 panelists + close (◄─╯) all render.
 
-If the rupu repo itself has many workflows, you'll see whichever sorts first alphabetically. If there are no project workflows, the placeholder remains.
+If the workflow is linear, you should see something like:
+
+```
+○  classify_input        classifier
+│
+○  panel_review          review-panel
+│
+○  aggregate_findings    findings-aggregator
+```
+
+(All `○` because nothing's running.)
 
 - [ ] **Step 3: Commit**
 
@@ -999,23 +1022,19 @@ git commit -m "feat(rupu-app): render Graph view of first project workflow in ma
 **Files:**
 - Modify: `CLAUDE.md`
 
-- [ ] **Step 1: Add `rupu-app-canvas` to the Crates section**
+- [ ] **Step 1: Add `rupu-app-canvas` to Crates section**
 
-Find the bulleted Crates list in `CLAUDE.md`. Insert a new bullet for `rupu-app-canvas` in alphabetical position (immediately after `rupu-app`):
+Find the Crates list. Insert after `rupu-app`:
 
 ```markdown
-- **`rupu-app-canvas`** — pure-Rust view layer for rupu.app (Slice D). Holds the GPUI-independent layout algorithms (`layout_canvas`, `layout_tree`), `NodeStatus` enum, and `CanvasModel` builder. Snapshot-tested via insta; no GPUI dep. rupu-app's `view/graph.rs` consumes a `CanvasModel` and paints with GPUI primitives.
+- **`rupu-app-canvas`** — pure-Rust view layer for rupu.app (Slice D). Walks a `rupu_orchestrator::Workflow` and emits a `Vec<GraphRow>` of structured cells (pipe / branch glyph / bullet / label / meta) for the git-graph view. Snapshot-tested with insta; no GPUI dep. rupu-app's `view/graph.rs` consumes the rows and paints with GPUI text spans. D-6 will add `layout_canvas`/`layout_tree` here for the Canvas view's col×row grid.
 ```
 
-- [ ] **Step 2: Append Plan 2 pointer to Read first**
-
-In the "## Read first" section, append after the existing Slice D Plan 1 line:
+- [ ] **Step 2: Append Plan 2 pointer in Read first**
 
 ```markdown
 - Slice D Plan 2 (Graph view, complete): `docs/superpowers/plans/2026-05-12-rupu-slice-d-plan-2-graph-view.md`
 ```
-
-(Mark "complete" — Task 11 verifies gates before finalizing.)
 
 - [ ] **Step 3: Commit**
 
@@ -1026,16 +1045,14 @@ git commit -m "docs: CLAUDE.md — rupu-app-canvas crate + Slice D Plan 2 pointe
 
 ---
 
-## Task 9: Smoke test verifies graph renders
+## Task 9: Smoke test extension
 
 **Files:**
-- Modify: `Makefile` (extend `app-smoke` to also assert specific log lines)
+- Modify: `Makefile` (extend `app-smoke` to assert workspace-open log line)
 
-- [ ] **Step 1: Tighten the smoke assertion**
+- [ ] **Step 1: Tighten the smoke target**
 
-The existing `app-smoke` target (from Plan 1, Task 16) only checks for absence of "panic" / "panicked" in output. Extend it to also confirm the app opens a workspace and renders something. Add an assertion that the workspace-open log line appears:
-
-In `Makefile`, find the existing `app-smoke` target. Replace its body with:
+In `Makefile`, find `app-smoke` and update its body:
 
 ```makefile
 app-smoke:
@@ -1055,21 +1072,21 @@ app-smoke:
 	@echo "app-smoke OK"
 ```
 
-This extra check confirms `Workspace::open` was actually invoked. If the Graph view renders cleanly (i.e. the workflow YAML parses), no extra log line is needed — absence of panic is the assertion.
+The fixture workspace from Plan 1's Task 16 has one workflow at `tests/fixtures/sample-workspace/.rupu/workflows/example.yaml`. The Graph view will render that during the 4-second window. Any GPUI panic in the new render path manifests here.
 
-- [ ] **Step 2: Run the smoke**
+- [ ] **Step 2: Run**
 
 ```bash
 make app-smoke
 ```
 
-Expected: prints `app-smoke OK`. The fixture workspace at `crates/rupu-app/tests/fixtures/sample-workspace` has one workflow (`example.yaml`) which will trigger the Graph render path.
+Expected: `app-smoke OK`.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add Makefile
-git commit -m "test(rupu-app): tighten app-smoke to assert workspace open log"
+git commit -m "test(rupu-app): tighten app-smoke to assert workspace-open log line"
 ```
 
 ---
@@ -1079,42 +1096,32 @@ git commit -m "test(rupu-app): tighten app-smoke to assert workspace open log"
 **Files:**
 - (none — runs existing tooling; may need minor fixups)
 
-- [ ] **Step 1: `cargo fmt`**
+- [ ] **Step 1: fmt**
 
 ```bash
 cd /Users/matt/Code/Oracle/rupu
 cargo fmt --all -- --check
 ```
 
-If diffs, run `cargo fmt --all` and commit:
+If diffs, `cargo fmt --all` + commit.
 
-```bash
-git add -u
-git commit -m "style: cargo fmt"
-```
-
-- [ ] **Step 2: `cargo clippy`**
+- [ ] **Step 2: clippy**
 
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-If warnings, fix narrowly + commit:
+If warnings, fix narrowly + commit.
 
-```bash
-git add -u
-git commit -m "fix: clippy warnings surfaced by D-2 Plan gates"
-```
-
-- [ ] **Step 3: `cargo test --workspace`**
+- [ ] **Step 3: tests**
 
 ```bash
 cargo test --workspace 2>&1 | tail -30
 ```
 
-Expected: all pass. rupu-app-canvas should report ~6 unit tests + 2 snapshot tests = 8 total. rupu-app's prior 14 tests still pass.
+Expected: all pass. rupu-app-canvas reports 4 unit (NodeStatus) + 3 unit (git_graph) + 3 snapshot = 10 tests. rupu-app's prior 14 tests still pass.
 
-- [ ] **Step 4: `make app-smoke`**
+- [ ] **Step 4: app-smoke**
 
 ```bash
 make app-smoke
@@ -1124,43 +1131,48 @@ Expected: `app-smoke OK`.
 
 - [ ] **Step 5: Final state**
 
-If any fixups were needed in Steps 1-3, the commits are in place. The CLAUDE.md pointer from Task 8 is already marked "complete" — confirm gates passed.
+Any fixups committed in Steps 1-3. Plan 2 complete.
 
 ---
 
 ## Self-review notes
 
-**Spec coverage check** (against spec §10 D-2 line: "Graph view widget — port Slice C TUI's canvas auto-layout to GPUI; render any workflow YAML; no live data yet."):
+**Spec coverage** (against spec §7.1 + §10 D-2 line):
 
 | D-2 deliverable | Covered by |
 |---|---|
-| Port Slice C canvas auto-layout | Task 3 (`layout_canvas` lifted verbatim + 2 unit tests + 2 snapshot tests) |
-| Render any workflow YAML | Tasks 4 (`CanvasModel::from_workflow`) + 6 (GPUI render) + 7 (wire into main area, parses YAML on render) |
-| No live data | Confirmed: all nodes default to `NodeStatus::Waiting`; no `EventSink` subscription |
+| Vertical git-graph spine with `●/│/├/╭/╰/◄` glyphs | Task 3 (`git_graph` emitter) + Task 6 (GPUI renderer paints each glyph) |
+| Status colors from the existing palette | Task 2 (`NodeStatus::rgb()` matches `rupu-cli/output/palette.rs`) + Task 6 (renderer maps to gpui::Rgba) |
+| Linear chains render | Task 3 (`emit_linear_step`) + insta snapshot in Task 4 (`linear_3_steps`) |
+| Panel fan-outs render (header + N panelists + close) | Task 3 (`emit_panel_step`) + insta snapshot in Task 4 (`panel_with_3_panelists`) |
+| Monospace code-editor typeface | Task 6 (`.font_family("Menlo")`) |
+| All nodes Waiting (no live data) | Task 3 (every emitted bullet has `NodeStatus::Waiting`) |
+| Render any workflow YAML | Task 7 (parses + renders the first project workflow) |
 
 **Spec sections deferred to later sub-slices:**
-- Edge painting (cards laid out but edges are visually implied via vertical stacking; proper SVG/path edges land in D-3)
+- ForEach + Parallel fan-out rendering (D-3 — D-2 renders these as single linear-shaped rows with kind label in meta)
+- Live status updates (D-3 — `EventSink` subscription)
 - Status pulse animations (D-3 — needs live data first)
-- Click-to-focus + drill-down (D-3)
-- Pane splits + tab strip (D-5/D-6)
-- View picker (D-5+ when there's more than one view)
+- Click-to-focus / drill-down (D-3)
+- Pane splits + tab strip (D-5 / D-6)
+- View picker (D-5+)
 
-**Placeholder scan:** zero `TODO` markers in the plan that aren't deliberate forward-references (Task 6 notes edges are deferred to D-3; that's documentation, not an unfinished item).
+**Placeholder scan:** zero `TODO` markers. The "D-3 lands ForEach/Parallel fan-out" notes are deferral documentation, not unfinished work.
 
 **Type consistency:**
-- `Position` (Task 3) → consumed by `layout_canvas` return type → consumed by `view::graph::render_card` (Task 6).
-- `NodeStatus` (Task 2) → field of `NodeView` (Task 4) → consumed by `view::graph::render_card` (Task 6) via `.glyph()` + `.rgb()`.
-- `CanvasModel` (Task 4) → built in `window/mod.rs` (Task 7) → passed to `view::graph::render` (Tasks 6, 7).
-- `derive_edges_from_workflow` (Task 4) → called by `CanvasModel::from_workflow` (Task 4).
+- `NodeStatus` (Task 2) → field of every `GraphCell::Pipe/Branch/Bullet` (Task 3) → consumed by `status_rgba` in renderer (Task 6).
+- `BranchGlyph` (Task 3) → consumed by `render_cell` via `as_str()` (Task 6).
+- `GraphRow` / `GraphCell` (Task 3) → produced by `render_rows` (Task 3) → consumed by `view::graph::render` (Tasks 6, 7).
+- `Workflow` (rupu-orchestrator) → consumed by `render_rows` (Task 3) and `view::graph::render` (Task 6).
 
-**No-placeholder verification:** every code step has full executable Rust; every command step has the exact command + expected output; no "TBD" / "fill in later" / "add error handling" hand-waves.
+**No-placeholder verification:** every code step has full executable Rust; every command has expected output; every snapshot test is concrete.
 
 ---
 
 Plan complete and saved to `docs/superpowers/plans/2026-05-12-rupu-slice-d-plan-2-graph-view.md`. Two execution options:
 
-**1. Subagent-Driven (recommended)** — fresh subagent per task, review between tasks, fast iteration.
+**1. Subagent-Driven (recommended)** — fresh subagent per task, review between tasks.
 
-**2. Inline Execution** — execute tasks in this session via `superpowers:executing-plans`, batch checkpoints.
+**2. Inline Execution** — `superpowers:executing-plans` with batch checkpoints.
 
 Which approach?
