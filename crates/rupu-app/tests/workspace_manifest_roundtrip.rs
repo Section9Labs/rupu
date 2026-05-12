@@ -7,10 +7,12 @@ use rupu_app::workspace::{
     manifest::{AttachedHost, RepoBinding, UiState, WorkspaceColor, WorkspaceManifest},
     storage,
 };
+use serial_test::serial;
 use std::env;
 use tempfile::TempDir;
 
 #[test]
+#[serial]
 fn save_then_load_yields_identical_manifest() {
     // Sandbox: directories crate honors XDG_CONFIG_HOME on Linux but
     // NOT macOS — there we have to redirect HOME instead. We do both
