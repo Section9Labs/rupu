@@ -100,6 +100,7 @@ pub trait StepFactory: Send + Sync {
         workspace_id: String,
         workspace_path: PathBuf,
         transcript_path: PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts;
 }
 
@@ -886,6 +887,23 @@ async fn run_linear_step(
     let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
     persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
 
+    let on_tool_call: Option<rupu_agent::OnToolCallCallback> =
+        opts.event_sink.as_ref().map(|sink| {
+            let sink = sink.clone();
+            let wf_run_id = workflow_run_id.to_string();
+            let step_id = step.id.clone();
+            std::sync::Arc::new(move |_caller_step_id: &str, tool_name: &str| {
+                sink.emit(
+                    &wf_run_id,
+                    &crate::executor::Event::StepWorking {
+                        run_id: wf_run_id.clone(),
+                        step_id: step_id.clone(),
+                        note: Some(tool_name.to_string()),
+                    },
+                );
+            }) as rupu_agent::OnToolCallCallback
+        });
+
     let outcome = dispatch_one(
         &opts.factory,
         &step.id,
@@ -895,6 +913,7 @@ async fn run_linear_step(
         opts.workspace_id.clone(),
         opts.workspace_path.clone(),
         transcript_path.clone(),
+        on_tool_call,
     )
     .await;
 
@@ -1041,6 +1060,7 @@ async fn run_fanout_step(
                 workspace_id,
                 workspace_path,
                 transcript_clone.clone(),
+                None,
             )
             .await;
             let (success, error_str, raw_error) = match outcome {
@@ -1209,6 +1229,7 @@ async fn run_parallel_step(
                 workspace_id,
                 workspace_path,
                 transcript_clone.clone(),
+                None,
             )
             .await;
             let (success, error_str, raw_error) = match outcome {
@@ -1343,6 +1364,7 @@ async fn dispatch_one(
     workspace_id: String,
     workspace_path: PathBuf,
     transcript_path: PathBuf,
+    on_tool_call: Option<rupu_agent::OnToolCallCallback>,
 ) -> Result<(), RunError> {
     let agent_opts = factory
         .build_opts_for_step(
@@ -1353,6 +1375,7 @@ async fn dispatch_one(
             workspace_id,
             workspace_path,
             transcript_path,
+            on_tool_call,
         )
         .await;
     run_agent(agent_opts).await.map(|_| ())
@@ -1704,6 +1727,7 @@ async fn dispatch_fixer(
         opts.workspace_id.clone(),
         opts.workspace_path.clone(),
         transcript_path.clone(),
+        None,
     )
     .await;
     match outcome {
@@ -1781,6 +1805,7 @@ async fn run_panel_iteration(
                 workspace_id,
                 workspace_path,
                 transcript_clone.clone(),
+                None,
             )
             .await;
             let (success, _err_str, raw_error) = match outcome {

@@ -2099,6 +2099,7 @@ impl StepFactory for CliStepFactory {
         workspace_id: String,
         workspace_path: PathBuf,
         transcript_path: PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         // We still verify the parent step exists in the workflow so
         // unknown step ids surface clearly, but we drive the agent
@@ -2235,6 +2236,8 @@ impl StepFactory for CliStepFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: spec.dispatchable_agents,
+            step_id: step_id.to_string(),
+            on_tool_call,
         }
     }
 }

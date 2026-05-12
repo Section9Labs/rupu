@@ -35,6 +35,7 @@ impl StepFactory for FakeFactory {
         workspace_id: String,
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
             text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
@@ -70,6 +71,8 @@ impl StepFactory for FakeFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: None,
+            step_id: step_id.to_string(),
+            on_tool_call,
         }
     }
 }

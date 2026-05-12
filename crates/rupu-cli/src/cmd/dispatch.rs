@@ -171,6 +171,8 @@ impl AgentDispatcher for CliAgentDispatcher {
             parent_run_id: Some(parent_run_id.to_string()),
             depth: child_depth,
             dispatchable_agents: spec.dispatchable_agents.clone(),
+            step_id: String::new(),
+            on_tool_call: None,
         };
 
         let started = std::time::Instant::now();

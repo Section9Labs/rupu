@@ -23,6 +23,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
+/// Callback invoked by `run_agent` immediately before each tool
+/// dispatch. The runner translates this into `Event::StepWorking
+/// { note: Some(tool_name) }` so the Graph view can pulse the
+/// active node. Called from the agent's tokio task — must be
+/// non-blocking.
+pub type OnToolCallCallback = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// Errors that can occur during an agent run.
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -141,6 +148,12 @@ pub struct AgentRunOpts {
     /// agent's `dispatchableAgents:` frontmatter field. `None`
     /// (default) ⇒ no dispatches allowed.
     pub dispatchable_agents: Option<Vec<String>>,
+    /// Step id that owns this agent run. Threaded through so
+    /// `on_tool_call` can identify which step is calling. Empty
+    /// for free-standing agent runs (no orchestrator).
+    pub step_id: String,
+    /// Optional callback invoked before each tool dispatch.
+    pub on_tool_call: Option<OnToolCallCallback>,
 }
 
 /// Outcome of a finished run.
@@ -385,6 +398,9 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                     continue;
                 }
             };
+            if let Some(cb) = opts.on_tool_call.as_ref() {
+                cb(&opts.step_id, &tool_name);
+            }
             let started_tool = Instant::now();
             match tool.invoke(input.clone(), &opts.tool_context).await {
                 Ok(out) => {
@@ -547,6 +563,99 @@ fn mcp_tool_name_matches_allowlist(name: &str, allowlist: &[String]) -> bool {
             false
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// on_tool_call callback test
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod on_tool_call_tests {
+    use super::*;
+    use rupu_providers::types::StopReason;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn on_tool_call_fires_once_per_tool_invocation() {
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_clone = calls.clone();
+        let cb: OnToolCallCallback = Arc::new(move |step_id: &str, tool_name: &str| {
+            calls_clone
+                .lock()
+                .unwrap()
+                .push(format!("{step_id}:{tool_name}"));
+        });
+
+        // Two-turn script: turn 0 → tool use (read_file), turn 1 → final text.
+        // The read_file tool needs a `path` input; we point it at a real
+        // filesystem path (the runner.rs source file itself) so the call
+        // succeeds and the agent proceeds to the final turn.
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_test.jsonl");
+
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_read_1".into(),
+                tool_name: "read_file".into(),
+                tool_input: serde_json::json!({
+                    "path": tmp_dir.path().to_str().unwrap_or("/tmp")
+                }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantText {
+                text: "done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
+
+        let opts = AgentRunOpts {
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_test_cb".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "test prompt".into(),
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: Some(cb),
+        };
+
+        run_agent(opts).await.expect("agent run succeeds");
+
+        let log = calls.lock().unwrap();
+        assert_eq!(log.len(), 1, "expected exactly one on_tool_call, got {log:?}");
+        assert!(
+            log[0].starts_with("s1:"),
+            "expected step_id 's1' prefix, got {}",
+            log[0]
+        );
+    }
 }
 
 #[cfg(test)]

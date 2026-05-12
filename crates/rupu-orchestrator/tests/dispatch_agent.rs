@@ -124,6 +124,7 @@ impl StepFactory for DispatchFactory {
         workspace_id: String,
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
+        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         // Two-turn script:
         //   turn 0: dispatch_agent tool_use targeting `security-reviewer`.
@@ -184,6 +185,8 @@ impl StepFactory for DispatchFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: Some(vec!["security-reviewer".into()]),
+            step_id: String::new(),
+            on_tool_call: None,
         }
     }
 }
@@ -274,6 +277,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
             workspace_id: String,
             workspace_path: std::path::PathBuf,
             transcript_path: std::path::PathBuf,
+            _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
         ) -> AgentRunOpts {
             let provider = MockProvider::new(vec![
                 ScriptedTurn::AssistantToolUse {
@@ -330,6 +334,8 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 parent_run_id: None,
                 depth: 0,
                 dispatchable_agents: Some(vec!["security-reviewer".into()]),
+                step_id: String::new(),
+                on_tool_call: None,
             }
         }
     }

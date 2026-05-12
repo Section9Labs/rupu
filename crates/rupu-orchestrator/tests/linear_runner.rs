@@ -37,6 +37,7 @@ impl StepFactory for FakeFactory {
         workspace_id: String,
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         // Produce a single assistant text turn that echoes the
         // rendered prompt + records which (parent step, sub agent)
@@ -75,6 +76,8 @@ impl StepFactory for FakeFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: None,
+            step_id: step_id.to_string(),
+            on_tool_call,
         }
     }
 }
@@ -395,6 +398,7 @@ impl StepFactory for FailingFactory {
         workspace_id: String,
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         let turn = if rendered_prompt.contains("FAIL") {
             ScriptedTurn::ProviderError("simulated failure for fan-out test".into())
@@ -435,6 +439,8 @@ impl StepFactory for FailingFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: None,
+            step_id: step_id.to_string(),
+            on_tool_call,
         }
     }
 }
@@ -1114,6 +1120,7 @@ impl StepFactory for PanelFactory {
         workspace_id: String,
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         // Hand-built JSON keyed by agent name. security-reviewer
         // emits one HIGH; perf-reviewer emits one MEDIUM with
@@ -1166,6 +1173,8 @@ impl StepFactory for PanelFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: None,
+            step_id: step_id.to_string(),
+            on_tool_call,
         }
     }
 }
@@ -1344,6 +1353,7 @@ impl StepFactory for LoopingPanelFactory {
         workspace_id: String,
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         let invocation = {
             let mut map = self.calls.lock().unwrap();
@@ -1400,6 +1410,8 @@ impl StepFactory for LoopingPanelFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: None,
+            step_id: step_id.to_string(),
+            on_tool_call,
         }
     }
 }

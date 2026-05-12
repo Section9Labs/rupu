@@ -146,6 +146,7 @@ impl StepFactory for ParallelFactory {
         workspace_id: String,
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
+        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         let provider = MockProvider::new(vec![
             ScriptedTurn::AssistantToolUse {
@@ -199,6 +200,8 @@ impl StepFactory for ParallelFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: Some(vec!["security-reviewer".into(), "perf-reviewer".into()]),
+            step_id: String::new(),
+            on_tool_call: None,
         }
     }
 }
