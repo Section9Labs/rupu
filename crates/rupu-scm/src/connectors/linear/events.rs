@@ -176,11 +176,6 @@ impl LinearEventConnector {
                       id
                       name
                     }
-                    blockedByIssues(first: 1) {
-                      nodes {
-                        id
-                      }
-                    }
                   }
                   pageInfo {
                     hasNextPage
@@ -463,11 +458,6 @@ fn build_updated_payload(
         )?;
         changed = true;
     }
-    if previous.blocked != current.blocked {
-        payload["blocked"] = Value::Bool(current.blocked);
-        changed = true;
-    }
-
     changed.then_some(payload)
 }
 
@@ -710,7 +700,6 @@ struct IssueSnapshot {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     priority: i64,
-    blocked: bool,
     team: NamedEntitySnapshot,
     state: Option<StateSnapshot>,
     project: Option<NamedEntitySnapshot>,
@@ -726,7 +715,6 @@ impl From<&LinearIssueNode> for IssueSnapshot {
             created_at: value.created_at,
             updated_at: value.updated_at,
             priority: value.priority,
-            blocked: !value.blocked_by_issues.nodes.is_empty(),
             team: NamedEntitySnapshot {
                 id: value.team.id.clone(),
                 name: value.team.name.clone(),
@@ -821,8 +809,6 @@ struct LinearIssueNode {
     state: Option<LinearStateNode>,
     project: Option<LinearNamedNode>,
     cycle: Option<LinearNamedNode>,
-    #[serde(rename = "blockedByIssues")]
-    blocked_by_issues: LinearIdNodePage,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -844,17 +830,6 @@ struct LinearStateNode {
     name: String,
     #[serde(rename = "type")]
     kind: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct LinearIdNodePage {
-    nodes: Vec<LinearIdNode>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct LinearIdNode {
-    #[allow(dead_code)]
-    id: String,
 }
 
 #[cfg(test)]
@@ -976,7 +951,6 @@ mod tests {
                             .unwrap()
                             .with_timezone(&Utc),
                         priority: 0,
-                        blocked: false,
                         team: NamedEntitySnapshot {
                             id: "team-123".into(),
                             name: "Engineering".into(),

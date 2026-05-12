@@ -162,6 +162,25 @@ pub struct RunRecord {
     /// Source wake id when this run came from the durable wake queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_wake_id: Option<String>,
+    /// Id of the step currently executing, when the run is in-flight.
+    /// Used by foreground attach/render paths so they can begin
+    /// tailing the step transcript before `step_results.jsonl` gets a
+    /// completed record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_step_id: Option<String>,
+    /// Workflow-step shape for the currently executing step. Optional
+    /// for back-compat with older `run.json` files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_step_kind: Option<StepKind>,
+    /// Agent assigned to the currently executing step, when the step
+    /// uses a single named agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_step_agent: Option<String>,
+    /// Transcript path for the currently executing step. Present for
+    /// linear steps and any other step kinds that expose a single live
+    /// transcript stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_step_transcript_path: Option<PathBuf>,
 }
 
 /// Workflow-step shape, persisted alongside the result so the
@@ -829,6 +848,10 @@ mod tests {
             worker_id: None,
             artifact_manifest_path: None,
             source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
         }
     }
 

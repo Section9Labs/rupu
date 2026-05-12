@@ -20,6 +20,9 @@ pub enum AutoflowCycleEventKind {
     ClaimReleased,
     ClaimTakeover,
     RunLaunched,
+    IssueCommented,
+    IssueStateChanged,
+    PullRequestOpened,
     AwaitingHuman,
     AwaitingExternal,
     RetryScheduled,
@@ -68,6 +71,45 @@ impl Default for AutoflowCycleEvent {
             wake_event_id: None,
             status: None,
             detail: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoflowHistoryEventRecord {
+    pub version: u32,
+    pub event_id: String,
+    pub cycle_id: String,
+    pub mode: AutoflowCycleMode,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub worker_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub worker_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub repo_filter: Option<String>,
+    pub at: String,
+    #[serde(flatten)]
+    pub event: AutoflowCycleEvent,
+}
+
+impl AutoflowHistoryEventRecord {
+    pub const VERSION: u32 = 1;
+
+    pub fn from_cycle_event(
+        cycle: &AutoflowCycleRecord,
+        event: AutoflowCycleEvent,
+        at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            version: Self::VERSION,
+            event_id: format!("afe_{}", Ulid::new()),
+            cycle_id: cycle.cycle_id.clone(),
+            mode: cycle.mode,
+            worker_id: cycle.worker_id.clone(),
+            worker_name: cycle.worker_name.clone(),
+            repo_filter: cycle.repo_filter.clone(),
+            at: at.to_rfc3339(),
+            event,
         }
     }
 }
@@ -150,6 +192,29 @@ impl AutoflowHistoryStore {
         Ok(())
     }
 
+    pub fn append_event(
+        &self,
+        record: &AutoflowHistoryEventRecord,
+    ) -> Result<(), AutoflowHistoryStoreError> {
+        self.ensure_dirs()?;
+        let at = parse_rfc3339(&record.at)?;
+        let day_dir = self.events_dir().join(at.format("%Y-%m-%d").to_string());
+        std::fs::create_dir_all(&day_dir)?;
+        write_atomic_json(&day_dir.join(format!("{}.json", record.event_id)), record)?;
+        Ok(())
+    }
+
+    pub fn append_cycle_event(
+        &self,
+        cycle: &AutoflowCycleRecord,
+        event: AutoflowCycleEvent,
+        at: DateTime<Utc>,
+    ) -> Result<AutoflowHistoryEventRecord, AutoflowHistoryStoreError> {
+        let record = AutoflowHistoryEventRecord::from_cycle_event(cycle, event, at);
+        self.append_event(&record)?;
+        Ok(record)
+    }
+
     pub fn load(
         &self,
         cycle_id: &str,
@@ -194,8 +259,38 @@ impl AutoflowHistoryStore {
         Ok(out)
     }
 
+    pub fn list_recent_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AutoflowHistoryEventRecord>, AutoflowHistoryStoreError> {
+        self.ensure_dirs()?;
+        let mut out = Vec::new();
+        for day in self.event_day_dirs()? {
+            for entry in std::fs::read_dir(day)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let body = std::fs::read(entry.path())?;
+                let record: AutoflowHistoryEventRecord = serde_json::from_slice(&body)?;
+                out.push(record);
+            }
+        }
+        out.sort_by(|left, right| {
+            right
+                .at
+                .cmp(&left.at)
+                .then_with(|| right.event_id.cmp(&left.event_id))
+        });
+        if out.len() > limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
     fn ensure_dirs(&self) -> Result<(), AutoflowHistoryStoreError> {
         std::fs::create_dir_all(self.cycles_dir())?;
+        std::fs::create_dir_all(self.events_dir())?;
         Ok(())
     }
 
@@ -203,9 +298,26 @@ impl AutoflowHistoryStore {
         self.root.join("cycles")
     }
 
+    fn events_dir(&self) -> PathBuf {
+        self.root.join("events")
+    }
+
     fn day_dirs(&self) -> Result<Vec<PathBuf>, AutoflowHistoryStoreError> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(self.cycles_dir())? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                out.push(entry.path());
+            }
+        }
+        out.sort();
+        out.reverse();
+        Ok(out)
+    }
+
+    fn event_day_dirs(&self) -> Result<Vec<PathBuf>, AutoflowHistoryStoreError> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(self.events_dir())? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 out.push(entry.path());
@@ -276,5 +388,52 @@ mod tests {
         let loaded = store.load(&newer.cycle_id).unwrap().unwrap();
         assert_eq!(loaded.events.len(), 1);
         assert_eq!(loaded.events[0].run_id.as_deref(), Some("run_123"));
+    }
+
+    #[test]
+    fn appends_and_lists_recent_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowHistoryStore::new(tmp.path().to_path_buf());
+
+        let cycle = AutoflowCycleRecord::new(
+            AutoflowCycleMode::Serve,
+            chrono::DateTime::parse_from_rfc3339("2026-05-11T10:05:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        );
+
+        let first = store
+            .append_cycle_event(
+                &cycle,
+                AutoflowCycleEvent {
+                    kind: AutoflowCycleEventKind::ClaimAcquired,
+                    issue_ref: Some("github:Section9Labs/rupu/issues/1".into()),
+                    ..Default::default()
+                },
+                chrono::DateTime::parse_from_rfc3339("2026-05-11T10:05:01Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+        let second = store
+            .append_cycle_event(
+                &cycle,
+                AutoflowCycleEvent {
+                    kind: AutoflowCycleEventKind::IssueCommented,
+                    issue_ref: Some("github:Section9Labs/rupu/issues/1".into()),
+                    ..Default::default()
+                },
+                chrono::DateTime::parse_from_rfc3339("2026-05-11T10:05:02Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            )
+            .unwrap();
+
+        let recent = store.list_recent_events(10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].event_id, second.event_id);
+        assert_eq!(recent[1].event_id, first.event_id);
+        assert_eq!(recent[0].cycle_id, cycle.cycle_id);
+        assert_eq!(recent[0].event.kind, AutoflowCycleEventKind::IssueCommented);
     }
 }

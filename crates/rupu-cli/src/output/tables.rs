@@ -50,6 +50,13 @@ pub fn status_color(status: &str, prefs: &UiPrefs) -> Option<TableColor> {
         "awaiting_approval" | "awaiting" | "paused" => TableColor::Yellow,
         "rejected" => TableColor::Magenta,
         "pending" => TableColor::DarkGrey,
+        // Autoflow claim states.
+        "claimed" => TableColor::Blue,
+        "await_human" | "await_external" => TableColor::Yellow,
+        "retry_backoff" => TableColor::Magenta,
+        "blocked" => TableColor::Red,
+        "complete" => TableColor::Green,
+        "eligible" | "released" => TableColor::DarkGrey,
         // Issue / PR states.
         "open" => TableColor::Green,
         "closed" => TableColor::Magenta,

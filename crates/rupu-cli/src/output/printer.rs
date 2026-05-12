@@ -15,10 +15,8 @@
 //! draws nothing and `multi.println` falls through to the regular
 //! print stream — pipes and CI runners get clean output.
 
-#[cfg(test)]
-use super::palette::Status;
 use super::palette::{
-    self, AWAITING, BRAND, BRAND_300, COMPLETE, DIM, FAILED, RUNNING, SEPARATOR, TOOL_ARROW,
+    self, Status, AWAITING, BRAND, BRAND_300, COMPLETE, DIM, FAILED, RUNNING, SEPARATOR, TOOL_ARROW,
 };
 use super::spinner::{Spinner, SpinnerHandle};
 use chrono::{DateTime, Utc};
@@ -620,6 +618,22 @@ impl LineStreamPrinter {
         if !summary.is_empty() {
             buf.push_str("  ");
             let _ = palette::write_colored(&mut buf, summary, DIM);
+        }
+        self.out(&buf);
+    }
+
+    /// Sideband status event emitted by a live attached workflow, used by
+    /// callers like autoflow to surface tool-driven issue/PR updates in
+    /// real time while preserving ticker coordination.
+    pub fn sideband_event(&mut self, status: Status, label: &str, detail: Option<&str>) {
+        let mut buf = String::new();
+        self.push_content_prefix(&mut buf);
+        let _ = palette::write_bold_colored(&mut buf, &status.glyph().to_string(), status.color());
+        buf.push(' ');
+        let _ = palette::write_bold_colored(&mut buf, label, status.color());
+        if let Some(detail) = detail.filter(|detail| !detail.trim().is_empty()) {
+            buf.push_str("  ");
+            let _ = palette::write_colored(&mut buf, detail, DIM);
         }
         self.out(&buf);
     }
