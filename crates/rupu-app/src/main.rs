@@ -2,6 +2,8 @@
 //!
 //! See `docs/superpowers/specs/2026-05-11-rupu-slice-d-app-design.md`.
 
+mod palette;
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter("rupu_app=debug,gpui=info")
