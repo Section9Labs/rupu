@@ -28,12 +28,26 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
-objc2-app-kit.workspace = true
+objc2-app-kit = { workspace = true, features = [
+    "NSButton",
+    "NSControl",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+] }
 objc2-foundation.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 serial_test.workspace = true
 
-[lints]
-workspace = true
+# rupu-app calls into Apple's AppKit via objc2 raw bindings on macOS
+# (NSStatusItem menubar stub). The FFI module opts in via
+# #[allow(unsafe_code)]. All other crates remain "forbid".
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }

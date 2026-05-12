@@ -1,7 +1,7 @@
 //! rupu.app — native macOS desktop app.
 
 use gpui::App;
-use rupu_app::{window::WorkspaceWindow, workspace::Workspace};
+use rupu_app::{menu, window::WorkspaceWindow, workspace::Workspace};
 
 fn main() {
     tracing_subscriber::fmt()
@@ -23,6 +23,13 @@ fn main() {
 
     gpui_platform::application().run(move |cx: &mut App| {
         cx.activate(true);
+
+        // Install the menubar status item. Keep the retain alive for
+        // the lifetime of the app loop — dropping it removes the
+        // status item from the system menubar.
+        #[cfg(target_os = "macos")]
+        let _status_item = menu::menubar::install();
+
         WorkspaceWindow::open(workspace, cx);
     });
 }
