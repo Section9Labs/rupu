@@ -6,7 +6,7 @@
 
 use crate::palette;
 use crate::workspace::{Asset, Workspace};
-use gpui::{AnyElement, IntoElement, div, prelude::*, px};
+use gpui::{div, prelude::*, px, AnyElement, IntoElement};
 
 const SIDEBAR_WIDTH: f32 = 180.0;
 const SECTION_ORDER: &[&str] = &["workflows", "runs", "repos", "agents", "issues"];
@@ -35,11 +35,7 @@ pub fn render(workspace: &Workspace) -> impl IntoElement {
                 .iter()
                 .chain(global.workflows.iter())
                 .collect(),
-            "agents" => project
-                .agents
-                .iter()
-                .chain(global.agents.iter())
-                .collect(),
+            "agents" => project.agents.iter().chain(global.agents.iter()).collect(),
             _ => Vec::new(), // runs/repos/issues land in D-3/D-9
         };
         container = container.child(render_section(section, &items, is_collapsed, i == 0));

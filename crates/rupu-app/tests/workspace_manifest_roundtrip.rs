@@ -28,8 +28,12 @@ fn save_then_load_yields_identical_manifest() {
         path: "/tmp/test-project".into(),
         opened_at: chrono::Utc::now(),
         repos: vec![
-            RepoBinding { r#ref: "github:acme/foo".into() },
-            RepoBinding { r#ref: "gitlab:acme/bar".into() },
+            RepoBinding {
+                r#ref: "github:acme/foo".into(),
+            },
+            RepoBinding {
+                r#ref: "gitlab:acme/bar".into(),
+            },
         ],
         attached_hosts: vec![AttachedHost::Local],
         ui: UiState::default(),

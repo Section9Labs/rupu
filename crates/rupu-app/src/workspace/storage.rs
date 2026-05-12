@@ -18,8 +18,7 @@ pub fn workspaces_dir() -> Result<PathBuf> {
     let proj = ProjectDirs::from("dev", "rupu", "rupu.app")
         .context("could not resolve user app-support dir for rupu.app")?;
     let dir = proj.config_dir().join("workspaces");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -31,10 +30,9 @@ pub fn manifest_path(workspace_id: &str) -> Result<PathBuf> {
 /// Load a manifest from disk. Missing file → error.
 pub fn load(workspace_id: &str) -> Result<WorkspaceManifest> {
     let path = manifest_path(workspace_id)?;
-    let bytes = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    toml::from_str(&bytes)
-        .with_context(|| format!("parse {}", path.display()))
+    let bytes =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    toml::from_str(&bytes).with_context(|| format!("parse {}", path.display()))
 }
 
 /// Save a manifest to disk. Overwrites any existing file at the same
@@ -63,6 +61,9 @@ mod tests {
     #[test]
     fn manifest_path_uses_id() {
         let p = manifest_path("ws_01H8X").expect("xdg lookup");
-        assert!(p.ends_with("ws_01H8X.toml"), "manifest path should be <id>.toml: {p:?}");
+        assert!(
+            p.ends_with("ws_01H8X.toml"),
+            "manifest path should be <id>.toml: {p:?}"
+        );
     }
 }

@@ -3,22 +3,20 @@
 
 use crate::window::WorkspaceWindow;
 use crate::workspace::Workspace;
-use gpui::{App, Menu, MenuItem, actions};
+use gpui::{actions, App, Menu, MenuItem};
 
 actions!(rupu_app, [NewWorkspace, OpenWorkspace, Quit]);
 
 /// Register the menu and wire its action handlers. Call once on app boot.
 pub fn install(cx: &mut App) {
-    cx.set_menus(vec![Menu::new("rupu").items(vec![
-        MenuItem::submenu(
-            Menu::new("File").items(vec![
-                MenuItem::action("New Workspace\u{2026}", NewWorkspace),
-                MenuItem::action("Open Workspace\u{2026}", OpenWorkspace),
-                MenuItem::separator(),
-                MenuItem::action("Quit rupu", Quit),
-            ]),
-        ),
-    ])]);
+    cx.set_menus(vec![Menu::new("rupu").items(vec![MenuItem::submenu(
+        Menu::new("File").items(vec![
+            MenuItem::action("New Workspace\u{2026}", NewWorkspace),
+            MenuItem::action("Open Workspace\u{2026}", OpenWorkspace),
+            MenuItem::separator(),
+            MenuItem::action("Quit rupu", Quit),
+        ]),
+    )])]);
 
     cx.on_action(|_: &NewWorkspace, cx| {
         if let Some(dir) = pick_directory_modal("Choose a directory for the new workspace") {

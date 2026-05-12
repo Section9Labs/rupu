@@ -112,7 +112,9 @@ mod tests {
             opened_at: chrono::DateTime::parse_from_rfc3339("2026-05-11T15:00:00Z")
                 .unwrap()
                 .with_timezone(&chrono::Utc),
-            repos: vec![RepoBinding { r#ref: "github:Section9Labs/rupu".into() }],
+            repos: vec![RepoBinding {
+                r#ref: "github:Section9Labs/rupu".into(),
+            }],
             attached_hosts: vec![AttachedHost::Local],
             ui: UiState::default(),
         };
@@ -134,8 +136,14 @@ mod tests {
             ui: UiState::default(),
         };
         let s = toml::to_string(&m).expect("serialize");
-        assert!(!s.contains("last_open_tabs"), "empty tabs should be omitted: {s}");
-        assert!(!s.contains("sidebar_collapsed_sections"), "empty collapsed should be omitted: {s}");
+        assert!(
+            !s.contains("last_open_tabs"),
+            "empty tabs should be omitted: {s}"
+        );
+        assert!(
+            !s.contains("sidebar_collapsed_sections"),
+            "empty collapsed should be omitted: {s}"
+        );
         assert!(!s.contains("repos"), "empty repos should be omitted: {s}");
     }
 }

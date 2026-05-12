@@ -6,8 +6,8 @@ pub mod titlebar;
 use crate::palette;
 use crate::workspace::Workspace;
 use gpui::{
-    App, Bounds, Context, IntoElement, Render, Window, WindowBounds, WindowHandle, WindowOptions,
-    div, prelude::*, px, size,
+    div, prelude::*, px, size, App, Bounds, Context, IntoElement, Render, Window, WindowBounds,
+    WindowHandle, WindowOptions,
 };
 
 pub struct WorkspaceWindow {

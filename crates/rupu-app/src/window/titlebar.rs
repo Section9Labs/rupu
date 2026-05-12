@@ -7,7 +7,7 @@
 
 use crate::palette;
 use crate::workspace::Workspace;
-use gpui::{FontWeight, IntoElement, div, prelude::*, px};
+use gpui::{div, prelude::*, px, FontWeight, IntoElement};
 
 pub fn render(workspace: &Workspace) -> impl IntoElement {
     let chip_color = workspace.manifest.color.to_rgba();
@@ -24,11 +24,7 @@ pub fn render(workspace: &Workspace) -> impl IntoElement {
         .gap(px(10.0))
         .child(
             // 10px color chip
-            div()
-                .w(px(10.0))
-                .h(px(10.0))
-                .rounded_full()
-                .bg(chip_color),
+            div().w(px(10.0)).h(px(10.0)).rounded_full().bg(chip_color),
         )
         .child(
             div()

@@ -109,7 +109,12 @@ mod tests {
         assert!(ws.manifest.id.starts_with("ws_"));
         assert_eq!(
             ws.manifest.path,
-            project.path().canonicalize().unwrap().to_string_lossy().to_string()
+            project
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
         );
         assert_eq!(ws.manifest.color, WorkspaceColor::Purple);
         let basename = project

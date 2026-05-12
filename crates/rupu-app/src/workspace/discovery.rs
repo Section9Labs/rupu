@@ -32,7 +32,7 @@ pub fn discover_project(project_dir: &Path) -> AssetSet {
     let rupu = project_dir.join(".rupu");
     AssetSet {
         workflows: list(&rupu.join("workflows"), "yaml"),
-        agents:    list(&rupu.join("agents"), "md"),
+        agents: list(&rupu.join("agents"), "md"),
         autoflows: list(&rupu.join("autoflows"), "yaml"),
     }
 }
@@ -46,7 +46,7 @@ pub fn discover_global() -> AssetSet {
     let rupu = home.join(".rupu");
     AssetSet {
         workflows: list(&rupu.join("workflows"), "yaml"),
-        agents:    list(&rupu.join("agents"), "md"),
+        agents: list(&rupu.join("agents"), "md"),
         autoflows: list(&rupu.join("autoflows"), "yaml"),
     }
 }
