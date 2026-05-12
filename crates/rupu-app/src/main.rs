@@ -3,6 +3,7 @@
 //! See `docs/superpowers/specs/2026-05-11-rupu-slice-d-app-design.md`.
 
 mod palette;
+mod workspace;
 
 fn main() {
     tracing_subscriber::fmt()
