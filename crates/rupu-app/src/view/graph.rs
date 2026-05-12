@@ -9,9 +9,14 @@ use rupu_app_canvas::{GraphCell, GraphRow, NodeStatus};
 use rupu_orchestrator::Workflow;
 
 /// Top-level entry point: render a parsed `Workflow` as the git-
-/// graph view.
-pub fn render(workflow: &Workflow) -> impl IntoElement {
-    let rows = rupu_app_canvas::render_rows(workflow);
+/// graph view, colouring each node according to live status in
+/// `model`. For a static (no live run) view, pass a default
+/// `RunModel` whose `nodes` map is empty — all nodes render as
+/// `Waiting`.
+pub fn render(workflow: &Workflow, model: &crate::run_model::RunModel) -> impl IntoElement {
+    let rows = rupu_app_canvas::render_rows(workflow, |id| {
+        model.nodes.get(id).copied().unwrap_or(NodeStatus::Waiting)
+    });
 
     let mut container = div()
         .size_full()

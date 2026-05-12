@@ -32,7 +32,7 @@ steps:
     prompt: hi
 "#,
     );
-    let rows = render_rows(&wf);
+    let rows = render_rows(&wf, |_| rupu_app_canvas::NodeStatus::Waiting);
     insta::assert_yaml_snapshot!("linear_3_steps", rows);
 }
 
@@ -60,7 +60,7 @@ steps:
     prompt: hi
 "#,
     );
-    let rows = render_rows(&wf);
+    let rows = render_rows(&wf, |_| rupu_app_canvas::NodeStatus::Waiting);
     insta::assert_yaml_snapshot!("panel_with_3_panelists", rows);
 }
 
@@ -76,6 +76,30 @@ steps:
     prompt: hi
 "#,
     );
-    let rows = render_rows(&wf);
+    let rows = render_rows(&wf, |_| rupu_app_canvas::NodeStatus::Waiting);
     insta::assert_yaml_snapshot!("single_linear_step", rows);
+}
+
+#[test]
+fn snapshot_panel_with_one_active_step() {
+    let yaml = r#"
+name: live-snapshot
+steps:
+  - id: classify
+    agent: classifier
+    prompt: "go"
+  - id: review_panel
+    panel:
+      panelists: [sec, perf]
+      subject: "review"
+    actions: []
+"#;
+    let wf = rupu_orchestrator::Workflow::parse(yaml).expect("parse");
+    let rows = rupu_app_canvas::render_rows(&wf, |id| match id {
+        "classify" => rupu_app_canvas::NodeStatus::Complete,
+        "review_panel" => rupu_app_canvas::NodeStatus::Active,
+        "sec" => rupu_app_canvas::NodeStatus::Working,
+        _ => rupu_app_canvas::NodeStatus::Waiting,
+    });
+    insta::assert_yaml_snapshot!(rows);
 }

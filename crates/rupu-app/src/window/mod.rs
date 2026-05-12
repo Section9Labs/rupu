@@ -12,6 +12,10 @@ use gpui::{
 
 pub struct WorkspaceWindow {
     pub workspace: Workspace,
+    /// Live run state for the currently displayed workflow. `None`
+    /// when no run is active (D-2 static display). Task 15 populates
+    /// this from the AppExecutor event stream.
+    pub run_model: Option<crate::run_model::RunModel>,
 }
 
 impl WorkspaceWindow {
@@ -25,7 +29,10 @@ impl WorkspaceWindow {
             ..Default::default()
         };
         cx.open_window(opts, |_window, cx| {
-            cx.new(|_cx| WorkspaceWindow { workspace })
+            cx.new(|_cx| WorkspaceWindow {
+                workspace,
+                run_model: None,
+            })
         })
         .expect("open workspace window")
     }
@@ -33,8 +40,9 @@ impl WorkspaceWindow {
 
 impl Render for WorkspaceWindow {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let run_model = self.run_model.clone();
         let main_area = match self.workspace.project_assets.workflows.first() {
-            Some(asset) => render_main_for_workflow(asset),
+            Some(asset) => render_main_for_workflow(asset, run_model.as_ref()),
             None => render_main_placeholder(),
         };
 
@@ -67,7 +75,10 @@ fn render_main_placeholder() -> AnyElement {
         .into_any_element()
 }
 
-fn render_main_for_workflow(asset: &crate::workspace::Asset) -> AnyElement {
+fn render_main_for_workflow(
+    asset: &crate::workspace::Asset,
+    run_model: Option<&crate::run_model::RunModel>,
+) -> AnyElement {
     use rupu_orchestrator::Workflow;
 
     let body = match std::fs::read_to_string(&asset.path) {
@@ -85,9 +96,12 @@ fn render_main_for_workflow(asset: &crate::workspace::Asset) -> AnyElement {
         }
     };
 
+    let default_model = crate::run_model::RunModel::new(String::new(), asset.path.clone());
+    let model = run_model.unwrap_or(&default_model);
+
     div()
         .flex_1()
-        .child(crate::view::graph::render(&wf))
+        .child(crate::view::graph::render(&wf, model))
         .into_any_element()
 }
 

@@ -1,0 +1,58 @@
+---
+source: crates/rupu-app-canvas/tests/git_graph_snapshots.rs
+expression: rows
+---
+- cells:
+    - Bullet: complete
+    - Space: 2
+    - Label: classify
+    - Space: 2
+    - Meta: classifier
+- cells:
+    - Pipe: waiting
+- cells:
+    - Branch:
+        - Mid
+        - active
+    - Branch:
+        - Top
+        - active
+    - Space: 1
+    - Label: review_panel
+    - Space: 2
+    - Meta: panel · 2 panelists
+- cells:
+    - Pipe: active
+    - Space: 1
+    - Pipe: active
+- cells:
+    - Pipe: active
+    - Space: 1
+    - Bullet: working
+    - Branch:
+        - Mid
+        - working
+    - Space: 1
+    - Label: sec
+- cells:
+    - Pipe: active
+    - Space: 1
+    - Bullet: waiting
+    - Branch:
+        - Mid
+        - waiting
+    - Space: 1
+    - Label: perf
+- cells:
+    - Pipe: active
+    - Space: 1
+    - Pipe: active
+- cells:
+    - Pipe: active
+    - Space: 1
+    - Branch:
+        - Merge
+        - active
+    - Branch:
+        - Bot
+        - active
