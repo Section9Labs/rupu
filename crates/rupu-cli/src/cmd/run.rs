@@ -334,6 +334,8 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         parent_run_id: None,
         depth: 0,
         dispatchable_agents: spec.dispatchable_agents.clone(),
+        step_id: String::new(),
+        on_tool_call: None,
     };
 
     // Spawn the agent in a background task and tail the transcript with

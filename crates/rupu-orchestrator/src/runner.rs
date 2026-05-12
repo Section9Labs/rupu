@@ -100,6 +100,7 @@ pub trait StepFactory: Send + Sync {
         workspace_id: String,
         workspace_path: PathBuf,
         transcript_path: PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts;
 }
 
@@ -153,6 +154,11 @@ pub struct OrchestratorRunOpts {
     pub run_id_override: Option<String>,
     /// When `true`, missing template variables abort rendering.
     pub strict_templates: bool,
+    /// Optional event sink. When `Some`, the runner emits
+    /// `Event::RunStarted` / `Event::StepStarted` / etc. at each
+    /// transition. When `None`, behavior is unchanged (back-compat for
+    /// any direct caller).
+    pub event_sink: Option<std::sync::Arc<dyn crate::executor::EventSink>>,
 }
 
 #[derive(Debug, Clone)]
@@ -383,6 +389,19 @@ pub async fn run_workflow(
         None
     };
 
+    // Emit RunStarted before entering the step loop.
+    if let Some(sink) = opts.event_sink.as_ref() {
+        sink.emit(
+            &run_id,
+            &crate::executor::Event::RunStarted {
+                event_version: 1,
+                run_id: run_id.clone(),
+                workflow_path: opts.workspace_path.join(&opts.workflow.name),
+                started_at: chrono::Utc::now(),
+            },
+        );
+    }
+
     let outcome = run_steps_inner(
         &opts,
         &run_id,
@@ -465,6 +484,37 @@ pub async fn run_workflow(
         });
     }
 
+    // Emit terminal run events (skip for Paused — StepAwaitingApproval
+    // was already emitted by run_steps_inner).
+    if let Some(sink) = opts.event_sink.as_ref() {
+        match &outcome {
+            Ok(InnerOutcome::Done) => {
+                sink.emit(
+                    &run_id,
+                    &crate::executor::Event::RunCompleted {
+                        run_id: run_id.clone(),
+                        status: crate::runs::RunStatus::Completed,
+                        finished_at: chrono::Utc::now(),
+                    },
+                );
+            }
+            Err(e) => {
+                sink.emit(
+                    &run_id,
+                    &crate::executor::Event::RunFailed {
+                        run_id: run_id.clone(),
+                        error: e.to_string(),
+                        finished_at: chrono::Utc::now(),
+                    },
+                );
+            }
+            Ok(InnerOutcome::Paused { .. }) => {
+                // StepAwaitingApproval was already emitted before returning
+                // from run_steps_inner; no additional run-level event here.
+            }
+        }
+    }
+
     outcome?;
     Ok(OrchestratorRunResult {
         step_results,
@@ -539,6 +589,16 @@ async fn run_steps_inner(
                 })?;
             if !take {
                 info!(step = %step.id, "skipping (when: expression is falsy)");
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepSkipped {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            reason: "when: expression evaluated to false".into(),
+                        },
+                    );
+                }
                 let result = StepResult {
                     step_id: step.id.clone(),
                     rendered_prompt: String::new(),
@@ -577,6 +637,16 @@ async fn run_steps_inner(
                     ),
                 };
                 info!(step = %step.id, "pausing for approval");
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepAwaitingApproval {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            reason: prompt.clone(),
+                        },
+                    );
+                }
                 return Ok(InnerOutcome::Paused {
                     step_id: step.id.clone(),
                     prompt,
@@ -589,15 +659,61 @@ async fn run_steps_inner(
             step.continue_on_error.unwrap_or(workflow_default_continue);
         persist_active_step(opts, run_id, step, None);
 
-        let result = if step.panel.is_some() {
-            run_panel_step(step, &ctx, opts, effective_continue_on_error).await?
+        let step_kind = step_kind_for_run_record(step);
+        if let Some(sink) = opts.event_sink.as_ref() {
+            sink.emit(
+                run_id,
+                &crate::executor::Event::StepStarted {
+                    run_id: run_id.to_string(),
+                    step_id: step.id.clone(),
+                    kind: step_kind,
+                    agent: step.agent.clone(),
+                },
+            );
+        }
+        let step_timer = std::time::Instant::now();
+
+        let dispatch_result = if step.panel.is_some() {
+            run_panel_step(step, &ctx, opts, effective_continue_on_error).await
         } else if step.parallel.is_some() {
-            run_parallel_step(step, &ctx, opts, effective_continue_on_error).await?
+            run_parallel_step(step, &ctx, opts, effective_continue_on_error).await
         } else if step.for_each.is_some() {
-            run_fanout_step(step, &ctx, opts, effective_continue_on_error).await?
+            run_fanout_step(step, &ctx, opts, effective_continue_on_error).await
         } else {
-            run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await?
+            run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await
         };
+
+        let duration_ms = step_timer.elapsed().as_millis() as u64;
+
+        match &dispatch_result {
+            Ok(result) => {
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepCompleted {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            success: result.success,
+                            duration_ms,
+                        },
+                    );
+                }
+            }
+            Err(e) => {
+                if let Some(sink) = opts.event_sink.as_ref() {
+                    sink.emit(
+                        run_id,
+                        &crate::executor::Event::StepFailed {
+                            run_id: run_id.to_string(),
+                            step_id: step.id.clone(),
+                            error: e.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let result = dispatch_result?;
         persist_step_result(opts, run_id, &result);
         clear_active_step(opts, run_id, &step.id);
         step_results.push(result);
@@ -771,6 +887,23 @@ async fn run_linear_step(
     let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
     persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
 
+    let on_tool_call: Option<rupu_agent::OnToolCallCallback> =
+        opts.event_sink.as_ref().map(|sink| {
+            let sink = sink.clone();
+            let wf_run_id = workflow_run_id.to_string();
+            let step_id = step.id.clone();
+            std::sync::Arc::new(move |_caller_step_id: &str, tool_name: &str| {
+                sink.emit(
+                    &wf_run_id,
+                    &crate::executor::Event::StepWorking {
+                        run_id: wf_run_id.clone(),
+                        step_id: step_id.clone(),
+                        note: Some(tool_name.to_string()),
+                    },
+                );
+            }) as rupu_agent::OnToolCallCallback
+        });
+
     let outcome = dispatch_one(
         &opts.factory,
         &step.id,
@@ -780,6 +913,7 @@ async fn run_linear_step(
         opts.workspace_id.clone(),
         opts.workspace_path.clone(),
         transcript_path.clone(),
+        on_tool_call,
     )
     .await;
 
@@ -926,6 +1060,7 @@ async fn run_fanout_step(
                 workspace_id,
                 workspace_path,
                 transcript_clone.clone(),
+                None,
             )
             .await;
             let (success, error_str, raw_error) = match outcome {
@@ -1094,6 +1229,7 @@ async fn run_parallel_step(
                 workspace_id,
                 workspace_path,
                 transcript_clone.clone(),
+                None,
             )
             .await;
             let (success, error_str, raw_error) = match outcome {
@@ -1228,6 +1364,7 @@ async fn dispatch_one(
     workspace_id: String,
     workspace_path: PathBuf,
     transcript_path: PathBuf,
+    on_tool_call: Option<rupu_agent::OnToolCallCallback>,
 ) -> Result<(), RunError> {
     let agent_opts = factory
         .build_opts_for_step(
@@ -1238,6 +1375,7 @@ async fn dispatch_one(
             workspace_id,
             workspace_path,
             transcript_path,
+            on_tool_call,
         )
         .await;
     run_agent(agent_opts).await.map(|_| ())
@@ -1589,6 +1727,7 @@ async fn dispatch_fixer(
         opts.workspace_id.clone(),
         opts.workspace_path.clone(),
         transcript_path.clone(),
+        None,
     )
     .await;
     match outcome {
@@ -1666,6 +1805,7 @@ async fn run_panel_iteration(
                 workspace_id,
                 workspace_path,
                 transcript_clone.clone(),
+                None,
             )
             .await;
             let (success, _err_str, raw_error) = match outcome {

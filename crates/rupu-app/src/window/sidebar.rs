@@ -7,11 +7,19 @@
 use crate::palette;
 use crate::workspace::{Asset, Workspace};
 use gpui::{div, prelude::*, px, AnyElement, IntoElement};
+use rupu_orchestrator::runs::RunStatus;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
 const SIDEBAR_WIDTH: f32 = 180.0;
 const SECTION_ORDER: &[&str] = &["workflows", "runs", "repos", "agents", "issues"];
 
-pub fn render(workspace: &Workspace) -> impl IntoElement {
+/// Active run status keyed by workflow path. Built by the caller
+/// (`WorkspaceWindow::render`) so the pure render function stays free of
+/// async / executor dependencies.
+pub type ActiveRunMap = HashMap<PathBuf, RunStatus>;
+
+pub fn render(workspace: &Workspace, active_runs: &ActiveRunMap) -> impl IntoElement {
     let collapsed = &workspace.manifest.ui.sidebar_collapsed_sections;
     let project = &workspace.project_assets;
     let global = &workspace.global_assets;
@@ -38,7 +46,13 @@ pub fn render(workspace: &Workspace) -> impl IntoElement {
             "agents" => project.agents.iter().chain(global.agents.iter()).collect(),
             _ => Vec::new(), // runs/repos/issues land in D-3/D-9
         };
-        container = container.child(render_section(section, &items, is_collapsed, i == 0));
+        container = container.child(render_section(
+            section,
+            &items,
+            is_collapsed,
+            i == 0,
+            active_runs,
+        ));
     }
 
     container
@@ -49,6 +63,7 @@ fn render_section(
     items: &[&Asset],
     is_collapsed: bool,
     is_first: bool,
+    active_runs: &ActiveRunMap,
 ) -> impl IntoElement {
     // Header: uppercase label + optional caret + count when collapsed.
     let caret_child: AnyElement = if is_collapsed {
@@ -95,12 +110,29 @@ fn render_section(
     } else {
         let mut list = div().flex().flex_col().gap(px(2.0));
         for asset in items {
-            list = list.child(
-                div()
-                    .text_xs()
-                    .text_color(palette::TEXT_MUTED)
-                    .child(asset.name.clone()),
-            );
+            let dot_color = active_runs
+                .get(&asset.path)
+                .and_then(|status| match status {
+                    RunStatus::Running => Some(palette::RUNNING),
+                    RunStatus::AwaitingApproval => Some(palette::AWAITING),
+                    RunStatus::Failed => Some(palette::FAILED),
+                    _ => None,
+                });
+
+            let mut row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .text_xs()
+                .text_color(palette::TEXT_MUTED)
+                .child(div().flex_1().child(asset.name.clone()));
+
+            if let Some(color) = dot_color {
+                row = row.child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(color));
+            }
+
+            list = list.child(row);
         }
         list.into_any_element()
     };

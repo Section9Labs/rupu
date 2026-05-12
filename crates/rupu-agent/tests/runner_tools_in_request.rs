@@ -43,6 +43,8 @@ async fn run_passes_all_default_tools_to_provider() {
         parent_run_id: None,
         depth: 0,
         dispatchable_agents: None,
+        step_id: String::new(),
+        on_tool_call: None,
     };
 
     run_agent(opts).await.unwrap();
@@ -125,6 +127,8 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         parent_run_id: None,
         depth: 0,
         dispatchable_agents: None,
+        step_id: String::new(),
+        on_tool_call: None,
     };
 
     run_agent(opts).await.unwrap();

@@ -614,6 +614,11 @@ impl RunStore {
         self.artifact_manifest(run_id)
     }
 
+    /// Path to the executor's event stream log for a run.
+    pub fn events_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("events.jsonl")
+    }
+
     /// List every run currently on disk, newest-first by
     /// `started_at`. Malformed `run.json` files are skipped.
     pub fn list(&self) -> Result<Vec<RunRecord>, RunStoreError> {

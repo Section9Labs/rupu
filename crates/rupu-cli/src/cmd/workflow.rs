@@ -821,6 +821,18 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         prior_step_results,
         approved_step_id: awaited_step_id.clone(),
     };
+    let event_sink_for_resume = {
+        let runs_dir = global.join("runs");
+        let events_path = runs_dir.join(run_id).join("events.jsonl");
+        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
+            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open events.jsonl for resume; continuing without event sink");
+                None
+            }
+        }
+    };
+
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -836,6 +848,7 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         resume_from: Some(resume),
         run_id_override: None,
         strict_templates: false,
+        event_sink: event_sink_for_resume,
     };
 
     let result = run_workflow(opts).await?;
@@ -1801,6 +1814,17 @@ async fn execute_workflow_invocation(
     let inputs_for_resume = inputs_map.clone();
     let strict_templates = ctx.strict_templates;
 
+    let event_sink_for_run = {
+        let events_path = runs_dir.join(&run_id).join("events.jsonl");
+        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
+            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create events.jsonl; continuing without event sink");
+                None
+            }
+        }
+    };
+
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -1816,6 +1840,7 @@ async fn execute_workflow_invocation(
         resume_from: None,
         run_id_override: Some(run_id.clone()),
         strict_templates,
+        event_sink: event_sink_for_run,
     };
 
     let workflow_result = if ctx.attach_ui {
@@ -1912,6 +1937,20 @@ async fn execute_workflow_invocation(
                         };
                         let factory_dyn: Arc<dyn rupu_orchestrator::StepFactory> =
                             factory_for_resume.clone();
+                        let resume_event_sink = {
+                            let events_path = runs_dir.join(&current_run_id).join("events.jsonl");
+                            match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
+                                Ok(sink) => Some(Arc::new(sink)
+                                    as Arc<dyn rupu_orchestrator::executor::EventSink>),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "failed to open events.jsonl for inline resume; continuing without event sink"
+                                    );
+                                    None
+                                }
+                            }
+                        };
                         let resume_opts = OrchestratorRunOpts {
                             workflow: workflow_for_resume.clone(),
                             inputs: inputs_for_resume.clone(),
@@ -1927,6 +1966,7 @@ async fn execute_workflow_invocation(
                             resume_from: Some(resume),
                             run_id_override: None,
                             strict_templates,
+                            event_sink: resume_event_sink,
                         };
                         current_runner = tokio::spawn(run_workflow(resume_opts));
                         current_run_id = result.run_id.clone();
@@ -2096,6 +2136,7 @@ impl StepFactory for CliStepFactory {
         workspace_id: String,
         workspace_path: PathBuf,
         transcript_path: PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         // We still verify the parent step exists in the workflow so
         // unknown step ids surface clearly, but we drive the agent
@@ -2232,6 +2273,8 @@ impl StepFactory for CliStepFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: spec.dispatchable_agents,
+            step_id: step_id.to_string(),
+            on_tool_call,
         }
     }
 }

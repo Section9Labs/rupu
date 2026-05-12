@@ -38,6 +38,8 @@ fn opts(
         parent_run_id: None,
         depth: 0,
         dispatchable_agents: None,
+        step_id: String::new(),
+        on_tool_call: None,
     }
 }
 

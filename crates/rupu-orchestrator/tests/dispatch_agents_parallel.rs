@@ -146,6 +146,7 @@ impl StepFactory for ParallelFactory {
         workspace_id: String,
         workspace_path: std::path::PathBuf,
         transcript_path: std::path::PathBuf,
+        _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
     ) -> AgentRunOpts {
         let provider = MockProvider::new(vec![
             ScriptedTurn::AssistantToolUse {
@@ -199,6 +200,8 @@ impl StepFactory for ParallelFactory {
             parent_run_id: None,
             depth: 0,
             dispatchable_agents: Some(vec!["security-reviewer".into(), "perf-reviewer".into()]),
+            step_id: String::new(),
+            on_tool_call: None,
         }
     }
 }
@@ -237,6 +240,7 @@ async fn parent_step_fans_out_two_children_and_aggregates() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -292,6 +296,7 @@ async fn one_child_failure_marks_all_succeeded_false_but_parent_continues() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -339,6 +344,7 @@ async fn allowlist_violation_blocks_dispatch_at_the_parallel_layer() {
         issue_ref: None,
         run_id_override: None,
         strict_templates: false,
+        event_sink: None,
     };
 
     run_workflow(opts).await.expect("workflow runs");

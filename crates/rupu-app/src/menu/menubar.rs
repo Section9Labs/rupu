@@ -7,6 +7,7 @@
 
 #[cfg(target_os = "macos")]
 mod imp {
+
     #[allow(unsafe_code)]
     pub fn install() -> objc2::rc::Retained<objc2_app_kit::NSStatusItem> {
         use objc2_app_kit::{NSStatusBar, NSVariableStatusItemLength};
@@ -34,6 +35,29 @@ mod imp {
             item
         }
     }
+
+    /// Update the NSStatusItem title to reflect the current pending-approval
+    /// count. Shows `"◐ 0"` when idle and `"◐ N"` when N approvals are
+    /// waiting. Called from the foreground (main) thread only.
+    #[allow(unsafe_code)]
+    pub fn update_badge_title(
+        item: &objc2::rc::Retained<objc2_app_kit::NSStatusItem>,
+        count: usize,
+    ) {
+        use objc2_foundation::{MainThreadMarker, NSString};
+
+        let label = format!("\u{25D0} {count}");
+        // SAFETY: update_badge_title is only called from the GPUI foreground
+        // executor (main thread). See App::spawn / foreground_executor note in
+        // main.rs. Same pattern as install() above.
+        unsafe {
+            let mtm = MainThreadMarker::new_unchecked();
+            let title = NSString::from_str(&label);
+            if let Some(button) = item.button(mtm) {
+                button.setTitle(&title);
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -43,3 +67,6 @@ mod imp {
 }
 
 pub use imp::install;
+
+#[cfg(target_os = "macos")]
+pub use imp::update_badge_title;
