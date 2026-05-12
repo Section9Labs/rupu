@@ -16,4 +16,5 @@ pub mod file_tail;
 
 pub use errors::ExecutorError;
 pub use event::Event;
+pub use jsonl_sink::JsonlSink;
 pub use sink::{EventSink, FanOutSink};
