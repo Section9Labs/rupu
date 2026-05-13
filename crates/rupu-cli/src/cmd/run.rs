@@ -7,13 +7,13 @@
 // TUI attach for single-agent runs deferred — see slice-c spec §4 v0.1
 
 use crate::paths;
-use crate::provider_factory;
 use crate::standalone_run_metadata::{
     metadata_path_for_run, write_metadata, StandaloneRunMetadata,
 };
 use clap::Args as ClapArgs;
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_agent::{load_agent, parse_mode, resolve_mode, PermissionDecision};
+use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, ToolContext};
 use std::io::IsTerminal;

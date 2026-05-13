@@ -14,6 +14,7 @@ pub mod event_vocab;
 pub mod executor;
 pub mod runner;
 pub mod runs;
+pub mod step_factory;
 pub mod templates;
 pub mod workflow;
 
@@ -31,6 +32,7 @@ pub use runs::{
     ApprovalDecision, ApprovalError, FindingRecord, ItemResultRecord, RunRecord, RunStatus,
     RunStore, RunStoreError, StepKind, StepResultRecord,
 };
+pub use step_factory::DefaultStepFactory;
 pub use templates::{
     render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,
     SubResult,

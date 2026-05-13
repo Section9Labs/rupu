@@ -202,11 +202,13 @@ async fn build_copilot(
 #[cfg(test)]
 mod build_copilot_tests {
     use super::*;
-    use crate::test_support::ENV_LOCK;
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
     use rupu_providers::AuthMode;
+    use tokio::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[tokio::test]
     async fn build_copilot_returns_provider() {
@@ -230,11 +232,13 @@ mod build_copilot_tests {
 #[cfg(test)]
 mod build_openai_tests {
     use super::*;
-    use crate::test_support::ENV_LOCK;
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
     use rupu_providers::AuthMode;
+    use tokio::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[tokio::test]
     async fn build_openai_returns_provider() {
@@ -271,11 +275,13 @@ mod build_openai_tests {
 #[cfg(test)]
 mod build_gemini_tests {
     use super::*;
-    use crate::test_support::ENV_LOCK;
     use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
     use rupu_auth::stored::StoredCredential;
     use rupu_providers::AuthMode;
+    use tokio::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[tokio::test]
     async fn build_gemini_with_api_key_returns_provider() {

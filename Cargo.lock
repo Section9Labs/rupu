@@ -6196,7 +6196,6 @@ dependencies = [
  "rupu-scm",
  "rupu-tools",
  "rupu-transcript",
- "rupu-workspace",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -6383,8 +6382,10 @@ dependencies = [
  "notify",
  "predicates",
  "rupu-agent",
+ "rupu-auth",
  "rupu-providers",
  "rupu-runtime",
+ "rupu-scm",
  "rupu-tools",
  "rupu-transcript",
  "serde",
@@ -6426,13 +6427,20 @@ dependencies = [
 name = "rupu-runtime"
 version = "0.5.4"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "chrono",
  "hex",
+ "rupu-agent",
+ "rupu-auth",
+ "rupu-providers",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "ulid",
 ]
 

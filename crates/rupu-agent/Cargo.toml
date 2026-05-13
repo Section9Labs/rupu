@@ -24,7 +24,6 @@ ulid.workspace = true
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-providers = { path = "../rupu-providers" }
-rupu-workspace = { path = "../rupu-workspace" }
 rupu-config = { path = "../rupu-config" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-mcp = { path = "../rupu-mcp" }

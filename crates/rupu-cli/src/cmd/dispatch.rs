@@ -3,17 +3,17 @@
 //!
 //! Spawns a child agent run synchronously: loads the agent spec,
 //! allocates a sub-run directory under the parent's run dir, builds a
-//! provider via [`crate::provider_factory`], threads the same
+//! provider via [`rupu_runtime::provider_factory`], threads the same
 //! dispatcher Arc into the child's [`ToolContext`] (so grandchildren
 //! up to `MAX_DEPTH` can dispatch too), runs the child to completion,
 //! and reads the final assistant text out of the persisted transcript.
 //!
 //! See `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
 
-use crate::provider_factory;
 use async_trait::async_trait;
 use rupu_agent::runner::{run_agent, AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_orchestrator::RunStore;
+use rupu_runtime::provider_factory;
 use rupu_tools::{AgentDispatcher, DispatchError, DispatchOutcome, ToolContext};
 use rupu_transcript::{Event as TxEvent, JsonlReader};
 use std::path::{Path, PathBuf};

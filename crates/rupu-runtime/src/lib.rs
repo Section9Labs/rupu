@@ -1,6 +1,7 @@
 mod artifacts;
 mod autoflow_history;
 mod backend;
+pub mod provider_factory;
 mod run_envelope;
 mod wake;
 mod worker;
@@ -11,6 +12,9 @@ pub use autoflow_history::{
     AutoflowHistoryEventRecord, AutoflowHistoryStore, AutoflowHistoryStoreError,
 };
 pub use backend::{ExecutionBackend, PreparedRun, RunResult, RunResultStatus};
+pub use provider_factory::{
+    build_for_provider, build_for_provider_with_config, FactoryError, ProviderConfig,
+};
 pub use run_envelope::{
     AutoflowEnvelope, ExecutionRequest, RepoBinding, RunContext, RunCorrelation, RunEnvelope,
     RunKind, RunTrigger, RunTriggerSource, WorkerRequest, WorkflowBinding,
