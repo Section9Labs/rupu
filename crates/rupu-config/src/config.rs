@@ -8,6 +8,7 @@ use crate::autoflow_config::AutoflowConfig;
 use crate::pricing_config::PricingConfig;
 use crate::provider_config::ProviderConfig;
 use crate::scm_config::{IssuesSection, ScmSection};
+use crate::storage_config::StorageConfig;
 use crate::triggers_config::TriggersConfig;
 
 /// Top-level rupu configuration. Loaded from `~/.rupu/config.toml`
@@ -40,6 +41,8 @@ pub struct Config {
     pub autoflow: AutoflowConfig,
     #[serde(default)]
     pub pricing: PricingConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 /// Terminal-output rendering preferences. Consumed by

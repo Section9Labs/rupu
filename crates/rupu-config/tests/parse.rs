@@ -37,6 +37,10 @@ fn parses_full_config() {
         strict_templates = true
         max_active = 2
         cleanup_after = "7d"
+
+        [storage]
+        archived_session_retention = "45d"
+        archived_transcript_retention = "14d"
     "#;
     let cfg: Config = toml::from_str(toml).expect("parse");
     assert_eq!(cfg.permission_mode.as_deref(), Some("ask"));
@@ -53,6 +57,14 @@ fn parses_full_config() {
         Some("github:Section9Labs/rupu")
     );
     assert_eq!(cfg.autoflow.max_active, Some(2));
+    assert_eq!(
+        cfg.storage.archived_session_retention.as_deref(),
+        Some("45d")
+    );
+    assert_eq!(
+        cfg.storage.archived_transcript_retention.as_deref(),
+        Some("14d")
+    );
 }
 
 #[test]
