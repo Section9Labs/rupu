@@ -447,6 +447,15 @@ Theme configuration is split between syntax highlighting and palette chrome:
 
 ```toml
 [ui]
+theme = "catppuccin-mocha"
+```
+
+That is the simple shared selector. It applies the same named theme across syntax and
+palette when both exist. If the shared name only maps directly to one side, `rupu`
+falls back to the palette theme's syntax hint.
+
+```toml
+[ui]
 color = "always"
 pager = "never"
 
@@ -459,7 +468,11 @@ theme = "tokyo-night"
 
 Notes:
 
-- `[ui].theme` still works as a legacy fallback for both syntax and palette selection.
+- Built-in parity names include `catppuccin-mocha`, `tokyo-night`, `dracula`,
+  `gruvbox-dark`, `github-dark`, `github-light`, `solarized-dark`, and
+  `solarized-light`.
+- `[ui].theme` is the simple shared selector; `[ui.syntax]` and `[ui.palette]` are the
+  advanced override knobs.
 - Global custom themes live in `~/.rupu/themes/`.
 - Project-local themes live in `<repo>/.rupu/themes/`.
 - Phase 1 import supports native rupu theme files and Base16 themes.
