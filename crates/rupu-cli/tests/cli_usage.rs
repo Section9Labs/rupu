@@ -88,6 +88,7 @@ fn write_standalone_usage_metadata(
             version: rupu_cli::standalone_run_metadata::StandaloneRunMetadata::VERSION,
             run_id: run_id.into(),
             session_id: None,
+            archived_at: None,
             workspace_path: PathBuf::from("/tmp/repo"),
             project_root: Some(PathBuf::from("/tmp/project")),
             repo_ref: Some(repo_ref.into()),

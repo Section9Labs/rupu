@@ -60,6 +60,7 @@ fn write_metadata_sidecar(
             version: StandaloneRunMetadata::VERSION,
             run_id: run_id.to_string(),
             session_id: session_id.map(str::to_string),
+            archived_at: None,
             workspace_path: dir.to_path_buf(),
             project_root: None,
             repo_ref: None,
@@ -73,6 +74,13 @@ fn write_metadata_sidecar(
     )
     .unwrap();
     path
+}
+
+fn rewrite_archived_at(meta_path: &std::path::Path, archived_at: &str) {
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(meta_path).unwrap()).unwrap();
+    payload["archived_at"] = serde_json::Value::String(archived_at.to_string());
+    std::fs::write(meta_path, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
 }
 
 #[tokio::test]
@@ -241,8 +249,47 @@ async fn list_csv_with_no_rows_emits_headers() {
         .assert()
         .success()
         .stdout(predicate::str::starts_with(
-            "run_id,title,agent,status,total_tokens,started_at\n",
+            "run_id,scope,title,agent,status,total_tokens,started_at\n",
         ));
+}
+
+#[tokio::test]
+async fn list_supports_archived_and_all_filters() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+
+    let transcripts_dir = global.path().join("transcripts");
+    write_transcript(&transcripts_dir, "run_active01", "agent-a", 10);
+    write_transcript(
+        &transcripts_dir.join("archive"),
+        "run_archived01",
+        "agent-b",
+        20,
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "json", "transcript", "list", "--archived"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"run_id\": \"run_archived01\""))
+        .stdout(predicate::str::contains("\"scope\": \"archived\""))
+        .stdout(predicate::str::contains("run_active01").not());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "json", "transcript", "list", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"run_id\": \"run_active01\""))
+        .stdout(predicate::str::contains("\"run_id\": \"run_archived01\""));
 }
 
 #[tokio::test]
@@ -269,6 +316,10 @@ async fn archive_moves_standalone_transcript_and_show_finds_it() {
     assert!(transcripts_dir
         .join("archive/run_archive123.jsonl")
         .is_file());
+    let meta_path = metadata_path_for_run(&transcripts_dir.join("archive"), "run_archive123");
+    let archived_meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    assert!(archived_meta["archived_at"].is_string());
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -323,4 +374,49 @@ async fn delete_requires_force_and_refuses_session_managed_transcripts() {
 
     assert!(!transcripts_dir.join("run_delete123.jsonl").exists());
     assert!(!metadata_path_for_run(&transcripts_dir, "run_delete123").exists());
+}
+
+#[tokio::test]
+async fn prune_deletes_old_archived_standalone_transcripts_and_uses_config_default() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global
+        .child("transcripts/archive")
+        .create_dir_all()
+        .unwrap();
+    std::fs::write(
+        global.path().join("config.toml"),
+        "[storage]\narchived_transcript_retention = \"7d\"\n",
+    )
+    .unwrap();
+
+    let archived_dir = global.path().join("transcripts/archive");
+    write_transcript(&archived_dir, "run_old01", "archive-agent", 61);
+    let old_meta = write_metadata_sidecar(&archived_dir, "run_old01", None);
+    rewrite_archived_at(
+        &old_meta,
+        &(Utc::now() - chrono::Duration::days(10)).to_rfc3339(),
+    );
+
+    write_transcript(&archived_dir, "run_new01", "archive-agent", 61);
+    let new_meta = write_metadata_sidecar(&archived_dir, "run_new01", None);
+    rewrite_archived_at(
+        &new_meta,
+        &(Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "json", "transcript", "prune"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"run_id\": \"run_old01\""))
+        .stdout(predicate::str::contains("\"action\": \"deleted\""));
+
+    assert!(!archived_dir.join("run_old01.jsonl").exists());
+    assert!(archived_dir.join("run_new01.jsonl").exists());
 }

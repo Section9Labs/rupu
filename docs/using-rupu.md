@@ -378,6 +378,7 @@ Persistent agent sessions:
 - `rupu session archive <session-id>`
 - `rupu session restore <session-id>`
 - `rupu session delete <session-id> --force`
+- `rupu session prune [--older-than 30d] [--dry-run]`
 
 Sessions keep agent conversation state across multiple turns. A session turn runs in a
 child `rupu` worker process, so `attach` can be interrupted without killing the active
@@ -398,11 +399,27 @@ Lifecycle notes:
 
 Standalone transcript lifecycle:
 
+- `rupu transcript list [--all|--archived]`
 - `rupu transcript archive <run-id>`
 - `rupu transcript delete <run-id> --force`
+- `rupu transcript prune [--older-than 30d] [--dry-run]`
 
 Transcript archive/delete is only available for standalone runs. If a transcript is owned
 by a session, manage it through `rupu session archive|delete` instead.
+
+Retention defaults:
+
+- if `--older-than` is omitted, archived session prune uses `[storage].archived_session_retention`
+- if `--older-than` is omitted, archived transcript prune uses `[storage].archived_transcript_retention`
+- both fall back to `30d` when unset
+
+Example global config:
+
+```toml
+[storage]
+archived_session_retention = "30d"
+archived_transcript_retention = "14d"
+```
 
 ---
 

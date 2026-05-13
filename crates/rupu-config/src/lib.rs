@@ -18,6 +18,7 @@ pub mod pricing_config;
 pub mod provider_config;
 
 pub mod scm_config;
+pub mod storage_config;
 
 pub mod triggers_config;
 
@@ -27,4 +28,5 @@ pub use layer::{layer_files, LayerError};
 pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};
 pub use scm_config::{IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmSection};
+pub use storage_config::StorageConfig;
 pub use triggers_config::{PollSourceEntry, PollSourceSpec, TriggersConfig};

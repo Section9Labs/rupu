@@ -17,6 +17,8 @@ pub struct StandaloneRunMetadata {
     pub run_id: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub archived_at: Option<String>,
     pub workspace_path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub project_root: Option<PathBuf>,
@@ -73,6 +75,7 @@ mod tests {
             version: StandaloneRunMetadata::VERSION,
             run_id: "run_01JXYZ".into(),
             session_id: Some("ses_01JXYZ".into()),
+            archived_at: Some("2026-05-13T00:00:00Z".into()),
             workspace_path: PathBuf::from("/tmp/repo"),
             project_root: Some(PathBuf::from("/tmp/project")),
             repo_ref: Some("github:Section9Labs/rupu".into()),

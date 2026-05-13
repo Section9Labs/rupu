@@ -16,6 +16,7 @@ pub mod issues;
 pub mod mcp;
 pub mod models;
 pub mod repos;
+pub mod retention;
 pub mod run;
 pub mod session;
 pub mod transcript;
