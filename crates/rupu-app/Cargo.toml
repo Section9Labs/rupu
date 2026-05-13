@@ -22,7 +22,14 @@ directories.workspace = true
 dirs.workspace = true
 futures-util.workspace = true
 gpui.workspace = true
-gpui_platform.workspace = true
+# `font-kit` activates `gpui_macos/font-kit`, which switches the platform
+# from `gpui::NoopTextSystem` to `MacTextSystem` and brings the CoreText
+# extern blocks into the link graph. Without this feature gpui_macos
+# compiles `text_system` and `open_type` out via `#[cfg(feature = "font-kit")]`
+# and `MacPlatform::new` falls back to a no-op text system — colored shapes
+# render but glyphs don't. Mirrors the dev-dep override Zed's own
+# `crates/gpui/Cargo.toml` uses for its examples.
+gpui_platform = { workspace = true, features = ["font-kit"] }
 notify.workspace = true
 rupu-app-canvas = { path = "../rupu-app-canvas" }
 rupu-auth = { path = "../rupu-auth" }
