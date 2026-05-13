@@ -323,6 +323,7 @@ Collection views that support `--format json|csv`:
 
 - `rupu agent list`
 - `rupu auth status`
+- `rupu cleanup`
 - `rupu cron list`
 - `rupu cron events`
 - `rupu issues list`
@@ -403,6 +404,7 @@ Standalone transcript lifecycle:
 - `rupu transcript archive <run-id>`
 - `rupu transcript delete <run-id> --force`
 - `rupu transcript prune [--older-than 30d] [--dry-run]`
+- `rupu cleanup [--older-than 30d] [--dry-run] [--sessions|--transcripts]`
 
 Transcript archive/delete is only available for standalone runs. If a transcript is owned
 by a session, manage it through `rupu session archive|delete` instead.
@@ -412,6 +414,13 @@ Retention defaults:
 - if `--older-than` is omitted, archived session prune uses `[storage].archived_session_retention`
 - if `--older-than` is omitted, archived transcript prune uses `[storage].archived_transcript_retention`
 - both fall back to `30d` when unset
+
+`rupu cleanup` is the operator shortcut over both archived resource types:
+
+- default: clean archived sessions and archived standalone transcripts together
+- `--sessions`: only archived sessions
+- `--transcripts`: only archived standalone transcripts
+- `--dry-run`: preview deletions without removing files
 
 Example global config:
 
