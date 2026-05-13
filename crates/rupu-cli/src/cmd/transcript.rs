@@ -18,11 +18,13 @@ use crate::output::report::{self, CollectionOutput, EventOutput};
 use crate::output::workflow_printer::tool_summary;
 use crate::output::LineStreamPrinter;
 use crate::paths;
-use clap::Subcommand;
+use crate::standalone_run_metadata::{metadata_path_for_run, read_metadata};
+use clap::{Args as ClapArgs, Subcommand};
 use comfy_table::Cell;
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader, RunStatus};
 use serde::Serialize;
 use std::cmp::Reverse;
+use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -37,12 +39,25 @@ pub enum Action {
     },
     /// Print a transcript's full event stream.
     Show { run_id: String },
+    /// Archive a standalone transcript and its metadata.
+    Archive { run_id: String },
+    /// Permanently delete a standalone transcript and its metadata.
+    Delete(DeleteArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct DeleteArgs {
+    pub run_id: String,
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
         Action::List { no_color } => list(no_color, global_format).await,
         Action::Show { run_id } => show(&run_id, global_format).await,
+        Action::Archive { run_id } => archive(&run_id).await,
+        Action::Delete(args) => delete(args).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -54,6 +69,8 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
     let (command_name, supported) = match action {
         Action::List { .. } => ("transcript list", report::TABLE_JSON_CSV),
         Action::Show { .. } => ("transcript show", report::PRETTY_TABLE_JSON_JSONL),
+        Action::Archive { .. } => ("transcript archive", report::TABLE_ONLY),
+        Action::Delete(_) => ("transcript delete", report::TABLE_ONLY),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
@@ -537,7 +554,7 @@ async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Re
 }
 
 async fn show(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let path = locate_transcript(run_id)?;
+    let path = locate_transcript(run_id)?.transcript_path;
     let mut events = Vec::new();
     let mut raw_events = Vec::new();
     for event in JsonlReader::iter(&path)? {
@@ -560,28 +577,131 @@ async fn show(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::Resu
     report::emit_event(global_format, &output)
 }
 
-fn locate_transcript(run_id: &str) -> anyhow::Result<PathBuf> {
+struct TranscriptLocation {
+    transcript_path: PathBuf,
+    metadata_path: PathBuf,
+    archived: bool,
+}
+
+async fn archive(run_id: &str) -> anyhow::Result<()> {
+    let location = locate_transcript(run_id)?;
+    if location.archived {
+        anyhow::bail!("transcript already archived: {run_id}");
+    }
+    ensure_standalone_transcript(run_id, &location)?;
+    let archived_dir = paths::archived_transcripts_dir(
+        location
+            .transcript_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("transcript has no parent directory"))?,
+    );
+    fs::create_dir_all(&archived_dir)?;
+    let archived_transcript = archived_dir.join(format!("{run_id}.jsonl"));
+    let archived_metadata = metadata_path_for_run(&archived_dir, run_id);
+    move_if_exists(&location.transcript_path, &archived_transcript)?;
+    move_if_exists(&location.metadata_path, &archived_metadata)?;
+    println!("archived transcript {run_id}");
+    Ok(())
+}
+
+async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
+    if !args.force {
+        anyhow::bail!("transcript delete requires --force");
+    }
+    let location = locate_transcript(&args.run_id)?;
+    ensure_standalone_transcript(&args.run_id, &location)?;
+    remove_file_if_exists(&location.transcript_path)?;
+    remove_file_if_exists(&location.metadata_path)?;
+    println!("deleted transcript {}", args.run_id);
+    Ok(())
+}
+
+fn locate_transcript(run_id: &str) -> anyhow::Result<TranscriptLocation> {
     let filename = format!("{run_id}.jsonl");
 
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
 
-    // Project-local first.
+    // Project-local first, active then archived.
     if let Some(ref proj) = project_root {
-        let candidate = proj.join(".rupu/transcripts").join(&filename);
+        let active_root = proj.join(".rupu/transcripts");
+        let candidate = active_root.join(&filename);
         if candidate.is_file() {
-            return Ok(candidate);
+            return Ok(TranscriptLocation {
+                metadata_path: metadata_path_for_run(&active_root, run_id),
+                transcript_path: candidate,
+                archived: false,
+            });
+        }
+        let archived_root = paths::archived_transcripts_dir(&active_root);
+        let archived_candidate = archived_root.join(&filename);
+        if archived_candidate.is_file() {
+            return Ok(TranscriptLocation {
+                metadata_path: metadata_path_for_run(&archived_root, run_id),
+                transcript_path: archived_candidate,
+                archived: true,
+            });
         }
     }
 
-    // Global fallback.
-    let candidate = global.join("transcripts").join(&filename);
+    // Global fallback, active then archived.
+    let active_root = global.join("transcripts");
+    let candidate = active_root.join(&filename);
     if candidate.is_file() {
-        return Ok(candidate);
+        return Ok(TranscriptLocation {
+            metadata_path: metadata_path_for_run(&active_root, run_id),
+            transcript_path: candidate,
+            archived: false,
+        });
+    }
+    let archived_root = paths::archived_transcripts_dir(&active_root);
+    let archived_candidate = archived_root.join(&filename);
+    if archived_candidate.is_file() {
+        return Ok(TranscriptLocation {
+            metadata_path: metadata_path_for_run(&archived_root, run_id),
+            transcript_path: archived_candidate,
+            archived: true,
+        });
     }
 
     Err(anyhow::anyhow!("transcript not found: {run_id}"))
+}
+
+fn ensure_standalone_transcript(run_id: &str, location: &TranscriptLocation) -> anyhow::Result<()> {
+    if !location.metadata_path.is_file() {
+        return Ok(());
+    }
+    let metadata = read_metadata(&location.metadata_path)?;
+    if metadata.session_id.is_some() {
+        anyhow::bail!(
+            "transcript {} is managed by session {}; use `rupu session archive|delete` instead",
+            run_id,
+            metadata.session_id.as_deref().unwrap_or("unknown")
+        );
+    }
+    Ok(())
+}
+
+fn move_if_exists(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
+    if !from.exists() || from == to {
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if to.exists() {
+        fs::remove_file(to)?;
+    }
+    fs::rename(from, to)?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &std::path::Path) -> anyhow::Result<()> {
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

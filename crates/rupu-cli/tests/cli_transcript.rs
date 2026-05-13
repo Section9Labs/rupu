@@ -8,6 +8,9 @@ use assert_cmd::Command;
 use assert_fs::prelude::*;
 use chrono::Utc;
 use predicates::prelude::*;
+use rupu_cli::standalone_run_metadata::{
+    metadata_path_for_run, write_metadata, StandaloneRunMetadata,
+};
 use rupu_transcript::{Event, JsonlWriter, RunMode, RunStatus};
 use tokio::sync::Mutex;
 
@@ -42,6 +45,33 @@ fn write_transcript(
     })
     .unwrap();
     w.flush().unwrap();
+    path
+}
+
+fn write_metadata_sidecar(
+    dir: &std::path::Path,
+    run_id: &str,
+    session_id: Option<&str>,
+) -> std::path::PathBuf {
+    let path = metadata_path_for_run(dir, run_id);
+    write_metadata(
+        &path,
+        &StandaloneRunMetadata {
+            version: StandaloneRunMetadata::VERSION,
+            run_id: run_id.to_string(),
+            session_id: session_id.map(str::to_string),
+            workspace_path: dir.to_path_buf(),
+            project_root: None,
+            repo_ref: None,
+            issue_ref: None,
+            backend_id: "local_checkout".into(),
+            worker_id: None,
+            trigger_source: "run_cli".into(),
+            target: None,
+            workspace_strategy: None,
+        },
+    )
+    .unwrap();
     path
 }
 
@@ -213,4 +243,84 @@ async fn list_csv_with_no_rows_emits_headers() {
         .stdout(predicate::str::starts_with(
             "run_id,title,agent,status,total_tokens,started_at\n",
         ));
+}
+
+#[tokio::test]
+async fn archive_moves_standalone_transcript_and_show_finds_it() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+
+    let transcripts_dir = global.path().join("transcripts");
+    write_transcript(&transcripts_dir, "run_archive123", "archive-agent", 61);
+    write_metadata_sidecar(&transcripts_dir, "run_archive123", None);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "archive", "run_archive123"])
+        .assert()
+        .success();
+
+    assert!(!transcripts_dir.join("run_archive123.jsonl").exists());
+    assert!(transcripts_dir
+        .join("archive/run_archive123.jsonl")
+        .is_file());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "json", "transcript", "show", "run_archive123"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"run_id\": \"run_archive123\""));
+}
+
+#[tokio::test]
+async fn delete_requires_force_and_refuses_session_managed_transcripts() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+
+    let transcripts_dir = global.path().join("transcripts");
+    write_transcript(&transcripts_dir, "run_sessionowned", "archive-agent", 61);
+    write_metadata_sidecar(&transcripts_dir, "run_sessionowned", Some("ses_owned01"));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "archive", "run_sessionowned"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("managed by session ses_owned01"));
+
+    write_transcript(&transcripts_dir, "run_delete123", "archive-agent", 61);
+    write_metadata_sidecar(&transcripts_dir, "run_delete123", None);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "delete", "run_delete123"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --force"));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["transcript", "delete", "run_delete123", "--force"])
+        .assert()
+        .success();
+
+    assert!(!transcripts_dir.join("run_delete123.jsonl").exists());
+    assert!(!metadata_path_for_run(&transcripts_dir, "run_delete123").exists());
 }
