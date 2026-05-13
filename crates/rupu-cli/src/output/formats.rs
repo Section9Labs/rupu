@@ -5,7 +5,9 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 pub enum OutputFormat {
     Table,
+    Pretty,
     Json,
+    Jsonl,
     Csv,
 }
 
@@ -13,7 +15,9 @@ impl OutputFormat {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Table => "table",
+            Self::Pretty => "pretty",
             Self::Json => "json",
+            Self::Jsonl => "jsonl",
             Self::Csv => "csv",
         }
     }
@@ -65,5 +69,12 @@ pub fn print_csv_rows<T: Serialize>(
         writer.serialize(row)?;
     }
     writer.flush()?;
+    Ok(())
+}
+
+pub fn print_jsonl_rows<T: Serialize>(rows: &[T]) -> anyhow::Result<()> {
+    for row in rows {
+        println!("{}", serde_json::to_string(row)?);
+    }
     Ok(())
 }
