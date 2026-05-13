@@ -22,6 +22,43 @@ pub fn workspaces_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Returns `<cache>/rupu.app/clones/`. Created on first use.
+pub fn clones_dir() -> Result<PathBuf> {
+    let proj = ProjectDirs::from("dev", "rupu", "rupu.app")
+        .ok_or_else(|| anyhow::anyhow!("no platform cache dir"))?;
+    let dir = proj.cache_dir().join("clones");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Best-effort sweep: delete `clones_dir()` entries older than 7 days.
+/// Logs failures via tracing but never propagates.
+pub fn gc_clones_dir() {
+    let Ok(dir) = clones_dir() else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, dir = %dir.display(), "gc_clones_dir: read_dir failed");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if mtime < cutoff {
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                tracing::warn!(error = %e, path = %path.display(), "gc_clones_dir: remove failed");
+            }
+        }
+    }
+}
+
 /// Path to a specific workspace's manifest file.
 pub fn manifest_path(workspace_id: &str) -> Result<PathBuf> {
     Ok(workspaces_dir()?.join(format!("{workspace_id}.toml")))

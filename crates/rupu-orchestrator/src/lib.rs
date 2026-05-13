@@ -25,8 +25,8 @@ pub use event_vocab::{
     matching_event_id_from_candidates,
 };
 pub use runner::{
-    run_workflow, AwaitingInfo, Finding, ItemResult, OrchestratorRunOpts, OrchestratorRunResult,
-    ResumeState, RunWorkflowError, StepFactory, StepResult,
+    resolve_inputs, run_workflow, AwaitingInfo, Finding, ItemResult, OrchestratorRunOpts,
+    OrchestratorRunResult, ResumeState, RunWorkflowError, StepFactory, StepResult,
 };
 pub use runs::{
     ApprovalDecision, ApprovalError, FindingRecord, ItemResultRecord, RunRecord, RunStatus,

@@ -8,6 +8,7 @@
 //!
 //! Spec: `docs/superpowers/specs/2026-05-03-rupu-slice-b2-scm-design.md`.
 
+pub mod clone;
 pub mod connectors;
 pub mod error;
 pub mod event_connector;
@@ -15,6 +16,7 @@ pub mod platform;
 pub mod registry;
 pub mod types;
 
+pub use clone::{clone_repo_ref, CloneError};
 pub use connectors::{IssueConnector, RepoConnector};
 pub use error::{classify_scm_error, ScmError};
 pub use event_connector::{EventConnector, EventPollResult, PolledEvent};

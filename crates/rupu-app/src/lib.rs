@@ -2,6 +2,7 @@
 //! pure-data modules (workspace, palette, view).
 
 pub mod executor;
+pub mod launcher;
 pub mod menu;
 pub mod palette;
 pub mod run_model;

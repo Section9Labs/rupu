@@ -29,6 +29,12 @@ pub const BRAND: Rgba = rgb(124, 58, 237); // brand-500 (purple)
 pub const BRAND_300: Rgba = rgb(167, 139, 250); // brand-300 (lighter purple)
 
 // ── Window chrome ─────────────────────────────────────────────────────────
+pub const BG_OVERLAY: Rgba = Rgba {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 0.6,
+}; // semi-transparent backdrop
 pub const BG_PRIMARY: Rgba = rgb(15, 15, 18); // window background (#0f0f12)
 pub const BG_SIDEBAR: Rgba = rgb(24, 24, 27); // sidebar bg (#18181b)
 pub const BG_TITLEBAR: Rgba = rgb(9, 9, 11); // titlebar bg (#09090b)

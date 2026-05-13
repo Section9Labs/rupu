@@ -12,7 +12,8 @@ actions!(
         OpenWorkspace,
         Quit,
         ApproveFocused,
-        RejectFocused
+        RejectFocused,
+        LaunchSelected
     ]
 );
 
@@ -33,6 +34,7 @@ pub fn install(cx: &mut App) {
     cx.bind_keys(vec![
         KeyBinding::new("a", ApproveFocused, None),
         KeyBinding::new("r", RejectFocused, None),
+        KeyBinding::new("cmd-r", LaunchSelected, None),
     ]);
 
     cx.on_action(|_: &NewWorkspace, cx| {
@@ -70,7 +72,7 @@ fn open_workspace_window(dir: &std::path::Path, cx: &mut App) {
 /// user confirm, None on cancel.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
-fn pick_directory_modal(prompt: &str) -> Option<std::path::PathBuf> {
+pub fn pick_directory_modal(prompt: &str) -> Option<std::path::PathBuf> {
     use objc2_app_kit::{NSModalResponseOK, NSOpenPanel};
     use objc2_foundation::{MainThreadMarker, NSString};
 
@@ -98,7 +100,7 @@ fn pick_directory_modal(prompt: &str) -> Option<std::path::PathBuf> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn pick_directory_modal(_prompt: &str) -> Option<std::path::PathBuf> {
+pub fn pick_directory_modal(_prompt: &str) -> Option<std::path::PathBuf> {
     // On non-macOS dev builds, fall back to env var so devs can
     // exercise the open flow without a native picker.
     std::env::var("RUPU_APP_OPEN_DIR")

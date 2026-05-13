@@ -4,11 +4,11 @@ pub mod sidebar;
 pub mod titlebar;
 
 use crate::executor::AppExecutor;
-use crate::menu::app_menu::{ApproveFocused, RejectFocused};
+use crate::menu::app_menu::{ApproveFocused, LaunchSelected, RejectFocused};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
-use crate::window::sidebar::ActiveRunMap;
+use crate::window::sidebar::{ActiveRunMap, WorkflowClickCb};
 use crate::workspace::Workspace;
 use gpui::{
     div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, WeakEntity,
@@ -32,6 +32,11 @@ pub struct WorkspaceWindow {
     /// step only and not re-spawned on focus changes. A follow-up task
     /// will add cancellation + re-spawn.
     pub transcript_lines: Vec<TranscriptLine>,
+    /// `Some` when the launcher sheet is open. None otherwise.
+    pub launcher: Option<crate::launcher::LauncherState>,
+    /// The workflow row most recently focused in the sidebar.
+    /// ⌘R uses this. `None` means no row has focus.
+    pub focused_workflow: Option<PathBuf>,
 }
 
 impl WorkspaceWindow {
@@ -54,6 +59,8 @@ impl WorkspaceWindow {
                 app_executor,
                 run_model: None,
                 transcript_lines: Vec::new(),
+                launcher: None,
+                focused_workflow: None,
             })
         })
         .expect("open workspace window")
@@ -229,42 +236,236 @@ impl WorkspaceWindow {
             .map(|a| a.path.clone())
     }
 
+    /// Sets `focused_workflow` to `path` and notifies the view.
+    /// Called when the user left-clicks a workflow row in the sidebar.
+    pub fn handle_workflow_clicked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.focused_workflow = Some(path);
+        cx.notify();
+    }
+
+    /// Sets `focused_workflow` to `path` and immediately opens the launcher.
+    /// Called when the user right-clicks a workflow row in the sidebar.
+    pub fn handle_workflow_right_clicked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.focused_workflow = Some(path.clone());
+        self.open_launcher(path, cx);
+    }
+
     /// Called when the user clicks the Run button in the toolbar.
-    /// Starts a new workflow run and subscribes to its event stream.
+    /// Opens the launcher modal with the current workflow.
     pub fn handle_run_clicked(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.current_workflow_path() else {
             return;
         };
-        let app_exec = self.app_executor.clone();
-        let this = cx.entity().downgrade();
+        self.open_launcher(path, cx);
+    }
+
+    pub fn open_launcher(&mut self, workflow_path: PathBuf, cx: &mut Context<Self>) {
+        let yaml = match std::fs::read_to_string(&workflow_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, path = %workflow_path.display(), "open_launcher: read_to_string failed");
+                return;
+            }
+        };
+        let workflow = match rupu_orchestrator::Workflow::parse(&yaml) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(error = %e, path = %workflow_path.display(), "open_launcher: parse failed");
+                return;
+            }
+        };
+        self.launcher = Some(crate::launcher::LauncherState::new(workflow_path, workflow));
+        cx.notify();
+    }
+
+    pub fn close_launcher(&mut self, cx: &mut Context<Self>) {
+        self.launcher = None;
+        cx.notify();
+    }
+
+    pub fn handle_launcher_input_change(
+        &mut self,
+        name: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.launcher.as_mut() {
+            state.set_input(&name, value);
+            state.revalidate();
+            cx.notify();
+        }
+    }
+
+    pub fn handle_launcher_mode_change(
+        &mut self,
+        mode: crate::launcher::LauncherMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.launcher.as_mut() {
+            state.mode = mode;
+            cx.notify();
+        }
+    }
+
+    pub fn handle_launcher_target_change(
+        &mut self,
+        target: crate::launcher::LauncherTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.launcher.as_mut() {
+            state.target = target;
+            cx.notify();
+        }
+    }
+
+    pub fn handle_launcher_pick_directory(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = crate::menu::app_menu::pick_directory_modal("Pick target directory")
+        else {
+            return; // User cancelled
+        };
+        if let Some(state) = self.launcher.as_mut() {
+            state.target = crate::launcher::LauncherTarget::Directory(path);
+            cx.notify();
+        }
+    }
+
+    pub fn handle_launcher_run(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.launcher.clone() else {
+            return;
+        };
+        if !state.can_run() {
+            return;
+        }
+        // Extract what we need from target before consuming state.
+        enum DispatchKind {
+            Direct(PathBuf),
+            CloneFirst(String),
+            NoOp,
+        }
+        let kind = match &state.target {
+            crate::launcher::LauncherTarget::ThisWorkspace => {
+                DispatchKind::Direct(PathBuf::from(&self.workspace.manifest.path))
+            }
+            crate::launcher::LauncherTarget::Directory(path) => DispatchKind::Direct(path.clone()),
+            crate::launcher::LauncherTarget::Clone { repo_ref, status } => match status {
+                crate::launcher::CloneStatus::Done(path) => DispatchKind::Direct(path.clone()),
+                crate::launcher::CloneStatus::NotStarted
+                | crate::launcher::CloneStatus::Failed(_) => {
+                    DispatchKind::CloneFirst(repo_ref.clone())
+                }
+                crate::launcher::CloneStatus::InProgress => DispatchKind::NoOp,
+            },
+        };
+        match kind {
+            DispatchKind::Direct(target) => self.spawn_run(state, target, cx),
+            DispatchKind::CloneFirst(repo_ref) => {
+                self.spawn_clone_then_run(state, repo_ref, cx);
+            }
+            DispatchKind::NoOp => {}
+        }
+    }
+
+    fn spawn_clone_then_run(
+        &mut self,
+        state: crate::launcher::LauncherState,
+        repo_ref: String,
+        cx: &mut Context<Self>,
+    ) {
+        // Flip status to InProgress immediately so the UI reflects the
+        // change before the spawn fires.
+        if let Some(s) = self.launcher.as_mut() {
+            if let crate::launcher::LauncherTarget::Clone { status, .. } = &mut s.target {
+                *status = crate::launcher::CloneStatus::InProgress;
+            }
+        }
+        cx.notify();
+
+        let registry = self.app_executor.config_mcp_registry();
+        let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
         cx.spawn(async move |_, cx| {
-            match app_exec.start_workflow(path.clone()).await {
+            let clone_result = crate::launcher::clone::clone_repo_ref(registry, &repo_ref).await;
+            match clone_result {
+                Ok(path) => {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(s) = this.launcher.as_mut() {
+                            if let crate::launcher::LauncherTarget::Clone { status, .. } =
+                                &mut s.target
+                            {
+                                *status = crate::launcher::CloneStatus::Done(path.clone());
+                            }
+                        }
+                        cx.notify();
+                        this.spawn_run(state.clone(), path, cx);
+                    });
+                }
+                Err(e) => {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(s) = this.launcher.as_mut() {
+                            if let crate::launcher::LauncherTarget::Clone { status, .. } =
+                                &mut s.target
+                            {
+                                *status = crate::launcher::CloneStatus::Failed(e.to_string());
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_run(
+        &mut self,
+        state: crate::launcher::LauncherState,
+        target_dir: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let app_exec = self.app_executor.clone();
+        let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let workflow_path = state.workflow_path.clone();
+        let inputs = state.inputs.clone();
+        let mode = state.mode;
+        cx.spawn(async move |_, cx| {
+            match app_exec
+                .start_workflow_with_opts(workflow_path.clone(), inputs, mode, target_dir)
+                .await
+            {
                 Ok(run_id) => {
-                    let _ = this.update(cx, |this, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.launcher = None;
                         this.run_model = Some(crate::run_model::RunModel::new(
                             run_id.clone(),
-                            path.clone(),
+                            workflow_path.clone(),
                         ));
                         cx.notify();
                     });
-                    // Subscribe to the new run's event stream and apply events.
+                    // Subscribe to the new run's event stream (mirrors
+                    // handle_run_clicked's existing pattern).
                     if let Ok(mut stream) = app_exec.attach(&run_id).await {
                         use futures_util::StreamExt;
                         while let Some(ev) = stream.next().await {
-                            let res = this.update(cx, |this, cx| {
+                            let res = weak.update(cx, |this, cx| {
                                 if let Some(m) = this.run_model.take() {
                                     this.run_model = Some(m.apply(&ev));
                                 }
                                 cx.notify();
                             });
                             if res.is_err() {
-                                break; // window closed
+                                break;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "start_workflow failed");
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(s) = this.launcher.as_mut() {
+                            s.validation = Some(crate::launcher::ValidationError {
+                                message: format!("start failed: {e}"),
+                            });
+                        }
+                        cx.notify();
+                    });
                 }
             }
         })
@@ -281,6 +482,10 @@ impl Render for WorkspaceWindow {
         // can update `self` when invoked from click handlers. WeakEntity
         // is Send + 'static, making it suitable for Arc<dyn Fn(...)> callbacks.
         let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        // Pre-clone for sidebar workflow-click callbacks (D-4) before `weak`
+        // is consumed by the on_approve closure below.
+        let weak_sidebar_click = weak.clone();
+        let weak_sidebar_right = weak.clone();
         let weak2 = weak.clone();
         let on_approve: ApproveCallback =
             Arc::new(move |step_id: String, window: &mut Window, cx: &mut App| {
@@ -350,8 +555,14 @@ impl Render for WorkspaceWindow {
                 this.handle_reject(step.clone(), "rejected via keyboard".into(), cx);
             }
         });
+        let launch_focused = self.focused_workflow.clone();
+        let on_launch_kb = cx.listener(move |this, _: &LaunchSelected, _window, cx| {
+            if let Some(path) = &launch_focused {
+                this.open_launcher(path.clone(), cx);
+            }
+        });
 
-        div()
+        let main_layout = div()
             .size_full()
             .bg(palette::BG_PRIMARY)
             .text_color(palette::TEXT_PRIMARY)
@@ -359,15 +570,94 @@ impl Render for WorkspaceWindow {
             .flex_col()
             .on_action(on_approve_kb)
             .on_action(on_reject_kb)
+            .on_action(on_launch_kb)
             .child(titlebar::render(&self.workspace))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .flex_1()
-                    .child(sidebar::render(&self.workspace, &active_run_map))
+                    .child({
+                        let on_workflow_click: WorkflowClickCb = Arc::new(move |path, _w, cx| {
+                            let _ = weak_sidebar_click
+                                .update(cx, |this, cx| this.handle_workflow_clicked(path, cx));
+                        });
+                        let on_workflow_right_click: WorkflowClickCb =
+                            Arc::new(move |path, _w, cx| {
+                                let _ = weak_sidebar_right.update(cx, |this, cx| {
+                                    this.handle_workflow_right_clicked(path, cx)
+                                });
+                            });
+                        sidebar::render(
+                            &self.workspace,
+                            &active_run_map,
+                            on_workflow_click,
+                            on_workflow_right_click,
+                        )
+                    })
                     .child(main_area),
-            )
+            );
+
+        let body: AnyElement = if let Some(state) = self.launcher.clone() {
+            let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+
+            let w1 = weak.clone();
+            let on_input_change: crate::view::launcher::InputChangeCb =
+                Arc::new(move |name, value, _w, cx| {
+                    let _ = w1.update(cx, |this, cx| {
+                        this.handle_launcher_input_change(name, value, cx);
+                    });
+                });
+
+            let w2 = weak.clone();
+            let on_mode_change: crate::view::launcher::ModeChangeCb =
+                Arc::new(move |mode, _w, cx| {
+                    let _ = w2.update(cx, |this, cx| {
+                        this.handle_launcher_mode_change(mode, cx);
+                    });
+                });
+
+            let w3 = weak.clone();
+            let on_target_change: crate::view::launcher::TargetChangeCb =
+                Arc::new(move |target, _w, cx| {
+                    let _ = w3.update(cx, |this, cx| {
+                        this.handle_launcher_target_change(target, cx);
+                    });
+                });
+
+            let w4 = weak.clone();
+            let on_run: crate::view::launcher::RunCb = Arc::new(move |_w, cx| {
+                let _ = w4.update(cx, |this, cx| this.handle_launcher_run(cx));
+            });
+
+            let w5 = weak.clone();
+            let on_close: crate::view::launcher::CloseCb = Arc::new(move |_w, cx| {
+                let _ = w5.update(cx, |this, cx| this.close_launcher(cx));
+            });
+
+            let w_pick = weak.clone();
+            let on_pick_dir: crate::view::launcher::PickDirCb = Arc::new(move |_w, cx| {
+                let _ = w_pick.update(cx, |this, cx| this.handle_launcher_pick_directory(cx));
+            });
+
+            div()
+                .relative()
+                .size_full()
+                .child(main_layout)
+                .child(crate::view::launcher::render(
+                    &state,
+                    on_input_change,
+                    on_mode_change,
+                    on_target_change,
+                    on_pick_dir,
+                    on_run,
+                    on_close,
+                ))
+                .into_any_element()
+        } else {
+            main_layout.into_any_element()
+        };
+        body
     }
 }
 
