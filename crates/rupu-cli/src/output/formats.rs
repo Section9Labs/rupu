@@ -50,9 +50,17 @@ pub fn print_json<T: Serialize>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn print_csv_rows<T: Serialize>(rows: &[T]) -> anyhow::Result<()> {
+pub fn print_csv_rows<T: Serialize>(
+    rows: &[T],
+    headers: Option<&'static [&'static str]>,
+) -> anyhow::Result<()> {
     let stdout = std::io::stdout();
     let mut writer = csv::Writer::from_writer(stdout.lock());
+    if rows.is_empty() {
+        if let Some(headers) = headers {
+            writer.write_record(headers)?;
+        }
+    }
     for row in rows {
         writer.serialize(row)?;
     }
