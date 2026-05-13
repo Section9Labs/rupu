@@ -6,6 +6,7 @@
 
 pub mod drilldown;
 pub mod graph;
+pub mod launcher;
 pub mod transcript_tail;
 
 use gpui::{App, Window};

@@ -24,7 +24,7 @@ fn main() {
         // Best-effort cleanup of stale launcher-clone tempdirs. Spawned on a
         // regular OS thread to keep GC off the GPUI main thread and out of
         // the tokio runtime startup path.
-        std::thread::spawn(|| rupu_app::workspace::storage::gc_clones_dir());
+        std::thread::spawn(rupu_app::workspace::storage::gc_clones_dir);
 
         // If a directory was passed on the command line, open it
         // immediately. Otherwise wait for the user to pick via File menu.
