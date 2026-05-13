@@ -4,7 +4,7 @@ pub mod sidebar;
 pub mod titlebar;
 
 use crate::executor::AppExecutor;
-use crate::menu::app_menu::{ApproveFocused, RejectFocused};
+use crate::menu::app_menu::{ApproveFocused, RejectFocused, LaunchSelected};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
@@ -548,6 +548,12 @@ impl Render for WorkspaceWindow {
                 this.handle_reject(step.clone(), "rejected via keyboard".into(), cx);
             }
         });
+        let launch_focused = self.focused_workflow.clone();
+        let on_launch_kb = cx.listener(move |this, _: &LaunchSelected, _window, cx| {
+            if let Some(path) = &launch_focused {
+                this.open_launcher(path.clone(), cx);
+            }
+        });
 
         let main_layout = div()
             .size_full()
@@ -557,6 +563,7 @@ impl Render for WorkspaceWindow {
             .flex_col()
             .on_action(on_approve_kb)
             .on_action(on_reject_kb)
+            .on_action(on_launch_kb)
             .child(titlebar::render(&self.workspace))
             .child(
                 div()

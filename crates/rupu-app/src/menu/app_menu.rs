@@ -12,7 +12,8 @@ actions!(
         OpenWorkspace,
         Quit,
         ApproveFocused,
-        RejectFocused
+        RejectFocused,
+        LaunchSelected
     ]
 );
 
@@ -33,6 +34,7 @@ pub fn install(cx: &mut App) {
     cx.bind_keys(vec![
         KeyBinding::new("a", ApproveFocused, None),
         KeyBinding::new("r", RejectFocused, None),
+        KeyBinding::new("cmd-r", LaunchSelected, None),
     ]);
 
     cx.on_action(|_: &NewWorkspace, cx| {
