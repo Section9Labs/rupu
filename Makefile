@@ -119,6 +119,10 @@ tui-smoke:
 # window to render, then SIGTERMs. Asserts no panic on stderr.
 app-smoke:
 	@cargo build --release -p rupu-app
+	@echo "  · launcher_state test"
+	@cargo test -p rupu-app --test launcher_state
+	@echo "  · clone helper test"
+	@cargo test -p rupu-scm --test clone
 	@FIXTURE="$$(pwd)/crates/rupu-app/tests/fixtures/sample-workspace"; \
 	OUTPUT=$$(sh -c './target/release/rupu-app "'"$$FIXTURE"'" & sleep 4; kill $$! 2>/dev/null' 2>&1 || true); \
 	if echo "$$OUTPUT" | grep -qE 'panic|panicked'; then \
