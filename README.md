@@ -359,7 +359,7 @@ See [`docs/spec.md`](docs/spec.md) for the full architecture. Short version:
 - **Sessions** are persistent agent containers that own multiple standalone runs over
   time; use `rupu session start`, `rupu session send`, and `rupu session attach` for
   long-lived agent conversations. Sessions can also be archived, restored, listed with
-  `--all|--archived`, and permanently deleted with `--force`.
+  `--all|--archived`, pruned by age, and permanently deleted with `--force`.
 - **Tool policy** lives in each agent's `tools:` and `permissionMode`; workflow
   `actions:` is a separate action-protocol allowlist, not a tool allowlist.
 
