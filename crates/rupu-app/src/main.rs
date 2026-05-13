@@ -26,8 +26,9 @@ fn main() {
         // the tokio runtime startup path.
         std::thread::spawn(rupu_app::workspace::storage::gc_clones_dir);
 
-        // If a directory was passed on the command line, open it
-        // immediately. Otherwise wait for the user to pick via File menu.
+        // If a directory was passed on the command line, open it immediately.
+        // Otherwise re-open the most-recently-used workspaces from the
+        // recents list so the user lands in a familiar state.
         if let Some(arg) = std::env::args().nth(1) {
             let dir = std::path::PathBuf::from(arg);
             match Workspace::open(&dir) {
@@ -43,6 +44,39 @@ fn main() {
                 }
                 Err(e) => {
                     tracing::error!(?dir, %e, "failed to open workspace from CLI arg");
+                }
+            }
+        } else {
+            // No CLI arg — restore the most recently opened workspaces.
+            match rupu_app::workspace::recents::list() {
+                Ok(manifests) if !manifests.is_empty() => {
+                    for manifest in manifests {
+                        let dir = std::path::PathBuf::from(&manifest.path);
+                        match Workspace::open(&dir) {
+                            Ok(workspace) => {
+                                tracing::info!(
+                                    id = %workspace.manifest.id,
+                                    path = ?dir,
+                                    "restored workspace from recents"
+                                );
+                                let app_executor = executor::build_executor(&workspace);
+                                WorkspaceWindow::open(workspace, app_executor, cx);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = ?dir,
+                                    %e,
+                                    "skip recent workspace that could not be opened"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {
+                    tracing::info!("no workspaces found; use File > Open Workspace\u{2026}");
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "could not read recents list; starting with no windows");
                 }
             }
         }
