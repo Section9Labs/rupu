@@ -527,19 +527,25 @@ impl Render for WorkspaceWindow {
         let on_approve: ApproveCallback =
             Arc::new(move |step_id: String, window: &mut Window, cx: &mut App| {
                 let _ = window;
-                weak.update(cx, |this, cx| {
-                    this.handle_approve(step_id, cx);
-                })
-                .ok();
+                let weak = weak.clone();
+                cx.defer(move |cx| {
+                    weak.update(cx, |this, cx| {
+                        this.handle_approve(step_id, cx);
+                    })
+                    .ok();
+                });
             });
         let on_reject: RejectCallback = Arc::new(
             move |step_id: String, reason: String, window: &mut Window, cx: &mut App| {
                 let _ = window;
-                weak2
-                    .update(cx, |this, cx| {
-                        this.handle_reject(step_id, reason, cx);
-                    })
-                    .ok();
+                let weak2 = weak2.clone();
+                cx.defer(move |cx| {
+                    weak2
+                        .update(cx, |this, cx| {
+                            this.handle_reject(step_id, reason, cx);
+                        })
+                        .ok();
+                });
             },
         );
 
@@ -595,13 +601,19 @@ impl Render for WorkspaceWindow {
                     .flex_1()
                     .child({
                         let on_workflow_click: WorkflowClickCb = Arc::new(move |path, _w, cx| {
-                            let _ = weak_sidebar_click
-                                .update(cx, |this, cx| this.handle_workflow_clicked(path, cx));
+                            let weak_sidebar_click = weak_sidebar_click.clone();
+                            cx.defer(move |cx| {
+                                let _ = weak_sidebar_click
+                                    .update(cx, |this, cx| this.handle_workflow_clicked(path, cx));
+                            });
                         });
                         let on_workflow_right_click: WorkflowClickCb =
                             Arc::new(move |path, _w, cx| {
-                                let _ = weak_sidebar_right.update(cx, |this, cx| {
-                                    this.handle_workflow_right_clicked(path, cx)
+                                let weak_sidebar_right = weak_sidebar_right.clone();
+                                cx.defer(move |cx| {
+                                    let _ = weak_sidebar_right.update(cx, |this, cx| {
+                                        this.handle_workflow_right_clicked(path, cx)
+                                    });
                                 });
                             });
                         sidebar::render(
@@ -614,56 +626,76 @@ impl Render for WorkspaceWindow {
                     .child(main_area),
             );
 
-        let body: AnyElement = if let Some(state) = self.launcher.clone() {
-            // Reuse the WeakEntity pre-cloned above (weak_launcher) rather
-            // than calling cx.weak_entity() again mid-render.
-            let weak = weak_launcher;
-
-            let w1 = weak.clone();
+        // Render the launcher overlay when present. KEY FIX 1: borrow
+        // self.launcher via as_ref() rather than cloning it. KEY FIX 2:
+        // launcher callbacks defer the entity update via cx.defer so the
+        // WeakEntity is not re-entered while GPUI's click-dispatch already
+        // holds a borrow → eliminates the RefCell-already-borrowed flood.
+        let body: AnyElement = if let Some(state) = self.launcher.as_ref() {
+            let weak2 = weak_launcher.clone();
             let on_input_change: crate::view::launcher::InputChangeCb =
                 Arc::new(move |name, value, _w, cx| {
-                    let _ = w1.update(cx, |this, cx| {
-                        this.handle_launcher_input_change(name, value, cx);
+                    let weak3 = weak2.clone();
+                    cx.defer(move |cx| {
+                        let _ = weak3.update(cx, |this, cx| {
+                            this.handle_launcher_input_change(name, value, cx);
+                        });
                     });
                 });
 
-            let w2 = weak.clone();
+            let weak2 = weak_launcher.clone();
             let on_mode_change: crate::view::launcher::ModeChangeCb =
                 Arc::new(move |mode, _w, cx| {
-                    let _ = w2.update(cx, |this, cx| {
-                        this.handle_launcher_mode_change(mode, cx);
+                    let weak3 = weak2.clone();
+                    cx.defer(move |cx| {
+                        let _ = weak3.update(cx, |this, cx| {
+                            this.handle_launcher_mode_change(mode, cx);
+                        });
                     });
                 });
 
-            let w3 = weak.clone();
+            let weak2 = weak_launcher.clone();
             let on_target_change: crate::view::launcher::TargetChangeCb =
                 Arc::new(move |target, _w, cx| {
-                    let _ = w3.update(cx, |this, cx| {
-                        this.handle_launcher_target_change(target, cx);
+                    let weak3 = weak2.clone();
+                    cx.defer(move |cx| {
+                        let _ = weak3.update(cx, |this, cx| {
+                            this.handle_launcher_target_change(target, cx);
+                        });
                     });
                 });
 
-            let w4 = weak.clone();
+            let weak2 = weak_launcher.clone();
             let on_run: crate::view::launcher::RunCb = Arc::new(move |_w, cx| {
-                let _ = w4.update(cx, |this, cx| this.handle_launcher_run(cx));
+                let weak3 = weak2.clone();
+                cx.defer(move |cx| {
+                    let _ = weak3.update(cx, |this, cx| this.handle_launcher_run(cx));
+                });
             });
 
-            let w5 = weak.clone();
+            let weak2 = weak_launcher.clone();
             let on_close: crate::view::launcher::CloseCb = Arc::new(move |_w, cx| {
-                let _ = w5.update(cx, |this, cx| this.close_launcher(cx));
+                let weak3 = weak2.clone();
+                cx.defer(move |cx| {
+                    let _ = weak3.update(cx, |this, cx| this.close_launcher(cx));
+                });
             });
 
-            let w_pick = weak.clone();
+            let weak2 = weak_launcher.clone();
             let on_pick_dir: crate::view::launcher::PickDirCb = Arc::new(move |_w, cx| {
-                let _ = w_pick.update(cx, |this, cx| this.handle_launcher_pick_directory(cx));
+                let weak3 = weak2.clone();
+                cx.defer(move |cx| {
+                    let _ = weak3.update(cx, |this, cx| this.handle_launcher_pick_directory(cx));
+                });
             });
 
+            let _ = weak;
             div()
                 .relative()
                 .size_full()
                 .child(main_layout)
                 .child(crate::view::launcher::render(
-                    &state,
+                    state,
                     on_input_change,
                     on_mode_change,
                     on_target_change,
@@ -673,6 +705,8 @@ impl Render for WorkspaceWindow {
                 ))
                 .into_any_element()
         } else {
+            let _ = weak;
+            let _ = weak_launcher;
             main_layout.into_any_element()
         };
         body
@@ -735,10 +769,13 @@ fn render_main_for_workflow(
         .child("Run");
     if !has_active_run {
         run_btn = run_btn.cursor_pointer().on_click(move |_ev, _window, cx| {
-            weak.update(cx, |this, cx| {
-                this.handle_run_clicked(cx);
-            })
-            .ok();
+            let weak = weak.clone();
+            cx.defer(move |cx| {
+                weak.update(cx, |this, cx| {
+                    this.handle_run_clicked(cx);
+                })
+                .ok();
+            });
         });
     }
 
