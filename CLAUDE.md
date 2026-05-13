@@ -23,6 +23,13 @@
 3. **Workspace deps only.** Versions pinned in root `Cargo.toml`; never in crate `Cargo.toml` files.
 4. `#![deny(clippy::all)]` workspace-wide via `[workspace.lints]`. `unsafe_code` forbidden.
 
+## rupu-app rules (learned from 8h debugging chain)
+1. **Metal Toolchain is a build prerequisite on macOS.** Install once:
+   `xcodebuild -downloadComponent MetalToolchain`. Without it the GPUI shader compile step fails.
+2. **Never enable `gpui_platform`'s `runtime_shaders` feature.** It compiles Metal shaders at app startup to bypass the toolchain requirement at build time, but the runtime-compiled glyph shader silently produces no pixels — colored shapes render, text doesn't. Stay on the default (build-time shader compilation).
+3. **Click handlers must defer entity updates via `cx.defer(...)`.** Calling `weak.update(cx, |this, cx| ...)` synchronously inside an `on_click` re-enters `AppCell::borrow_mut` while GPUI is still dispatching the click → `RefCell already borrowed` flood at the display refresh rate. `cx.spawn(async ...)` does NOT work as a substitute (the future is polled on the same foreground executor). `cx.listener(...)` is the same trap dressed up. `cx.defer(...)` is the correct primitive — see `gpui::App::defer` docstring.
+4. **GUI changes require runtime validation before merge.** `cargo build` + `cargo test` cleanliness ≠ rendering cleanliness. Subagents cannot validate GPUI rendering. matt runs the binary before any rupu-app PR merges.
+
 ### Crates
 
 - **`rupu-agent`** — agent file format (`.md` + YAML frontmatter), agent loop, and permission resolver. Lifts spec/loader/permission/runner/tool_registry into one integration crate. Mock-provider tests use `MockProvider` + `BypassDecider` exposed from `runner`.
