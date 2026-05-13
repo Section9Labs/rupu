@@ -211,6 +211,8 @@ mod tests {
         UiPrefs {
             color: ColorMode::Never,
             theme: String::new(),
+            palette_theme: "rupu-dark".into(),
+            palette: crate::output::palette::UiPaletteTheme::default(),
             pager: crate::cmd::ui::PagerMode::Never,
         }
     }

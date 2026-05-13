@@ -23,7 +23,7 @@ pub mod storage_config;
 pub mod triggers_config;
 
 pub use autoflow_config::{AutoflowCheckout, AutoflowConfig};
-pub use config::{BashConfig, Config, RetryConfig, UiConfig};
+pub use config::{BashConfig, Config, RetryConfig, UiConfig, UiPaletteConfig, UiSyntaxConfig};
 pub use layer::{layer_files, LayerError};
 pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};

@@ -6301,6 +6301,7 @@ dependencies = [
  "minijinja",
  "owo-colors",
  "predicates",
+ "reqwest",
  "rupu-agent",
  "rupu-auth",
  "rupu-config",
