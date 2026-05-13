@@ -190,17 +190,16 @@ pub fn build_executor(workspace: &Workspace) -> Arc<AppExecutor> {
     // when no [scm] section is present).
     //
     // Registry::discover is async; build_executor is called from the
-    // synchronous GPUI app closure (no tokio context). Spin up a
-    // single-thread tokio runtime just for this one-shot await.
+    // synchronous GPUI app closure. The ambient Tokio runtime (installed
+    // in main before GPUI starts) provides a Handle we can block on via
+    // block_in_place so we don't block the runtime's async executor.
     let mcp_registry = {
         let resolver_ref = Arc::clone(&resolver);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio runtime for registry discovery");
-        rt.block_on(async move {
-            let cfg = rupu_config::Config::default();
-            Arc::new(rupu_scm::Registry::discover(resolver_ref.as_ref(), &cfg).await)
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let cfg = rupu_config::Config::default();
+                Arc::new(rupu_scm::Registry::discover(resolver_ref.as_ref(), &cfg).await)
+            })
         })
     };
 

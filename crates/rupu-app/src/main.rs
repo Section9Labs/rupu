@@ -10,6 +10,18 @@ fn main() {
         )
         .init();
 
+    // Install a multi-thread Tokio runtime kept alive for the app's
+    // lifetime. GPUI's event loop is not tokio-aware; without an
+    // ambient runtime, InProcessExecutor::start panics when it
+    // tokio::spawn's the workflow task.
+    let rt: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime"),
+    ));
+    let _rt_guard = rt.enter();
+
     gpui_platform::application().run(|cx: &mut App| {
         cx.activate(true);
 
