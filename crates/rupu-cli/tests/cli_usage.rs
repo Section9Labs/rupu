@@ -692,13 +692,13 @@ fn usage_runs_support_failed_and_top_cost_views() {
 }
 
 #[test]
-fn unsupported_global_format_is_rejected() {
+fn agent_list_supports_global_json_format() {
     Command::cargo_bin("rupu")
         .unwrap()
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .args(["--format", "json", "agent", "list"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "does not support structured `--format json` output yet",
-        ));
+        .success()
+        .stdout(predicate::str::contains("\"kind\": \"agent_list\""))
+        .stdout(predicate::str::contains("\"rows\""));
 }

@@ -645,6 +645,37 @@ fn autoflow_history_supports_json_and_csv_output() {
 }
 
 #[test]
+fn autoflow_doctor_supports_json_and_csv_output() {
+    let _guard = ENV_LOCK.blocking_lock();
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join("autoflows/claims")).unwrap();
+
+    let json_output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["--format", "json", "autoflow", "doctor"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&json_output).unwrap();
+    assert_eq!(value["kind"], "autoflow_doctor");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["rows"], serde_json::Value::Array(vec![]));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .args(["--format", "csv", "autoflow", "doctor"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("scope,problem,detail\n"));
+}
+
+#[test]
 fn autoflow_show_prints_resolved_metadata_and_body() {
     let _guard = ENV_LOCK.blocking_lock();
 

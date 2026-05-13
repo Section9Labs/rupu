@@ -313,16 +313,47 @@ If older standalone `rupu run` transcripts predate sidecars, backfill them with:
 - `rupu usage backfill`
 - `rupu --format json usage backfill`
 
-Structured `--format table|json|csv` is currently supported on report/list commands that already have stable row shapes:
+Structured output now follows one shared contract:
 
-- `rupu usage`
+- `table` — default human view
+- `json` — structured detail or collection report
+- `csv` — collection/report views with stable row shapes
+
+Collection views that support `--format json|csv`:
+
+- `rupu agent list`
+- `rupu auth status`
+- `rupu cron list`
+- `rupu cron events`
+- `rupu issues list`
+- `rupu models list`
+- `rupu repos list`
 - `rupu repos tracked`
+- `rupu transcript list`
+- `rupu usage`
+- `rupu workflow list`
+- `rupu workflow runs`
 - `rupu autoflow list`
-- `rupu autoflow monitor` (`table` and `json`)
-- `rupu autoflow history`
+- `rupu autoflow wakes`
 - `rupu autoflow status`
 - `rupu autoflow claims`
-- `rupu autoflow wakes`
+- `rupu autoflow history`
+- `rupu autoflow doctor`
+
+Detail views that support `--format json`:
+
+- `rupu agent show`
+- `rupu auth backend`
+- `rupu issues show`
+- `rupu workflow show`
+- `rupu workflow show-run`
+- `rupu transcript show`
+- `rupu autoflow show`
+- `rupu autoflow explain`
+
+Snapshot views with a custom structured surface:
+
+- `rupu autoflow monitor` (`table` and `json`)
 
 ---
 

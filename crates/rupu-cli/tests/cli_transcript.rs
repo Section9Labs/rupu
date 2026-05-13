@@ -4,8 +4,10 @@
 //! `ENV_LOCK` for the whole body of every test to serialise them within
 //! this binary.
 
+use assert_cmd::Command;
 use assert_fs::prelude::*;
 use chrono::Utc;
+use predicates::prelude::*;
 use rupu_transcript::{Event, JsonlWriter, RunMode, RunStatus};
 use tokio::sync::Mutex;
 
@@ -123,4 +125,47 @@ async fn show_missing_run_id_exits_nonzero() {
         format!("{:?}", std::process::ExitCode::from(0)),
         "transcript show for missing run_id should exit nonzero"
     );
+}
+
+#[tokio::test]
+async fn show_supports_json_output() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+
+    let transcripts_dir = global.path().join("transcripts");
+    write_transcript(&transcripts_dir, "run_json123", "json-agent", 77);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "json", "transcript", "show", "run_json123"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"kind\": \"transcript_show\""))
+        .stdout(predicate::str::contains("\"run_id\": \"run_json123\""))
+        .stdout(predicate::str::contains("\"events\""));
+}
+
+#[tokio::test]
+async fn list_csv_with_no_rows_emits_headers() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "csv", "transcript", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with(
+            "run_id,title,agent,status,total_tokens,started_at\n",
+        ));
 }
