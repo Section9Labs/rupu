@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync gh-build bump fmt lint test gates tui-smoke app-smoke clean help
+.PHONY: build release sign-dev sign-release run install sync gh-build bump fmt lint test gates tui-smoke app-smoke app-run clean help
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -136,6 +136,17 @@ app-smoke:
 		exit 1; \
 	fi
 	@echo "app-smoke OK"
+
+app-run:
+	@cargo build --release -p rupu-app
+	@echo "Running rupu-app against the rupu repo; stderr → /tmp/rupu-app-run.log"
+	@sh -c 'RUST_LOG=info,rupu_app=debug,gpui=warn ./target/release/rupu-app . & PID=$$!; sleep 8; kill $$PID 2>/dev/null || true; wait $$PID 2>/dev/null' 2>/tmp/rupu-app-run.log; true
+	@if grep -q 'RefCell already borrowed' /tmp/rupu-app-run.log; then \
+		echo "FAIL: RefCell errors detected in /tmp/rupu-app-run.log"; \
+		grep -c 'RefCell already borrowed' /tmp/rupu-app-run.log; \
+		exit 1; \
+	fi
+	@echo "app-run OK — no RefCell errors during 8s smoke"
 
 help:
 	@echo "rupu Makefile targets:"

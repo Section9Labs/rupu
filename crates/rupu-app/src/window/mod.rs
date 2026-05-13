@@ -53,17 +53,53 @@ impl WorkspaceWindow {
             titlebar: None, // we draw our own titlebar inside the view
             ..Default::default()
         };
-        cx.open_window(opts, |_window, cx| {
-            cx.new(|_cx| WorkspaceWindow {
-                workspace,
-                app_executor,
-                run_model: None,
-                transcript_lines: Vec::new(),
-                launcher: None,
-                focused_workflow: None,
+        let handle = cx
+            .open_window(opts, |_window, cx| {
+                cx.new(|_cx| WorkspaceWindow {
+                    workspace,
+                    app_executor,
+                    run_model: None,
+                    transcript_lines: Vec::new(),
+                    launcher: None,
+                    focused_workflow: None,
+                })
             })
-        })
-        .expect("open workspace window")
+            .expect("open workspace window");
+
+        // Register keyboard-action handlers globally once at window-open
+        // time via WeakEntity. Registering them per-frame in Render::render
+        // (via cx.listener + .on_action) causes a RefCell borrow conflict
+        // because the entity is already borrowed during render.
+        if let Ok(entity) = handle.entity(cx) {
+            let weak_a = entity.downgrade();
+            cx.on_action(move |_: &ApproveFocused, cx| {
+                let _ = weak_a.update(cx, |this, cx| {
+                    if let Some(step) = this.run_model.as_ref().and_then(|m| m.focused_step.clone())
+                    {
+                        this.handle_approve(step, cx);
+                    }
+                });
+            });
+            let weak_r = entity.downgrade();
+            cx.on_action(move |_: &RejectFocused, cx| {
+                let _ = weak_r.update(cx, |this, cx| {
+                    if let Some(step) = this.run_model.as_ref().and_then(|m| m.focused_step.clone())
+                    {
+                        this.handle_reject(step, "rejected via keyboard".into(), cx);
+                    }
+                });
+            });
+            let weak_l = entity.downgrade();
+            cx.on_action(move |_: &LaunchSelected, cx| {
+                let _ = weak_l.update(cx, |this, cx| {
+                    if let Some(path) = this.focused_workflow.clone() {
+                        this.open_launcher(path, cx);
+                    }
+                });
+            });
+        }
+
+        handle
     }
 
     /// Called when the user selects a workflow in the sidebar. Checks
@@ -540,27 +576,10 @@ impl Render for WorkspaceWindow {
             None => render_main_placeholder(),
         };
 
-        // Keyboard approval shortcuts — `a` to approve, `r` to reject.
-        // Only fire when `focused_step` is Some and Awaiting; the guard is
-        // inside handle_approve / handle_reject.
-        let focused_for_approve = self.run_model.as_ref().and_then(|m| m.focused_step.clone());
-        let focused_for_reject = focused_for_approve.clone();
-        let on_approve_kb = cx.listener(move |this, _: &ApproveFocused, _window, cx| {
-            if let Some(step) = &focused_for_approve {
-                this.handle_approve(step.clone(), cx);
-            }
-        });
-        let on_reject_kb = cx.listener(move |this, _: &RejectFocused, _window, cx| {
-            if let Some(step) = &focused_for_reject {
-                this.handle_reject(step.clone(), "rejected via keyboard".into(), cx);
-            }
-        });
-        let launch_focused = self.focused_workflow.clone();
-        let on_launch_kb = cx.listener(move |this, _: &LaunchSelected, _window, cx| {
-            if let Some(path) = &launch_focused {
-                this.open_launcher(path.clone(), cx);
-            }
-        });
+        // Keyboard approval shortcuts (`a` / `r` / ⌘R) are registered
+        // globally at window-open time in WorkspaceWindow::open via WeakEntity
+        // + cx.on_action. Registering them here per-frame caused a RefCell
+        // already-borrowed panic at ~120Hz on 120Hz displays.
 
         let main_layout = div()
             .size_full()
@@ -568,9 +587,6 @@ impl Render for WorkspaceWindow {
             .text_color(palette::TEXT_PRIMARY)
             .flex()
             .flex_col()
-            .on_action(on_approve_kb)
-            .on_action(on_reject_kb)
-            .on_action(on_launch_kb)
             .child(titlebar::render(&self.workspace))
             .child(
                 div()
