@@ -155,6 +155,8 @@ impl AgentDispatcher for CliAgentDispatcher {
             decider: Arc::new(BypassDecider) as Arc<dyn PermissionDecider>,
             tool_context: child_tool_ctx,
             user_message: prompt,
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
             mode_str: child_mode_str,
             no_stream: false,
             // The parent's printer renders the child as a callout from

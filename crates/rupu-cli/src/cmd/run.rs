@@ -282,6 +282,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     let metadata = StandaloneRunMetadata {
         version: StandaloneRunMetadata::VERSION,
         run_id: run_id.clone(),
+        session_id: None,
         workspace_path: canonicalize_if_exists(&workspace_path),
         project_root: project_root.clone(),
         repo_ref,
@@ -315,6 +316,8 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         decider,
         tool_context,
         user_message,
+        initial_messages: Vec::new(),
+        turn_index_offset: 0,
         mode_str: mode_str.to_string(),
         no_stream: args.no_stream,
         // Suppress the agent runner's inline stdout writes; the CLI's
@@ -431,11 +434,11 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn canonicalize_if_exists(path: &Path) -> std::path::PathBuf {
+pub(crate) fn canonicalize_if_exists(path: &Path) -> std::path::PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn standalone_repo_ref(
+pub(crate) fn standalone_repo_ref(
     run_target: Option<&crate::run_target::RunTarget>,
     workspace_path: &Path,
 ) -> Option<String> {
@@ -461,7 +464,9 @@ fn standalone_repo_ref(
     }
 }
 
-fn standalone_issue_ref(run_target: Option<&crate::run_target::RunTarget>) -> Option<String> {
+pub(crate) fn standalone_issue_ref(
+    run_target: Option<&crate::run_target::RunTarget>,
+) -> Option<String> {
     match run_target {
         Some(crate::run_target::RunTarget::Issue {
             tracker,
@@ -472,7 +477,7 @@ fn standalone_issue_ref(run_target: Option<&crate::run_target::RunTarget>) -> Op
     }
 }
 
-fn standalone_workspace_strategy(
+pub(crate) fn standalone_workspace_strategy(
     run_target: Option<&crate::run_target::RunTarget>,
     workspace_path: &Path,
     tmp: bool,
@@ -494,7 +499,7 @@ fn standalone_workspace_strategy(
     Some(value.into())
 }
 
-fn pick_decider(
+pub(crate) fn pick_decider(
     mode: PermissionMode,
     multi: Option<indicatif::MultiProgress>,
 ) -> Arc<dyn PermissionDecider> {
@@ -518,7 +523,7 @@ fn pick_decider(
 /// Modes 2 and 3 refuse-by-default on existing paths to protect
 /// uncommitted work; the error message points at `--into`, `--tmp`,
 /// or removing the existing directory as escape hatches.
-fn resolve_clone_dest(
+pub(crate) fn resolve_clone_dest(
     cwd: &std::path::Path,
     repo: &str,
     into: Option<&std::path::Path>,
@@ -544,7 +549,7 @@ fn resolve_clone_dest(
 }
 
 /// Readonly: deny writers (bash/write_file/edit_file), allow readers.
-struct ReadonlyDecider;
+pub(crate) struct ReadonlyDecider;
 impl PermissionDecider for ReadonlyDecider {
     fn decide(
         &self,

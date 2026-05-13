@@ -172,6 +172,8 @@ impl StepFactory for DefaultStepFactory {
                 depth: 0,
             },
             user_message: rendered_prompt,
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
             mode_str: self.mode_str.clone(),
             no_stream: false,
             // Workflow runs always feed into the TUI; the TUI tails

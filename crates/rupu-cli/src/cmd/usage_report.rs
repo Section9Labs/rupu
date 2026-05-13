@@ -616,6 +616,7 @@ fn backfill_metadata_from_workspace(
     crate::standalone_run_metadata::StandaloneRunMetadata {
         version: crate::standalone_run_metadata::StandaloneRunMetadata::VERSION,
         run_id: run_id.to_string(),
+        session_id: None,
         workspace_path,
         project_root,
         repo_ref,
@@ -851,6 +852,7 @@ mod tests {
             &crate::standalone_run_metadata::StandaloneRunMetadata {
                 version: crate::standalone_run_metadata::StandaloneRunMetadata::VERSION,
                 run_id: "run_standalone_02".into(),
+                session_id: None,
                 workspace_path: PathBuf::from("/tmp/repo"),
                 project_root: Some(PathBuf::from("/tmp/project")),
                 repo_ref: Some("github:Section9Labs/rupu".into()),

@@ -227,175 +227,7 @@ fn render_pretty_transcript(events: &[TranscriptEvent]) -> anyhow::Result<()> {
     let mut saw_header = false;
 
     for event in events {
-        match event {
-            TranscriptEvent::RunStart {
-                run_id,
-                workspace_id,
-                agent,
-                provider,
-                model,
-                started_at,
-                mode,
-            } => {
-                printer.agent_header(agent, provider, model, run_id);
-                let detail = format!(
-                    "workspace {workspace_id}  ·  mode {}  ·  {}",
-                    format!("{mode:?}").to_lowercase(),
-                    started_at.format("%Y-%m-%d %H:%M:%S UTC")
-                );
-                printer.sideband_event(Status::Active, "run started", Some(&detail));
-                saw_header = true;
-            }
-            TranscriptEvent::TurnStart { turn_idx } => {
-                printer.sideband_event(
-                    Status::Working,
-                    &format!("turn {turn_idx}"),
-                    Some("assistant turn started"),
-                );
-            }
-            TranscriptEvent::AssistantMessage { content, thinking } => {
-                if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty())
-                {
-                    let detail = truncate_single_line(thinking, 96);
-                    printer.sideband_event(Status::Active, "thinking", Some(&detail));
-                }
-                if !content.trim().is_empty() {
-                    printer.assistant_chunk(content);
-                }
-            }
-            TranscriptEvent::ToolCall { tool, input, .. } => {
-                printer.tool_call(tool, &tool_summary(tool, input));
-            }
-            TranscriptEvent::ToolResult {
-                output,
-                error,
-                duration_ms,
-                ..
-            } => {
-                let label = if error.is_some() {
-                    "tool error"
-                } else {
-                    "tool result"
-                };
-                let status = if error.is_some() {
-                    Status::Failed
-                } else {
-                    Status::Complete
-                };
-                let mut detail =
-                    truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 84);
-                if *duration_ms > 0 {
-                    detail.push_str(&format!("  ·  {}ms", duration_ms));
-                }
-                printer.sideband_event(status, label, Some(&detail));
-            }
-            TranscriptEvent::FileEdit { path, kind, .. } => {
-                let detail = format!("{:?} {}", kind, path).to_lowercase();
-                printer.sideband_event(Status::Complete, "file edit", Some(&detail));
-            }
-            TranscriptEvent::CommandRun {
-                argv,
-                cwd,
-                exit_code,
-                ..
-            } => {
-                let status = if *exit_code == 0 {
-                    Status::Complete
-                } else {
-                    Status::Failed
-                };
-                let detail = format!(
-                    "{}  ·  cwd {}  ·  exit {}",
-                    truncate_single_line(&argv.join(" "), 64),
-                    truncate_single_line(cwd, 24),
-                    exit_code
-                );
-                printer.sideband_event(status, "command", Some(&detail));
-            }
-            TranscriptEvent::ActionEmitted {
-                kind,
-                allowed,
-                applied,
-                reason,
-                ..
-            } => {
-                let status = if *applied {
-                    Status::Complete
-                } else if *allowed {
-                    Status::Awaiting
-                } else {
-                    Status::Failed
-                };
-                let mut detail = format!("{kind}  ·  allowed={allowed} applied={applied}");
-                if let Some(reason) = reason.as_deref().filter(|value| !value.trim().is_empty()) {
-                    detail.push_str("  ·  ");
-                    detail.push_str(&truncate_single_line(reason, 64));
-                }
-                printer.sideband_event(status, "action", Some(&detail));
-            }
-            TranscriptEvent::GateRequested {
-                gate_id,
-                prompt,
-                decision,
-                decided_by,
-            } => {
-                let mut detail = format!("{gate_id}  ·  {}", truncate_single_line(prompt, 72));
-                if let Some(decision) = decision.as_deref() {
-                    detail.push_str(&format!("  ·  decision {decision}"));
-                }
-                if let Some(decided_by) = decided_by.as_deref() {
-                    detail.push_str(&format!("  ·  by {decided_by}"));
-                }
-                printer.sideband_event(Status::Awaiting, "approval gate", Some(&detail));
-            }
-            TranscriptEvent::TurnEnd {
-                turn_idx,
-                tokens_in,
-                tokens_out,
-            } => {
-                let detail = format!(
-                    "turn {turn_idx}  ·  in {} out {}",
-                    tokens_in.unwrap_or(0),
-                    tokens_out.unwrap_or(0)
-                );
-                printer.sideband_event(Status::Complete, "turn complete", Some(&detail));
-            }
-            TranscriptEvent::Usage {
-                provider,
-                model,
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-            } => {
-                let detail = format!(
-                    "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
-                );
-                printer.sideband_event(Status::Active, "usage", Some(&detail));
-            }
-            TranscriptEvent::RunComplete {
-                status,
-                total_tokens,
-                duration_ms,
-                error,
-                ..
-            } => {
-                let ui_status = match status {
-                    RunStatus::Ok => Status::Complete,
-                    RunStatus::Error | RunStatus::Aborted => Status::Failed,
-                };
-                let mut detail = format!(
-                    "status {}  ·  {}ms  ·  {} tokens",
-                    format!("{status:?}").to_lowercase(),
-                    duration_ms,
-                    total_tokens
-                );
-                if let Some(error) = error.as_deref().filter(|value| !value.trim().is_empty()) {
-                    detail.push_str("  ·  ");
-                    detail.push_str(&truncate_single_line(error, 72));
-                }
-                printer.sideband_event(ui_status, "run complete", Some(&detail));
-            }
-        }
+        render_pretty_transcript_event(&mut printer, event, &mut saw_header);
     }
 
     if !saw_header {
@@ -406,7 +238,181 @@ fn render_pretty_transcript(events: &[TranscriptEvent]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn truncate_single_line(value: &str, max: usize) -> String {
+pub(crate) fn render_pretty_transcript_event(
+    printer: &mut LineStreamPrinter,
+    event: &TranscriptEvent,
+    saw_header: &mut bool,
+) {
+    match event {
+        TranscriptEvent::RunStart {
+            run_id,
+            workspace_id,
+            agent,
+            provider,
+            model,
+            started_at,
+            mode,
+        } => {
+            printer.agent_header(agent, provider, model, run_id);
+            let detail = format!(
+                "workspace {workspace_id}  ·  mode {}  ·  {}",
+                format!("{mode:?}").to_lowercase(),
+                started_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+            printer.sideband_event(Status::Active, "run started", Some(&detail));
+            *saw_header = true;
+        }
+        TranscriptEvent::TurnStart { turn_idx } => {
+            printer.sideband_event(
+                Status::Working,
+                &format!("turn {turn_idx}"),
+                Some("assistant turn started"),
+            );
+        }
+        TranscriptEvent::AssistantMessage { content, thinking } => {
+            if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
+                let detail = truncate_single_line(thinking, 96);
+                printer.sideband_event(Status::Active, "thinking", Some(&detail));
+            }
+            if !content.trim().is_empty() {
+                printer.assistant_chunk(content);
+            }
+        }
+        TranscriptEvent::ToolCall { tool, input, .. } => {
+            printer.tool_call(tool, &tool_summary(tool, input));
+        }
+        TranscriptEvent::ToolResult {
+            output,
+            error,
+            duration_ms,
+            ..
+        } => {
+            let label = if error.is_some() {
+                "tool error"
+            } else {
+                "tool result"
+            };
+            let status = if error.is_some() {
+                Status::Failed
+            } else {
+                Status::Complete
+            };
+            let mut detail = truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 84);
+            if *duration_ms > 0 {
+                detail.push_str(&format!("  ·  {}ms", duration_ms));
+            }
+            printer.sideband_event(status, label, Some(&detail));
+        }
+        TranscriptEvent::FileEdit { path, kind, .. } => {
+            let detail = format!("{:?} {}", kind, path).to_lowercase();
+            printer.sideband_event(Status::Complete, "file edit", Some(&detail));
+        }
+        TranscriptEvent::CommandRun {
+            argv,
+            cwd,
+            exit_code,
+            ..
+        } => {
+            let status = if *exit_code == 0 {
+                Status::Complete
+            } else {
+                Status::Failed
+            };
+            let detail = format!(
+                "{}  ·  cwd {}  ·  exit {}",
+                truncate_single_line(&argv.join(" "), 64),
+                truncate_single_line(cwd, 24),
+                exit_code
+            );
+            printer.sideband_event(status, "command", Some(&detail));
+        }
+        TranscriptEvent::ActionEmitted {
+            kind,
+            allowed,
+            applied,
+            reason,
+            ..
+        } => {
+            let status = if *applied {
+                Status::Complete
+            } else if *allowed {
+                Status::Awaiting
+            } else {
+                Status::Failed
+            };
+            let mut detail = format!("{kind}  ·  allowed={allowed} applied={applied}");
+            if let Some(reason) = reason.as_deref().filter(|value| !value.trim().is_empty()) {
+                detail.push_str("  ·  ");
+                detail.push_str(&truncate_single_line(reason, 64));
+            }
+            printer.sideband_event(status, "action", Some(&detail));
+        }
+        TranscriptEvent::GateRequested {
+            gate_id,
+            prompt,
+            decision,
+            decided_by,
+        } => {
+            let mut detail = format!("{gate_id}  ·  {}", truncate_single_line(prompt, 72));
+            if let Some(decision) = decision.as_deref() {
+                detail.push_str(&format!("  ·  decision {decision}"));
+            }
+            if let Some(decided_by) = decided_by.as_deref() {
+                detail.push_str(&format!("  ·  by {decided_by}"));
+            }
+            printer.sideband_event(Status::Awaiting, "approval gate", Some(&detail));
+        }
+        TranscriptEvent::TurnEnd {
+            turn_idx,
+            tokens_in,
+            tokens_out,
+        } => {
+            let detail = format!(
+                "turn {turn_idx}  ·  in {} out {}",
+                tokens_in.unwrap_or(0),
+                tokens_out.unwrap_or(0)
+            );
+            printer.sideband_event(Status::Complete, "turn complete", Some(&detail));
+        }
+        TranscriptEvent::Usage {
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        } => {
+            let detail = format!(
+                "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+            );
+            printer.sideband_event(Status::Active, "usage", Some(&detail));
+        }
+        TranscriptEvent::RunComplete {
+            status,
+            total_tokens,
+            duration_ms,
+            error,
+            ..
+        } => {
+            let ui_status = match status {
+                RunStatus::Ok => Status::Complete,
+                RunStatus::Error | RunStatus::Aborted => Status::Failed,
+            };
+            let mut detail = format!(
+                "status {}  ·  {}ms  ·  {} tokens",
+                format!("{status:?}").to_lowercase(),
+                duration_ms,
+                total_tokens
+            );
+            if let Some(error) = error.as_deref().filter(|value| !value.trim().is_empty()) {
+                detail.push_str("  ·  ");
+                detail.push_str(&truncate_single_line(error, 72));
+            }
+            printer.sideband_event(ui_status, "run complete", Some(&detail));
+        }
+    }
+}
+
+pub(crate) fn truncate_single_line(value: &str, max: usize) -> String {
     let squashed = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if squashed.chars().count() <= max {
         squashed

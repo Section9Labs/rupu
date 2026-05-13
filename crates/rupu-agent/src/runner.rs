@@ -95,6 +95,11 @@ pub struct AgentRunOpts {
     pub decider: Arc<dyn PermissionDecider>,
     pub tool_context: ToolContext,
     pub user_message: String,
+    /// Existing conversation state to prepend before `user_message`.
+    /// Empty for one-shot runs.
+    pub initial_messages: Vec<Message>,
+    /// Absolute turn index for the first turn in this run.
+    pub turn_index_offset: u32,
     pub mode_str: String,
     /// If true, skip token streaming and use `provider.send` for one-shot
     /// completions. Default is false (streaming). Used by --no-stream.
@@ -158,9 +163,11 @@ pub struct AgentRunOpts {
 
 /// Outcome of a finished run.
 pub struct RunResult {
+    pub status: RunStatus,
     pub turns: u32,
     pub total_tokens_in: u64,
     pub total_tokens_out: u64,
+    pub final_messages: Vec<Message>,
 }
 
 /// Drive one agent run to completion. Writes a JSONL transcript at
@@ -232,8 +239,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
 
     let tool_defs = registry.to_tool_definitions();
 
-    let mut messages: Vec<Message> = vec![Message::user(&opts.user_message)];
-    let mut turn_idx: u32 = 0;
+    let mut messages: Vec<Message> = opts.initial_messages.clone();
+    messages.push(Message::user(&opts.user_message));
+    let mut turn_idx: u32 = opts.turn_index_offset;
+    let initial_turn_idx = turn_idx;
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
     let mut runtime_mode = parse_mode_for_runtime(&opts.mode_str);
@@ -509,9 +518,11 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     }
 
     Ok(RunResult {
-        turns: turn_idx,
+        status: result_status,
+        turns: turn_idx.saturating_sub(initial_turn_idx),
         total_tokens_in: total_in,
         total_tokens_out: total_out,
+        final_messages: messages,
     })
 }
 
@@ -629,6 +640,8 @@ mod on_tool_call_tests {
                 ..Default::default()
             },
             user_message: "test prompt".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
             mode_str: "bypass".into(),
             no_stream: true,
             suppress_stream_stdout: false,

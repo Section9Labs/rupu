@@ -329,6 +329,7 @@ Collection views that support `--format json|csv`:
 - `rupu models list`
 - `rupu repos list`
 - `rupu repos tracked`
+- `rupu session list`
 - `rupu transcript list`
 - `rupu usage`
 - `rupu workflow list`
@@ -345,6 +346,7 @@ Detail views that support `--format json`:
 - `rupu agent show`
 - `rupu auth backend`
 - `rupu issues show`
+- `rupu session show`
 - `rupu workflow show`
 - `rupu workflow show-run`
 - `rupu transcript show`
@@ -364,6 +366,22 @@ Event/timeline views use a separate contract:
 Snapshot views with a custom structured surface:
 
 - `rupu autoflow monitor` (`table` and `json`)
+
+Persistent agent sessions:
+
+- `rupu session start <agent> [target] [prompt]`
+- `rupu session send <session-id> <prompt>`
+- `rupu session attach <session-id>`
+- `rupu session stop <session-id>`
+
+Sessions keep agent conversation state across multiple turns. A session turn runs in a
+child `rupu` worker process, so `attach` can be interrupted without killing the active
+turn. Re-attach later with `rupu session attach <session-id>`.
+
+While attached:
+
+- press `p` or `Enter` to submit the next prompt once the session is idle
+- press `d` or `Ctrl-]` to detach without stopping the worker
 
 ---
 

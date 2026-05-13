@@ -47,6 +47,11 @@ pub fn repos_dir(global: &Path) -> PathBuf {
     global.join("repos")
 }
 
+/// Global session state root.
+pub fn sessions_dir(global: &Path) -> PathBuf {
+    global.join("sessions")
+}
+
 /// Global autoflow state root.
 pub fn autoflows_dir(global: &Path) -> PathBuf {
     global.join("autoflows")

@@ -38,6 +38,8 @@ async fn mcp_registry_attaches_tools_to_run() {
         decider: Arc::new(BypassDecider),
         tool_context: ToolContext::default(),
         user_message: "list repos".into(),
+        initial_messages: Vec::new(),
+        turn_index_offset: 0,
         mode_str: "bypass".into(),
         no_stream: true,
         suppress_stream_stdout: false,
