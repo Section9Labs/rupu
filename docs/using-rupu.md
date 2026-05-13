@@ -370,9 +370,14 @@ Snapshot views with a custom structured surface:
 Persistent agent sessions:
 
 - `rupu session start <agent> [target] [prompt]`
+- `rupu session list [--all|--archived]`
+- `rupu session show <session-id>`
 - `rupu session send <session-id> <prompt>`
 - `rupu session attach <session-id>`
 - `rupu session stop <session-id>`
+- `rupu session archive <session-id>`
+- `rupu session restore <session-id>`
+- `rupu session delete <session-id> --force`
 
 Sessions keep agent conversation state across multiple turns. A session turn runs in a
 child `rupu` worker process, so `attach` can be interrupted without killing the active
@@ -382,6 +387,22 @@ While attached:
 
 - press `p` or `Enter` to submit the next prompt once the session is idle
 - press `d` or `Ctrl-]` to detach without stopping the worker
+
+Lifecycle notes:
+
+- `archive` hides the session from the default `session list` view and moves its owned
+  transcripts out of the active transcript set
+- `restore` brings an archived session and its owned transcripts back into the active set
+- `delete --force` permanently removes the session and its owned transcripts
+- a running session must be stopped before it can be archived or deleted
+
+Standalone transcript lifecycle:
+
+- `rupu transcript archive <run-id>`
+- `rupu transcript delete <run-id> --force`
+
+Transcript archive/delete is only available for standalone runs. If a transcript is owned
+by a session, manage it through `rupu session archive|delete` instead.
 
 ---
 

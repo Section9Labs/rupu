@@ -27,6 +27,7 @@ use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, ToolContext};
 use rupu_transcript::{Event as TranscriptEvent, RunStatus};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -40,9 +41,15 @@ pub enum Action {
     /// Start a persistent agent session.
     Start(StartArgs),
     /// List persistent agent sessions.
-    List,
+    List(ListArgs),
     /// Show session details.
     Show { session_id: String },
+    /// Archive an inactive session and its owned transcripts.
+    Archive { session_id: String },
+    /// Restore an archived session and its owned transcripts.
+    Restore { session_id: String },
+    /// Permanently delete a session and its owned transcripts.
+    Delete(DeleteArgs),
     /// Send a follow-up prompt to an existing session.
     Send(SendArgs),
     /// Attach to the current or last run in a session.
@@ -75,12 +82,29 @@ pub struct StartArgs {
     pub detach: bool,
 }
 
+#[derive(ClapArgs, Debug, Clone, Default)]
+pub struct ListArgs {
+    /// Include both active and archived sessions.
+    #[arg(long, conflicts_with = "archived")]
+    pub all: bool,
+    /// Show only archived sessions.
+    #[arg(long, conflicts_with = "all")]
+    pub archived: bool,
+}
+
 #[derive(ClapArgs, Debug, Clone)]
 pub struct SendArgs {
     pub session_id: String,
     pub prompt: String,
     #[arg(long)]
     pub detach: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct DeleteArgs {
+    pub session_id: String,
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -109,6 +133,21 @@ impl SessionStatus {
             Self::Running => "running",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionScope {
+    Active,
+    Archived,
+}
+
+impl SessionScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
         }
     }
 }
@@ -216,6 +255,7 @@ impl SessionRecord {
 struct SessionListRow {
     session_id: String,
     agent: String,
+    scope: String,
     status: String,
     target: Option<String>,
     active_run_id: Option<String>,
@@ -226,6 +266,7 @@ struct SessionListRow {
 struct SessionListCsvRow {
     session_id: String,
     agent: String,
+    scope: String,
     status: String,
     target: String,
     active_run_id: String,
@@ -248,6 +289,7 @@ struct SessionListOutput {
 struct SessionShowItem {
     session_id: String,
     agent: String,
+    scope: String,
     status: String,
     provider: String,
     model: String,
@@ -313,6 +355,7 @@ impl CollectionOutput for SessionListOutput {
         Some(&[
             "session_id",
             "agent",
+            "scope",
             "status",
             "target",
             "active_run_id",
@@ -323,12 +366,13 @@ impl CollectionOutput for SessionListOutput {
     fn render_table(&self) -> anyhow::Result<()> {
         let mut table = crate::output::tables::new_table();
         table.set_header(vec![
-            "SESSION", "AGENT", "STATUS", "TARGET", "RUN", "UPDATED",
+            "SESSION", "AGENT", "SCOPE", "STATUS", "TARGET", "RUN", "UPDATED",
         ]);
         for row in &self.report.rows {
             table.add_row(vec![
                 Cell::new(&row.session_id),
                 Cell::new(&row.agent),
+                Cell::new(&row.scope),
                 Cell::new(&row.status),
                 Cell::new(row.target.as_deref().unwrap_or("—")),
                 Cell::new(row.active_run_id.as_deref().unwrap_or("—")),
@@ -355,6 +399,7 @@ impl DetailOutput for SessionShowOutput {
         let item = &self.report.item;
         println!("session: {}", item.session_id);
         println!("agent: {}", item.agent);
+        println!("scope: {}", item.scope);
         println!("status: {}", item.status);
         println!("provider: {}", item.provider);
         println!("model: {}", item.model);
@@ -404,8 +449,11 @@ impl DetailOutput for SessionShowOutput {
 pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
         Action::Start(args) => start(args).await,
-        Action::List => list(global_format).await,
+        Action::List(args) => list(args, global_format).await,
         Action::Show { session_id } => show(&session_id, global_format).await,
+        Action::Archive { session_id } => archive(&session_id).await,
+        Action::Restore { session_id } => restore(&session_id).await,
+        Action::Delete(args) => delete(args).await,
         Action::Send(args) => send(args).await,
         Action::Attach { session_id } => attach(&session_id).await,
         Action::Stop { session_id } => stop(&session_id).await,
@@ -419,8 +467,11 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
 
 pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
     let (command_name, supported) = match action {
-        Action::List => ("session list", report::TABLE_JSON_CSV),
+        Action::List(_) => ("session list", report::TABLE_JSON_CSV),
         Action::Show { .. } => ("session show", report::TABLE_JSON),
+        Action::Archive { .. } => ("session archive", report::TABLE_ONLY),
+        Action::Restore { .. } => ("session restore", report::TABLE_ONLY),
+        Action::Delete(_) => ("session delete", report::TABLE_ONLY),
         Action::Start(_) => ("session start", report::TABLE_ONLY),
         Action::Send(_) => ("session send", report::TABLE_ONLY),
         Action::Attach { .. } => ("session attach", report::TABLE_ONLY),
@@ -430,21 +481,31 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
 
-async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let mut rows = Vec::new();
-    for mut session in load_all_sessions(&global)? {
-        if reconcile_stale_session(&mut session) {
-            write_session(&global, &session)?;
+    let scopes: &[SessionScope] = if args.all {
+        &[SessionScope::Active, SessionScope::Archived]
+    } else if args.archived {
+        &[SessionScope::Archived]
+    } else {
+        &[SessionScope::Active]
+    };
+    for &scope in scopes {
+        for mut session in load_sessions_in_scope(&global, scope)? {
+            if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
+                write_session(&global, scope, &session)?;
+            }
+            rows.push(SessionListRow {
+                session_id: session.session_id.clone(),
+                agent: session.agent_name.clone(),
+                scope: scope.as_str().to_string(),
+                status: session.status.as_str().to_string(),
+                target: session.target.clone(),
+                active_run_id: session.active_run_id.clone(),
+                updated_at: session.updated_at.to_rfc3339(),
+            });
         }
-        rows.push(SessionListRow {
-            session_id: session.session_id.clone(),
-            agent: session.agent_name.clone(),
-            status: session.status.as_str().to_string(),
-            target: session.target.clone(),
-            active_run_id: session.active_run_id.clone(),
-            updated_at: session.updated_at.to_rfc3339(),
-        });
     }
     rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at.clone()));
     let csv_rows = rows
@@ -452,6 +513,7 @@ async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
         .map(|row| SessionListCsvRow {
             session_id: row.session_id.clone(),
             agent: row.agent.clone(),
+            scope: row.scope.clone(),
             status: row.status.clone(),
             target: row.target.clone().unwrap_or_default(),
             active_run_id: row.active_run_id.clone().unwrap_or_default(),
@@ -471,9 +533,9 @@ async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
 
 async fn show(session_id: &str, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
-    let mut session = read_session(&global, session_id)?;
-    if reconcile_stale_session(&mut session) {
-        write_session(&global, &session)?;
+    let (mut session, scope) = read_session(&global, session_id)?;
+    if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
+        write_session(&global, scope, &session)?;
     }
     let output = SessionShowOutput {
         report: SessionShowReport {
@@ -482,6 +544,7 @@ async fn show(session_id: &str, global_format: Option<OutputFormat>) -> anyhow::
             item: SessionShowItem {
                 session_id: session.session_id.clone(),
                 agent: session.agent_name.clone(),
+                scope: scope.as_str().to_string(),
                 status: session.status.as_str().to_string(),
                 provider: session.provider_name.clone(),
                 model: session.model.clone(),
@@ -688,15 +751,16 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         message_history: Vec::new(),
         runs: Vec::new(),
     };
-    write_session(&global, &session)?;
+    write_session(&global, SessionScope::Active, &session)?;
     launch_turn(&global, &session_id, user_message, args.detach).await
 }
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
-    let mut session = read_session(&global, &args.session_id)?;
+    let (mut session, scope) = read_session(&global, &args.session_id)?;
+    ensure_active_scope(scope, "session send")?;
     if reconcile_stale_session(&mut session) {
-        write_session(&global, &session)?;
+        write_session(&global, scope, &session)?;
     }
     if session.status == SessionStatus::Stopped {
         anyhow::bail!("session {} is stopped", session.session_id);
@@ -724,9 +788,10 @@ async fn launch_turn(
 }
 
 fn launch_turn_detached(global: &Path, session_id: &str, prompt: String) -> anyhow::Result<String> {
-    let mut session = read_session(global, session_id)?;
+    let (mut session, scope) = read_session(global, session_id)?;
+    ensure_active_scope(scope, "session send")?;
     if reconcile_stale_session(&mut session) {
-        write_session(global, &session)?;
+        write_session(global, scope, &session)?;
     }
     ensure_session_available(&session)?;
 
@@ -752,7 +817,7 @@ fn launch_turn_detached(global: &Path, session_id: &str, prompt: String) -> anyh
         pid: None,
         error: None,
     });
-    write_session(global, &session)?;
+    write_session(global, scope, &session)?;
 
     let exe = std::env::current_exe()?;
     let child = Command::new(exe)
@@ -771,13 +836,13 @@ fn launch_turn_detached(global: &Path, session_id: &str, prompt: String) -> anyh
         .with_context(|| format!("spawn session worker for {session_id}"))?;
 
     let pid = child.id();
-    let mut session = read_session(global, session_id)?;
+    let (mut session, scope) = read_session(global, session_id)?;
     if let Some(run) = session.runs.iter_mut().find(|run| run.run_id == run_id) {
         run.pid = Some(pid);
     }
     session.active_pid = Some(pid);
     session.updated_at = Utc::now();
-    write_session(global, &session)?;
+    write_session(global, scope, &session)?;
     drop(child);
     Ok(run_id)
 }
@@ -791,9 +856,10 @@ async fn attach(session_id: &str) -> anyhow::Result<()> {
 }
 
 fn attach_blocking(global: &Path, session_id: &str) -> anyhow::Result<()> {
-    let mut session = read_session(global, session_id)?;
+    let (mut session, scope) = read_session(global, session_id)?;
+    ensure_active_scope(scope, "session attach")?;
     if reconcile_stale_session(&mut session) {
-        write_session(global, &session)?;
+        write_session(global, scope, &session)?;
     }
     let mut transcript_path = session
         .active_transcript_path
@@ -831,9 +897,10 @@ fn attach_blocking(global: &Path, session_id: &str) -> anyhow::Result<()> {
             saw_any = true;
         }
 
-        let mut session = read_session(global, session_id)?;
+        let (mut session, scope) = read_session(global, session_id)?;
+        ensure_active_scope(scope, "session attach")?;
         if reconcile_stale_session(&mut session) {
-            write_session(global, &session)?;
+            write_session(global, scope, &session)?;
         }
 
         let desired_run_id = session
@@ -870,7 +937,10 @@ fn attach_blocking(global: &Path, session_id: &str) -> anyhow::Result<()> {
             printer.sideband_event(
                 crate::output::palette::Status::Awaiting,
                 "detached",
-                Some(&format!("re-attach with: rupu session attach {}", session.session_id)),
+                Some(&format!(
+                    "re-attach with: rupu session attach {}",
+                    session.session_id
+                )),
             );
             return Ok(());
         }
@@ -938,10 +1008,7 @@ fn handle_attach_keypress(
             }
             if let Some(prompt) = prompt_for_session_input(printer, &session.session_id)? {
                 let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
-                let detail = format!(
-                    "{run_id}  ·  {}",
-                    truncate_single_line(prompt.as_str(), 72)
-                );
+                let detail = format!("{run_id}  ·  {}", truncate_single_line(prompt.as_str(), 72));
                 printer.sideband_event(
                     crate::output::palette::Status::Working,
                     "queued prompt",
@@ -995,11 +1062,72 @@ impl Drop for RawModeGuard {
     }
 }
 
+async fn archive(session_id: &str) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let (mut session, scope) = read_session(&global, session_id)?;
+    if scope == SessionScope::Archived {
+        anyhow::bail!("session {session_id} is already archived");
+    }
+    if reconcile_stale_session(&mut session) {
+        write_session(&global, scope, &session)?;
+    }
+    ensure_session_not_running(&session, "archive")?;
+    move_session_owned_transcripts(&mut session, SessionScope::Archived)?;
+    move_session_scope(
+        &global,
+        &session.session_id,
+        SessionScope::Active,
+        SessionScope::Archived,
+    )?;
+    write_session(&global, SessionScope::Archived, &session)?;
+    println!("archived session {}", session.session_id);
+    Ok(())
+}
+
+async fn restore(session_id: &str) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let (mut session, scope) = read_session(&global, session_id)?;
+    if scope == SessionScope::Active {
+        anyhow::bail!("session {session_id} is already active");
+    }
+    move_session_owned_transcripts(&mut session, SessionScope::Active)?;
+    move_session_scope(
+        &global,
+        &session.session_id,
+        SessionScope::Archived,
+        SessionScope::Active,
+    )?;
+    write_session(&global, SessionScope::Active, &session)?;
+    println!("restored session {}", session.session_id);
+    Ok(())
+}
+
+async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
+    if !args.force {
+        anyhow::bail!("session delete requires --force");
+    }
+    let global = paths::global_dir()?;
+    let (mut session, scope) = read_session(&global, &args.session_id)?;
+    if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
+        write_session(&global, scope, &session)?;
+    }
+    ensure_session_not_running(&session, "delete")?;
+    delete_session_owned_artifacts(&session)?;
+    let dir = session_dir(&global, scope, &session.session_id);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove session dir {}", dir.display()))?;
+    }
+    println!("deleted session {}", session.session_id);
+    Ok(())
+}
+
 async fn stop(session_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
-    let mut session = read_session(&global, session_id)?;
+    let (mut session, scope) = read_session(&global, session_id)?;
+    ensure_active_scope(scope, "session stop")?;
     if reconcile_stale_session(&mut session) {
-        write_session(&global, &session)?;
+        write_session(&global, scope, &session)?;
     }
     if let Some(pid) = session.active_pid.filter(|pid| pid_is_running(*pid)) {
         let _ = terminate_pid(pid);
@@ -1027,7 +1155,7 @@ async fn stop(session_id: &str) -> anyhow::Result<()> {
         run.status = Some(RunStatus::Aborted);
         run.error = Some("stopped by operator".into());
     }
-    write_session(&global, &session)?;
+    write_session(&global, scope, &session)?;
     println!("stopped session {}", session.session_id);
     Ok(())
 }
@@ -1036,7 +1164,8 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     crate::logging::init_to_file();
 
     let global = paths::global_dir()?;
-    let mut session = read_session(&global, &args.session_id)?;
+    let (mut session, scope) = read_session(&global, &args.session_id)?;
+    ensure_active_scope(scope, "session _run-turn")?;
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = session
         .project_root
@@ -1142,7 +1271,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
     let outcome = rupu_agent::run_agent(opts).await;
 
-    session = read_session(&global, &args.session_id)?;
+    session = read_session(&global, &args.session_id)?.0;
     session.updated_at = Utc::now();
     session.active_run_id = None;
     session.active_transcript_path = None;
@@ -1217,7 +1346,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         }
     }
 
-    write_session(&global, &session)?;
+    write_session(&global, scope, &session)?;
     Ok(())
 }
 
@@ -1246,6 +1375,24 @@ fn ensure_session_available(session: &SessionRecord) -> anyhow::Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn ensure_active_scope(scope: SessionScope, command: &str) -> anyhow::Result<()> {
+    if scope == SessionScope::Archived {
+        anyhow::bail!("{command} does not support archived sessions; restore the session first");
+    }
+    Ok(())
+}
+
+fn ensure_session_not_running(session: &SessionRecord, action: &str) -> anyhow::Result<()> {
+    if session.status == SessionStatus::Running && session.active_pid.is_some_and(pid_is_running) {
+        anyhow::bail!(
+            "cannot {action} session {} while {} is still running",
+            session.session_id,
+            session.active_run_id.as_deref().unwrap_or("a turn")
+        );
     }
     Ok(())
 }
@@ -1287,38 +1434,58 @@ fn reconcile_stale_session(session: &mut SessionRecord) -> bool {
     true
 }
 
-fn session_dir(global: &Path, session_id: &str) -> PathBuf {
-    paths::sessions_dir(global).join(session_id)
+fn session_dir(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
+    match scope {
+        SessionScope::Active => paths::sessions_dir(global),
+        SessionScope::Archived => paths::archived_sessions_dir(global),
+    }
+    .join(session_id)
 }
 
-fn session_record_path(global: &Path, session_id: &str) -> PathBuf {
-    session_dir(global, session_id).join("session.json")
+fn session_record_path(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
+    session_dir(global, scope, session_id).join("session.json")
 }
 
-fn write_session(global: &Path, session: &SessionRecord) -> anyhow::Result<()> {
-    let dir = session_dir(global, &session.session_id);
+fn write_session(
+    global: &Path,
+    scope: SessionScope,
+    session: &SessionRecord,
+) -> anyhow::Result<()> {
+    let dir = session_dir(global, scope, &session.session_id);
     fs::create_dir_all(&dir)?;
-    let path = session_record_path(global, &session.session_id);
+    let path = session_record_path(global, scope, &session.session_id);
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(session)?)?;
     fs::rename(&tmp, &path)?;
     Ok(())
 }
 
-fn read_session(global: &Path, session_id: &str) -> anyhow::Result<SessionRecord> {
-    let path = session_record_path(global, session_id);
-    let bytes =
-        fs::read(&path).with_context(|| format!("read session record {}", path.display()))?;
-    Ok(serde_json::from_slice(&bytes)?)
+fn read_session(global: &Path, session_id: &str) -> anyhow::Result<(SessionRecord, SessionScope)> {
+    for scope in [SessionScope::Active, SessionScope::Archived] {
+        let path = session_record_path(global, scope, session_id);
+        if !path.is_file() {
+            continue;
+        }
+        let bytes =
+            fs::read(&path).with_context(|| format!("read session record {}", path.display()))?;
+        return Ok((serde_json::from_slice(&bytes)?, scope));
+    }
+    anyhow::bail!("unknown session: {session_id}")
 }
 
-fn load_all_sessions(global: &Path) -> anyhow::Result<Vec<SessionRecord>> {
-    let dir = paths::sessions_dir(global);
+fn load_sessions_in_scope(
+    global: &Path,
+    scope: SessionScope,
+) -> anyhow::Result<Vec<SessionRecord>> {
+    let dir = match scope {
+        SessionScope::Active => paths::sessions_dir(global),
+        SessionScope::Archived => paths::archived_sessions_dir(global),
+    };
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in fs::read_dir(dir)? {
+    for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path().join("session.json");
         if !path.is_file() {
@@ -1329,6 +1496,121 @@ fn load_all_sessions(global: &Path) -> anyhow::Result<Vec<SessionRecord>> {
         out.push(record);
     }
     Ok(out)
+}
+
+fn move_session_scope(
+    global: &Path,
+    session_id: &str,
+    from: SessionScope,
+    to: SessionScope,
+) -> anyhow::Result<()> {
+    let src = session_dir(global, from, session_id);
+    let dst = session_dir(global, to, session_id);
+    if dst.exists() {
+        anyhow::bail!("session {} already exists in {}", session_id, to.as_str());
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(&src, &dst)
+        .with_context(|| format!("move session {} → {}", src.display(), dst.display()))?;
+    Ok(())
+}
+
+fn move_session_owned_transcripts(
+    session: &mut SessionRecord,
+    target_scope: SessionScope,
+) -> anyhow::Result<()> {
+    let active_root = session.transcripts_dir.clone();
+    let archived_root = paths::archived_transcripts_dir(&active_root);
+    fs::create_dir_all(&active_root)?;
+    fs::create_dir_all(&archived_root)?;
+
+    for run in &mut session.runs {
+        let active_path = active_root.join(format!("{}.jsonl", run.run_id));
+        let archived_path = archived_root.join(format!("{}.jsonl", run.run_id));
+        let active_meta = metadata_path_for_run(&active_root, &run.run_id);
+        let archived_meta = metadata_path_for_run(&archived_root, &run.run_id);
+        match target_scope {
+            SessionScope::Active => {
+                move_if_exists(&run.transcript_path, &active_path)?;
+                move_if_exists(&archived_path, &active_path)?;
+                move_if_exists(&archived_meta, &active_meta)?;
+                run.transcript_path = active_path;
+            }
+            SessionScope::Archived => {
+                move_if_exists(&run.transcript_path, &archived_path)?;
+                move_if_exists(&active_path, &archived_path)?;
+                move_if_exists(&active_meta, &archived_meta)?;
+                run.transcript_path = archived_path;
+            }
+        }
+    }
+
+    if let Some(run_id) = session.last_run_id.as_deref() {
+        session.last_transcript_path =
+            Some(transcript_path_for_scope(session, run_id, target_scope));
+    }
+    if let Some(run_id) = session.active_run_id.as_deref() {
+        session.active_transcript_path =
+            Some(transcript_path_for_scope(session, run_id, target_scope));
+    }
+    session.updated_at = Utc::now();
+    Ok(())
+}
+
+fn delete_session_owned_artifacts(session: &SessionRecord) -> anyhow::Result<()> {
+    let active_root = session.transcripts_dir.clone();
+    let archived_root = paths::archived_transcripts_dir(&active_root);
+    let mut seen = HashSet::new();
+    for run in &session.runs {
+        if !seen.insert(run.run_id.clone()) {
+            continue;
+        }
+        let active_path = active_root.join(format!("{}.jsonl", run.run_id));
+        let archived_path = archived_root.join(format!("{}.jsonl", run.run_id));
+        let active_meta = metadata_path_for_run(&active_root, &run.run_id);
+        let archived_meta = metadata_path_for_run(&archived_root, &run.run_id);
+        remove_file_if_exists(&run.transcript_path)?;
+        remove_file_if_exists(&active_path)?;
+        remove_file_if_exists(&archived_path)?;
+        remove_file_if_exists(&active_meta)?;
+        remove_file_if_exists(&archived_meta)?;
+    }
+    Ok(())
+}
+
+fn transcript_path_for_scope(
+    session: &SessionRecord,
+    run_id: &str,
+    scope: SessionScope,
+) -> PathBuf {
+    match scope {
+        SessionScope::Active => session.transcripts_dir.join(format!("{run_id}.jsonl")),
+        SessionScope::Archived => paths::archived_transcripts_dir(&session.transcripts_dir)
+            .join(format!("{run_id}.jsonl")),
+    }
+}
+
+fn move_if_exists(from: &Path, to: &Path) -> anyhow::Result<()> {
+    if !from.exists() || from == to {
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if to.exists() {
+        fs::remove_file(to).with_context(|| format!("remove {}", to.display()))?;
+    }
+    fs::rename(from, to).with_context(|| format!("move {} → {}", from.display(), to.display()))?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> anyhow::Result<()> {
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn pid_is_running(pid: u32) -> bool {

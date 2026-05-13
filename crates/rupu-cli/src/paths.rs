@@ -52,6 +52,16 @@ pub fn sessions_dir(global: &Path) -> PathBuf {
     global.join("sessions")
 }
 
+/// Global archived session state root.
+pub fn archived_sessions_dir(global: &Path) -> PathBuf {
+    global.join("sessions-archive")
+}
+
+/// Archive directory nested under a transcript root.
+pub fn archived_transcripts_dir(transcripts_dir: &Path) -> PathBuf {
+    transcripts_dir.join("archive")
+}
+
 /// Global autoflow state root.
 pub fn autoflows_dir(global: &Path) -> PathBuf {
     global.join("autoflows")
