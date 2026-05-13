@@ -259,3 +259,26 @@ async fn cleanup_transcripts_only_removes_archived_transcripts() {
     assert!(home.join("sessions-archive").join("ses_cleanup03").exists());
     assert!(!transcript.exists());
 }
+
+#[tokio::test]
+async fn cleanup_stats_reports_resource_inventory() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let old = (Utc::now() - Duration::days(40)).to_rfc3339();
+    write_archived_session(&home, "ses_cleanup04", &old);
+    write_archived_standalone_transcript(&home, "run_cleanup04", &old);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["--format", "json", "cleanup", "--stats"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"kind\": \"cleanup_stats\""))
+        .stdout(predicate::str::contains("\"scope\": \"archived\""))
+        .stdout(predicate::str::contains("\"scope\": \"global_archived\""))
+        .stdout(predicate::str::contains("\"count\": 1"));
+}
