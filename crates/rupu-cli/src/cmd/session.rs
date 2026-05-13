@@ -1,3 +1,4 @@
+use crate::cmd::retention::parse_retention_duration;
 use crate::cmd::run::{
     canonicalize_if_exists, resolve_clone_dest, standalone_issue_ref, standalone_repo_ref,
     standalone_workspace_strategy, ReadonlyDecider,
@@ -50,6 +51,8 @@ pub enum Action {
     Restore { session_id: String },
     /// Permanently delete a session and its owned transcripts.
     Delete(DeleteArgs),
+    /// Delete archived sessions older than a cutoff.
+    Prune(PruneArgs),
     /// Send a follow-up prompt to an existing session.
     Send(SendArgs),
     /// Attach to the current or last run in a session.
@@ -105,6 +108,16 @@ pub struct DeleteArgs {
     pub session_id: String,
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct PruneArgs {
+    /// Retention cutoff, e.g. `30d`, `12h`, or `1w`.
+    #[arg(long, value_name = "DURATION")]
+    pub older_than: Option<String>,
+    /// Preview deletions without removing files.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -335,6 +348,36 @@ struct SessionShowOutput {
     report: SessionShowReport,
 }
 
+#[derive(Serialize)]
+struct SessionPruneRow {
+    session_id: String,
+    scope: String,
+    status: String,
+    updated_at: String,
+    action: String,
+}
+
+#[derive(Serialize)]
+struct SessionPruneCsvRow {
+    session_id: String,
+    scope: String,
+    status: String,
+    updated_at: String,
+    action: String,
+}
+
+#[derive(Serialize)]
+struct SessionPruneReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<SessionPruneRow>,
+}
+
+struct SessionPruneOutput {
+    report: SessionPruneReport,
+    csv_rows: Vec<SessionPruneCsvRow>,
+}
+
 impl CollectionOutput for SessionListOutput {
     type JsonReport = SessionListReport;
     type CsvRow = SessionListCsvRow;
@@ -446,6 +489,43 @@ impl DetailOutput for SessionShowOutput {
     }
 }
 
+impl CollectionOutput for SessionPruneOutput {
+    type JsonReport = SessionPruneReport;
+    type CsvRow = SessionPruneCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "session prune"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["session_id", "scope", "status", "updated_at", "action"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["SESSION", "SCOPE", "STATUS", "UPDATED", "ACTION"]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                Cell::new(&row.session_id),
+                Cell::new(&row.scope),
+                Cell::new(&row.status),
+                Cell::new(&row.updated_at),
+                Cell::new(&row.action),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
 pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
         Action::Start(args) => start(args).await,
@@ -454,6 +534,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::Archive { session_id } => archive(&session_id).await,
         Action::Restore { session_id } => restore(&session_id).await,
         Action::Delete(args) => delete(args).await,
+        Action::Prune(args) => prune(args, global_format).await,
         Action::Send(args) => send(args).await,
         Action::Attach { session_id } => attach(&session_id).await,
         Action::Stop { session_id } => stop(&session_id).await,
@@ -472,6 +553,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Archive { .. } => ("session archive", report::TABLE_ONLY),
         Action::Restore { .. } => ("session restore", report::TABLE_ONLY),
         Action::Delete(_) => ("session delete", report::TABLE_ONLY),
+        Action::Prune(_) => ("session prune", report::TABLE_JSON_CSV),
         Action::Start(_) => ("session start", report::TABLE_ONLY),
         Action::Send(_) => ("session send", report::TABLE_ONLY),
         Action::Attach { .. } => ("session attach", report::TABLE_ONLY),
@@ -1122,6 +1204,56 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let cutoff = session_prune_cutoff(args.older_than.as_deref(), &global)?;
+    let mut rows = Vec::new();
+    for session in load_sessions_in_scope(&global, SessionScope::Archived)? {
+        if session.updated_at > cutoff {
+            continue;
+        }
+        rows.push(SessionPruneRow {
+            session_id: session.session_id.clone(),
+            scope: SessionScope::Archived.as_str().to_string(),
+            status: session.status.as_str().to_string(),
+            updated_at: session.updated_at.to_rfc3339(),
+            action: if args.dry_run {
+                "would_delete".into()
+            } else {
+                "deleted".into()
+            },
+        });
+        if !args.dry_run {
+            delete_session_owned_artifacts(&session)?;
+            let dir = session_dir(&global, SessionScope::Archived, &session.session_id);
+            if dir.exists() {
+                fs::remove_dir_all(&dir)
+                    .with_context(|| format!("remove session dir {}", dir.display()))?;
+            }
+        }
+    }
+    rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    let csv_rows = rows
+        .iter()
+        .map(|row| SessionPruneCsvRow {
+            session_id: row.session_id.clone(),
+            scope: row.scope.clone(),
+            status: row.status.clone(),
+            updated_at: row.updated_at.clone(),
+            action: row.action.clone(),
+        })
+        .collect();
+    let output = SessionPruneOutput {
+        report: SessionPruneReport {
+            kind: "session_prune",
+            version: 1,
+            rows,
+        },
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
+}
+
 async fn stop(session_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, session_id)?;
@@ -1205,6 +1337,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         version: StandaloneRunMetadata::VERSION,
         run_id: args.run_id.clone(),
         session_id: Some(session.session_id.clone()),
+        archived_at: None,
         workspace_path: canonicalize_if_exists(&session.workspace_path),
         project_root: session.project_root.clone(),
         repo_ref: session.repo_ref.clone(),
@@ -1611,6 +1744,22 @@ fn remove_file_if_exists(path: &Path) -> anyhow::Result<()> {
         fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
     }
     Ok(())
+}
+
+fn session_prune_cutoff(
+    older_than: Option<&str>,
+    global: &Path,
+) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let retention = if let Some(value) = older_than {
+        value.to_string()
+    } else {
+        let path = global.join("config.toml");
+        let cfg = rupu_config::layer_files(Some(&path), None)?;
+        cfg.storage
+            .archived_session_retention
+            .unwrap_or_else(|| "30d".to_string())
+    };
+    Ok(Utc::now() - parse_retention_duration(&retention)?)
 }
 
 fn pid_is_running(pid: u32) -> bool {

@@ -163,6 +163,19 @@ fn write_session(
     .unwrap();
 }
 
+fn rewrite_session_updated_at(
+    home: &std::path::Path,
+    root: &str,
+    session_id: &str,
+    updated_at: &str,
+) {
+    let path = home.join(root).join(session_id).join("session.json");
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    payload["updated_at"] = serde_json::Value::String(updated_at.to_string());
+    std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
+}
+
 #[tokio::test]
 async fn session_list_supports_json_output() {
     let _guard = ENV_LOCK.lock().await;
@@ -333,4 +346,79 @@ async fn session_delete_refuses_running_worker() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot delete session"));
+}
+
+#[tokio::test]
+async fn session_prune_removes_archived_sessions_older_than_cutoff() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_old01", "idle", None, true);
+    write_session(&home, "ses_new01", "idle", None, true);
+    rewrite_session_updated_at(
+        &home,
+        "sessions-archive",
+        "ses_old01",
+        &(Utc::now() - chrono::Duration::days(45)).to_rfc3339(),
+    );
+    rewrite_session_updated_at(
+        &home,
+        "sessions-archive",
+        "ses_new01",
+        &(Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args([
+            "--format",
+            "json",
+            "session",
+            "prune",
+            "--older-than",
+            "30d",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"session_id\": \"ses_old01\""))
+        .stdout(predicate::str::contains("\"action\": \"deleted\""));
+
+    assert!(!home.join("sessions-archive/ses_old01").exists());
+    assert!(home.join("sessions-archive/ses_new01").exists());
+}
+
+#[tokio::test]
+async fn session_prune_dry_run_uses_config_default() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        "[storage]\narchived_session_retention = \"7d\"\n",
+    )
+    .unwrap();
+    write_session(&home, "ses_cfg01", "idle", None, true);
+    rewrite_session_updated_at(
+        &home,
+        "sessions-archive",
+        "ses_cfg01",
+        &(Utc::now() - chrono::Duration::days(10)).to_rfc3339(),
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["--format", "json", "session", "prune", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"session_id\": \"ses_cfg01\""))
+        .stdout(predicate::str::contains("\"action\": \"would_delete\""));
+
+    assert!(home.join("sessions-archive/ses_cfg01").exists());
 }
