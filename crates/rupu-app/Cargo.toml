@@ -31,6 +31,7 @@ rupu-orchestrator = { path = "../rupu-orchestrator" }
 rupu-scm = { path = "../rupu-scm" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 tokio-stream.workspace = true

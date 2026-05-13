@@ -1444,7 +1444,7 @@ fn parse_fanout_items(rendered: &str) -> Vec<serde_json::Value> {
 /// coercion. Returns the effective input map (declared defaults
 /// applied for missing entries) used by every step's template
 /// context.
-fn resolve_inputs(
+pub fn resolve_inputs(
     wf: &Workflow,
     user: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, RunWorkflowError> {
