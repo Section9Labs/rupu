@@ -32,6 +32,11 @@ pub struct WorkspaceWindow {
     /// step only and not re-spawned on focus changes. A follow-up task
     /// will add cancellation + re-spawn.
     pub transcript_lines: Vec<TranscriptLine>,
+    /// `Some` when the launcher sheet is open. None otherwise.
+    pub launcher: Option<crate::launcher::LauncherState>,
+    /// The workflow row most recently focused in the sidebar.
+    /// ⌘R uses this. `None` means no row has focus.
+    pub focused_workflow: Option<PathBuf>,
 }
 
 impl WorkspaceWindow {
@@ -54,6 +59,8 @@ impl WorkspaceWindow {
                 app_executor,
                 run_model: None,
                 transcript_lines: Vec::new(),
+                launcher: None,
+                focused_workflow: None,
             })
         })
         .expect("open workspace window")
@@ -270,6 +277,65 @@ impl WorkspaceWindow {
         })
         .detach();
     }
+
+    pub fn open_launcher(&mut self, workflow_path: PathBuf, cx: &mut Context<Self>) {
+        let yaml = match std::fs::read_to_string(&workflow_path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, path = %workflow_path.display(), "open_launcher: read_to_string failed");
+                return;
+            }
+        };
+        let workflow = match rupu_orchestrator::Workflow::parse(&yaml) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(error = %e, path = %workflow_path.display(), "open_launcher: parse failed");
+                return;
+            }
+        };
+        self.launcher = Some(crate::launcher::LauncherState::new(workflow_path, workflow));
+        cx.notify();
+    }
+
+    pub fn close_launcher(&mut self, cx: &mut Context<Self>) {
+        self.launcher = None;
+        cx.notify();
+    }
+
+    pub fn handle_launcher_input_change(
+        &mut self,
+        name: String,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.launcher.as_mut() {
+            state.set_input(&name, value);
+            state.revalidate();
+            cx.notify();
+        }
+    }
+
+    pub fn handle_launcher_mode_change(
+        &mut self,
+        mode: crate::launcher::LauncherMode,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.launcher.as_mut() {
+            state.mode = mode;
+            cx.notify();
+        }
+    }
+
+    pub fn handle_launcher_target_change(
+        &mut self,
+        target: crate::launcher::LauncherTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.launcher.as_mut() {
+            state.target = target;
+            cx.notify();
+        }
+    }
 }
 
 impl Render for WorkspaceWindow {
@@ -351,7 +417,7 @@ impl Render for WorkspaceWindow {
             }
         });
 
-        div()
+        let main_layout = div()
             .size_full()
             .bg(palette::BG_PRIMARY)
             .text_color(palette::TEXT_PRIMARY)
@@ -367,7 +433,61 @@ impl Render for WorkspaceWindow {
                     .flex_1()
                     .child(sidebar::render(&self.workspace, &active_run_map))
                     .child(main_area),
-            )
+            );
+
+        let body: AnyElement = if let Some(state) = self.launcher.clone() {
+            let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+
+            let w1 = weak.clone();
+            let on_input_change: crate::view::launcher::InputChangeCb =
+                Arc::new(move |name, value, _w, cx| {
+                    let _ = w1.update(cx, |this, cx| {
+                        this.handle_launcher_input_change(name, value, cx);
+                    });
+                });
+
+            let w2 = weak.clone();
+            let on_mode_change: crate::view::launcher::ModeChangeCb =
+                Arc::new(move |mode, _w, cx| {
+                    let _ = w2.update(cx, |this, cx| {
+                        this.handle_launcher_mode_change(mode, cx);
+                    });
+                });
+
+            let w3 = weak.clone();
+            let on_target_change: crate::view::launcher::TargetChangeCb =
+                Arc::new(move |target, _w, cx| {
+                    let _ = w3.update(cx, |this, cx| {
+                        this.handle_launcher_target_change(target, cx);
+                    });
+                });
+
+            // `on_run` is wired in Task 10 (dispatch flow). For Task 9,
+            // pass a no-op so the launcher renders cleanly.
+            let on_run: crate::view::launcher::RunCb = Arc::new(|_w, _cx| {});
+
+            let w5 = weak.clone();
+            let on_close: crate::view::launcher::CloseCb = Arc::new(move |_w, cx| {
+                let _ = w5.update(cx, |this, cx| this.close_launcher(cx));
+            });
+
+            div()
+                .relative()
+                .size_full()
+                .child(main_layout)
+                .child(crate::view::launcher::render(
+                    &state,
+                    on_input_change,
+                    on_mode_change,
+                    on_target_change,
+                    on_run,
+                    on_close,
+                ))
+                .into_any_element()
+        } else {
+            main_layout.into_any_element()
+        };
+        body
     }
 }
 
