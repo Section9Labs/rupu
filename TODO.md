@@ -164,6 +164,18 @@ Has its own design spec: [`docs/superpowers/specs/2026-05-11-rupu-autoflow-obser
 - Future-only follow-on: add a lightweight TUI over the same history model if `monitor --watch` proves insufficient in real operator use.
 - `explain` / `claims` / `watch` handoff polish
 
+## UI theme system
+
+**Status:**
+- ✅ Phase 1 foundation shipped: split syntax theme vs palette theme, built-in palette themes, local/project theme loading, Base16 import, and `rupu ui themes|theme`.
+
+**Follow-on backlog:**
+- add `rupu ui theme preview <name>`
+- add a convenience `rupu ui theme use <name>` command
+- importers for VS Code themes and terminal color schemes
+- richer full-chrome palette adoption for any remaining hardcoded UI colors
+- downloadable theme catalog / remote install registry once the native schema is stable
+
 ## Gemini API-key support via AI Studio ✅ shipped
 
 Added `GeminiVariant::AiStudio` to the existing `GoogleGeminiClient` (rather than a separate `GoogleGeminiAiStudioClient`) so the OAuth and api-key paths share the body builder + response parser. Variant-specific branches handle the different URL pattern (`v1beta/models/{model}:generateContent`), `x-goog-api-key` header, request-body shape (no Cloud Code Assist `project` / `requestId` wrapping), and skipped token refresh. Wired through `provider_factory::build_gemini` so `rupu auth login --provider gemini --mode api-key --key AIzaSy...` followed by `rupu run --provider gemini ...` works end-to-end.

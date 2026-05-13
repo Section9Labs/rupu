@@ -23,6 +23,7 @@
 //! return uncolored cells.
 
 use crate::cmd::ui::UiPrefs;
+use crate::output::palette;
 use comfy_table::{presets, Cell, Color as TableColor, ContentArrangement, Table};
 
 /// Build a `comfy-table::Table` with rupu's default visual style:
@@ -42,28 +43,29 @@ pub fn status_color(status: &str, prefs: &UiPrefs) -> Option<TableColor> {
     if !prefs.use_color() {
         return None;
     }
+    let palette = palette::active_palette();
     Some(match status {
         // Workflow runs.
-        "running" => TableColor::Blue,
-        "completed" => TableColor::Green,
-        "failed" => TableColor::Red,
-        "awaiting_approval" | "awaiting" | "paused" => TableColor::Yellow,
-        "rejected" => TableColor::Magenta,
-        "pending" => TableColor::DarkGrey,
+        "running" => palette.running.into_table(),
+        "completed" => palette.complete.into_table(),
+        "failed" => palette.failed.into_table(),
+        "awaiting_approval" | "awaiting" | "paused" => palette.awaiting.into_table(),
+        "rejected" => palette.retrying.into_table(),
+        "pending" => palette.dim.into_table(),
         // Autoflow claim states.
-        "claimed" => TableColor::Blue,
-        "await_human" | "await_external" => TableColor::Yellow,
-        "retry_backoff" => TableColor::Magenta,
-        "blocked" => TableColor::Red,
-        "complete" => TableColor::Green,
-        "eligible" | "released" => TableColor::DarkGrey,
+        "claimed" => palette.running.into_table(),
+        "await_human" | "await_external" => palette.awaiting.into_table(),
+        "retry_backoff" => palette.retrying.into_table(),
+        "blocked" => palette.failed.into_table(),
+        "complete" => palette.complete.into_table(),
+        "eligible" | "released" => palette.dim.into_table(),
         // Issue / PR states.
-        "open" => TableColor::Green,
-        "closed" => TableColor::Magenta,
-        "merged" => TableColor::Magenta,
+        "open" => palette.complete.into_table(),
+        "closed" => palette.brand_subtle.into_table(),
+        "merged" => palette.brand.into_table(),
         // Agent / workflow scope.
-        "project" => TableColor::Cyan,
-        "global" => TableColor::DarkGrey,
+        "project" => palette.brand.into_table(),
+        "global" => palette.dim.into_table(),
         _ => return None,
     })
 }
@@ -182,25 +184,15 @@ pub fn label_chips_with_colors_capped(
 /// stable FNV-1a hash. Names with the same color cluster visually
 /// without forcing the user to memorize anything.
 fn label_palette_color(name: &str) -> (u8, u8, u8) {
-    // 12 distinct hues spaced ~30° apart on the HSL wheel at L=58, S=68.
-    // Picked to be visible on both light and dark terminals — no near-
-    // black, no near-white, no muddy desaturated browns.
-    const PALETTE: &[(u8, u8, u8)] = &[
-        (0xd1, 0x4b, 0x4b), // red
-        (0xd1, 0x6a, 0x4b), // orange
-        (0xd1, 0xa1, 0x4b), // amber
-        (0xb8, 0xc1, 0x4b), // lime
-        (0x6a, 0xc1, 0x4b), // green
-        (0x4b, 0xc1, 0x9e), // teal
-        (0x4b, 0xa1, 0xc1), // cyan
-        (0x4b, 0x6a, 0xc1), // blue
-        (0x6a, 0x4b, 0xc1), // indigo
-        (0xa1, 0x4b, 0xc1), // violet
-        (0xc1, 0x4b, 0xa1), // pink
-        (0x96, 0x70, 0x60), // mocha (the "neutral" slot)
-    ];
+    let active = palette::active_palette();
+    let palette = if active.label_palette.is_empty() {
+        palette::UiPaletteTheme::default().label_palette
+    } else {
+        active.label_palette
+    };
     let h = fnv1a(name.as_bytes());
-    PALETTE[(h % PALETTE.len() as u64) as usize]
+    let color = palette[(h % palette.len() as u64) as usize];
+    (color.r, color.g, color.b)
 }
 
 /// Pick a black-or-white foreground that contrasts with a given RGB
@@ -263,11 +255,12 @@ pub fn relative_time_cell(seconds_until: i64, prefs: &UiPrefs) -> Cell {
     if !prefs.use_color() {
         return cell;
     }
+    let palette = palette::active_palette();
     let abs = seconds_until.unsigned_abs();
     if abs < 3600 {
-        cell.fg(TableColor::Yellow)
+        cell.fg(palette.awaiting.into_table())
     } else if abs > 86_400 {
-        cell.fg(TableColor::DarkGrey)
+        cell.fg(palette.dim.into_table())
     } else {
         cell
     }
@@ -305,6 +298,8 @@ mod tests {
         UiPrefs {
             color: ColorMode::Always,
             theme: "base16-ocean.dark".into(),
+            palette_theme: "rupu-dark".into(),
+            palette: palette::UiPaletteTheme::default(),
             pager: PagerMode::Never,
         }
     }
@@ -313,6 +308,8 @@ mod tests {
         UiPrefs {
             color: ColorMode::Never,
             theme: "base16-ocean.dark".into(),
+            palette_theme: "rupu-dark".into(),
+            palette: palette::UiPaletteTheme::default(),
             pager: PagerMode::Never,
         }
     }
@@ -320,32 +317,39 @@ mod tests {
     #[test]
     fn status_color_known_buckets() {
         let p = prefs_color_always();
-        assert!(matches!(
+        let palette = palette::active_palette();
+        assert_eq!(
             status_color("running", &p),
-            Some(TableColor::Blue)
-        ));
-        assert!(matches!(
+            Some(palette.running.into_table())
+        );
+        assert_eq!(
             status_color("completed", &p),
-            Some(TableColor::Green)
-        ));
-        assert!(matches!(status_color("failed", &p), Some(TableColor::Red)));
-        assert!(matches!(
+            Some(palette.complete.into_table())
+        );
+        assert_eq!(
+            status_color("failed", &p),
+            Some(palette.failed.into_table())
+        );
+        assert_eq!(
             status_color("awaiting_approval", &p),
-            Some(TableColor::Yellow)
-        ));
-        assert!(matches!(
+            Some(palette.awaiting.into_table())
+        );
+        assert_eq!(
             status_color("rejected", &p),
-            Some(TableColor::Magenta)
-        ));
-        assert!(matches!(status_color("open", &p), Some(TableColor::Green)));
-        assert!(matches!(
+            Some(palette.retrying.into_table())
+        );
+        assert_eq!(
+            status_color("open", &p),
+            Some(palette.complete.into_table())
+        );
+        assert_eq!(
             status_color("closed", &p),
-            Some(TableColor::Magenta)
-        ));
-        assert!(matches!(
+            Some(palette.brand_subtle.into_table())
+        );
+        assert_eq!(
             status_color("project", &p),
-            Some(TableColor::Cyan)
-        ));
+            Some(palette.brand.into_table())
+        );
     }
 
     #[test]

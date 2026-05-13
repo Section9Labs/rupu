@@ -69,9 +69,9 @@ impl Severity {
         match self {
             Self::Error => Status::Failed.color(),
             Self::Warn => Status::Awaiting.color(),
-            Self::Info => crate::output::palette::DIM,
+            Self::Info => crate::output::palette::themed(crate::output::palette::DIM),
             Self::Success => Status::Complete.color(),
-            Self::Skip => crate::output::palette::DIM,
+            Self::Skip => crate::output::palette::themed(crate::output::palette::DIM),
         }
     }
 
@@ -116,8 +116,8 @@ pub fn diag_with_hint(severity: Severity, prefs: &UiPrefs, msg: impl Display, hi
     if prefs.use_color() {
         eprintln!(
             "  {} {}",
-            "→".color(crate::output::palette::DIM),
-            hint.color(crate::output::palette::DIM)
+            "→".color(crate::output::palette::themed(crate::output::palette::DIM)),
+            hint.color(crate::output::palette::themed(crate::output::palette::DIM))
         );
     } else {
         eprintln!("  -> {hint}");
@@ -202,6 +202,8 @@ mod tests {
         UiPrefs {
             color: ColorMode::Never,
             theme: "base16-ocean.dark".into(),
+            palette_theme: "rupu-dark".into(),
+            palette: crate::output::palette::UiPaletteTheme::default(),
             pager: PagerMode::Never,
         }
     }

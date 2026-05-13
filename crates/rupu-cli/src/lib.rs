@@ -64,6 +64,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::config::Action,
     },
+    /// Manage UI themes and palette imports.
+    Ui {
+        #[command(subcommand)]
+        action: cmd::ui::Action,
+    },
     /// Prune archived local sessions and transcripts.
     Cleanup(cmd::cleanup::Args),
     /// Manage provider credentials.
@@ -184,6 +189,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
         Cmd::Transcript { action } => cmd::transcript::handle(action, cli.format).await,
         Cmd::Config { action } => cmd::config::handle(action).await,
+        Cmd::Ui { action } => cmd::ui::handle(action, cli.format).await,
         Cmd::Cleanup(args) => cmd::cleanup::handle(args, cli.format).await,
         Cmd::Auth { action } => cmd::auth::handle(action, cli.format).await,
         Cmd::Models { action } => cmd::models::handle(action, cli.format).await,
@@ -219,6 +225,7 @@ fn ensure_output_format_supported(
             format,
             &[output::formats::OutputFormat::Table],
         ),
+        Cmd::Ui { action } => cmd::ui::ensure_output_format(action, format),
         Cmd::Cleanup(_) => cmd::cleanup::ensure_output_format(format),
         Cmd::Auth { action } => cmd::auth::ensure_output_format(action, format),
         Cmd::Models { action } => cmd::models::ensure_output_format(action, format),

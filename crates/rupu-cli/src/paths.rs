@@ -62,6 +62,16 @@ pub fn archived_transcripts_dir(transcripts_dir: &Path) -> PathBuf {
     transcripts_dir.join("archive")
 }
 
+/// Global UI theme directory.
+pub fn themes_dir(global: &Path) -> PathBuf {
+    global.join("themes")
+}
+
+/// Project-local UI theme directory.
+pub fn project_themes_dir(project_root: &Path) -> PathBuf {
+    project_root.join(".rupu/themes")
+}
+
 /// Global autoflow state root.
 pub fn autoflows_dir(global: &Path) -> PathBuf {
     global.join("autoflows")

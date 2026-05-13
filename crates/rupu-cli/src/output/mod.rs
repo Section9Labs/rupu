@@ -14,6 +14,7 @@ pub mod printer;
 pub mod report;
 pub mod spinner;
 pub mod tables;
+pub mod theme;
 pub mod workflow_printer;
 pub mod yaml_snippet;
 

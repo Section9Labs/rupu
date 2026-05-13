@@ -277,6 +277,7 @@ rupu webhook serve [--addr]           Long-lived webhook receiver for GitHub / G
 rupu mcp serve [--transport]          Expose rupu's tools to MCP clients
 rupu auth {login, logout, status}     Provider credential management
 rupu models {list, refresh}           Browse / refresh discovered model lists
+rupu ui {themes, theme ...}           List, inspect, validate, and import UI themes
 rupu config {get, set}                Read / write rupu configuration
 rupu completions {print, install}     Shell-completion scripts (with dynamic agent names)
 rupu usage                            Usage reports across transcripts + workflow runs
@@ -313,6 +314,7 @@ Collection views that support `--format json|csv` include:
 - `rupu autoflow claims`
 - `rupu autoflow history`
 - `rupu autoflow doctor`
+- `rupu ui themes`
 
 Detail views that support `--format json` include:
 
@@ -325,6 +327,9 @@ Detail views that support `--format json` include:
 - `rupu transcript show`
 - `rupu autoflow show`
 - `rupu autoflow explain`
+- `rupu ui theme show`
+- `rupu ui theme validate`
+- `rupu ui theme import`
 
 Event/timeline views use a separate contract:
 
@@ -339,6 +344,25 @@ Event/timeline views use a separate contract:
 Snapshot views with a custom structured surface:
 
 - `rupu autoflow monitor` (`table` and `json`)
+
+UI theming is split into two layers:
+
+- syntax highlighting theme (`[ui.syntax].theme`)
+- CLI palette theme (`[ui.palette].theme`)
+
+Example:
+
+```toml
+[ui.syntax]
+theme = "Solarized (dark)"
+
+[ui.palette]
+theme = "tokyo-night"
+```
+
+Use `rupu ui themes` to list built-in and installed themes, and `rupu ui theme import`
+to install a local or remote Base16/native theme file into `~/.rupu/themes/` or
+`<repo>/.rupu/themes/`.
 
 If older standalone `rupu run` transcripts predate usage sidecars, repair them with
 `rupu usage backfill`.

@@ -341,6 +341,7 @@ Collection views that support `--format json|csv`:
 - `rupu autoflow claims`
 - `rupu autoflow history`
 - `rupu autoflow doctor`
+- `rupu ui themes`
 
 Detail views that support `--format json`:
 
@@ -353,6 +354,9 @@ Detail views that support `--format json`:
 - `rupu transcript show`
 - `rupu autoflow show`
 - `rupu autoflow explain`
+- `rupu ui theme show`
+- `rupu ui theme validate`
+- `rupu ui theme import`
 
 Event/timeline views use a separate contract:
 
@@ -431,6 +435,34 @@ Example global config:
 archived_session_retention = "30d"
 archived_transcript_retention = "14d"
 ```
+
+UI themes:
+
+- `rupu ui themes`
+- `rupu ui theme show <name>`
+- `rupu ui theme validate path/to/theme.toml`
+- `rupu ui theme import path/or/url --from auto|rupu|base16`
+
+Theme configuration is split between syntax highlighting and palette chrome:
+
+```toml
+[ui]
+color = "always"
+pager = "never"
+
+[ui.syntax]
+theme = "Solarized (dark)"
+
+[ui.palette]
+theme = "tokyo-night"
+```
+
+Notes:
+
+- `[ui].theme` still works as a legacy fallback for both syntax and palette selection.
+- Global custom themes live in `~/.rupu/themes/`.
+- Project-local themes live in `<repo>/.rupu/themes/`.
+- Phase 1 import supports native rupu theme files and Base16 themes.
 
 ---
 

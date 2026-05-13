@@ -58,12 +58,6 @@ const SPACE: &str = " ";
 /// the meta tail.
 const FRAME_RULE_DASHES: usize = 6;
 
-/// 24-bit ANSI escape for the DIM palette color (slate-500 #64748b).
-/// Inlined here so `start_ticker`'s indicatif template literal can
-/// open/close a dim region around `{elapsed}` without going through
-/// `palette::write_colored` (which writes to a `String`, not into a
-/// format-template literal).
-const DIM_OPEN: &str = "\x1b[38;2;100;116;139m";
 const DIM_CLOSE: &str = "\x1b[0m";
 
 /// Fallback terminal width when stdout is not a tty (pipe, CI). Same
@@ -1048,7 +1042,13 @@ impl LineStreamPrinter {
 /// without spinning up a real terminal.
 fn build_ticker_template(body_prefix: &str) -> String {
     let trimmed = body_prefix.trim_end_matches(' ');
-    format!("{trimmed} {{spinner:.cyan}} {{msg}}  {DIM_OPEN}· {{elapsed}}{DIM_CLOSE}")
+    let dim = palette::themed(DIM);
+    let spinner = palette::themed(RUNNING);
+    let dim_open = format!("\x1b[38;2;{};{};{}m", dim.0, dim.1, dim.2);
+    let spinner_open = format!("\x1b[38;2;{};{};{}m", spinner.0, spinner.1, spinner.2);
+    format!(
+        "{trimmed} {spinner_open}{{spinner}}{DIM_CLOSE} {{msg}}  {dim_open}· {{elapsed}}{DIM_CLOSE}"
+    )
 }
 
 /// Format a `Duration` as `Xs` or `Xm Ys` or `HhXmYs`.
@@ -1595,14 +1595,14 @@ mod tests {
         p.push_body_prefix(&mut prefix);
         let tpl = build_ticker_template(&prefix);
         // Indent 0: body prefix is `│ ┃  ` (5 cells); template
-        // collapses the trailing 2 spaces and spaces in `{spinner}`
-        // — net "│ ┃ {spinner:.cyan} {msg}  · {elapsed}" (with ANSI
+        // collapses the trailing 2 spaces and wraps `{spinner}` in
+        // themed ANSI escapes — net "│ ┃ {spinner} {msg}  · {elapsed}" (with ANSI
         // dim around the elapsed clause). Assert the salient slots
         // and the alignment cue (single space after `┃` before the
         // spinner placeholder).
         assert!(tpl.contains("│"));
         assert!(tpl.contains("┃"));
-        assert!(tpl.contains("{spinner:.cyan}"));
+        assert!(tpl.contains("{spinner}"));
         assert!(tpl.contains("{msg}"));
         assert!(tpl.contains("{elapsed}"));
         // Body bar must be followed by exactly one space before the
@@ -1610,7 +1610,7 @@ mod tests {
         // shift broke and the ticker no longer reads as the frame's
         // continuation.
         assert!(
-            tpl.contains("┃ {spinner:.cyan}"),
+            tpl.contains("┃ ") && tpl.contains("{spinner}"),
             "body bar should sit one space before the spinner placeholder: {tpl:?}"
         );
     }

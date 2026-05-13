@@ -54,11 +54,30 @@ pub struct UiConfig {
     /// `auto` (default — color when stdout is a tty and `NO_COLOR`
     /// is unset), `always`, or `never`.
     pub color: Option<String>,
-    /// syntect theme name. Defaults to `base16-ocean.dark`.
+    /// Legacy overall theme knob. When set, consumers may treat this as
+    /// both a syntax-theme hint and a palette-theme hint.
     pub theme: Option<String>,
+    #[serde(default)]
+    pub syntax: UiSyntaxConfig,
+    #[serde(default)]
+    pub palette: UiPaletteConfig,
     /// `auto` (default — page when stdout is a tty and the output
     /// exceeds one screen), `always`, or `never`.
     pub pager: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiSyntaxConfig {
+    /// syntect theme name. Defaults to `base16-ocean.dark`.
+    pub theme: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiPaletteConfig {
+    /// Named rupu UI palette theme. Defaults to `rupu-dark`.
+    pub theme: Option<String>,
 }
 
 /// Bash tool configuration.
