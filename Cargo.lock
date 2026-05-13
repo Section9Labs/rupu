@@ -2972,6 +2972,7 @@ dependencies = [
  "strum 0.27.2",
  "util",
  "uuid",
+ "zed-font-kit",
 ]
 
 [[package]]
