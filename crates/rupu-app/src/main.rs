@@ -47,11 +47,6 @@ fn main() {
                 Ok(workspace) => {
                     tracing::info!(id = %workspace.manifest.id, "opened workspace from CLI arg");
                     let app_executor = executor::build_executor(&workspace);
-
-                    // D-3 simplification: badge updater deferred to D-4 when the app
-                    // fully initializes its main event loop. For now, the menubar shows
-                    // a static 0 count, which is acceptable for smoke test.
-
                     WorkspaceWindow::open(workspace, app_executor, cx);
                 }
                 Err(e) => {
