@@ -318,6 +318,17 @@ impl WorkspaceWindow {
         }
     }
 
+    pub fn handle_launcher_pick_directory(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = crate::menu::app_menu::pick_directory_modal("Pick target directory")
+        else {
+            return; // User cancelled
+        };
+        if let Some(state) = self.launcher.as_mut() {
+            state.target = crate::launcher::LauncherTarget::Directory(path);
+            cx.notify();
+        }
+    }
+
     pub fn handle_launcher_run(&mut self, cx: &mut Context<Self>) {
         let Some(state) = self.launcher.clone() else {
             return;
@@ -630,6 +641,11 @@ impl Render for WorkspaceWindow {
                 let _ = w5.update(cx, |this, cx| this.close_launcher(cx));
             });
 
+            let w_pick = weak.clone();
+            let on_pick_dir: crate::view::launcher::PickDirCb = Arc::new(move |_w, cx| {
+                let _ = w_pick.update(cx, |this, cx| this.handle_launcher_pick_directory(cx));
+            });
+
             div()
                 .relative()
                 .size_full()
@@ -639,6 +655,7 @@ impl Render for WorkspaceWindow {
                     on_input_change,
                     on_mode_change,
                     on_target_change,
+                    on_pick_dir,
                     on_run,
                     on_close,
                 ))

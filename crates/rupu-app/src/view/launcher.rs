@@ -31,16 +31,18 @@ pub type TargetChangeCb =
     Arc<dyn Fn(LauncherTarget, &mut gpui::Window, &mut gpui::App) + Send + Sync + 'static>;
 pub type RunCb = Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + Send + Sync + 'static>;
 pub type CloseCb = Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + Send + Sync + 'static>;
+pub type PickDirCb = Arc<dyn Fn(&mut gpui::Window, &mut gpui::App) + Send + Sync + 'static>;
 
 pub fn render(
     state: &LauncherState,
     on_input_change: InputChangeCb,
     on_mode_change: ModeChangeCb,
     on_target_change: TargetChangeCb,
+    on_pick_dir: PickDirCb,
     on_run: RunCb,
     on_close: CloseCb,
 ) -> AnyElement {
-    let sheet = render_sheet(state, on_input_change, on_mode_change, on_target_change, on_run, on_close);
+    let sheet = render_sheet(state, on_input_change, on_mode_change, on_target_change, on_pick_dir, on_run, on_close);
 
     div()
         .absolute()
@@ -58,6 +60,7 @@ fn render_sheet(
     on_input_change: InputChangeCb,
     on_mode_change: ModeChangeCb,
     on_target_change: TargetChangeCb,
+    on_pick_dir: PickDirCb,
     on_run: RunCb,
     on_close: CloseCb,
 ) -> AnyElement {
@@ -74,7 +77,7 @@ fn render_sheet(
 
     sheet = sheet.child(render_header(state, on_close));
     sheet = sheet.child(render_inputs_form(state, on_input_change));
-    sheet = sheet.child(render_footer(state, on_mode_change, on_target_change, on_run));
+    sheet = sheet.child(render_footer(state, on_mode_change, on_target_change, on_pick_dir, on_run));
 
     if let Some(err) = &state.validation {
         sheet = sheet.child(
@@ -316,6 +319,7 @@ fn render_footer(
     state: &LauncherState,
     on_mode_change: ModeChangeCb,
     on_target_change: TargetChangeCb,
+    on_pick_dir: PickDirCb,
     on_run: RunCb,
 ) -> AnyElement {
     let can_run = state.can_run();
@@ -325,7 +329,7 @@ fn render_footer(
         .gap(px(8.0))
         .items_center()
         .child(render_mode_picker(state.mode, on_mode_change))
-        .child(render_target_picker(&state.target, on_target_change))
+        .child(render_target_picker(&state.target, on_target_change, on_pick_dir))
         .child(div().flex_grow())
         .child(render_run_button(can_run, on_run))
         .into_any_element()
@@ -363,38 +367,99 @@ fn render_mode_picker(current: LauncherMode, on_mode_change: ModeChangeCb) -> An
     row.into_any_element()
 }
 
-/// Target picker: shows a summary pill for each variant; clicking cycles.
-fn render_target_picker(current: &LauncherTarget, on_target_change: TargetChangeCb) -> AnyElement {
-    let label = match current {
-        LauncherTarget::ThisWorkspace => "this workspace".to_owned(),
-        LauncherTarget::Directory(p) => p
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| p.display().to_string()),
-        LauncherTarget::Clone { repo_ref, status } => match status {
-            CloneStatus::NotStarted => format!("clone: {repo_ref}"),
-            CloneStatus::InProgress => "cloning\u{2026}".to_string(),
-            CloneStatus::Done(_) => format!("cloned: {repo_ref}"),
-            CloneStatus::Failed(_) => "clone failed".to_string(),
-        },
-    };
-
-    // Clicking cycles back to ThisWorkspace — sufficient for D-4;
-    // a Task 18+ pass will add a proper target-selector sheet.
-    let cb = on_target_change.clone();
-    div()
-        .id("target-picker")
+/// Target picker: three separate pills for ThisWorkspace / Directory / Clone.
+/// - "This workspace" → sets target directly via `on_target_change`
+/// - "Pick directory…" → invokes `on_pick_dir` which opens NSOpenPanel
+/// - "Clone repo…" → sets target to Clone{NotStarted} via `on_target_change`
+fn render_target_picker(
+    current: &LauncherTarget,
+    on_target_change: TargetChangeCb,
+    on_pick_dir: PickDirCb,
+) -> AnyElement {
+    // "This workspace" pill
+    let is_workspace = matches!(current, LauncherTarget::ThisWorkspace);
+    let cb_ws = on_target_change.clone();
+    let pill_workspace = div()
+        .id("target-this-workspace")
         .px(px(8.0))
         .py(px(3.0))
         .border_1()
-        .border_color(palette::BORDER)
-        .text_color(palette::TEXT_MUTED)
+        .border_color(if is_workspace { palette::BRAND } else { palette::BORDER })
+        .bg(if is_workspace { palette::BG_SIDEBAR } else { palette::BG_PRIMARY })
+        .text_color(if is_workspace { palette::BRAND_300 } else { palette::TEXT_MUTED })
         .text_sm()
         .cursor_pointer()
-        .child(SharedString::from(label))
+        .child("this workspace")
         .on_click(move |_ev, window, cx| {
-            cb(LauncherTarget::ThisWorkspace, window, cx);
-        })
+            cb_ws(LauncherTarget::ThisWorkspace, window, cx);
+        });
+
+    // "Pick directory…" pill — label shows current dir name when active
+    let is_dir = matches!(current, LauncherTarget::Directory(_));
+    let dir_label: SharedString = match current {
+        LauncherTarget::Directory(p) => SharedString::from(
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string()),
+        ),
+        _ => SharedString::from("pick directory\u{2026}"),
+    };
+    let pill_dir = div()
+        .id("target-pick-dir")
+        .px(px(8.0))
+        .py(px(3.0))
+        .border_1()
+        .border_color(if is_dir { palette::BRAND } else { palette::BORDER })
+        .bg(if is_dir { palette::BG_SIDEBAR } else { palette::BG_PRIMARY })
+        .text_color(if is_dir { palette::BRAND_300 } else { palette::TEXT_MUTED })
+        .text_sm()
+        .cursor_pointer()
+        .child(dir_label)
+        .on_click(move |_ev, window, cx| {
+            on_pick_dir(window, cx);
+        });
+
+    // "Clone repo…" pill — label shows repo_ref when active
+    let is_clone = matches!(current, LauncherTarget::Clone { .. });
+    let clone_label: SharedString = match current {
+        LauncherTarget::Clone { repo_ref, status } => match status {
+            CloneStatus::NotStarted => SharedString::from(format!("clone: {repo_ref}")),
+            CloneStatus::InProgress => SharedString::from("cloning\u{2026}"),
+            CloneStatus::Done(_) => SharedString::from(format!("cloned: {repo_ref}")),
+            CloneStatus::Failed(_) => SharedString::from("clone failed"),
+        },
+        _ => SharedString::from("clone repo\u{2026}"),
+    };
+    let cb_clone = on_target_change.clone();
+    let pill_clone = div()
+        .id("target-clone")
+        .px(px(8.0))
+        .py(px(3.0))
+        .border_1()
+        .border_color(if is_clone { palette::BRAND } else { palette::BORDER })
+        .bg(if is_clone { palette::BG_SIDEBAR } else { palette::BG_PRIMARY })
+        .text_color(if is_clone { palette::BRAND_300 } else { palette::TEXT_MUTED })
+        .text_sm()
+        .cursor_pointer()
+        .child(clone_label)
+        .on_click(move |_ev, window, cx| {
+            cb_clone(
+                LauncherTarget::Clone {
+                    repo_ref: String::new(),
+                    status: CloneStatus::NotStarted,
+                },
+                window,
+                cx,
+            );
+        });
+
+    div()
+        .flex()
+        .flex_row()
+        .gap(px(4.0))
+        .child(pill_workspace)
+        .child(pill_dir)
+        .child(pill_clone)
         .into_any_element()
 }
 
