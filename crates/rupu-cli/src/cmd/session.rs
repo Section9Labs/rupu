@@ -378,6 +378,15 @@ struct SessionPruneOutput {
     csv_rows: Vec<SessionPruneCsvRow>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PrunedSession {
+    pub session_id: String,
+    pub scope: String,
+    pub status: String,
+    pub updated_at: String,
+    pub action: String,
+}
+
 impl CollectionOutput for SessionListOutput {
     type JsonReport = SessionListReport;
     type CsvRow = SessionListCsvRow;
@@ -1205,35 +1214,19 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
 }
 
 async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let global = paths::global_dir()?;
-    let cutoff = session_prune_cutoff(args.older_than.as_deref(), &global)?;
-    let mut rows = Vec::new();
-    for session in load_sessions_in_scope(&global, SessionScope::Archived)? {
-        if session.updated_at > cutoff {
-            continue;
-        }
-        rows.push(SessionPruneRow {
-            session_id: session.session_id.clone(),
-            scope: SessionScope::Archived.as_str().to_string(),
-            status: session.status.as_str().to_string(),
-            updated_at: session.updated_at.to_rfc3339(),
-            action: if args.dry_run {
-                "would_delete".into()
-            } else {
-                "deleted".into()
-            },
-        });
-        if !args.dry_run {
-            delete_session_owned_artifacts(&session)?;
-            let dir = session_dir(&global, SessionScope::Archived, &session.session_id);
-            if dir.exists() {
-                fs::remove_dir_all(&dir)
-                    .with_context(|| format!("remove session dir {}", dir.display()))?;
-            }
-        }
-    }
-    rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    let csv_rows = rows
+    let mut pruned = prune_archived_sessions(args.older_than.as_deref(), args.dry_run)?;
+    pruned.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    let rows = pruned
+        .iter()
+        .map(|row| SessionPruneRow {
+            session_id: row.session_id.clone(),
+            scope: row.scope.clone(),
+            status: row.status.clone(),
+            updated_at: row.updated_at.clone(),
+            action: row.action.clone(),
+        })
+        .collect::<Vec<_>>();
+    let csv_rows = pruned
         .iter()
         .map(|row| SessionPruneCsvRow {
             session_id: row.session_id.clone(),
@@ -1252,6 +1245,40 @@ async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::
         csv_rows,
     };
     report::emit_collection(global_format, &output)
+}
+
+pub(crate) fn prune_archived_sessions(
+    older_than: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<Vec<PrunedSession>> {
+    let global = paths::global_dir()?;
+    let cutoff = session_prune_cutoff(older_than, &global)?;
+    let mut rows = Vec::new();
+    for session in load_sessions_in_scope(&global, SessionScope::Archived)? {
+        if session.updated_at > cutoff {
+            continue;
+        }
+        rows.push(PrunedSession {
+            session_id: session.session_id.clone(),
+            scope: SessionScope::Archived.as_str().to_string(),
+            status: session.status.as_str().to_string(),
+            updated_at: session.updated_at.to_rfc3339(),
+            action: if dry_run {
+                "would_delete".into()
+            } else {
+                "deleted".into()
+            },
+        });
+        if !dry_run {
+            delete_session_owned_artifacts(&session)?;
+            let dir = session_dir(&global, SessionScope::Archived, &session.session_id);
+            if dir.exists() {
+                fs::remove_dir_all(&dir)
+                    .with_context(|| format!("remove session dir {}", dir.display()))?;
+            }
+        }
+    }
+    Ok(rows)
 }
 
 async fn stop(session_id: &str) -> anyhow::Result<()> {

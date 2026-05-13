@@ -64,6 +64,8 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::config::Action,
     },
+    /// Prune archived local sessions and transcripts.
+    Cleanup(cmd::cleanup::Args),
     /// Manage provider credentials.
     Auth {
         #[command(subcommand)]
@@ -182,6 +184,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
         Cmd::Transcript { action } => cmd::transcript::handle(action, cli.format).await,
         Cmd::Config { action } => cmd::config::handle(action).await,
+        Cmd::Cleanup(args) => cmd::cleanup::handle(args, cli.format).await,
         Cmd::Auth { action } => cmd::auth::handle(action, cli.format).await,
         Cmd::Models { action } => cmd::models::handle(action, cli.format).await,
         Cmd::Repos { action } => cmd::repos::handle(action, cli.format).await,
@@ -216,6 +219,7 @@ fn ensure_output_format_supported(
             format,
             &[output::formats::OutputFormat::Table],
         ),
+        Cmd::Cleanup(_) => cmd::cleanup::ensure_output_format(format),
         Cmd::Auth { action } => cmd::auth::ensure_output_format(action, format),
         Cmd::Models { action } => cmd::models::ensure_output_format(action, format),
         Cmd::Repos { action } => cmd::repos::ensure_output_format(action, format),

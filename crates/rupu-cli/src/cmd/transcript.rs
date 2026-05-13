@@ -196,6 +196,15 @@ struct TranscriptPruneOutput {
     csv_rows: Vec<TranscriptPruneCsvRow>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PrunedTranscript {
+    pub run_id: String,
+    pub scope: String,
+    pub location: String,
+    pub archived_at: String,
+    pub action: String,
+}
+
 #[derive(Serialize)]
 struct TranscriptShowItem {
     run_id: String,
@@ -782,8 +791,45 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
 }
 
 async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+    let mut pruned = prune_archived_transcripts(args.older_than.as_deref(), args.dry_run)?;
+    pruned.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+    let rows = pruned
+        .iter()
+        .map(|row| TranscriptPruneRow {
+            run_id: row.run_id.clone(),
+            scope: row.scope.clone(),
+            location: row.location.clone(),
+            archived_at: row.archived_at.clone(),
+            action: row.action.clone(),
+        })
+        .collect::<Vec<_>>();
+    let csv_rows = pruned
+        .iter()
+        .map(|row| TranscriptPruneCsvRow {
+            run_id: row.run_id.clone(),
+            scope: row.scope.clone(),
+            location: row.location.clone(),
+            archived_at: row.archived_at.clone(),
+            action: row.action.clone(),
+        })
+        .collect();
+    let output = TranscriptPruneOutput {
+        report: TranscriptPruneReport {
+            kind: "transcript_prune",
+            version: 1,
+            rows,
+        },
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
+}
+
+pub(crate) fn prune_archived_transcripts(
+    older_than: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<Vec<PrunedTranscript>> {
     let global = paths::global_dir()?;
-    let cutoff = prune_cutoff(args.older_than.as_deref(), &global)?;
+    let cutoff = prune_cutoff(older_than, &global)?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
 
@@ -814,42 +860,23 @@ async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::
         } else {
             "project"
         };
-        rows.push(TranscriptPruneRow {
+        rows.push(PrunedTranscript {
             run_id: run_id.clone(),
             scope: scope.to_string(),
             location: location.transcript_path.display().to_string(),
             archived_at: archived_at.to_rfc3339(),
-            action: if args.dry_run {
+            action: if dry_run {
                 "would_delete".into()
             } else {
                 "deleted".into()
             },
         });
-        if !args.dry_run {
+        if !dry_run {
             remove_file_if_exists(&location.transcript_path)?;
             remove_file_if_exists(&location.metadata_path)?;
         }
     }
-    rows.sort_by(|a, b| a.run_id.cmp(&b.run_id));
-    let csv_rows = rows
-        .iter()
-        .map(|row| TranscriptPruneCsvRow {
-            run_id: row.run_id.clone(),
-            scope: row.scope.clone(),
-            location: row.location.clone(),
-            archived_at: row.archived_at.clone(),
-            action: row.action.clone(),
-        })
-        .collect();
-    let output = TranscriptPruneOutput {
-        report: TranscriptPruneReport {
-            kind: "transcript_prune",
-            version: 1,
-            rows,
-        },
-        csv_rows,
-    };
-    report::emit_collection(global_format, &output)
+    Ok(rows)
 }
 
 fn locate_transcript(run_id: &str) -> anyhow::Result<TranscriptLocation> {
