@@ -64,17 +64,47 @@ struct TestSession {
     runs: Vec<TestRun>,
 }
 
-fn write_session(home: &std::path::Path, session_id: &str, status: &str, active_pid: Option<u32>) {
-    let dir = home.join("sessions").join(session_id);
+fn write_session(
+    home: &std::path::Path,
+    session_id: &str,
+    status: &str,
+    active_pid: Option<u32>,
+    archived: bool,
+) {
+    let repo_root = home.parent().unwrap().join("repo");
+    let transcripts_dir = repo_root.join(".rupu/transcripts");
+    std::fs::create_dir_all(&transcripts_dir).unwrap();
+    let archived_transcripts_dir = transcripts_dir.join("archive");
+    std::fs::create_dir_all(&archived_transcripts_dir).unwrap();
+    let root_dir = if archived {
+        "sessions-archive"
+    } else {
+        "sessions"
+    };
+    let dir = home.join(root_dir).join(session_id);
     std::fs::create_dir_all(&dir).unwrap();
     let now = Utc::now().to_rfc3339();
+    let prev_transcript_path = if archived {
+        archived_transcripts_dir.join("run_prev123.jsonl")
+    } else {
+        transcripts_dir.join("run_prev123.jsonl")
+    };
+    std::fs::write(&prev_transcript_path, "{}\n").unwrap();
+    let live_transcript_path = if archived {
+        archived_transcripts_dir.join("run_live123.jsonl")
+    } else {
+        transcripts_dir.join("run_live123.jsonl")
+    };
+    if status == "running" {
+        std::fs::write(&live_transcript_path, "{}\n").unwrap();
+    }
     let active_run_id = if status == "running" {
         Some("run_live123".to_string())
     } else {
         None
     };
     let active_transcript_path = if status == "running" {
-        Some("/tmp/repo/.rupu/transcripts/run_live123.jsonl".to_string())
+        Some(live_transcript_path.display().to_string())
     } else {
         None
     };
@@ -92,9 +122,9 @@ fn write_session(home: &std::path::Path, session_id: &str, status: &str, active_
         permission_mode: "bypass".into(),
         no_stream: false,
         workspace_id: "ws_test".into(),
-        workspace_path: "/tmp/repo".into(),
-        project_root: "/tmp/repo".into(),
-        transcripts_dir: "/tmp/repo/.rupu/transcripts".into(),
+        workspace_path: repo_root.display().to_string(),
+        project_root: repo_root.display().to_string(),
+        transcripts_dir: transcripts_dir.display().to_string(),
         repo_ref: "github:Section9Labs/rupu".into(),
         issue_ref: "github:Section9Labs/rupu/issues/42".into(),
         target: "github:Section9Labs/rupu/issues/42".into(),
@@ -106,7 +136,7 @@ fn write_session(home: &std::path::Path, session_id: &str, status: &str, active_
         active_transcript_path,
         active_pid,
         last_run_id: "run_prev123".into(),
-        last_transcript_path: "/tmp/repo/.rupu/transcripts/run_prev123.jsonl".into(),
+        last_transcript_path: prev_transcript_path.display().to_string(),
         last_error: None,
         total_turns: 3,
         total_tokens_in: 120,
@@ -139,7 +169,7 @@ async fn session_list_supports_json_output() {
 
     let tmp = assert_fs::TempDir::new().unwrap();
     let home = tmp.path().join("home");
-    write_session(&home, "ses_01", "idle", None);
+    write_session(&home, "ses_01", "idle", None, false);
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -158,7 +188,7 @@ async fn session_show_supports_json_output() {
 
     let tmp = assert_fs::TempDir::new().unwrap();
     let home = tmp.path().join("home");
-    write_session(&home, "ses_show01", "idle", None);
+    write_session(&home, "ses_show01", "idle", None, false);
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -178,7 +208,7 @@ async fn session_list_reconciles_stale_running_workers() {
 
     let tmp = assert_fs::TempDir::new().unwrap();
     let home = tmp.path().join("home");
-    write_session(&home, "ses_stale01", "running", Some(999_999));
+    write_session(&home, "ses_stale01", "running", Some(999_999), false);
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -195,4 +225,112 @@ async fn session_list_reconciles_stale_running_workers() {
     .unwrap();
     assert_eq!(persisted["status"], "failed");
     assert!(persisted["active_run_id"].is_null());
+}
+
+#[tokio::test]
+async fn session_archive_restore_round_trip_moves_owned_transcripts() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_archive01", "idle", None, false);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["session", "archive", "ses_archive01"])
+        .assert()
+        .success();
+
+    assert!(home.join("sessions/ses_archive01").is_dir() == false);
+    assert!(home
+        .join("sessions-archive/ses_archive01/session.json")
+        .is_file());
+    assert!(tmp
+        .path()
+        .join("repo/.rupu/transcripts/archive/run_prev123.jsonl")
+        .is_file());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["--format", "json", "session", "list", "--archived"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"session_id\": \"ses_archive01\"",
+        ))
+        .stdout(predicate::str::contains("\"scope\": \"archived\""));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["session", "restore", "ses_archive01"])
+        .assert()
+        .success();
+
+    assert!(home.join("sessions/ses_archive01/session.json").is_file());
+    assert!(tmp
+        .path()
+        .join("repo/.rupu/transcripts/run_prev123.jsonl")
+        .is_file());
+}
+
+#[tokio::test]
+async fn session_delete_requires_force_and_removes_files() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_delete01", "idle", None, false);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["session", "delete", "ses_delete01"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires --force"));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["session", "delete", "ses_delete01", "--force"])
+        .assert()
+        .success();
+
+    assert!(!home.join("sessions/ses_delete01").exists());
+    assert!(!tmp
+        .path()
+        .join("repo/.rupu/transcripts/run_prev123.jsonl")
+        .exists());
+}
+
+#[tokio::test]
+async fn session_delete_refuses_running_worker() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(
+        &home,
+        "ses_running01",
+        "running",
+        Some(std::process::id()),
+        false,
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["session", "delete", "ses_running01", "--force"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot delete session"));
 }
