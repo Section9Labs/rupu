@@ -15,6 +15,8 @@ pub enum StandaloneRunMetadataError {
 pub struct StandaloneRunMetadata {
     pub version: u32,
     pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_id: Option<String>,
     pub workspace_path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub project_root: Option<PathBuf>,
@@ -70,6 +72,7 @@ mod tests {
         let metadata = StandaloneRunMetadata {
             version: StandaloneRunMetadata::VERSION,
             run_id: "run_01JXYZ".into(),
+            session_id: Some("ses_01JXYZ".into()),
             workspace_path: PathBuf::from("/tmp/repo"),
             project_root: Some(PathBuf::from("/tmp/project")),
             repo_ref: Some("github:Section9Labs/rupu".into()),

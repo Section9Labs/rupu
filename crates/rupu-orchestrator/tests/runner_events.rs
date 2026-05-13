@@ -58,6 +58,8 @@ impl StepFactory for FakeFactory {
             decider: Arc::new(BypassDecider),
             tool_context: ToolContext::default(),
             user_message: rendered_prompt,
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
             mode_str: "bypass".into(),
             no_stream: false,
             suppress_stream_stdout: false,
