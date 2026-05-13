@@ -12,6 +12,7 @@
 //! and renders it as a timeline (`pretty`, the default), a structured
 //! `json` envelope, or raw `jsonl`.
 
+use crate::cmd::retention::parse_retention_duration;
 use crate::output::formats::OutputFormat;
 use crate::output::palette::Status;
 use crate::output::report::{self, CollectionOutput, EventOutput};
@@ -24,6 +25,7 @@ use comfy_table::Cell;
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader, RunStatus};
 use serde::Serialize;
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,6 +38,12 @@ pub enum Action {
         /// `[ui].color` config knob too — flag is the explicit override.
         #[arg(long)]
         no_color: bool,
+        /// Include both active and archived transcripts.
+        #[arg(long, conflicts_with = "archived")]
+        all: bool,
+        /// Show only archived transcripts.
+        #[arg(long, conflicts_with = "all")]
+        archived: bool,
     },
     /// Print a transcript's full event stream.
     Show { run_id: String },
@@ -43,6 +51,8 @@ pub enum Action {
     Archive { run_id: String },
     /// Permanently delete a standalone transcript and its metadata.
     Delete(DeleteArgs),
+    /// Delete archived standalone transcripts older than a cutoff.
+    Prune(PruneArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -52,12 +62,27 @@ pub struct DeleteArgs {
     pub force: bool,
 }
 
+#[derive(ClapArgs, Debug)]
+pub struct PruneArgs {
+    /// Retention cutoff, e.g. `30d`, `12h`, or `1w`.
+    #[arg(long, value_name = "DURATION")]
+    pub older_than: Option<String>,
+    /// Preview deletions without removing files.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
-        Action::List { no_color } => list(no_color, global_format).await,
+        Action::List {
+            no_color,
+            all,
+            archived,
+        } => list(no_color, all, archived, global_format).await,
         Action::Show { run_id } => show(&run_id, global_format).await,
         Action::Archive { run_id } => archive(&run_id).await,
         Action::Delete(args) => delete(args).await,
+        Action::Prune(args) => prune(args, global_format).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -71,6 +96,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Show { .. } => ("transcript show", report::PRETTY_TABLE_JSON_JSONL),
         Action::Archive { .. } => ("transcript archive", report::TABLE_ONLY),
         Action::Delete(_) => ("transcript delete", report::TABLE_ONLY),
+        Action::Prune(_) => ("transcript prune", report::TABLE_JSON_CSV),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
@@ -108,6 +134,7 @@ fn one_line_preview(s: &str, max: usize) -> String {
 #[derive(Serialize)]
 struct TranscriptListRow {
     run_id: String,
+    scope: String,
     title: Option<String>,
     agent: String,
     status: String,
@@ -118,6 +145,7 @@ struct TranscriptListRow {
 #[derive(Serialize)]
 struct TranscriptListCsvRow {
     run_id: String,
+    scope: String,
     title: String,
     agent: String,
     status: String,
@@ -136,6 +164,36 @@ struct TranscriptListOutput {
     prefs: crate::cmd::ui::UiPrefs,
     report: TranscriptListReport,
     csv_rows: Vec<TranscriptListCsvRow>,
+}
+
+#[derive(Serialize)]
+struct TranscriptPruneRow {
+    run_id: String,
+    scope: String,
+    location: String,
+    archived_at: String,
+    action: String,
+}
+
+#[derive(Serialize)]
+struct TranscriptPruneCsvRow {
+    run_id: String,
+    scope: String,
+    location: String,
+    archived_at: String,
+    action: String,
+}
+
+#[derive(Serialize)]
+struct TranscriptPruneReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<TranscriptPruneRow>,
+}
+
+struct TranscriptPruneOutput {
+    report: TranscriptPruneReport,
+    csv_rows: Vec<TranscriptPruneCsvRow>,
 }
 
 #[derive(Serialize)]
@@ -176,6 +234,7 @@ impl CollectionOutput for TranscriptListOutput {
     fn csv_headers(&self) -> Option<&'static [&'static str]> {
         Some(&[
             "run_id",
+            "scope",
             "title",
             "agent",
             "status",
@@ -187,7 +246,7 @@ impl CollectionOutput for TranscriptListOutput {
     fn render_table(&self) -> anyhow::Result<()> {
         let mut table = crate::output::tables::new_table();
         table.set_header(vec![
-            "RUN ID", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
+            "RUN ID", "SCOPE", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
         ]);
         for row in &self.report.rows {
             let title_cell = match &row.title {
@@ -202,11 +261,49 @@ impl CollectionOutput for TranscriptListOutput {
             };
             table.add_row(vec![
                 Cell::new(&row.run_id),
+                Cell::new(&row.scope),
                 title_cell,
                 Cell::new(&row.agent),
                 crate::output::tables::status_cell(&row.status, &self.prefs),
                 Cell::new(row.total_tokens.to_string()),
                 Cell::new(&row.started_at),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+impl CollectionOutput for TranscriptPruneOutput {
+    type JsonReport = TranscriptPruneReport;
+    type CsvRow = TranscriptPruneCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "transcript prune"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["run_id", "scope", "location", "archived_at", "action"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["RUN ID", "SCOPE", "LOCATION", "ARCHIVED", "ACTION"]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                Cell::new(&row.run_id),
+                Cell::new(&row.scope),
+                Cell::new(&row.location),
+                Cell::new(&row.archived_at),
+                Cell::new(&row.action),
             ]);
         }
         println!("{table}");
@@ -443,33 +540,91 @@ pub(crate) fn truncate_single_line(value: &str, max: usize) -> String {
     }
 }
 
-async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptScope {
+    Active,
+    Archived,
+}
+
+impl TranscriptScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+}
+
+async fn list(
+    no_color: bool,
+    all: bool,
+    archived: bool,
+    global_format: Option<OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
 
-    let mut paths_to_scan: Vec<PathBuf> = Vec::new();
+    let mut paths_to_scan: Vec<(TranscriptScope, PathBuf)> = Vec::new();
+    let mut seen = HashSet::new();
 
     // Collect .jsonl paths from a directory — miss is a silent skip.
-    fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    fn collect_jsonl(
+        dir: &std::path::Path,
+        scope: TranscriptScope,
+        seen: &mut HashSet<PathBuf>,
+        out: &mut Vec<(TranscriptScope, PathBuf)>,
+    ) {
         let Ok(rd) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in rd.flatten() {
             let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                out.push(p);
+            let dedupe_key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if p.extension().and_then(|s| s.to_str()) == Some("jsonl") && seen.insert(dedupe_key) {
+                out.push((scope, p));
             }
         }
     }
 
+    let scopes: &[TranscriptScope] = if all {
+        &[TranscriptScope::Active, TranscriptScope::Archived]
+    } else if archived {
+        &[TranscriptScope::Archived]
+    } else {
+        &[TranscriptScope::Active]
+    };
+
     if let Some(ref proj) = project_root {
-        collect_jsonl(&proj.join(".rupu/transcripts"), &mut paths_to_scan);
+        let active_root = proj.join(".rupu/transcripts");
+        let archived_root = paths::archived_transcripts_dir(&active_root);
+        for &scope in scopes {
+            match scope {
+                TranscriptScope::Active => {
+                    collect_jsonl(&active_root, scope, &mut seen, &mut paths_to_scan)
+                }
+                TranscriptScope::Archived => {
+                    collect_jsonl(&archived_root, scope, &mut seen, &mut paths_to_scan)
+                }
+            }
+        }
     }
-    collect_jsonl(&global.join("transcripts"), &mut paths_to_scan);
+    let active_root = global.join("transcripts");
+    let archived_root = paths::archived_transcripts_dir(&active_root);
+    for &scope in scopes {
+        match scope {
+            TranscriptScope::Active => {
+                collect_jsonl(&active_root, scope, &mut seen, &mut paths_to_scan)
+            }
+            TranscriptScope::Archived => {
+                collect_jsonl(&archived_root, scope, &mut seen, &mut paths_to_scan)
+            }
+        }
+    }
 
     struct Row {
         run_id: String,
+        scope: TranscriptScope,
         title: Option<String>,
         agent: String,
         status: RunStatus,
@@ -478,10 +633,11 @@ async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Re
     }
 
     let mut rows: Vec<Row> = Vec::new();
-    for path in &paths_to_scan {
+    for (scope, path) in &paths_to_scan {
         match JsonlReader::summary(path) {
             Ok(s) => rows.push(Row {
                 run_id: s.run_id,
+                scope: *scope,
                 title: s.first_assistant_text,
                 agent: s.agent,
                 status: s.status,
@@ -519,6 +675,7 @@ async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Re
         .iter()
         .map(|row| TranscriptListRow {
             run_id: row.run_id.clone(),
+            scope: row.scope.as_str().to_string(),
             title: row.title.clone(),
             agent: row.agent.clone(),
             status: match row.status {
@@ -534,6 +691,7 @@ async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Re
         .iter()
         .map(|row| TranscriptListCsvRow {
             run_id: row.run_id.clone(),
+            scope: row.scope.clone(),
             title: row.title.clone().unwrap_or_default(),
             agent: row.agent.clone(),
             status: row.status.clone(),
@@ -588,7 +746,8 @@ async fn archive(run_id: &str) -> anyhow::Result<()> {
     if location.archived {
         anyhow::bail!("transcript already archived: {run_id}");
     }
-    ensure_standalone_transcript(run_id, &location)?;
+    let mut metadata = load_metadata_if_present(&location)?;
+    ensure_standalone_transcript(run_id, metadata.as_ref())?;
     let archived_dir = paths::archived_transcripts_dir(
         location
             .transcript_path
@@ -599,7 +758,13 @@ async fn archive(run_id: &str) -> anyhow::Result<()> {
     let archived_transcript = archived_dir.join(format!("{run_id}.jsonl"));
     let archived_metadata = metadata_path_for_run(&archived_dir, run_id);
     move_if_exists(&location.transcript_path, &archived_transcript)?;
-    move_if_exists(&location.metadata_path, &archived_metadata)?;
+    if let Some(meta) = metadata.as_mut() {
+        meta.archived_at = Some(chrono::Utc::now().to_rfc3339());
+        crate::standalone_run_metadata::write_metadata(&archived_metadata, meta)?;
+        remove_file_if_exists(&location.metadata_path)?;
+    } else {
+        move_if_exists(&location.metadata_path, &archived_metadata)?;
+    }
     println!("archived transcript {run_id}");
     Ok(())
 }
@@ -609,11 +774,82 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
         anyhow::bail!("transcript delete requires --force");
     }
     let location = locate_transcript(&args.run_id)?;
-    ensure_standalone_transcript(&args.run_id, &location)?;
+    ensure_standalone_transcript(&args.run_id, load_metadata_if_present(&location)?.as_ref())?;
     remove_file_if_exists(&location.transcript_path)?;
     remove_file_if_exists(&location.metadata_path)?;
     println!("deleted transcript {}", args.run_id);
     Ok(())
+}
+
+async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let cutoff = prune_cutoff(args.older_than.as_deref(), &global)?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+
+    let mut rows = Vec::new();
+    for location in scan_archived_transcripts(&global, project_root.as_deref())? {
+        let Some(archived_at) = archived_at_for_location(&location)? else {
+            continue;
+        };
+        if archived_at > cutoff {
+            continue;
+        }
+        let Some(run_id) = run_id_from_transcript_path(&location.transcript_path) else {
+            continue;
+        };
+        let metadata = load_metadata_if_present(&location)?;
+        if metadata
+            .as_ref()
+            .and_then(|value| value.session_id.as_ref())
+            .is_some()
+        {
+            continue;
+        }
+        let scope = if location
+            .transcript_path
+            .starts_with(global.join("transcripts"))
+        {
+            "global"
+        } else {
+            "project"
+        };
+        rows.push(TranscriptPruneRow {
+            run_id: run_id.clone(),
+            scope: scope.to_string(),
+            location: location.transcript_path.display().to_string(),
+            archived_at: archived_at.to_rfc3339(),
+            action: if args.dry_run {
+                "would_delete".into()
+            } else {
+                "deleted".into()
+            },
+        });
+        if !args.dry_run {
+            remove_file_if_exists(&location.transcript_path)?;
+            remove_file_if_exists(&location.metadata_path)?;
+        }
+    }
+    rows.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+    let csv_rows = rows
+        .iter()
+        .map(|row| TranscriptPruneCsvRow {
+            run_id: row.run_id.clone(),
+            scope: row.scope.clone(),
+            location: row.location.clone(),
+            archived_at: row.archived_at.clone(),
+            action: row.action.clone(),
+        })
+        .collect();
+    let output = TranscriptPruneOutput {
+        report: TranscriptPruneReport {
+            kind: "transcript_prune",
+            version: 1,
+            rows,
+        },
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
 }
 
 fn locate_transcript(run_id: &str) -> anyhow::Result<TranscriptLocation> {
@@ -668,11 +904,13 @@ fn locate_transcript(run_id: &str) -> anyhow::Result<TranscriptLocation> {
     Err(anyhow::anyhow!("transcript not found: {run_id}"))
 }
 
-fn ensure_standalone_transcript(run_id: &str, location: &TranscriptLocation) -> anyhow::Result<()> {
-    if !location.metadata_path.is_file() {
+fn ensure_standalone_transcript(
+    run_id: &str,
+    metadata: Option<&crate::standalone_run_metadata::StandaloneRunMetadata>,
+) -> anyhow::Result<()> {
+    let Some(metadata) = metadata else {
         return Ok(());
-    }
-    let metadata = read_metadata(&location.metadata_path)?;
+    };
     if metadata.session_id.is_some() {
         anyhow::bail!(
             "transcript {} is managed by session {}; use `rupu session archive|delete` instead",
@@ -681,6 +919,93 @@ fn ensure_standalone_transcript(run_id: &str, location: &TranscriptLocation) -> 
         );
     }
     Ok(())
+}
+
+fn load_metadata_if_present(
+    location: &TranscriptLocation,
+) -> anyhow::Result<Option<crate::standalone_run_metadata::StandaloneRunMetadata>> {
+    if !location.metadata_path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(read_metadata(&location.metadata_path)?))
+}
+
+fn scan_archived_transcripts(
+    global: &std::path::Path,
+    project_root: Option<&std::path::Path>,
+) -> anyhow::Result<Vec<TranscriptLocation>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_dir = |root: &std::path::Path| -> anyhow::Result<()> {
+        if !root.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let dedupe_key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !seen.insert(dedupe_key) {
+                continue;
+            }
+            let Some(run_id) = run_id_from_transcript_path(&path) else {
+                continue;
+            };
+            out.push(TranscriptLocation {
+                metadata_path: metadata_path_for_run(root, &run_id),
+                transcript_path: path,
+                archived: true,
+            });
+        }
+        Ok(())
+    };
+    if let Some(project_root) = project_root {
+        push_dir(&paths::archived_transcripts_dir(
+            &project_root.join(".rupu/transcripts"),
+        ))?;
+    }
+    push_dir(&paths::archived_transcripts_dir(
+        &global.join("transcripts"),
+    ))?;
+    Ok(out)
+}
+
+fn archived_at_for_location(
+    location: &TranscriptLocation,
+) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    if let Some(metadata) = load_metadata_if_present(location)? {
+        if let Some(value) = metadata.archived_at.as_deref() {
+            return Ok(Some(
+                chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc),
+            ));
+        }
+    }
+    let modified = fs::metadata(&location.transcript_path)?.modified()?;
+    Ok(Some(chrono::DateTime::<chrono::Utc>::from(modified)))
+}
+
+fn run_id_from_transcript_path(path: &std::path::Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .map(ToOwned::to_owned)
+}
+
+fn prune_cutoff(
+    older_than: Option<&str>,
+    global: &std::path::Path,
+) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let retention = if let Some(value) = older_than {
+        value.to_string()
+    } else {
+        let path = global.join("config.toml");
+        let cfg = rupu_config::layer_files(Some(&path), None)?;
+        cfg.storage
+            .archived_transcript_retention
+            .unwrap_or_else(|| "30d".to_string())
+    };
+    Ok(chrono::Utc::now() - parse_retention_duration(&retention)?)
 }
 
 fn move_if_exists(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {

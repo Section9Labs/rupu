@@ -283,6 +283,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         version: StandaloneRunMetadata::VERSION,
         run_id: run_id.clone(),
         session_id: None,
+        archived_at: None,
         workspace_path: canonicalize_if_exists(&workspace_path),
         project_root: project_root.clone(),
         repo_ref,
