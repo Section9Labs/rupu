@@ -3,6 +3,7 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use syntect::highlighting::{Color as SyntaxColor, Theme, ThemeSet};
 
 pub const DEFAULT_PALETTE_THEME: &str = "rupu-dark";
 pub const DEFAULT_SYNTAX_THEME: &str = "base16-ocean.dark";
@@ -24,6 +25,15 @@ pub struct ThemeSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub palette: UiPaletteTheme,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SyntaxThemeSpec {
+    pub name: String,
+    pub description: Option<String>,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -195,16 +205,136 @@ pub fn validate_theme_file(
     Ok(theme)
 }
 
-pub fn builtin_syntax_themes() -> Vec<&'static str> {
-    vec![
-        "base16-ocean.dark",
-        "base16-eighties.dark",
-        "base16-mocha.dark",
-        "base16-ocean.light",
-        "InspiredGitHub",
-        "Solarized (dark)",
-        "Solarized (light)",
-    ]
+pub fn list_syntax_themes(
+    global: &Path,
+    project_root: Option<&Path>,
+) -> anyhow::Result<Vec<SyntaxThemeSpec>> {
+    let mut out = BTreeMap::<String, SyntaxThemeSpec>::new();
+    for spec in builtin_syntax_theme_specs() {
+        out.insert(spec.name.clone(), spec);
+    }
+    for spec in load_syntax_theme_dir(&crate::paths::themes_dir(global), "global file")? {
+        out.insert(spec.name.clone(), spec);
+    }
+    if let Some(project_root) = project_root {
+        for spec in load_syntax_theme_dir(
+            &crate::paths::project_themes_dir(project_root),
+            "project file",
+        )? {
+            out.insert(spec.name.clone(), spec);
+        }
+    }
+    Ok(out.into_values().collect())
+}
+
+pub fn syntax_theme_set(global: &Path, project_root: Option<&Path>) -> anyhow::Result<ThemeSet> {
+    let mut set = ThemeSet::load_defaults();
+    register_builtin_syntax_aliases(&mut set);
+    let global_dir = crate::paths::themes_dir(global);
+    if global_dir.is_dir() {
+        set.add_from_folder(&global_dir)
+            .with_context(|| format!("load syntax themes from {}", global_dir.display()))?;
+    }
+    if let Some(project_root) = project_root {
+        let project_dir = crate::paths::project_themes_dir(project_root);
+        if project_dir.is_dir() {
+            set.add_from_folder(&project_dir)
+                .with_context(|| format!("load syntax themes from {}", project_dir.display()))?;
+        }
+    }
+    Ok(set)
+}
+
+pub fn palette_theme_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "Solarized (dark)" => Some("solarized-dark"),
+        "Solarized (light)" => Some("solarized-light"),
+        "InspiredGitHub" => Some("github-light"),
+        _ => None,
+    }
+}
+
+fn builtin_syntax_theme_specs() -> Vec<SyntaxThemeSpec> {
+    let mut specs = vec![
+        syntax_theme(
+            "base16-ocean.dark",
+            "Built-in syntect syntax theme.",
+            "builtin syntect",
+        ),
+        syntax_theme(
+            "base16-eighties.dark",
+            "Built-in syntect syntax theme.",
+            "builtin syntect",
+        ),
+        syntax_theme(
+            "base16-mocha.dark",
+            "Built-in syntect syntax theme.",
+            "builtin syntect",
+        ),
+        syntax_theme(
+            "base16-ocean.light",
+            "Built-in syntect syntax theme.",
+            "builtin syntect",
+        ),
+        syntax_theme(
+            "InspiredGitHub",
+            "Built-in syntect syntax theme.",
+            "builtin syntect",
+        ),
+        syntax_theme(
+            "Solarized (dark)",
+            "Built-in syntect syntax theme.",
+            "builtin syntect",
+        ),
+        syntax_theme(
+            "Solarized (light)",
+            "Built-in syntect syntax theme.",
+            "builtin syntect",
+        ),
+    ];
+    specs.extend([
+        syntax_theme(
+            "catppuccin-mocha",
+            "Bundled rupu syntax theme alias tuned from base16-mocha.dark.",
+            "builtin rupu",
+        ),
+        syntax_theme(
+            "tokyo-night",
+            "Bundled rupu syntax theme alias tuned from base16-ocean.dark.",
+            "builtin rupu",
+        ),
+        syntax_theme(
+            "dracula",
+            "Bundled rupu syntax theme alias tuned from base16-eighties.dark.",
+            "builtin rupu",
+        ),
+        syntax_theme(
+            "gruvbox-dark",
+            "Bundled rupu syntax theme alias tuned from base16-mocha.dark.",
+            "builtin rupu",
+        ),
+        syntax_theme(
+            "github-dark",
+            "Bundled rupu syntax theme alias tuned for GitHub dark parity.",
+            "builtin rupu",
+        ),
+        syntax_theme(
+            "github-light",
+            "Bundled rupu syntax theme alias tuned for GitHub light parity.",
+            "builtin rupu",
+        ),
+        syntax_theme(
+            "solarized-dark",
+            "Bundled rupu syntax theme alias for Solarized dark parity.",
+            "builtin rupu",
+        ),
+        syntax_theme(
+            "solarized-light",
+            "Bundled rupu syntax theme alias for Solarized light parity.",
+            "builtin rupu",
+        ),
+    ]);
+    specs
 }
 
 fn builtin_palette_themes() -> Vec<ThemeSpec> {
@@ -478,6 +608,15 @@ fn theme(
     }
 }
 
+fn syntax_theme(name: &str, description: &str, source: &str) -> SyntaxThemeSpec {
+    SyntaxThemeSpec {
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        source: source.to_string(),
+        path: None,
+    }
+}
+
 fn rgb(r: u8, g: u8, b: u8) -> RgbColor {
     RgbColor::new(r, g, b)
 }
@@ -515,6 +654,28 @@ fn load_theme_dir(
         let mut theme = load_theme_file(&path, source, global, project_root, &mut visited)?;
         theme.path = Some(path.display().to_string());
         out.push(theme);
+    }
+    Ok(out)
+}
+
+fn load_syntax_theme_dir(dir: &Path, source: &str) -> anyhow::Result<Vec<SyntaxThemeSpec>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for path in ThemeSet::discover_theme_paths(dir)
+        .with_context(|| format!("discover syntax themes in {}", dir.display()))?
+    {
+        let name = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("invalid syntax theme path {}", path.display()))?;
+        out.push(SyntaxThemeSpec {
+            name: name.to_string(),
+            description: Some("User-provided TextMate syntax theme.".into()),
+            source: source.to_string(),
+            path: Some(path.display().to_string()),
+        });
     }
     Ok(out)
 }
@@ -849,6 +1010,109 @@ fn base16(
 
 fn format_hex(color: RgbColor) -> String {
     format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+}
+
+fn register_builtin_syntax_aliases(set: &mut ThemeSet) {
+    register_syntax_alias(set, "catppuccin-mocha", "base16-mocha.dark", |theme| {
+        tune_theme_settings(
+            theme,
+            Some(0x1e1e2e),
+            Some(0xcdd6f4),
+            Some(0x313244),
+            Some(0x45475a),
+            Some(0x7f849c),
+        );
+    });
+    register_syntax_alias(set, "tokyo-night", "base16-ocean.dark", |theme| {
+        tune_theme_settings(
+            theme,
+            Some(0x1a1b26),
+            Some(0xc0caf5),
+            Some(0x2f3549),
+            Some(0x3b4261),
+            Some(0x565f89),
+        );
+    });
+    register_syntax_alias(set, "dracula", "base16-eighties.dark", |theme| {
+        tune_theme_settings(
+            theme,
+            Some(0x282a36),
+            Some(0xf8f8f2),
+            Some(0x44475a),
+            Some(0x44475a),
+            Some(0x6272a4),
+        );
+    });
+    register_syntax_alias(set, "gruvbox-dark", "base16-mocha.dark", |theme| {
+        tune_theme_settings(
+            theme,
+            Some(0x282828),
+            Some(0xebdbb2),
+            Some(0x3c3836),
+            Some(0x504945),
+            Some(0x928374),
+        );
+    });
+    register_syntax_alias(set, "github-dark", "base16-ocean.dark", |theme| {
+        tune_theme_settings(
+            theme,
+            Some(0x0d1117),
+            Some(0xc9d1d9),
+            Some(0x21262d),
+            Some(0x30363d),
+            Some(0x8b949e),
+        );
+    });
+    register_syntax_alias(set, "github-light", "InspiredGitHub", |theme| {
+        tune_theme_settings(
+            theme,
+            Some(0xffffff),
+            Some(0x1f2328),
+            Some(0xddf4ff),
+            Some(0xd0d7de),
+            Some(0x57606a),
+        );
+    });
+    register_syntax_alias(set, "solarized-dark", "Solarized (dark)", |_| {});
+    register_syntax_alias(set, "solarized-light", "Solarized (light)", |_| {});
+}
+
+fn register_syntax_alias(
+    set: &mut ThemeSet,
+    alias: &str,
+    base: &str,
+    adjust: impl FnOnce(&mut Theme),
+) {
+    let Some(mut theme) = set.themes.get(base).cloned() else {
+        return;
+    };
+    theme.name = Some(alias.to_string());
+    adjust(&mut theme);
+    set.themes.insert(alias.to_string(), theme);
+}
+
+fn tune_theme_settings(
+    theme: &mut Theme,
+    background: Option<u32>,
+    foreground: Option<u32>,
+    selection: Option<u32>,
+    gutter: Option<u32>,
+    gutter_foreground: Option<u32>,
+) {
+    theme.settings.background = background.map(syntax_hex);
+    theme.settings.foreground = foreground.map(syntax_hex);
+    theme.settings.selection = selection.map(syntax_hex);
+    theme.settings.gutter = gutter.map(syntax_hex);
+    theme.settings.gutter_foreground = gutter_foreground.map(syntax_hex);
+}
+
+fn syntax_hex(value: u32) -> SyntaxColor {
+    SyntaxColor {
+        r: ((value >> 16) & 0xff) as u8,
+        g: ((value >> 8) & 0xff) as u8,
+        b: (value & 0xff) as u8,
+        a: 0xff,
+    }
 }
 
 pub fn slugify(value: &str) -> String {
