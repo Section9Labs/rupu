@@ -28,6 +28,17 @@ fn parses_full_config() {
         max_attempts = 3
         initial_delay_ms = 200
 
+        [ui]
+        color = "always"
+        theme = "Solarized (light)"
+        pager = "never"
+
+        [ui.syntax]
+        theme = "InspiredGitHub"
+
+        [ui.palette]
+        theme = "github-light"
+
         [autoflow]
         enabled = true
         repo = "github:Section9Labs/rupu"
@@ -51,6 +62,10 @@ fn parses_full_config() {
         Some(vec!["MY_VAR".into(), "AWS_PROFILE".into()])
     );
     assert_eq!(cfg.retry.max_attempts, Some(3));
+    assert_eq!(cfg.ui.color.as_deref(), Some("always"));
+    assert_eq!(cfg.ui.theme.as_deref(), Some("Solarized (light)"));
+    assert_eq!(cfg.ui.syntax.theme.as_deref(), Some("InspiredGitHub"));
+    assert_eq!(cfg.ui.palette.theme.as_deref(), Some("github-light"));
     assert_eq!(cfg.autoflow.enabled, Some(true));
     assert_eq!(
         cfg.autoflow.repo.as_deref(),
