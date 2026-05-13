@@ -8,7 +8,7 @@ use crate::menu::app_menu::{ApproveFocused, RejectFocused};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
-use crate::window::sidebar::ActiveRunMap;
+use crate::window::sidebar::{ActiveRunMap, WorkflowClickCb};
 use crate::workspace::Workspace;
 use gpui::{
     div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, WeakEntity,
@@ -236,6 +236,20 @@ impl WorkspaceWindow {
             .map(|a| a.path.clone())
     }
 
+    /// Sets `focused_workflow` to `path` and notifies the view.
+    /// Called when the user left-clicks a workflow row in the sidebar.
+    pub fn handle_workflow_clicked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.focused_workflow = Some(path);
+        cx.notify();
+    }
+
+    /// Sets `focused_workflow` to `path` and immediately opens the launcher.
+    /// Called when the user right-clicks a workflow row in the sidebar.
+    pub fn handle_workflow_right_clicked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.focused_workflow = Some(path.clone());
+        self.open_launcher(path, cx);
+    }
+
     /// Called when the user clicks the Run button in the toolbar.
     /// Opens the launcher modal with the current workflow.
     pub fn handle_run_clicked(&mut self, cx: &mut Context<Self>) {
@@ -461,6 +475,10 @@ impl Render for WorkspaceWindow {
         // can update `self` when invoked from click handlers. WeakEntity
         // is Send + 'static, making it suitable for Arc<dyn Fn(...)> callbacks.
         let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        // Pre-clone for sidebar workflow-click callbacks (D-4) before `weak`
+        // is consumed by the on_approve closure below.
+        let weak_sidebar_click = weak.clone();
+        let weak_sidebar_right = weak.clone();
         let weak2 = weak.clone();
         let on_approve: ApproveCallback =
             Arc::new(move |step_id: String, window: &mut Window, cx: &mut App| {
@@ -545,7 +563,26 @@ impl Render for WorkspaceWindow {
                     .flex()
                     .flex_row()
                     .flex_1()
-                    .child(sidebar::render(&self.workspace, &active_run_map))
+                    .child({
+                        let on_workflow_click: WorkflowClickCb =
+                            Arc::new(move |path, _w, cx| {
+                                let _ = weak_sidebar_click.update(cx, |this, cx| {
+                                    this.handle_workflow_clicked(path, cx)
+                                });
+                            });
+                        let on_workflow_right_click: WorkflowClickCb =
+                            Arc::new(move |path, _w, cx| {
+                                let _ = weak_sidebar_right.update(cx, |this, cx| {
+                                    this.handle_workflow_right_clicked(path, cx)
+                                });
+                            });
+                        sidebar::render(
+                            &self.workspace,
+                            &active_run_map,
+                            on_workflow_click,
+                            on_workflow_right_click,
+                        )
+                    })
                     .child(main_area),
             );
 

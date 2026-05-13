@@ -3,13 +3,15 @@
 //! Fixed section order: workflows · runs · repos · agents · issues.
 //! Collapse state persists in `Workspace.manifest.ui.sidebar_collapsed_sections`.
 //! For D-1, item clicks are no-ops (tabs land in D-2).
+//! D-4: workflow row clicks set `focused_workflow`; right-click opens the launcher.
 
 use crate::palette;
 use crate::workspace::{Asset, Workspace};
-use gpui::{div, prelude::*, px, AnyElement, IntoElement};
+use gpui::{div, prelude::*, px, App, AnyElement, IntoElement, MouseButton, Window};
 use rupu_orchestrator::runs::RunStatus;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const SIDEBAR_WIDTH: f32 = 180.0;
 const SECTION_ORDER: &[&str] = &["workflows", "runs", "repos", "agents", "issues"];
@@ -19,7 +21,17 @@ const SECTION_ORDER: &[&str] = &["workflows", "runs", "repos", "agents", "issues
 /// async / executor dependencies.
 pub type ActiveRunMap = HashMap<PathBuf, RunStatus>;
 
-pub fn render(workspace: &Workspace, active_runs: &ActiveRunMap) -> impl IntoElement {
+/// Callback type for sidebar workflow-row clicks. Receives the workflow path,
+/// the current GPUI window handle, and the app context.
+pub type WorkflowClickCb =
+    Arc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync + 'static>;
+
+pub fn render(
+    workspace: &Workspace,
+    active_runs: &ActiveRunMap,
+    on_workflow_click: WorkflowClickCb,
+    on_workflow_right_click: WorkflowClickCb,
+) -> impl IntoElement {
     let collapsed = &workspace.manifest.ui.sidebar_collapsed_sections;
     let project = &workspace.project_assets;
     let global = &workspace.global_assets;
@@ -52,6 +64,8 @@ pub fn render(workspace: &Workspace, active_runs: &ActiveRunMap) -> impl IntoEle
             is_collapsed,
             i == 0,
             active_runs,
+            on_workflow_click.clone(),
+            on_workflow_right_click.clone(),
         ));
     }
 
@@ -64,6 +78,8 @@ fn render_section(
     is_collapsed: bool,
     is_first: bool,
     active_runs: &ActiveRunMap,
+    on_workflow_click: WorkflowClickCb,
+    on_workflow_right_click: WorkflowClickCb,
 ) -> impl IntoElement {
     // Header: uppercase label + optional caret + count when collapsed.
     let caret_child: AnyElement = if is_collapsed {
@@ -108,6 +124,7 @@ fn render_section(
             .child("—")
             .into_any_element()
     } else {
+        let is_workflows = name == "workflows";
         let mut list = div().flex().flex_col().gap(px(2.0));
         for asset in items {
             let dot_color = active_runs
@@ -119,7 +136,12 @@ fn render_section(
                     _ => None,
                 });
 
+            let path = asset.path.clone();
             let mut row = div()
+                .id(gpui::SharedString::from(format!(
+                    "wf-{}",
+                    asset.path.display()
+                )))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -130,6 +152,21 @@ fn render_section(
 
             if let Some(color) = dot_color {
                 row = row.child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(color));
+            }
+
+            if is_workflows {
+                let cb_click = on_workflow_click.clone();
+                let cb_right = on_workflow_right_click.clone();
+                let path_right = path.clone();
+                row = row
+                    .cursor_pointer()
+                    .on_click({
+                        let path = path.clone();
+                        move |_, w, cx| cb_click(path.clone(), w, cx)
+                    })
+                    .on_mouse_down(MouseButton::Right, {
+                        move |_, w, cx| cb_right(path_right.clone(), w, cx)
+                    });
             }
 
             list = list.child(row);
