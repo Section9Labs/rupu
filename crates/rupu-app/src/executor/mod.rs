@@ -69,15 +69,36 @@ impl AppExecutor {
         &self,
         workflow_path: PathBuf,
     ) -> Result<String, rupu_orchestrator::executor::ExecutorError> {
+        let workspace_path = self
+            .config
+            .project_root
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        self.start_workflow_with_opts(
+            workflow_path,
+            Default::default(),
+            crate::launcher::LauncherMode::Ask,
+            workspace_path,
+        )
+        .await
+    }
+
+    pub async fn start_workflow_with_opts(
+        &self,
+        workflow_path: PathBuf,
+        inputs: std::collections::BTreeMap<String, String>,
+        mode: crate::launcher::LauncherMode,
+        target_dir: PathBuf,
+    ) -> Result<String, rupu_orchestrator::executor::ExecutorError> {
         let yaml = std::fs::read_to_string(&workflow_path)?;
         let workflow = rupu_orchestrator::Workflow::parse(&yaml)?;
 
         let factory: Arc<dyn StepFactory> = Arc::new(DefaultStepFactory {
             workflow,
             global: self.config.global.clone(),
-            project_root: self.config.project_root.clone(),
+            project_root: Some(target_dir.clone()),
             resolver: Arc::clone(&self.config.resolver),
-            mode_str: "ask".into(),
+            mode_str: mode.as_str().into(),
             mcp_registry: Arc::clone(&self.config.mcp_registry),
             system_prompt_suffix: None,
             dispatcher: None,
@@ -88,7 +109,7 @@ impl AppExecutor {
             .start(
                 WorkflowRunOpts {
                     workflow_path,
-                    vars: Default::default(),
+                    vars: inputs,
                 },
                 factory,
             )
