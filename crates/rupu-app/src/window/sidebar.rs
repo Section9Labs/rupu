@@ -7,7 +7,7 @@
 
 use crate::palette;
 use crate::workspace::{Asset, Workspace};
-use gpui::{div, prelude::*, px, App, AnyElement, IntoElement, MouseButton, Window};
+use gpui::{div, prelude::*, px, AnyElement, App, IntoElement, MouseButton, Window};
 use rupu_orchestrator::runs::RunStatus;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,8 +23,7 @@ pub type ActiveRunMap = HashMap<PathBuf, RunStatus>;
 
 /// Callback type for sidebar workflow-row clicks. Receives the workflow path,
 /// the current GPUI window handle, and the app context.
-pub type WorkflowClickCb =
-    Arc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync + 'static>;
+pub type WorkflowClickCb = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync + 'static>;
 
 pub fn render(
     workspace: &Workspace,

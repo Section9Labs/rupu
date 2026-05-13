@@ -37,7 +37,10 @@ impl LauncherMode {
 pub enum LauncherTarget {
     ThisWorkspace,
     Directory(PathBuf),
-    Clone { repo_ref: String, status: CloneStatus },
+    Clone {
+        repo_ref: String,
+        status: CloneStatus,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +91,9 @@ impl LauncherState {
         match rupu_orchestrator::resolve_inputs(&self.workflow, &self.inputs) {
             Ok(_) => self.validation = None,
             Err(e) => {
-                self.validation = Some(ValidationError { message: e.to_string() })
+                self.validation = Some(ValidationError {
+                    message: e.to_string(),
+                })
             }
         }
     }

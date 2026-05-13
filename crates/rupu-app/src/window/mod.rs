@@ -4,7 +4,7 @@ pub mod sidebar;
 pub mod titlebar;
 
 use crate::executor::AppExecutor;
-use crate::menu::app_menu::{ApproveFocused, RejectFocused, LaunchSelected};
+use crate::menu::app_menu::{ApproveFocused, LaunchSelected, RejectFocused};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
@@ -346,9 +346,7 @@ impl WorkspaceWindow {
             crate::launcher::LauncherTarget::ThisWorkspace => {
                 DispatchKind::Direct(PathBuf::from(&self.workspace.manifest.path))
             }
-            crate::launcher::LauncherTarget::Directory(path) => {
-                DispatchKind::Direct(path.clone())
-            }
+            crate::launcher::LauncherTarget::Directory(path) => DispatchKind::Direct(path.clone()),
             crate::launcher::LauncherTarget::Clone { repo_ref, status } => match status {
                 crate::launcher::CloneStatus::Done(path) => DispatchKind::Direct(path.clone()),
                 crate::launcher::CloneStatus::NotStarted
@@ -385,8 +383,7 @@ impl WorkspaceWindow {
         let registry = self.app_executor.config_mcp_registry();
         let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
         cx.spawn(async move |_, cx| {
-            let clone_result =
-                crate::launcher::clone::clone_repo_ref(registry, &repo_ref).await;
+            let clone_result = crate::launcher::clone::clone_repo_ref(registry, &repo_ref).await;
             match clone_result {
                 Ok(path) => {
                     let _ = weak.update(cx, |this, cx| {
@@ -407,8 +404,7 @@ impl WorkspaceWindow {
                             if let crate::launcher::LauncherTarget::Clone { status, .. } =
                                 &mut s.target
                             {
-                                *status =
-                                    crate::launcher::CloneStatus::Failed(e.to_string());
+                                *status = crate::launcher::CloneStatus::Failed(e.to_string());
                             }
                         }
                         cx.notify();
@@ -582,12 +578,10 @@ impl Render for WorkspaceWindow {
                     .flex_row()
                     .flex_1()
                     .child({
-                        let on_workflow_click: WorkflowClickCb =
-                            Arc::new(move |path, _w, cx| {
-                                let _ = weak_sidebar_click.update(cx, |this, cx| {
-                                    this.handle_workflow_clicked(path, cx)
-                                });
-                            });
+                        let on_workflow_click: WorkflowClickCb = Arc::new(move |path, _w, cx| {
+                            let _ = weak_sidebar_click
+                                .update(cx, |this, cx| this.handle_workflow_clicked(path, cx));
+                        });
                         let on_workflow_right_click: WorkflowClickCb =
                             Arc::new(move |path, _w, cx| {
                                 let _ = weak_sidebar_right.update(cx, |this, cx| {

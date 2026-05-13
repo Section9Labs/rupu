@@ -34,7 +34,9 @@ pub fn clones_dir() -> Result<PathBuf> {
 /// Best-effort sweep: delete `clones_dir()` entries older than 7 days.
 /// Logs failures via tracing but never propagates.
 pub fn gc_clones_dir() {
-    let Ok(dir) = clones_dir() else { return; };
+    let Ok(dir) = clones_dir() else {
+        return;
+    };
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,

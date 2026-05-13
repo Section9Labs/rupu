@@ -30,7 +30,10 @@ steps:
     assert_eq!(state.inputs.get("topic").map(String::as_str), Some("hello"));
     assert!(matches!(state.mode, LauncherMode::Ask));
     assert!(matches!(state.target, LauncherTarget::ThisWorkspace));
-    assert!(state.validation.is_none(), "default pre-fill should validate");
+    assert!(
+        state.validation.is_none(),
+        "default pre-fill should validate"
+    );
 }
 
 #[test]
@@ -50,7 +53,10 @@ steps:
     let mut state = LauncherState::new(PathBuf::from("/wf.yaml"), wf);
     state.set_input("topic", "");
     state.revalidate();
-    assert!(state.validation.is_some(), "empty required input must error");
+    assert!(
+        state.validation.is_some(),
+        "empty required input must error"
+    );
 }
 
 #[test]

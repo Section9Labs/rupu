@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use crate::{Platform, RepoRef, Registry, ScmError};
+use crate::{Platform, Registry, RepoRef, ScmError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CloneError {

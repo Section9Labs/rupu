@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use rupu_scm::{
     clone_repo_ref,
     types::{Branch, Comment, CreatePr, Diff, FileContent, Pr, PrFilter, PrRef, Repo},
-    Platform, RepoConnector, RepoRef, Registry, ScmError,
+    Platform, Registry, RepoConnector, RepoRef, ScmError,
 };
 
 struct FakeConnector;
@@ -60,8 +60,7 @@ impl RepoConnector for FakeConnector {
         unimplemented!()
     }
     async fn clone_to(&self, r: &RepoRef, dir: &Path) -> Result<(), ScmError> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| ScmError::Transient(anyhow::anyhow!("{e}")))?;
+        std::fs::create_dir_all(dir).map_err(|e| ScmError::Transient(anyhow::anyhow!("{e}")))?;
         std::fs::write(dir.join("README.md"), format!("{}/{}\n", r.owner, r.repo))
             .map_err(|e| ScmError::Transient(anyhow::anyhow!("{e}")))?;
         Ok(())
@@ -99,5 +98,8 @@ async fn clone_repo_ref_missing_connector_returns_error() {
         .expect_err("should fail without connector");
     let msg = err.to_string();
     assert!(msg.contains("github"), "error mentions platform: {msg}");
-    assert!(msg.contains("rupu auth login"), "error hints at login: {msg}");
+    assert!(
+        msg.contains("rupu auth login"),
+        "error hints at login: {msg}"
+    );
 }

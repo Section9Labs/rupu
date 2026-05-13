@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use gpui::{div, prelude::*, px, AnyElement, IntoElement, SharedString};
 
-use crate::launcher::{CloneStatus, LauncherMode, LauncherTarget, LauncherState};
+use crate::launcher::{CloneStatus, LauncherMode, LauncherState, LauncherTarget};
 use crate::palette;
 
 pub type InputChangeCb =
@@ -42,7 +42,15 @@ pub fn render(
     on_run: RunCb,
     on_close: CloseCb,
 ) -> AnyElement {
-    let sheet = render_sheet(state, on_input_change, on_mode_change, on_target_change, on_pick_dir, on_run, on_close);
+    let sheet = render_sheet(
+        state,
+        on_input_change,
+        on_mode_change,
+        on_target_change,
+        on_pick_dir,
+        on_run,
+        on_close,
+    );
 
     div()
         .absolute()
@@ -77,7 +85,13 @@ fn render_sheet(
 
     sheet = sheet.child(render_header(state, on_close));
     sheet = sheet.child(render_inputs_form(state, on_input_change));
-    sheet = sheet.child(render_footer(state, on_mode_change, on_target_change, on_pick_dir, on_run));
+    sheet = sheet.child(render_footer(
+        state,
+        on_mode_change,
+        on_target_change,
+        on_pick_dir,
+        on_run,
+    ));
 
     if let Some(err) = &state.validation {
         sheet = sheet.child(
@@ -134,9 +148,13 @@ fn render_inputs_form(state: &LauncherState, on_input_change: InputChangeCb) -> 
     for (name, def) in &state.workflow.inputs {
         let current = state.inputs.get(name).cloned().unwrap_or_default();
         let row = match def.ty {
-            rupu_orchestrator::InputType::String if !def.allowed.is_empty() => {
-                render_select_row(name, &def.allowed, &current, def.required, on_input_change.clone())
-            }
+            rupu_orchestrator::InputType::String if !def.allowed.is_empty() => render_select_row(
+                name,
+                &def.allowed,
+                &current,
+                def.required,
+                on_input_change.clone(),
+            ),
             rupu_orchestrator::InputType::String => {
                 render_text_row(name, &current, def.required, on_input_change.clone())
             }
@@ -256,7 +274,11 @@ fn render_checkbox_row(
                 .id(SharedString::from(format!("checkbox-{name_owned}")))
                 .px(px(6.0))
                 .py(px(2.0))
-                .text_color(if checked { palette::COMPLETE } else { palette::TEXT_MUTED })
+                .text_color(if checked {
+                    palette::COMPLETE
+                } else {
+                    palette::TEXT_MUTED
+                })
                 .cursor_pointer()
                 .child(glyph)
                 .on_click(move |_ev, window, cx| {
@@ -284,13 +306,27 @@ fn render_select_row(
         let name_clone = name_owned.clone();
         let cb = on_input_change.clone();
         let pill = div()
-            .id(SharedString::from(format!("select-{name_owned}-{opt_clone}")))
+            .id(SharedString::from(format!(
+                "select-{name_owned}-{opt_clone}"
+            )))
             .px(px(8.0))
             .py(px(3.0))
             .border_1()
-            .border_color(if is_selected { palette::BRAND } else { palette::BORDER })
-            .bg(if is_selected { palette::BG_SIDEBAR } else { palette::BG_PRIMARY })
-            .text_color(if is_selected { palette::BRAND_300 } else { palette::TEXT_MUTED })
+            .border_color(if is_selected {
+                palette::BRAND
+            } else {
+                palette::BORDER
+            })
+            .bg(if is_selected {
+                palette::BG_SIDEBAR
+            } else {
+                palette::BG_PRIMARY
+            })
+            .text_color(if is_selected {
+                palette::BRAND_300
+            } else {
+                palette::TEXT_MUTED
+            })
             .text_sm()
             .cursor_pointer()
             .child(SharedString::from(opt_clone.clone()))
@@ -329,7 +365,11 @@ fn render_footer(
         .gap(px(8.0))
         .items_center()
         .child(render_mode_picker(state.mode, on_mode_change))
-        .child(render_target_picker(&state.target, on_target_change, on_pick_dir))
+        .child(render_target_picker(
+            &state.target,
+            on_target_change,
+            on_pick_dir,
+        ))
         .child(div().flex_grow())
         .child(render_run_button(can_run, on_run))
         .into_any_element()
@@ -337,7 +377,11 @@ fn render_footer(
 
 /// Mode picker: three pills cycling Ask → Bypass → ReadOnly on click.
 fn render_mode_picker(current: LauncherMode, on_mode_change: ModeChangeCb) -> AnyElement {
-    let modes = [LauncherMode::Ask, LauncherMode::Bypass, LauncherMode::ReadOnly];
+    let modes = [
+        LauncherMode::Ask,
+        LauncherMode::Bypass,
+        LauncherMode::ReadOnly,
+    ];
     let mut row = div().flex().flex_row().gap(px(4.0));
     for mode in modes {
         let is_selected = mode == current;
@@ -353,9 +397,21 @@ fn render_mode_picker(current: LauncherMode, on_mode_change: ModeChangeCb) -> An
             .px(px(8.0))
             .py(px(3.0))
             .border_1()
-            .border_color(if is_selected { palette::BRAND } else { palette::BORDER })
-            .bg(if is_selected { palette::BG_SIDEBAR } else { palette::BG_PRIMARY })
-            .text_color(if is_selected { palette::BRAND_300 } else { palette::TEXT_MUTED })
+            .border_color(if is_selected {
+                palette::BRAND
+            } else {
+                palette::BORDER
+            })
+            .bg(if is_selected {
+                palette::BG_SIDEBAR
+            } else {
+                palette::BG_PRIMARY
+            })
+            .text_color(if is_selected {
+                palette::BRAND_300
+            } else {
+                palette::TEXT_MUTED
+            })
             .text_sm()
             .cursor_pointer()
             .child(mode.as_str())
@@ -384,9 +440,21 @@ fn render_target_picker(
         .px(px(8.0))
         .py(px(3.0))
         .border_1()
-        .border_color(if is_workspace { palette::BRAND } else { palette::BORDER })
-        .bg(if is_workspace { palette::BG_SIDEBAR } else { palette::BG_PRIMARY })
-        .text_color(if is_workspace { palette::BRAND_300 } else { palette::TEXT_MUTED })
+        .border_color(if is_workspace {
+            palette::BRAND
+        } else {
+            palette::BORDER
+        })
+        .bg(if is_workspace {
+            palette::BG_SIDEBAR
+        } else {
+            palette::BG_PRIMARY
+        })
+        .text_color(if is_workspace {
+            palette::BRAND_300
+        } else {
+            palette::TEXT_MUTED
+        })
         .text_sm()
         .cursor_pointer()
         .child("this workspace")
@@ -409,9 +477,21 @@ fn render_target_picker(
         .px(px(8.0))
         .py(px(3.0))
         .border_1()
-        .border_color(if is_dir { palette::BRAND } else { palette::BORDER })
-        .bg(if is_dir { palette::BG_SIDEBAR } else { palette::BG_PRIMARY })
-        .text_color(if is_dir { palette::BRAND_300 } else { palette::TEXT_MUTED })
+        .border_color(if is_dir {
+            palette::BRAND
+        } else {
+            palette::BORDER
+        })
+        .bg(if is_dir {
+            palette::BG_SIDEBAR
+        } else {
+            palette::BG_PRIMARY
+        })
+        .text_color(if is_dir {
+            palette::BRAND_300
+        } else {
+            palette::TEXT_MUTED
+        })
         .text_sm()
         .cursor_pointer()
         .child(dir_label)
@@ -436,9 +516,21 @@ fn render_target_picker(
         .px(px(8.0))
         .py(px(3.0))
         .border_1()
-        .border_color(if is_clone { palette::BRAND } else { palette::BORDER })
-        .bg(if is_clone { palette::BG_SIDEBAR } else { palette::BG_PRIMARY })
-        .text_color(if is_clone { palette::BRAND_300 } else { palette::TEXT_MUTED })
+        .border_color(if is_clone {
+            palette::BRAND
+        } else {
+            palette::BORDER
+        })
+        .bg(if is_clone {
+            palette::BG_SIDEBAR
+        } else {
+            palette::BG_PRIMARY
+        })
+        .text_color(if is_clone {
+            palette::BRAND_300
+        } else {
+            palette::TEXT_MUTED
+        })
         .text_sm()
         .cursor_pointer()
         .child(clone_label)
@@ -465,8 +557,16 @@ fn render_target_picker(
 
 /// Run button: greyed + non-interactive when `!can_run`.
 fn render_run_button(can_run: bool, on_run: RunCb) -> AnyElement {
-    let bg = if can_run { palette::RUNNING } else { palette::BG_SIDEBAR };
-    let text_color = if can_run { palette::TEXT_PRIMARY } else { palette::TEXT_DIMMEST };
+    let bg = if can_run {
+        palette::RUNNING
+    } else {
+        palette::BG_SIDEBAR
+    };
+    let text_color = if can_run {
+        palette::TEXT_PRIMARY
+    } else {
+        palette::TEXT_DIMMEST
+    };
     let mut btn = div()
         .id("launcher-run")
         .px(px(16.0))
