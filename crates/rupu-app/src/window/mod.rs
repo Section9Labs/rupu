@@ -336,6 +336,153 @@ impl WorkspaceWindow {
             cx.notify();
         }
     }
+
+    pub fn handle_launcher_run(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.launcher.clone() else {
+            return;
+        };
+        if !state.can_run() {
+            return;
+        }
+        // Extract what we need from target before consuming state.
+        enum DispatchKind {
+            Direct(PathBuf),
+            CloneFirst(String),
+            NoOp,
+        }
+        let kind = match &state.target {
+            crate::launcher::LauncherTarget::ThisWorkspace => {
+                DispatchKind::Direct(PathBuf::from(&self.workspace.manifest.path))
+            }
+            crate::launcher::LauncherTarget::Directory(path) => {
+                DispatchKind::Direct(path.clone())
+            }
+            crate::launcher::LauncherTarget::Clone { repo_ref, status } => match status {
+                crate::launcher::CloneStatus::Done(path) => DispatchKind::Direct(path.clone()),
+                crate::launcher::CloneStatus::NotStarted
+                | crate::launcher::CloneStatus::Failed(_) => {
+                    DispatchKind::CloneFirst(repo_ref.clone())
+                }
+                crate::launcher::CloneStatus::InProgress => DispatchKind::NoOp,
+            },
+        };
+        match kind {
+            DispatchKind::Direct(target) => self.spawn_run(state, target, cx),
+            DispatchKind::CloneFirst(repo_ref) => {
+                self.spawn_clone_then_run(state, repo_ref, cx);
+            }
+            DispatchKind::NoOp => {}
+        }
+    }
+
+    fn spawn_clone_then_run(
+        &mut self,
+        state: crate::launcher::LauncherState,
+        repo_ref: String,
+        cx: &mut Context<Self>,
+    ) {
+        // Flip status to InProgress immediately so the UI reflects the
+        // change before the spawn fires.
+        if let Some(s) = self.launcher.as_mut() {
+            if let crate::launcher::LauncherTarget::Clone { status, .. } = &mut s.target {
+                *status = crate::launcher::CloneStatus::InProgress;
+            }
+        }
+        cx.notify();
+
+        let registry = self.app_executor.config_mcp_registry();
+        let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let clone_result =
+                crate::launcher::clone::clone_repo_ref(registry, &repo_ref).await;
+            match clone_result {
+                Ok(path) => {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(s) = this.launcher.as_mut() {
+                            if let crate::launcher::LauncherTarget::Clone { status, .. } =
+                                &mut s.target
+                            {
+                                *status = crate::launcher::CloneStatus::Done(path.clone());
+                            }
+                        }
+                        cx.notify();
+                        this.spawn_run(state.clone(), path, cx);
+                    });
+                }
+                Err(e) => {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(s) = this.launcher.as_mut() {
+                            if let crate::launcher::LauncherTarget::Clone { status, .. } =
+                                &mut s.target
+                            {
+                                *status =
+                                    crate::launcher::CloneStatus::Failed(e.to_string());
+                            }
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_run(
+        &mut self,
+        state: crate::launcher::LauncherState,
+        target_dir: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let app_exec = self.app_executor.clone();
+        let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let workflow_path = state.workflow_path.clone();
+        let inputs = state.inputs.clone();
+        let mode = state.mode;
+        cx.spawn(async move |_, cx| {
+            match app_exec
+                .start_workflow_with_opts(workflow_path.clone(), inputs, mode, target_dir)
+                .await
+            {
+                Ok(run_id) => {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.launcher = None;
+                        this.run_model = Some(crate::run_model::RunModel::new(
+                            run_id.clone(),
+                            workflow_path.clone(),
+                        ));
+                        cx.notify();
+                    });
+                    // Subscribe to the new run's event stream (mirrors
+                    // handle_run_clicked's existing pattern).
+                    if let Ok(mut stream) = app_exec.attach(&run_id).await {
+                        use futures_util::StreamExt;
+                        while let Some(ev) = stream.next().await {
+                            let res = weak.update(cx, |this, cx| {
+                                if let Some(m) = this.run_model.take() {
+                                    this.run_model = Some(m.apply(&ev));
+                                }
+                                cx.notify();
+                            });
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(s) = this.launcher.as_mut() {
+                            s.validation = Some(crate::launcher::ValidationError {
+                                message: format!("start failed: {e}"),
+                            });
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
 }
 
 impl Render for WorkspaceWindow {
@@ -462,9 +609,10 @@ impl Render for WorkspaceWindow {
                     });
                 });
 
-            // `on_run` is wired in Task 10 (dispatch flow). For Task 9,
-            // pass a no-op so the launcher renders cleanly.
-            let on_run: crate::view::launcher::RunCb = Arc::new(|_w, _cx| {});
+            let w4 = weak.clone();
+            let on_run: crate::view::launcher::RunCb = Arc::new(move |_w, cx| {
+                let _ = w4.update(cx, |this, cx| this.handle_launcher_run(cx));
+            });
 
             let w5 = weak.clone();
             let on_close: crate::view::launcher::CloseCb = Arc::new(move |_w, cx| {

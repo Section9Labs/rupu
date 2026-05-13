@@ -65,6 +65,10 @@ impl AppExecutor {
         &self.run_store
     }
 
+    pub fn config_mcp_registry(&self) -> Arc<rupu_scm::Registry> {
+        Arc::clone(&self.config.mcp_registry)
+    }
+
     pub async fn start_workflow(
         &self,
         workflow_path: PathBuf,
