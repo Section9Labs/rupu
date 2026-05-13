@@ -1,0 +1,16 @@
+# Mirrors Zed's .cargo/config.toml because we depend on the gpui /
+# gpui_platform / gpui_macos crates as git deps pinned to a Zed commit.
+# Those crates were built assuming Zed's build settings; reproducing
+# them here keeps text rendering, tokio integration, and backtraces
+# consistent.
+#
+# Specifically: MACOSX_DEPLOYMENT_TARGET = "10.15.7" matters for the
+# Metal/CoreText text rendering path in gpui_macos. Without it, the
+# default deployment target is set by the host SDK, which can cause
+# glyph rasterization to silently produce no output.
+
+[build]
+rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]
+
+[env]
+MACOSX_DEPLOYMENT_TARGET = "10.15.7"
