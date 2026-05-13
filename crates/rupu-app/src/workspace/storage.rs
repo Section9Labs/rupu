@@ -22,6 +22,15 @@ pub fn workspaces_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Returns `<cache>/rupu.app/clones/`. Created on first use.
+pub fn clones_dir() -> Result<PathBuf> {
+    let proj = ProjectDirs::from("dev", "rupu", "rupu.app")
+        .ok_or_else(|| anyhow::anyhow!("no platform cache dir"))?;
+    let dir = proj.cache_dir().join("clones");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Path to a specific workspace's manifest file.
 pub fn manifest_path(workspace_id: &str) -> Result<PathBuf> {
     Ok(workspaces_dir()?.join(format!("{workspace_id}.toml")))
