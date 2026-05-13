@@ -1202,15 +1202,10 @@ async fn run_with_outcome(
                             owner: owner.clone(),
                             repo: repo.clone(),
                         };
-                        let conn = mcp_registry.repo(*platform).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "no {} credential — run `rupu auth login --provider {}`",
-                                platform,
-                                platform
-                            )
-                        })?;
                         let tmp = tempfile::tempdir()?;
-                        conn.clone_to(&r, tmp.path()).await?;
+                        rupu_scm::clone_repo_ref(&mcp_registry, &r, tmp.path())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
                         let p = tmp.path().to_path_buf();
                         (Some(tmp), p)
                     }

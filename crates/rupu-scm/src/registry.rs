@@ -185,6 +185,12 @@ impl Registry {
         self.event_connectors.insert(p, c);
     }
 
+    /// Test/internal: register a `RepoConnector` directly without going
+    /// through `discover`. Used by tests that need a fake connector.
+    pub fn insert_repo_connector(&mut self, p: Platform, c: Arc<dyn RepoConnector>) {
+        self.repo_connectors.insert(p, c);
+    }
+
     /// Returns the per-platform extras handle for GitHub actions, if
     /// GitHub credentials were present during discovery.
     pub fn github_extras(&self) -> Option<Arc<GithubExtras>> {
