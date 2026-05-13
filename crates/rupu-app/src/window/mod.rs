@@ -237,45 +237,12 @@ impl WorkspaceWindow {
     }
 
     /// Called when the user clicks the Run button in the toolbar.
-    /// Starts a new workflow run and subscribes to its event stream.
+    /// Opens the launcher modal with the current workflow.
     pub fn handle_run_clicked(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.current_workflow_path() else {
             return;
         };
-        let app_exec = self.app_executor.clone();
-        let this = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            match app_exec.start_workflow(path.clone()).await {
-                Ok(run_id) => {
-                    let _ = this.update(cx, |this, cx| {
-                        this.run_model = Some(crate::run_model::RunModel::new(
-                            run_id.clone(),
-                            path.clone(),
-                        ));
-                        cx.notify();
-                    });
-                    // Subscribe to the new run's event stream and apply events.
-                    if let Ok(mut stream) = app_exec.attach(&run_id).await {
-                        use futures_util::StreamExt;
-                        while let Some(ev) = stream.next().await {
-                            let res = this.update(cx, |this, cx| {
-                                if let Some(m) = this.run_model.take() {
-                                    this.run_model = Some(m.apply(&ev));
-                                }
-                                cx.notify();
-                            });
-                            if res.is_err() {
-                                break; // window closed
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "start_workflow failed");
-                }
-            }
-        })
-        .detach();
+        self.open_launcher(path, cx);
     }
 
     pub fn open_launcher(&mut self, workflow_path: PathBuf, cx: &mut Context<Self>) {
