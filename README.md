@@ -324,6 +324,16 @@ Detail views that support `--format json` include:
 - `rupu autoflow show`
 - `rupu autoflow explain`
 
+Event/timeline views use a separate contract:
+
+- `rupu transcript show`
+  - `pretty` (default human timeline)
+  - `json`
+  - `jsonl`
+- `rupu workflow show-run`
+  - `pretty` (default human timeline)
+  - `json`
+
 Snapshot views with a custom structured surface:
 
 - `rupu autoflow monitor` (`table` and `json`)

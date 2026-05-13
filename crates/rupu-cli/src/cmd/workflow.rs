@@ -12,7 +12,9 @@
 
 use crate::cmd::completers::workflow_names;
 use crate::output::formats::OutputFormat;
-use crate::output::report::{self, CollectionOutput, DetailOutput};
+use crate::output::palette::Status as UiStatus;
+use crate::output::report::{self, CollectionOutput, DetailOutput, EventOutput};
+use crate::output::LineStreamPrinter;
 use crate::paths;
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
@@ -243,7 +245,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::List => ("workflow list", report::TABLE_JSON_CSV),
         Action::Show { .. } => ("workflow show", report::TABLE_JSON),
         Action::Runs { .. } => ("workflow runs", report::TABLE_JSON_CSV),
-        Action::ShowRun { .. } => ("workflow show-run", report::TABLE_JSON),
+        Action::ShowRun { .. } => ("workflow show-run", report::PRETTY_TABLE_JSON),
         Action::Edit { .. } => ("workflow edit", report::TABLE_ONLY),
         Action::Run { .. } => ("workflow run", report::TABLE_ONLY),
         Action::Approve { .. } => ("workflow approve", report::TABLE_ONLY),
@@ -507,109 +509,159 @@ impl DetailOutput for WorkflowShowOutput {
     }
 }
 
-impl DetailOutput for WorkflowShowRunOutput {
+impl EventOutput for WorkflowShowRunOutput {
     type JsonReport = WorkflowShowRunReport;
+    type JsonlRow = serde_json::Value;
 
     fn command_name(&self) -> &'static str {
         "workflow show-run"
+    }
+
+    fn supported_formats(&self) -> &'static [OutputFormat] {
+        report::PRETTY_TABLE_JSON
     }
 
     fn json_report(&self) -> &Self::JsonReport {
         &self.report
     }
 
-    fn render_human(&self) -> anyhow::Result<()> {
+    fn render_pretty(&self) -> anyhow::Result<()> {
         let item = &self.report.item;
-        println!("Run        : {}", item.run_id);
-        println!("Workflow   : {}", item.workflow);
-        println!("Status     : {}", item.status);
-        println!(
-            "Workspace  : {} ({})",
-            item.workspace_id, item.workspace_path
-        );
-        println!("Started    : {}", item.started_at);
-        if let Some(fin) = item.finished_at.as_deref() {
-            println!("Finished   : {fin}");
-        }
-        if !item.inputs.is_empty() {
-            println!("Inputs     :");
-            for (k, v) in &item.inputs {
-                println!("  {k} = {v}");
-            }
-        }
-        if let Some(err) = item.error.as_deref() {
-            println!("Error      : {err}");
-        }
-        if let Some(step) = item.awaiting_step.as_deref() {
-            println!("Awaiting   : {step}");
-        }
+        render_pretty_workflow_run(item)
+    }
+}
+
+fn render_pretty_workflow_run(item: &WorkflowShowRunItem) -> anyhow::Result<()> {
+    let mut printer = LineStreamPrinter::new();
+    let started_at = chrono::DateTime::parse_from_str(&item.started_at, "%Y-%m-%d %H:%M:%S UTC")
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now());
+
+    printer.workflow_header(&item.workflow, &item.run_id, started_at);
+    printer.sideband_event(
+        workflow_run_status(item.status.as_str()),
+        "status",
+        Some(&item.status),
+    );
+
+    let workspace = format!("{}  ·  {}", item.workspace_id, item.workspace_path);
+    printer.sideband_event(UiStatus::Active, "workspace", Some(&workspace));
+    printer.sideband_event(UiStatus::Active, "started", Some(&item.started_at));
+
+    if let Some(finished_at) = item.finished_at.as_deref() {
+        printer.sideband_event(UiStatus::Complete, "finished", Some(finished_at));
+    }
+    if let Some(error) = item.error.as_deref() {
+        printer.sideband_event(UiStatus::Failed, "error", Some(error));
+    }
+    if let Some(step) = item.awaiting_step.as_deref() {
+        let mut detail = step.to_string();
         if let Some(since) = item.awaiting_since.as_deref() {
-            println!("Paused at  : {since}");
+            detail.push_str(&format!("  ·  since {since}"));
         }
         if let Some(expires) = item.expires_at.as_deref() {
-            println!("Expires    : {expires}");
+            detail.push_str(&format!("  ·  expires {expires}"));
         }
-        println!();
-        println!("STEPS ({}):", item.steps.len());
-        for row in &item.steps {
-            println!(
-                "  [{:<7}] {:<24} -> {}",
-                row.status, row.step_id, row.transcript_path
+        printer.sideband_event(UiStatus::Awaiting, "awaiting", Some(&detail));
+    }
+
+    for (key, value) in &item.inputs {
+        let detail = format!("{key} = {}", truncate_pretty(value, 72));
+        printer.sideband_event(UiStatus::Active, "input", Some(&detail));
+    }
+
+    if !item.steps.is_empty() {
+        printer.phase_separator();
+        for step in &item.steps {
+            let detail = format!(
+                "{}  ·  {}",
+                step.status,
+                truncate_pretty(&step.transcript_path, 72)
             );
-            for sub in &row.items {
-                println!(
-                    "     [{:<7}] {:<22} -> {}",
-                    sub.status, sub.label, sub.transcript_path
+            printer.sideband_event(
+                workflow_step_status(step.status.as_str()),
+                &format!("step {}", step.step_id),
+                Some(&detail),
+            );
+            for child in &step.items {
+                let sub_detail = format!(
+                    "{}  ·  {}",
+                    child.status,
+                    truncate_pretty(&child.transcript_path, 68)
+                );
+                printer.sideband_event(
+                    workflow_step_status(child.status.as_str()),
+                    &format!("item {}", child.label),
+                    Some(&sub_detail),
                 );
             }
         }
-        if !item.usage_rows.is_empty() {
-            println!();
-            println!("USAGE:");
-            let mut t = crate::output::tables::new_table();
-            t.set_header(vec![
-                "PROVIDER",
-                "MODEL",
-                "AGENT",
-                "INPUT",
-                "OUTPUT",
-                "CACHED",
-                "COST (USD)",
-            ]);
-            for row in &item.usage_rows {
-                t.add_row(vec![
-                    comfy_table::Cell::new(&row.provider),
-                    comfy_table::Cell::new(&row.model),
-                    comfy_table::Cell::new(&row.agent),
-                    comfy_table::Cell::new(row.input_tokens.to_string()),
-                    comfy_table::Cell::new(row.output_tokens.to_string()),
-                    comfy_table::Cell::new(row.cached_tokens.to_string()),
-                    comfy_table::Cell::new(
-                        row.cost_usd
-                            .map(|value| format!("${value:.4}"))
-                            .unwrap_or_else(|| "—".into()),
-                    ),
-                ]);
-            }
-            if let Some(totals) = &item.usage_totals {
-                t.add_row(vec![
-                    comfy_table::Cell::new("TOTAL"),
-                    comfy_table::Cell::new(""),
-                    comfy_table::Cell::new(""),
-                    comfy_table::Cell::new(totals.input_tokens.to_string()),
-                    comfy_table::Cell::new(totals.output_tokens.to_string()),
-                    comfy_table::Cell::new(totals.cached_tokens.to_string()),
-                    comfy_table::Cell::new(
-                        totals
-                            .cost_usd
-                            .map(|value| format!("${value:.4}"))
-                            .unwrap_or_else(|| "—".into()),
-                    ),
-                ]);
-            }
-            println!("{t}");
+    }
+
+    if !item.usage_rows.is_empty() {
+        printer.phase_separator();
+        for row in &item.usage_rows {
+            let detail = format!(
+                "{} · {} · {}  ·  in {} out {} cached {}{}",
+                row.provider,
+                row.model,
+                row.agent,
+                row.input_tokens,
+                row.output_tokens,
+                row.cached_tokens,
+                row.cost_usd
+                    .map(|value| format!("  ·  ${value:.4}"))
+                    .unwrap_or_default()
+            );
+            printer.sideband_event(UiStatus::Active, "usage", Some(&detail));
         }
-        Ok(())
+        if let Some(totals) = &item.usage_totals {
+            let detail = format!(
+                "in {} out {} cached {}{}",
+                totals.input_tokens,
+                totals.output_tokens,
+                totals.cached_tokens,
+                totals
+                    .cost_usd
+                    .map(|value| format!("  ·  ${value:.4}"))
+                    .unwrap_or_default()
+            );
+            printer.sideband_event(UiStatus::Complete, "usage total", Some(&detail));
+        }
+    }
+
+    Ok(())
+}
+
+fn workflow_run_status(status: &str) -> UiStatus {
+    match status {
+        "completed" => UiStatus::Complete,
+        "failed" | "rejected" => UiStatus::Failed,
+        "awaiting_approval" => UiStatus::Awaiting,
+        "running" => UiStatus::Working,
+        _ => UiStatus::Active,
+    }
+}
+
+fn workflow_step_status(status: &str) -> UiStatus {
+    match status {
+        "ok" | "completed" => UiStatus::Complete,
+        "fail" | "failed" => UiStatus::Failed,
+        "skipped" => UiStatus::Skipped,
+        _ => UiStatus::Active,
+    }
+}
+
+fn truncate_pretty(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_string()
+    } else {
+        let mut out = value
+            .chars()
+            .take(max.saturating_sub(1))
+            .collect::<String>();
+        out.push('…');
+        out
     }
 }
 
@@ -1045,7 +1097,7 @@ async fn show_run(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::
         },
     };
     let _ = prefs;
-    report::emit_detail(global_format, &output)
+    report::emit_event(global_format, &output)
 }
 
 async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {

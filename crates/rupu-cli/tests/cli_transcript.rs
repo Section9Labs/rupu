@@ -151,6 +151,51 @@ async fn show_supports_json_output() {
 }
 
 #[tokio::test]
+async fn show_supports_jsonl_output() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+
+    let transcripts_dir = global.path().join("transcripts");
+    write_transcript(&transcripts_dir, "run_jsonl123", "jsonl-agent", 88);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "jsonl", "transcript", "show", "run_jsonl123"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"type\":\"run_start\""))
+        .stdout(predicate::str::contains("\"type\":\"run_complete\""));
+}
+
+#[tokio::test]
+async fn show_supports_pretty_output() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+
+    let transcripts_dir = global.path().join("transcripts");
+    write_transcript(&transcripts_dir, "run_pretty123", "pretty-agent", 55);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "pretty", "transcript", "show", "run_pretty123"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pretty-agent"))
+        .stdout(predicate::str::contains("run started"))
+        .stdout(predicate::str::contains("run complete"));
+}
+
+#[tokio::test]
 async fn list_csv_with_no_rows_emits_headers() {
     let _guard = ENV_LOCK.lock().await;
 
