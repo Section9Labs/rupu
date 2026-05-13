@@ -514,15 +514,16 @@ impl Render for WorkspaceWindow {
         let run_model = self.run_model.clone();
         let transcript_lines = self.transcript_lines.clone();
 
-        // Build approve / reject callbacks via WeakEntity so the closures
-        // can update `self` when invoked from click handlers. WeakEntity
-        // is Send + 'static, making it suitable for Arc<dyn Fn(...)> callbacks.
+        // One cx.weak_entity() call for the whole render frame. All
+        // callback closures share clones of this WeakEntity so we never
+        // call cx.weak_entity() again mid-render (each extra call would
+        // re-borrow the context and risk a RefCell conflict).
         let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
-        // Pre-clone for sidebar workflow-click callbacks (D-4) before `weak`
-        // is consumed by the on_approve closure below.
         let weak_sidebar_click = weak.clone();
         let weak_sidebar_right = weak.clone();
         let weak2 = weak.clone();
+        // Pre-cloned for the launcher overlay branch below.
+        let weak_launcher = weak.clone();
         let on_approve: ApproveCallback =
             Arc::new(move |step_id: String, window: &mut Window, cx: &mut App| {
                 let _ = window;
@@ -562,7 +563,6 @@ impl Render for WorkspaceWindow {
             Some(asset) => {
                 let wf_path = asset.path.clone();
                 let has_active = active_run_map.contains_key(&wf_path);
-                let weak_run = cx.weak_entity();
                 render_main_for_workflow(
                     asset,
                     run_model.as_ref(),
@@ -570,7 +570,7 @@ impl Render for WorkspaceWindow {
                     on_approve.clone(),
                     on_reject.clone(),
                     has_active,
-                    weak_run,
+                    weak_sidebar_click.clone(),
                 )
             }
             None => render_main_placeholder(),
@@ -615,7 +615,9 @@ impl Render for WorkspaceWindow {
             );
 
         let body: AnyElement = if let Some(state) = self.launcher.clone() {
-            let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+            // Reuse the WeakEntity pre-cloned above (weak_launcher) rather
+            // than calling cx.weak_entity() again mid-render.
+            let weak = weak_launcher;
 
             let w1 = weak.clone();
             let on_input_change: crate::view::launcher::InputChangeCb =
