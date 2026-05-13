@@ -405,6 +405,7 @@ Standalone transcript lifecycle:
 - `rupu transcript delete <run-id> --force`
 - `rupu transcript prune [--older-than 30d] [--dry-run]`
 - `rupu cleanup [--older-than 30d] [--dry-run] [--sessions|--transcripts]`
+- `rupu cleanup --stats [--sessions|--transcripts]`
 
 Transcript archive/delete is only available for standalone runs. If a transcript is owned
 by a session, manage it through `rupu session archive|delete` instead.
@@ -420,6 +421,7 @@ Retention defaults:
 - default: clean archived sessions and archived standalone transcripts together
 - `--sessions`: only archived sessions
 - `--transcripts`: only archived standalone transcripts
+- `--stats`: show resource counts and byte totals instead of deleting
 - `--dry-run`: preview deletions without removing files
 
 Example global config:
