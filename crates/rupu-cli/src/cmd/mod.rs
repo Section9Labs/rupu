@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod models;
 pub mod repos;
 pub mod run;
+pub mod session;
 pub mod transcript;
 pub mod ui;
 pub mod usage;

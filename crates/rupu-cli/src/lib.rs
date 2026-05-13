@@ -79,6 +79,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::repos::Action,
     },
+    /// Persistent agent sessions.
+    Session {
+        #[command(subcommand)]
+        action: cmd::session::Action,
+    },
     /// Issue-tracker operations (list / show / run a workflow).
     Issues {
         #[command(subcommand)]
@@ -151,6 +156,12 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         cli.command,
         Cmd::Run(_)
             | Cmd::Watch(_)
+            | Cmd::Session {
+                action: cmd::session::Action::Start(_)
+                    | cmd::session::Action::Send(_)
+                    | cmd::session::Action::Attach { .. }
+                    | cmd::session::Action::RunTurn(_)
+            }
             | Cmd::Workflow {
                 action: cmd::workflow::Action::Run { .. }
             }
@@ -174,6 +185,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Auth { action } => cmd::auth::handle(action, cli.format).await,
         Cmd::Models { action } => cmd::models::handle(action, cli.format).await,
         Cmd::Repos { action } => cmd::repos::handle(action, cli.format).await,
+        Cmd::Session { action } => cmd::session::handle(action, cli.format).await,
         Cmd::Issues { action } => cmd::issues::handle(action, cli.format).await,
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
@@ -207,6 +219,7 @@ fn ensure_output_format_supported(
         Cmd::Auth { action } => cmd::auth::ensure_output_format(action, format),
         Cmd::Models { action } => cmd::models::ensure_output_format(action, format),
         Cmd::Repos { action } => cmd::repos::ensure_output_format(action, format),
+        Cmd::Session { action } => cmd::session::ensure_output_format(action, format),
         Cmd::Issues { action } => cmd::issues::ensure_output_format(action, format),
         Cmd::Init(_) => output::formats::ensure_supported(
             "init",
