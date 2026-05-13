@@ -1,9 +1,12 @@
 //! `rupu models list | refresh`.
 
+use crate::output::formats::OutputFormat;
+use crate::output::report::{self, CollectionOutput};
 use std::process::ExitCode;
 
 use clap::Subcommand;
 use rupu_providers::{ModelRegistry, ModelSource};
+use serde::Serialize;
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
@@ -21,9 +24,9 @@ pub enum Action {
     },
 }
 
-pub async fn handle(action: Action) -> ExitCode {
+pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     match action {
-        Action::List { provider } => match list(provider).await {
+        Action::List { provider } => match list(provider, global_format).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("rupu models list: {e}");
@@ -40,14 +43,87 @@ pub async fn handle(action: Action) -> ExitCode {
     }
 }
 
+pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
+    let (command_name, supported) = match action {
+        Action::List { .. } => ("models list", report::TABLE_JSON_CSV),
+        Action::Refresh { .. } => ("models refresh", report::TABLE_ONLY),
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
+}
+
 const PROVIDERS: [&str; 4] = ["anthropic", "openai", "gemini", "copilot"];
 
-async fn list(filter: Option<String>) -> anyhow::Result<()> {
+#[derive(Serialize)]
+struct ModelListRow {
+    provider: String,
+    model: String,
+    source: String,
+    context: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ModelListCsvRow {
+    provider: String,
+    model: String,
+    source: String,
+    context: String,
+}
+
+#[derive(Serialize)]
+struct ModelListReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<ModelListRow>,
+}
+
+struct ModelListOutput {
+    report: ModelListReport,
+    csv_rows: Vec<ModelListCsvRow>,
+}
+
+impl CollectionOutput for ModelListOutput {
+    type JsonReport = ModelListReport;
+    type CsvRow = ModelListCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "models list"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["provider", "model", "source", "context"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["PROVIDER", "MODEL", "SOURCE", "CONTEXT"]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                comfy_table::Cell::new(&row.provider),
+                comfy_table::Cell::new(&row.model),
+                comfy_table::Cell::new(&row.source),
+                comfy_table::Cell::new(
+                    row.context
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+async fn list(filter: Option<String>, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let registry = build_registry().await?;
-    println!(
-        "{:<10} {:<32} {:<10} CONTEXT",
-        "PROVIDER", "MODEL", "SOURCE"
-    );
+    let mut rows = Vec::new();
     for p in &PROVIDERS {
         if let Some(only) = &filter {
             if only != p {
@@ -61,15 +137,35 @@ async fn list(filter: Option<String>) -> anyhow::Result<()> {
                 ModelSource::Live => "live",
                 ModelSource::BakedIn => "baked-in",
             };
-            let ctx = if m.entry.context_window > 0 {
-                m.entry.context_window.to_string()
-            } else {
-                "-".to_string()
-            };
-            println!("{:<10} {:<32} {:<10} {}", p, m.entry.id, src, ctx);
+            rows.push(ModelListRow {
+                provider: (*p).to_string(),
+                model: m.entry.id,
+                source: src.to_string(),
+                context: (m.entry.context_window > 0).then_some(m.entry.context_window.into()),
+            });
         }
     }
-    Ok(())
+    let csv_rows: Vec<ModelListCsvRow> = rows
+        .iter()
+        .map(|row| ModelListCsvRow {
+            provider: row.provider.clone(),
+            model: row.model.clone(),
+            source: row.source.clone(),
+            context: row
+                .context
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        })
+        .collect();
+    let output = ModelListOutput {
+        report: ModelListReport {
+            kind: "model_list",
+            version: 1,
+            rows,
+        },
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
 }
 
 async fn refresh(filter: Option<String>) -> anyhow::Result<()> {

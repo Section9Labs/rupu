@@ -11,10 +11,13 @@
 //! `show <run_id>` finds `<run_id>.jsonl` in either transcripts directory
 //! and pretty-prints each event as JSON.
 
+use crate::output::formats::OutputFormat;
+use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::paths;
 use clap::Subcommand;
 use comfy_table::Cell;
 use rupu_transcript::{JsonlReader, RunStatus};
+use serde::Serialize;
 use std::cmp::Reverse;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,15 +35,23 @@ pub enum Action {
     Show { run_id: String },
 }
 
-pub async fn handle(action: Action) -> ExitCode {
+pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
-        Action::List { no_color } => list(no_color).await,
-        Action::Show { run_id } => show(&run_id).await,
+        Action::List { no_color } => list(no_color, global_format).await,
+        Action::Show { run_id } => show(&run_id, global_format).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => crate::output::diag::fail(e),
     }
+}
+
+pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
+    let (command_name, supported) = match action {
+        Action::List { .. } => ("transcript list", report::TABLE_JSON_CSV),
+        Action::Show { .. } => ("transcript show", report::TABLE_JSON),
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
 }
 
 /// Truncate to a single-line preview — strip newlines, collapse runs
@@ -73,7 +84,135 @@ fn one_line_preview(s: &str, max: usize) -> String {
     out
 }
 
-async fn list(no_color: bool) -> anyhow::Result<()> {
+#[derive(Serialize)]
+struct TranscriptListRow {
+    run_id: String,
+    title: Option<String>,
+    agent: String,
+    status: String,
+    total_tokens: u64,
+    started_at: String,
+}
+
+#[derive(Serialize)]
+struct TranscriptListCsvRow {
+    run_id: String,
+    title: String,
+    agent: String,
+    status: String,
+    total_tokens: u64,
+    started_at: String,
+}
+
+#[derive(Serialize)]
+struct TranscriptListReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<TranscriptListRow>,
+}
+
+struct TranscriptListOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: TranscriptListReport,
+    csv_rows: Vec<TranscriptListCsvRow>,
+}
+
+#[derive(Serialize)]
+struct TranscriptShowItem {
+    run_id: String,
+    path: String,
+    events: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct TranscriptShowReport {
+    kind: &'static str,
+    version: u8,
+    item: TranscriptShowItem,
+}
+
+struct TranscriptShowOutput {
+    report: TranscriptShowReport,
+}
+
+impl CollectionOutput for TranscriptListOutput {
+    type JsonReport = TranscriptListReport;
+    type CsvRow = TranscriptListCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "transcript list"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "run_id",
+            "title",
+            "agent",
+            "status",
+            "total_tokens",
+            "started_at",
+        ])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec![
+            "RUN ID", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
+        ]);
+        for row in &self.report.rows {
+            let title_cell = match &row.title {
+                Some(title) => Cell::new(one_line_preview(title, 60)),
+                None => {
+                    if self.prefs.use_color() {
+                        Cell::new("\x1b[2m—\x1b[0m")
+                    } else {
+                        Cell::new("—")
+                    }
+                }
+            };
+            table.add_row(vec![
+                Cell::new(&row.run_id),
+                title_cell,
+                Cell::new(&row.agent),
+                crate::output::tables::status_cell(&row.status, &self.prefs),
+                Cell::new(row.total_tokens.to_string()),
+                Cell::new(&row.started_at),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+impl DetailOutput for TranscriptShowOutput {
+    type JsonReport = TranscriptShowReport;
+
+    fn command_name(&self) -> &'static str {
+        "transcript show"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn render_human(&self) -> anyhow::Result<()> {
+        for event in &self.report.item.events {
+            let pretty = serde_json::to_string_pretty(event)?;
+            println!("{pretty}");
+        }
+        Ok(())
+    }
+}
+
+async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -127,7 +266,12 @@ async fn list(no_color: bool) -> anyhow::Result<()> {
     // Sort newest first.
     rows.sort_by_key(|r| Reverse(r.started_at));
 
-    if rows.is_empty() {
+    if rows.is_empty()
+        && matches!(
+            global_format.unwrap_or(OutputFormat::Table),
+            OutputFormat::Table
+        )
+    {
         println!("(no transcripts yet — `rupu run <agent>` to create one)");
         return Ok(());
     }
@@ -140,48 +284,62 @@ async fn list(no_color: bool) -> anyhow::Result<()> {
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default()
     };
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
-
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec![
-        "RUN ID", "TITLE", "AGENT", "STATUS", "TOKENS", "STARTED",
-    ]);
-    for r in &rows {
-        let status_str = match r.status {
-            RunStatus::Ok => "completed",
-            RunStatus::Error => "failed",
-            RunStatus::Aborted => "rejected",
-        };
-        let title_cell = match &r.title {
-            Some(t) => Cell::new(one_line_preview(t, 60)),
-            None => {
-                if prefs.use_color() {
-                    Cell::new("\x1b[2m—\x1b[0m")
-                } else {
-                    Cell::new("—")
-                }
-            }
-        };
-        table.add_row(vec![
-            Cell::new(&r.run_id),
-            title_cell,
-            Cell::new(&r.agent),
-            crate::output::tables::status_cell(status_str, &prefs),
-            Cell::new(r.total_tokens.to_string()),
-            Cell::new(r.started_at.format("%Y-%m-%d %H:%M:%S").to_string()),
-        ]);
-    }
-    println!("{table}");
-    Ok(())
+    let report_rows: Vec<TranscriptListRow> = rows
+        .iter()
+        .map(|row| TranscriptListRow {
+            run_id: row.run_id.clone(),
+            title: row.title.clone(),
+            agent: row.agent.clone(),
+            status: match row.status {
+                RunStatus::Ok => "completed".to_string(),
+                RunStatus::Error => "failed".to_string(),
+                RunStatus::Aborted => "rejected".to_string(),
+            },
+            total_tokens: row.total_tokens,
+            started_at: row.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        })
+        .collect();
+    let csv_rows: Vec<TranscriptListCsvRow> = report_rows
+        .iter()
+        .map(|row| TranscriptListCsvRow {
+            run_id: row.run_id.clone(),
+            title: row.title.clone().unwrap_or_default(),
+            agent: row.agent.clone(),
+            status: row.status.clone(),
+            total_tokens: row.total_tokens,
+            started_at: row.started_at.clone(),
+        })
+        .collect();
+    let output = TranscriptListOutput {
+        prefs,
+        report: TranscriptListReport {
+            kind: "transcript_list",
+            version: 1,
+            rows: report_rows,
+        },
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
 }
 
-async fn show(run_id: &str) -> anyhow::Result<()> {
+async fn show(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let path = locate_transcript(run_id)?;
+    let mut events = Vec::new();
     for event in JsonlReader::iter(&path)? {
-        let event = event?;
-        let pretty = serde_json::to_string_pretty(&event)?;
-        println!("{pretty}");
+        events.push(serde_json::to_value(event?)?);
     }
-    Ok(())
+    let output = TranscriptShowOutput {
+        report: TranscriptShowReport {
+            kind: "transcript_show",
+            version: 1,
+            item: TranscriptShowItem {
+                run_id: run_id.to_string(),
+                path: path.display().to_string(),
+                events,
+            },
+        },
+    };
+    report::emit_detail(global_format, &output)
 }
 
 fn locate_transcript(run_id: &str) -> anyhow::Result<PathBuf> {

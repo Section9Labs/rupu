@@ -7,11 +7,14 @@
 //! and parses common SSH / HTTPS / shorthand forms into a `RepoRef`.
 
 use crate::cmd::completers::workflow_names;
+use crate::output::formats::OutputFormat;
+use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::paths;
 use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
 use comfy_table::{Cell, ColumnConstraint, Width};
 use rupu_scm::{IssueFilter, IssueRef, IssueState, IssueTracker, Platform, Registry, RepoRef};
+use serde::Serialize;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -79,10 +82,10 @@ pub struct RunArgs {
     pub mode: Option<String>,
 }
 
-pub async fn handle(action: Action) -> ExitCode {
+pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
-        Action::List(a) => list(a).await,
-        Action::Show(a) => show(a).await,
+        Action::List(a) => list(a, global_format).await,
+        Action::Show(a) => show(a, global_format).await,
         Action::Run(a) => run(a).await,
     };
     match result {
@@ -91,7 +94,165 @@ pub async fn handle(action: Action) -> ExitCode {
     }
 }
 
-async fn list(args: ListArgs) -> anyhow::Result<()> {
+pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
+    let (command_name, supported) = match action {
+        Action::List(_) => ("issues list", report::TABLE_JSON_CSV),
+        Action::Show(_) => ("issues show", report::TABLE_JSON),
+        Action::Run(_) => ("issues run", report::TABLE_ONLY),
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
+}
+
+#[derive(Serialize)]
+struct IssueListRow {
+    number: u64,
+    state: String,
+    labels: Vec<String>,
+    label_colors: std::collections::BTreeMap<String, String>,
+    author: String,
+    title: String,
+}
+
+#[derive(Serialize)]
+struct IssueListCsvRow {
+    number: u64,
+    state: String,
+    labels: String,
+    author: String,
+    title: String,
+}
+
+#[derive(Serialize)]
+struct IssueListSummary {
+    repo: String,
+    state_filter: String,
+    labels_filter: Vec<String>,
+    count: usize,
+}
+
+#[derive(Serialize)]
+struct IssueListReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<IssueListRow>,
+    summary: IssueListSummary,
+}
+
+struct IssueListOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: IssueListReport,
+    csv_rows: Vec<IssueListCsvRow>,
+}
+
+#[derive(Serialize)]
+struct IssueShowItem {
+    issue_ref: String,
+    tracker: String,
+    project: String,
+    number: u64,
+    title: String,
+    state: String,
+    author: String,
+    labels: Vec<String>,
+    created_at: String,
+    updated_at: String,
+    body: String,
+}
+
+#[derive(Serialize)]
+struct IssueShowReport {
+    kind: &'static str,
+    version: u8,
+    item: IssueShowItem,
+}
+
+struct IssueShowOutput {
+    report: IssueShowReport,
+}
+
+impl CollectionOutput for IssueListOutput {
+    type JsonReport = IssueListReport;
+    type CsvRow = IssueListCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "issues list"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["number", "state", "labels", "author", "title"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["#", "STATE", "LABELS", "AUTHOR", "TITLE"]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                Cell::new(row.number.to_string()),
+                crate::output::tables::status_cell(&row.state, &self.prefs),
+                Cell::new(crate::output::tables::label_chips_with_colors_capped(
+                    &row.labels,
+                    &row.label_colors,
+                    &self.prefs,
+                    3,
+                )),
+                Cell::new(&row.author),
+                Cell::new(truncate(&row.title, 60)),
+            ]);
+        }
+        if let Some(col) = table.column_mut(2) {
+            col.set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(48)));
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+impl DetailOutput for IssueShowOutput {
+    type JsonReport = IssueShowReport;
+
+    fn command_name(&self) -> &'static str {
+        "issues show"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn render_human(&self) -> anyhow::Result<()> {
+        let item = &self.report.item;
+        println!("Issue   : #{} on {}", item.number, item.project);
+        println!("Title   : {}", item.title);
+        println!("State   : {}", item.state);
+        println!("Author  : {}", item.author);
+        println!(
+            "Labels  : {}",
+            if item.labels.is_empty() {
+                "-".into()
+            } else {
+                item.labels.join(", ")
+            }
+        );
+        println!("Created : {}", item.created_at);
+        println!("Updated : {}", item.updated_at);
+        println!();
+        if item.body.trim().is_empty() {
+            println!("(no body)");
+        } else {
+            println!("{}", item.body.trim_end());
+        }
+        Ok(())
+    }
+}
+
+async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let (registry, global, project_root) = build_registry().await?;
     let repo = resolve_repo_or_autodetect(args.repo.as_deref())?;
     let tracker = repo_to_issue_tracker(repo.platform);
@@ -120,7 +281,12 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
     let project = format!("{}/{}", repo.owner, repo.repo);
     let issues = conn.list_issues(&project, filter).await?;
 
-    if issues.is_empty() {
+    if issues.is_empty()
+        && matches!(
+            global_format.unwrap_or(OutputFormat::Table),
+            OutputFormat::Table
+        )
+    {
         // Empty results go to stdout so `rupu issues list ... | wc -l`
         // and similar pipelines see a clean "(none)" line. Echoing
         // `all_labels` (the merged --label + --labels set) tells the
@@ -134,41 +300,46 @@ async fn list(args: ListArgs) -> anyhow::Result<()> {
 
     let cfg = layered_config(&global, project_root.as_deref());
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None);
-
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec!["#", "STATE", "LABELS", "AUTHOR", "TITLE"]);
-    for i in &issues {
-        let state = match i.state {
-            IssueState::Open => "open",
-            IssueState::Closed => "closed",
-        };
-        // Truncate long titles so the table stays one-row-per-issue
-        // in narrow terminals. `comfy_table` Dynamic arrangement
-        // handles soft-wrap but a hard cap reads cleaner here.
-        let title = truncate(&i.title, 60);
-        table.add_row(vec![
-            Cell::new(i.r.number.to_string()),
-            crate::output::tables::status_cell(state, &prefs),
-            Cell::new(crate::output::tables::label_chips_with_colors_capped(
-                &i.labels,
-                &i.label_colors,
-                &prefs,
-                3,
-            )),
-            Cell::new(i.author.clone()),
-            Cell::new(title),
-        ]);
-    }
-    // Pin the LABELS column to its capped width so issues with many
-    // labels don't push comfy-table's Dynamic arrangement into wrapping
-    // each chip onto its own line. The 3-chip cap above keeps the cell
-    // bounded, but we still need to tell the layout engine not to use
-    // this column as the wrap target. TITLE remains the wrap fallback.
-    if let Some(col) = table.column_mut(2) {
-        col.set_constraint(ColumnConstraint::UpperBoundary(Width::Fixed(48)));
-    }
-    println!("{table}");
-    Ok(())
+    let rows: Vec<IssueListRow> = issues
+        .iter()
+        .map(|issue| IssueListRow {
+            number: issue.r.number,
+            state: match issue.state {
+                IssueState::Open => "open".to_string(),
+                IssueState::Closed => "closed".to_string(),
+            },
+            labels: issue.labels.clone(),
+            label_colors: issue.label_colors.clone(),
+            author: issue.author.clone(),
+            title: issue.title.clone(),
+        })
+        .collect();
+    let csv_rows: Vec<IssueListCsvRow> = rows
+        .iter()
+        .map(|row| IssueListCsvRow {
+            number: row.number,
+            state: row.state.clone(),
+            labels: row.labels.join(","),
+            author: row.author.clone(),
+            title: row.title.clone(),
+        })
+        .collect();
+    let output = IssueListOutput {
+        prefs,
+        report: IssueListReport {
+            kind: "issue_list",
+            version: 1,
+            summary: IssueListSummary {
+                repo: project,
+                state_filter: args.state.clone(),
+                labels_filter: all_labels,
+                count: rows.len(),
+            },
+            rows,
+        },
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
 }
 
 fn layered_config(
@@ -181,7 +352,7 @@ fn layered_config(
         .unwrap_or_default()
 }
 
-async fn show(args: ShowArgs) -> anyhow::Result<()> {
+async fn show(args: ShowArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let (registry, _global, _project_root) = build_registry().await?;
     let issue_ref = resolve_issue_ref(&args.r#ref)?;
     let conn = registry.issues(issue_ref.tracker).ok_or_else(|| {
@@ -196,33 +367,27 @@ async fn show(args: ShowArgs) -> anyhow::Result<()> {
         IssueState::Open => "open",
         IssueState::Closed => "closed",
     };
-    println!("Issue   : #{} on {}", issue.r.number, issue.r.project);
-    println!("Title   : {}", issue.title);
-    println!("State   : {state}");
-    println!("Author  : {}", issue.author);
-    println!(
-        "Labels  : {}",
-        if issue.labels.is_empty() {
-            "-".into()
-        } else {
-            issue.labels.join(", ")
-        }
-    );
-    println!(
-        "Created : {}",
-        issue.created_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-    println!(
-        "Updated : {}",
-        issue.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-    println!();
-    if issue.body.trim().is_empty() {
-        println!("(no body)");
-    } else {
-        println!("{}", issue.body.trim_end());
-    }
-    Ok(())
+    let report = IssueShowReport {
+        kind: "issue_show",
+        version: 1,
+        item: IssueShowItem {
+            issue_ref: format!(
+                "{}:{}/issues/{}",
+                issue.r.tracker, issue.r.project, issue.r.number
+            ),
+            tracker: issue.r.tracker.to_string(),
+            project: issue.r.project.clone(),
+            number: issue.r.number,
+            title: issue.title.clone(),
+            state: state.into(),
+            author: issue.author.clone(),
+            labels: issue.labels.clone(),
+            created_at: issue.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            updated_at: issue.updated_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            body: issue.body,
+        },
+    };
+    report::emit_detail(global_format, &IssueShowOutput { report })
 }
 
 async fn run(args: RunArgs) -> anyhow::Result<()> {

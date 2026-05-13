@@ -133,12 +133,12 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         }
     };
 
-    if let Some(format) = cli.format {
-        if !supports_structured_output(&cli.command) {
-            eprintln!(
-                "`rupu {}` does not support structured `--format {format}` output yet",
-                command_name(&cli.command)
-            );
+    if let Some(format) = cli
+        .format
+        .filter(|format| *format != output::formats::OutputFormat::Table)
+    {
+        if let Err(error) = ensure_output_format_supported(&cli.command, format) {
+            eprintln!("{error}");
             return ExitCode::from(2);
         }
     }
@@ -166,18 +166,18 @@ pub async fn run(args: Vec<String>) -> ExitCode {
 
     match cli.command {
         Cmd::Run(args) => cmd::run::handle(args).await,
-        Cmd::Agent { action } => cmd::agent::handle(action).await,
-        Cmd::Workflow { action } => cmd::workflow::handle(action).await,
+        Cmd::Agent { action } => cmd::agent::handle(action, cli.format).await,
+        Cmd::Workflow { action } => cmd::workflow::handle(action, cli.format).await,
         Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
-        Cmd::Transcript { action } => cmd::transcript::handle(action).await,
+        Cmd::Transcript { action } => cmd::transcript::handle(action, cli.format).await,
         Cmd::Config { action } => cmd::config::handle(action).await,
-        Cmd::Auth { action } => cmd::auth::handle(action).await,
-        Cmd::Models { action } => cmd::models::handle(action).await,
+        Cmd::Auth { action } => cmd::auth::handle(action, cli.format).await,
+        Cmd::Models { action } => cmd::models::handle(action, cli.format).await,
         Cmd::Repos { action } => cmd::repos::handle(action, cli.format).await,
-        Cmd::Issues { action } => cmd::issues::handle(action).await,
+        Cmd::Issues { action } => cmd::issues::handle(action, cli.format).await,
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
-        Cmd::Cron { action } => cmd::cron::handle(action).await,
+        Cmd::Cron { action } => cmd::cron::handle(action, cli.format).await,
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
         Cmd::Usage(args) => cmd::usage::handle(*args, cli.format).await,
         Cmd::Watch(args) => cmd::watch::handle(args).await,
@@ -185,42 +185,55 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     }
 }
 
-fn command_name(command: &Cmd) -> &'static str {
+fn ensure_output_format_supported(
+    command: &Cmd,
+    format: output::formats::OutputFormat,
+) -> anyhow::Result<()> {
     match command {
-        Cmd::Run(_) => "run",
-        Cmd::Agent { .. } => "agent",
-        Cmd::Workflow { .. } => "workflow",
-        Cmd::Autoflow { .. } => "autoflow",
-        Cmd::Transcript { .. } => "transcript",
-        Cmd::Config { .. } => "config",
-        Cmd::Auth { .. } => "auth",
-        Cmd::Models { .. } => "models",
-        Cmd::Repos { .. } => "repos",
-        Cmd::Issues { .. } => "issues",
-        Cmd::Init(_) => "init",
-        Cmd::Mcp { .. } => "mcp",
-        Cmd::Cron { .. } => "cron",
-        Cmd::Webhook { .. } => "webhook",
-        Cmd::Usage(_) => "usage",
-        Cmd::Watch(_) => "watch",
-        Cmd::Completions { .. } => "completions",
+        Cmd::Run(_) => output::formats::ensure_supported(
+            "run",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Agent { action } => cmd::agent::ensure_output_format(action, format),
+        Cmd::Workflow { action } => cmd::workflow::ensure_output_format(action, format),
+        Cmd::Autoflow { action } => cmd::autoflow::ensure_output_format(action, format),
+        Cmd::Transcript { action } => cmd::transcript::ensure_output_format(action, format),
+        Cmd::Config { .. } => output::formats::ensure_supported(
+            "config",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Auth { action } => cmd::auth::ensure_output_format(action, format),
+        Cmd::Models { action } => cmd::models::ensure_output_format(action, format),
+        Cmd::Repos { action } => cmd::repos::ensure_output_format(action, format),
+        Cmd::Issues { action } => cmd::issues::ensure_output_format(action, format),
+        Cmd::Init(_) => output::formats::ensure_supported(
+            "init",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Mcp { .. } => output::formats::ensure_supported(
+            "mcp",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Cron { action } => cmd::cron::ensure_output_format(action, format),
+        Cmd::Webhook { .. } => output::formats::ensure_supported(
+            "webhook",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Usage(args) => cmd::usage::ensure_output_format(args, format),
+        Cmd::Watch(_) => output::formats::ensure_supported(
+            "watch",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Completions { .. } => output::formats::ensure_supported(
+            "completions",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
     }
-}
-
-fn supports_structured_output(command: &Cmd) -> bool {
-    matches!(
-        command,
-        Cmd::Usage(_)
-            | Cmd::Repos {
-                action: cmd::repos::Action::Tracked(_),
-            }
-            | Cmd::Autoflow {
-                action: cmd::autoflow::Action::List(_)
-                    | cmd::autoflow::Action::History { .. }
-                    | cmd::autoflow::Action::Monitor { .. }
-                    | cmd::autoflow::Action::Wakes(_)
-                    | cmd::autoflow::Action::Status(_)
-                    | cmd::autoflow::Action::Claims(_),
-            }
-    )
 }

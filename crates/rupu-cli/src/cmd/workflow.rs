@@ -11,6 +11,8 @@
 //! step's `agent:` field is honored (no hardcoded agent name).
 
 use crate::cmd::completers::workflow_names;
+use crate::output::formats::OutputFormat;
+use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::paths;
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
@@ -44,6 +46,7 @@ fn to_anyhow_with_input_snippet(
     }
 }
 use rupu_orchestrator::Workflow;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -169,9 +172,9 @@ fn parse_kv(s: &str) -> Result<(String, String), String> {
     Ok((k.to_string(), v.to_string()))
 }
 
-pub async fn handle(action: Action) -> ExitCode {
+pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
-        Action::List => list().await,
+        Action::List => list(global_format).await,
         Action::Show {
             name,
             no_color,
@@ -186,7 +189,7 @@ pub async fn handle(action: Action) -> ExitCode {
             } else {
                 None
             };
-            show(&name, no_color, theme.as_deref(), pager_flag).await
+            show(&name, no_color, theme.as_deref(), pager_flag, global_format).await
         }
         Action::Edit {
             name,
@@ -215,8 +218,17 @@ pub async fn handle(action: Action) -> ExitCode {
             status,
             issue,
             no_color,
-        } => runs(limit, status.as_deref(), issue.as_deref(), no_color).await,
-        Action::ShowRun { run_id } => show_run(&run_id).await,
+        } => {
+            runs(
+                limit,
+                status.as_deref(),
+                issue.as_deref(),
+                no_color,
+                global_format,
+            )
+            .await
+        }
+        Action::ShowRun { run_id } => show_run(&run_id, global_format).await,
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
     };
@@ -226,7 +238,382 @@ pub async fn handle(action: Action) -> ExitCode {
     }
 }
 
-async fn list() -> anyhow::Result<()> {
+pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
+    let (command_name, supported) = match action {
+        Action::List => ("workflow list", report::TABLE_JSON_CSV),
+        Action::Show { .. } => ("workflow show", report::TABLE_JSON),
+        Action::Runs { .. } => ("workflow runs", report::TABLE_JSON_CSV),
+        Action::ShowRun { .. } => ("workflow show-run", report::TABLE_JSON),
+        Action::Edit { .. } => ("workflow edit", report::TABLE_ONLY),
+        Action::Run { .. } => ("workflow run", report::TABLE_ONLY),
+        Action::Approve { .. } => ("workflow approve", report::TABLE_ONLY),
+        Action::Reject { .. } => ("workflow reject", report::TABLE_ONLY),
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
+}
+
+#[derive(Serialize)]
+struct WorkflowListRow {
+    name: String,
+    scope: String,
+}
+
+#[derive(Serialize)]
+struct WorkflowRunsRow {
+    run_id: String,
+    status: String,
+    started_at: String,
+    duration_seconds: Option<i64>,
+    expires_in_seconds: Option<i64>,
+    total_tokens: u64,
+    cost_usd: Option<f64>,
+    workflow: String,
+}
+
+#[derive(Serialize)]
+struct WorkflowListReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<WorkflowListRow>,
+}
+
+#[derive(Serialize)]
+struct WorkflowRunsSummary {
+    count: usize,
+    limit: usize,
+    status_filter: Option<String>,
+    issue_filter: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WorkflowRunsReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<WorkflowRunsRow>,
+    summary: WorkflowRunsSummary,
+}
+
+struct WorkflowListOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: WorkflowListReport,
+}
+
+impl CollectionOutput for WorkflowListOutput {
+    type JsonReport = WorkflowListReport;
+    type CsvRow = WorkflowListRow;
+
+    fn command_name(&self) -> &'static str {
+        "workflow list"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["name", "scope"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["NAME", "SCOPE"]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                comfy_table::Cell::new(&row.name),
+                crate::output::tables::status_cell(&row.scope, &self.prefs),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+struct WorkflowRunsOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: WorkflowRunsReport,
+}
+
+#[derive(Serialize)]
+struct WorkflowShowItem {
+    name: String,
+    path: String,
+    body: String,
+}
+
+#[derive(Serialize)]
+struct WorkflowShowReport {
+    kind: &'static str,
+    version: u8,
+    item: WorkflowShowItem,
+}
+
+struct WorkflowShowOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: WorkflowShowReport,
+}
+
+#[derive(Serialize)]
+struct WorkflowShowRunStepItem {
+    label: String,
+    status: String,
+    transcript_path: String,
+}
+
+#[derive(Serialize)]
+struct WorkflowShowRunStep {
+    step_id: String,
+    status: String,
+    transcript_path: String,
+    items: Vec<WorkflowShowRunStepItem>,
+}
+
+#[derive(Serialize)]
+struct WorkflowShowRunUsageRow {
+    provider: String,
+    model: String,
+    agent: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    cost_usd: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct WorkflowShowRunUsageTotals {
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    cost_usd: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct WorkflowShowRunItem {
+    run_id: String,
+    workflow: String,
+    status: String,
+    workspace_id: String,
+    workspace_path: String,
+    started_at: String,
+    finished_at: Option<String>,
+    inputs: BTreeMap<String, String>,
+    error: Option<String>,
+    awaiting_step: Option<String>,
+    awaiting_since: Option<String>,
+    expires_at: Option<String>,
+    steps: Vec<WorkflowShowRunStep>,
+    usage_rows: Vec<WorkflowShowRunUsageRow>,
+    usage_totals: Option<WorkflowShowRunUsageTotals>,
+}
+
+#[derive(Serialize)]
+struct WorkflowShowRunReport {
+    kind: &'static str,
+    version: u8,
+    item: WorkflowShowRunItem,
+}
+
+struct WorkflowShowRunOutput {
+    report: WorkflowShowRunReport,
+}
+
+impl CollectionOutput for WorkflowRunsOutput {
+    type JsonReport = WorkflowRunsReport;
+    type CsvRow = WorkflowRunsRow;
+
+    fn command_name(&self) -> &'static str {
+        "workflow runs"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "run_id",
+            "status",
+            "started_at",
+            "duration_seconds",
+            "expires_in_seconds",
+            "total_tokens",
+            "cost_usd",
+            "workflow",
+        ])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec![
+            "RUN ID",
+            "STATUS",
+            "STARTED (UTC)",
+            "DURATION",
+            "EXPIRES",
+            "TOKENS",
+            "COST",
+            "WORKFLOW",
+        ]);
+        for row in &self.report.rows {
+            let expires_cell = match row.expires_in_seconds {
+                Some(delta) => crate::output::tables::relative_time_cell(delta, &self.prefs),
+                None => comfy_table::Cell::new(""),
+            };
+            let duration = row
+                .duration_seconds
+                .map(|seconds| format!("{seconds}s"))
+                .unwrap_or_else(|| "(in flight)".to_string());
+            let cost = row
+                .cost_usd
+                .map(|value| format!("${value:.4}"))
+                .unwrap_or_else(|| "—".to_string());
+            table.add_row(vec![
+                comfy_table::Cell::new(&row.run_id),
+                crate::output::tables::status_cell(&row.status, &self.prefs),
+                comfy_table::Cell::new(&row.started_at),
+                comfy_table::Cell::new(duration),
+                expires_cell,
+                comfy_table::Cell::new(format_tokens_total(row.total_tokens)),
+                comfy_table::Cell::new(cost),
+                comfy_table::Cell::new(&row.workflow),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+impl DetailOutput for WorkflowShowOutput {
+    type JsonReport = WorkflowShowReport;
+
+    fn command_name(&self) -> &'static str {
+        "workflow show"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn render_human(&self) -> anyhow::Result<()> {
+        let rendered = crate::cmd::ui::highlight_yaml(&self.report.item.body, &self.prefs);
+        crate::cmd::ui::paginate(&rendered, &self.prefs)
+    }
+}
+
+impl DetailOutput for WorkflowShowRunOutput {
+    type JsonReport = WorkflowShowRunReport;
+
+    fn command_name(&self) -> &'static str {
+        "workflow show-run"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn render_human(&self) -> anyhow::Result<()> {
+        let item = &self.report.item;
+        println!("Run        : {}", item.run_id);
+        println!("Workflow   : {}", item.workflow);
+        println!("Status     : {}", item.status);
+        println!(
+            "Workspace  : {} ({})",
+            item.workspace_id, item.workspace_path
+        );
+        println!("Started    : {}", item.started_at);
+        if let Some(fin) = item.finished_at.as_deref() {
+            println!("Finished   : {fin}");
+        }
+        if !item.inputs.is_empty() {
+            println!("Inputs     :");
+            for (k, v) in &item.inputs {
+                println!("  {k} = {v}");
+            }
+        }
+        if let Some(err) = item.error.as_deref() {
+            println!("Error      : {err}");
+        }
+        if let Some(step) = item.awaiting_step.as_deref() {
+            println!("Awaiting   : {step}");
+        }
+        if let Some(since) = item.awaiting_since.as_deref() {
+            println!("Paused at  : {since}");
+        }
+        if let Some(expires) = item.expires_at.as_deref() {
+            println!("Expires    : {expires}");
+        }
+        println!();
+        println!("STEPS ({}):", item.steps.len());
+        for row in &item.steps {
+            println!(
+                "  [{:<7}] {:<24} -> {}",
+                row.status, row.step_id, row.transcript_path
+            );
+            for sub in &row.items {
+                println!(
+                    "     [{:<7}] {:<22} -> {}",
+                    sub.status, sub.label, sub.transcript_path
+                );
+            }
+        }
+        if !item.usage_rows.is_empty() {
+            println!();
+            println!("USAGE:");
+            let mut t = crate::output::tables::new_table();
+            t.set_header(vec![
+                "PROVIDER",
+                "MODEL",
+                "AGENT",
+                "INPUT",
+                "OUTPUT",
+                "CACHED",
+                "COST (USD)",
+            ]);
+            for row in &item.usage_rows {
+                t.add_row(vec![
+                    comfy_table::Cell::new(&row.provider),
+                    comfy_table::Cell::new(&row.model),
+                    comfy_table::Cell::new(&row.agent),
+                    comfy_table::Cell::new(row.input_tokens.to_string()),
+                    comfy_table::Cell::new(row.output_tokens.to_string()),
+                    comfy_table::Cell::new(row.cached_tokens.to_string()),
+                    comfy_table::Cell::new(
+                        row.cost_usd
+                            .map(|value| format!("${value:.4}"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                ]);
+            }
+            if let Some(totals) = &item.usage_totals {
+                t.add_row(vec![
+                    comfy_table::Cell::new("TOTAL"),
+                    comfy_table::Cell::new(""),
+                    comfy_table::Cell::new(""),
+                    comfy_table::Cell::new(totals.input_tokens.to_string()),
+                    comfy_table::Cell::new(totals.output_tokens.to_string()),
+                    comfy_table::Cell::new(totals.cached_tokens.to_string()),
+                    comfy_table::Cell::new(
+                        totals
+                            .cost_usd
+                            .map(|value| format!("${value:.4}"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                ]);
+            }
+            println!("{t}");
+        }
+        Ok(())
+    }
+}
+
+async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -240,12 +627,20 @@ async fn list() -> anyhow::Result<()> {
         // global scope chip for the same name.
         push_yaml_names(&p.join(".rupu/workflows"), "project", &mut by_name);
     }
-
-    println!("{:<28} SCOPE", "NAME");
-    for (n, s) in &by_name {
-        println!("{n:<28} {s}");
-    }
-    Ok(())
+    let cfg = layered_config_workflow(&global, project_root.as_deref());
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None);
+    let output = WorkflowListOutput {
+        prefs,
+        report: WorkflowListReport {
+            kind: "workflow_list",
+            version: 1,
+            rows: by_name
+                .into_iter()
+                .map(|(name, scope)| WorkflowListRow { name, scope })
+                .collect(),
+        },
+    };
+    report::emit_collection(global_format, &output)
 }
 
 fn push_yaml_names(dir: &Path, scope: &str, into: &mut BTreeMap<String, String>) {
@@ -268,6 +663,7 @@ async fn show(
     no_color: bool,
     theme: Option<&str>,
     pager_flag: Option<bool>,
+    global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
@@ -281,9 +677,19 @@ async fn show(
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
 
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag);
-    let rendered = crate::cmd::ui::highlight_yaml(&body, &prefs);
-    crate::cmd::ui::paginate(&rendered, &prefs)?;
-    Ok(())
+    let output = WorkflowShowOutput {
+        prefs,
+        report: WorkflowShowReport {
+            kind: "workflow_show",
+            version: 1,
+            item: WorkflowShowItem {
+                name: name.to_string(),
+                path: path.display().to_string(),
+                body,
+            },
+        },
+    };
+    report::emit_detail(global_format, &output)
 }
 
 async fn edit(
@@ -378,6 +784,7 @@ async fn runs(
     status_filter: Option<&str>,
     issue_filter: Option<&str>,
     no_color: bool,
+    global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
@@ -416,7 +823,12 @@ async fn runs(
         .take(limit)
         .collect();
 
-    if filtered.is_empty() {
+    if filtered.is_empty()
+        && matches!(
+            global_format.unwrap_or(OutputFormat::Table),
+            OutputFormat::Table
+        )
+    {
         let scope = match (status_filter, issue_filter_canonical.as_deref()) {
             (None, None) => "(no runs yet — use `rupu workflow run <name>` to create one)".into(),
             (Some(s), None) => format!("(no runs match status={s})"),
@@ -432,53 +844,39 @@ async fn runs(
     let cfg = layered_config_workflow(&global, project_root.as_deref());
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
 
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec![
-        "RUN ID",
-        "STATUS",
-        "STARTED (UTC)",
-        "DURATION",
-        "EXPIRES",
-        "TOKENS",
-        "COST",
-        "WORKFLOW",
-    ]);
-    for r in &filtered {
-        let started = r.started_at.format("%Y-%m-%d %H:%M:%S").to_string();
-        let duration = match r.finished_at {
-            Some(fin) => format!("{}s", (fin - r.started_at).num_seconds()),
-            None => "(in flight)".into(),
-        };
-        let expires_cell = match r.expires_at {
-            Some(ex) => {
-                let delta = (ex - now).num_seconds();
-                crate::output::tables::relative_time_cell(delta, &prefs)
+    let rows: Vec<WorkflowRunsRow> = filtered
+        .iter()
+        .map(|run| {
+            let agg = aggregate_run_usage_from_store(&store, &run.id);
+            WorkflowRunsRow {
+                run_id: run.id.clone(),
+                status: run.status.as_str().to_string(),
+                started_at: run.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                duration_seconds: run
+                    .finished_at
+                    .map(|finished| (finished - run.started_at).num_seconds()),
+                expires_in_seconds: run.expires_at.map(|expires| (expires - now).num_seconds()),
+                total_tokens: total_tokens(&agg),
+                cost_usd: run_cost_usd(&agg, &cfg.pricing),
+                workflow: run.workflow_name.clone(),
             }
-            None => comfy_table::Cell::new(""),
-        };
-
-        // Aggregate Usage events from this specific run's per-step
-        // transcripts (NOT the project-wide `.rupu/transcripts/`
-        // directory, which would double-count every run's tokens).
-        // Step-result records pin down each agent invocation's
-        // transcript path, including per-panelist sub-runs.
-        let agg = aggregate_run_usage_from_store(&store, &r.id);
-        let tokens_cell = comfy_table::Cell::new(format_tokens_cell(&agg));
-        let cost_cell = run_cost_cell(&agg, &cfg.pricing, &prefs);
-
-        table.add_row(vec![
-            comfy_table::Cell::new(&r.id),
-            crate::output::tables::status_cell(r.status.as_str(), &prefs),
-            comfy_table::Cell::new(started),
-            comfy_table::Cell::new(duration),
-            expires_cell,
-            tokens_cell,
-            cost_cell,
-            comfy_table::Cell::new(&r.workflow_name),
-        ]);
-    }
-    println!("{table}");
-    Ok(())
+        })
+        .collect();
+    let output = WorkflowRunsOutput {
+        prefs,
+        report: WorkflowRunsReport {
+            kind: "workflow_runs",
+            version: 1,
+            summary: WorkflowRunsSummary {
+                count: rows.len(),
+                limit,
+                status_filter: status_filter.map(str::to_string),
+                issue_filter: issue_filter_canonical,
+            },
+            rows,
+        },
+    };
+    report::emit_collection(global_format, &output)
 }
 
 /// Per-step transcripts for one run, sourced from the run's
@@ -507,14 +905,11 @@ fn aggregate_run_usage_from_store(
     rupu_transcript::aggregate(&paths, rupu_transcript::TimeWindow::default())
 }
 
-/// Compact `input + output` token total for the runs table. Returns
-/// `—` when the run had no Usage events (fresh in-flight run, or one
-/// that failed before the first turn).
-fn format_tokens_cell(rows: &[rupu_transcript::UsageRow]) -> String {
-    let total: u64 = rows.iter().map(|r| r.input_tokens + r.output_tokens).sum();
-    if total == 0 {
-        return "—".into();
-    }
+fn total_tokens(rows: &[rupu_transcript::UsageRow]) -> u64 {
+    rows.iter().map(|r| r.input_tokens + r.output_tokens).sum()
+}
+
+fn format_tokens_total(total: u64) -> String {
     if total >= 1_000_000 {
         format!("{:.2}M", total as f64 / 1_000_000.0)
     } else if total >= 1_000 {
@@ -524,14 +919,10 @@ fn format_tokens_cell(rows: &[rupu_transcript::UsageRow]) -> String {
     }
 }
 
-/// Sum costs across every `(provider, model, agent)` triple in the
-/// run. Renders `$X.XX` when at least one row had pricing, dim `—`
-/// when none did.
-fn run_cost_cell(
+fn run_cost_usd(
     rows: &[rupu_transcript::UsageRow],
     pricing: &rupu_config::PricingConfig,
-    prefs: &crate::cmd::ui::UiPrefs,
-) -> comfy_table::Cell {
+) -> Option<f64> {
     let mut total = 0.0f64;
     let mut any = false;
     for r in rows {
@@ -540,14 +931,7 @@ fn run_cost_cell(
             any = true;
         }
     }
-    if !any {
-        return if prefs.use_color() {
-            comfy_table::Cell::new("\x1b[2m—\x1b[0m")
-        } else {
-            comfy_table::Cell::new("—")
-        };
-    }
-    comfy_table::Cell::new(format!("${total:.4}"))
+    any.then_some(total)
 }
 
 fn layered_config_workflow(
@@ -560,7 +944,7 @@ fn layered_config_workflow(
         .unwrap_or_default()
 }
 
-async fn show_run(run_id: &str) -> anyhow::Result<()> {
+async fn show_run(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -577,140 +961,91 @@ async fn show_run(run_id: &str) -> anyhow::Result<()> {
         .read_step_results(run_id)
         .map_err(|e| anyhow::anyhow!("read step results failed: {e}"))?;
 
-    println!("Run        : {}", record.id);
-    println!("Workflow   : {}", record.workflow_name);
-    println!("Status     : {}", record.status.as_str());
-    println!(
-        "Workspace  : {} ({})",
-        record.workspace_id,
-        record.workspace_path.display()
-    );
-    println!(
-        "Started    : {}",
-        record.started_at.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-    if let Some(fin) = record.finished_at {
-        println!("Finished   : {}", fin.format("%Y-%m-%d %H:%M:%S UTC"));
-    }
-    if !record.inputs.is_empty() {
-        println!("Inputs     :");
-        for (k, v) in &record.inputs {
-            println!("  {k} = {v}");
-        }
-    }
-    if let Some(err) = &record.error_message {
-        println!("Error      : {err}");
-    }
-    if let Some(step) = &record.awaiting_step_id {
-        println!("Awaiting   : {step}");
-    }
-    if let Some(since) = &record.awaiting_since {
-        println!("Paused at  : {}", since.format("%Y-%m-%d %H:%M:%S UTC"));
-    }
-    if let Some(ex) = &record.expires_at {
-        println!("Expires    : {}", ex.format("%Y-%m-%d %H:%M:%S UTC"));
-    }
-
-    println!();
-    println!("STEPS ({}):", rows.len());
-    for row in &rows {
-        let chip = if row.skipped {
-            "skipped"
-        } else if row.success {
-            "ok"
-        } else {
-            "fail"
-        };
-        println!(
-            "  [{:<7}] {:<24} -> {}",
-            chip,
-            row.step_id,
-            row.transcript_path.display()
-        );
-        if !row.items.is_empty() {
-            for item in &row.items {
-                let chip = if item.success { "ok" } else { "fail" };
-                let label = if !item.sub_id.is_empty() {
-                    item.sub_id.clone()
-                } else {
-                    format!("[{}]", item.index)
-                };
-                println!(
-                    "     [{:<7}] {:<22} -> {}",
-                    chip,
-                    label,
-                    item.transcript_path.display()
-                );
-            }
-        }
-    }
-
-    // ── Usage summary ────────────────────────────────────────────
-    // Aggregate every transcript referenced by this run's step
-    // results, group by (provider, model, agent), and render with
-    // the same table style `rupu usage` uses. Cost lookup honors the
-    // layered pricing config + built-in defaults.
     let usage_rows = aggregate_run_usage_from_store(&store, run_id);
-    if !usage_rows.is_empty() {
-        println!();
-        println!("USAGE:");
-        let mut t = crate::output::tables::new_table();
-        t.set_header(vec![
-            "PROVIDER",
-            "MODEL",
-            "AGENT",
-            "INPUT",
-            "OUTPUT",
-            "CACHED",
-            "COST (USD)",
-        ]);
-        let mut total_in = 0u64;
-        let mut total_out = 0u64;
-        let mut total_cached = 0u64;
-        let mut total_cost = 0.0f64;
-        let mut any_priced = false;
-        for r in &usage_rows {
-            let cost = crate::pricing::lookup(&cfg.pricing, &r.provider, &r.model, &r.agent)
-                .map(|p| p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens));
-            if let Some(c) = cost {
-                total_cost += c;
-                any_priced = true;
-            }
-            let cost_str = match cost {
-                Some(c) => format!("${c:.4}"),
-                None => "—".into(),
-            };
-            t.add_row(vec![
-                comfy_table::Cell::new(&r.provider),
-                comfy_table::Cell::new(&r.model),
-                comfy_table::Cell::new(&r.agent),
-                comfy_table::Cell::new(r.input_tokens.to_string()),
-                comfy_table::Cell::new(r.output_tokens.to_string()),
-                comfy_table::Cell::new(r.cached_tokens.to_string()),
-                comfy_table::Cell::new(cost_str),
-            ]);
-            total_in += r.input_tokens;
-            total_out += r.output_tokens;
-            total_cached += r.cached_tokens;
-        }
-        t.add_row(vec![
-            comfy_table::Cell::new("TOTAL"),
-            comfy_table::Cell::new(""),
-            comfy_table::Cell::new(""),
-            comfy_table::Cell::new(total_in.to_string()),
-            comfy_table::Cell::new(total_out.to_string()),
-            comfy_table::Cell::new(total_cached.to_string()),
-            comfy_table::Cell::new(if any_priced {
-                format!("${total_cost:.4}")
+    let usage_detail_rows = usage_rows
+        .iter()
+        .map(|r| WorkflowShowRunUsageRow {
+            provider: r.provider.clone(),
+            model: r.model.clone(),
+            agent: r.agent.clone(),
+            input_tokens: r.input_tokens,
+            output_tokens: r.output_tokens,
+            cached_tokens: r.cached_tokens,
+            cost_usd: crate::pricing::lookup(&cfg.pricing, &r.provider, &r.model, &r.agent)
+                .map(|p| p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens)),
+        })
+        .collect::<Vec<_>>();
+    let usage_totals = (!usage_rows.is_empty()).then(|| WorkflowShowRunUsageTotals {
+        input_tokens: usage_rows.iter().map(|r| r.input_tokens).sum(),
+        output_tokens: usage_rows.iter().map(|r| r.output_tokens).sum(),
+        cached_tokens: usage_rows.iter().map(|r| r.cached_tokens).sum(),
+        cost_usd: run_cost_usd(&usage_rows, &cfg.pricing),
+    });
+    let step_rows = rows
+        .iter()
+        .map(|row| WorkflowShowRunStep {
+            step_id: row.step_id.clone(),
+            status: if row.skipped {
+                "skipped".into()
+            } else if row.success {
+                "ok".into()
             } else {
-                "—".into()
-            }),
-        ]);
-        println!("{t}");
-    }
-
-    let _ = prefs; // reserved for future colorized cost cells in show_run
-    Ok(())
+                "fail".into()
+            },
+            transcript_path: row.transcript_path.display().to_string(),
+            items: row
+                .items
+                .iter()
+                .map(|item| WorkflowShowRunStepItem {
+                    label: if !item.sub_id.is_empty() {
+                        item.sub_id.clone()
+                    } else {
+                        format!("[{}]", item.index)
+                    },
+                    status: if item.success {
+                        "ok".into()
+                    } else {
+                        "fail".into()
+                    },
+                    transcript_path: item.transcript_path.display().to_string(),
+                })
+                .collect(),
+        })
+        .collect();
+    let output = WorkflowShowRunOutput {
+        report: WorkflowShowRunReport {
+            kind: "workflow_show_run",
+            version: 1,
+            item: WorkflowShowRunItem {
+                run_id: record.id,
+                workflow: record.workflow_name,
+                status: record.status.as_str().to_string(),
+                workspace_id: record.workspace_id,
+                workspace_path: record.workspace_path.display().to_string(),
+                started_at: record
+                    .started_at
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string(),
+                finished_at: record
+                    .finished_at
+                    .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
+                inputs: record.inputs,
+                error: record.error_message,
+                awaiting_step: record.awaiting_step_id,
+                awaiting_since: record
+                    .awaiting_since
+                    .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
+                expires_at: record
+                    .expires_at
+                    .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
+                steps: step_rows,
+                usage_rows: usage_detail_rows,
+                usage_totals,
+            },
+        },
+    };
+    let _ = prefs;
+    report::emit_detail(global_format, &output)
 }
 
 async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {

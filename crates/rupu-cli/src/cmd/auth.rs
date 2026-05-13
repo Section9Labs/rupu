@@ -1,7 +1,10 @@
 //! `rupu auth login | logout | status`.
 
+use crate::output::formats::OutputFormat;
+use crate::output::report::{self, CollectionOutput, DetailOutput};
 use clap::Subcommand;
 use rupu_auth::ProviderId;
+use serde::Serialize;
 use std::process::ExitCode;
 
 #[derive(Subcommand, Debug)]
@@ -66,7 +69,7 @@ impl From<AuthModeArg> for rupu_providers::AuthMode {
     }
 }
 
-pub async fn handle(action: Action) -> ExitCode {
+pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
         Action::Login {
             provider,
@@ -87,13 +90,23 @@ pub async fn handle(action: Action) -> ExitCode {
             })
             .await
         }
-        Action::Status => status().await,
-        Action::Backend { r#use } => backend(r#use.as_deref()).await,
+        Action::Status => status(global_format).await,
+        Action::Backend { r#use } => backend(r#use.as_deref(), global_format).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
         Err(e) => crate::output::diag::fail(e),
     }
+}
+
+pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
+    let (command_name, supported) = match action {
+        Action::Status => ("auth status", report::TABLE_JSON_CSV),
+        Action::Backend { .. } => ("auth backend", report::TABLE_JSON),
+        Action::Login { .. } => ("auth login", report::TABLE_ONLY),
+        Action::Logout { .. } => ("auth logout", report::TABLE_ONLY),
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
 }
 
 fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
@@ -262,7 +275,54 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Serialize)]
+struct AuthBackendItem {
+    requested_backend: Option<String>,
+    active_backend: String,
+    cache_path: String,
+    auth_path: String,
+    cache_choice: Option<String>,
+    env_override: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthBackendReport {
+    kind: &'static str,
+    version: u8,
+    item: AuthBackendItem,
+}
+
+struct AuthBackendOutput {
+    report: AuthBackendReport,
+}
+
+impl DetailOutput for AuthBackendOutput {
+    type JsonReport = AuthBackendReport;
+
+    fn command_name(&self) -> &'static str {
+        "auth backend"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn render_human(&self) -> anyhow::Result<()> {
+        let item = &self.report.item;
+        println!("Active backend : {}", item.active_backend);
+        println!("Cache file     : {}", item.cache_path);
+        println!();
+        println!("To switch persistently:");
+        println!("  rupu auth backend --use file       # store in ~/.rupu/auth.json (chmod 600)");
+        println!("  rupu auth backend --use keychain   # store in OS keychain");
+        println!();
+        println!("To override per-shell session:");
+        println!("  export RUPU_AUTH_BACKEND=file      # or `keychain`");
+        Ok(())
+    }
+}
+
+async fn backend(r#use: Option<&str>, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     // Persist the user's choice via a tiny shell-rc-friendly env-export
     // hint rather than writing to the cache directly: the env var
     // lives at the session boundary, and any in-process change here
@@ -271,6 +331,7 @@ async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
     let global = crate::paths::global_dir()?;
     let cache_path = global.join("cache/auth-backend.json");
     let cache = rupu_auth::ProbeCache::new(cache_path.clone());
+    let auth_path = global.join("auth.json");
 
     if let Some(target) = r#use {
         let target_norm = target.trim().to_ascii_lowercase();
@@ -288,6 +349,21 @@ async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
             rupu_auth::BackendChoice::JsonFile => "file",
             rupu_auth::BackendChoice::Keyring => "keychain",
         };
+        if matches!(global_format, Some(OutputFormat::Json)) {
+            let report = AuthBackendReport {
+                kind: "auth_backend",
+                version: 1,
+                item: AuthBackendItem {
+                    requested_backend: Some(env_value.to_string()),
+                    active_backend: format!("cached: {env_value}"),
+                    cache_path: cache_path.display().to_string(),
+                    auth_path: auth_path.display().to_string(),
+                    cache_choice: Some(env_value.to_string()),
+                    env_override: None,
+                },
+            };
+            return report::emit_detail(global_format, &AuthBackendOutput { report });
+        }
         println!(
             "rupu: persisted backend choice = {env_value} (cache: {})",
             cache_path.display()
@@ -296,7 +372,6 @@ async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
         println!("To override per-shell session (e.g. while debugging):");
         println!("  export RUPU_AUTH_BACKEND={env_value}");
         if matches!(choice, rupu_auth::BackendChoice::JsonFile) {
-            let auth_path = global.join("auth.json");
             println!();
             println!("Credentials will be stored at:");
             println!("  {}", auth_path.display());
@@ -316,24 +391,100 @@ async fn backend(r#use: Option<&str>) -> anyhow::Result<()> {
         (None, Some(rupu_auth::BackendChoice::JsonFile)) => "cached: file".into(),
         (None, None) => "default: file (chmod-600 ~/.rupu/auth.json)".into(),
     };
-    println!("Active backend : {active}");
-    println!("Cache file     : {}", cache_path.display());
-    println!();
-    println!("To switch persistently:");
-    println!("  rupu auth backend --use file       # store in ~/.rupu/auth.json (chmod 600)");
-    println!("  rupu auth backend --use keychain   # store in OS keychain");
-    println!();
-    println!("To override per-shell session:");
-    println!("  export RUPU_AUTH_BACKEND=file      # or `keychain`");
-    Ok(())
+    let report = AuthBackendReport {
+        kind: "auth_backend",
+        version: 1,
+        item: AuthBackendItem {
+            requested_backend: None,
+            active_backend: active,
+            cache_path: cache_path.display().to_string(),
+            auth_path: auth_path.display().to_string(),
+            cache_choice: cached.map(|choice| match choice {
+                rupu_auth::BackendChoice::JsonFile => "file".to_string(),
+                rupu_auth::BackendChoice::Keyring => "keychain".to_string(),
+            }),
+            env_override,
+        },
+    };
+    report::emit_detail(global_format, &AuthBackendOutput { report })
 }
 
-async fn status() -> anyhow::Result<()> {
+#[derive(Debug, Clone, Serialize)]
+struct AuthStatusRow {
+    provider: String,
+    api_key: bool,
+    sso: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthStatusCsvRow {
+    provider: String,
+    api_key: String,
+    sso: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AuthStatusReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<AuthStatusRow>,
+}
+
+struct AuthStatusOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: AuthStatusReport,
+    csv_rows: Vec<AuthStatusCsvRow>,
+}
+
+impl CollectionOutput for AuthStatusOutput {
+    type JsonReport = AuthStatusReport;
+    type CsvRow = AuthStatusCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "auth status"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["provider", "api_key", "sso"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["PROVIDER", "API-KEY", "SSO"]);
+        for row in &self.report.rows {
+            let api_cell = if row.api_key {
+                comfy_table::Cell::new("✓").fg(crate::output::tables::status_color(
+                    "completed",
+                    &self.prefs,
+                )
+                .unwrap_or(comfy_table::Color::Reset))
+            } else {
+                comfy_table::Cell::new("—").fg(comfy_table::Color::DarkGrey)
+            };
+            let sso_cell = sso_status_cell(&row.sso, &self.prefs);
+            table.add_row(vec![
+                comfy_table::Cell::new(&row.provider),
+                api_cell,
+                sso_cell,
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let resolver = rupu_auth::resolver::KeychainResolver::new();
     let prefs = crate::output::diag::prefs_for_diag(false);
-
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec!["PROVIDER", "API-KEY", "SSO"]);
+    let mut rows = Vec::new();
 
     for (label, pid) in [
         ("anthropic", ProviderId::Anthropic),
@@ -346,38 +497,54 @@ async fn status() -> anyhow::Result<()> {
         ("jira", ProviderId::Jira),
     ] {
         let api_present = resolver.peek(pid, rupu_providers::AuthMode::ApiKey).await;
-        let api_cell = if api_present {
-            comfy_table::Cell::new("✓").fg(crate::output::tables::status_color("completed", &prefs)
-                .unwrap_or(comfy_table::Color::Reset))
-        } else {
-            comfy_table::Cell::new("—").fg(comfy_table::Color::DarkGrey)
-        };
-
-        let sso_cell = match resolver.peek_sso(pid).await {
-            Some(expiry_repr) => {
-                let lower = expiry_repr.to_ascii_lowercase();
-                let color = if lower.contains("expired") {
-                    comfy_table::Color::Red
-                } else if lower.contains("expires in") && is_soon(&expiry_repr) {
-                    comfy_table::Color::Yellow
-                } else {
-                    crate::output::tables::status_color("completed", &prefs)
-                        .unwrap_or(comfy_table::Color::Reset)
-                };
-                let glyph = if lower.contains("expired") {
-                    "✗"
-                } else {
-                    "✓"
-                };
-                comfy_table::Cell::new(format!("{glyph} {expiry_repr}")).fg(color)
-            }
-            None => comfy_table::Cell::new("—").fg(comfy_table::Color::DarkGrey),
-        };
-
-        table.add_row(vec![comfy_table::Cell::new(label), api_cell, sso_cell]);
+        rows.push(AuthStatusRow {
+            provider: label.to_string(),
+            api_key: api_present,
+            sso: resolver.peek_sso(pid).await.unwrap_or_default(),
+        });
     }
-    println!("{table}");
-    Ok(())
+    let csv_rows = rows
+        .iter()
+        .map(|row| AuthStatusCsvRow {
+            provider: row.provider.clone(),
+            api_key: if row.api_key {
+                "yes".into()
+            } else {
+                "no".into()
+            },
+            sso: row.sso.clone(),
+        })
+        .collect();
+    let output = AuthStatusOutput {
+        prefs,
+        report: AuthStatusReport {
+            kind: "auth_status",
+            version: 1,
+            rows,
+        },
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
+}
+
+fn sso_status_cell(value: &str, prefs: &crate::cmd::ui::UiPrefs) -> comfy_table::Cell {
+    if value.is_empty() {
+        return comfy_table::Cell::new("—").fg(comfy_table::Color::DarkGrey);
+    }
+    let lower = value.to_ascii_lowercase();
+    let color = if lower.contains("expired") {
+        comfy_table::Color::Red
+    } else if lower.contains("expires in") && is_soon(value) {
+        comfy_table::Color::Yellow
+    } else {
+        crate::output::tables::status_color("completed", prefs).unwrap_or(comfy_table::Color::Reset)
+    };
+    let glyph = if lower.contains("expired") {
+        "✗"
+    } else {
+        "✓"
+    };
+    comfy_table::Cell::new(format!("{glyph} {value}")).fg(color)
 }
 
 /// Heuristic: SSO expiry strings like `expires in 8d` / `expires in 47h`

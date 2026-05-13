@@ -21,6 +21,8 @@
 //! (`rupu cron run`) is the durable answer; this PR is the shipping-
 //! today version that delegates scheduling to system cron.
 
+use crate::output::formats::OutputFormat;
+use crate::output::report::{self, CollectionOutput};
 use crate::paths;
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
@@ -28,6 +30,7 @@ use rupu_config::PollSourceEntry;
 use rupu_orchestrator::cron_schedule::{next_fire_after, parse_schedule, should_fire};
 use rupu_orchestrator::{annotate_event_payload, matching_event_id, TriggerKind, Workflow};
 use rupu_scm::EventSourceRef;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -73,15 +76,15 @@ pub enum Action {
     },
 }
 
-pub async fn handle(action: Action) -> ExitCode {
+pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
-        Action::List { no_color } => list(no_color).await,
+        Action::List { no_color } => list(no_color, global_format).await,
         Action::Tick {
             dry_run,
             skip_events,
             only_events,
         } => tick(dry_run, skip_events, only_events).await,
-        Action::Events { no_color } => events(no_color).await,
+        Action::Events { no_color } => events(no_color, global_format).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -89,9 +92,151 @@ pub async fn handle(action: Action) -> ExitCode {
     }
 }
 
-async fn list(no_color: bool) -> anyhow::Result<()> {
+pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
+    let (command_name, supported) = match action {
+        Action::List { .. } => ("cron list", report::TABLE_JSON_CSV),
+        Action::Events { .. } => ("cron events", report::TABLE_JSON_CSV),
+        Action::Tick { .. } => ("cron tick", report::TABLE_ONLY),
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
+}
+
+#[derive(Serialize)]
+struct CronListRow {
+    name: String,
+    schedule: String,
+    next_utc: Option<String>,
+    in_seconds: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct CronListReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<CronListRow>,
+}
+
+#[derive(Serialize)]
+struct CronEventsRow {
+    name: String,
+    event: String,
+    sources: Vec<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CronEventsSummary {
+    poll_sources: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CronEventsReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<CronEventsRow>,
+    summary: CronEventsSummary,
+}
+
+struct CronListOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: CronListReport,
+}
+
+impl CollectionOutput for CronListOutput {
+    type JsonReport = CronListReport;
+    type CsvRow = CronListRow;
+
+    fn command_name(&self) -> &'static str {
+        "cron list"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["name", "schedule", "next_utc", "in_seconds"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["NAME", "SCHEDULE", "NEXT (UTC)", "IN"]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                comfy_table::Cell::new(&row.name),
+                comfy_table::Cell::new(&row.schedule),
+                comfy_table::Cell::new(row.next_utc.as_deref().unwrap_or("<unschedulable>")),
+                match row.in_seconds {
+                    Some(delta) => crate::output::tables::relative_time_cell(delta, &self.prefs),
+                    None => comfy_table::Cell::new(""),
+                },
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+struct CronEventsOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: CronEventsReport,
+}
+
+impl CollectionOutput for CronEventsOutput {
+    type JsonReport = CronEventsReport;
+    type CsvRow = CronEventsRow;
+
+    fn command_name(&self) -> &'static str {
+        "cron events"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["name", "event", "sources", "cursor"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["NAME", "EVENT", "SOURCES", "CURSOR"]);
+        for row in &self.report.rows {
+            let event_cell = comfy_table::Cell::new(&row.event)
+                .fg(crate::output::tables::status_color("running", &self.prefs)
+                    .unwrap_or(comfy_table::Color::Reset));
+            table.add_row(vec![
+                comfy_table::Cell::new(&row.name),
+                event_cell,
+                comfy_table::Cell::new(if row.sources.is_empty() {
+                    "(none configured)".to_string()
+                } else {
+                    row.sources.join(",")
+                }),
+                comfy_table::Cell::new(truncate(row.cursor.as_deref().unwrap_or("(none)"), 60)),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let workflows = collect_cron_workflows()?;
-    if workflows.is_empty() {
+    if workflows.is_empty()
+        && matches!(
+            global_format.unwrap_or(OutputFormat::Table),
+            OutputFormat::Table
+        )
+    {
         println!(
             "(no cron-triggered workflows found)\n\nAdd `trigger.on: cron` to a workflow under \
              `.rupu/workflows/` and configure a schedule (e.g. `cron: \"0 4 * * *\"`)."
@@ -100,32 +245,29 @@ async fn list(no_color: bool) -> anyhow::Result<()> {
     }
     let now = Utc::now();
     let prefs = ui_prefs(no_color)?;
-
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec!["NAME", "SCHEDULE", "NEXT (UTC)", "IN"]);
-    for w in &workflows {
-        let next = parse_schedule(&w.schedule)
-            .ok()
-            .and_then(|s| next_fire_after(&s, now));
-        let (next_str, until_cell) = match next {
-            Some(t) => {
-                let delta = (t - now).num_seconds();
-                (
-                    t.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    crate::output::tables::relative_time_cell(delta, &prefs),
-                )
+    let rows = workflows
+        .iter()
+        .map(|workflow| {
+            let next = parse_schedule(&workflow.schedule)
+                .ok()
+                .and_then(|schedule| next_fire_after(&schedule, now));
+            CronListRow {
+                name: workflow.name.clone(),
+                schedule: workflow.schedule.clone(),
+                next_utc: next.map(|time| time.format("%Y-%m-%d %H:%M:%S").to_string()),
+                in_seconds: next.map(|time| (time - now).num_seconds()),
             }
-            None => ("<unschedulable>".to_string(), comfy_table::Cell::new("")),
-        };
-        table.add_row(vec![
-            comfy_table::Cell::new(&w.name),
-            comfy_table::Cell::new(&w.schedule),
-            comfy_table::Cell::new(next_str),
-            until_cell,
-        ]);
-    }
-    println!("{table}");
-    Ok(())
+        })
+        .collect();
+    let output = CronListOutput {
+        prefs,
+        report: CronListReport {
+            kind: "cron_list",
+            version: 1,
+            rows,
+        },
+    };
+    report::emit_collection(global_format, &output)
 }
 
 fn ui_prefs(no_color: bool) -> anyhow::Result<crate::cmd::ui::UiPrefs> {
@@ -418,7 +560,7 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
 
 /// `rupu cron events` — read-only inspection of event-triggered
 /// workflows + which sources they cover + most recent cursor.
-async fn events(no_color: bool) -> anyhow::Result<()> {
+async fn events(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -430,7 +572,12 @@ async fn events(no_color: bool) -> anyhow::Result<()> {
     let workflows = collect_event_workflows()?;
     let cursors_root = global.join("cron-state").join("event-cursors");
 
-    if workflows.is_empty() {
+    if workflows.is_empty()
+        && matches!(
+            global_format.unwrap_or(OutputFormat::Table),
+            OutputFormat::Table
+        )
+    {
         println!(
             "(no event-triggered workflows found)\n\nDrop a workflow YAML under `.rupu/workflows/` \
              with `trigger.on: event` (e.g. `event: github.issue.opened`) and configure \
@@ -438,7 +585,12 @@ async fn events(no_color: bool) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    if cfg.triggers.poll_sources.is_empty() {
+    if cfg.triggers.poll_sources.is_empty()
+        && matches!(
+            global_format.unwrap_or(OutputFormat::Table),
+            OutputFormat::Table
+        )
+    {
         println!(
             "(workflows configured, but `[triggers].poll_sources` is empty in config.toml — \
              `rupu cron tick` will not poll any sources until you add at least one entry like \
@@ -447,47 +599,42 @@ async fn events(no_color: bool) -> anyhow::Result<()> {
     }
 
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
-
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec!["NAME", "EVENT", "SOURCES", "CURSOR"]);
-    for wf in &workflows {
-        let sources = cfg
-            .triggers
-            .poll_sources
-            .iter()
-            .map(format_poll_source_entry)
-            .collect::<Vec<_>>()
-            .join(",");
-        // Best-effort: print the cursor of the *first* configured source.
-        let cursor_repr = cfg
-            .triggers
-            .poll_sources
-            .iter()
-            .filter_map(|s| s.source().parse::<EventSourceRef>().ok())
-            .find_map(|source| {
-                let path = cursor_path(&cursors_root, &source);
-                read_cursor(&path).ok()
-            })
-            .unwrap_or_else(|| "(none)".into());
-        let event_cell = comfy_table::Cell::new(&wf.event)
-            .fg(crate::output::tables::status_color("running", &prefs)
-                .unwrap_or(comfy_table::Color::Reset));
-        // The "running" color (blue) is reused for event-id cells so
-        // the column is visually anchored without inventing a new
-        // semantic bucket. Falls back to default when colors are off.
-        table.add_row(vec![
-            comfy_table::Cell::new(&wf.name),
-            event_cell,
-            comfy_table::Cell::new(if sources.is_empty() {
-                "(none configured)".into()
-            } else {
-                sources
-            }),
-            comfy_table::Cell::new(truncate(&cursor_repr, 60)),
-        ]);
-    }
-    println!("{table}");
-    Ok(())
+    let poll_sources: Vec<String> = cfg
+        .triggers
+        .poll_sources
+        .iter()
+        .map(format_poll_source_entry)
+        .collect();
+    let rows = workflows
+        .iter()
+        .map(|wf| {
+            let cursor = cfg
+                .triggers
+                .poll_sources
+                .iter()
+                .filter_map(|s| s.source().parse::<EventSourceRef>().ok())
+                .find_map(|source| {
+                    let path = cursor_path(&cursors_root, &source);
+                    read_cursor(&path).ok()
+                });
+            CronEventsRow {
+                name: wf.name.clone(),
+                event: wf.event.clone(),
+                sources: poll_sources.clone(),
+                cursor,
+            }
+        })
+        .collect();
+    let output = CronEventsOutput {
+        prefs,
+        report: CronEventsReport {
+            kind: "cron_events",
+            version: 1,
+            summary: CronEventsSummary { poll_sources },
+            rows,
+        },
+    };
+    report::emit_collection(global_format, &output)
 }
 
 struct EventWorkflow {

@@ -11,6 +11,7 @@ use crate::cmd::workflow::{
 };
 use crate::output::palette::{self, Status as UiStatus, BRAND, DIM};
 use crate::output::printer::format_duration;
+use crate::output::report::{self as output_report, CollectionOutput, DetailOutput};
 use crate::output::workflow_printer::{
     LiveWorkflowEvent, LiveWorkflowEventHook, LiveWorkflowRender,
 };
@@ -391,6 +392,28 @@ struct AutoflowClaimsReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct AutoflowClaimCsvRow {
+    issue: String,
+    issue_display: String,
+    tracker: String,
+    state: String,
+    source: String,
+    repo: String,
+    workflow: String,
+    priority: String,
+    status: String,
+    next: String,
+    branch: String,
+    pr: String,
+    summary: String,
+    contenders: String,
+    workspace: String,
+    last_cycle: String,
+    last_event: String,
+    last_run: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct AutoflowMonitorWorkerRow {
     worker: String,
     kind: String,
@@ -452,6 +475,534 @@ struct AutoflowHistoryReport {
     total_cycles: usize,
     total_events: usize,
     rows: Vec<AutoflowHistoryRow>,
+}
+
+struct AutoflowListOutput {
+    prefs: UiPrefs,
+    report: AutoflowListReport,
+}
+
+impl CollectionOutput for AutoflowListOutput {
+    type JsonReport = AutoflowListReport;
+    type CsvRow = AutoflowListRow;
+
+    fn command_name(&self) -> &'static str {
+        "autoflow list"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["name", "scope", "entity", "source", "priority", "repo"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec![
+            "Name", "Scope", "Entity", "Source", "Priority", "Repo",
+        ]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                Cell::new(&row.name),
+                crate::output::tables::status_cell(&row.scope, &self.prefs),
+                Cell::new(&row.entity),
+                Cell::new(&row.source),
+                Cell::new(row.priority),
+                Cell::new(&row.repo),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+struct AutoflowWakesOutput {
+    report: AutoflowWakesReport,
+}
+
+impl CollectionOutput for AutoflowWakesOutput {
+    type JsonReport = AutoflowWakesReport;
+    type CsvRow = AutoflowWakeRow;
+
+    fn command_name(&self) -> &'static str {
+        "autoflow wakes"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "wake_id",
+            "state",
+            "source",
+            "event",
+            "entity",
+            "not_before",
+            "repo",
+        ])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec![
+            "Wake",
+            "State",
+            "Source",
+            "Event",
+            "Entity",
+            "Not Before",
+            "Repo",
+        ]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                Cell::new(&row.wake_id),
+                Cell::new(&row.state),
+                Cell::new(&row.source),
+                Cell::new(&row.event),
+                Cell::new(&row.entity),
+                Cell::new(compact_timestamp(&row.not_before)),
+                Cell::new(&row.repo),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+struct AutoflowStatusOutput {
+    prefs: UiPrefs,
+    report: AutoflowStatusReport,
+}
+
+impl CollectionOutput for AutoflowStatusOutput {
+    type JsonReport = AutoflowStatusReport;
+    type CsvRow = AutoflowStatusRow;
+
+    fn command_name(&self) -> &'static str {
+        "autoflow status"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["status", "count"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["Status", "Count"]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                crate::output::tables::status_cell(&row.status, &self.prefs),
+                Cell::new(row.count),
+            ]);
+        }
+        println!("{table}");
+        if !self.report.contested.is_empty() {
+            println!();
+            let mut contested_table = crate::output::tables::new_table();
+            contested_table.set_header(vec![
+                "Issue",
+                "Source",
+                "State",
+                "Repo",
+                "Recent",
+                "Contenders",
+            ]);
+            for claim in &self.report.contested {
+                let recent = match (claim.last_event.as_deref(), claim.last_cycle.as_deref()) {
+                    (Some(event), Some(at)) => format!("{event} @ {}", compact_timestamp(at)),
+                    (Some(event), None) => event.to_string(),
+                    _ => "-".into(),
+                };
+                contested_table.add_row(vec![
+                    Cell::new(claim.issue_display.as_deref().unwrap_or(&claim.issue)),
+                    Cell::new(
+                        claim
+                            .source
+                            .as_deref()
+                            .or(claim.tracker.as_deref())
+                            .unwrap_or("-"),
+                    ),
+                    Cell::new(claim.state.as_deref().unwrap_or("-")),
+                    Cell::new(&claim.repo),
+                    Cell::new(recent),
+                    Cell::new(&claim.contenders),
+                ]);
+            }
+            println!("{contested_table}");
+        }
+        Ok(())
+    }
+}
+
+struct AutoflowClaimsOutput {
+    prefs: UiPrefs,
+    report: AutoflowClaimsReport,
+    csv_rows: Vec<AutoflowClaimCsvRow>,
+}
+
+impl CollectionOutput for AutoflowClaimsOutput {
+    type JsonReport = AutoflowClaimsReport;
+    type CsvRow = AutoflowClaimCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "autoflow claims"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "issue",
+            "issue_display",
+            "tracker",
+            "state",
+            "source",
+            "repo",
+            "workflow",
+            "priority",
+            "status",
+            "next",
+            "branch",
+            "pr",
+            "summary",
+            "contenders",
+            "workspace",
+            "last_cycle",
+            "last_event",
+            "last_run",
+        ])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec![
+            "Issue", "Source", "State", "Workflow", "Status", "Next", "Run", "Repo", "Branch",
+            "Summary",
+        ]);
+        for claim in &self.report.rows {
+            table.add_row(vec![
+                Cell::new(claim.issue_display.as_deref().unwrap_or(&claim.issue)),
+                Cell::new(
+                    claim
+                        .source
+                        .as_deref()
+                        .or(claim.tracker.as_deref())
+                        .unwrap_or("-"),
+                ),
+                Cell::new(claim.state.as_deref().unwrap_or("-")),
+                Cell::new(&claim.workflow),
+                crate::output::tables::status_cell(&claim.status, &self.prefs),
+                Cell::new(&claim.next),
+                Cell::new(&claim.last_run),
+                Cell::new(&claim.repo),
+                Cell::new(&claim.branch),
+                Cell::new(truncate_text(&claim.summary, 56)),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+struct AutoflowMonitorOutput {
+    report: AutoflowMonitorReport,
+}
+
+impl CollectionOutput for AutoflowMonitorOutput {
+    type JsonReport = AutoflowMonitorReport;
+    type CsvRow = AutoflowMonitorActivityRow;
+
+    fn command_name(&self) -> &'static str {
+        "autoflow monitor"
+    }
+
+    fn supported_formats(&self) -> &'static [crate::output::formats::OutputFormat] {
+        output_report::TABLE_JSON
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.activity
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        render_monitor_snapshot(&self.report, false)
+    }
+}
+
+struct AutoflowHistoryOutput {
+    report: AutoflowHistoryReport,
+}
+
+impl CollectionOutput for AutoflowHistoryOutput {
+    type JsonReport = AutoflowHistoryReport;
+    type CsvRow = AutoflowHistoryRow;
+
+    fn command_name(&self) -> &'static str {
+        "autoflow history"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "at", "cycle_id", "mode", "worker", "event", "issue", "source", "workflow", "repo",
+            "run", "wake", "detail",
+        ])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        render_history_table(&self.report)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowDoctorRow {
+    scope: String,
+    problem: String,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowDoctorReport {
+    kind: &'static str,
+    version: u8,
+    ok: bool,
+    rows: Vec<AutoflowDoctorRow>,
+}
+
+struct AutoflowDoctorOutput {
+    report: AutoflowDoctorReport,
+}
+
+impl CollectionOutput for AutoflowDoctorOutput {
+    type JsonReport = AutoflowDoctorReport;
+    type CsvRow = AutoflowDoctorRow;
+
+    fn command_name(&self) -> &'static str {
+        "autoflow doctor"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["scope", "problem", "detail"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        if self.report.rows.is_empty() {
+            println!("autoflow doctor: ok");
+            return Ok(());
+        }
+
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["Scope", "Problem", "Detail"]);
+        for row in &self.report.rows {
+            table.add_row(vec![
+                Cell::new(&row.scope),
+                Cell::new(&row.problem),
+                Cell::new(&row.detail),
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowShowItem {
+    name: String,
+    scope: String,
+    path: String,
+    repo: Option<String>,
+    project_root: Option<String>,
+    preferred_checkout: Option<String>,
+    description: Option<String>,
+    entity: String,
+    source: String,
+    priority: i32,
+    workspace: String,
+    workspace_branch: Option<String>,
+    reconcile_every: Option<String>,
+    claim_ttl: Option<String>,
+    outcome_output: Option<String>,
+    wake_on: Vec<String>,
+    labels_all: Vec<String>,
+    labels_any: Vec<String>,
+    labels_none: Vec<String>,
+    selector_states: Vec<String>,
+    selector_limit: Option<u32>,
+    body: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowShowReport {
+    kind: &'static str,
+    version: u8,
+    item: AutoflowShowItem,
+}
+
+struct AutoflowShowOutput {
+    prefs: UiPrefs,
+    report: AutoflowShowReport,
+    rendered: String,
+}
+
+impl DetailOutput for AutoflowShowOutput {
+    type JsonReport = AutoflowShowReport;
+
+    fn command_name(&self) -> &'static str {
+        "autoflow show"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn render_human(&self) -> anyhow::Result<()> {
+        crate::cmd::ui::paginate(&self.rendered, &self.prefs)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowExplainLock {
+    owner: String,
+    acquired_at: String,
+    lease_expires: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowExplainPendingDispatch {
+    workflow: String,
+    target: String,
+    inputs: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowExplainRun {
+    run_id: String,
+    status: String,
+    backend: String,
+    worker: String,
+    source_wake: Option<String>,
+    approval_step: Option<String>,
+    approval_expires: Option<String>,
+    execution: Option<String>,
+    models: Option<String>,
+    usage: Option<String>,
+    changes: Option<String>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    workspace: Option<String>,
+    merge_target: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowExplainClaim {
+    issue_display: Option<String>,
+    issue_title: Option<String>,
+    issue_tracker: Option<String>,
+    issue_state: Option<String>,
+    source: Option<String>,
+    issue_url: Option<String>,
+    workflow: String,
+    status: String,
+    priority: Option<String>,
+    contenders: String,
+    workspace: String,
+    branch: String,
+    pr: String,
+    claim_owner: String,
+    lease_expires: String,
+    active_lock: Option<AutoflowExplainLock>,
+    last_run: Option<AutoflowExplainRun>,
+    next_action: String,
+    pending_dispatch: Option<AutoflowExplainPendingDispatch>,
+    next_retry: Option<String>,
+    summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowExplainItem {
+    issue: String,
+    repo: String,
+    status: String,
+    source: Option<String>,
+    candidate_workflows: Vec<String>,
+    claim: Option<AutoflowExplainClaim>,
+    queued_wakes: Vec<AutoflowWakeRow>,
+    recent_processed_wake: Option<AutoflowWakeRow>,
+    recent_cycle_events: Vec<AutoflowHistoryRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutoflowExplainReport {
+    kind: &'static str,
+    version: u8,
+    item: AutoflowExplainItem,
+}
+
+struct AutoflowExplainOutput {
+    report: AutoflowExplainReport,
+    rendered: String,
+}
+
+impl DetailOutput for AutoflowExplainOutput {
+    type JsonReport = AutoflowExplainReport;
+
+    fn command_name(&self) -> &'static str {
+        "autoflow explain"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn render_human(&self) -> anyhow::Result<()> {
+        print!("{}", self.rendered);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -607,7 +1158,7 @@ async fn handle_with_resolver(
 ) -> anyhow::Result<()> {
     match action {
         Action::List(args) => list(args.repo.as_deref(), global_format).await,
-        Action::Show { name, repo } => show(&name, repo.as_deref()).await,
+        Action::Show { name, repo } => show(&name, repo.as_deref(), global_format).await,
         Action::Run {
             name,
             target,
@@ -666,8 +1217,8 @@ async fn handle_with_resolver(
             };
             history(query, watch, &interval, global_format).await
         }
-        Action::Explain { r#ref, repo } => explain(&r#ref, repo.as_deref()).await,
-        Action::Doctor(args) => doctor(args.repo.as_deref()).await,
+        Action::Explain { r#ref, repo } => explain(&r#ref, repo.as_deref(), global_format).await,
+        Action::Doctor(args) => doctor(args.repo.as_deref(), global_format).await,
         Action::Repair {
             r#ref,
             release,
@@ -684,6 +1235,42 @@ async fn handle_with_resolver(
     }
 }
 
+pub fn ensure_output_format(
+    action: &Action,
+    format: crate::output::formats::OutputFormat,
+) -> anyhow::Result<()> {
+    let (command_name, supported) = match action {
+        Action::List(_) => ("autoflow list", output_report::TABLE_JSON_CSV),
+        Action::Show { .. } => ("autoflow show", output_report::TABLE_JSON),
+        Action::Run { .. } => ("autoflow run", output_report::TABLE_ONLY),
+        Action::Tick => ("autoflow tick", output_report::TABLE_ONLY),
+        Action::Serve { .. } => ("autoflow serve", output_report::TABLE_ONLY),
+        Action::Wakes(_) => ("autoflow wakes", output_report::TABLE_JSON_CSV),
+        Action::Monitor { watch, .. } => {
+            if *watch {
+                ("autoflow monitor", output_report::TABLE_ONLY)
+            } else {
+                ("autoflow monitor", output_report::TABLE_JSON)
+            }
+        }
+        Action::History { watch, .. } => {
+            if *watch {
+                ("autoflow history", output_report::TABLE_ONLY)
+            } else {
+                ("autoflow history", output_report::TABLE_JSON_CSV)
+            }
+        }
+        Action::Explain { .. } => ("autoflow explain", output_report::TABLE_JSON),
+        Action::Doctor(_) => ("autoflow doctor", output_report::TABLE_JSON_CSV),
+        Action::Repair { .. } => ("autoflow repair", output_report::TABLE_ONLY),
+        Action::Requeue { .. } => ("autoflow requeue", output_report::TABLE_ONLY),
+        Action::Status(_) => ("autoflow status", output_report::TABLE_JSON_CSV),
+        Action::Claims(_) => ("autoflow claims", output_report::TABLE_JSON_CSV),
+        Action::Release { .. } => ("autoflow release", output_report::TABLE_ONLY),
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
+}
+
 async fn list(
     repo: Option<&str>,
     global_format: Option<crate::output::formats::OutputFormat>,
@@ -691,7 +1278,12 @@ async fn list(
     let repo_filter = normalize_repo_filter(repo)?;
     let entries = visible_autoflows()?;
     let entries = filter_visible_autoflows(entries, repo_filter.as_deref());
-    if entries.is_empty() {
+    if entries.is_empty()
+        && matches!(
+            global_format.unwrap_or(crate::output::formats::OutputFormat::Table),
+            crate::output::formats::OutputFormat::Table
+        )
+    {
         println!("(no autoflows)");
         return Ok(());
     }
@@ -711,53 +1303,104 @@ async fn list(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let format =
-        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
-    crate::output::formats::ensure_supported(
-        "rupu autoflow list",
-        format,
-        &[
-            crate::output::formats::OutputFormat::Table,
-            crate::output::formats::OutputFormat::Json,
-            crate::output::formats::OutputFormat::Csv,
-        ],
-    )?;
-    if format != crate::output::formats::OutputFormat::Table {
-        let report = AutoflowListReport {
+    let prefs = autoflow_ui_prefs()?;
+    let output = AutoflowListOutput {
+        prefs,
+        report: AutoflowListReport {
             kind: "autoflow_list",
             version: 1,
             rows,
-        };
-        return match format {
-            crate::output::formats::OutputFormat::Json => {
-                crate::output::formats::print_json(&report)
-            }
-            crate::output::formats::OutputFormat::Csv => {
-                crate::output::formats::print_csv_rows(&report.rows)
-            }
-            crate::output::formats::OutputFormat::Table => Ok(()),
-        };
-    }
-    let prefs = autoflow_ui_prefs()?;
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec![
-        "Name", "Scope", "Entity", "Source", "Priority", "Repo",
-    ]);
-    for row in rows {
-        table.add_row(vec![
-            Cell::new(row.name),
-            crate::output::tables::status_cell(&row.scope, &prefs),
-            Cell::new(row.entity),
-            Cell::new(row.source),
-            Cell::new(row.priority),
-            Cell::new(row.repo),
-        ]);
-    }
-    println!("{table}");
-    Ok(())
+        },
+    };
+    output_report::emit_collection(global_format, &output)
 }
 
-async fn show(name: &str, repo: Option<&str>) -> anyhow::Result<()> {
+fn build_autoflow_show_output(
+    entry: &VisibleAutoflowWorkflow,
+    body: String,
+) -> anyhow::Result<AutoflowShowOutput> {
+    let autoflow = entry.autoflow()?;
+    let prefs = autoflow_ui_prefs()?;
+    let rendered_yaml = crate::cmd::ui::highlight_yaml(&body, &prefs);
+    let rendered = format!(
+        "{}\n\n{}\n",
+        render_autoflow_show_summary(entry, autoflow),
+        rendered_yaml
+    );
+    let selector_states = autoflow
+        .selector
+        .states
+        .iter()
+        .map(|state| match state {
+            rupu_orchestrator::AutoflowIssueState::Open => "open".to_string(),
+            rupu_orchestrator::AutoflowIssueState::Closed => "closed".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let item = AutoflowShowItem {
+        name: entry.name.clone(),
+        scope: entry.scope.clone(),
+        path: entry.workflow_path.display().to_string(),
+        repo: entry.repo_ref.clone(),
+        project_root: entry
+            .project_root
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        preferred_checkout: entry
+            .preferred_checkout
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        description: entry.workflow.description.clone(),
+        entity: match autoflow.entity {
+            rupu_orchestrator::AutoflowEntity::Issue => "issue".to_string(),
+        },
+        source: autoflow
+            .source
+            .clone()
+            .or_else(|| entry.repo_ref.clone())
+            .unwrap_or_else(|| "-".to_string()),
+        priority: autoflow.priority,
+        workspace: autoflow
+            .workspace
+            .as_ref()
+            .map(|workspace| match workspace.strategy {
+                AutoflowWorkspaceStrategy::Worktree => "worktree".to_string(),
+                AutoflowWorkspaceStrategy::InPlace => "in_place".to_string(),
+            })
+            .unwrap_or_else(|| "worktree".to_string()),
+        workspace_branch: autoflow
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.branch.clone()),
+        reconcile_every: autoflow.reconcile_every.clone(),
+        claim_ttl: autoflow.claim.as_ref().and_then(|claim| claim.ttl.clone()),
+        outcome_output: autoflow
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.output.clone()),
+        wake_on: autoflow.wake_on.clone(),
+        labels_all: autoflow.selector.labels_all.clone(),
+        labels_any: autoflow.selector.labels_any.clone(),
+        labels_none: autoflow.selector.labels_none.clone(),
+        selector_states,
+        selector_limit: autoflow.selector.limit,
+        body,
+    };
+    Ok(AutoflowShowOutput {
+        prefs,
+        report: AutoflowShowReport {
+            kind: "autoflow_show",
+            version: 1,
+            item,
+        },
+        rendered,
+    })
+}
+
+async fn show(
+    name: &str,
+    repo: Option<&str>,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
     let matches = visible_autoflow_matches(name, repo)?;
     let entry = match matches.as_slice() {
         [] => match repo {
@@ -785,15 +1428,8 @@ async fn show(name: &str, repo: Option<&str>) -> anyhow::Result<()> {
         }
     };
     let body = std::fs::read_to_string(&entry.workflow_path)?;
-    let autoflow = entry.autoflow()?;
-    let prefs = autoflow_ui_prefs()?;
-    let rendered_yaml = crate::cmd::ui::highlight_yaml(&body, &prefs);
-    let rendered = format!(
-        "{}\n\n{}\n",
-        render_autoflow_show_summary(entry, autoflow),
-        rendered_yaml
-    );
-    crate::cmd::ui::paginate(&rendered, &prefs)
+    let output = build_autoflow_show_output(entry, body)?;
+    output_report::emit_detail(global_format, &output)
 }
 
 async fn run(
@@ -1072,7 +1708,13 @@ async fn wakes(
     });
     let recent_processed = processed.into_iter().take(10).collect::<Vec<_>>();
 
-    if queued.is_empty() && recent_processed.is_empty() {
+    if queued.is_empty()
+        && recent_processed.is_empty()
+        && matches!(
+            global_format.unwrap_or(crate::output::formats::OutputFormat::Table),
+            crate::output::formats::OutputFormat::Table
+        )
+    {
         println!("(no autoflow wakes)");
         return Ok(());
     }
@@ -1097,57 +1739,14 @@ async fn wakes(
         not_before: wake.not_before,
         repo: wake.repo_ref,
     }));
-    let format =
-        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
-    crate::output::formats::ensure_supported(
-        "rupu autoflow wakes",
-        format,
-        &[
-            crate::output::formats::OutputFormat::Table,
-            crate::output::formats::OutputFormat::Json,
-            crate::output::formats::OutputFormat::Csv,
-        ],
-    )?;
-    if format != crate::output::formats::OutputFormat::Table {
-        let report = AutoflowWakesReport {
+    let output = AutoflowWakesOutput {
+        report: AutoflowWakesReport {
             kind: "autoflow_wakes",
             version: 1,
             rows,
-        };
-        return match format {
-            crate::output::formats::OutputFormat::Json => {
-                crate::output::formats::print_json(&report)
-            }
-            crate::output::formats::OutputFormat::Csv => {
-                crate::output::formats::print_csv_rows(&report.rows)
-            }
-            crate::output::formats::OutputFormat::Table => Ok(()),
-        };
-    }
-
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec![
-        "Wake",
-        "State",
-        "Source",
-        "Event",
-        "Entity",
-        "Not Before",
-        "Repo",
-    ]);
-    for row in rows {
-        table.add_row(vec![
-            Cell::new(row.wake_id),
-            Cell::new(row.state),
-            Cell::new(row.source),
-            Cell::new(row.event),
-            Cell::new(row.entity),
-            Cell::new(compact_timestamp(&row.not_before)),
-            Cell::new(row.repo),
-        ]);
-    }
-    println!("{table}");
-    Ok(())
+        },
+    };
+    output_report::emit_collection(global_format, &output)
 }
 
 async fn monitor(
@@ -1159,14 +1758,6 @@ async fn monitor(
 ) -> anyhow::Result<()> {
     let format =
         crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
-    crate::output::formats::ensure_supported(
-        "rupu autoflow monitor",
-        format,
-        &[
-            crate::output::formats::OutputFormat::Table,
-            crate::output::formats::OutputFormat::Json,
-        ],
-    )?;
     if watch && format != crate::output::formats::OutputFormat::Table {
         bail!("`rupu autoflow monitor --watch` only supports table output");
     }
@@ -1178,7 +1769,8 @@ async fn monitor(
 
     if !watch {
         let report = build_monitor_report(repo_filter.as_deref(), worker)?;
-        return print_monitor_report(&report, format);
+        let output = AutoflowMonitorOutput { report };
+        return output_report::emit_collection(global_format, &output);
     }
 
     loop {
@@ -1201,15 +1793,6 @@ async fn history(
 ) -> anyhow::Result<()> {
     let format =
         crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
-    crate::output::formats::ensure_supported(
-        "rupu autoflow history",
-        format,
-        &[
-            crate::output::formats::OutputFormat::Table,
-            crate::output::formats::OutputFormat::Json,
-            crate::output::formats::OutputFormat::Csv,
-        ],
-    )?;
     if watch && format != crate::output::formats::OutputFormat::Table {
         bail!("`rupu autoflow history --watch` only supports table output");
     }
@@ -1225,7 +1808,8 @@ async fn history(
 
     if !watch {
         let report = build_history_report(&query)?;
-        return print_history_report(&report, format);
+        let output = AutoflowHistoryOutput { report };
+        return output_report::emit_collection(global_format, &output);
     }
 
     loop {
@@ -1489,30 +2073,6 @@ fn recent_activity_map_from_events(
             });
     }
     out
-}
-
-fn print_monitor_report(
-    report: &AutoflowMonitorReport,
-    format: crate::output::formats::OutputFormat,
-) -> anyhow::Result<()> {
-    match format {
-        crate::output::formats::OutputFormat::Json => crate::output::formats::print_json(report),
-        crate::output::formats::OutputFormat::Table => render_monitor_snapshot(report, false),
-        crate::output::formats::OutputFormat::Csv => unreachable!("csv not supported"),
-    }
-}
-
-fn print_history_report(
-    report: &AutoflowHistoryReport,
-    format: crate::output::formats::OutputFormat,
-) -> anyhow::Result<()> {
-    match format {
-        crate::output::formats::OutputFormat::Json => crate::output::formats::print_json(report),
-        crate::output::formats::OutputFormat::Csv => {
-            crate::output::formats::print_csv_rows(&report.rows)
-        }
-        crate::output::formats::OutputFormat::Table => render_history_table(report),
-    }
 }
 
 fn render_monitor_watch_frame(report: &AutoflowMonitorReport) -> anyhow::Result<()> {
@@ -3579,7 +4139,177 @@ fn pr_preview_from_input(input: &serde_json::Value) -> Option<String> {
     }
 }
 
-async fn explain(r#ref: &str, repo: Option<&str>) -> anyhow::Result<()> {
+fn wake_row_from_record(wake: &WakeRecord, state: &str) -> AutoflowWakeRow {
+    AutoflowWakeRow {
+        wake_id: wake.wake_id.clone(),
+        state: state.to_string(),
+        source: wake_source_name(wake.source).into(),
+        event: wake.event.id.clone(),
+        entity: wake.entity.ref_text.clone(),
+        not_before: wake.not_before.clone(),
+        repo: wake.repo_ref.clone(),
+    }
+}
+
+fn render_autoflow_explain_report(report: &AutoflowExplainReport) -> String {
+    let item = &report.item;
+    let mut out = String::new();
+    let _ = writeln!(&mut out, "issue: {}", item.issue);
+    let _ = writeln!(&mut out, "repo: {}", item.repo);
+    if let Some(claim) = &item.claim {
+        if let Some(display_ref) = claim.issue_display.as_deref() {
+            let _ = writeln!(&mut out, "issue display: {display_ref}");
+        }
+        if let Some(title) = claim.issue_title.as_deref() {
+            let _ = writeln!(&mut out, "issue title: {title}");
+        }
+        if let Some(tracker) = claim.issue_tracker.as_deref() {
+            let _ = writeln!(&mut out, "issue tracker: {tracker}");
+        }
+        if let Some(state_name) = claim.issue_state.as_deref() {
+            let _ = writeln!(&mut out, "issue state: {state_name}");
+        }
+        if let Some(source_ref) = claim.source.as_deref() {
+            let _ = writeln!(&mut out, "source: {source_ref}");
+        }
+        if let Some(issue_url) = claim.issue_url.as_deref() {
+            let _ = writeln!(&mut out, "issue url: {issue_url}");
+        }
+        let _ = writeln!(&mut out, "workflow: {}", claim.workflow);
+        let _ = writeln!(&mut out, "status: {}", claim.status);
+        let _ = writeln!(
+            &mut out,
+            "priority: {}",
+            claim.priority.as_deref().unwrap_or("-")
+        );
+        let _ = writeln!(&mut out, "contenders: {}", claim.contenders);
+        let _ = writeln!(&mut out, "workspace: {}", claim.workspace);
+        let _ = writeln!(&mut out, "branch: {}", claim.branch);
+        let _ = writeln!(&mut out, "pr: {}", claim.pr);
+        let _ = writeln!(&mut out, "claim owner: {}", claim.claim_owner);
+        let _ = writeln!(&mut out, "lease expires: {}", claim.lease_expires);
+        if let Some(lock) = &claim.active_lock {
+            let _ = writeln!(
+                &mut out,
+                "active lock: owner={} acquired_at={} lease_expires={}",
+                lock.owner,
+                lock.acquired_at,
+                lock.lease_expires.as_deref().unwrap_or("-")
+            );
+        } else {
+            let _ = writeln!(&mut out, "active lock: -");
+        }
+        if let Some(run) = &claim.last_run {
+            let _ = writeln!(&mut out, "last run: {}", run.run_id);
+            let _ = writeln!(&mut out, "watch hint: rupu watch {}", run.run_id);
+            let _ = writeln!(&mut out, "last run status: {}", run.status);
+            let _ = writeln!(&mut out, "last run backend: {}", run.backend);
+            let _ = writeln!(&mut out, "last run worker: {}", run.worker);
+            if let Some(source_wake) = run.source_wake.as_deref() {
+                let _ = writeln!(&mut out, "source wake: {source_wake}");
+            }
+            if let Some(step) = run.approval_step.as_deref() {
+                let _ = writeln!(
+                    &mut out,
+                    "approval gate: step={} expires={}",
+                    step,
+                    run.approval_expires.as_deref().unwrap_or("-")
+                );
+            }
+            if let Some(execution) = run.execution.as_deref() {
+                let _ = writeln!(&mut out, "last run execution: {execution}");
+            }
+            if let Some(models) = run.models.as_deref() {
+                let _ = writeln!(&mut out, "last run models: {models}");
+            }
+            if let Some(usage) = run.usage.as_deref() {
+                let _ = writeln!(&mut out, "last run usage: {usage}");
+            }
+            if let Some(changes) = run.changes.as_deref() {
+                let _ = writeln!(&mut out, "last run changes: {changes}");
+            }
+            if let Some(started_at) = run.started_at.as_deref() {
+                let _ = writeln!(&mut out, "last run started: {started_at}");
+            }
+            if let Some(finished_at) = run.finished_at.as_deref() {
+                let _ = writeln!(&mut out, "last run finished: {finished_at}");
+            }
+            if let Some(workspace) = run.workspace.as_deref() {
+                let _ = writeln!(&mut out, "last run workspace: {workspace}");
+            }
+            if let Some(merge_target) = run.merge_target.as_deref() {
+                let _ = writeln!(&mut out, "last run merge target: {merge_target}");
+            }
+        } else {
+            let _ = writeln!(&mut out, "last run: -");
+        }
+        let _ = writeln!(&mut out, "next action: {}", claim.next_action);
+        if let Some(dispatch) = &claim.pending_dispatch {
+            let _ = writeln!(
+                &mut out,
+                "pending dispatch: {} target={} inputs={}",
+                dispatch.workflow, dispatch.target, dispatch.inputs
+            );
+        }
+        if let Some(next_retry_at) = claim.next_retry.as_deref() {
+            let _ = writeln!(&mut out, "next retry: {next_retry_at}");
+        }
+        if let Some(summary) = claim.summary.as_deref() {
+            let _ = writeln!(&mut out, "summary: {summary}");
+        }
+    } else {
+        let _ = writeln!(&mut out, "status: {}", item.status);
+        if let Some(source) = item.source.as_deref() {
+            let _ = writeln!(&mut out, "source: {source}");
+        }
+        if !item.candidate_workflows.is_empty() {
+            let _ = writeln!(
+                &mut out,
+                "candidate workflows: {}",
+                item.candidate_workflows.join(", ")
+            );
+        }
+    }
+
+    if item.queued_wakes.is_empty() {
+        let _ = writeln!(&mut out, "queued wakes: -");
+    } else {
+        let _ = writeln!(&mut out, "queued wakes:");
+        for wake in &item.queued_wakes {
+            let _ = writeln!(
+                &mut out,
+                "- {} {} {} not_before={}",
+                wake.wake_id, wake.source, wake.event, wake.not_before
+            );
+        }
+    }
+    if let Some(wake) = &item.recent_processed_wake {
+        let _ = writeln!(
+            &mut out,
+            "recent processed wake: {} {} {}",
+            wake.wake_id, wake.source, wake.event
+        );
+    }
+    if item.recent_cycle_events.is_empty() {
+        let _ = writeln!(&mut out, "recent cycle events: -");
+    } else {
+        let _ = writeln!(&mut out, "recent cycle events:");
+        for row in &item.recent_cycle_events {
+            let _ = writeln!(
+                &mut out,
+                "- {} {} workflow={} run={} detail={}",
+                row.at, row.event, row.workflow, row.run, row.detail
+            );
+        }
+    }
+    out
+}
+
+async fn explain(
+    r#ref: &str,
+    repo: Option<&str>,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
     let issue_ref = canonical_autoflow_issue_ref(r#ref)?;
     let global = paths::global_dir()?;
     let pricing = autoflow_pricing_config();
@@ -3622,199 +4352,163 @@ async fn explain(r#ref: &str, repo: Option<&str>) -> anyhow::Result<()> {
     .into_iter()
     .take(5)
     .collect::<Vec<_>>();
+    let queued_wakes = queued
+        .iter()
+        .map(|wake| wake_row_from_record(wake, "queued"))
+        .collect::<Vec<_>>();
+    let recent_processed_wake = processed
+        .first()
+        .map(|wake| wake_row_from_record(wake, "processed"));
+    let candidate_workflows = source_matches
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect::<Vec<_>>();
 
-    println!("issue: {issue_ref}");
-    println!("repo: {repo_ref}");
-    match claim {
-        Some(claim) => {
-            if let Some(display_ref) = claim.issue_display_ref.as_deref() {
-                println!("issue display: {display_ref}");
-            }
-            if let Some(title) = claim.issue_title.as_deref() {
-                println!("issue title: {title}");
-            }
-            if let Some(tracker) = claim.issue_tracker.as_deref() {
-                println!("issue tracker: {tracker}");
-            }
-            if let Some(state_name) = claim.issue_state_name.as_deref() {
-                println!("issue state: {state_name}");
-            }
-            if let Some(source_ref) = claim.source_ref.as_deref() {
-                println!("source: {source_ref}");
-            }
-            if let Some(issue_url) = claim.issue_url.as_deref() {
-                println!("issue url: {issue_url}");
-            }
-            println!("workflow: {}", claim.workflow);
-            println!("status: {}", status_name(claim.status));
-            println!(
-                "priority: {}",
-                selected_priority(&claim)
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "-".into())
-            );
-            println!("contenders: {}", format_contenders(&claim.contenders));
-            println!(
-                "workspace: {}",
-                claim.worktree_path.as_deref().unwrap_or("-")
-            );
-            println!("branch: {}", claim.branch.as_deref().unwrap_or("-"));
-            println!("pr: {}", claim.pr_url.as_deref().unwrap_or("-"));
-            println!(
-                "claim owner: {}",
-                claim.claim_owner.as_deref().unwrap_or("-")
-            );
-            println!(
-                "lease expires: {}",
-                claim.lease_expires_at.as_deref().unwrap_or("-")
-            );
-            if let Some(lock) = claim_store.read_active_lock(&issue_ref)? {
-                println!(
-                    "active lock: owner={} acquired_at={} lease_expires={}",
-                    lock.owner,
-                    lock.acquired_at,
-                    lock.lease_expires_at.as_deref().unwrap_or("-")
-                );
-            } else {
-                println!("active lock: -");
-            }
-            if let Some(run_id) = claim.last_run_id.as_deref() {
-                println!("last run: {run_id}");
-                println!("watch hint: rupu watch {run_id}");
-                match run_store.load(run_id) {
-                    Ok(run) => {
-                        println!("last run status: {}", run.status.as_str());
-                        println!(
-                            "last run backend: {}",
-                            run.backend_id.as_deref().unwrap_or("-")
-                        );
-                        println!(
-                            "last run worker: {}",
-                            run.worker_id.as_deref().unwrap_or("-")
-                        );
-                        if let Some(source_wake_id) = run.source_wake_id.as_deref() {
-                            println!(
-                                "source wake: {}",
-                                describe_wake_source(&global, &wake_store, source_wake_id)
-                            );
-                        }
-                        if run.status == RunStatus::AwaitingApproval {
-                            println!(
-                                "approval gate: step={} expires={}",
-                                run.awaiting_step_id.as_deref().unwrap_or("-"),
-                                run.expires_at
-                                    .map(|value| value.to_rfc3339())
-                                    .unwrap_or_else(|| "-".into())
-                            );
-                        }
-                        if let Some(summary) = load_run_summary(&run_store, run_id, &pricing) {
-                            println!("last run execution: {}", format_run_metrics_line(&summary));
-                            println!("last run models: {}", format_run_models_line(&summary));
-                            println!("last run usage: {}", format_run_usage_line(&summary));
-                            println!("last run changes: {}", format_run_diff_line(&summary));
-                            println!("last run started: {}", summary.started_at.to_rfc3339());
-                            println!(
-                                "last run finished: {}",
-                                summary
-                                    .finished_at
-                                    .as_ref()
-                                    .map(|value| value.to_rfc3339())
-                                    .unwrap_or_else(|| "-".into())
-                            );
-                            println!(
-                                "last run workspace: {}",
-                                summary.workspace.as_deref().unwrap_or("-")
-                            );
-                            println!(
-                                "last run merge target: {}",
-                                summary
-                                    .diff
-                                    .as_ref()
-                                    .and_then(|diff| diff.merge_target.as_deref())
-                                    .unwrap_or("-")
-                            );
-                        }
-                    }
-                    Err(error) => println!("last run status: missing ({error})"),
+    let claim_report = if let Some(claim) = claim {
+        let active_lock =
+            claim_store
+                .read_active_lock(&issue_ref)?
+                .map(|lock| AutoflowExplainLock {
+                    owner: lock.owner,
+                    acquired_at: lock.acquired_at,
+                    lease_expires: lock.lease_expires_at,
+                });
+        let last_run = match claim.last_run_id.as_deref() {
+            Some(run_id) => match run_store.load(run_id) {
+                Ok(run) => {
+                    let summary = load_run_summary(&run_store, run_id, &pricing);
+                    Some(AutoflowExplainRun {
+                        run_id: run_id.to_string(),
+                        status: run.status.as_str().to_string(),
+                        backend: run.backend_id.unwrap_or_else(|| "-".into()),
+                        worker: run.worker_id.unwrap_or_else(|| "-".into()),
+                        source_wake: run.source_wake_id.as_deref().map(|source_wake_id| {
+                            describe_wake_source(&global, &wake_store, source_wake_id)
+                        }),
+                        approval_step: (run.status == RunStatus::AwaitingApproval)
+                            .then(|| run.awaiting_step_id.unwrap_or_else(|| "-".into())),
+                        approval_expires: (run.status == RunStatus::AwaitingApproval).then(|| {
+                            run.expires_at
+                                .map(|value| value.to_rfc3339())
+                                .unwrap_or_else(|| "-".into())
+                        }),
+                        execution: summary.as_ref().map(format_run_metrics_line),
+                        models: summary.as_ref().map(format_run_models_line),
+                        usage: summary.as_ref().map(format_run_usage_line),
+                        changes: summary.as_ref().map(format_run_diff_line),
+                        started_at: summary
+                            .as_ref()
+                            .map(|summary| summary.started_at.to_rfc3339()),
+                        finished_at: summary.as_ref().map(|summary| {
+                            summary
+                                .finished_at
+                                .as_ref()
+                                .map(|value| value.to_rfc3339())
+                                .unwrap_or_else(|| "-".into())
+                        }),
+                        workspace: summary
+                            .as_ref()
+                            .map(|summary| summary.workspace.as_deref().unwrap_or("-").to_string()),
+                        merge_target: summary.as_ref().map(|summary| {
+                            summary
+                                .diff
+                                .as_ref()
+                                .and_then(|diff| diff.merge_target.as_deref())
+                                .unwrap_or("-")
+                                .to_string()
+                        }),
+                    })
                 }
-            } else {
-                println!("last run: -");
-            }
-            println!("next action: {}", next_action_summary(&claim));
-            if let Some(dispatch) = &claim.pending_dispatch {
-                println!(
-                    "pending dispatch: {} target={} inputs={}",
-                    dispatch.workflow,
-                    dispatch.target,
-                    format_inputs(&dispatch.inputs)
-                );
-            }
-            if let Some(next_retry_at) = claim.next_retry_at.as_deref() {
-                println!("next retry: {next_retry_at}");
-            }
-            if let Some(summary) = claim.last_summary.as_deref() {
-                println!("summary: {summary}");
-            }
-        }
-        None => {
-            println!("status: unclaimed");
-            if let Some(source) = source_matches
-                .first()
-                .and_then(|entry| entry.autoflow().ok())
-                .and_then(|autoflow| autoflow.source.as_deref())
-            {
-                println!("source: {source}");
-            }
-            if !source_matches.is_empty() {
-                println!(
-                    "candidate workflows: {}",
-                    source_matches
-                        .iter()
-                        .map(|entry| entry.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-        }
-    }
+                Err(error) => Some(AutoflowExplainRun {
+                    run_id: run_id.to_string(),
+                    status: format!("missing ({error})"),
+                    backend: "-".into(),
+                    worker: "-".into(),
+                    source_wake: None,
+                    approval_step: None,
+                    approval_expires: None,
+                    execution: None,
+                    models: None,
+                    usage: None,
+                    changes: None,
+                    started_at: None,
+                    finished_at: None,
+                    workspace: None,
+                    merge_target: None,
+                }),
+            },
+            None => None,
+        };
+        let priority = selected_priority(&claim).map(|value| value.to_string());
+        let contenders = format_contenders(&claim.contenders);
+        let next_action = next_action_summary(&claim);
+        Some(AutoflowExplainClaim {
+            issue_display: claim.issue_display_ref,
+            issue_title: claim.issue_title,
+            issue_tracker: claim.issue_tracker,
+            issue_state: claim.issue_state_name,
+            source: claim.source_ref,
+            issue_url: claim.issue_url,
+            workflow: claim.workflow,
+            status: status_name(claim.status).to_string(),
+            priority,
+            contenders,
+            workspace: claim.worktree_path.unwrap_or_else(|| "-".into()),
+            branch: claim.branch.unwrap_or_else(|| "-".into()),
+            pr: claim.pr_url.unwrap_or_else(|| "-".into()),
+            claim_owner: claim.claim_owner.unwrap_or_else(|| "-".into()),
+            lease_expires: claim.lease_expires_at.unwrap_or_else(|| "-".into()),
+            active_lock,
+            last_run,
+            next_action,
+            pending_dispatch: claim.pending_dispatch.map(|dispatch| {
+                AutoflowExplainPendingDispatch {
+                    workflow: dispatch.workflow,
+                    target: dispatch.target,
+                    inputs: format_inputs(&dispatch.inputs),
+                }
+            }),
+            next_retry: claim.next_retry_at,
+            summary: claim.last_summary,
+        })
+    } else {
+        None
+    };
 
-    if queued.is_empty() {
-        println!("queued wakes: -");
-    } else {
-        println!("queued wakes:");
-        for wake in queued {
-            println!(
-                "- {} {} {} not_before={}",
-                wake.wake_id,
-                wake_source_name(wake.source),
-                wake.event.id,
-                wake.not_before
-            );
-        }
-    }
-    if let Some(wake) = processed.first() {
-        println!(
-            "recent processed wake: {} {} {}",
-            wake.wake_id,
-            wake_source_name(wake.source),
-            wake.event.id
-        );
-    }
-    if recent_history.is_empty() {
-        println!("recent cycle events: -");
-    } else {
-        println!("recent cycle events:");
-        for row in recent_history {
-            println!(
-                "- {} {} workflow={} run={} detail={}",
-                row.at, row.event, row.workflow, row.run, row.detail
-            );
-        }
-    }
-    Ok(())
+    let report = AutoflowExplainReport {
+        kind: "autoflow_explain",
+        version: 1,
+        item: AutoflowExplainItem {
+            issue: issue_ref,
+            repo: repo_ref,
+            status: claim_report
+                .as_ref()
+                .map(|claim| claim.status.clone())
+                .unwrap_or_else(|| "unclaimed".into()),
+            source: claim_report
+                .as_ref()
+                .and_then(|claim| claim.source.clone())
+                .or_else(|| {
+                    source_matches
+                        .first()
+                        .and_then(|entry| entry.autoflow().ok())
+                        .and_then(|autoflow| autoflow.source.clone())
+                }),
+            candidate_workflows,
+            claim: claim_report,
+            queued_wakes,
+            recent_processed_wake,
+            recent_cycle_events: recent_history,
+        },
+    };
+    let rendered = render_autoflow_explain_report(&report);
+    output_report::emit_detail(global_format, &AutoflowExplainOutput { report, rendered })
 }
 
-async fn doctor(repo: Option<&str>) -> anyhow::Result<()> {
+async fn doctor(
+    repo: Option<&str>,
+    global_format: Option<crate::output::formats::OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let repo_filter = normalize_repo_filter(repo)?;
     let repo_store = RepoRegistryStore {
@@ -3952,22 +4646,24 @@ async fn doctor(repo: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
-    if findings.is_empty() {
-        println!("autoflow doctor: ok");
-        return Ok(());
-    }
+    let rows = findings
+        .into_iter()
+        .map(|finding| AutoflowDoctorRow {
+            scope: finding.scope,
+            problem: finding.kind.to_string(),
+            detail: finding.detail,
+        })
+        .collect::<Vec<_>>();
 
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec!["Scope", "Problem", "Detail"]);
-    for finding in findings {
-        table.add_row(vec![
-            Cell::new(finding.scope),
-            Cell::new(finding.kind),
-            Cell::new(finding.detail),
-        ]);
-    }
-    println!("{table}");
-    Ok(())
+    let output = AutoflowDoctorOutput {
+        report: AutoflowDoctorReport {
+            kind: "autoflow_doctor",
+            version: 1,
+            ok: rows.is_empty(),
+            rows,
+        },
+    };
+    output_report::emit_collection(global_format, &output)
 }
 
 async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::Result<()> {
@@ -4137,79 +4833,17 @@ async fn status(
             contenders: format_contenders(&claim.contenders),
         })
         .collect::<Vec<_>>();
-    let format =
-        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
-    crate::output::formats::ensure_supported(
-        "rupu autoflow status",
-        format,
-        &[
-            crate::output::formats::OutputFormat::Table,
-            crate::output::formats::OutputFormat::Json,
-            crate::output::formats::OutputFormat::Csv,
-        ],
-    )?;
-    if format != crate::output::formats::OutputFormat::Table {
-        let report = AutoflowStatusReport {
+    let prefs = autoflow_ui_prefs()?;
+    let output = AutoflowStatusOutput {
+        prefs,
+        report: AutoflowStatusReport {
             kind: "autoflow_status",
             version: 2,
             rows,
             contested,
-        };
-        return match format {
-            crate::output::formats::OutputFormat::Json => {
-                crate::output::formats::print_json(&report)
-            }
-            crate::output::formats::OutputFormat::Csv => {
-                crate::output::formats::print_csv_rows(&report.rows)
-            }
-            crate::output::formats::OutputFormat::Table => Ok(()),
-        };
-    }
-    let prefs = autoflow_ui_prefs()?;
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec!["Status", "Count"]);
-    for row in &rows {
-        table.add_row(vec![
-            crate::output::tables::status_cell(&row.status, &prefs),
-            Cell::new(row.count),
-        ]);
-    }
-    println!("{table}");
-    if !contested.is_empty() {
-        println!();
-        let mut contested_table = crate::output::tables::new_table();
-        contested_table.set_header(vec![
-            "Issue",
-            "Source",
-            "State",
-            "Repo",
-            "Recent",
-            "Contenders",
-        ]);
-        for claim in contested {
-            let recent = match (claim.last_event.as_deref(), claim.last_cycle.as_deref()) {
-                (Some(event), Some(at)) => format!("{event} @ {}", compact_timestamp(at)),
-                (Some(event), None) => event.to_string(),
-                _ => "-".into(),
-            };
-            contested_table.add_row(vec![
-                Cell::new(claim.issue_display.as_deref().unwrap_or(&claim.issue)),
-                Cell::new(
-                    claim
-                        .source
-                        .as_deref()
-                        .or(claim.tracker.as_deref())
-                        .unwrap_or("-"),
-                ),
-                Cell::new(claim.state.as_deref().unwrap_or("-")),
-                Cell::new(claim.repo),
-                Cell::new(recent),
-                Cell::new(claim.contenders),
-            ]);
-        }
-        println!("{contested_table}");
-    }
-    Ok(())
+        },
+    };
+    output_report::emit_collection(global_format, &output)
 }
 
 async fn claims(
@@ -4224,7 +4858,12 @@ async fn claims(
     let repo_filter = normalize_repo_filter(repo)?;
     let claims = filter_claims_by_repo(store.list()?, repo_filter.as_deref());
     let recent = recent_activity_by_issue(&history_store, repo_filter.as_deref())?;
-    if claims.is_empty() {
+    if claims.is_empty()
+        && matches!(
+            global_format.unwrap_or(crate::output::formats::OutputFormat::Table),
+            crate::output::formats::OutputFormat::Table
+        )
+    {
         println!("(no autoflow claims)");
         return Ok(());
     }
@@ -4263,62 +4902,39 @@ async fn claims(
                 .unwrap_or_else(|| "-".into()),
         })
         .collect::<Vec<_>>();
-    let format =
-        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
-    crate::output::formats::ensure_supported(
-        "rupu autoflow claims",
-        format,
-        &[
-            crate::output::formats::OutputFormat::Table,
-            crate::output::formats::OutputFormat::Json,
-            crate::output::formats::OutputFormat::Csv,
-        ],
-    )?;
-    if format != crate::output::formats::OutputFormat::Table {
-        let report = AutoflowClaimsReport {
+    let prefs = autoflow_ui_prefs()?;
+    let output = AutoflowClaimsOutput {
+        prefs,
+        csv_rows: rows
+            .iter()
+            .map(|claim| AutoflowClaimCsvRow {
+                issue: claim.issue.clone(),
+                issue_display: claim.issue_display.clone().unwrap_or_default(),
+                tracker: claim.tracker.clone().unwrap_or_default(),
+                state: claim.state.clone().unwrap_or_default(),
+                source: claim.source.clone().unwrap_or_default(),
+                repo: claim.repo.clone(),
+                workflow: claim.workflow.clone(),
+                priority: claim.priority.clone(),
+                status: claim.status.clone(),
+                next: claim.next.clone(),
+                branch: claim.branch.clone(),
+                pr: claim.pr.clone(),
+                summary: claim.summary.clone(),
+                contenders: claim.contenders.clone(),
+                workspace: claim.workspace.clone(),
+                last_cycle: claim.last_cycle.clone(),
+                last_event: claim.last_event.clone(),
+                last_run: claim.last_run.clone(),
+            })
+            .collect(),
+        report: AutoflowClaimsReport {
             kind: "autoflow_claims",
             version: 2,
             rows,
-        };
-        return match format {
-            crate::output::formats::OutputFormat::Json => {
-                crate::output::formats::print_json(&report)
-            }
-            crate::output::formats::OutputFormat::Csv => {
-                crate::output::formats::print_csv_rows(&report.rows)
-            }
-            crate::output::formats::OutputFormat::Table => Ok(()),
-        };
-    }
-
-    let prefs = autoflow_ui_prefs()?;
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec![
-        "Issue", "Source", "State", "Workflow", "Status", "Next", "Run", "Repo", "Branch",
-        "Summary",
-    ]);
-    for claim in rows {
-        table.add_row(vec![
-            Cell::new(claim.issue_display.as_deref().unwrap_or(&claim.issue)),
-            Cell::new(
-                claim
-                    .source
-                    .as_deref()
-                    .or(claim.tracker.as_deref())
-                    .unwrap_or("-"),
-            ),
-            Cell::new(claim.state.as_deref().unwrap_or("-")),
-            Cell::new(claim.workflow),
-            crate::output::tables::status_cell(&claim.status, &prefs),
-            Cell::new(truncate_text(&claim.next, 32)),
-            Cell::new(claim.last_run),
-            Cell::new(claim.repo),
-            Cell::new(claim.branch),
-            Cell::new(truncate_text(&claim.summary, 40)),
-        ]);
-    }
-    println!("{table}");
-    Ok(())
+        },
+    };
+    output_report::emit_collection(global_format, &output)
 }
 
 async fn release(r#ref: &str) -> anyhow::Result<()> {

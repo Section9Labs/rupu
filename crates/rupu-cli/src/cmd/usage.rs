@@ -7,6 +7,8 @@ use crate::cmd::usage_report::{
     backfill_standalone_metadata, StandaloneMetadataBackfillStats, UsageDataset, UsageFact,
     UsageFilter,
 };
+use crate::output::formats::OutputFormat;
+use crate::output::report::{self, CollectionOutput};
 use crate::paths;
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
@@ -107,10 +109,7 @@ pub struct UsageArgs {
     pub command: Option<UsageCommand>,
 }
 
-pub async fn handle(
-    args: UsageArgs,
-    global_format: Option<crate::output::formats::OutputFormat>,
-) -> ExitCode {
+pub async fn handle(args: UsageArgs, global_format: Option<OutputFormat>) -> ExitCode {
     let result = run(args, global_format).await;
     match result {
         Ok(()) => ExitCode::from(0),
@@ -118,26 +117,16 @@ pub async fn handle(
     }
 }
 
-async fn run(
-    args: UsageArgs,
-    global_format: Option<crate::output::formats::OutputFormat>,
-) -> anyhow::Result<()> {
+pub fn ensure_output_format(_args: &UsageArgs, format: OutputFormat) -> anyhow::Result<()> {
+    crate::output::formats::ensure_supported("usage", format, report::TABLE_JSON_CSV)
+}
+
+async fn run(args: UsageArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let cfg = layered_config(&global, project_root.as_deref());
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None);
-    let format =
-        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
-    crate::output::formats::ensure_supported(
-        "rupu usage",
-        format,
-        &[
-            crate::output::formats::OutputFormat::Table,
-            crate::output::formats::OutputFormat::Json,
-            crate::output::formats::OutputFormat::Csv,
-        ],
-    )?;
 
     match args.command {
         Some(UsageCommand::Runs(run_args)) => render_run_view(
@@ -146,14 +135,14 @@ async fn run(
             &cfg,
             &prefs,
             *run_args,
-            format,
+            global_format,
         ),
         Some(UsageCommand::Backfill(backfill_args)) => render_backfill_view(
             &global,
             project_root.as_deref(),
             &prefs,
             backfill_args,
-            format,
+            global_format,
         ),
         None => render_breakdown_view(
             &global,
@@ -162,7 +151,7 @@ async fn run(
             &prefs,
             args.scope,
             args.group_by,
-            format,
+            global_format,
         ),
     }
 }
@@ -172,7 +161,7 @@ fn render_backfill_view(
     project_root: Option<&std::path::Path>,
     prefs: &crate::cmd::ui::UiPrefs,
     args: UsageBackfillArgs,
-    format: crate::output::formats::OutputFormat,
+    global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let stats = backfill_standalone_metadata(global, project_root, args.force)?;
     let report = UsageBackfillReport {
@@ -183,16 +172,11 @@ fn render_backfill_view(
         rows: vec![UsageBackfillRow::from_stats(&stats)],
     };
 
-    match format {
-        crate::output::formats::OutputFormat::Table => {
-            print_backfill_table(&report, prefs);
-            Ok(())
-        }
-        crate::output::formats::OutputFormat::Json => crate::output::formats::print_json(&report),
-        crate::output::formats::OutputFormat::Csv => {
-            crate::output::formats::print_csv_rows(&report.rows)
-        }
-    }
+    let output = UsageBackfillOutput {
+        prefs: prefs.clone(),
+        report,
+    };
+    report::emit_collection(global_format, &output)
 }
 
 fn render_breakdown_view(
@@ -202,7 +186,7 @@ fn render_breakdown_view(
     prefs: &crate::cmd::ui::UiPrefs,
     scope: UsageScopeArgs,
     group_by: UsageGroupBy,
-    format: crate::output::formats::OutputFormat,
+    global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let window = resolve_window(&scope)?;
     let dataset = UsageDataset::load(global, project_root, window.window())?;
@@ -219,16 +203,13 @@ fn render_breakdown_view(
         rows,
     };
 
-    match format {
-        crate::output::formats::OutputFormat::Table => {
-            print_breakdown_table(&report, prefs);
-            Ok(())
-        }
-        crate::output::formats::OutputFormat::Json => crate::output::formats::print_json(&report),
-        crate::output::formats::OutputFormat::Csv => {
-            crate::output::formats::print_csv_rows(&report.rows)
-        }
-    }
+    let csv_rows = rows_to_breakdown_csv_rows(&report.rows);
+    let output = UsageBreakdownOutput {
+        prefs: prefs.clone(),
+        report,
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
 }
 
 fn render_run_view(
@@ -237,7 +218,7 @@ fn render_run_view(
     cfg: &rupu_config::Config,
     prefs: &crate::cmd::ui::UiPrefs,
     args: UsageRunsArgs,
-    format: crate::output::formats::OutputFormat,
+    global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let window = resolve_window(&args.scope)?;
     let dataset = UsageDataset::load(global, project_root, window.window())?;
@@ -257,16 +238,13 @@ fn render_run_view(
         rows,
     };
 
-    match format {
-        crate::output::formats::OutputFormat::Table => {
-            print_run_table(&report, prefs);
-            Ok(())
-        }
-        crate::output::formats::OutputFormat::Json => crate::output::formats::print_json(&report),
-        crate::output::formats::OutputFormat::Csv => {
-            crate::output::formats::print_csv_rows(&report.rows)
-        }
-    }
+    let csv_rows = rows_to_run_csv_rows(&report.rows);
+    let output = UsageRunsOutput {
+        prefs: prefs.clone(),
+        report,
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)
 }
 
 fn layered_config(
@@ -517,6 +495,141 @@ struct UsageBackfillReport {
     rows: Vec<UsageBackfillRow>,
 }
 
+struct UsageBreakdownOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: UsageBreakdownReport,
+    csv_rows: Vec<UsageBreakdownCsvRow>,
+}
+
+impl CollectionOutput for UsageBreakdownOutput {
+    type JsonReport = UsageBreakdownReport;
+    type CsvRow = UsageBreakdownCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "usage"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "group",
+            "provider",
+            "model",
+            "agent",
+            "workflow",
+            "repo",
+            "day",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "runs",
+            "cost_usd",
+            "cost_partial",
+        ])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        print_breakdown_table(&self.report, &self.prefs);
+        Ok(())
+    }
+}
+
+struct UsageRunsOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: UsageRunsReport,
+    csv_rows: Vec<UsageRunCsvRow>,
+}
+
+impl CollectionOutput for UsageRunsOutput {
+    type JsonReport = UsageRunsReport;
+    type CsvRow = UsageRunCsvRow;
+
+    fn command_name(&self) -> &'static str {
+        "usage runs"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.csv_rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "started_at",
+            "run_id",
+            "source",
+            "status",
+            "workflow",
+            "repo",
+            "issue",
+            "worker",
+            "backend",
+            "trigger",
+            "providers",
+            "models",
+            "agents",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "cost_usd",
+            "cost_partial",
+        ])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        print_run_table(&self.report, &self.prefs);
+        Ok(())
+    }
+}
+
+struct UsageBackfillOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: UsageBackfillReport,
+}
+
+impl CollectionOutput for UsageBackfillOutput {
+    type JsonReport = UsageBackfillReport;
+    type CsvRow = UsageBackfillRow;
+
+    fn command_name(&self) -> &'static str {
+        "usage backfill"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&[
+            "scanned",
+            "referenced_workflow_transcripts",
+            "existing_sidecars",
+            "backfilled",
+            "unresolved_workspace",
+            "unreadable_transcripts",
+        ])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        print_backfill_table(&self.report, &self.prefs);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct UsageBreakdownRow {
     group: String,
@@ -538,6 +651,23 @@ struct UsageBreakdownRow {
     runs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
+    cost_partial: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageBreakdownCsvRow {
+    group: String,
+    provider: String,
+    model: String,
+    agent: String,
+    workflow: String,
+    repo: String,
+    day: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    runs: u64,
+    cost_usd: String,
     cost_partial: bool,
 }
 
@@ -567,6 +697,28 @@ struct UsageRunRow {
     cached_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
+    cost_partial: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageRunCsvRow {
+    started_at: DateTime<Utc>,
+    run_id: String,
+    source: String,
+    status: String,
+    workflow: String,
+    repo: String,
+    issue: String,
+    worker: String,
+    backend: String,
+    trigger: String,
+    providers: String,
+    models: String,
+    agents: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    cost_usd: String,
     cost_partial: bool,
 }
 
@@ -890,6 +1042,57 @@ fn compare_cost_then_tokens(
         .partial_cmp(&left_cost)
         .unwrap_or(std::cmp::Ordering::Equal)
         .then_with(|| right_tokens.cmp(&left_tokens))
+}
+
+fn rows_to_breakdown_csv_rows(rows: &[UsageBreakdownRow]) -> Vec<UsageBreakdownCsvRow> {
+    rows.iter()
+        .map(|row| UsageBreakdownCsvRow {
+            group: row.group.clone(),
+            provider: row.provider.clone().unwrap_or_default(),
+            model: row.model.clone().unwrap_or_default(),
+            agent: row.agent.clone().unwrap_or_default(),
+            workflow: row.workflow.clone().unwrap_or_default(),
+            repo: row.repo.clone().unwrap_or_default(),
+            day: row.day.clone().unwrap_or_default(),
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cached_tokens: row.cached_tokens,
+            runs: row.runs,
+            cost_usd: row
+                .cost_usd
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_default(),
+            cost_partial: row.cost_partial,
+        })
+        .collect()
+}
+
+fn rows_to_run_csv_rows(rows: &[UsageRunRow]) -> Vec<UsageRunCsvRow> {
+    rows.iter()
+        .map(|row| UsageRunCsvRow {
+            started_at: row.started_at,
+            run_id: row.run_id.clone(),
+            source: row.source.clone(),
+            status: row.status.clone(),
+            workflow: row.workflow.clone().unwrap_or_default(),
+            repo: row.repo.clone().unwrap_or_default(),
+            issue: row.issue.clone().unwrap_or_default(),
+            worker: row.worker.clone().unwrap_or_default(),
+            backend: row.backend.clone().unwrap_or_default(),
+            trigger: row.trigger.clone().unwrap_or_default(),
+            providers: row.providers.clone(),
+            models: row.models.clone(),
+            agents: row.agents.clone(),
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            cached_tokens: row.cached_tokens,
+            cost_usd: row
+                .cost_usd
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_default(),
+            cost_partial: row.cost_partial,
+        })
+        .collect()
 }
 
 fn print_breakdown_table(report: &UsageBreakdownReport, prefs: &crate::cmd::ui::UiPrefs) {

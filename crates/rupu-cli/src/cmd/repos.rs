@@ -3,6 +3,8 @@
 use crate::cmd::issues::{
     autodetect_repo_from_path, canonical_repo_ref, resolve_repo_or_autodetect,
 };
+use crate::output::formats::OutputFormat;
+use crate::output::report::{self, CollectionOutput};
 use crate::paths;
 use clap::{Args as ClapArgs, Subcommand};
 use comfy_table::Cell;
@@ -64,12 +66,9 @@ pub struct ForgetArgs {
     pub path: Option<String>,
 }
 
-pub async fn handle(
-    action: Action,
-    global_format: Option<crate::output::formats::OutputFormat>,
-) -> ExitCode {
+pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
-        Action::List(args) => list_inner(args).await,
+        Action::List(args) => list_inner(args, global_format).await,
         Action::Attach(args) => attach_inner(args).await,
         Action::Prefer(args) => prefer_inner(args).await,
         Action::Tracked(args) => tracked_inner(args, global_format).await,
@@ -81,7 +80,87 @@ pub async fn handle(
     }
 }
 
-async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
+pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Result<()> {
+    let (command_name, supported) = match action {
+        Action::List(_) => ("repos list", report::TABLE_JSON_CSV),
+        Action::Tracked(_) => ("repos tracked", report::TABLE_JSON_CSV),
+        Action::Attach(_) => ("repos attach", report::TABLE_ONLY),
+        Action::Prefer(_) => ("repos prefer", report::TABLE_ONLY),
+        Action::Forget(_) => ("repos forget", report::TABLE_ONLY),
+    };
+    crate::output::formats::ensure_supported(command_name, format, supported)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepoListRow {
+    platform: String,
+    repo: String,
+    default_branch: String,
+    visibility: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepoListReport {
+    kind: &'static str,
+    version: u8,
+    rows: Vec<RepoListRow>,
+}
+
+struct RepoListOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: RepoListReport,
+}
+
+impl CollectionOutput for RepoListOutput {
+    type JsonReport = RepoListReport;
+    type CsvRow = RepoListRow;
+
+    fn command_name(&self) -> &'static str {
+        "repos list"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["platform", "repo", "default_branch", "visibility"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec![
+            "Platform",
+            "Owner/Repo",
+            "Default branch",
+            "Visibility",
+        ]);
+        for row in &self.report.rows {
+            let visibility_cell = if !self.prefs.use_color() {
+                Cell::new(&row.visibility)
+            } else if row.visibility == "private" {
+                Cell::new("private").fg(comfy_table::Color::DarkGrey)
+            } else {
+                Cell::new("public").fg(crate::output::tables::status_color("open", &self.prefs)
+                    .unwrap_or(comfy_table::Color::Reset))
+            };
+            table.add_row(vec![
+                Cell::new(&row.platform),
+                Cell::new(&row.repo),
+                Cell::new(&row.default_branch),
+                visibility_cell,
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
+async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let pwd = std::env::current_dir()?;
@@ -99,26 +178,22 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
     };
 
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None);
+    let format = global_format.unwrap_or(OutputFormat::Table);
 
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec![
-        "Platform",
-        "Owner/Repo",
-        "Default branch",
-        "Visibility",
-    ]);
-
+    let mut rows = Vec::new();
     let mut any_listed = false;
     let mut any_skipped = false;
     let mut any_private = false;
     for p in platforms {
         let Some(conn) = registry.repo(p) else {
-            crate::output::diag::skip(
-                &prefs,
-                p.to_string(),
-                "no credential",
-                format!("rupu auth login --provider {p}"),
-            );
+            if format == OutputFormat::Table {
+                crate::output::diag::skip(
+                    &prefs,
+                    p.to_string(),
+                    "no credential",
+                    format!("rupu auth login --provider {p}"),
+                );
+            }
             any_skipped = true;
             continue;
         };
@@ -127,32 +202,32 @@ async fn list_inner(args: ListArgs) -> anyhow::Result<()> {
             if r.private {
                 any_private = true;
             }
-            let visibility_cell = if !prefs.use_color() {
-                Cell::new(if r.private { "private" } else { "public" })
-            } else if r.private {
-                Cell::new("private").fg(comfy_table::Color::DarkGrey)
-            } else {
-                Cell::new("public").fg(crate::output::tables::status_color("open", &prefs)
-                    .unwrap_or(comfy_table::Color::Reset))
-            };
-            table.add_row(vec![
-                Cell::new(p.to_string()),
-                Cell::new(format!("{}/{}", r.r.owner, r.r.repo)),
-                Cell::new(&r.default_branch),
-                visibility_cell,
-            ]);
+            rows.push(RepoListRow {
+                platform: p.to_string(),
+                repo: format!("{}/{}", r.r.owner, r.r.repo),
+                default_branch: r.default_branch,
+                visibility: if r.private { "private" } else { "public" }.into(),
+            });
             any_listed = true;
         }
     }
-    if !any_listed {
+    if !any_listed && format == OutputFormat::Table {
         if !any_skipped {
             println!("No repos to list across configured platforms.");
         }
         return Ok(());
     }
-    println!("{table}");
+    let output = RepoListOutput {
+        prefs: prefs.clone(),
+        report: RepoListReport {
+            kind: "repo_list",
+            version: 1,
+            rows,
+        },
+    };
+    report::emit_collection(Some(format), &output)?;
 
-    if !any_private {
+    if format == OutputFormat::Table && !any_private {
         if let Some(extras) = registry.github_extras() {
             if let Some(scopes) = extras.fetch_token_scopes().await {
                 emit_private_repo_diag(&prefs, &scopes);
@@ -224,9 +299,65 @@ struct TrackedReposReport {
     rows: Vec<TrackedRepoRow>,
 }
 
+struct TrackedReposOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    report: TrackedReposReport,
+}
+
+impl CollectionOutput for TrackedReposOutput {
+    type JsonReport = TrackedReposReport;
+    type CsvRow = TrackedRepoRow;
+
+    fn command_name(&self) -> &'static str {
+        "repos tracked"
+    }
+
+    fn json_report(&self) -> &Self::JsonReport {
+        &self.report
+    }
+
+    fn csv_rows(&self) -> &[Self::CsvRow] {
+        &self.report.rows
+    }
+
+    fn csv_headers(&self) -> Option<&'static [&'static str]> {
+        Some(&["repo", "preferred_path", "known_paths", "default_branch"])
+    }
+
+    fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec![
+            "Repo",
+            "Preferred Path",
+            "Known Paths",
+            "Default Branch",
+        ]);
+        for rec in &self.report.rows {
+            let branch_cell = match rec.default_branch.as_deref() {
+                Some(branch) => Cell::new(branch),
+                None => Cell::new("-"),
+            };
+            let repo_cell = if !self.prefs.use_color() {
+                Cell::new(&rec.repo)
+            } else {
+                Cell::new(&rec.repo).fg(crate::output::tables::status_color("running", &self.prefs)
+                    .unwrap_or(comfy_table::Color::Reset))
+            };
+            table.add_row(vec![
+                repo_cell,
+                Cell::new(&rec.preferred_path),
+                Cell::new(rec.known_paths.to_string()),
+                branch_cell,
+            ]);
+        }
+        println!("{table}");
+        Ok(())
+    }
+}
+
 async fn tracked_inner(
     args: TrackedArgs,
-    global_format: Option<crate::output::formats::OutputFormat>,
+    global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -240,7 +371,12 @@ async fn tracked_inner(
         root: paths::repos_dir(&global),
     };
     let repos = store.list()?;
-    if repos.is_empty() {
+    if repos.is_empty()
+        && matches!(
+            global_format.unwrap_or(OutputFormat::Table),
+            OutputFormat::Table
+        )
+    {
         println!("(no tracked repos)");
         return Ok(());
     }
@@ -253,60 +389,15 @@ async fn tracked_inner(
             default_branch: rec.default_branch.clone(),
         })
         .collect::<Vec<_>>();
-    let format =
-        crate::output::formats::resolve(global_format, crate::output::formats::OutputFormat::Table);
-    crate::output::formats::ensure_supported(
-        "rupu repos tracked",
-        format,
-        &[
-            crate::output::formats::OutputFormat::Table,
-            crate::output::formats::OutputFormat::Json,
-            crate::output::formats::OutputFormat::Csv,
-        ],
-    )?;
-    if format != crate::output::formats::OutputFormat::Table {
-        let report = TrackedReposReport {
+    let output = TrackedReposOutput {
+        prefs,
+        report: TrackedReposReport {
             kind: "tracked_repos",
             version: 1,
             rows,
-        };
-        return match format {
-            crate::output::formats::OutputFormat::Json => {
-                crate::output::formats::print_json(&report)
-            }
-            crate::output::formats::OutputFormat::Csv => {
-                crate::output::formats::print_csv_rows(&report.rows)
-            }
-            crate::output::formats::OutputFormat::Table => Ok(()),
-        };
-    }
-    let mut table = crate::output::tables::new_table();
-    table.set_header(vec![
-        "Repo",
-        "Preferred Path",
-        "Known Paths",
-        "Default Branch",
-    ]);
-    for rec in repos {
-        let branch_cell = match rec.default_branch.as_deref() {
-            Some(branch) => Cell::new(branch),
-            None => Cell::new("-"),
-        };
-        let repo_cell = if !prefs.use_color() {
-            Cell::new(&rec.repo_ref)
-        } else {
-            Cell::new(&rec.repo_ref).fg(crate::output::tables::status_color("running", &prefs)
-                .unwrap_or(comfy_table::Color::Reset))
-        };
-        table.add_row(vec![
-            repo_cell,
-            Cell::new(rec.preferred_path),
-            Cell::new(rec.known_paths.len().to_string()),
-            branch_cell,
-        ]);
-    }
-    println!("{table}");
-    Ok(())
+        },
+    };
+    report::emit_collection(global_format, &output)
 }
 
 async fn forget_inner(args: ForgetArgs) -> anyhow::Result<()> {
