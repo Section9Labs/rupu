@@ -44,7 +44,11 @@ pub enum RunFilter {
 /// Surface for starting, inspecting, and controlling workflow runs.
 #[async_trait]
 pub trait WorkflowExecutor: Send + Sync {
-    async fn start(&self, opts: WorkflowRunOpts) -> Result<RunHandle, ExecutorError>;
+    async fn start(
+        &self,
+        opts: WorkflowRunOpts,
+        factory: Arc<dyn StepFactory>,
+    ) -> Result<RunHandle, ExecutorError>;
     fn list_runs(&self, filter: RunFilter) -> Vec<RunRecord>;
     fn tail(&self, run_id: &str) -> Result<EventStream, ExecutorError>;
     async fn approve(&self, run_id: &str, approver: &str) -> Result<(), ExecutorError>;
@@ -64,7 +68,6 @@ struct RunState {
 
 pub struct InProcessExecutor {
     run_store: Arc<RunStore>,
-    factory: Arc<dyn StepFactory>,
     runs: Mutex<HashMap<String, Arc<RunState>>>,
     extra_sinks: Vec<Arc<dyn EventSink>>,
     workspace_id: String,
@@ -75,14 +78,12 @@ pub struct InProcessExecutor {
 impl InProcessExecutor {
     pub fn new(
         run_store: Arc<RunStore>,
-        factory: Arc<dyn StepFactory>,
         workspace_id: String,
         workspace_path: PathBuf,
         transcript_dir: PathBuf,
     ) -> Self {
         Self {
             run_store,
-            factory,
             runs: Mutex::new(HashMap::new()),
             extra_sinks: Vec::new(),
             workspace_id,
@@ -99,7 +100,11 @@ impl InProcessExecutor {
 
 #[async_trait]
 impl WorkflowExecutor for InProcessExecutor {
-    async fn start(&self, opts: WorkflowRunOpts) -> Result<RunHandle, ExecutorError> {
+    async fn start(
+        &self,
+        opts: WorkflowRunOpts,
+        factory: Arc<dyn StepFactory>,
+    ) -> Result<RunHandle, ExecutorError> {
         // 1. Read + parse the workflow YAML.
         let yaml = std::fs::read_to_string(&opts.workflow_path)?;
         let workflow = crate::workflow::Workflow::parse(&yaml)?;
@@ -132,7 +137,7 @@ impl WorkflowExecutor for InProcessExecutor {
             workspace_id: self.workspace_id.clone(),
             workspace_path: self.workspace_path.clone(),
             transcript_dir: self.transcript_dir.clone(),
-            factory: self.factory.clone(),
+            factory,
             event: None,
             issue: None,
             issue_ref: None,

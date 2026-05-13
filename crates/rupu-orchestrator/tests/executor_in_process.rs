@@ -74,14 +74,16 @@ impl StepFactory for FakeFactory {
 fn make_executor(tmp: &TempDir) -> InProcessExecutor {
     let runs_dir = tmp.path().join("runs");
     let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
-    let factory = Arc::new(FakeFactory);
     InProcessExecutor::new(
         store,
-        factory,
         "ws_test".into(),
         tmp.path().to_path_buf(),
         tmp.path().join("transcripts"),
     )
+}
+
+fn fake_factory() -> Arc<FakeFactory> {
+    Arc::new(FakeFactory)
 }
 
 const WF_TWO_STEPS: &str = r#"
@@ -124,10 +126,13 @@ async fn start_then_tail_yields_events_in_order() {
     let exec = make_executor(&tmp);
 
     let handle = exec
-        .start(WorkflowRunOpts {
-            workflow_path: wf_path,
-            vars: Default::default(),
-        })
+        .start(
+            WorkflowRunOpts {
+                workflow_path: wf_path,
+                vars: Default::default(),
+            },
+            fake_factory(),
+        )
         .await
         .expect("start");
 
@@ -177,10 +182,13 @@ async fn list_runs_returns_active_for_in_flight() {
     let exec = make_executor(&tmp);
 
     let handle = exec
-        .start(WorkflowRunOpts {
-            workflow_path: wf_path,
-            vars: Default::default(),
-        })
+        .start(
+            WorkflowRunOpts {
+                workflow_path: wf_path,
+                vars: Default::default(),
+            },
+            fake_factory(),
+        )
         .await
         .expect("start");
 
@@ -225,10 +233,13 @@ async fn approve_unsticks_an_awaiting_step() {
     let exec = make_executor(&tmp);
 
     let handle = exec
-        .start(WorkflowRunOpts {
-            workflow_path: wf_path,
-            vars: Default::default(),
-        })
+        .start(
+            WorkflowRunOpts {
+                workflow_path: wf_path,
+                vars: Default::default(),
+            },
+            fake_factory(),
+        )
         .await
         .expect("start");
 
