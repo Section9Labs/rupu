@@ -30,12 +30,19 @@ pub type WorkflowClickCb = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + S
 /// the current GPUI window handle, and the app context.
 pub type SectionToggleCb = Arc<dyn Fn(&'static str, &mut Window, &mut App) + Send + Sync + 'static>;
 
+/// Callback type for sidebar agent-row clicks. Receives the agent file
+/// path, the current GPUI window handle, and the app context.
+pub type AgentClickCb = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync + 'static>;
+
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     workspace: &Workspace,
     active_runs: &ActiveRunMap,
     focused_workflow: Option<&PathBuf>,
     on_workflow_click: WorkflowClickCb,
     on_workflow_right_click: WorkflowClickCb,
+    on_agent_click: AgentClickCb,
+    on_agent_right_click: AgentClickCb,
     on_section_toggle: SectionToggleCb,
 ) -> impl IntoElement {
     let collapsed = &workspace.manifest.ui.sidebar_collapsed_sections;
@@ -73,6 +80,8 @@ pub fn render(
             focused_workflow,
             on_workflow_click.clone(),
             on_workflow_right_click.clone(),
+            on_agent_click.clone(),
+            on_agent_right_click.clone(),
             on_section_toggle.clone(),
         ));
     }
@@ -90,6 +99,8 @@ fn render_section(
     focused_workflow: Option<&PathBuf>,
     on_workflow_click: WorkflowClickCb,
     on_workflow_right_click: WorkflowClickCb,
+    on_agent_click: AgentClickCb,
+    on_agent_right_click: AgentClickCb,
     on_section_toggle: SectionToggleCb,
 ) -> impl IntoElement {
     // Header: clickable row with caret + uppercase label + count badge.
@@ -129,7 +140,6 @@ fn render_section(
             .child("—")
             .into_any_element()
     } else {
-        let is_workflows = name == "workflows";
         let mut list = div().flex().flex_col().gap(px(2.0));
         for asset in items {
             let dot_color = active_runs
@@ -142,7 +152,7 @@ fn render_section(
                 });
 
             let path = asset.path.clone();
-            let is_selected = is_workflows
+            let is_selected = name == "workflows"
                 && focused_workflow.map(|p| p == &asset.path).unwrap_or(false);
             let row_bg = if is_selected {
                 palette::BG_ROW_SELECTED
@@ -171,19 +181,36 @@ fn render_section(
                 row = row.child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(color));
             }
 
-            if is_workflows {
-                let cb_click = on_workflow_click.clone();
-                let cb_right = on_workflow_right_click.clone();
-                let path_right = path.clone();
-                row = row
-                    .cursor_pointer()
-                    .on_click({
-                        let path = path.clone();
-                        move |_, w, cx| cb_click(path.clone(), w, cx)
-                    })
-                    .on_mouse_down(MouseButton::Right, {
-                        move |_, w, cx| cb_right(path_right.clone(), w, cx)
-                    });
+            match name {
+                "workflows" => {
+                    let cb_click = on_workflow_click.clone();
+                    let cb_right = on_workflow_right_click.clone();
+                    let path_right = path.clone();
+                    row = row
+                        .cursor_pointer()
+                        .on_click({
+                            let path = path.clone();
+                            move |_, w, cx| cb_click(path.clone(), w, cx)
+                        })
+                        .on_mouse_down(MouseButton::Right, {
+                            move |_, w, cx| cb_right(path_right.clone(), w, cx)
+                        });
+                }
+                "agents" => {
+                    let cb_click = on_agent_click.clone();
+                    let cb_right = on_agent_right_click.clone();
+                    let path_right = path.clone();
+                    row = row
+                        .cursor_pointer()
+                        .on_click({
+                            let path = path.clone();
+                            move |_, w, cx| cb_click(path.clone(), w, cx)
+                        })
+                        .on_mouse_down(MouseButton::Right, {
+                            move |_, w, cx| cb_right(path_right.clone(), w, cx)
+                        });
+                }
+                _ => {} // runs / repos / issues — wired in D-3 / D-9
             }
 
             list = list.child(row);

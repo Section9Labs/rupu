@@ -298,6 +298,38 @@ impl WorkspaceWindow {
         cx.notify();
     }
 
+    /// Open an agent's `.md` source file in the user's default app.
+    pub fn handle_agent_clicked(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(e) = std::process::Command::new("open").arg(&path).spawn() {
+                tracing::warn!(?path, %e, "open agent file");
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tracing::info!(?path, "agent click: no-op on non-macOS");
+        }
+    }
+
+    /// Reveal the agent file in Finder. macOS: `open -R <path>`.
+    pub fn handle_agent_reveal(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(e) = std::process::Command::new("open")
+                .args(["-R"])
+                .arg(&path)
+                .spawn()
+            {
+                tracing::warn!(?path, %e, "reveal agent in Finder");
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tracing::info!(?path, "reveal: no-op on non-macOS");
+        }
+    }
+
     /// Called when the user clicks the Run button in the toolbar.
     /// Opens the launcher modal with the current workflow.
     pub fn handle_run_clicked(&mut self, cx: &mut Context<Self>) {
@@ -534,6 +566,8 @@ impl Render for WorkspaceWindow {
         let weak_sidebar_click = weak.clone();
         let weak_sidebar_right = weak.clone();
         let weak_section_toggle = weak.clone();
+        let weak_agent_click = weak.clone();
+        let weak_agent_reveal = weak.clone();
         let weak2 = weak.clone();
         // Pre-cloned for the launcher overlay branch below.
         let weak_launcher = weak.clone();
@@ -638,12 +672,32 @@ impl Render for WorkspaceWindow {
                                     });
                                 });
                             });
+                        let on_agent_click: sidebar::AgentClickCb =
+                            Arc::new(move |path, _w, cx| {
+                                let weak = weak_agent_click.clone();
+                                cx.defer(move |cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.handle_agent_clicked(path, cx)
+                                    });
+                                });
+                            });
+                        let on_agent_right_click: sidebar::AgentClickCb =
+                            Arc::new(move |path, _w, cx| {
+                                let weak = weak_agent_reveal.clone();
+                                cx.defer(move |cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.handle_agent_reveal(path, cx)
+                                    });
+                                });
+                            });
                         sidebar::render(
                             &self.workspace,
                             &active_run_map,
                             self.focused_workflow.as_ref(),
                             on_workflow_click,
                             on_workflow_right_click,
+                            on_agent_click,
+                            on_agent_right_click,
                             on_section_toggle,
                         )
                     })
