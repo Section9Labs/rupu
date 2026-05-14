@@ -107,6 +107,9 @@ pub struct StartArgs {
     /// Start the first turn without auto-attaching.
     #[arg(long)]
     pub detach: bool,
+    /// Live renderer mode when auto-attaching.
+    #[arg(long, value_enum)]
+    pub view: Option<LiveViewMode>,
 }
 
 #[derive(ClapArgs, Debug, Clone, Default)]
@@ -126,6 +129,9 @@ pub struct SendArgs {
     pub prompt: String,
     #[arg(long)]
     pub detach: bool,
+    /// Live renderer mode when auto-attaching.
+    #[arg(long, value_enum)]
+    pub view: Option<LiveViewMode>,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -897,7 +903,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         runs: Vec::new(),
     };
     write_session(&global, SessionScope::Active, &session)?;
-    launch_turn(&global, &session_id, user_message, args.detach).await
+    launch_turn(&global, &session_id, user_message, args.detach, args.view).await
 }
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
@@ -911,7 +917,14 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
         anyhow::bail!("session {} is stopped", session.session_id);
     }
     ensure_session_available(&session)?;
-    launch_turn(&global, &session.session_id, args.prompt, args.detach).await
+    launch_turn(
+        &global,
+        &session.session_id,
+        args.prompt,
+        args.detach,
+        args.view,
+    )
+    .await
 }
 
 async fn launch_turn(
@@ -919,6 +932,7 @@ async fn launch_turn(
     session_id: &str,
     prompt: String,
     detach: bool,
+    view: Option<LiveViewMode>,
 ) -> anyhow::Result<()> {
     let run_id = launch_turn_detached(global, session_id, prompt)?;
 
@@ -929,7 +943,7 @@ async fn launch_turn(
         return Ok(());
     }
 
-    attach(session_id, None).await
+    attach(session_id, view).await
 }
 
 fn launch_turn_detached(global: &Path, session_id: &str, prompt: String) -> anyhow::Result<String> {
@@ -2393,6 +2407,7 @@ fn terminate_pid(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn parse_attach_command_handles_known_commands() {
@@ -2444,9 +2459,48 @@ mod tests {
     fn compact_session_run_id_shortens_long_values() {
         assert_eq!(
             compact_session_run_id("run_01KRJDKSBE7X4J49094149WFJS"),
-            "run_01KRJDK…WFJS"
+            "run_01KRJDKS…WFJS"
         );
         assert_eq!(compact_session_run_id("run_short"), "run_short");
+    }
+
+    #[test]
+    fn session_start_parses_view_mode() {
+        let cli = crate::Cli::try_parse_from([
+            "rupu",
+            "session",
+            "start",
+            "issue-reader",
+            "--view",
+            "full",
+        ])
+        .expect("cli parses");
+        match cli.command {
+            crate::Cmd::Session {
+                action: Action::Start(args),
+            } => assert_eq!(args.view, Some(LiveViewMode::Full)),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_send_parses_view_mode() {
+        let cli = crate::Cli::try_parse_from([
+            "rupu",
+            "session",
+            "send",
+            "ses_01",
+            "next prompt",
+            "--view",
+            "focused",
+        ])
+        .expect("cli parses");
+        match cli.command {
+            crate::Cmd::Session {
+                action: Action::Send(args),
+            } => assert_eq!(args.view, Some(LiveViewMode::Focused)),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     fn test_session_record() -> SessionRecord {
