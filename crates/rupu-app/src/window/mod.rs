@@ -641,6 +641,7 @@ impl Render for WorkspaceWindow {
                         sidebar::render(
                             &self.workspace,
                             &active_run_map,
+                            self.focused_workflow.as_ref(),
                             on_workflow_click,
                             on_workflow_right_click,
                             on_section_toggle,

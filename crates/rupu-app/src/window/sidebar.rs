@@ -33,6 +33,7 @@ pub type SectionToggleCb = Arc<dyn Fn(&'static str, &mut Window, &mut App) + Sen
 pub fn render(
     workspace: &Workspace,
     active_runs: &ActiveRunMap,
+    focused_workflow: Option<&PathBuf>,
     on_workflow_click: WorkflowClickCb,
     on_workflow_right_click: WorkflowClickCb,
     on_section_toggle: SectionToggleCb,
@@ -69,6 +70,7 @@ pub fn render(
             is_collapsed,
             i == 0,
             active_runs,
+            focused_workflow,
             on_workflow_click.clone(),
             on_workflow_right_click.clone(),
             on_section_toggle.clone(),
@@ -85,6 +87,7 @@ fn render_section(
     is_collapsed: bool,
     is_first: bool,
     active_runs: &ActiveRunMap,
+    focused_workflow: Option<&PathBuf>,
     on_workflow_click: WorkflowClickCb,
     on_workflow_right_click: WorkflowClickCb,
     on_section_toggle: SectionToggleCb,
@@ -139,6 +142,13 @@ fn render_section(
                 });
 
             let path = asset.path.clone();
+            let is_selected = is_workflows
+                && focused_workflow.map(|p| p == &asset.path).unwrap_or(false);
+            let row_bg = if is_selected {
+                palette::BG_ROW_SELECTED
+            } else {
+                palette::BG_SIDEBAR
+            };
             let mut row = div()
                 .id(gpui::SharedString::from(format!(
                     "wf-{}",
@@ -148,6 +158,11 @@ fn render_section(
                 .flex_row()
                 .items_center()
                 .gap(px(4.0))
+                .px(px(4.0))
+                .py(px(2.0))
+                .rounded(px(3.0))
+                .bg(row_bg)
+                .hover(|s| s.bg(palette::BG_ROW_HOVER))
                 .text_xs()
                 .text_color(palette::TEXT_MUTED)
                 .child(div().flex_1().child(asset.name.clone()));
