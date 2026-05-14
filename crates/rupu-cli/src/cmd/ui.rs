@@ -16,10 +16,11 @@ use clap::{Args as ClapArgs, Subcommand};
 use rupu_config::UiConfig;
 use serde::Serialize;
 use std::io::{IsTerminal, Write};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Style, Theme, ThemeSet};
+use syntect::highlighting::{Style, Theme};
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
 
@@ -99,16 +100,16 @@ impl UiPrefs {
         } else {
             parse_color(cfg.color.as_deref()).unwrap_or(ColorMode::Auto)
         };
-        let theme = flag_theme
-            .map(str::to_string)
-            .or_else(|| cfg.syntax.theme.clone())
-            .or_else(|| cfg.theme.clone())
-            .unwrap_or_else(|| DEFAULT_THEME.to_string());
         let global = crate::paths::global_dir().ok();
         let project_root = std::env::current_dir()
             .ok()
             .and_then(|pwd| crate::paths::project_root_for(&pwd).ok().flatten());
-        let palette_requested = cfg.palette.theme.as_deref().or(cfg.theme.as_deref());
+        let palette_requested = cfg
+            .palette
+            .theme
+            .as_deref()
+            .or(cfg.theme.as_deref())
+            .map(|theme| crate::output::theme::palette_theme_alias(theme).unwrap_or(theme));
         let palette_spec = global
             .as_deref()
             .map(|global| {
@@ -119,6 +120,24 @@ impl UiPrefs {
                 )
             })
             .unwrap_or_else(crate::output::theme::default_palette_theme);
+        let theme = global
+            .as_deref()
+            .map(|global| {
+                resolve_syntax_theme(
+                    cfg,
+                    flag_theme,
+                    global,
+                    project_root.as_deref(),
+                    &palette_spec,
+                )
+            })
+            .unwrap_or_else(|| {
+                flag_theme
+                    .map(str::to_string)
+                    .or_else(|| cfg.syntax.theme.clone())
+                    .or_else(|| cfg.theme.clone())
+                    .unwrap_or_else(|| DEFAULT_THEME.to_string())
+            });
         crate::output::palette::set_active_palette(palette_spec.palette.clone());
         let pager = match flag_pager {
             Some(true) => PagerMode::Always,
@@ -149,6 +168,33 @@ impl UiPrefs {
             PagerMode::Auto => std::io::stdout().is_terminal(),
         }
     }
+}
+
+fn resolve_syntax_theme(
+    cfg: &UiConfig,
+    flag_theme: Option<&str>,
+    global: &Path,
+    project_root: Option<&Path>,
+    palette_spec: &crate::output::theme::ThemeSpec,
+) -> String {
+    if let Some(theme) = flag_theme {
+        return theme.to_string();
+    }
+    if let Some(theme) = cfg.syntax.theme.as_deref() {
+        return theme.to_string();
+    }
+    if let Some(theme) = cfg.theme.as_deref() {
+        if crate::output::theme::syntax_theme_set(global, project_root)
+            .ok()
+            .is_some_and(|set| set.themes.contains_key(theme))
+        {
+            return theme.to_string();
+        }
+        if let Some(theme) = palette_spec.syntax_theme.as_deref() {
+            return theme.to_string();
+        }
+    }
+    DEFAULT_THEME.to_string()
 }
 
 #[derive(Serialize)]
@@ -432,7 +478,11 @@ fn split_frontmatter(text: &str) -> Option<(&str, &str)> {
 
 fn highlight_with_extension(text: &str, ext: &str, prefs: &UiPrefs) -> Option<String> {
     let ss = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
+    let global = crate::paths::global_dir().ok()?;
+    let project_root = std::env::current_dir()
+        .ok()
+        .and_then(|pwd| crate::paths::project_root_for(&pwd).ok().flatten());
+    let ts = crate::output::theme::syntax_theme_set(&global, project_root.as_deref()).ok()?;
     let theme: &Theme = ts
         .themes
         .get(&prefs.theme)
@@ -511,19 +561,26 @@ async fn themes(global_format: Option<crate::output::formats::OutputFormat>) -> 
             .map(|root| root.join(".rupu/config.toml"))
             .as_deref(),
     )?;
-    let current_palette = crate::output::theme::resolve_palette_theme(
-        cfg.ui.palette.theme.as_deref().or(cfg.ui.theme.as_deref()),
+    let palette_requested = cfg
+        .ui
+        .palette
+        .theme
+        .as_deref()
+        .or(cfg.ui.theme.as_deref())
+        .map(|theme| crate::output::theme::palette_theme_alias(theme).unwrap_or(theme));
+    let current_palette_spec = crate::output::theme::resolve_palette_theme(
+        palette_requested,
         &global,
         project_root.as_deref(),
-    )
-    .name;
-    let current_syntax = cfg
-        .ui
-        .syntax
-        .theme
-        .clone()
-        .or(cfg.ui.theme.clone())
-        .unwrap_or_else(|| DEFAULT_THEME.to_string());
+    );
+    let current_palette = current_palette_spec.name.clone();
+    let current_syntax = resolve_syntax_theme(
+        &cfg.ui,
+        None,
+        &global,
+        project_root.as_deref(),
+        &current_palette_spec,
+    );
 
     let mut rows = crate::output::theme::list_palette_themes(&global, project_root.as_deref())?
         .into_iter()
@@ -538,15 +595,15 @@ async fn themes(global_format: Option<crate::output::formats::OutputFormat>) -> 
         .collect::<Vec<_>>();
 
     rows.extend(
-        crate::output::theme::builtin_syntax_themes()
+        crate::output::theme::list_syntax_themes(&global, project_root.as_deref())?
             .into_iter()
             .map(|theme| ThemeListRow {
-                current: theme == current_syntax,
-                name: theme.to_string(),
+                current: theme.name == current_syntax,
+                name: theme.name,
                 kind: "syntax".into(),
-                source: "builtin syntect".into(),
+                source: theme.source,
                 syntax_theme: None,
-                description: Some("Built-in syntect syntax theme".into()),
+                description: theme.description,
             }),
     );
     rows.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
@@ -594,17 +651,18 @@ async fn show(
             description: theme.description,
             palette: Some(theme.palette),
         }
-    } else if crate::output::theme::builtin_syntax_themes()
-        .iter()
-        .any(|theme| theme.eq_ignore_ascii_case(name))
+    } else if let Some(theme) =
+        crate::output::theme::list_syntax_themes(&global, project_root.as_deref())?
+            .into_iter()
+            .find(|theme| theme.name.eq_ignore_ascii_case(name))
     {
         ThemeShowItem {
-            name: name.to_string(),
+            name: theme.name.clone(),
             kind: "syntax".into(),
-            source: "builtin syntect".into(),
-            path: None,
-            syntax_theme: Some(name.to_string()),
-            description: Some("Built-in syntect syntax theme".into()),
+            source: theme.source,
+            path: theme.path,
+            syntax_theme: Some(theme.name),
+            description: theme.description,
             palette: None,
         }
     } else {

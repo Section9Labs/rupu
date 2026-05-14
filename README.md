@@ -350,6 +350,17 @@ UI theming is split into two layers:
 - syntax highlighting theme (`[ui.syntax].theme`)
 - CLI palette theme (`[ui.palette].theme`)
 
+The simple path is a single shared selector:
+
+```toml
+[ui]
+theme = "catppuccin-mocha"
+```
+
+That applies the same named theme across syntax and palette when both exist. If the
+shared name only matches one side directly, `rupu` falls back to the palette theme's
+syntax hint.
+
 Example:
 
 ```toml
@@ -363,6 +374,17 @@ theme = "tokyo-night"
 Use `rupu ui themes` to list built-in and installed themes, and `rupu ui theme import`
 to install a local or remote Base16/native theme file into `~/.rupu/themes/` or
 `<repo>/.rupu/themes/`.
+
+Built-in parity names currently include:
+
+- `catppuccin-mocha`
+- `tokyo-night`
+- `dracula`
+- `gruvbox-dark`
+- `github-dark`
+- `github-light`
+- `solarized-dark`
+- `solarized-light`
 
 If older standalone `rupu run` transcripts predate usage sidecars, repair them with
 `rupu usage backfill`.

@@ -54,8 +54,10 @@ pub struct UiConfig {
     /// `auto` (default — color when stdout is a tty and `NO_COLOR`
     /// is unset), `always`, or `never`.
     pub color: Option<String>,
-    /// Legacy overall theme knob. When set, consumers may treat this as
-    /// both a syntax-theme hint and a palette-theme hint.
+    /// Shared overall theme knob. When set, consumers treat this as the
+    /// simple "use one named theme across syntax + palette" selector,
+    /// unless a more specific `[ui.syntax]` or `[ui.palette]` override
+    /// is present.
     pub theme: Option<String>,
     #[serde(default)]
     pub syntax: UiSyntaxConfig,

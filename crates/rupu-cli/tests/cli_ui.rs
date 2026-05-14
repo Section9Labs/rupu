@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
+use serde_json::Value;
 
 #[test]
 fn ui_themes_supports_json_and_lists_builtin_palette_and_syntax() {
@@ -17,7 +18,9 @@ fn ui_themes_supports_json_and_lists_builtin_palette_and_syntax() {
         .success()
         .stdout(predicate::str::contains("\"kind\": \"ui_theme_list\""))
         .stdout(predicate::str::contains("\"name\": \"rupu-dark\""))
-        .stdout(predicate::str::contains("\"name\": \"base16-ocean.dark\""));
+        .stdout(predicate::str::contains("\"name\": \"base16-ocean.dark\""))
+        .stdout(predicate::str::contains("\"name\": \"catppuccin-mocha\""))
+        .stdout(predicate::str::contains("\"source\": \"builtin rupu\""));
 }
 
 #[test]
@@ -171,4 +174,80 @@ complete = "#f1fa8c"
         .stdout(predicate::str::contains("\"name\": \"project-amber\""))
         .stdout(predicate::str::contains("\"source\": \"project file\""))
         .stdout(predicate::str::contains("\"current\": true"));
+}
+
+#[test]
+fn ui_theme_legacy_selector_sets_matching_syntax_and_palette_theme() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child(".rupu");
+    home.create_dir_all().unwrap();
+    let project = tmp.child("project");
+    project.child(".rupu").create_dir_all().unwrap();
+    project
+        .child(".rupu/config.toml")
+        .write_str(
+            r#"[ui]
+theme = "catppuccin-mocha"
+"#,
+        )
+        .unwrap();
+
+    let output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .current_dir(project.path())
+        .args(["--format", "json", "ui", "themes"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = value["rows"].as_array().unwrap();
+    let palette = rows
+        .iter()
+        .find(|row| row["kind"] == "palette" && row["name"] == "catppuccin-mocha")
+        .unwrap();
+    assert_eq!(palette["current"], true);
+    let syntax = rows
+        .iter()
+        .find(|row| row["kind"] == "syntax" && row["name"] == "catppuccin-mocha")
+        .unwrap();
+    assert_eq!(syntax["current"], true);
+}
+
+#[test]
+fn ui_theme_legacy_selector_maps_syntax_name_to_palette_alias() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.child(".rupu");
+    home.create_dir_all().unwrap();
+    let project = tmp.child("project");
+    project.child(".rupu").create_dir_all().unwrap();
+    project
+        .child(".rupu/config.toml")
+        .write_str(
+            r#"[ui]
+theme = "Solarized (dark)"
+"#,
+        )
+        .unwrap();
+
+    let output = Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", home.path())
+        .current_dir(project.path())
+        .args(["--format", "json", "ui", "themes"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = value["rows"].as_array().unwrap();
+    let palette = rows
+        .iter()
+        .find(|row| row["kind"] == "palette" && row["name"] == "solarized-dark")
+        .unwrap();
+    assert_eq!(palette["current"], true);
+    let syntax = rows
+        .iter()
+        .find(|row| row["kind"] == "syntax" && row["name"] == "Solarized (dark)")
+        .unwrap();
+    assert_eq!(syntax["current"], true);
 }
