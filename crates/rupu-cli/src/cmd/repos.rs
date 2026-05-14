@@ -177,7 +177,7 @@ async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyh
         None => vec![Platform::Github, Platform::Gitlab],
     };
 
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None, None);
     let format = global_format.unwrap_or(OutputFormat::Table);
 
     let mut rows = Vec::new();
@@ -366,7 +366,7 @@ async fn tracked_inner(
     let global_cfg = global.join("config.toml");
     let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref())?;
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None, None);
     let store = RepoRegistryStore {
         root: paths::repos_dir(&global),
     };

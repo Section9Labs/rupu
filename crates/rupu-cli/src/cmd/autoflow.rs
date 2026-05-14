@@ -3738,7 +3738,7 @@ fn autoflow_ui_config() -> anyhow::Result<Config> {
 
 fn autoflow_ui_prefs() -> anyhow::Result<UiPrefs> {
     let cfg = autoflow_ui_config().unwrap_or_default();
-    Ok(UiPrefs::resolve(&cfg.ui, false, None, None))
+    Ok(UiPrefs::resolve(&cfg.ui, false, None, None, None))
 }
 
 fn render_autoflow_show_summary(

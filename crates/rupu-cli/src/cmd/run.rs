@@ -4,8 +4,7 @@
 //! resolution → workspace upsert → auth backend → provider factory →
 //! `rupu_agent::run_agent`. Prints a one-line summary on success.
 //!
-// TUI attach for single-agent runs deferred — see slice-c spec §4 v0.1
-
+use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::paths;
 use crate::standalone_run_metadata::{
     metadata_path_for_run, write_metadata, StandaloneRunMetadata,
@@ -39,6 +38,9 @@ pub struct Args {
     /// Skip token streaming; receive the full response at once.
     #[arg(long)]
     pub no_stream: bool,
+    /// Control live output density (`focused` | `full`).
+    #[arg(long, value_enum)]
+    pub view: Option<LiveViewMode>,
     /// For `<platform>:<owner>/<repo>` targets: clone into this
     /// directory instead of the default `./<repo>/`. The directory
     /// must not already exist (refuse-by-default — pass an explicit
@@ -79,6 +81,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let prefs = UiPrefs::resolve(&cfg.ui, false, None, None, args.view);
 
     // Resolve permission mode.
     let cli_mode = args.mode.as_deref().and_then(parse_mode);
@@ -369,7 +372,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
                     rupu_transcript::Event::AssistantMessage { content, .. }
                         if !content.trim().is_empty() =>
                     {
-                        printer.assistant_chunk(content);
+                        render_assistant_output(&mut printer, content, prefs.live_view);
                     }
                     rupu_transcript::Event::ToolCall { tool, input, .. } => {
                         let summary = crate::output::workflow_printer::tool_summary(tool, input);
@@ -409,7 +412,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
                 for ev in tail_events {
                     if let rupu_transcript::Event::AssistantMessage { content, .. } = &ev {
                         if !content.trim().is_empty() {
-                            printer.assistant_chunk(content);
+                            render_assistant_output(&mut printer, content, prefs.live_view);
                         }
                     }
                 }
@@ -433,6 +436,36 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     println!("transcript: {}", transcript_path.display());
     let _ = result;
     Ok(())
+}
+
+fn render_assistant_output(
+    printer: &mut crate::output::LineStreamPrinter,
+    content: &str,
+    view_mode: LiveViewMode,
+) {
+    match view_mode {
+        LiveViewMode::Full => printer.assistant_chunk(content),
+        LiveViewMode::Focused => printer.sideband_event(
+            crate::output::palette::Status::Active,
+            "assistant output",
+            Some(&truncate_single_line(content, 100)),
+        ),
+    }
+}
+
+fn truncate_single_line(content: &str, max_chars: usize) -> String {
+    let trimmed = content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let mut out = String::new();
+    for ch in trimmed.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if trimmed.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }
 
 pub(crate) fn canonicalize_if_exists(path: &Path) -> std::path::PathBuf {

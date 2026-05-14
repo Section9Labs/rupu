@@ -157,3 +157,47 @@ fn run_line_stream_transcript_footer() {
         .success()
         .stdout(predicate::str::contains("transcript:"));
 }
+
+#[test]
+fn run_line_stream_supports_focused_and_full_view_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "view-agent");
+
+    let script = r#"[{"AssistantText":{"text":"OMEGA-SENTINEL from agent","stop":"end_turn"}}]"#;
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&dir)
+        .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
+        .env("RUPU_HOME", dir.path().join(".rupu"))
+        .args([
+            "run",
+            "view-agent",
+            "--mode",
+            "bypass",
+            "--view",
+            "focused",
+            "go",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("assistant output"));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .current_dir(&dir)
+        .env("RUPU_MOCK_PROVIDER_SCRIPT", script)
+        .env("RUPU_HOME", dir.path().join(".rupu"))
+        .args([
+            "run",
+            "view-agent",
+            "--mode",
+            "bypass",
+            "--view",
+            "full",
+            "go",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OMEGA-SENTINEL from agent"));
+}

@@ -318,6 +318,20 @@ impl LineStreamPrinter {
         self.print_rail_only();
     }
 
+    /// `▶ session attach  <agent_name>  <session_id>`
+    pub fn session_header(&mut self, session_id: &str, agent_name: &str) {
+        let mut buf = String::new();
+        let _ = palette::write_colored(&mut buf, "▶", BRAND);
+        buf.push(' ');
+        let _ = palette::write_bold_colored(&mut buf, "session attach", BRAND);
+        buf.push_str("  ");
+        let _ = palette::write_bold_colored(&mut buf, agent_name, BRAND);
+        buf.push_str("  ");
+        let _ = palette::write_colored(&mut buf, session_id, DIM);
+        self.out(&buf);
+        self.print_rail_only();
+    }
+
     /// `├─ ◐ <step_id>  (agent · provider · model)`
     ///
     /// Static glyph — no animation. Returns a no-op `SpinnerHandle` so the

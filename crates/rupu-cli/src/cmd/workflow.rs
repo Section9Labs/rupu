@@ -664,7 +664,7 @@ async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
         push_yaml_names(&p.join(".rupu/workflows"), "project", &mut by_name);
     }
     let cfg = layered_config_workflow(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None);
     let output = WorkflowListOutput {
         prefs,
         report: WorkflowListReport {
@@ -712,7 +712,7 @@ async fn show(
     let cfg =
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
 
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag, None);
     let output = WorkflowShowOutput {
         prefs,
         report: WorkflowShowReport {
@@ -878,7 +878,7 @@ async fn runs(
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let cfg = layered_config_workflow(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
 
     let rows: Vec<WorkflowRunsRow> = filtered
         .iter()
@@ -985,7 +985,7 @@ async fn show_run(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let cfg = layered_config_workflow(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None);
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let record = store.load(run_id).map_err(|e| {
         anyhow::anyhow!(

@@ -279,8 +279,9 @@ rupu usage                            Usage reports across transcripts + workflo
 ```
 
 Run `rupu <subcommand> --help` for the full surface of any one. Tab completion
-covers every flag and dynamically lists agent / workflow names for the
-positional slots.
+covers every flag and dynamically lists agent / workflow names plus session /
+transcript ids for the relevant positional slots once shell integration is
+installed.
 
 Structured output is standardized as:
 
@@ -350,6 +351,7 @@ The simple path is a single shared selector:
 ```toml
 [ui]
 theme = "catppuccin-mocha"
+live_view = "focused"
 ```
 
 That applies the same named theme across syntax and palette when both exist. If the
@@ -369,6 +371,19 @@ theme = "tokyo-night"
 Use `rupu ui themes` to list built-in and installed themes, and `rupu ui theme import`
 to install a local or remote Base16/native theme file into `~/.rupu/themes/` or
 `<repo>/.rupu/themes/`.
+
+Interactive/event-driven surfaces also support a shared live view mode:
+
+- `[ui].live_view = "focused" | "full"`
+- per-command override: `--view focused|full`
+
+The first commands wired to this are:
+
+- `rupu run`
+- `rupu transcript show`
+- `rupu session attach`
+- `rupu workflow run`
+- `rupu autoflow serve`
 
 Built-in parity names currently include:
 

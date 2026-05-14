@@ -299,7 +299,7 @@ async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Re
     }
 
     let cfg = layered_config(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, args.no_color, None, None, None);
     let rows: Vec<IssueListRow> = issues
         .iter()
         .map(|issue| IssueListRow {

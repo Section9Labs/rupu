@@ -126,7 +126,7 @@ async fn run(args: UsageArgs, global_format: Option<OutputFormat>) -> anyhow::Re
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let cfg = layered_config(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None);
 
     match args.command {
         Some(UsageCommand::Runs(run_args)) => render_run_view(
