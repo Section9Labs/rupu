@@ -64,7 +64,7 @@ pub fn render(
             _ => Vec::new(), // runs/repos/issues land in D-3/D-9
         };
         container = container.child(render_section(
-            *section,
+            section,
             &items,
             is_collapsed,
             i == 0,
@@ -78,6 +78,7 @@ pub fn render(
     container
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_section(
     name: &'static str,
     items: &[&Asset],
