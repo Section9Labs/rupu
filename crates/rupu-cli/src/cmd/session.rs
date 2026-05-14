@@ -210,31 +210,6 @@ enum AttachControl {
     Exit(AttachExit),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionAttachSnapshot {
-    status: SessionStatus,
-    active_run_id: Option<String>,
-    last_run_id: Option<String>,
-    total_turns: u32,
-    total_tokens_in: u64,
-    total_tokens_out: u64,
-    last_error: Option<String>,
-}
-
-impl From<&SessionRecord> for SessionAttachSnapshot {
-    fn from(session: &SessionRecord) -> Self {
-        Self {
-            status: session.status,
-            active_run_id: session.active_run_id.clone(),
-            last_run_id: session.last_run_id.clone(),
-            total_turns: session.total_turns,
-            total_tokens_in: session.total_tokens_in,
-            total_tokens_out: session.total_tokens_out,
-            last_error: session.last_error.clone(),
-        }
-    }
-}
-
 impl SessionScope {
     fn as_str(self) -> &'static str {
         match self {
@@ -1061,8 +1036,6 @@ fn attach_blocking(
     let mut saw_any = false;
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let _raw_mode = RawModeGuard::new(interactive)?;
-    let mut last_snapshot = SessionAttachSnapshot::from(&session);
-
     if view_mode == LiveViewMode::Focused {
         render_session_attach_intro(&mut printer, &session);
     } else {
@@ -1075,8 +1048,6 @@ fn attach_blocking(
             );
         }
     }
-    sync_session_attach_ticker(&mut printer, &session);
-
     loop {
         let events = tailer.drain();
         for event in &events {
@@ -1095,15 +1066,6 @@ fn attach_blocking(
         if reconcile_stale_session(&mut session) {
             write_session(global, scope, &session)?;
         }
-        sync_session_attach_ticker(&mut printer, &session);
-        if view_mode == LiveViewMode::Focused {
-            let snapshot = SessionAttachSnapshot::from(&session);
-            if snapshot != last_snapshot {
-                render_session_attach_update(&mut printer, &last_snapshot, &session);
-                last_snapshot = snapshot;
-            }
-        }
-
         let desired_run_id = session
             .active_run_id
             .clone()
@@ -1564,51 +1526,19 @@ fn render_session_attach_intro(
     session: &SessionRecord,
 ) {
     printer.session_header(&session.session_id, &session.agent_name);
-    render_session_status(printer, session);
-    render_attach_help_hint(printer);
-}
-
-fn render_session_attach_update(
-    printer: &mut crate::output::LineStreamPrinter,
-    previous: &SessionAttachSnapshot,
-    session: &SessionRecord,
-) {
-    let snapshot = SessionAttachSnapshot::from(session);
-    if previous.status != snapshot.status
-        || previous.total_turns != snapshot.total_turns
-        || previous.active_run_id != snapshot.active_run_id
-        || previous.last_run_id != snapshot.last_run_id
-        || previous.total_tokens_in != snapshot.total_tokens_in
-        || previous.total_tokens_out != snapshot.total_tokens_out
-    {
+    printer.sideband_event(
+        session_attach_status(session.status),
+        "session",
+        Some(&session_status_detail(session)),
+    );
+    if let Some(detail) = session_route_detail(session) {
         printer.sideband_event(
-            session_attach_status(session.status),
-            "session",
-            Some(&session_status_detail(session)),
+            crate::output::palette::Status::Active,
+            "route",
+            Some(&detail),
         );
     }
-    if previous.last_error != snapshot.last_error {
-        if let Some(error) = session
-            .last_error
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            printer.sideband_event(
-                crate::output::palette::Status::Failed,
-                "last error",
-                Some(&truncate_single_line(error, 96)),
-            );
-        }
-    }
-}
-
-fn sync_session_attach_ticker(
-    printer: &mut crate::output::LineStreamPrinter,
-    session: &SessionRecord,
-) {
-    let message = session_ticker_message(session);
-    printer.start_ticker(message.clone());
-    printer.tick_with(message);
+    render_attach_help_hint(printer);
 }
 
 fn session_attach_status(status: SessionStatus) -> crate::output::palette::Status {
@@ -1680,31 +1610,6 @@ fn session_recent_prompt(session: &SessionRecord) -> Option<String> {
         .runs
         .last()
         .map(|run| truncate_single_line(&run.prompt, 96))
-}
-
-fn session_ticker_message(session: &SessionRecord) -> String {
-    match session.status {
-        SessionStatus::Running => format!(
-            "session {}  ·  run {}  ·  turns {}",
-            session.agent_name,
-            session
-                .active_run_id
-                .as_deref()
-                .map(compact_session_run_id)
-                .as_deref()
-                .unwrap_or("starting"),
-            session.total_turns
-        ),
-        SessionStatus::Idle => format!(
-            "session {}  ·  idle  ·  press p to prompt",
-            session.agent_name
-        ),
-        SessionStatus::Failed => format!(
-            "session {}  ·  failed  ·  /status for detail",
-            session.agent_name
-        ),
-        SessionStatus::Stopped => format!("session {}  ·  stopped", session.agent_name),
-    }
 }
 
 fn compact_session_run_id(run_id: &str) -> String {
@@ -2503,25 +2408,12 @@ mod tests {
     }
 
     #[test]
-    fn session_ticker_message_changes_with_status() {
-        let mut session = test_session_record();
+    fn compact_session_run_id_shortens_long_values() {
         assert_eq!(
-            session_ticker_message(&session),
-            "session issue-reader  ·  run run_live123  ·  turns 3"
+            compact_session_run_id("run_01KRJDKSBE7X4J49094149WFJS"),
+            "run_01KRJDK…WFJS"
         );
-
-        session.status = SessionStatus::Idle;
-        session.active_run_id = None;
-        assert_eq!(
-            session_ticker_message(&session),
-            "session issue-reader  ·  idle  ·  press p to prompt"
-        );
-
-        session.status = SessionStatus::Failed;
-        assert_eq!(
-            session_ticker_message(&session),
-            "session issue-reader  ·  failed  ·  /status for detail"
-        );
+        assert_eq!(compact_session_run_id("run_short"), "run_short");
     }
 
     fn test_session_record() -> SessionRecord {
