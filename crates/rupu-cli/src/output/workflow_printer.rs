@@ -118,6 +118,7 @@ struct WorkflowInteractiveState {
     followed_step_id: Option<String>,
     followed_transcript_path: Option<PathBuf>,
     tailer: Option<TranscriptTailer>,
+    active_transcript_indent: usize,
     lines: Vec<WorkflowViewLine>,
     total_tokens: u64,
     dispatches: BTreeMap<String, InFlightDispatch>,
@@ -131,6 +132,7 @@ impl WorkflowInteractiveState {
             followed_step_id: None,
             followed_transcript_path: None,
             tailer: None,
+            active_transcript_indent: 0,
             lines: Vec::new(),
             total_tokens: 0,
             dispatches: BTreeMap::new(),
@@ -720,7 +722,7 @@ fn rebuild_workflow_interactive_state(
     prefs: &UiPrefs,
 ) -> WorkflowInteractiveState {
     let mut state = WorkflowInteractiveState::new(skip_count);
-    drain_step_results_interactive(step_results_log, &mut state, view_mode, prefs);
+    replay_step_results_interactive(step_results_log, &mut state, view_mode, prefs);
     follow_active_transcript(record, &mut state, view_mode, prefs);
     drain_workflow_transcript_events(&mut state, view_mode, prefs);
     state
@@ -747,15 +749,128 @@ fn follow_active_transcript(
     state.followed_step_id = record.active_step_id.clone();
     state.followed_transcript_path = desired_path.clone();
     state.tailer = desired_path.map(TranscriptTailer::new);
+    state.active_transcript_indent = 1;
     state.dispatches.clear();
     if let Some(step_id) = record.active_step_id.as_deref() {
-        let detail = if let Some(agent) = record.active_step_agent.as_deref() {
-            format!("{step_id}  ·  {agent}")
-        } else {
-            step_id.to_string()
-        };
-        state.push_line(UiStatus::Working, format!("active step  ·  {detail}"));
+        let detail = record.active_step_agent.as_deref().unwrap_or("running");
+        state.push_tree_item(
+            UiStatus::Working,
+            0,
+            retained_tree_item_text(UiStatus::Working, step_id, detail),
+        );
     }
+}
+
+fn load_step_result_records(log: &Path) -> Vec<StepResultRecord> {
+    let Ok(bytes) = std::fs::read(log) else {
+        return Vec::new();
+    };
+    bytes
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_slice::<StepResultRecord>(line).ok())
+        .collect()
+}
+
+fn replay_step_results_interactive(
+    log: &Path,
+    state: &mut WorkflowInteractiveState,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) {
+    let records = load_step_result_records(log);
+    state.seen_step_results = records.len();
+    for rec in records {
+        if rec.skipped {
+            state.push_line(UiStatus::Skipped, format!("skipped  ·  {}", rec.step_id));
+            continue;
+        }
+        replay_step_result_history(state, &rec, view_mode, prefs);
+    }
+}
+
+fn replay_step_result_history(
+    state: &mut WorkflowInteractiveState,
+    rec: &StepResultRecord,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) {
+    match rec.kind {
+        StepKind::Linear => replay_linear_step_history(state, rec, view_mode, prefs),
+        StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
+            append_step_result_lines(state, rec, view_mode, prefs)
+        }
+    }
+}
+
+fn replay_linear_step_history(
+    state: &mut WorkflowInteractiveState,
+    rec: &StepResultRecord,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) {
+    let events = transcript_events_for_path(&rec.transcript_path);
+    let mut summary = summarize_compact_child_events(&events);
+    if !rec.success && summary.error.is_none() {
+        summary.error = Some("step failed".into());
+    }
+    let status = if rec.success {
+        UiStatus::Complete
+    } else {
+        UiStatus::Failed
+    };
+    state.total_tokens += summary.total_tokens;
+    state.push_tree_item(
+        status,
+        0,
+        retained_tree_item_text(
+            status,
+            &rec.step_id,
+            &compact_child_detail(
+                status,
+                &summary.provider,
+                &summary.model,
+                summary.duration_ms,
+                summary.total_tokens,
+                None,
+            ),
+        ),
+    );
+    if view_mode.shows_full_payloads() {
+        for event in &events {
+            for line in workflow_transcript_event_lines(event, view_mode, prefs) {
+                state.push_view_line(WorkflowViewLine {
+                    indent: line.indent + 1,
+                    ..line
+                });
+            }
+        }
+    } else if !rec.success {
+        let reason = summary.error.as_deref().unwrap_or("step failed");
+        state.push_tree_note(
+            UiStatus::Failed,
+            1,
+            retained_tree_note_text(
+                UiStatus::Failed,
+                &format!("error  {}", truncate_single_line(reason, 88)),
+            ),
+        );
+    } else if view_mode == LiveViewMode::Focused {
+        if let Some(note) = compact_child_note(&summary) {
+            state.push_tree_note(
+                UiStatus::Active,
+                1,
+                retained_tree_note_text(UiStatus::Active, &note),
+            );
+        }
+    }
+}
+
+fn transcript_events_for_path(path: &Path) -> Vec<TxEvent> {
+    if path.as_os_str().is_empty() || !path.exists() {
+        return Vec::new();
+    }
+    TranscriptTailer::new(path).drain()
 }
 
 fn drain_workflow_transcript_events(
@@ -768,63 +883,67 @@ fn drain_workflow_transcript_events(
             if let TxEvent::RunComplete { total_tokens, .. } = &event {
                 state.total_tokens += *total_tokens;
             }
-            if view_mode == LiveViewMode::Full {
-                match &event {
-                    TxEvent::ToolCall {
-                        call_id,
-                        tool,
-                        input,
-                    } => match tool.as_str() {
-                        "dispatch_agent" => {
-                            let agent = input
-                                .get("agent")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("?")
-                                .to_string();
-                            state
-                                .dispatches
-                                .insert(call_id.clone(), InFlightDispatch::Single { agent });
-                        }
-                        "dispatch_agents_parallel" => {
-                            state
-                                .dispatches
-                                .insert(call_id.clone(), InFlightDispatch::Parallel);
-                        }
-                        _ => {}
-                    },
-                    TxEvent::ToolResult {
-                        call_id,
-                        output,
-                        error,
-                        ..
-                    } => {
-                        if let Some(dispatch) = state.dispatches.remove(call_id) {
-                            let nested = match dispatch {
-                                InFlightDispatch::Single { agent } => {
-                                    retained_dispatch_child_lines(
-                                        &agent,
-                                        output,
-                                        error.as_deref(),
-                                        prefs,
-                                    )
-                                }
-                                InFlightDispatch::Parallel => {
-                                    retained_dispatch_children_lines(output, prefs)
-                                }
-                            };
-                            if !nested.is_empty() {
-                                for line in nested {
-                                    state.push_view_line(line);
-                                }
-                                continue;
-                            }
-                        }
+            match &event {
+                TxEvent::ToolCall {
+                    call_id,
+                    tool,
+                    input,
+                } => match tool.as_str() {
+                    "dispatch_agent" => {
+                        let agent = input
+                            .get("agent")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        state
+                            .dispatches
+                            .insert(call_id.clone(), InFlightDispatch::Single { agent });
+                    }
+                    "dispatch_agents_parallel" => {
+                        state
+                            .dispatches
+                            .insert(call_id.clone(), InFlightDispatch::Parallel);
                     }
                     _ => {}
+                },
+                TxEvent::ToolResult {
+                    call_id,
+                    output,
+                    error,
+                    ..
+                } => {
+                    if let Some(dispatch) = state.dispatches.remove(call_id) {
+                        let nested = match dispatch {
+                            InFlightDispatch::Single { agent } => retained_dispatch_child_lines(
+                                &agent,
+                                output,
+                                error.as_deref(),
+                                prefs,
+                                view_mode,
+                                state.active_transcript_indent + 1,
+                            ),
+                            InFlightDispatch::Parallel => retained_dispatch_children_lines(
+                                output,
+                                prefs,
+                                view_mode,
+                                state.active_transcript_indent + 1,
+                            ),
+                        };
+                        if !nested.is_empty() {
+                            for line in nested {
+                                state.push_view_line(line);
+                            }
+                            continue;
+                        }
+                    }
                 }
+                _ => {}
             }
             for line in workflow_transcript_event_lines(&event, view_mode, prefs) {
-                state.push_view_line(line);
+                state.push_view_line(WorkflowViewLine {
+                    indent: line.indent + state.active_transcript_indent,
+                    ..line
+                });
             }
         }
     }
@@ -870,24 +989,34 @@ fn append_step_result_lines(
             } else {
                 UiStatus::Failed
             };
-            let label = if rec.success {
-                "step complete"
-            } else {
-                "step failed"
-            };
-            let detail = truncate_single_line(&rec.step_id, 96);
-            state.push_line(status, format!("{label}  ·  {detail}"));
+            state.push_tree_item(
+                status,
+                0,
+                retained_tree_item_text(
+                    status,
+                    &rec.step_id,
+                    if rec.success { "step complete" } else { "step failed" },
+                ),
+            );
             if !rec.output.trim().is_empty() {
                 match view_mode {
                     LiveViewMode::Focused => {
                         let label = if rec.success { "output" } else { "error" };
-                        state.push_line(
+                        state.push_tree_note(
                             if rec.success {
                                 UiStatus::Active
                             } else {
                                 UiStatus::Failed
                             },
-                            format!("{label}  ·  {}", truncate_single_line(&rec.output, 96)),
+                            1,
+                            retained_tree_note_text(
+                                if rec.success {
+                                    UiStatus::Active
+                                } else {
+                                    UiStatus::Failed
+                                },
+                                &format!("{label}  {}", truncate_single_line(&rec.output, 96)),
+                            ),
                         );
                     }
                     LiveViewMode::Compact => {}
@@ -920,11 +1049,14 @@ fn append_step_result_lines(
                 StepKind::Panel => "panel",
                 StepKind::Linear => unreachable!(),
             };
-            state.push_line(
+            state.push_tree_item(
                 status,
-                format!(
-                    "{}  ·  {}  ·  {} {}",
-                    rec.step_id,
+                0,
+                retained_tree_item_text(
+                    status,
+                    &rec.step_id,
+                    &format!(
+                        "{}  ·  {} {}",
                     kind,
                     rec.items.len(),
                     if rec.items.len() == 1 {
@@ -932,6 +1064,7 @@ fn append_step_result_lines(
                     } else {
                         "items"
                     }
+                    ),
                 ),
             );
             append_fanout_item_lines(state, rec, view_mode, prefs);
@@ -990,7 +1123,7 @@ fn append_fanout_item_lines(
         );
         state.push_tree_item(
             status,
-            0,
+            1,
             retained_tree_item_text(status, &headline, &detail),
         );
         if view_mode == LiveViewMode::Full {
@@ -1006,7 +1139,7 @@ fn append_fanout_item_lines(
             let reason = summary.error.as_deref().unwrap_or("item failed");
             state.push_tree_note(
                 UiStatus::Failed,
-                1,
+                2,
                 retained_tree_note_text(
                     UiStatus::Failed,
                     &format!("error  {}", truncate_single_line(reason, 88)),
@@ -1016,16 +1149,18 @@ fn append_fanout_item_lines(
             if let Some(note) = compact_child_note(&summary) {
                 state.push_tree_note(
                     UiStatus::Active,
-                    1,
+                    2,
                     retained_tree_note_text(UiStatus::Active, &note),
                 );
             }
-        } else if let Some(note) = compact_child_note(&summary) {
+        } else if view_mode == LiveViewMode::Full {
+            if let Some(note) = compact_child_note(&summary) {
             state.push_tree_note(
                 UiStatus::Active,
-                1,
+                2,
                 retained_tree_note_text(UiStatus::Active, &note),
             );
+            }
         }
     }
 }
@@ -1042,48 +1177,62 @@ fn workflow_transcript_event_lines(
             mode,
             started_at,
             ..
-        } => vec![WorkflowViewLine {
-            status: UiStatus::Active,
-            text: retained_workflow_event_line(
-                UiStatus::Active,
-                "run started",
-                &format!(
-                    "{}  ·  workspace {}  ·  mode {}  ·  {}",
-                    compact_workflow_run_id(run_id),
-                    workspace_id,
-                    format!("{mode:?}").to_lowercase(),
-                    started_at.format("%Y-%m-%d %H:%M:%S UTC")
+        } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![WorkflowViewLine {
+                status: UiStatus::Active,
+                text: retained_workflow_event_line(
+                    UiStatus::Active,
+                    "run started",
+                    &format!(
+                        "{}  ·  workspace {}  ·  mode {}  ·  {}",
+                        compact_workflow_run_id(run_id),
+                        workspace_id,
+                        format!("{mode:?}").to_lowercase(),
+                        started_at.format("%Y-%m-%d %H:%M:%S UTC")
+                    ),
                 ),
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
-        TxEvent::TurnStart { turn_idx } => vec![WorkflowViewLine {
-            status: UiStatus::Working,
-            text: retained_workflow_event_line(
-                UiStatus::Working,
-                &format!("turn {turn_idx}"),
-                "assistant turn started",
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
+        TxEvent::TurnStart { turn_idx } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![WorkflowViewLine {
+                status: UiStatus::Working,
+                text: retained_workflow_event_line(
+                    UiStatus::Working,
+                    &format!("turn {turn_idx}"),
+                    "assistant turn started",
+                ),
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
         TxEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
-            if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
-                out.push(WorkflowViewLine {
-                    status: UiStatus::Active,
-                    text: retained_workflow_event_line(
-                        UiStatus::Active,
-                        "thinking",
-                        &truncate_single_line(thinking, 96),
-                    ),
-                    continuation: false,
-                    indent: 0,
-                    kind: WorkflowViewLineKind::Event,
-                });
+            if view_mode.shows_full_payloads() {
+                if let Some(thinking) =
+                    thinking.as_deref().filter(|value| !value.trim().is_empty())
+                {
+                    out.push(WorkflowViewLine {
+                        status: UiStatus::Active,
+                        text: retained_workflow_event_line(
+                            UiStatus::Active,
+                            "thinking",
+                            &truncate_single_line(thinking, 96),
+                        ),
+                        continuation: false,
+                        indent: 0,
+                        kind: WorkflowViewLineKind::Event,
+                    });
+                }
             }
             if !content.trim().is_empty() {
                 match view_mode {
@@ -1304,40 +1453,50 @@ fn workflow_transcript_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
-        } => vec![WorkflowViewLine {
-            status: UiStatus::Complete,
-            text: retained_workflow_event_line(
-                UiStatus::Complete,
-                "turn complete",
-                &format!(
-                    "turn {turn_idx}  ·  in {} out {}",
-                    tokens_in.unwrap_or(0),
-                    tokens_out.unwrap_or(0)
+        } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![WorkflowViewLine {
+                status: UiStatus::Complete,
+                text: retained_workflow_event_line(
+                    UiStatus::Complete,
+                    "turn complete",
+                    &format!(
+                        "turn {turn_idx}  ·  in {} out {}",
+                        tokens_in.unwrap_or(0),
+                        tokens_out.unwrap_or(0)
+                    ),
                 ),
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
         TxEvent::Usage {
             provider,
             model,
             input_tokens,
             output_tokens,
             cached_tokens,
-        } => vec![WorkflowViewLine {
-            status: UiStatus::Active,
-            text: retained_workflow_event_line_raw(
-                UiStatus::Active,
-                "usage",
-                &format!(
-                    "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+        } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![WorkflowViewLine {
+                status: UiStatus::Active,
+                text: retained_workflow_event_line_raw(
+                    UiStatus::Active,
+                    "usage",
+                    &format!(
+                        "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+                    ),
                 ),
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
         TxEvent::RunComplete {
             status,
             total_tokens,
@@ -1377,15 +1536,22 @@ fn retained_dispatch_child_lines(
     output: &str,
     fallback_error: Option<&str>,
     prefs: &UiPrefs,
+    view_mode: LiveViewMode,
+    indent: usize,
 ) -> Vec<WorkflowViewLine> {
     let parsed: serde_json::Value = match serde_json::from_str(output) {
         Ok(value) => value,
         Err(_) => return Vec::new(),
     };
-    retained_dispatch_outcome_lines(headline, &parsed, fallback_error, prefs)
+    retained_dispatch_outcome_lines(headline, &parsed, fallback_error, prefs, view_mode, indent)
 }
 
-fn retained_dispatch_children_lines(output: &str, prefs: &UiPrefs) -> Vec<WorkflowViewLine> {
+fn retained_dispatch_children_lines(
+    output: &str,
+    prefs: &UiPrefs,
+    view_mode: LiveViewMode,
+    indent: usize,
+) -> Vec<WorkflowViewLine> {
     let parsed: serde_json::Value = match serde_json::from_str(output) {
         Ok(value) => value,
         Err(_) => return Vec::new(),
@@ -1395,7 +1561,9 @@ fn retained_dispatch_children_lines(output: &str, prefs: &UiPrefs) -> Vec<Workfl
     };
     let mut out = Vec::new();
     for (id, outcome) in results {
-        out.extend(retained_dispatch_outcome_lines(id, outcome, None, prefs));
+        out.extend(retained_dispatch_outcome_lines(
+            id, outcome, None, prefs, view_mode, indent,
+        ));
     }
     out
 }
@@ -1405,6 +1573,8 @@ fn retained_dispatch_outcome_lines(
     outcome: &serde_json::Value,
     fallback_error: Option<&str>,
     prefs: &UiPrefs,
+    view_mode: LiveViewMode,
+    indent: usize,
 ) -> Vec<WorkflowViewLine> {
     let transcript_path = outcome["transcript_path"]
         .as_str()
@@ -1446,18 +1616,48 @@ fn retained_dispatch_outcome_lines(
         status,
         text: retained_tree_item_text(status, headline, &detail),
         continuation: false,
-        indent: 0,
+        indent,
         kind: WorkflowViewLineKind::TreeItem,
     }];
-    for event in &events {
-        for line in workflow_transcript_event_lines(event, LiveViewMode::Full, prefs) {
-            out.push(WorkflowViewLine {
-                indent: line.indent + 2,
-                ..line
-            });
+    match view_mode {
+        LiveViewMode::Full => {
+            for event in &events {
+                for line in workflow_transcript_event_lines(event, LiveViewMode::Full, prefs) {
+                    out.push(WorkflowViewLine {
+                        indent: line.indent + indent + 1,
+                        ..line
+                    });
+                }
+            }
         }
+        LiveViewMode::Focused => {
+            if !success {
+                out.push(WorkflowViewLine {
+                    status: UiStatus::Failed,
+                    text: retained_tree_note_text(
+                        UiStatus::Failed,
+                        &format!(
+                            "error  {}",
+                            truncate_single_line(dispatch_error.unwrap_or("dispatch failed"), 96)
+                        ),
+                    ),
+                    continuation: false,
+                    indent: indent + 1,
+                    kind: WorkflowViewLineKind::TreeNote,
+                });
+            } else if let Some(note) = compact_child_note(&summary) {
+                out.push(WorkflowViewLine {
+                    status: UiStatus::Active,
+                    text: retained_tree_note_text(UiStatus::Active, &note),
+                    continuation: false,
+                    indent: indent + 1,
+                    kind: WorkflowViewLineKind::TreeNote,
+                });
+            }
+        }
+        LiveViewMode::Compact => {}
     }
-    if !success && events.is_empty() {
+    if !success && events.is_empty() && !matches!(view_mode, LiveViewMode::Focused) {
         out.push(WorkflowViewLine {
             status: UiStatus::Failed,
             text: retained_tree_note_text(
@@ -1465,7 +1665,7 @@ fn retained_dispatch_outcome_lines(
                 &truncate_single_line(dispatch_error.unwrap_or("dispatch failed"), 96),
             ),
             continuation: false,
-            indent: 1,
+            indent: indent + 1,
             kind: WorkflowViewLineKind::TreeNote,
         });
     }
@@ -3082,6 +3282,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
+    fn write_transcript(path: &Path, events: &[TxEvent]) {
+        let mut buf = String::new();
+        for event in events {
+            buf.push_str(&serde_json::to_string(event).unwrap());
+            buf.push('\n');
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
     fn sample_run_record() -> RunRecord {
         RunRecord {
             id: "run_test".into(),
@@ -3366,6 +3575,126 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_workflow_state_replays_completed_linear_transcript_history() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("step.jsonl");
+        let step_results = dir.path().join("step_results.jsonl");
+        let run_started = Utc::now();
+        write_transcript(
+            &transcript,
+            &[
+                TxEvent::RunStart {
+                    run_id: "run_linear".into(),
+                    workspace_id: "ws".into(),
+                    agent: "builder".into(),
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    started_at: run_started,
+                    mode: rupu_transcript::RunMode::Readonly,
+                },
+                TxEvent::AssistantMessage {
+                    content: "Summarized the implementation plan.".into(),
+                    thinking: None,
+                },
+                TxEvent::RunComplete {
+                    run_id: "run_linear".into(),
+                    status: rupu_transcript::RunStatus::Ok,
+                    total_tokens: 321,
+                    duration_ms: 1200,
+                    error: None,
+                },
+            ],
+        );
+        let record = StepResultRecord {
+            step_id: "understand".into(),
+            run_id: "run_linear".into(),
+            transcript_path: transcript,
+            output: "Summarized the implementation plan.".into(),
+            success: true,
+            skipped: false,
+            rendered_prompt: "Read the repo".into(),
+            kind: StepKind::Linear,
+            items: Vec::new(),
+            findings: Vec::new(),
+            iterations: 0,
+            resolved: true,
+            finished_at: Utc::now(),
+        };
+        std::fs::write(
+            &step_results,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let state = rebuild_workflow_interactive_state(
+            &sample_run_record(),
+            &step_results,
+            0,
+            LiveViewMode::Focused,
+            &prefs,
+        );
+        assert!(state.lines.iter().any(|line| line.text.contains("understand")));
+        assert!(state
+            .lines
+            .iter()
+            .any(|line| line.text.contains("assistant output")));
+    }
+
+    #[test]
+    fn retained_dispatch_child_lines_focused_emit_tree_summary() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("child.jsonl");
+        write_transcript(
+            &transcript,
+            &[
+                TxEvent::AssistantMessage {
+                    content: "Investigated the target repo.".into(),
+                    thinking: None,
+                },
+                TxEvent::RunComplete {
+                    run_id: "sub_1".into(),
+                    status: rupu_transcript::RunStatus::Ok,
+                    total_tokens: 42,
+                    duration_ms: 250,
+                    error: None,
+                },
+            ],
+        );
+        let output = serde_json::json!({
+            "ok": true,
+            "transcript_path": transcript,
+            "tokens_used": 42,
+            "duration_ms": 250,
+        });
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let lines = retained_dispatch_child_lines(
+            "repo-investigator",
+            &output.to_string(),
+            None,
+            &prefs,
+            LiveViewMode::Focused,
+            1,
+        );
+        assert!(lines.iter().any(|line| line.kind == WorkflowViewLineKind::TreeItem));
+        assert!(lines
+            .iter()
+            .any(|line| line.text.contains("assistant output")));
+    }
+
+    #[test]
     fn workflow_transcript_event_lines_full_keeps_more_assistant_text_than_focused() {
         let event = TxEvent::AssistantMessage {
             content: "This is a longer workflow assistant response that should stay fuller in full mode while focused mode truncates it.".into(),
@@ -3596,11 +3925,18 @@ mod tests {
             None,
             Some(LiveViewMode::Full),
         );
-        let lines = retained_dispatch_child_lines("reviewer", &output.to_string(), None, &prefs);
+        let lines = retained_dispatch_child_lines(
+            "reviewer",
+            &output.to_string(),
+            None,
+            &prefs,
+            LiveViewMode::Full,
+            0,
+        );
         assert!(lines.iter().any(|line| line.text.contains("reviewer")));
         assert!(lines
             .iter()
             .any(|line| line.text.contains("assistant output")));
-        assert!(lines.iter().any(|line| line.indent >= 2));
+        assert!(lines.iter().any(|line| line.indent >= 1));
     }
 }
