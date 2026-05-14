@@ -333,7 +333,7 @@ fn render_footer(
         .items_center()
         .child(render_mode_picker(state.mode, on_mode_change))
         .child(render_target_picker(
-            &state.target,
+            state,
             on_target_change,
             on_pick_dir,
         ))
@@ -395,10 +395,11 @@ fn render_mode_picker(current: LauncherMode, on_mode_change: ModeChangeCb) -> An
 /// - "Pick directory…" → invokes `on_pick_dir` which opens NSOpenPanel
 /// - "Clone repo…" → sets target to Clone{NotStarted} via `on_target_change`
 fn render_target_picker(
-    current: &LauncherTarget,
+    state: &LauncherState,
     on_target_change: TargetChangeCb,
     on_pick_dir: PickDirCb,
 ) -> AnyElement {
+    let current = &state.target;
     // "This workspace" pill
     let is_workspace = matches!(current, LauncherTarget::ThisWorkspace);
     let cb_ws = on_target_change.clone();
@@ -466,13 +467,14 @@ fn render_target_picker(
             on_pick_dir(window, cx);
         });
 
-    // "Clone repo…" pill — label shows repo_ref when active
+    // "Clone repo…" pill — simplified status label; the repo_ref is typed in the
+    // embedded TextInput that appears below the pills row when Clone is active.
     let is_clone = matches!(current, LauncherTarget::Clone { .. });
-    let clone_label: SharedString = match current {
-        LauncherTarget::Clone { repo_ref, status } => match status {
-            CloneStatus::NotStarted => SharedString::from(format!("clone: {repo_ref}")),
+    let clone_status_label: SharedString = match current {
+        LauncherTarget::Clone { status, .. } => match status {
+            CloneStatus::NotStarted => SharedString::from("clone repo"),
             CloneStatus::InProgress => SharedString::from("cloning\u{2026}"),
-            CloneStatus::Done(_) => SharedString::from(format!("cloned: {repo_ref}")),
+            CloneStatus::Done(_) => SharedString::from("cloned"),
             CloneStatus::Failed(_) => SharedString::from("clone failed"),
         },
         _ => SharedString::from("clone repo\u{2026}"),
@@ -500,7 +502,7 @@ fn render_target_picker(
         })
         .text_sm()
         .cursor_pointer()
-        .child(clone_label)
+        .child(clone_status_label)
         .on_click(move |_ev, window, cx| {
             cb_clone(
                 LauncherTarget::Clone {
@@ -512,14 +514,23 @@ fn render_target_picker(
             );
         });
 
-    div()
-        .flex()
-        .flex_row()
-        .gap(px(4.0))
-        .child(pill_workspace)
-        .child(pill_dir)
-        .child(pill_clone)
-        .into_any_element()
+    // Wrap the three pills in a row, with the repo_ref TextInput appearing
+    // below the row when Clone is selected.
+    let mut col = div().flex().flex_col().gap(px(4.0)).child(
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(4.0))
+            .child(pill_workspace)
+            .child(pill_dir)
+            .child(pill_clone),
+    );
+    if is_clone {
+        if let Some(entity) = state.text_inputs.get("__repo_ref").cloned() {
+            col = col.child(div().w(px(280.0)).child(entity));
+        }
+    }
+    col.into_any_element()
 }
 
 /// Run button: greyed + non-interactive when `!can_run`.
