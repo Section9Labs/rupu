@@ -89,6 +89,7 @@ pub enum PagerMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum LiveViewMode {
     Focused,
+    Compact,
     Full,
 }
 
@@ -96,15 +97,29 @@ impl LiveViewMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Focused => "focused",
+            Self::Compact => "compact",
             Self::Full => "full",
         }
     }
 
     pub fn toggled(self) -> Self {
         match self {
-            Self::Focused => Self::Full,
+            Self::Focused => Self::Compact,
+            Self::Compact => Self::Full,
             Self::Full => Self::Focused,
         }
+    }
+
+    pub fn shows_full_payloads(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    pub fn shows_assistant_preview(self) -> bool {
+        matches!(self, Self::Focused)
+    }
+
+    pub fn hides_assistant_output(self) -> bool {
+        matches!(self, Self::Compact)
     }
 }
 
@@ -466,6 +481,7 @@ fn parse_pager(raw: Option<&str>) -> Option<PagerMode> {
 fn parse_live_view(raw: Option<&str>) -> Option<LiveViewMode> {
     match raw?.to_ascii_lowercase().as_str() {
         "focused" => Some(LiveViewMode::Focused),
+        "compact" => Some(LiveViewMode::Compact),
         "full" => Some(LiveViewMode::Full),
         _ => None,
     }
@@ -842,5 +858,17 @@ mod tests {
         let prefs = UiPrefs::resolve(&cfg, false, None, None, None);
         assert_eq!(prefs.color, ColorMode::Never);
         std::env::remove_var("NO_COLOR");
+    }
+
+    #[test]
+    fn live_view_mode_cycles_all_three_states() {
+        assert_eq!(LiveViewMode::Focused.toggled(), LiveViewMode::Compact);
+        assert_eq!(LiveViewMode::Compact.toggled(), LiveViewMode::Full);
+        assert_eq!(LiveViewMode::Full.toggled(), LiveViewMode::Focused);
+    }
+
+    #[test]
+    fn parse_live_view_supports_compact() {
+        assert_eq!(parse_live_view(Some("compact")), Some(LiveViewMode::Compact));
     }
 }

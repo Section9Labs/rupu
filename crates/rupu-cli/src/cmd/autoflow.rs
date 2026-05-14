@@ -2257,6 +2257,7 @@ fn build_retained_serve_rows_for_size(
     body_rows.push(String::new());
     body_rows.push(retained_serve_section_title("recent", width));
     let recent_limit = match view_mode {
+        LiveViewMode::Compact => 2,
         LiveViewMode::Focused => 4,
         LiveViewMode::Full => 8,
     };
@@ -2576,9 +2577,10 @@ fn live_run_event_lines(
                     text: format!("assistant  ·  {}", truncate_single_line(content, 96)),
                     continuation: false,
                 }],
+                LiveViewMode::Compact => Vec::new(),
                 LiveViewMode::Full => {
                     let prefs = retained_serve_ui_prefs();
-                    let highlighted = crate::cmd::ui::highlight_markdown(content.trim(), &prefs);
+                    let highlighted = render_payload(content.trim(), &prefs).rendered;
                     let mut out = Vec::new();
                     for (index, line) in highlighted.lines().enumerate() {
                         out.push(AutoflowServeViewLine {
@@ -2596,7 +2598,7 @@ fn live_run_event_lines(
             }
         }
         TranscriptEvent::ToolCall { tool, input, .. } => match view_mode {
-            LiveViewMode::Focused => vec![AutoflowServeViewLine {
+            LiveViewMode::Focused | LiveViewMode::Compact => vec![AutoflowServeViewLine {
                 status: UiStatus::Working,
                 text: format!(
                     "{}  ·  {}",
@@ -2637,31 +2639,29 @@ fn live_run_event_lines(
             } else {
                 UiStatus::Complete
             };
+            let prefs = retained_serve_ui_prefs();
+            let raw = error.as_deref().unwrap_or(output.as_str());
+            let payload = render_payload(raw, &prefs);
             match view_mode {
-                LiveViewMode::Focused => {
-                    let mut detail =
-                        truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 88);
-                    if *duration_ms > 0 {
-                        detail.push_str(&format!("  ·  {}ms", duration_ms));
-                    }
-                    vec![AutoflowServeViewLine {
-                        status,
-                        text: format!(
-                            "{}  ·  {}",
-                            if error.is_some() {
-                                "tool error"
-                            } else {
-                                "tool result"
-                            },
-                            detail
-                        ),
-                        continuation: false,
-                    }]
-                }
+                LiveViewMode::Focused | LiveViewMode::Compact => vec![AutoflowServeViewLine {
+                    status,
+                    text: format!(
+                        "{}  ·  {}{}",
+                        if error.is_some() {
+                            "tool error"
+                        } else {
+                            "tool result"
+                        },
+                        payload.headline,
+                        if *duration_ms > 0 {
+                            format!("  ·  {}ms", duration_ms)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    continuation: false,
+                }],
                 LiveViewMode::Full => {
-                    let prefs = retained_serve_ui_prefs();
-                    let raw = error.as_deref().unwrap_or(output.as_str());
-                    let payload = render_payload(raw, &prefs);
                     let mut out = vec![AutoflowServeViewLine {
                         status,
                         text: format!(

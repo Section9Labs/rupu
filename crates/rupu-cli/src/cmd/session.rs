@@ -1715,7 +1715,7 @@ fn render_session_controls_line(width: usize) -> String {
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
     let _ = palette::write_colored(
         &mut buf,
-        "  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help",
+        "  f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help",
         DIM,
     );
     truncate_ansi_line(&buf, width)
@@ -1850,6 +1850,7 @@ fn transcript_event_lines(
                         ),
                         continuation: false,
                     }),
+                    LiveViewMode::Compact => {}
                     LiveViewMode::Full => {
                         let highlighted = render_payload(content.trim(), prefs).rendered;
                         let mut lines = highlighted.split('\n');
@@ -1877,7 +1878,7 @@ fn transcript_event_lines(
             out
         }
         TranscriptEvent::ToolCall { tool, input, .. } => match view_mode {
-            LiveViewMode::Focused => vec![SessionViewLine {
+            LiveViewMode::Focused | LiveViewMode::Compact => vec![SessionViewLine {
                 status: Status::Working,
                 text: retained_session_event_line(
                     Status::Working,
@@ -1923,20 +1924,18 @@ fn transcript_event_lines(
                 "tool result"
             };
             let raw = error.as_deref().unwrap_or(output.as_str());
+            let payload = render_payload(raw, prefs);
             match view_mode {
-                LiveViewMode::Focused => {
-                    let mut detail = truncate_single_line(raw, 84);
-                    if *duration_ms > 0 {
-                        detail.push_str(&format!("  ·  {}ms", duration_ms));
-                    }
-                    vec![SessionViewLine {
+                LiveViewMode::Focused | LiveViewMode::Compact => vec![SessionViewLine {
+                    status,
+                    text: retained_session_event_line(
                         status,
-                        text: retained_session_event_line(status, label, &detail),
-                        continuation: false,
-                    }]
-                }
+                        label,
+                        &session_payload_summary(&payload, *duration_ms),
+                    ),
+                    continuation: false,
+                }],
                 LiveViewMode::Full => {
-                    let payload = render_payload(raw, prefs);
                     let mut out = vec![SessionViewLine {
                         status,
                         text: retained_session_event_line(
@@ -2196,7 +2195,7 @@ fn transcript_tool_summary(tool: &str, input: &serde_json::Value) -> String {
 fn append_session_help_lines(state: &mut SessionInteractiveState) {
     state.push_line(
         crate::output::palette::Status::Active,
-        "help  ·  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit",
+        "help  ·  f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit",
     );
     state.push_line(
         crate::output::palette::Status::Active,

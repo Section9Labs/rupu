@@ -450,6 +450,7 @@ fn render_assistant_output(
             "assistant output",
             Some(&truncate_single_line(content, 100)),
         ),
+        LiveViewMode::Compact => {}
     }
 }
 

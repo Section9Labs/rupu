@@ -890,6 +890,7 @@ fn append_step_result_lines(
                             format!("{label}  ·  {}", truncate_single_line(&rec.output, 96)),
                         );
                     }
+                    LiveViewMode::Compact => {}
                     LiveViewMode::Full => {
                         let payload = render_payload(&rec.output, prefs);
                         for line in retained_payload_lines(
@@ -1096,7 +1097,8 @@ fn workflow_transcript_event_lines(
                         continuation: false,
                         indent: 0,
                         kind: WorkflowViewLineKind::Event,
-                    }),
+                        }),
+                    LiveViewMode::Compact => {}
                     LiveViewMode::Full => {
                         let highlighted = render_payload(content.trim(), prefs).rendered;
                         let mut lines = highlighted.split('\n');
@@ -1128,7 +1130,7 @@ fn workflow_transcript_event_lines(
             out
         }
         TxEvent::ToolCall { tool, input, .. } => match view_mode {
-            LiveViewMode::Focused => vec![WorkflowViewLine {
+            LiveViewMode::Focused | LiveViewMode::Compact => vec![WorkflowViewLine {
                 status: UiStatus::Working,
                 text: retained_workflow_event_line(
                     UiStatus::Working,
@@ -1179,24 +1181,21 @@ fn workflow_transcript_event_lines(
             } else {
                 "tool result"
             };
+            let raw = error.as_deref().unwrap_or(output.as_str());
+            let payload = render_payload(raw, prefs);
             match view_mode {
-                LiveViewMode::Focused => {
-                    let mut detail =
-                        truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 90);
-                    if *duration_ms > 0 {
-                        detail.push_str(&format!("  ·  {}ms", duration_ms));
-                    }
-                    vec![WorkflowViewLine {
+                LiveViewMode::Focused | LiveViewMode::Compact => vec![WorkflowViewLine {
+                    status,
+                    text: retained_workflow_event_line(
                         status,
-                        text: retained_workflow_event_line(status, label, &detail),
-                        continuation: false,
-                        indent: 0,
-                        kind: WorkflowViewLineKind::Event,
-                    }]
-                }
+                        label,
+                        &workflow_payload_summary(&payload, *duration_ms),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                    kind: WorkflowViewLineKind::Event,
+                }],
                 LiveViewMode::Full => {
-                    let raw = error.as_deref().unwrap_or(output.as_str());
-                    let payload = render_payload(raw, prefs);
                     let mut out = vec![WorkflowViewLine {
                         status,
                         text: retained_workflow_event_line(
@@ -1556,7 +1555,7 @@ fn handle_workflow_navigation_keypress(
         (KeyCode::Char('?'), _) => {
             state.push_line(
                 UiStatus::Active,
-                "help  ·  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel",
+                "help  ·  f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel",
             );
             Some(WorkflowNavAction::Handled)
         }
@@ -1808,9 +1807,9 @@ fn build_workflow_screen_rows_for_size(
 fn render_workflow_controls_line(status: rupu_orchestrator::RunStatus, width: usize) -> String {
     let line = match status {
         rupu_orchestrator::RunStatus::AwaitingApproval => {
-            "f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  a approve  ·  r reject  ·  v findings  ·  q detach"
+            "f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  a approve  ·  r reject  ·  v findings  ·  q detach"
         }
-        _ => "f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel  ·  resize reflows automatically  ·  ? help",
+        _ => "f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel  ·  resize reflows automatically  ·  ? help",
     };
     let mut buf = String::new();
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
@@ -2654,6 +2653,7 @@ fn render_assistant_output(
             "assistant output",
             Some(&truncate_single_line(content, 96)),
         ),
+        LiveViewMode::Compact => {}
     }
 }
 

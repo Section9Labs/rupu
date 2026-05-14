@@ -432,6 +432,7 @@ pub(crate) fn render_pretty_transcript_event(
                         "assistant output",
                         Some(&truncate_single_line(content, 96)),
                     ),
+                    LiveViewMode::Compact => {}
                 }
             }
         }
