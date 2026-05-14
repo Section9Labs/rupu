@@ -52,6 +52,7 @@ use rupu_orchestrator::Workflow;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -2233,7 +2234,19 @@ async fn execute_workflow_invocation(
             let shared_printer_for_attach = shared_printer.clone();
             let outcome_result = tokio::task::spawn_blocking(move || {
                 let printer_store = rupu_orchestrator::RunStore::new(runs_dir_for_attach.clone());
-                if let Some(shared_printer) = shared_printer_for_attach {
+                let interactive_retained = shared_printer_for_attach.is_none()
+                    && io::stdin().is_terminal()
+                    && io::stdout().is_terminal()
+                    && attach_opts_for_attach.skip_count == 0;
+                if interactive_retained {
+                    crate::output::workflow_printer::attach_and_render_interactive_with(
+                        &name_owned,
+                        &rid_for_attach,
+                        &runs_dir_for_attach,
+                        &printer_store,
+                        attach_opts_for_attach,
+                    )
+                } else if let Some(shared_printer) = shared_printer_for_attach {
                     let mut printer = shared_printer
                         .lock()
                         .map_err(|_| io::Error::other("shared printer poisoned"))?;
