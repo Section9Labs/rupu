@@ -365,6 +365,7 @@ pub async fn run_workflow(
                 backend_id: None,
                 worker_id: None,
                 artifact_manifest_path: None,
+                runner_pid: Some(std::process::id()),
                 source_wake_id: None,
                 active_step_id: None,
                 active_step_kind: None,
@@ -379,7 +380,13 @@ pub async fn run_workflow(
         // Resume path: load the existing record so the terminal-flip
         // block at the bottom of the function can update it.
         match store.load(&run_id) {
-            Ok(rec) => Some(rec),
+            Ok(mut rec) => {
+                rec.runner_pid = Some(std::process::id());
+                if let Err(e) = store.update(&rec) {
+                    warn!(error = %e, "failed to persist resumed runner pid");
+                }
+                Some(rec)
+            }
             Err(e) => {
                 warn!(error = %e, "failed to load resumed run record");
                 None
@@ -426,6 +433,7 @@ pub async fn run_workflow(
                 record.approval_prompt = None;
                 record.awaiting_since = None;
                 record.expires_at = None;
+                record.runner_pid = None;
                 record.active_step_id = None;
                 record.active_step_kind = None;
                 record.active_step_agent = None;
@@ -443,6 +451,7 @@ pub async fn run_workflow(
                 record.awaiting_since = Some(now);
                 record.expires_at =
                     timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
+                record.runner_pid = None;
                 record.active_step_id = None;
                 record.active_step_kind = None;
                 record.active_step_agent = None;
@@ -458,6 +467,7 @@ pub async fn run_workflow(
                 record.status = crate::runs::RunStatus::Failed;
                 record.finished_at = Some(chrono::Utc::now());
                 record.error_message = Some(e.to_string());
+                record.runner_pid = None;
                 record.active_step_id = None;
                 record.active_step_kind = None;
                 record.active_step_agent = None;

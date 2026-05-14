@@ -159,6 +159,11 @@ pub struct RunRecord {
     /// Path to the persisted artifact manifest for this run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_manifest_path: Option<PathBuf>,
+    /// PID of the local process currently executing this run, when the
+    /// run is actively owned by a foreground CLI / serve worker on this
+    /// machine. Cleared once the run reaches a terminal or paused state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_pid: Option<u32>,
     /// Source wake id when this run came from the durable wake queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_wake_id: Option<String>,
@@ -850,6 +855,7 @@ mod tests {
             backend_id: None,
             worker_id: None,
             artifact_manifest_path: None,
+            runner_pid: None,
             source_wake_id: None,
             active_step_id: None,
             active_step_kind: None,
