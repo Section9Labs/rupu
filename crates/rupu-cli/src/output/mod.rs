@@ -1,10 +1,8 @@
 //! Line-stream output module for `rupu`.
 //!
 //! Provides a streaming vertical timeline printed line-by-line to stdout —
-//! the default UI replacing the alt-screen TUI canvas. Works in any
-//! terminal, any pipe, and any CI runner.
-//!
-//! The TUI canvas remains available behind the `--canvas` flag.
+//! the default UI for long-running CLI surfaces. Works in any terminal,
+//! any pipe, and any CI runner.
 
 pub mod diag;
 pub mod formats;

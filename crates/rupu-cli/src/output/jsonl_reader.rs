@@ -2,7 +2,7 @@
 //!
 //! `TranscriptTailer` maintains a byte-offset into a transcript file and
 //! returns newly-added events on each `drain` call. Used by the workflow
-//! and watch commands to tail live transcript files without the TUI.
+//! and watch commands to tail live transcript files.
 
 use rupu_transcript::Event;
 use std::path::{Path, PathBuf};

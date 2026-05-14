@@ -176,10 +176,9 @@ impl StepFactory for DefaultStepFactory {
             turn_index_offset: 0,
             mode_str: self.mode_str.clone(),
             no_stream: false,
-            // Workflow runs always feed into the TUI; the TUI tails
-            // the JSONL transcript for tokens. Suppress the legacy
-            // line-stream stdout writes so they don't corrupt the
-            // alt-screen canvas.
+            // Workflow runs stream through the workflow printer by
+            // tailing JSONL transcripts. Suppress direct stdout
+            // writes here so they don't corrupt the live view.
             suppress_stream_stdout: true,
             mcp_registry: Some(Arc::clone(&self.mcp_registry)),
             effort: spec.effort,

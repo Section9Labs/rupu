@@ -19,9 +19,9 @@
 //! Goes to **stderr** (so machine-piped stdout stays clean for the
 //! command's actual output). Honors `NO_COLOR`, `--no-color`, and
 //! `[ui].color = "never"` via [`UiPrefs`]. Glyphs reuse the Okesu
-//! palette already shared with the line-stream printer + TUI canvas
-//! (see `output::palette::Status`) so vocabulary stays consistent
-//! across rupu surfaces.
+//! palette already shared with the line-stream printer and other live
+//! CLI surfaces (see `output::palette::Status`) so vocabulary stays
+//! consistent across rupu surfaces.
 //!
 //! ## When to use which severity
 //!

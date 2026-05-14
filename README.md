@@ -19,8 +19,8 @@ transcript on every run. A single Rust binary that:
 - Fires workflows on cron schedules OR external SCM events (GitHub / GitLab),
   via either a system-cron poll loop (no daemon) or a user-managed
   `rupu webhook serve` long-running process.
-- Renders runs as a live terminal canvas (`rupu workflow run`) or a streaming
-  line view, with `rupu watch <run_id>` to re-attach to anything in flight.
+- Renders runs as live terminal streams (`rupu workflow run` / `rupu run`),
+  with `rupu watch <run_id>` to re-attach to anything in flight.
 
 What's NOT in this binary yet: the SaaS dashboard, the remote sandbox runtime,
 and the native desktop app — those are slices D + E. See [TODO.md](TODO.md) for
@@ -67,11 +67,6 @@ to overwrite local template customizations with the latest embedded
 versions.
 
 ---
-
-## TUI
-
-`rupu workflow run` opens a live terminal canvas of the in-flight run.
-See `docs/tui.md` for full key bindings and surfaces.
 
 `rupu watch <run_id>` re-attaches to any historic run. Add `--replay
 --pace=20` to replay a finished run for review.
@@ -268,7 +263,7 @@ rupu workflow {list, show, edit}      Manage workflows
 rupu workflow run <name> [target]     Run a workflow (target: repo, PR, or issue ref)
 rupu workflow runs                    List recent persisted runs
 rupu workflow {approve, reject} <id>  Resume / cancel a paused-for-approval run
-rupu watch <run_id> [--replay]        Re-attach the TUI to any past or in-flight run
+rupu watch <run_id> [--replay]        Re-attach to any past or in-flight run
 rupu transcript {list, show}          Browse JSONL transcripts
 rupu issues {list, show, run}         Issue-tracker surface (auto-detects from cwd)
 rupu repos list                       List configured-platform repositories

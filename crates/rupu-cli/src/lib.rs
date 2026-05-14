@@ -115,7 +115,7 @@ pub enum Cmd {
     },
     /// Aggregate token spend across persisted transcripts.
     Usage(Box<cmd::usage::UsageArgs>),
-    /// Re-attach TUI to an existing run.
+    /// Re-attach to an existing run.
     Watch(cmd::watch::WatchArgs),
     /// Generate or install shell-completion scripts.
     Completions {
@@ -155,10 +155,10 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         }
     }
 
-    // Run / Workflow Run / Watch write to stdout (either line-stream or
-    // alt-screen TUI canvas). Either way, tracing on stderr would bleed
-    // through and corrupt the output. Route logs to the rupu log file
-    // for all three commands; everything else keeps stderr.
+    // Run / Workflow Run / Watch / Session Attach own a live stdout view.
+    // Tracing on stderr would bleed through and corrupt that output.
+    // Route logs to the rupu log file for those commands; everything
+    // else keeps stderr.
     let is_output_cmd = matches!(
         cli.command,
         Cmd::Run(_)

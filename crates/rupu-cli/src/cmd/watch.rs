@@ -22,11 +22,6 @@ pub struct WatchArgs {
     /// every 250ms until the run reaches a terminal state.
     #[arg(long)]
     pub follow: bool,
-
-    /// Use the alt-screen TUI canvas instead of the default line-stream
-    /// output. Requires an interactive terminal.
-    #[arg(long)]
-    pub canvas: bool,
 }
 
 pub async fn handle(args: WatchArgs) -> ExitCode {
@@ -41,27 +36,6 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
-    // Route: --canvas always uses the TUI.
-    if args.canvas {
-        let result = if args.replay {
-            let pace_us = (1_000_000.0 / args.pace.max(0.1)) as u64;
-            rupu_tui::run_replay(args.run_id, runs_dir, pace_us)
-        } else {
-            rupu_tui::run_watch(args.run_id, runs_dir)
-        };
-        return match result {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(rupu_tui::TuiError::RunNotFound(id, dir)) => {
-                eprintln!(
-                    "error: run \"{id}\" not found in {}/. Suggest `rupu workflow runs`",
-                    dir.display()
-                );
-                ExitCode::from(2)
-            }
-            Err(e) => crate::output::diag::fail(e),
-        };
-    }
 
     // Default: line-stream output.
     // Load the run record to get the transcript_dir and workflow_name.
