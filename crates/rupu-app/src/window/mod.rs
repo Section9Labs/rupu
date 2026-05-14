@@ -640,7 +640,10 @@ impl Render for WorkspaceWindow {
             .text_color(palette::TEXT_PRIMARY)
             .flex()
             .flex_col()
-            .child(titlebar::render(&self.workspace))
+            .child(titlebar::render(
+                &self.workspace,
+                titlebar::in_flight_count(&active_run_map),
+            ))
             .child(
                 div()
                     .flex()
