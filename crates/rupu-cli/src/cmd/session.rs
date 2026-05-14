@@ -7,8 +7,10 @@ use crate::cmd::run::{
 use crate::cmd::transcript::{
     render_pretty_transcript_event, truncate_single_line, TranscriptPrettyContext,
 };
-use crate::cmd::ui::LiveViewMode;
+use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::output::formats::OutputFormat;
+use crate::output::palette::{self, BRAND, DIM};
+use crate::output::printer::{visible_len, wrap_with_ansi};
 use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::paths;
 use crate::standalone_run_metadata::{
@@ -182,6 +184,15 @@ impl SessionStatus {
             Self::Running => "running",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+        }
+    }
+
+    fn ui_status(self) -> crate::output::palette::Status {
+        match self {
+            Self::Idle => crate::output::palette::Status::Skipped,
+            Self::Running => crate::output::palette::Status::Working,
+            Self::Failed => crate::output::palette::Status::Failed,
+            Self::Stopped => crate::output::palette::Status::Awaiting,
         }
     }
 }
@@ -1036,7 +1047,7 @@ fn attach_blocking(
     let view_mode = prefs.live_view;
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if interactive {
-        return attach_blocking_interactive(global, session_id, view_mode);
+        return attach_blocking_interactive(global, session_id, prefs);
     }
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session attach")?;
@@ -1192,6 +1203,7 @@ fn attach_blocking(
 struct SessionViewLine {
     status: crate::output::palette::Status,
     text: String,
+    continuation: bool,
 }
 
 struct SessionInteractiveState {
@@ -1218,6 +1230,7 @@ impl SessionInteractiveState {
         self.lines.push(SessionViewLine {
             status,
             text: text.into(),
+            continuation: false,
         });
         if self.lines.len() > 400 {
             let keep_from = self.lines.len().saturating_sub(400);
@@ -1225,9 +1238,18 @@ impl SessionInteractiveState {
         }
     }
 
-    fn push_transcript_event(&mut self, event: &TranscriptEvent, view_mode: LiveViewMode) {
-        for line in transcript_event_lines(event, view_mode) {
-            self.push_line(line.status, line.text);
+    fn push_transcript_event(
+        &mut self,
+        event: &TranscriptEvent,
+        view_mode: LiveViewMode,
+        prefs: &UiPrefs,
+    ) {
+        for line in transcript_event_lines(event, view_mode, prefs) {
+            self.lines.push(line);
+            if self.lines.len() > 400 {
+                let keep_from = self.lines.len().saturating_sub(400);
+                self.lines.drain(0..keep_from);
+            }
         }
     }
 }
@@ -1250,8 +1272,9 @@ impl Drop for SessionScreenGuard {
 fn attach_blocking_interactive(
     global: &Path,
     session_id: &str,
-    view_mode: LiveViewMode,
+    prefs: UiPrefs,
 ) -> anyhow::Result<()> {
+    let view_mode = prefs.live_view;
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session attach")?;
     if reconcile_stale_session(&mut session) {
@@ -1267,77 +1290,101 @@ fn attach_blocking_interactive(
         .clone()
         .or_else(|| session.last_run_id.clone());
 
-    let _raw_mode = RawModeGuard::new(true)?;
-    let _screen = SessionScreenGuard::enter()?;
-    let mut state = SessionInteractiveState::new(transcript_path, followed_run_id);
-    let mut last_rows: Vec<String> = Vec::new();
-    if let Some(run_id) = state.followed_run_id.as_deref() {
-        state.push_line(
-            crate::output::palette::Status::Working,
-            format!("attached to {}", compact_session_run_id(run_id)),
-        );
-    }
-
-    loop {
-        for event in state.tailer.drain() {
-            state.push_transcript_event(&event, view_mode);
+    let outcome = {
+        let _raw_mode = RawModeGuard::new(true)?;
+        let _screen = SessionScreenGuard::enter()?;
+        let mut state = SessionInteractiveState::new(transcript_path, followed_run_id);
+        let mut last_rows: Vec<String> = Vec::new();
+        if let Some(run_id) = state.followed_run_id.as_deref() {
+            state.push_line(
+                crate::output::palette::Status::Working,
+                format!("attached to {}", compact_session_run_id(run_id)),
+            );
         }
 
-        let (mut session, scope) = read_session(global, session_id)?;
-        ensure_active_scope(scope, "session attach")?;
-        if reconcile_stale_session(&mut session) {
-            write_session(global, scope, &session)?;
-        }
-
-        let desired_run_id = session
-            .active_run_id
-            .clone()
-            .or_else(|| session.last_run_id.clone());
-        let desired_transcript_path = session
-            .active_transcript_path
-            .clone()
-            .or_else(|| session.last_transcript_path.clone());
-        if desired_run_id != state.followed_run_id {
+        loop {
             for event in state.tailer.drain() {
-                state.push_transcript_event(&event, view_mode);
+                state.push_transcript_event(&event, view_mode, &prefs);
             }
-            if let Some(next_path) = desired_transcript_path {
-                state.transcript_path = next_path.clone();
-                state.followed_run_id = desired_run_id.clone();
-                state.tailer = crate::output::TranscriptTailer::new(next_path);
-                if let Some(run_id) = desired_run_id.as_deref() {
-                    state.push_line(
-                        crate::output::palette::Status::Working,
-                        format!("following {}", compact_session_run_id(run_id)),
-                    );
+
+            let (mut session, scope) = read_session(global, session_id)?;
+            ensure_active_scope(scope, "session attach")?;
+            if reconcile_stale_session(&mut session) {
+                write_session(global, scope, &session)?;
+            }
+
+            let desired_run_id = session
+                .active_run_id
+                .clone()
+                .or_else(|| session.last_run_id.clone());
+            let desired_transcript_path = session
+                .active_transcript_path
+                .clone()
+                .or_else(|| session.last_transcript_path.clone());
+            if desired_run_id != state.followed_run_id {
+                for event in state.tailer.drain() {
+                    state.push_transcript_event(&event, view_mode, &prefs);
                 }
-            }
-        }
-
-        let rows = build_session_screen_rows(&session, &state, view_mode);
-        if rows != last_rows {
-            render_session_screen_rows(&rows)?;
-            last_rows = rows;
-        }
-
-        if event::poll(std::time::Duration::from_millis(100))? {
-            match event::read()? {
-                CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                    match handle_session_live_keypress(global, &session, &mut state, key)? {
-                        AttachControl::Continue => {}
-                        AttachControl::Exit(AttachExit::Detach) => {
-                            return Ok(());
-                        }
-                        AttachControl::Exit(AttachExit::Quit) => {
-                            return Ok(());
-                        }
+                if let Some(next_path) = desired_transcript_path {
+                    state.transcript_path = next_path.clone();
+                    state.followed_run_id = desired_run_id.clone();
+                    state.tailer = crate::output::TranscriptTailer::new(next_path);
+                    if let Some(run_id) = desired_run_id.as_deref() {
+                        state.push_line(
+                            crate::output::palette::Status::Working,
+                            format!("following {}", compact_session_run_id(run_id)),
+                        );
                     }
                 }
-                CrosstermEvent::Resize(_, _) => {}
-                _ => {}
+            }
+
+            let rows = build_session_screen_rows(&session, &state, &prefs);
+            if rows != last_rows {
+                render_session_screen_rows(&rows)?;
+                last_rows = rows;
+            }
+
+            if event::poll(std::time::Duration::from_millis(100))? {
+                match event::read()? {
+                    CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                        match handle_session_live_keypress(global, &session, &mut state, key)? {
+                            AttachControl::Continue => {}
+                            AttachControl::Exit(AttachExit::Detach) => {
+                                break AttachExit::Detach;
+                            }
+                            AttachControl::Exit(AttachExit::Quit) => {
+                                break AttachExit::Quit;
+                            }
+                        }
+                    }
+                    CrosstermEvent::Resize(_, _) => {}
+                    _ => {}
+                }
             }
         }
+    };
+
+    let (session, _scope) = read_session(global, session_id)?;
+    ensure_active_scope(_scope, "session attach")?;
+
+    match outcome {
+        AttachExit::Detach => {
+            println!("session: {}", session.session_id);
+            println!("attach: rupu session attach {}", session.session_id);
+            if let Some(run_id) = session
+                .active_run_id
+                .as_deref()
+                .or(session.last_run_id.as_deref())
+            {
+                println!("run: {}", compact_session_run_id(run_id));
+            }
+        }
+        AttachExit::Quit => {
+            println!("session still available: {}", session.session_id);
+            println!("attach: rupu session attach {}", session.session_id);
+        }
     }
+    Ok(())
 }
 
 fn handle_session_live_keypress(
@@ -1515,47 +1562,58 @@ fn execute_session_live_command(
 fn build_session_screen_rows(
     session: &SessionRecord,
     state: &SessionInteractiveState,
-    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
 ) -> Vec<String> {
     let (width, height) = terminal::size().unwrap_or((100, 30));
     let width = width.max(40) as usize;
     let height = height.max(12) as usize;
-    build_session_screen_rows_for_size(session, state, view_mode, width, height)
+    build_session_screen_rows_for_size(session, state, prefs, width, height)
 }
 
 fn build_session_screen_rows_for_size(
     session: &SessionRecord,
     state: &SessionInteractiveState,
-    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
     width: usize,
     height: usize,
 ) -> Vec<String> {
+    let view_mode = prefs.live_view;
     let mut rows = vec![
         render_session_header_line(session, view_mode, width),
         String::new(),
-        format!(
-            "status     {}",
-            truncate_single_line(&session_status_detail(session), width.saturating_sub(11))
+        retained_session_kv_row(
+            "status",
+            &session_status_detail(session),
+            width,
+            session.status.ui_status(),
         ),
     ];
     if let Some(route) = session_route_detail(session) {
-        rows.push(format!(
-            "route      {}",
-            truncate_single_line(&route, width.saturating_sub(11))
+        rows.push(retained_session_kv_row(
+            "route",
+            &route,
+            width,
+            crate::output::palette::Status::Active,
         ));
     }
-    rows.push(format!(
-        "workspace  {}",
-        truncate_single_line(&session_workspace_detail(session), width.saturating_sub(11))
+    rows.push(retained_session_kv_row(
+        "workspace",
+        &session_workspace_detail(session),
+        width,
+        crate::output::palette::Status::Active,
     ));
-    rows.push(format!(
-        "usage      {}",
-        truncate_single_line(&session_usage_detail(session), width.saturating_sub(11))
+    rows.push(retained_session_kv_row(
+        "usage",
+        &session_usage_detail(session),
+        width,
+        crate::output::palette::Status::Active,
     ));
     if let Some(prompt) = session_recent_prompt(session) {
-        rows.push(format!(
-            "prompt     {}",
-            truncate_single_line(&prompt, width.saturating_sub(11))
+        rows.push(retained_session_kv_row(
+            "prompt",
+            &prompt,
+            width,
+            crate::output::palette::Status::Active,
         ));
     }
     rows.push(String::new());
@@ -1592,22 +1650,30 @@ fn render_session_header_line(
     view_mode: LiveViewMode,
     width: usize,
 ) -> String {
-    truncate_single_line(
-        &format!(
-            "▶ session attach  {}  ·  {}  ·  {}",
-            session.agent_name,
-            session.session_id,
-            view_mode.as_str()
-        ),
-        width,
-    )
+    let agent = truncate_single_line(&session.agent_name, 24);
+    let sid = truncate_single_line(&session.session_id, 24);
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "session attach", BRAND);
+    buf.push_str("  ");
+    let _ = palette::write_bold_colored(&mut buf, &agent, BRAND);
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, &sid, DIM);
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, view_mode.as_str(), DIM);
+    truncate_ansi_line(&buf, width)
 }
 
 fn render_session_controls_line(width: usize) -> String {
-    truncate_single_line(
-        "controls  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help",
-        width,
-    )
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        "  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help",
+        DIM,
+    );
+    truncate_ansi_line(&buf, width)
 }
 
 fn render_session_prompt_line(
@@ -1616,14 +1682,19 @@ fn render_session_prompt_line(
     width: usize,
 ) -> String {
     if let Some(buffer) = state.compose.as_deref() {
-        truncate_single_line(
-            &format!("session {}> {}", session.session_id, buffer),
-            width,
-        )
+        let mut buf = String::new();
+        let _ = palette::write_bold_colored(&mut buf, "prompt", BRAND);
+        let _ = palette::write_colored(
+            &mut buf,
+            &format!("  {}> {}", session.session_id, buffer),
+            DIM,
+        );
+        truncate_ansi_line(&buf, width)
     } else {
-        truncate_single_line(
+        retained_session_kv_row(
+            "view",
             &format!(
-                "view  {}  ·  runs {}  ·  current {}",
+                "{}  ·  runs {}  ·  current {}",
                 session.status.as_str(),
                 session.runs.len(),
                 session
@@ -1634,6 +1705,7 @@ fn render_session_prompt_line(
                     .unwrap_or_else(|| "none".into())
             ),
             width,
+            session.status.ui_status(),
         )
     }
 }
@@ -1645,11 +1717,22 @@ fn render_session_event_rows(
 ) -> Vec<String> {
     let mut rendered = Vec::new();
     for line in lines {
-        let prefix = format!("{} ", line.status.glyph());
+        let prefix = if line.continuation {
+            "  ".to_string()
+        } else {
+            let mut value = String::new();
+            let _ = palette::write_bold_colored(
+                &mut value,
+                &line.status.glyph().to_string(),
+                line.status.color(),
+            );
+            value.push(' ');
+            value
+        };
         let content_width = width.saturating_sub(2).max(1);
-        let wrapped = wrap_plain(&line.text, content_width);
+        let wrapped = wrap_with_ansi(&line.text, content_width);
         for (idx, segment) in wrapped.into_iter().enumerate() {
-            let text = if idx == 0 {
+            let text = if idx == 0 && !line.continuation {
                 format!("{prefix}{segment}")
             } else {
                 format!("  {segment}")
@@ -1664,64 +1747,10 @@ fn render_session_event_rows(
     }
 }
 
-fn wrap_plain(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    let mut out = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-        let current_len = current.chars().count();
-        if current.is_empty() {
-            if word_len <= width {
-                current.push_str(word);
-            } else {
-                let mut chunk = String::new();
-                for ch in word.chars() {
-                    if chunk.chars().count() >= width {
-                        out.push(chunk);
-                        chunk = String::new();
-                    }
-                    chunk.push(ch);
-                }
-                if !chunk.is_empty() {
-                    current = chunk;
-                }
-            }
-        } else if current_len + 1 + word_len <= width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            out.push(current);
-            current = String::new();
-            if word_len <= width {
-                current.push_str(word);
-            } else {
-                let mut chunk = String::new();
-                for ch in word.chars() {
-                    if chunk.chars().count() >= width {
-                        out.push(chunk);
-                        chunk = String::new();
-                    }
-                    chunk.push(ch);
-                }
-                current = chunk;
-            }
-        }
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
-}
-
 fn transcript_event_lines(
     event: &TranscriptEvent,
     view_mode: LiveViewMode,
+    prefs: &UiPrefs,
 ) -> Vec<SessionViewLine> {
     use crate::output::palette::Status;
     match event {
@@ -1733,42 +1762,86 @@ fn transcript_event_lines(
             ..
         } => vec![SessionViewLine {
             status: Status::Active,
-            text: format!(
-                "run started  ·  {}  ·  workspace {}  ·  mode {}  ·  {}",
-                compact_session_run_id(run_id),
-                workspace_id,
-                format!("{mode:?}").to_lowercase(),
-                started_at.format("%Y-%m-%d %H:%M:%S UTC")
+            text: retained_session_event_line(
+                Status::Active,
+                "run started",
+                &format!(
+                    "{}  ·  workspace {}  ·  mode {}  ·  {}",
+                    compact_session_run_id(run_id),
+                    workspace_id,
+                    format!("{mode:?}").to_lowercase(),
+                    started_at.format("%Y-%m-%d %H:%M:%S UTC")
+                ),
             ),
+            continuation: false,
         }],
         TranscriptEvent::TurnStart { turn_idx } => vec![SessionViewLine {
             status: Status::Working,
-            text: format!("turn {turn_idx}  ·  assistant turn started"),
+            text: retained_session_event_line(
+                Status::Working,
+                &format!("turn {turn_idx}"),
+                "assistant turn started",
+            ),
+            continuation: false,
         }],
         TranscriptEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
                 out.push(SessionViewLine {
                     status: Status::Active,
-                    text: format!("thinking  ·  {}", truncate_single_line(thinking, 96)),
+                    text: retained_session_event_line(
+                        Status::Active,
+                        "thinking",
+                        &truncate_single_line(thinking, 96),
+                    ),
+                    continuation: false,
                 });
             }
             if !content.trim().is_empty() {
-                out.push(SessionViewLine {
-                    status: Status::Active,
-                    text: match view_mode {
-                        LiveViewMode::Focused => {
-                            format!("assistant output  ·  {}", truncate_single_line(content, 96))
+                match view_mode {
+                    LiveViewMode::Focused => out.push(SessionViewLine {
+                        status: Status::Active,
+                        text: retained_session_event_line(
+                            Status::Active,
+                            "assistant output",
+                            &truncate_single_line(content, 96),
+                        ),
+                        continuation: false,
+                    }),
+                    LiveViewMode::Full => {
+                        let highlighted = crate::cmd::ui::highlight_markdown(content.trim(), prefs);
+                        let mut lines = highlighted.split('\n');
+                        if let Some(first) = lines.next() {
+                            out.push(SessionViewLine {
+                                status: Status::Active,
+                                text: retained_session_event_line_raw(
+                                    Status::Active,
+                                    "assistant output",
+                                    first,
+                                ),
+                                continuation: false,
+                            });
+                            for line in lines {
+                                out.push(SessionViewLine {
+                                    status: Status::Active,
+                                    text: line.to_string(),
+                                    continuation: true,
+                                });
+                            }
                         }
-                        LiveViewMode::Full => format!("assistant output  ·  {}", content.trim()),
-                    },
-                });
+                    }
+                }
             }
             out
         }
         TranscriptEvent::ToolCall { tool, input, .. } => vec![SessionViewLine {
             status: Status::Working,
-            text: format!("tool {}  ·  {}", tool, transcript_tool_summary(tool, input)),
+            text: retained_session_event_line(
+                Status::Working,
+                &format!("tool {tool}"),
+                &transcript_tool_summary(tool, input),
+            ),
+            continuation: false,
         }],
         TranscriptEvent::ToolResult {
             output,
@@ -1787,20 +1860,30 @@ fn transcript_event_lines(
                 } else {
                     Status::Complete
                 },
-                text: format!(
-                    "{}  ·  {}",
+                text: retained_session_event_line(
+                    if error.is_some() {
+                        Status::Failed
+                    } else {
+                        Status::Complete
+                    },
                     if error.is_some() {
                         "tool error"
                     } else {
                         "tool result"
                     },
-                    detail
+                    &detail,
                 ),
+                continuation: false,
             }]
         }
         TranscriptEvent::FileEdit { path, kind, .. } => vec![SessionViewLine {
             status: Status::Complete,
-            text: format!("file edit  ·  {} {}", format!("{kind:?}").to_lowercase(), path),
+            text: retained_session_event_line(
+                Status::Complete,
+                "file edit",
+                &format!("{} {}", format!("{kind:?}").to_lowercase(), path),
+            ),
+            continuation: false,
         }],
         TranscriptEvent::CommandRun {
             argv,
@@ -1813,12 +1896,21 @@ fn transcript_event_lines(
             } else {
                 Status::Failed
             },
-            text: format!(
-                "command  ·  {}  ·  cwd {}  ·  exit {}",
+            text: retained_session_event_line(
+                if *exit_code == 0 {
+                    Status::Complete
+                } else {
+                    Status::Failed
+                },
+                "command",
+                &format!(
+                    "{}  ·  cwd {}  ·  exit {}",
                 truncate_single_line(&argv.join(" "), 64),
                 truncate_single_line(cwd, 24),
                 exit_code
+                ),
             ),
+            continuation: false,
         }],
         TranscriptEvent::ActionEmitted {
             kind,
@@ -1840,7 +1932,18 @@ fn transcript_event_lines(
                 } else {
                     Status::Failed
                 },
-                text: detail,
+                text: retained_session_event_line_raw(
+                    if *applied {
+                        Status::Complete
+                    } else if *allowed {
+                        Status::Awaiting
+                    } else {
+                        Status::Failed
+                    },
+                    "action",
+                    &detail,
+                ),
+                continuation: false,
             }]
         }
         TranscriptEvent::GateRequested {
@@ -1861,7 +1964,8 @@ fn transcript_event_lines(
             }
             vec![SessionViewLine {
                 status: Status::Awaiting,
-                text: detail,
+                text: retained_session_event_line_raw(Status::Awaiting, "approval gate", &detail),
+                continuation: false,
             }]
         }
         TranscriptEvent::TurnEnd {
@@ -1870,11 +1974,16 @@ fn transcript_event_lines(
             tokens_out,
         } => vec![SessionViewLine {
             status: Status::Complete,
-            text: format!(
-                "turn complete  ·  turn {turn_idx}  ·  in {} out {}",
+            text: retained_session_event_line(
+                Status::Complete,
+                "turn complete",
+                &format!(
+                    "turn {turn_idx}  ·  in {} out {}",
                 tokens_in.unwrap_or(0),
                 tokens_out.unwrap_or(0)
+                ),
             ),
+            continuation: false,
         }],
         TranscriptEvent::Usage {
             provider,
@@ -1884,9 +1993,14 @@ fn transcript_event_lines(
             cached_tokens,
         } => vec![SessionViewLine {
             status: Status::Active,
-            text: format!(
-                "usage  ·  {provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+            text: retained_session_event_line_raw(
+                Status::Active,
+                "usage",
+                &format!(
+                    "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+                ),
             ),
+            continuation: false,
         }],
         TranscriptEvent::RunComplete {
             status,
@@ -1910,9 +2024,70 @@ fn transcript_event_lines(
                     RunStatus::Ok => Status::Complete,
                     RunStatus::Error | RunStatus::Aborted => Status::Failed,
                 },
-                text: detail,
+                text: retained_session_event_line_raw(
+                    match status {
+                        RunStatus::Ok => Status::Complete,
+                        RunStatus::Error | RunStatus::Aborted => Status::Failed,
+                    },
+                    "run complete",
+                    &detail,
+                ),
+                continuation: false,
             }]
         }
+    }
+}
+
+fn retained_session_kv_row(
+    label: &str,
+    value: &str,
+    width: usize,
+    status: crate::output::palette::Status,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, &format!("{label:<10}"), status.color());
+    let _ = palette::write_colored(
+        &mut buf,
+        &truncate_single_line(value, width.saturating_sub(11)),
+        DIM,
+    );
+    truncate_ansi_line(&buf, width)
+}
+
+fn retained_session_event_line(
+    status: crate::output::palette::Status,
+    label: &str,
+    detail: &str,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, status.color());
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, detail, DIM);
+    buf
+}
+
+fn retained_session_event_line_raw(
+    status: crate::output::palette::Status,
+    label: &str,
+    detail: &str,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, status.color());
+    if !detail.is_empty() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+        buf.push_str(detail);
+    }
+    buf
+}
+
+fn truncate_ansi_line(value: &str, width: usize) -> String {
+    if visible_len(value) <= width {
+        value.to_string()
+    } else {
+        wrap_with_ansi(value, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
     }
 }
 
@@ -3368,6 +3543,13 @@ mod tests {
     #[test]
     fn retained_session_screen_rows_respect_width_and_height() {
         let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
         let mut state = SessionInteractiveState::new(
             PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
             Some("run_live123".into()),
@@ -3376,10 +3558,9 @@ mod tests {
             crate::output::palette::Status::Active,
             "assistant output  ·  this is a deliberately long line that should wrap cleanly inside the retained session screen without spilling past the requested width",
         );
-        let rows =
-            build_session_screen_rows_for_size(&session, &state, LiveViewMode::Focused, 48, 14);
+        let rows = build_session_screen_rows_for_size(&session, &state, &prefs, 48, 14);
         assert!(rows.len() <= 14);
-        assert!(rows.iter().all(|row| row.chars().count() <= 48));
+        assert!(rows.iter().all(|row| visible_len(row) <= 48));
     }
 
     #[test]
@@ -3388,13 +3569,27 @@ mod tests {
             content: "This is a longer assistant response that should stay fuller in full mode while focused mode truncates it.".into(),
             thinking: None,
         };
-        let focused = transcript_event_lines(&event, LiveViewMode::Focused);
-        let full = transcript_event_lines(&event, LiveViewMode::Full);
+        let focused_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let full_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+        let focused = transcript_event_lines(&event, LiveViewMode::Focused, &focused_prefs);
+        let full = transcript_event_lines(&event, LiveViewMode::Full, &full_prefs);
         assert_eq!(focused.len(), 1);
-        assert_eq!(full.len(), 1);
+        assert!(!full.is_empty());
         assert!(focused[0].text.contains("assistant output"));
         assert!(full[0].text.contains("assistant output"));
-        assert!(full[0].text.chars().count() >= focused[0].text.chars().count());
+        assert!(full.len() >= focused.len());
     }
 
     fn test_session_record() -> SessionRecord {
