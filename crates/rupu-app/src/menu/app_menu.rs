@@ -1,5 +1,8 @@
-//! macOS app menu — at the moment, just `File > New / Open`.
-//! `Open Recent` lands in D-2 alongside the tab system.
+//! macOS app menu. `rupu / File / View / Window / Help`. Edit menu
+//! intentionally skipped at this rev — Zed wires Cut/Copy/Paste via its
+//! own `editor::actions` crate we don't depend on; macOS default routing
+//! handles clipboard ops for focused text fields anyway.
+//! `Open Recent` is a TODO for when the tab system lands.
 
 use crate::window::WorkspaceWindow;
 use crate::workspace::Workspace;
@@ -13,28 +16,43 @@ actions!(
         Quit,
         ApproveFocused,
         RejectFocused,
-        LaunchSelected
+        LaunchSelected,
+        ToggleSidebar,
+        AboutRupu,
     ]
 );
 
 /// Register the menu and wire its action handlers. Call once on app boot.
 pub fn install(cx: &mut App) {
-    cx.set_menus(vec![Menu::new("rupu").items(vec![MenuItem::submenu(
-        Menu::new("File").items(vec![
-            MenuItem::action("New Workspace\u{2026}", NewWorkspace),
-            MenuItem::action("Open Workspace\u{2026}", OpenWorkspace),
+    cx.set_menus(vec![
+        Menu::new("rupu").items(vec![
+            MenuItem::action("About rupu", AboutRupu),
             MenuItem::separator(),
             MenuItem::action("Quit rupu", Quit),
         ]),
-    )])]);
+        Menu::new("File").items(vec![
+            MenuItem::action("New Workspace\u{2026}", NewWorkspace),
+            MenuItem::action("Open Workspace\u{2026}", OpenWorkspace),
+        ]),
+        Menu::new("View").items(vec![MenuItem::action("Toggle Sidebar", ToggleSidebar)]),
+        // AppKit auto-populates the Window menu with Minimize / Zoom /
+        // Bring All to Front when the bundle has a standard titlebar
+        // (restored in the traffic-light task). Leaving items empty is
+        // intentional.
+        Menu::new("Window").items(vec![]),
+        Menu::new("Help").items(vec![]),
+    ]);
 
-    // Keyboard shortcuts for approval — `a` to approve, `r` to reject.
-    // These only fire when a step is focused and in the Awaiting state;
-    // the guard lives in the WorkspaceWindow render's on_action handlers.
+    // Keyboard shortcuts. `a` / `r` only fire when a step is focused and
+    // in the Awaiting state; the guard lives in WorkspaceWindow render's
+    // on_action handlers. `cmd-r` launches the focused workflow; `cmd-\`
+    // toggles every sidebar section (sidebar-hide proxy until a dedicated
+    // `sidebar_hidden` flag lands).
     cx.bind_keys(vec![
         KeyBinding::new("a", ApproveFocused, None),
         KeyBinding::new("r", RejectFocused, None),
         KeyBinding::new("cmd-r", LaunchSelected, None),
+        KeyBinding::new("cmd-\\", ToggleSidebar, None),
     ]);
 
     cx.on_action(|_: &NewWorkspace, cx| {
@@ -52,6 +70,16 @@ pub fn install(cx: &mut App) {
         }
     });
     cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &AboutRupu, _cx| {
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            "About rupu — native About panel deferred to D-10"
+        );
+    });
+    // ToggleSidebar is wired per-window in WorkspaceWindow::open so the
+    // handler can reach the focused workspace via WeakEntity. Registering
+    // it globally here would require synthesizing the active entity at
+    // dispatch time, which the GPUI API doesn't expose cleanly at this rev.
 }
 
 fn open_workspace_window(dir: &std::path::Path, cx: &mut App) {

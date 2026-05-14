@@ -4,7 +4,7 @@ pub mod sidebar;
 pub mod titlebar;
 
 use crate::executor::AppExecutor;
-use crate::menu::app_menu::{ApproveFocused, LaunchSelected, RejectFocused};
+use crate::menu::app_menu::{ApproveFocused, LaunchSelected, RejectFocused, ToggleSidebar};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
@@ -95,6 +95,16 @@ impl WorkspaceWindow {
                     if let Some(step) = this.run_model.as_ref().and_then(|m| m.focused_step.clone())
                     {
                         this.handle_reject(step, "rejected via keyboard".into(), cx);
+                    }
+                });
+            });
+            let weak_t = entity.downgrade();
+            cx.on_action(move |_: &ToggleSidebar, cx| {
+                let _ = weak_t.update(cx, |this, cx| {
+                    // Toggle every section as a proxy for sidebar hide/show.
+                    // A future task may add a dedicated `sidebar_hidden` flag.
+                    for section in ["workflows", "runs", "repos", "agents", "issues"] {
+                        this.handle_section_toggle(section, cx);
                     }
                 });
             });
