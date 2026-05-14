@@ -3380,4 +3380,62 @@ mod tests {
             .any(|line| line.text.contains("assistant output")));
         assert!(state.lines.iter().any(|line| line.indent >= 2));
     }
+
+    #[test]
+    fn retained_dispatch_child_lines_full_replay_child_transcript() {
+        let dir = tempdir().unwrap();
+        let transcript_path = dir.path().join("dispatch-child.jsonl");
+        let events = vec![
+            TxEvent::RunStart {
+                run_id: "run_child".into(),
+                workspace_id: "ws".into(),
+                agent: "reviewer".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                started_at: Utc::now(),
+                mode: rupu_transcript::RunMode::Readonly,
+            },
+            TxEvent::AssistantMessage {
+                content: "## Reviewer output\n\n- looks good".into(),
+                thinking: None,
+            },
+            TxEvent::RunComplete {
+                run_id: "run_child".into(),
+                status: rupu_transcript::RunStatus::Ok,
+                total_tokens: 21,
+                duration_ms: 800,
+                error: None,
+            },
+        ];
+        let mut body = String::new();
+        for event in &events {
+            body.push_str(&serde_json::to_string(event).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(&transcript_path, body).unwrap();
+
+        let output = serde_json::json!({
+            "ok": true,
+            "agent": "reviewer",
+            "output": "looks good",
+            "findings": [],
+            "tokens_used": 21,
+            "duration_ms": 800,
+            "transcript_path": transcript_path.display().to_string(),
+            "sub_run_id": "sub_TEST"
+        });
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+        let lines = retained_dispatch_child_lines("reviewer", &output.to_string(), None, &prefs);
+        assert!(lines.iter().any(|line| line.text.contains("reviewer")));
+        assert!(lines
+            .iter()
+            .any(|line| line.text.contains("assistant output")));
+        assert!(lines.iter().any(|line| line.indent >= 2));
+    }
 }

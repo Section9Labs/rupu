@@ -1,5 +1,7 @@
 use crate::cmd::transcript::truncate_single_line;
-use crate::cmd::ui::{highlight_diff, highlight_json, highlight_markdown, highlight_yaml, UiPrefs};
+use crate::cmd::ui::{
+    highlight_diff, highlight_json, highlight_markdown, highlight_shell, highlight_yaml, UiPrefs,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadKind {
@@ -89,7 +91,7 @@ pub fn render_tool_input(tool: &str, input: &serde_json::Value, prefs: &UiPrefs)
         "bash" => input
             .get("command")
             .and_then(|value| value.as_str())
-            .map(|command| command.trim_end().to_string()),
+            .map(|command| highlight_shell(command.trim_end(), prefs)),
         _ => serde_json::to_string_pretty(input)
             .ok()
             .map(|pretty| highlight_json(&pretty, prefs)),

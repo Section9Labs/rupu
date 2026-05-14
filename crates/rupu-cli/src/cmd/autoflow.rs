@@ -13,6 +13,7 @@ use crate::cmd::workflow::{
 use crate::output::palette::{self, Status as UiStatus, BRAND, DIM};
 use crate::output::printer::{format_duration, visible_len, wrap_with_ansi};
 use crate::output::report::{self as output_report, CollectionOutput, DetailOutput};
+use crate::output::rich_payload::{render_payload, render_tool_input};
 use crate::output::viewport::ViewportState;
 use crate::output::workflow_printer::{
     LiveWorkflowEvent, LiveWorkflowEventHook, LiveWorkflowRender,
@@ -1027,6 +1028,7 @@ struct ServeProgressSnapshot {
 struct AutoflowServeViewLine {
     status: UiStatus,
     text: String,
+    continuation: bool,
 }
 
 struct AutoflowServeScreenGuard;
@@ -1993,7 +1995,7 @@ fn build_retained_serve_rows_for_size(
         ));
 
         if let Some((record, summary, live_lines)) =
-            resolve_live_claim_run(run_store, pricing, claim)
+            resolve_live_claim_run(run_store, pricing, claim, view_mode)
         {
             body_rows.push(retained_serve_kv_row(
                 "run",
@@ -2265,6 +2267,26 @@ fn truncate_retained_ansi_line(value: &str, width: usize) -> String {
     }
 }
 
+fn retained_serve_ui_prefs() -> UiPrefs {
+    let global = paths::global_dir().ok();
+    let pwd = std::env::current_dir().ok();
+    let project_root = pwd
+        .as_ref()
+        .and_then(|dir| paths::project_root_for(dir).ok().flatten());
+    let cfg = match global.as_ref() {
+        Some(global_dir) => rupu_config::layer_files(
+            Some(&global_dir.join("config.toml")),
+            project_root
+                .as_deref()
+                .map(|root| root.join(".rupu/config.toml"))
+                .as_deref(),
+        )
+        .unwrap_or_default(),
+        None => rupu_config::Config::default(),
+    };
+    UiPrefs::resolve(&cfg.ui, false, None, None, None)
+}
+
 fn render_retained_serve_event_rows(
     lines: &[AutoflowServeViewLine],
     width: usize,
@@ -2272,7 +2294,9 @@ fn render_retained_serve_event_rows(
 ) -> Vec<String> {
     let mut rendered = Vec::new();
     for line in lines {
-        let prefix = {
+        let prefix = if line.continuation {
+            "  ".to_string()
+        } else {
             let mut value = String::new();
             let _ = palette::write_bold_colored(
                 &mut value,
@@ -2282,12 +2306,12 @@ fn render_retained_serve_event_rows(
             value.push(' ');
             value
         };
-        let content_width = width.saturating_sub(2).max(1);
+        let content_width = width.saturating_sub(visible_len(&prefix)).max(1);
         for (idx, segment) in wrap_with_ansi(&line.text, content_width)
             .into_iter()
             .enumerate()
         {
-            if idx == 0 {
+            if idx == 0 && !line.continuation {
                 rendered.push(format!("{prefix}{segment}"));
             } else {
                 rendered.push(format!("  {segment}"));
@@ -2305,6 +2329,7 @@ fn resolve_live_claim_run(
     run_store: &RunStore,
     pricing: &rupu_config::PricingConfig,
     claim: &AutoflowClaimRow,
+    view_mode: LiveViewMode,
 ) -> Option<(
     rupu_orchestrator::RunRecord,
     AutoflowRunSummary,
@@ -2316,7 +2341,7 @@ fn resolve_live_claim_run(
             .flatten()
     })?;
     let summary = load_run_summary(run_store, &record.id, pricing)?;
-    let live_lines = load_live_run_lines(&record, 6);
+    let live_lines = load_live_run_lines(&record, view_mode);
     Some((record, summary, live_lines))
 }
 
@@ -2360,7 +2385,7 @@ fn find_live_autoflow_run(claim: &AutoflowClaimRow) -> Option<rupu_orchestrator:
 
 fn load_live_run_lines(
     record: &rupu_orchestrator::RunRecord,
-    max_rows: usize,
+    view_mode: LiveViewMode,
 ) -> Vec<AutoflowServeViewLine> {
     let Some(path) = record.active_step_transcript_path.as_ref() else {
         return Vec::new();
@@ -2370,37 +2395,78 @@ fn load_live_run_lines(
     };
     let mut lines = Vec::new();
     for event in iter.flatten() {
-        if let Some(line) = live_run_event_line(&event) {
-            lines.push(line);
-            if lines.len() > max_rows {
-                let keep_from = lines.len().saturating_sub(max_rows);
-                lines.drain(0..keep_from);
-            }
-        }
+        lines.extend(live_run_event_lines(&event, view_mode));
     }
     lines
 }
 
-fn live_run_event_line(event: &TranscriptEvent) -> Option<AutoflowServeViewLine> {
+fn live_run_event_lines(
+    event: &TranscriptEvent,
+    view_mode: LiveViewMode,
+) -> Vec<AutoflowServeViewLine> {
     match event {
-        TranscriptEvent::TurnStart { turn_idx } => Some(AutoflowServeViewLine {
+        TranscriptEvent::TurnStart { turn_idx } => vec![AutoflowServeViewLine {
             status: UiStatus::Working,
             text: format!("turn {turn_idx}  ·  assistant turn started"),
-        }),
+            continuation: false,
+        }],
         TranscriptEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-            Some(AutoflowServeViewLine {
-                status: UiStatus::Active,
-                text: format!("assistant  ·  {}", truncate_single_line(content, 96)),
-            })
+            match view_mode {
+                LiveViewMode::Focused => vec![AutoflowServeViewLine {
+                    status: UiStatus::Active,
+                    text: format!("assistant  ·  {}", truncate_single_line(content, 96)),
+                    continuation: false,
+                }],
+                LiveViewMode::Full => {
+                    let prefs = retained_serve_ui_prefs();
+                    let highlighted = crate::cmd::ui::highlight_markdown(content.trim(), &prefs);
+                    let mut out = Vec::new();
+                    for (index, line) in highlighted.lines().enumerate() {
+                        out.push(AutoflowServeViewLine {
+                            status: UiStatus::Active,
+                            text: if index == 0 {
+                                format!("assistant output  ·  {line}")
+                            } else {
+                                line.to_string()
+                            },
+                            continuation: index > 0,
+                        });
+                    }
+                    out
+                }
+            }
         }
-        TranscriptEvent::ToolCall { tool, input, .. } => Some(AutoflowServeViewLine {
-            status: UiStatus::Working,
-            text: format!(
-                "{}  ·  {}",
-                tool,
-                crate::output::workflow_printer::tool_summary(tool, input)
-            ),
-        }),
+        TranscriptEvent::ToolCall { tool, input, .. } => match view_mode {
+            LiveViewMode::Focused => vec![AutoflowServeViewLine {
+                status: UiStatus::Working,
+                text: format!(
+                    "{}  ·  {}",
+                    tool,
+                    crate::output::workflow_printer::tool_summary(tool, input)
+                ),
+                continuation: false,
+            }],
+            LiveViewMode::Full => {
+                let prefs = retained_serve_ui_prefs();
+                let mut out = vec![AutoflowServeViewLine {
+                    status: UiStatus::Working,
+                    text: format!(
+                        "{}  ·  {}",
+                        tool,
+                        crate::output::workflow_printer::tool_summary(tool, input)
+                    ),
+                    continuation: false,
+                }];
+                if let Some(rendered) = render_tool_input(tool, input, &prefs) {
+                    out.extend(rendered.lines().map(|line| AutoflowServeViewLine {
+                        status: UiStatus::Working,
+                        text: line.to_string(),
+                        continuation: true,
+                    }));
+                }
+                out
+            }
+        },
         TranscriptEvent::ToolResult {
             output,
             error,
@@ -2412,23 +2478,57 @@ fn live_run_event_line(event: &TranscriptEvent) -> Option<AutoflowServeViewLine>
             } else {
                 UiStatus::Complete
             };
-            let mut detail =
-                truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 88);
-            if *duration_ms > 0 {
-                detail.push_str(&format!("  ·  {}ms", duration_ms));
+            match view_mode {
+                LiveViewMode::Focused => {
+                    let mut detail =
+                        truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 88);
+                    if *duration_ms > 0 {
+                        detail.push_str(&format!("  ·  {}ms", duration_ms));
+                    }
+                    vec![AutoflowServeViewLine {
+                        status,
+                        text: format!(
+                            "{}  ·  {}",
+                            if error.is_some() {
+                                "tool error"
+                            } else {
+                                "tool result"
+                            },
+                            detail
+                        ),
+                        continuation: false,
+                    }]
+                }
+                LiveViewMode::Full => {
+                    let prefs = retained_serve_ui_prefs();
+                    let raw = error.as_deref().unwrap_or(output.as_str());
+                    let payload = render_payload(raw, &prefs);
+                    let mut out = vec![AutoflowServeViewLine {
+                        status,
+                        text: format!(
+                            "{}  ·  {}{}",
+                            if error.is_some() {
+                                "tool error"
+                            } else {
+                                "tool result"
+                            },
+                            payload.headline,
+                            if *duration_ms > 0 {
+                                format!("  ·  {}ms", duration_ms)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        continuation: false,
+                    }];
+                    out.extend(payload.rendered.lines().map(|line| AutoflowServeViewLine {
+                        status,
+                        text: line.to_string(),
+                        continuation: true,
+                    }));
+                    out
+                }
             }
-            Some(AutoflowServeViewLine {
-                status,
-                text: format!(
-                    "{}  ·  {}",
-                    if error.is_some() {
-                        "tool error"
-                    } else {
-                        "tool result"
-                    },
-                    detail
-                ),
-            })
         }
         TranscriptEvent::Usage {
             provider,
@@ -2436,31 +2536,33 @@ fn live_run_event_line(event: &TranscriptEvent) -> Option<AutoflowServeViewLine>
             input_tokens,
             output_tokens,
             cached_tokens,
-        } => Some(AutoflowServeViewLine {
+        } => vec![AutoflowServeViewLine {
             status: UiStatus::Active,
             text: format!(
                 "usage  ·  {provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
             ),
-        }),
+            continuation: false,
+        }],
         TranscriptEvent::TurnEnd {
             turn_idx,
             tokens_in,
             tokens_out,
-        } => Some(AutoflowServeViewLine {
+        } => vec![AutoflowServeViewLine {
             status: UiStatus::Complete,
             text: format!(
                 "turn complete  ·  turn {turn_idx}  ·  in {} out {}",
                 tokens_in.unwrap_or(0),
                 tokens_out.unwrap_or(0)
             ),
-        }),
+            continuation: false,
+        }],
         TranscriptEvent::RunComplete {
             status,
             total_tokens,
             duration_ms,
             error,
             ..
-        } => Some(AutoflowServeViewLine {
+        } => vec![AutoflowServeViewLine {
             status: match status {
                 rupu_transcript::RunStatus::Ok => UiStatus::Complete,
                 rupu_transcript::RunStatus::Error | rupu_transcript::RunStatus::Aborted => {
@@ -2480,8 +2582,9 @@ fn live_run_event_line(event: &TranscriptEvent) -> Option<AutoflowServeViewLine>
                 }
                 text
             },
-        }),
-        _ => None,
+            continuation: false,
+        }],
+        _ => Vec::new(),
     }
 }
 
@@ -3271,6 +3374,38 @@ mod serve_heartbeat_tests {
         assert!(rows
             .iter()
             .any(|row| row.contains("storefront-feature-delivery")));
+    }
+
+    #[test]
+    fn live_run_event_lines_focused_summarize_read_file_tool_call() {
+        let lines = live_run_event_lines(
+            &TranscriptEvent::ToolCall {
+                call_id: "call_123".into(),
+                tool: "read_file".into(),
+                input: serde_json::json!({"path": ".git/logs/refs/heads/storefront/issue-19"}),
+            },
+            LiveViewMode::Focused,
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0]
+            .text
+            .contains(".git/logs/refs/heads/storefront/issue-19"));
+        assert!(!lines[0].text.contains("{\"path\""));
+    }
+
+    #[test]
+    fn live_run_event_lines_full_expand_json_tool_result() {
+        let lines = live_run_event_lines(
+            &TranscriptEvent::ToolResult {
+                call_id: "call_123".into(),
+                output: "{\"status\":\"ok\",\"items\":[1,2]}".into(),
+                error: None,
+                duration_ms: 7,
+            },
+            LiveViewMode::Full,
+        );
+        assert!(lines.len() > 1);
+        assert!(lines[0].text.contains("json payload"));
     }
 }
 

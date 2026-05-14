@@ -2204,7 +2204,7 @@ fn transcript_tool_summary(tool: &str, input: &serde_json::Value) -> String {
 fn append_session_help_lines(state: &mut SessionInteractiveState) {
     state.push_line(
         crate::output::palette::Status::Active,
-        "help  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit",
+        "help  ·  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit",
     );
     state.push_line(
         crate::output::palette::Status::Active,
