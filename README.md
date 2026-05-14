@@ -374,8 +374,14 @@ to install a local or remote Base16/native theme file into `~/.rupu/themes/` or
 
 Interactive/event-driven surfaces also support a shared live view mode:
 
-- `[ui].live_view = "focused" | "full"`
-- per-command override: `--view focused|full`
+- `[ui].live_view = "focused" | "compact" | "full"`
+- per-command override: `--view focused|compact|full`
+
+Mode semantics:
+
+- `focused` — graph/timeline first, semantic summaries only
+- `compact` — same timeline structure, full assistant messages, trimmed tool payload previews
+- `full` — same timeline structure, full assistant/tool payload bodies with highlighting
 
 The first commands wired to this are:
 

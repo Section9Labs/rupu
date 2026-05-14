@@ -497,7 +497,10 @@ Notes:
   - `rupu session attach`
   - `rupu workflow run`
   - `rupu autoflow serve`
-- `--view focused|full` overrides the config per command.
+- `focused` keeps the graph/timeline and semantic summaries only.
+- `compact` keeps the same timeline, shows assistant bodies, and trims tool payloads to previews.
+- `full` keeps the same timeline and expands assistant/tool payloads fully with syntax highlighting.
+- `--view focused|compact|full` overrides the config per command.
 - Global custom themes live in `~/.rupu/themes/`.
 - Project-local themes live in `<repo>/.rupu/themes/`.
 - Phase 1 import supports native rupu theme files and Base16 themes.
