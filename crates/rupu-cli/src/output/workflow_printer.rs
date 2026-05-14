@@ -628,6 +628,12 @@ fn render_child_item(
         StepKind::Linear => unreachable!(),
     };
 
+    if view_mode == LiveViewMode::Focused {
+        let summary = summarize_compact_child_events(&events);
+        render_focused_child_item(parent, item, &headline, &summary, printer);
+        return;
+    }
+
     // The headline replaces the agent slot in step_start so it shows
     // as the bold opener line. Provider + model still show in the
     // dim meta tail when present.
@@ -940,6 +946,21 @@ fn render_one_child(
         })
         .unwrap_or((String::new(), String::new()));
 
+    if view_mode == LiveViewMode::Focused {
+        let mut summary = summarize_compact_child_events(&events);
+        if summary.provider.is_empty() {
+            summary.provider = provider.clone();
+        }
+        if summary.model.is_empty() {
+            summary.model = model.clone();
+        }
+        if !success && summary.error.is_none() {
+            summary.error = dispatch_error.map(ToOwned::to_owned);
+        }
+        render_focused_dispatch_child(headline, success, &summary, printer);
+        return;
+    }
+
     let spinner = printer.step_start(
         headline,
         Some(headline),
@@ -996,6 +1017,188 @@ fn render_assistant_output(
             "assistant output",
             Some(&truncate_single_line(content, 96)),
         ),
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct CompactChildSummary {
+    provider: String,
+    model: String,
+    assistant_summary: Option<String>,
+    tool_calls: usize,
+    total_tokens: u64,
+    duration_ms: u64,
+    error: Option<String>,
+}
+
+fn summarize_compact_child_events(events: &[TxEvent]) -> CompactChildSummary {
+    let mut out = CompactChildSummary::default();
+    for ev in events {
+        match ev {
+            TxEvent::RunStart {
+                provider, model, ..
+            } => {
+                if out.provider.is_empty() {
+                    out.provider = provider.clone();
+                }
+                if out.model.is_empty() {
+                    out.model = model.clone();
+                }
+            }
+            TxEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
+                if out.assistant_summary.is_none() {
+                    out.assistant_summary = Some(truncate_single_line(content, 84));
+                }
+            }
+            TxEvent::ToolCall { .. } => {
+                out.tool_calls += 1;
+            }
+            TxEvent::RunComplete {
+                total_tokens,
+                duration_ms,
+                status,
+                error,
+                ..
+            } => {
+                out.total_tokens += total_tokens;
+                out.duration_ms = *duration_ms;
+                if matches!(
+                    status,
+                    rupu_transcript::RunStatus::Error | rupu_transcript::RunStatus::Aborted
+                ) {
+                    out.error = error.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn render_focused_child_item(
+    parent: &StepResultRecord,
+    item: &ItemResultRecord,
+    headline: &str,
+    summary: &CompactChildSummary,
+    printer: &mut LineStreamPrinter,
+) {
+    let status = if item.success {
+        UiStatus::Complete
+    } else {
+        UiStatus::Failed
+    };
+    let detail = compact_child_detail(
+        status,
+        &summary.provider,
+        &summary.model,
+        summary.duration_ms,
+        summary.total_tokens,
+        match parent.kind {
+            StepKind::Panel => Some(
+                parent
+                    .findings
+                    .iter()
+                    .filter(|finding| finding.source == item.sub_id)
+                    .count(),
+            ),
+            _ => None,
+        },
+    );
+    printer.tree_item(headline, status, Some(&detail));
+    if !item.success {
+        let reason = summary.error.as_deref().unwrap_or("item failed");
+        printer.tree_note(&format!("error  {}", truncate_single_line(reason, 88)));
+    } else if let Some(note) = compact_child_note(summary) {
+        printer.tree_note(&note);
+    }
+}
+
+fn render_focused_dispatch_child(
+    headline: &str,
+    success: bool,
+    summary: &CompactChildSummary,
+    printer: &mut LineStreamPrinter,
+) {
+    let status = if success {
+        UiStatus::Complete
+    } else {
+        UiStatus::Failed
+    };
+    let detail = compact_child_detail(
+        status,
+        &summary.provider,
+        &summary.model,
+        summary.duration_ms,
+        summary.total_tokens,
+        None,
+    );
+    printer.tree_item(headline, status, Some(&detail));
+    if !success {
+        let reason = summary.error.as_deref().unwrap_or("dispatch failed");
+        printer.tree_note(&format!("error  {}", truncate_single_line(reason, 88)));
+    } else if let Some(note) = compact_child_note(summary) {
+        printer.tree_note(&note);
+    }
+}
+
+fn compact_child_detail(
+    status: UiStatus,
+    provider: &str,
+    model: &str,
+    duration_ms: u64,
+    total_tokens: u64,
+    findings_count: Option<usize>,
+) -> String {
+    let mut parts = Vec::new();
+    if !model.is_empty() {
+        parts.push(truncate_single_line(model, 24));
+    } else if !provider.is_empty() {
+        parts.push(truncate_single_line(provider, 18));
+    }
+    if let Some(findings_count) = findings_count {
+        parts.push(if findings_count == 1 {
+            "1 finding".to_string()
+        } else {
+            format!("{findings_count} findings")
+        });
+    } else {
+        parts.push(match status {
+            UiStatus::Failed => "failed".to_string(),
+            _ => "done".to_string(),
+        });
+    }
+    if duration_ms > 0 {
+        parts.push(compact_duration(duration_ms));
+    }
+    if total_tokens > 0 {
+        parts.push(format!("{total_tokens} tokens"));
+    }
+    parts.join("  ·  ")
+}
+
+fn compact_child_note(summary: &CompactChildSummary) -> Option<String> {
+    if let Some(text) = summary.assistant_summary.as_deref() {
+        return Some(format!(
+            "assistant output  {}",
+            truncate_single_line(text, 88)
+        ));
+    }
+    if summary.tool_calls > 0 {
+        let noun = if summary.tool_calls == 1 {
+            "tool call"
+        } else {
+            "tool calls"
+        };
+        return Some(format!("{} {}", summary.tool_calls, noun));
+    }
+    None
+}
+
+fn compact_duration(duration_ms: u64) -> String {
+    if duration_ms >= 1_000 {
+        format!("{:.1}s", duration_ms as f64 / 1_000.0)
+    } else {
+        format!("{duration_ms}ms")
     }
 }
 

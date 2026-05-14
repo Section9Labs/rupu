@@ -523,6 +523,38 @@ impl LineStreamPrinter {
         self.out(&buf);
     }
 
+    /// Compact tree row for focused fan-out / dispatch rendering.
+    /// Uses the current indent level and a simple branch glyph rather
+    /// than opening a full nested frame.
+    pub fn tree_item(&mut self, label: &str, status: Status, detail: Option<&str>) {
+        let mut buf = String::new();
+        self.push_indent_pipes(&mut buf);
+        let _ = palette::write_colored(&mut buf, PIPE, BRAND_300);
+        buf.push_str("  ");
+        let _ = palette::write_colored(&mut buf, BRANCH, BRAND_300);
+        buf.push(' ');
+        let _ = palette::write_bold_colored(&mut buf, &status.glyph().to_string(), status.color());
+        buf.push(' ');
+        let _ = palette::write_bold_colored(&mut buf, label, status.color());
+        if let Some(detail) = detail.filter(|detail| !detail.trim().is_empty()) {
+            buf.push_str("  ");
+            let _ = palette::write_colored(&mut buf, detail, DIM);
+        }
+        self.out(&buf);
+    }
+
+    /// Continuation detail for [`Self::tree_item`].
+    pub fn tree_note(&mut self, message: &str) {
+        let mut buf = String::new();
+        self.push_indent_pipes(&mut buf);
+        let _ = palette::write_colored(&mut buf, PIPE, BRAND_300);
+        buf.push_str("  ");
+        let _ = palette::write_colored(&mut buf, PIPE, BRAND_300);
+        buf.push_str("   ");
+        let _ = palette::write_colored(&mut buf, message, DIM);
+        self.out(&buf);
+    }
+
     /// Footer for a panelist child frame (replaces the legacy
     /// one-line `panelist_line` summary when the panelist has its own
     /// child frame open). Same shape as `step_done` but the meta
