@@ -19,10 +19,14 @@ use chrono::{DateTime, Utc};
 use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
+use crossterm::style::Print;
 use crossterm::terminal;
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, queue};
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_agent::{load_agent, parse_mode, resolve_mode};
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
@@ -1030,6 +1034,10 @@ fn attach_blocking(
     )?;
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, view);
     let view_mode = prefs.live_view;
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if interactive {
+        return attach_blocking_interactive(global, session_id, view_mode);
+    }
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session attach")?;
     if reconcile_stale_session(&mut session) {
@@ -1048,7 +1056,6 @@ fn attach_blocking(
     let mut printer = crate::output::LineStreamPrinter::new();
     let mut saw_header = false;
     let mut saw_any = false;
-    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let _raw_mode = RawModeGuard::new(interactive)?;
     if view_mode == LiveViewMode::Focused {
         render_session_attach_intro(&mut printer, &session);
@@ -1178,6 +1185,854 @@ fn attach_blocking(
         }
 
         std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[derive(Clone)]
+struct SessionViewLine {
+    status: crate::output::palette::Status,
+    text: String,
+}
+
+struct SessionInteractiveState {
+    followed_run_id: Option<String>,
+    transcript_path: PathBuf,
+    tailer: crate::output::TranscriptTailer,
+    lines: Vec<SessionViewLine>,
+    compose: Option<String>,
+}
+
+impl SessionInteractiveState {
+    fn new(transcript_path: PathBuf, followed_run_id: Option<String>) -> Self {
+        let tailer = crate::output::TranscriptTailer::new(transcript_path.clone());
+        Self {
+            followed_run_id,
+            transcript_path,
+            tailer,
+            lines: Vec::new(),
+            compose: None,
+        }
+    }
+
+    fn push_line(&mut self, status: crate::output::palette::Status, text: impl Into<String>) {
+        self.lines.push(SessionViewLine {
+            status,
+            text: text.into(),
+        });
+        if self.lines.len() > 400 {
+            let keep_from = self.lines.len().saturating_sub(400);
+            self.lines.drain(0..keep_from);
+        }
+    }
+
+    fn push_transcript_event(&mut self, event: &TranscriptEvent, view_mode: LiveViewMode) {
+        for line in transcript_event_lines(event, view_mode) {
+            self.push_line(line.status, line.text);
+        }
+    }
+}
+
+struct SessionScreenGuard;
+
+impl SessionScreenGuard {
+    fn enter() -> anyhow::Result<Self> {
+        execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for SessionScreenGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+    }
+}
+
+fn attach_blocking_interactive(
+    global: &Path,
+    session_id: &str,
+    view_mode: LiveViewMode,
+) -> anyhow::Result<()> {
+    let (mut session, scope) = read_session(global, session_id)?;
+    ensure_active_scope(scope, "session attach")?;
+    if reconcile_stale_session(&mut session) {
+        write_session(global, scope, &session)?;
+    }
+    let transcript_path = session
+        .active_transcript_path
+        .clone()
+        .or_else(|| session.last_transcript_path.clone())
+        .ok_or_else(|| anyhow::anyhow!("session {} has no runs yet", session.session_id))?;
+    let followed_run_id = session
+        .active_run_id
+        .clone()
+        .or_else(|| session.last_run_id.clone());
+
+    let _raw_mode = RawModeGuard::new(true)?;
+    let _screen = SessionScreenGuard::enter()?;
+    let mut state = SessionInteractiveState::new(transcript_path, followed_run_id);
+    let mut last_rows: Vec<String> = Vec::new();
+    if let Some(run_id) = state.followed_run_id.as_deref() {
+        state.push_line(
+            crate::output::palette::Status::Working,
+            format!("attached to {}", compact_session_run_id(run_id)),
+        );
+    }
+
+    loop {
+        for event in state.tailer.drain() {
+            state.push_transcript_event(&event, view_mode);
+        }
+
+        let (mut session, scope) = read_session(global, session_id)?;
+        ensure_active_scope(scope, "session attach")?;
+        if reconcile_stale_session(&mut session) {
+            write_session(global, scope, &session)?;
+        }
+
+        let desired_run_id = session
+            .active_run_id
+            .clone()
+            .or_else(|| session.last_run_id.clone());
+        let desired_transcript_path = session
+            .active_transcript_path
+            .clone()
+            .or_else(|| session.last_transcript_path.clone());
+        if desired_run_id != state.followed_run_id {
+            for event in state.tailer.drain() {
+                state.push_transcript_event(&event, view_mode);
+            }
+            if let Some(next_path) = desired_transcript_path {
+                state.transcript_path = next_path.clone();
+                state.followed_run_id = desired_run_id.clone();
+                state.tailer = crate::output::TranscriptTailer::new(next_path);
+                if let Some(run_id) = desired_run_id.as_deref() {
+                    state.push_line(
+                        crate::output::palette::Status::Working,
+                        format!("following {}", compact_session_run_id(run_id)),
+                    );
+                }
+            }
+        }
+
+        let rows = build_session_screen_rows(&session, &state, view_mode);
+        if rows != last_rows {
+            render_session_screen_rows(&rows)?;
+            last_rows = rows;
+        }
+
+        if event::poll(std::time::Duration::from_millis(100))? {
+            match event::read()? {
+                CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    match handle_session_live_keypress(global, &session, &mut state, key)? {
+                        AttachControl::Continue => {}
+                        AttachControl::Exit(AttachExit::Detach) => {
+                            return Ok(());
+                        }
+                        AttachControl::Exit(AttachExit::Quit) => {
+                            return Ok(());
+                        }
+                    }
+                }
+                CrosstermEvent::Resize(_, _) => {}
+                _ => {}
+            }
+        }
+    }
+}
+
+fn handle_session_live_keypress(
+    global: &Path,
+    session: &SessionRecord,
+    state: &mut SessionInteractiveState,
+    key: KeyEvent,
+) -> anyhow::Result<AttachControl> {
+    if let Some(buffer) = state.compose.as_mut() {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                state.compose = None;
+                state.push_line(crate::output::palette::Status::Skipped, "prompt cancelled");
+                return Ok(AttachControl::Continue);
+            }
+            (KeyCode::Enter, _) => {
+                let input = buffer.trim().to_string();
+                state.compose = None;
+                if input.is_empty() {
+                    return Ok(AttachControl::Continue);
+                }
+                return handle_session_live_input(global, session, state, input);
+            }
+            (KeyCode::Backspace, _) => {
+                buffer.pop();
+                return Ok(AttachControl::Continue);
+            }
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                buffer.push(ch);
+                return Ok(AttachControl::Continue);
+            }
+            _ => return Ok(AttachControl::Continue),
+        }
+    }
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('d'), _) | (KeyCode::Char(']'), KeyModifiers::CONTROL) => {
+            Ok(AttachControl::Exit(AttachExit::Detach))
+        }
+        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            Ok(AttachControl::Exit(AttachExit::Quit))
+        }
+        (KeyCode::Char('?'), _) => {
+            append_session_help_lines(state);
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Char('x'), _) => {
+            let detail = cancel_active_turn_in_place(global, &session.session_id)?
+                .unwrap_or_else(|| "no active turn".into());
+            state.push_line(
+                crate::output::palette::Status::Awaiting,
+                format!("cancel requested  ·  {detail}"),
+            );
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Char('s'), _) => {
+            stop_session_in_place(global, &session.session_id)?;
+            state.push_line(crate::output::palette::Status::Failed, "session stopped");
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Char('p'), _) | (KeyCode::Enter, _) => {
+            if session.status == SessionStatus::Running {
+                state.push_line(
+                    crate::output::palette::Status::Awaiting,
+                    format!(
+                        "session busy  ·  {}",
+                        session
+                            .active_run_id
+                            .as_deref()
+                            .map(compact_session_run_id)
+                            .unwrap_or_else(|| "turn still running".into())
+                    ),
+                );
+                return Ok(AttachControl::Continue);
+            }
+            if session.status == SessionStatus::Stopped {
+                state.push_line(
+                    crate::output::palette::Status::Failed,
+                    "session stopped  ·  use `rupu session start` to create a new one",
+                );
+                return Ok(AttachControl::Continue);
+            }
+            state.compose = Some(String::new());
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Esc, _) => {
+            if session.status == SessionStatus::Running {
+                let detail = cancel_active_turn_in_place(global, &session.session_id)?
+                    .unwrap_or_else(|| "no active turn".into());
+                state.push_line(
+                    crate::output::palette::Status::Awaiting,
+                    format!(
+                        "cancel requested  ·  {detail}  ·  press p once the session is idle to send the next prompt"
+                    ),
+                );
+                return Ok(AttachControl::Continue);
+            }
+            if session.status == SessionStatus::Stopped {
+                state.push_line(
+                    crate::output::palette::Status::Failed,
+                    "session stopped  ·  use `rupu session start` to create a new one",
+                );
+                return Ok(AttachControl::Continue);
+            }
+            state.compose = Some(String::new());
+            Ok(AttachControl::Continue)
+        }
+        _ => Ok(AttachControl::Continue),
+    }
+}
+
+fn handle_session_live_input(
+    global: &Path,
+    session: &SessionRecord,
+    state: &mut SessionInteractiveState,
+    input: String,
+) -> anyhow::Result<AttachControl> {
+    if let Some(command) = parse_attach_command(&input) {
+        return execute_session_live_command(global, session, state, command);
+    }
+    if input.starts_with('/') && !input.starts_with("//") {
+        state.push_line(
+            crate::output::palette::Status::Failed,
+            format!("unknown command  ·  {}", input.trim()),
+        );
+        return Ok(AttachControl::Continue);
+    }
+    let prompt = if let Some(escaped) = input.strip_prefix("//") {
+        format!("/{escaped}")
+    } else {
+        input.clone()
+    };
+    let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
+    state.push_line(
+        crate::output::palette::Status::Working,
+        format!(
+            "queued prompt  ·  {}  ·  {}",
+            compact_session_run_id(&run_id),
+            truncate_single_line(prompt.as_str(), 72)
+        ),
+    );
+    Ok(AttachControl::Continue)
+}
+
+fn execute_session_live_command(
+    global: &Path,
+    session: &SessionRecord,
+    state: &mut SessionInteractiveState,
+    command: AttachCommand,
+) -> anyhow::Result<AttachControl> {
+    match command {
+        AttachCommand::Help => append_session_help_lines(state),
+        AttachCommand::Status => append_session_status_lines(state, session),
+        AttachCommand::History => append_session_history_lines(state, session),
+        AttachCommand::Transcript => append_session_transcript_lines(state, session),
+        AttachCommand::Runs => append_session_runs_lines(state, session),
+        AttachCommand::Cancel => {
+            let detail = cancel_active_turn_in_place(global, &session.session_id)?
+                .unwrap_or_else(|| "no active turn".into());
+            state.push_line(
+                crate::output::palette::Status::Awaiting,
+                format!("cancel requested  ·  {detail}"),
+            );
+        }
+        AttachCommand::Stop => {
+            stop_session_in_place(global, &session.session_id)?;
+            state.push_line(crate::output::palette::Status::Failed, "session stopped");
+        }
+        AttachCommand::Detach => return Ok(AttachControl::Exit(AttachExit::Detach)),
+        AttachCommand::Quit => return Ok(AttachControl::Exit(AttachExit::Quit)),
+    }
+    Ok(AttachControl::Continue)
+}
+
+fn build_session_screen_rows(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+    view_mode: LiveViewMode,
+) -> Vec<String> {
+    let (width, height) = terminal::size().unwrap_or((100, 30));
+    let width = width.max(40) as usize;
+    let height = height.max(12) as usize;
+    build_session_screen_rows_for_size(session, state, view_mode, width, height)
+}
+
+fn build_session_screen_rows_for_size(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+    view_mode: LiveViewMode,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let mut rows = vec![
+        render_session_header_line(session, view_mode, width),
+        String::new(),
+        format!(
+            "status     {}",
+            truncate_single_line(&session_status_detail(session), width.saturating_sub(11))
+        ),
+    ];
+    if let Some(route) = session_route_detail(session) {
+        rows.push(format!(
+            "route      {}",
+            truncate_single_line(&route, width.saturating_sub(11))
+        ));
+    }
+    rows.push(format!(
+        "workspace  {}",
+        truncate_single_line(&session_workspace_detail(session), width.saturating_sub(11))
+    ));
+    rows.push(format!(
+        "usage      {}",
+        truncate_single_line(&session_usage_detail(session), width.saturating_sub(11))
+    ));
+    if let Some(prompt) = session_recent_prompt(session) {
+        rows.push(format!(
+            "prompt     {}",
+            truncate_single_line(&prompt, width.saturating_sub(11))
+        ));
+    }
+    rows.push(String::new());
+
+    let footer_reserved = 2usize;
+    let available_event_rows = height
+        .saturating_sub(rows.len())
+        .saturating_sub(footer_reserved)
+        .max(1);
+    let event_rows = render_session_event_rows(&state.lines, width, available_event_rows);
+    rows.extend(event_rows);
+    while rows.len() < height.saturating_sub(footer_reserved) {
+        rows.push(String::new());
+    }
+
+    rows.push(render_session_controls_line(width));
+    rows.push(render_session_prompt_line(session, state, width));
+    rows.truncate(height);
+    rows
+}
+
+fn render_session_screen_rows(rows: &[String]) -> anyhow::Result<()> {
+    let mut stdout = io::stdout();
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+    for (idx, row) in rows.iter().enumerate() {
+        queue!(stdout, MoveTo(0, idx as u16), Print(row))?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+fn render_session_header_line(
+    session: &SessionRecord,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    truncate_single_line(
+        &format!(
+            "▶ session attach  {}  ·  {}  ·  {}",
+            session.agent_name,
+            session.session_id,
+            view_mode.as_str()
+        ),
+        width,
+    )
+}
+
+fn render_session_controls_line(width: usize) -> String {
+    truncate_single_line(
+        "controls  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help",
+        width,
+    )
+}
+
+fn render_session_prompt_line(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+    width: usize,
+) -> String {
+    if let Some(buffer) = state.compose.as_deref() {
+        truncate_single_line(
+            &format!("session {}> {}", session.session_id, buffer),
+            width,
+        )
+    } else {
+        truncate_single_line(
+            &format!(
+                "view  {}  ·  runs {}  ·  current {}",
+                session.status.as_str(),
+                session.runs.len(),
+                session
+                    .active_run_id
+                    .as_deref()
+                    .or(session.last_run_id.as_deref())
+                    .map(compact_session_run_id)
+                    .unwrap_or_else(|| "none".into())
+            ),
+            width,
+        )
+    }
+}
+
+fn render_session_event_rows(
+    lines: &[SessionViewLine],
+    width: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    let mut rendered = Vec::new();
+    for line in lines {
+        let prefix = format!("{} ", line.status.glyph());
+        let content_width = width.saturating_sub(2).max(1);
+        let wrapped = wrap_plain(&line.text, content_width);
+        for (idx, segment) in wrapped.into_iter().enumerate() {
+            let text = if idx == 0 {
+                format!("{prefix}{segment}")
+            } else {
+                format!("  {segment}")
+            };
+            rendered.push(text);
+        }
+    }
+    if rendered.len() > max_rows {
+        rendered.split_off(rendered.len() - max_rows)
+    } else {
+        rendered
+    }
+}
+
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let current_len = current.chars().count();
+        if current.is_empty() {
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    if chunk.chars().count() >= width {
+                        out.push(chunk);
+                        chunk = String::new();
+                    }
+                    chunk.push(ch);
+                }
+                if !chunk.is_empty() {
+                    current = chunk;
+                }
+            }
+        } else if current_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            out.push(current);
+            current = String::new();
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    if chunk.chars().count() >= width {
+                        out.push(chunk);
+                        chunk = String::new();
+                    }
+                    chunk.push(ch);
+                }
+                current = chunk;
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn transcript_event_lines(
+    event: &TranscriptEvent,
+    view_mode: LiveViewMode,
+) -> Vec<SessionViewLine> {
+    use crate::output::palette::Status;
+    match event {
+        TranscriptEvent::RunStart {
+            run_id,
+            workspace_id,
+            mode,
+            started_at,
+            ..
+        } => vec![SessionViewLine {
+            status: Status::Active,
+            text: format!(
+                "run started  ·  {}  ·  workspace {}  ·  mode {}  ·  {}",
+                compact_session_run_id(run_id),
+                workspace_id,
+                format!("{mode:?}").to_lowercase(),
+                started_at.format("%Y-%m-%d %H:%M:%S UTC")
+            ),
+        }],
+        TranscriptEvent::TurnStart { turn_idx } => vec![SessionViewLine {
+            status: Status::Working,
+            text: format!("turn {turn_idx}  ·  assistant turn started"),
+        }],
+        TranscriptEvent::AssistantMessage { content, thinking } => {
+            let mut out = Vec::new();
+            if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
+                out.push(SessionViewLine {
+                    status: Status::Active,
+                    text: format!("thinking  ·  {}", truncate_single_line(thinking, 96)),
+                });
+            }
+            if !content.trim().is_empty() {
+                out.push(SessionViewLine {
+                    status: Status::Active,
+                    text: match view_mode {
+                        LiveViewMode::Focused => {
+                            format!("assistant output  ·  {}", truncate_single_line(content, 96))
+                        }
+                        LiveViewMode::Full => format!("assistant output  ·  {}", content.trim()),
+                    },
+                });
+            }
+            out
+        }
+        TranscriptEvent::ToolCall { tool, input, .. } => vec![SessionViewLine {
+            status: Status::Working,
+            text: format!("tool {}  ·  {}", tool, transcript_tool_summary(tool, input)),
+        }],
+        TranscriptEvent::ToolResult {
+            output,
+            error,
+            duration_ms,
+            ..
+        } => {
+            let mut detail =
+                truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 84);
+            if *duration_ms > 0 {
+                detail.push_str(&format!("  ·  {}ms", duration_ms));
+            }
+            vec![SessionViewLine {
+                status: if error.is_some() {
+                    Status::Failed
+                } else {
+                    Status::Complete
+                },
+                text: format!(
+                    "{}  ·  {}",
+                    if error.is_some() {
+                        "tool error"
+                    } else {
+                        "tool result"
+                    },
+                    detail
+                ),
+            }]
+        }
+        TranscriptEvent::FileEdit { path, kind, .. } => vec![SessionViewLine {
+            status: Status::Complete,
+            text: format!("file edit  ·  {} {}", format!("{kind:?}").to_lowercase(), path),
+        }],
+        TranscriptEvent::CommandRun {
+            argv,
+            cwd,
+            exit_code,
+            ..
+        } => vec![SessionViewLine {
+            status: if *exit_code == 0 {
+                Status::Complete
+            } else {
+                Status::Failed
+            },
+            text: format!(
+                "command  ·  {}  ·  cwd {}  ·  exit {}",
+                truncate_single_line(&argv.join(" "), 64),
+                truncate_single_line(cwd, 24),
+                exit_code
+            ),
+        }],
+        TranscriptEvent::ActionEmitted {
+            kind,
+            allowed,
+            applied,
+            reason,
+            ..
+        } => {
+            let mut detail = format!("action  ·  {kind}  ·  allowed={allowed} applied={applied}");
+            if let Some(reason) = reason.as_deref().filter(|value| !value.trim().is_empty()) {
+                detail.push_str("  ·  ");
+                detail.push_str(&truncate_single_line(reason, 64));
+            }
+            vec![SessionViewLine {
+                status: if *applied {
+                    Status::Complete
+                } else if *allowed {
+                    Status::Awaiting
+                } else {
+                    Status::Failed
+                },
+                text: detail,
+            }]
+        }
+        TranscriptEvent::GateRequested {
+            gate_id,
+            prompt,
+            decision,
+            decided_by,
+        } => {
+            let mut detail = format!(
+                "approval gate  ·  {gate_id}  ·  {}",
+                truncate_single_line(prompt, 72)
+            );
+            if let Some(decision) = decision.as_deref() {
+                detail.push_str(&format!("  ·  decision {decision}"));
+            }
+            if let Some(decided_by) = decided_by.as_deref() {
+                detail.push_str(&format!("  ·  by {decided_by}"));
+            }
+            vec![SessionViewLine {
+                status: Status::Awaiting,
+                text: detail,
+            }]
+        }
+        TranscriptEvent::TurnEnd {
+            turn_idx,
+            tokens_in,
+            tokens_out,
+        } => vec![SessionViewLine {
+            status: Status::Complete,
+            text: format!(
+                "turn complete  ·  turn {turn_idx}  ·  in {} out {}",
+                tokens_in.unwrap_or(0),
+                tokens_out.unwrap_or(0)
+            ),
+        }],
+        TranscriptEvent::Usage {
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        } => vec![SessionViewLine {
+            status: Status::Active,
+            text: format!(
+                "usage  ·  {provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+            ),
+        }],
+        TranscriptEvent::RunComplete {
+            status,
+            total_tokens,
+            duration_ms,
+            error,
+            ..
+        } => {
+            let mut detail = format!(
+                "run complete  ·  status {}  ·  {}ms  ·  {} tokens",
+                format!("{status:?}").to_lowercase(),
+                duration_ms,
+                total_tokens
+            );
+            if let Some(error) = error.as_deref().filter(|value| !value.trim().is_empty()) {
+                detail.push_str("  ·  ");
+                detail.push_str(&truncate_single_line(error, 72));
+            }
+            vec![SessionViewLine {
+                status: match status {
+                    RunStatus::Ok => Status::Complete,
+                    RunStatus::Error | RunStatus::Aborted => Status::Failed,
+                },
+                text: detail,
+            }]
+        }
+    }
+}
+
+fn transcript_tool_summary(tool: &str, input: &serde_json::Value) -> String {
+    match tool {
+        "issues.comment" => input
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .map(|r| format!("commented on {r}"))
+            .unwrap_or_else(|| "commented".into()),
+        "issues.update_state" => {
+            let r = input.get("ref").and_then(|v| v.as_str()).unwrap_or("issue");
+            let state = input
+                .get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("updated");
+            format!("{r} → {state}")
+        }
+        _ => truncate_single_line(&input.to_string(), 72),
+    }
+}
+
+fn append_session_help_lines(state: &mut SessionInteractiveState) {
+    state.push_line(
+        crate::output::palette::Status::Active,
+        "help  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit",
+    );
+    state.push_line(
+        crate::output::palette::Status::Active,
+        "commands  ·  /help /status /history /runs /transcript /cancel /stop /detach /quit",
+    );
+}
+
+fn append_session_status_lines(state: &mut SessionInteractiveState, session: &SessionRecord) {
+    state.push_line(
+        session_attach_status(session.status),
+        format!("status  ·  {}", session_status_detail(session)),
+    );
+    if let Some(detail) = session_route_detail(session) {
+        state.push_line(
+            crate::output::palette::Status::Active,
+            format!("route  ·  {detail}"),
+        );
+    }
+    state.push_line(
+        crate::output::palette::Status::Active,
+        format!("workspace  ·  {}", session_workspace_detail(session)),
+    );
+    state.push_line(
+        crate::output::palette::Status::Active,
+        format!("usage  ·  {}", session_usage_detail(session)),
+    );
+    if let Some(prompt) = session_recent_prompt(session) {
+        state.push_line(
+            crate::output::palette::Status::Active,
+            format!("last prompt  ·  {prompt}"),
+        );
+    }
+    if let Some(error) = session
+        .last_error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        state.push_line(
+            crate::output::palette::Status::Failed,
+            format!("last error  ·  {}", truncate_single_line(error, 96)),
+        );
+    }
+}
+
+fn append_session_history_lines(state: &mut SessionInteractiveState, session: &SessionRecord) {
+    if session.runs.is_empty() {
+        state.push_line(
+            crate::output::palette::Status::Skipped,
+            "history  ·  no prior turns",
+        );
+        return;
+    }
+    for run in session.runs.iter().rev().take(5) {
+        state.push_line(
+            crate::output::palette::Status::Active,
+            format!(
+                "history  ·  {}  ·  {}",
+                compact_session_run_id(&run.run_id),
+                truncate_single_line(&run.prompt, 72)
+            ),
+        );
+    }
+}
+
+fn append_session_transcript_lines(state: &mut SessionInteractiveState, session: &SessionRecord) {
+    let detail = session
+        .active_transcript_path
+        .as_ref()
+        .or(session.last_transcript_path.as_ref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "no transcript".into());
+    state.push_line(
+        crate::output::palette::Status::Active,
+        format!("transcript  ·  {detail}"),
+    );
+}
+
+fn append_session_runs_lines(state: &mut SessionInteractiveState, session: &SessionRecord) {
+    if session.runs.is_empty() {
+        state.push_line(crate::output::palette::Status::Skipped, "runs  ·  no runs");
+        return;
+    }
+    for run in session.runs.iter().rev().take(5) {
+        let status = run
+            .status
+            .map(|value| format!("{:?}", value).to_lowercase())
+            .unwrap_or_else(|| "running".into());
+        state.push_line(
+            crate::output::palette::Status::Active,
+            format!(
+                "run  ·  {status}  ·  {}",
+                compact_session_run_id(&run.run_id)
+            ),
+        );
     }
 }
 
@@ -1872,18 +2727,30 @@ fn cancel_active_turn(
     session_id: &str,
     printer: &mut crate::output::LineStreamPrinter,
 ) -> anyhow::Result<()> {
+    let detail = cancel_active_turn_in_place(global, session_id)?;
+    match detail {
+        Some(run_id) => printer.sideband_event(
+            crate::output::palette::Status::Awaiting,
+            "cancel requested",
+            Some(&run_id),
+        ),
+        None => printer.sideband_event(
+            crate::output::palette::Status::Skipped,
+            "no active turn",
+            Some(session_id),
+        ),
+    }
+    Ok(())
+}
+
+fn cancel_active_turn_in_place(global: &Path, session_id: &str) -> anyhow::Result<Option<String>> {
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session cancel")?;
     if reconcile_stale_session(&mut session) {
         write_session(global, scope, &session)?;
     }
     let Some(run_id) = session.active_run_id.clone() else {
-        printer.sideband_event(
-            crate::output::palette::Status::Skipped,
-            "no active turn",
-            Some(&session.session_id),
-        );
-        return Ok(());
+        return Ok(None);
     };
     if let Some(pid) = session.active_pid.filter(|pid| pid_is_running(*pid)) {
         let _ = terminate_pid(pid);
@@ -1902,12 +2769,7 @@ fn cancel_active_turn(
         run.error = Some("turn cancelled by operator".into());
     }
     write_session(global, scope, &session)?;
-    printer.sideband_event(
-        crate::output::palette::Status::Awaiting,
-        "cancel requested",
-        Some(&run_id),
-    );
-    Ok(())
+    Ok(Some(run_id))
 }
 
 async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
@@ -2501,6 +3363,38 @@ mod tests {
             } => assert_eq!(args.view, Some(LiveViewMode::Focused)),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn retained_session_screen_rows_respect_width_and_height() {
+        let session = test_session_record();
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+        );
+        state.push_line(
+            crate::output::palette::Status::Active,
+            "assistant output  ·  this is a deliberately long line that should wrap cleanly inside the retained session screen without spilling past the requested width",
+        );
+        let rows =
+            build_session_screen_rows_for_size(&session, &state, LiveViewMode::Focused, 48, 14);
+        assert!(rows.len() <= 14);
+        assert!(rows.iter().all(|row| row.chars().count() <= 48));
+    }
+
+    #[test]
+    fn transcript_event_lines_full_keeps_more_assistant_text_than_focused() {
+        let event = TranscriptEvent::AssistantMessage {
+            content: "This is a longer assistant response that should stay fuller in full mode while focused mode truncates it.".into(),
+            thinking: None,
+        };
+        let focused = transcript_event_lines(&event, LiveViewMode::Focused);
+        let full = transcript_event_lines(&event, LiveViewMode::Full);
+        assert_eq!(focused.len(), 1);
+        assert_eq!(full.len(), 1);
+        assert!(focused[0].text.contains("assistant output"));
+        assert!(full[0].text.contains("assistant output"));
+        assert!(full[0].text.chars().count() >= focused[0].text.chars().count());
     }
 
     fn test_session_record() -> SessionRecord {
