@@ -1849,32 +1849,49 @@ fn transcript_event_lines(
             duration_ms,
             ..
         } => {
-            let mut detail =
-                truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 84);
-            if *duration_ms > 0 {
-                detail.push_str(&format!("  ·  {}ms", duration_ms));
+            let status = if error.is_some() {
+                Status::Failed
+            } else {
+                Status::Complete
+            };
+            let label = if error.is_some() {
+                "tool error"
+            } else {
+                "tool result"
+            };
+            let raw = error.as_deref().unwrap_or(output.as_str());
+            match view_mode {
+                LiveViewMode::Focused => {
+                    let mut detail = truncate_single_line(raw, 84);
+                    if *duration_ms > 0 {
+                        detail.push_str(&format!("  ·  {}ms", duration_ms));
+                    }
+                    vec![SessionViewLine {
+                        status,
+                        text: retained_session_event_line(status, label, &detail),
+                        continuation: false,
+                    }]
+                }
+                LiveViewMode::Full => {
+                    let mut out = vec![SessionViewLine {
+                        status,
+                        text: retained_session_event_line(
+                            status,
+                            label,
+                            &session_payload_summary(raw, *duration_ms),
+                        ),
+                        continuation: false,
+                    }];
+                    for line in session_rich_payload_lines(raw, prefs) {
+                        out.push(SessionViewLine {
+                            status,
+                            text: line,
+                            continuation: true,
+                        });
+                    }
+                    out
+                }
             }
-            vec![SessionViewLine {
-                status: if error.is_some() {
-                    Status::Failed
-                } else {
-                    Status::Complete
-                },
-                text: retained_session_event_line(
-                    if error.is_some() {
-                        Status::Failed
-                    } else {
-                        Status::Complete
-                    },
-                    if error.is_some() {
-                        "tool error"
-                    } else {
-                        "tool result"
-                    },
-                    &detail,
-                ),
-                continuation: false,
-            }]
         }
         TranscriptEvent::FileEdit { path, kind, .. } => vec![SessionViewLine {
             status: Status::Complete,
@@ -2036,6 +2053,76 @@ fn transcript_event_lines(
             }]
         }
     }
+}
+
+fn session_payload_summary(raw: &str, duration_ms: u64) -> String {
+    let detail = truncate_single_line(&session_payload_headline(raw), 84);
+    if duration_ms > 0 {
+        format!("{detail}  ·  {duration_ms}ms")
+    } else {
+        detail
+    }
+}
+
+fn session_payload_headline(raw: &str) -> String {
+    if raw.trim().is_empty() {
+        return "empty payload".into();
+    }
+    if let Some(lines) = try_pretty_jsonl(raw) {
+        return format!("jsonl payload  ·  {} record(s)", lines.len());
+    }
+    if try_pretty_json(raw).is_some() {
+        return "json payload".into();
+    }
+    let line_count = raw.lines().count();
+    if line_count > 1 {
+        format!("{line_count} lines")
+    } else {
+        truncate_single_line(raw, 84)
+    }
+}
+
+fn session_rich_payload_lines(raw: &str, prefs: &UiPrefs) -> Vec<String> {
+    let rendered = if let Some(pretty) = try_pretty_json(raw) {
+        crate::cmd::ui::highlight_json(&pretty, prefs)
+    } else if let Some(records) = try_pretty_jsonl(raw) {
+        let joined = records.join("\n\n");
+        crate::cmd::ui::highlight_json(&joined, prefs)
+    } else if looks_like_markdown(raw) {
+        crate::cmd::ui::highlight_markdown(raw.trim(), prefs)
+    } else {
+        raw.trim_end().to_string()
+    };
+    rendered.lines().map(|line| line.to_string()).collect()
+}
+
+fn try_pretty_json(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    serde_json::to_string_pretty(&value).ok()
+}
+
+fn try_pretty_jsonl(raw: &str) -> Option<Vec<String>> {
+    let mut rows = Vec::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        rows.push(serde_json::to_string_pretty(&value).ok()?);
+    }
+    if rows.len() > 1 {
+        Some(rows)
+    } else {
+        None
+    }
+}
+
+fn looks_like_markdown(raw: &str) -> bool {
+    let trimmed = raw.trim_start();
+    trimmed.starts_with('#')
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("```")
+        || trimmed.contains("\n#")
+        || trimmed.contains("\n- ")
+        || trimmed.contains("\n* ")
 }
 
 fn retained_session_kv_row(
@@ -3590,6 +3677,35 @@ mod tests {
         assert!(focused[0].text.contains("assistant output"));
         assert!(full[0].text.contains("assistant output"));
         assert!(full.len() >= focused.len());
+    }
+
+    #[test]
+    fn transcript_event_lines_full_expands_json_tool_results() {
+        let event = TranscriptEvent::ToolResult {
+            output: "{\"status\":\"ok\",\"items\":[1,2]}".into(),
+            error: None,
+            duration_ms: 12,
+            call_id: "call_123".into(),
+        };
+        let focused_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let full_prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+        let focused = transcript_event_lines(&event, LiveViewMode::Focused, &focused_prefs);
+        let full = transcript_event_lines(&event, LiveViewMode::Full, &full_prefs);
+        assert_eq!(focused.len(), 1);
+        assert!(full.len() > 1);
+        assert!(full[0].text.contains("json payload"));
     }
 
     fn test_session_record() -> SessionRecord {

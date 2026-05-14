@@ -484,6 +484,15 @@ pub fn highlight_markdown(text: &str, prefs: &UiPrefs) -> String {
     highlight_with_extension(text, "md", prefs).unwrap_or_else(|| text.to_string())
 }
 
+/// Highlight a JSON buffer. Falls back to plain text when color is
+/// disabled or the syntax/theme lookup fails.
+pub fn highlight_json(text: &str, prefs: &UiPrefs) -> String {
+    if !prefs.use_color() {
+        return text.to_string();
+    }
+    highlight_with_extension(text, "json", prefs).unwrap_or_else(|| text.to_string())
+}
+
 /// Highlight an agent file: split on the trailing `---` of the YAML
 /// frontmatter, color the frontmatter as YAML and the body as Markdown.
 /// If the split fails (no frontmatter or shape unexpected), fall back
