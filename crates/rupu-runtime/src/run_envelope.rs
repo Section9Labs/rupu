@@ -67,8 +67,6 @@ pub struct ExecutionRequest {
     pub strict_templates: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub attach_ui: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub use_canvas: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

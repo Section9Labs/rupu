@@ -681,8 +681,8 @@ impl RunStore {
     }
 }
 
-/// Outcome of an approve/reject library call. Returned to callers
-/// (CLI text wrapper or TUI toast) so they decide how to display it.
+/// Outcome of an approve/reject library call. Returned to callers so
+/// they decide how to display it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Approved {
@@ -718,9 +718,7 @@ pub enum ApprovalError {
 impl RunStore {
     /// Library-level approve flow: load → expire-check → mutate
     /// status → persist. Caller is responsible for re-entering
-    /// `run_workflow` (CLI does this via the existing path; TUI
-    /// optimistically updates the local model and waits for the next
-    /// RunUpdate from disk).
+    /// `run_workflow` (CLI does this via the existing path).
     pub fn approve(
         &self,
         run_id: &str,
@@ -912,7 +910,6 @@ mod tests {
                 workspace_strategy: Some("in_place_checkout".into()),
                 strict_templates: false,
                 attach_ui: false,
-                use_canvas: false,
             },
             autoflow: None,
             correlation: None,

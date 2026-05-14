@@ -180,7 +180,6 @@ fn sample_envelope(
             workspace_strategy: Some("managed_worktree".into()),
             strict_templates: true,
             attach_ui: false,
-            use_canvas: false,
         },
         autoflow: None,
         correlation: None,
@@ -319,10 +318,10 @@ fn usage_supports_csv_format() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "group,provider,model,agent,input_tokens,output_tokens,cached_tokens,runs,cost_usd,cost_partial",
+            "group,provider,model,agent,workflow,repo,day,input_tokens,output_tokens,cached_tokens,runs,cost_usd,cost_partial",
         ))
         .stdout(predicate::str::contains(
-            "anthropic / claude-sonnet-4-6 / reviewer,anthropic,claude-sonnet-4-6,reviewer,12,4,0,1,",
+            "anthropic / claude-sonnet-4-6 / reviewer,anthropic,claude-sonnet-4-6,reviewer,,,,12,4,0,1,",
         ));
 }
 

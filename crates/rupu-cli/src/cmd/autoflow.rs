@@ -5948,7 +5948,6 @@ pub(crate) async fn execute_autoflow_cycle(
                 },
             )),
             attach_ui,
-            use_canvas: false,
             run_id_override: None,
             strict_templates: resolved.cfg.autoflow.strict_templates.unwrap_or(true),
             run_envelope_template: Some(RunEnvelopeTemplate {
@@ -6770,7 +6769,6 @@ pub(crate) async fn execute_pending_dispatch_workflow(
                 },
             )),
             attach_ui,
-            use_canvas: false,
             run_id_override: None,
             strict_templates: cfg.autoflow.strict_templates.unwrap_or(true),
             run_envelope_template: Some(RunEnvelopeTemplate {

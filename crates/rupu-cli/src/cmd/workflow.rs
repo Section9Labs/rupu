@@ -112,11 +112,6 @@ pub enum Action {
         /// Override permission mode (`ask` | `bypass` | `readonly`).
         #[arg(long)]
         mode: Option<String>,
-        /// Use the alt-screen TUI canvas instead of the default line-stream
-        /// output. The canvas offers a DAG view and live status glyphs but
-        /// requires an interactive terminal.
-        #[arg(long)]
-        canvas: bool,
     },
     /// List recent workflow runs from the persistent run-store
     /// (`<global>/runs/`). Newest first.
@@ -203,18 +198,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             target,
             input,
             mode,
-            canvas,
-        } => {
-            run(
-                &name,
-                target.as_deref(),
-                input,
-                mode.as_deref(),
-                None,
-                canvas,
-            )
-            .await
-        }
+        } => run(&name, target.as_deref(), input, mode.as_deref(), None).await,
         Action::Runs {
             limit,
             status,
@@ -1376,7 +1360,6 @@ pub struct ExplicitWorkflowRunContext {
     pub issue_ref: Option<String>,
     pub system_prompt_suffix: Option<String>,
     pub attach_ui: bool,
-    pub use_canvas: bool,
     pub run_id_override: Option<String>,
     pub strict_templates: bool,
     pub run_envelope_template: Option<RunEnvelopeTemplate>,
@@ -1428,7 +1411,7 @@ pub async fn run_by_name(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event, false, false, None).await
+    run_with_outcome(name, None, inputs, mode, event, false, None).await
 }
 
 /// Variant of [`run_by_name`] that pins the run-id. Used by the
@@ -1444,7 +1427,7 @@ pub async fn run_by_name_with_run_id(
     event: Option<serde_json::Value>,
     run_id: String,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event, false, false, Some(run_id)).await
+    run_with_outcome(name, None, inputs, mode, event, false, Some(run_id)).await
 }
 
 /// Run a specific workflow file using the same execution pipeline as
@@ -1468,7 +1451,6 @@ pub async fn run_by_path(
         mode,
         event,
         false,
-        false,
         None,
     )
     .await
@@ -1480,7 +1462,7 @@ pub async fn run_by_path(
 /// (interactive line-stream by default) so the issue-targeted run
 /// looks identical to the user.
 pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyhow::Result<()> {
-    run(name, Some(target), Vec::new(), mode, None, false).await
+    run(name, Some(target), Vec::new(), mode, None).await
 }
 
 async fn run(
@@ -1489,9 +1471,8 @@ async fn run(
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
     event: Option<serde_json::Value>,
-    use_canvas: bool,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event, true, use_canvas, None)
+    run_with_outcome(name, target, inputs, mode, event, true, None)
         .await
         .map(|_| ())
 }
@@ -1507,7 +1488,6 @@ async fn run_with_outcome(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
     attach_ui: bool,
-    use_canvas: bool,
     run_id_override: Option<String>,
 ) -> anyhow::Result<RunOutcomeSummary> {
     let path = locate_workflow(name)?;
@@ -1668,7 +1648,6 @@ async fn run_with_outcome(
             issue_ref: issue_ref_text,
             system_prompt_suffix,
             attach_ui,
-            use_canvas,
             run_id_override,
             strict_templates: false,
             run_envelope_template: None,
@@ -1689,7 +1668,6 @@ async fn run_path_with_outcome(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
     attach_ui: bool,
-    use_canvas: bool,
     run_id_override: Option<String>,
 ) -> anyhow::Result<RunOutcomeSummary> {
     let body = std::fs::read_to_string(&workflow_path)?;
@@ -1735,7 +1713,6 @@ async fn run_path_with_outcome(
             issue_ref: None,
             system_prompt_suffix: None,
             attach_ui,
-            use_canvas,
             run_id_override,
             strict_templates: false,
             run_envelope_template: None,
@@ -1815,7 +1792,6 @@ fn build_run_envelope(
             workspace_strategy: template.workspace_strategy,
             strict_templates: ctx.strict_templates,
             attach_ui: ctx.attach_ui,
-            use_canvas: ctx.use_canvas,
         },
         autoflow: template.autoflow_name.map(|name| AutoflowEnvelope {
             name,
@@ -2225,136 +2201,127 @@ async fn execute_workflow_invocation(
         let runner_task = tokio::spawn(run_workflow(opts));
         let rid = run_id.clone();
 
-        if ctx.use_canvas {
-            if let Err(e) = rupu_tui::run_attached(rid.clone(), runs_dir.clone()) {
-                eprintln!("rupu: TUI exited early: {e}");
-            }
-            runner_task
+        let mut attach_opts = crate::output::workflow_printer::AttachOpts {
+            skip_header: false,
+            skip_count: 0,
+            live_event_hook: ctx.live_event_hook.clone(),
+        };
+        let mut current_runner = runner_task;
+        let mut current_run_id = rid.clone();
+        let shared_printer = ctx.shared_printer.clone();
+
+        loop {
+            let name_owned = name.to_string();
+            let rid_for_attach = current_run_id.clone();
+            let runs_dir_for_attach = runs_dir.clone();
+            let transcripts_for_attach = transcripts_dir_snapshot.clone();
+            let attach_opts_for_attach = attach_opts.clone();
+            let shared_printer_for_attach = shared_printer.clone();
+            let outcome_result = tokio::task::spawn_blocking(move || {
+                let printer_store = rupu_orchestrator::RunStore::new(runs_dir_for_attach.clone());
+                if let Some(shared_printer) = shared_printer_for_attach {
+                    let mut printer = shared_printer
+                        .lock()
+                        .map_err(|_| io::Error::other("shared printer poisoned"))?;
+                    crate::output::workflow_printer::attach_and_print_with(
+                        &name_owned,
+                        &rid_for_attach,
+                        &runs_dir_for_attach,
+                        &transcripts_for_attach,
+                        &mut printer,
+                        &printer_store,
+                        attach_opts_for_attach,
+                    )
+                } else {
+                    let mut printer = crate::output::LineStreamPrinter::new();
+                    crate::output::workflow_printer::attach_and_print_with(
+                        &name_owned,
+                        &rid_for_attach,
+                        &runs_dir_for_attach,
+                        &transcripts_for_attach,
+                        &mut printer,
+                        &printer_store,
+                        attach_opts_for_attach,
+                    )
+                }
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("workflow printer task panicked: {e}"))?;
+            let outcome = match outcome_result {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("rupu: printer error: {e}");
+                    crate::output::workflow_printer::AttachOutcome::Detached
+                }
+            };
+
+            let result = current_runner
                 .await
                 .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-                .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
-        } else {
-            let mut attach_opts = crate::output::workflow_printer::AttachOpts {
-                skip_header: false,
-                skip_count: 0,
-                live_event_hook: ctx.live_event_hook.clone(),
-            };
-            let mut current_runner = runner_task;
-            let mut current_run_id = rid.clone();
-            let shared_printer = ctx.shared_printer.clone();
+                .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?;
 
-            loop {
-                let name_owned = name.to_string();
-                let rid_for_attach = current_run_id.clone();
-                let runs_dir_for_attach = runs_dir.clone();
-                let transcripts_for_attach = transcripts_dir_snapshot.clone();
-                let attach_opts_for_attach = attach_opts.clone();
-                let shared_printer_for_attach = shared_printer.clone();
-                let outcome_result = tokio::task::spawn_blocking(move || {
-                    let printer_store =
-                        rupu_orchestrator::RunStore::new(runs_dir_for_attach.clone());
-                    if let Some(shared_printer) = shared_printer_for_attach {
-                        let mut printer = shared_printer
-                            .lock()
-                            .map_err(|_| io::Error::other("shared printer poisoned"))?;
-                        crate::output::workflow_printer::attach_and_print_with(
-                            &name_owned,
-                            &rid_for_attach,
-                            &runs_dir_for_attach,
-                            &transcripts_for_attach,
-                            &mut printer,
-                            &printer_store,
-                            attach_opts_for_attach,
-                        )
-                    } else {
-                        let mut printer = crate::output::LineStreamPrinter::new();
-                        crate::output::workflow_printer::attach_and_print_with(
-                            &name_owned,
-                            &rid_for_attach,
-                            &runs_dir_for_attach,
-                            &transcripts_for_attach,
-                            &mut printer,
-                            &printer_store,
-                            attach_opts_for_attach,
-                        )
-                    }
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("workflow printer task panicked: {e}"))?;
-                let outcome = match outcome_result {
-                    Ok(o) => o,
-                    Err(e) => {
-                        eprintln!("rupu: printer error: {e}");
-                        crate::output::workflow_printer::AttachOutcome::Detached
-                    }
-                };
-
-                let result = current_runner
-                    .await
-                    .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-                    .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?;
-
-                use crate::output::workflow_printer::AttachOutcome;
-                match outcome {
-                    AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
-                        break result;
-                    }
-                    AttachOutcome::Approved { awaited_step_id } => {
-                        let prior_records = run_store_for_resume
-                            .read_step_results(&current_run_id)
-                            .map_err(|e| anyhow::anyhow!("read step results for resume: {e}"))?;
-                        let prior_count = prior_records.len();
-                        let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
-                            .iter()
-                            .map(rupu_orchestrator::StepResult::from)
-                            .collect();
-                        let resume = rupu_orchestrator::ResumeState {
-                            run_id: current_run_id.clone(),
-                            prior_step_results,
-                            approved_step_id: awaited_step_id,
-                        };
-                        let factory_dyn: Arc<dyn rupu_orchestrator::StepFactory> =
-                            factory_for_resume.clone();
-                        let resume_event_sink = {
-                            let events_path = runs_dir.join(&current_run_id).join("events.jsonl");
-                            match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
-                                Ok(sink) => Some(Arc::new(sink)
-                                    as Arc<dyn rupu_orchestrator::executor::EventSink>),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        error = %e,
-                                        "failed to open events.jsonl for inline resume; continuing without event sink"
-                                    );
-                                    None
-                                }
+            use crate::output::workflow_printer::AttachOutcome;
+            match outcome {
+                AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
+                    break result;
+                }
+                AttachOutcome::Approved { awaited_step_id } => {
+                    let prior_records = run_store_for_resume
+                        .read_step_results(&current_run_id)
+                        .map_err(|e| anyhow::anyhow!("read step results for resume: {e}"))?;
+                    let prior_count = prior_records.len();
+                    let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
+                        .iter()
+                        .map(rupu_orchestrator::StepResult::from)
+                        .collect();
+                    let resume = rupu_orchestrator::ResumeState {
+                        run_id: current_run_id.clone(),
+                        prior_step_results,
+                        approved_step_id: awaited_step_id,
+                    };
+                    let factory_dyn: Arc<dyn rupu_orchestrator::StepFactory> =
+                        factory_for_resume.clone();
+                    let resume_event_sink = {
+                        let events_path = runs_dir.join(&current_run_id).join("events.jsonl");
+                        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
+                            Ok(sink) => {
+                                Some(Arc::new(sink)
+                                    as Arc<dyn rupu_orchestrator::executor::EventSink>)
                             }
-                        };
-                        let resume_opts = OrchestratorRunOpts {
-                            workflow: workflow_for_resume.clone(),
-                            inputs: inputs_for_resume.clone(),
-                            workspace_id: workspace_id_for_resume.clone(),
-                            workspace_path: workspace_path_for_resume.clone(),
-                            transcript_dir: transcripts_for_resume.clone(),
-                            factory: factory_dyn,
-                            event: event_for_resume.clone(),
-                            issue: issue_for_resume.clone(),
-                            issue_ref: issue_ref_for_resume.clone(),
-                            run_store: Some(Arc::clone(&run_store_for_resume)),
-                            workflow_yaml: Some(body_for_resume.clone()),
-                            resume_from: Some(resume),
-                            run_id_override: None,
-                            strict_templates,
-                            event_sink: resume_event_sink,
-                        };
-                        current_runner = tokio::spawn(run_workflow(resume_opts));
-                        current_run_id = result.run_id.clone();
-                        attach_opts = crate::output::workflow_printer::AttachOpts {
-                            skip_header: true,
-                            skip_count: prior_count,
-                            live_event_hook: ctx.live_event_hook.clone(),
-                        };
-                        let _ = result;
-                    }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "failed to open events.jsonl for inline resume; continuing without event sink"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    let resume_opts = OrchestratorRunOpts {
+                        workflow: workflow_for_resume.clone(),
+                        inputs: inputs_for_resume.clone(),
+                        workspace_id: workspace_id_for_resume.clone(),
+                        workspace_path: workspace_path_for_resume.clone(),
+                        transcript_dir: transcripts_for_resume.clone(),
+                        factory: factory_dyn,
+                        event: event_for_resume.clone(),
+                        issue: issue_for_resume.clone(),
+                        issue_ref: issue_ref_for_resume.clone(),
+                        run_store: Some(Arc::clone(&run_store_for_resume)),
+                        workflow_yaml: Some(body_for_resume.clone()),
+                        resume_from: Some(resume),
+                        run_id_override: None,
+                        strict_templates,
+                        event_sink: resume_event_sink,
+                    };
+                    current_runner = tokio::spawn(run_workflow(resume_opts));
+                    current_run_id = result.run_id.clone();
+                    attach_opts = crate::output::workflow_printer::AttachOpts {
+                        skip_header: true,
+                        skip_count: prior_count,
+                        live_event_hook: ctx.live_event_hook.clone(),
+                    };
+                    let _ = result;
                 }
             }
         }

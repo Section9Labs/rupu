@@ -771,7 +771,6 @@ mod tests {
                 workspace_strategy: Some("managed_worktree".into()),
                 strict_templates: true,
                 attach_ui: false,
-                use_canvas: false,
             },
             autoflow: None,
             correlation: None,
