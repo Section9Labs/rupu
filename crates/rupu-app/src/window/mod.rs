@@ -373,7 +373,77 @@ impl WorkspaceWindow {
                 return;
             }
         };
-        self.launcher = Some(crate::launcher::LauncherState::new(workflow_path, workflow));
+        let mut state = crate::launcher::LauncherState::new(workflow_path, workflow);
+
+        // Construct one TextInput entity per string/int input and seed it with
+        // the current value (which may be the workflow's default).
+        for (name, def) in &state.workflow.inputs {
+            let is_text =
+                matches!(def.ty, rupu_orchestrator::InputType::String) && def.allowed.is_empty();
+            let is_int = matches!(def.ty, rupu_orchestrator::InputType::Int);
+            if !is_text && !is_int {
+                continue;
+            }
+            let initial = state.inputs.get(name).cloned().unwrap_or_default();
+            let placeholder = format!("{name}…");
+            let name_owned = name.clone();
+            let entity = cx.new(|cx| {
+                let mut t = crate::widget::TextInput::new(cx, placeholder);
+                if !initial.is_empty() {
+                    t.set_content(initial, cx);
+                }
+                t
+            });
+            // Subscribe to ContentChanged → mirror into LauncherState.inputs.
+            let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+            cx.subscribe(&entity, move |_, _entity, ev: &crate::widget::ContentChanged, cx| {
+                let name = name_owned.clone();
+                let new_value = ev.content.to_string();
+                let weak = weak.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(s) = this.launcher.as_mut() {
+                            s.set_input(&name, new_value);
+                            s.revalidate();
+                            cx.notify();
+                        }
+                    });
+                });
+            })
+            .detach();
+            state.text_inputs.insert(name.clone(), entity);
+        }
+
+        // Reserved entity for Clone target's repo_ref. Always constructed even when
+        // the user hasn't selected the Clone target yet, so switching to Clone
+        // doesn't have to wire it lazily.
+        let weak_clone: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let repo_ref_entity = cx.new(|cx| crate::widget::TextInput::new(cx, "owner/repo"));
+        cx.subscribe(
+            &repo_ref_entity,
+            move |_, _entity, ev: &crate::widget::ContentChanged, cx| {
+                let new_value = ev.content.to_string();
+                let weak = weak_clone.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(s) = this.launcher.as_mut() {
+                            if let crate::launcher::LauncherTarget::Clone { repo_ref, .. } =
+                                &mut s.target
+                            {
+                                *repo_ref = new_value;
+                                cx.notify();
+                            }
+                        }
+                    });
+                });
+            },
+        )
+        .detach();
+        state
+            .text_inputs
+            .insert("__repo_ref".to_string(), repo_ref_entity);
+
+        self.launcher = Some(state);
         cx.notify();
     }
 
