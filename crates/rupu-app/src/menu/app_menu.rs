@@ -53,6 +53,52 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("r", RejectFocused, None),
         KeyBinding::new("cmd-r", LaunchSelected, None),
         KeyBinding::new("cmd-\\", ToggleSidebar, None),
+        // TextInput shortcuts — scoped to focused text inputs only.
+        KeyBinding::new(
+            "backspace",
+            crate::widget::text_input::Backspace,
+            Some("TextInput"),
+        ),
+        KeyBinding::new(
+            "delete",
+            crate::widget::text_input::Delete,
+            Some("TextInput"),
+        ),
+        KeyBinding::new("left", crate::widget::text_input::Left, Some("TextInput")),
+        KeyBinding::new(
+            "right",
+            crate::widget::text_input::Right,
+            Some("TextInput"),
+        ),
+        KeyBinding::new(
+            "shift-left",
+            crate::widget::text_input::SelectLeft,
+            Some("TextInput"),
+        ),
+        KeyBinding::new(
+            "shift-right",
+            crate::widget::text_input::SelectRight,
+            Some("TextInput"),
+        ),
+        KeyBinding::new(
+            "cmd-a",
+            crate::widget::text_input::SelectAll,
+            Some("TextInput"),
+        ),
+        KeyBinding::new("home", crate::widget::text_input::Home, Some("TextInput")),
+        KeyBinding::new("end", crate::widget::text_input::End, Some("TextInput")),
+        KeyBinding::new(
+            "ctrl-cmd-space",
+            crate::widget::text_input::ShowCharacterPalette,
+            Some("TextInput"),
+        ),
+        KeyBinding::new(
+            "cmd-v",
+            crate::widget::text_input::Paste,
+            Some("TextInput"),
+        ),
+        KeyBinding::new("cmd-c", crate::widget::text_input::Copy, Some("TextInput")),
+        KeyBinding::new("cmd-x", crate::widget::text_input::Cut, Some("TextInput")),
     ]);
 
     cx.on_action(|_: &NewWorkspace, cx| {
