@@ -4,7 +4,9 @@ use crate::cmd::run::{
     canonicalize_if_exists, resolve_clone_dest, standalone_issue_ref, standalone_repo_ref,
     standalone_workspace_strategy, ReadonlyDecider,
 };
-use crate::cmd::transcript::{render_pretty_transcript_event, truncate_single_line};
+use crate::cmd::transcript::{
+    render_pretty_transcript_event, truncate_single_line, TranscriptPrettyContext,
+};
 use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
 use crate::output::report::{self, CollectionOutput, DetailOutput};
@@ -1069,7 +1071,7 @@ fn attach_blocking(
             printer.sideband_event(
                 crate::output::palette::Status::Working,
                 "waiting for session output",
-                Some(run_id),
+                Some(&compact_session_run_id(run_id)),
             );
         }
     }
@@ -1078,7 +1080,13 @@ fn attach_blocking(
     loop {
         let events = tailer.drain();
         for event in &events {
-            render_pretty_transcript_event(&mut printer, event, &mut saw_header, view_mode);
+            render_pretty_transcript_event(
+                &mut printer,
+                event,
+                &mut saw_header,
+                view_mode,
+                TranscriptPrettyContext::SessionAttached,
+            );
             saw_any = true;
         }
 
@@ -1107,7 +1115,13 @@ fn attach_blocking(
         if desired_run_id != followed_run_id {
             let final_events = tailer.drain();
             for event in &final_events {
-                render_pretty_transcript_event(&mut printer, event, &mut saw_header, view_mode);
+                render_pretty_transcript_event(
+                    &mut printer,
+                    event,
+                    &mut saw_header,
+                    view_mode,
+                    TranscriptPrettyContext::SessionAttached,
+                );
                 saw_any = true;
             }
             if let Some(next_path) = desired_transcript_path {
@@ -1124,7 +1138,7 @@ fn attach_blocking(
                         } else {
                             "following run"
                         },
-                        Some(run_id),
+                        Some(&compact_session_run_id(run_id)),
                     );
                 }
             }
@@ -1159,7 +1173,13 @@ fn attach_blocking(
             printer.stop_ticker();
             let final_events = tailer.drain();
             for event in &final_events {
-                render_pretty_transcript_event(&mut printer, event, &mut saw_header, view_mode);
+                render_pretty_transcript_event(
+                    &mut printer,
+                    event,
+                    &mut saw_header,
+                    view_mode,
+                    TranscriptPrettyContext::SessionAttached,
+                );
                 saw_any = true;
             }
             if !saw_any && transcript_path.exists() {
@@ -1174,6 +1194,7 @@ fn attach_blocking(
                         &event,
                         &mut saw_header,
                         view_mode,
+                        TranscriptPrettyContext::SessionAttached,
                     );
                 }
             }
@@ -1230,6 +1251,8 @@ fn handle_attach_keypress(
                     Some(
                         session
                             .active_run_id
+                            .as_deref()
+                            .map(compact_session_run_id)
                             .as_deref()
                             .unwrap_or("turn still running"),
                     ),
@@ -1357,7 +1380,11 @@ fn handle_session_input(
         input.clone()
     };
     let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
-    let detail = format!("{run_id}  ·  {}", truncate_single_line(prompt.as_str(), 72));
+    let detail = format!(
+        "{}  ·  {}",
+        compact_session_run_id(&run_id),
+        truncate_single_line(prompt.as_str(), 72)
+    );
     printer.sideband_event(
         crate::output::palette::Status::Working,
         "queued prompt",
@@ -1604,7 +1631,7 @@ fn session_status_detail(session: &SessionRecord) -> String {
         .as_deref()
         .or(session.last_run_id.as_deref())
     {
-        parts.push(format!("run {run_id}"));
+        parts.push(format!("run {}", compact_session_run_id(run_id)));
     }
     parts.join("  ·  ")
 }
@@ -1612,13 +1639,13 @@ fn session_status_detail(session: &SessionRecord) -> String {
 fn session_route_detail(session: &SessionRecord) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(repo_ref) = session.repo_ref.as_deref() {
-        parts.push(format!("repo {}", truncate_single_line(repo_ref, 56)));
+        parts.push(format!("repo {}", truncate_single_line(repo_ref, 40)));
     }
     if let Some(target) = session.target.as_deref() {
-        parts.push(format!("target {}", truncate_single_line(target, 72)));
+        parts.push(format!("target {}", truncate_single_line(target, 52)));
     }
     if let Some(issue_ref) = session.issue_ref.as_deref() {
-        parts.push(format!("issue {}", truncate_single_line(issue_ref, 72)));
+        parts.push(format!("issue {}", truncate_single_line(issue_ref, 52)));
     }
     if parts.is_empty() {
         None
@@ -1630,7 +1657,7 @@ fn session_route_detail(session: &SessionRecord) -> Option<String> {
 fn session_workspace_detail(session: &SessionRecord) -> String {
     let mut parts = vec![truncate_single_line(
         &session.workspace_path.display().to_string(),
-        84,
+        52,
     )];
     if let Some(strategy) = session.workspace_strategy.as_deref() {
         parts.push(strategy.to_string());
@@ -1641,7 +1668,10 @@ fn session_workspace_detail(session: &SessionRecord) -> String {
 fn session_usage_detail(session: &SessionRecord) -> String {
     format!(
         "{}  ·  {}  ·  in {} out {}",
-        session.provider_name, session.model, session.total_tokens_in, session.total_tokens_out
+        truncate_single_line(&session.provider_name, 14),
+        truncate_single_line(&session.model, 24),
+        session.total_tokens_in,
+        session.total_tokens_out
     )
 }
 
@@ -1657,7 +1687,12 @@ fn session_ticker_message(session: &SessionRecord) -> String {
         SessionStatus::Running => format!(
             "session {}  ·  run {}  ·  turns {}",
             session.agent_name,
-            session.active_run_id.as_deref().unwrap_or("starting"),
+            session
+                .active_run_id
+                .as_deref()
+                .map(compact_session_run_id)
+                .as_deref()
+                .unwrap_or("starting"),
             session.total_turns
         ),
         SessionStatus::Idle => format!(
@@ -1669,6 +1704,23 @@ fn session_ticker_message(session: &SessionRecord) -> String {
             session.agent_name
         ),
         SessionStatus::Stopped => format!("session {}  ·  stopped", session.agent_name),
+    }
+}
+
+fn compact_session_run_id(run_id: &str) -> String {
+    if run_id.chars().count() <= 18 {
+        run_id.to_string()
+    } else {
+        let head = run_id.chars().take(12).collect::<String>();
+        let tail = run_id
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        format!("{head}…{tail}")
     }
 }
 

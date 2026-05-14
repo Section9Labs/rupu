@@ -208,6 +208,7 @@ impl LineStreamPrinter {
             // test capture) get a clean stdout stream.
             return;
         }
+        let message = self.clamp_ticker_message(message.into());
         if let Some(pb) = &self.ticker {
             // Already running — update the message in place rather
             // than double-starting (which would put two bars on the
@@ -217,7 +218,7 @@ impl LineStreamPrinter {
             // calls update the message, then per-step `stop_ticker`
             // tears it down at end of step, and the workflow-level
             // poll loop re-arms it before the next sleep.
-            pb.set_message(message.into());
+            pb.set_message(message);
             return;
         }
         let pb = self.multi.add(ProgressBar::new_spinner());
@@ -239,7 +240,7 @@ impl LineStreamPrinter {
                 .unwrap_or_else(|_| ProgressStyle::default_spinner())
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
         );
-        pb.set_message(message.into());
+        pb.set_message(message);
         // ~80 ms per tick reads as a smooth pulse without flooding
         // the terminal. The steady-tick thread also re-renders
         // `{elapsed}` so the time counter updates roughly 12× per
@@ -254,7 +255,7 @@ impl LineStreamPrinter {
     /// having to re-check state.
     pub fn tick_with(&self, message: impl Into<String>) {
         if let Some(pb) = &self.ticker {
-            pb.set_message(message.into());
+            pb.set_message(self.clamp_ticker_message(message.into()));
         }
     }
 
@@ -1073,6 +1074,17 @@ impl LineStreamPrinter {
         let trimmed = buf.trim_end_matches(' ').to_string();
         self.out(&trimmed);
     }
+
+    fn clamp_ticker_message(&self, message: String) -> String {
+        let squashed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        let reserved = 16usize;
+        let max_visible = self
+            .term_width
+            .saturating_sub(self.body_prefix_visual_width() as u16)
+            .saturating_sub(reserved as u16)
+            .max(16) as usize;
+        truncate_plain_single_line(&squashed, max_visible)
+    }
 }
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -1095,6 +1107,23 @@ fn build_ticker_template(body_prefix: &str) -> String {
     format!(
         "{trimmed} {spinner_open}{{spinner}}{DIM_CLOSE} {{msg}}  {dim_open}· {{elapsed}}{DIM_CLOSE}"
     )
+}
+
+fn truncate_plain_single_line(value: &str, max: usize) -> String {
+    if visible_len(value) <= max {
+        return value.to_string();
+    }
+    let mut visible = 0usize;
+    let mut out = String::new();
+    for ch in value.chars() {
+        if visible + 1 >= max {
+            break;
+        }
+        out.push(ch);
+        visible += 1;
+    }
+    out.push('…');
+    out
 }
 
 /// Format a `Duration` as `Xs` or `Xm Ys` or `HhXmYs`.
@@ -1685,6 +1714,16 @@ mod tests {
         // workflow-level message without spawning a second bar.
         p.start_ticker("second message");
         p.stop_ticker();
+    }
+
+    #[test]
+    fn test_clamp_ticker_message_truncates_long_lines() {
+        no_color();
+        let p = LineStreamPrinter::new();
+        let message = "session issue-reader  ·  run run_01KRJDKSBE7X4J49094149WFJS  ·  turns 42  ·  extra words to overflow";
+        let clamped = p.clamp_ticker_message(message.to_string());
+        assert!(visible_len(&clamped) <= 79);
+        assert!(clamped.ends_with('…'));
     }
 
     #[test]
