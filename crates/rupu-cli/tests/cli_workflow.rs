@@ -26,6 +26,19 @@ steps:
     prompt: hi
 "#;
 
+const FANOUT_WORKFLOW_YAML: &str = r#"name: fanout-wf
+inputs:
+  files:
+    type: string
+steps:
+  - id: review
+    agent: echo
+    actions: []
+    for_each: "{{ inputs.files }}"
+    max_parallel: 2
+    prompt: "review {{ item }}"
+"#;
+
 fn init_git_checkout(path: &std::path::Path, origin_url: &str) {
     let status = Command::new("git")
         .arg("init")
@@ -267,6 +280,47 @@ async fn workflow_run_supports_focused_and_full_view_modes() {
         .success()
         .stdout(predicates::str::contains("step output"))
         .stdout(predicates::str::contains("assistant output").not());
+}
+
+#[tokio::test]
+async fn workflow_run_focused_mode_renders_fanout_tree() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/echo.md")
+        .write_str("---\nname: echo\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\nyou echo.")
+        .unwrap();
+    global.child("workflows").create_dir_all().unwrap();
+    global
+        .child("workflows/fanout-wf.yaml")
+        .write_str(FANOUT_WORKFLOW_YAML)
+        .unwrap();
+
+    let project = assert_fs::TempDir::new().unwrap();
+
+    AssertCommand::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .env("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT)
+        .current_dir(project.path())
+        .args([
+            "workflow",
+            "run",
+            "fanout-wf",
+            "--mode",
+            "bypass",
+            "--input",
+            "files=[\"a.rs\",\"b.py\"]",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("for_each"))
+        .stdout(predicates::str::contains("iter[1]"))
+        .stdout(predicates::str::contains("iter[2]"))
+        .stdout(predicates::str::contains("assistant output  step output"));
 }
 
 #[tokio::test]
