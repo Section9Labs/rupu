@@ -46,6 +46,7 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ulid.workspace = true
+unicode-segmentation.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

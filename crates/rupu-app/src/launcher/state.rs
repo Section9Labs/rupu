@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use rupu_orchestrator::Workflow;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LauncherState {
     pub workflow_path: PathBuf,
     pub workflow: Workflow,
@@ -14,6 +14,11 @@ pub struct LauncherState {
     pub mode: LauncherMode,
     pub target: LauncherTarget,
     pub validation: Option<ValidationError>,
+    /// One `Entity<TextInput>` per text/int workflow input, keyed by input name.
+    /// Plus the reserved key `"__repo_ref"` for the Clone target's repo ref.
+    /// Constructed in `WorkspaceWindow::open_launcher` because `cx.new` is
+    /// only callable with a mutable `App` context, not at struct-literal time.
+    pub text_inputs: BTreeMap<String, gpui::Entity<crate::widget::TextInput>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +78,7 @@ impl LauncherState {
             mode: LauncherMode::Ask,
             target: LauncherTarget::ThisWorkspace,
             validation: None,
+            text_inputs: BTreeMap::new(),
         };
         state.revalidate();
         state
@@ -102,15 +108,19 @@ impl LauncherState {
         if self.validation.is_some() {
             return false;
         }
-        matches!(
-            &self.target,
-            LauncherTarget::ThisWorkspace
-                | LauncherTarget::Directory(_)
-                | LauncherTarget::Clone {
-                    status: CloneStatus::Done(_) | CloneStatus::NotStarted | CloneStatus::Failed(_),
-                    ..
-                }
-        )
+        match &self.target {
+            LauncherTarget::ThisWorkspace | LauncherTarget::Directory(_) => true,
+            // Clone is runnable only when there's actually a repo ref to clone.
+            // Otherwise the user could click Run on a blank Clone field and get
+            // a "missing ':' separator" parse error from the SCM layer.
+            LauncherTarget::Clone { repo_ref, status } => {
+                !repo_ref.is_empty()
+                    && matches!(
+                        status,
+                        CloneStatus::Done(_) | CloneStatus::NotStarted | CloneStatus::Failed(_)
+                    )
+            }
+        }
     }
 }
 
@@ -120,5 +130,63 @@ fn yaml_value_to_string(v: &serde_yaml::Value) -> Option<String> {
         serde_yaml::Value::Number(n) => Some(n.to_string()),
         serde_yaml::Value::Bool(b) => Some(b.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rupu_orchestrator::{InputDef, InputType, Trigger, WorkflowDefaults, Contracts};
+
+    fn workflow_with_input(name: &str, ty: InputType, required: bool) -> Workflow {
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            name.to_string(),
+            InputDef {
+                ty,
+                required,
+                default: None,
+                description: None,
+                allowed: vec![],
+            },
+        );
+        Workflow {
+            name: "test".to_string(),
+            description: None,
+            trigger: Trigger::default(),
+            inputs,
+            defaults: WorkflowDefaults::default(),
+            autoflow: None,
+            contracts: Contracts {
+                outputs: BTreeMap::new(),
+            },
+            notify_issue: false,
+            steps: vec![],
+        }
+    }
+
+    #[test]
+    fn set_input_then_revalidate_clears_error_when_required_input_provided() {
+        let wf = workflow_with_input("repo", InputType::String, true);
+        let mut state = LauncherState::new("/tmp/wf.yml".into(), wf);
+        // Required input is missing → validation should fail.
+        assert!(state.validation.is_some(), "expected validation error on init");
+        state.set_input("repo", "github:foo/bar");
+        state.revalidate();
+        assert!(
+            state.validation.is_none(),
+            "expected validation to clear once required input set, got {:?}",
+            state.validation
+        );
+    }
+
+    #[test]
+    fn set_input_with_empty_string_removes_the_entry() {
+        let wf = workflow_with_input("repo", InputType::String, false);
+        let mut state = LauncherState::new("/tmp/wf.yml".into(), wf);
+        state.set_input("repo", "value");
+        assert_eq!(state.inputs.get("repo").map(|s| s.as_str()), Some("value"));
+        state.set_input("repo", "");
+        assert!(state.inputs.get("repo").is_none());
     }
 }

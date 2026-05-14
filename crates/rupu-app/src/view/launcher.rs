@@ -4,17 +4,13 @@
 //! Task 7 ships the skeleton (header + form-row stubs + footer stub
 //! + error band). Task 8 fills in per-widget rendering.
 //!
-//! # Text-input strategy (Option B)
+//! # Text-input strategy
 //!
-//! The GPUI text-input primitive (see `crates/gpui/examples/input.rs`) requires
-//! an `Entity<TextInput>` with a `FocusHandle` and must be rendered from a
-//! stateful `Render` impl — it is not compatible with the pure-function render
-//! pattern used here. For D-4 we therefore use **Option B**: text/number rows
-//! render the current value as styled text plus a small "(edit)" affordance.
-//! The `on_input_change` callback is still wired; a Task 18+ polish pass can
-//! promote text rows to a real text-input entity once the window model holds
-//! per-input `Entity<TextInput>` handles. All other widget kinds (checkbox,
-//! select pills, mode/target pickers) use the full click-dispatch path.
+//! Text and number rows embed real `Entity<TextInput>` handles stored on
+//! `LauncherState::text_inputs`. The entities are constructed by `open_launcher`
+//! (Task 4) which also subscribes to `ContentChanged` to forward values back
+//! into `LauncherState::inputs`. All other widget kinds (checkbox, select pills,
+//! mode/target pickers) use the click-dispatch callback path.
 
 use std::sync::Arc;
 
@@ -155,12 +151,16 @@ fn render_inputs_form(state: &LauncherState, on_input_change: InputChangeCb) -> 
                 def.required,
                 on_input_change.clone(),
             ),
-            rupu_orchestrator::InputType::String => {
-                render_text_row(name, &current, def.required, on_input_change.clone())
-            }
-            rupu_orchestrator::InputType::Int => {
-                render_number_row(name, &current, def.required, on_input_change.clone())
-            }
+            rupu_orchestrator::InputType::String => render_text_row(
+                name,
+                state.text_inputs.get(name).cloned(),
+                def.required,
+            ),
+            rupu_orchestrator::InputType::Int => render_number_row(
+                name,
+                state.text_inputs.get(name).cloned(),
+                def.required,
+            ),
             rupu_orchestrator::InputType::Bool => {
                 render_checkbox_row(name, &current, def.required, on_input_change.clone())
             }
@@ -170,24 +170,22 @@ fn render_inputs_form(state: &LauncherState, on_input_change: InputChangeCb) -> 
     form.into_any_element()
 }
 
-/// Render a text string input row (Option B: value label + "(edit)" affordance).
-/// A Task 18+ polish pass can promote this to a real Entity<TextInput>.
+/// Render a text input row: label + embedded `TextInput` entity.
 fn render_text_row(
     name: &str,
-    current: &str,
+    entity: Option<gpui::Entity<crate::widget::TextInput>>,
     required: bool,
-    on_input_change: InputChangeCb,
 ) -> AnyElement {
     let label = format_label(name, required);
-    let display = if current.is_empty() {
-        SharedString::from("—")
-    } else {
-        SharedString::from(current.to_owned())
+    let body: AnyElement = match entity {
+        Some(e) => div().flex_1().child(e).into_any_element(),
+        None => div()
+            .flex_1()
+            .text_color(palette::FAILED)
+            .text_sm()
+            .child(SharedString::from("input entity missing"))
+            .into_any_element(),
     };
-    // "(edit)" is a stub affordance; in a future polish pass this triggers
-    // an overlay or inline text-input entity.
-    let name_owned = name.to_owned();
-    let current_owned = current.to_owned();
     div()
         .flex()
         .flex_row()
@@ -200,50 +198,19 @@ fn render_text_row(
                 .text_sm()
                 .child(label),
         )
-        .child(
-            div()
-                .flex_1()
-                .text_color(palette::TEXT_PRIMARY)
-                .text_sm()
-                .child(display),
-        )
-        .child(
-            div()
-                .id(SharedString::from(format!("edit-{name_owned}")))
-                .px(px(6.0))
-                .py(px(2.0))
-                .border_1()
-                .border_color(palette::BORDER)
-                .text_color(palette::TEXT_MUTED)
-                .text_sm()
-                .cursor_pointer()
-                .child("edit")
-                // Stub: cycles through a placeholder toggle so the callback
-                // is exercised; real text entry deferred to Task 18+.
-                .on_click(move |_ev, window, cx| {
-                    // Toggle a placeholder so tests can see the callback fires.
-                    let next = if current_owned.is_empty() {
-                        "(value)".to_owned()
-                    } else {
-                        String::new()
-                    };
-                    on_input_change(name_owned.clone(), next, window, cx);
-                }),
-        )
+        .child(body)
         .into_any_element()
 }
 
-/// Render a numeric (Int) input row. Same Option B treatment as text.
+/// Render an integer input row. Same widget as text — validation lives in
+/// `rupu_orchestrator::resolve_inputs` which catches non-numeric strings on
+/// every keystroke via the `revalidate` call in the ContentChanged subscriber.
 fn render_number_row(
     name: &str,
-    current: &str,
+    entity: Option<gpui::Entity<crate::widget::TextInput>>,
     required: bool,
-    on_input_change: InputChangeCb,
 ) -> AnyElement {
-    // Numbers share the same Option B affordance as strings; the callback
-    // is still wired. A future polish pass can add an increment/decrement
-    // control or a real text-input entity here.
-    render_text_row(name, current, required, on_input_change)
+    render_text_row(name, entity, required)
 }
 
 /// Render a bool toggle as a clickable checkbox glyph.
@@ -366,7 +333,7 @@ fn render_footer(
         .items_center()
         .child(render_mode_picker(state.mode, on_mode_change))
         .child(render_target_picker(
-            &state.target,
+            state,
             on_target_change,
             on_pick_dir,
         ))
@@ -428,10 +395,11 @@ fn render_mode_picker(current: LauncherMode, on_mode_change: ModeChangeCb) -> An
 /// - "Pick directory…" → invokes `on_pick_dir` which opens NSOpenPanel
 /// - "Clone repo…" → sets target to Clone{NotStarted} via `on_target_change`
 fn render_target_picker(
-    current: &LauncherTarget,
+    state: &LauncherState,
     on_target_change: TargetChangeCb,
     on_pick_dir: PickDirCb,
 ) -> AnyElement {
+    let current = &state.target;
     // "This workspace" pill
     let is_workspace = matches!(current, LauncherTarget::ThisWorkspace);
     let cb_ws = on_target_change.clone();
@@ -499,13 +467,14 @@ fn render_target_picker(
             on_pick_dir(window, cx);
         });
 
-    // "Clone repo…" pill — label shows repo_ref when active
+    // "Clone repo…" pill — simplified status label; the repo_ref is typed in the
+    // embedded TextInput that appears below the pills row when Clone is active.
     let is_clone = matches!(current, LauncherTarget::Clone { .. });
-    let clone_label: SharedString = match current {
-        LauncherTarget::Clone { repo_ref, status } => match status {
-            CloneStatus::NotStarted => SharedString::from(format!("clone: {repo_ref}")),
+    let clone_status_label: SharedString = match current {
+        LauncherTarget::Clone { status, .. } => match status {
+            CloneStatus::NotStarted => SharedString::from("clone repo"),
             CloneStatus::InProgress => SharedString::from("cloning\u{2026}"),
-            CloneStatus::Done(_) => SharedString::from(format!("cloned: {repo_ref}")),
+            CloneStatus::Done(_) => SharedString::from("cloned"),
             CloneStatus::Failed(_) => SharedString::from("clone failed"),
         },
         _ => SharedString::from("clone repo\u{2026}"),
@@ -533,7 +502,7 @@ fn render_target_picker(
         })
         .text_sm()
         .cursor_pointer()
-        .child(clone_label)
+        .child(clone_status_label)
         .on_click(move |_ev, window, cx| {
             cb_clone(
                 LauncherTarget::Clone {
@@ -545,14 +514,23 @@ fn render_target_picker(
             );
         });
 
-    div()
-        .flex()
-        .flex_row()
-        .gap(px(4.0))
-        .child(pill_workspace)
-        .child(pill_dir)
-        .child(pill_clone)
-        .into_any_element()
+    // Wrap the three pills in a row, with the repo_ref TextInput appearing
+    // below the row when Clone is selected.
+    let mut col = div().flex().flex_col().gap(px(4.0)).child(
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(4.0))
+            .child(pill_workspace)
+            .child(pill_dir)
+            .child(pill_clone),
+    );
+    if is_clone {
+        if let Some(entity) = state.text_inputs.get("__repo_ref").cloned() {
+            col = col.child(div().w(px(280.0)).child(entity));
+        }
+    }
+    col.into_any_element()
 }
 
 /// Run button: greyed + non-interactive when `!can_run`.
