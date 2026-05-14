@@ -128,3 +128,61 @@ fn yaml_value_to_string(v: &serde_yaml::Value) -> Option<String> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rupu_orchestrator::{InputDef, InputType, Trigger, WorkflowDefaults, Contracts};
+
+    fn workflow_with_input(name: &str, ty: InputType, required: bool) -> Workflow {
+        let mut inputs = BTreeMap::new();
+        inputs.insert(
+            name.to_string(),
+            InputDef {
+                ty,
+                required,
+                default: None,
+                description: None,
+                allowed: vec![],
+            },
+        );
+        Workflow {
+            name: "test".to_string(),
+            description: None,
+            trigger: Trigger::default(),
+            inputs,
+            defaults: WorkflowDefaults::default(),
+            autoflow: None,
+            contracts: Contracts {
+                outputs: BTreeMap::new(),
+            },
+            notify_issue: false,
+            steps: vec![],
+        }
+    }
+
+    #[test]
+    fn set_input_then_revalidate_clears_error_when_required_input_provided() {
+        let wf = workflow_with_input("repo", InputType::String, true);
+        let mut state = LauncherState::new("/tmp/wf.yml".into(), wf);
+        // Required input is missing → validation should fail.
+        assert!(state.validation.is_some(), "expected validation error on init");
+        state.set_input("repo", "github:foo/bar");
+        state.revalidate();
+        assert!(
+            state.validation.is_none(),
+            "expected validation to clear once required input set, got {:?}",
+            state.validation
+        );
+    }
+
+    #[test]
+    fn set_input_with_empty_string_removes_the_entry() {
+        let wf = workflow_with_input("repo", InputType::String, false);
+        let mut state = LauncherState::new("/tmp/wf.yml".into(), wf);
+        state.set_input("repo", "value");
+        assert_eq!(state.inputs.get("repo").map(|s| s.as_str()), Some("value"));
+        state.set_input("repo", "");
+        assert!(state.inputs.get("repo").is_none());
+    }
+}
