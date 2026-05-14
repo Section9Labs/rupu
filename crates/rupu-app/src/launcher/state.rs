@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use rupu_orchestrator::Workflow;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LauncherState {
     pub workflow_path: PathBuf,
     pub workflow: Workflow,
@@ -14,6 +14,11 @@ pub struct LauncherState {
     pub mode: LauncherMode,
     pub target: LauncherTarget,
     pub validation: Option<ValidationError>,
+    /// One `Entity<TextInput>` per text/int workflow input, keyed by input name.
+    /// Plus the reserved key `"__repo_ref"` for the Clone target's repo ref.
+    /// Constructed in `WorkspaceWindow::open_launcher` because `cx.new` is
+    /// only callable with a mutable `App` context, not at struct-literal time.
+    pub text_inputs: BTreeMap<String, gpui::Entity<crate::widget::TextInput>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +78,7 @@ impl LauncherState {
             mode: LauncherMode::Ask,
             target: LauncherTarget::ThisWorkspace,
             validation: None,
+            text_inputs: BTreeMap::new(),
         };
         state.revalidate();
         state
