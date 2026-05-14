@@ -11,8 +11,8 @@ use crate::view::{ApproveCallback, RejectCallback};
 use crate::window::sidebar::{ActiveRunMap, SectionToggleCb, WorkflowClickCb};
 use crate::workspace::Workspace;
 use gpui::{
-    div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, WeakEntity,
-    Window, WindowBounds, WindowHandle, WindowOptions,
+    div, point, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,7 +50,16 @@ impl WorkspaceWindow {
         let bounds = Bounds::centered(None, size(px(1240.0), px(800.0)), cx);
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: None, // we draw our own titlebar inside the view
+            // appears_transparent = true keeps the custom titlebar we draw in
+            // `titlebar::render` (color chip + name + in-flight badge) while
+            // restoring the native macOS traffic-light controls. The 80px
+            // left-padding on the custom titlebar leaves room for the lights.
+            // Position mirrors Zed (crates/zed/src/zed.rs:352).
+            titlebar: Some(TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(9.0), px(9.0))),
+            }),
             ..Default::default()
         };
         let handle = cx
