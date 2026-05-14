@@ -16,6 +16,12 @@ pub struct WindowedRows {
 impl ViewportState {
     pub fn apply(&mut self, rows: Vec<String>, max_rows: usize) -> WindowedRows {
         let max_rows = max_rows.max(1);
+        let previous_total_rows = self.total_rows;
+        if self.scroll_from_bottom > 0 && rows.len() > previous_total_rows {
+            self.scroll_from_bottom = self
+                .scroll_from_bottom
+                .saturating_add(rows.len() - previous_total_rows);
+        }
         self.total_rows = rows.len();
         self.page_rows = max_rows;
         let max_offset = rows.len().saturating_sub(max_rows);
@@ -99,6 +105,31 @@ mod tests {
         ];
         viewport.jump_top();
         let window = viewport.apply(rows, 2);
+        assert_eq!(window.rows, vec!["row1".to_string(), "row2".to_string()]);
+    }
+
+    #[test]
+    fn viewport_keeps_oldest_visible_rows_when_history_grows() {
+        let mut viewport = ViewportState::default();
+        let rows = vec![
+            "row1".to_string(),
+            "row2".to_string(),
+            "row3".to_string(),
+            "row4".to_string(),
+        ];
+        viewport.jump_top();
+        let window = viewport.apply(rows, 2);
+        assert_eq!(window.rows, vec!["row1".to_string(), "row2".to_string()]);
+
+        let grown = vec![
+            "row1".to_string(),
+            "row2".to_string(),
+            "row3".to_string(),
+            "row4".to_string(),
+            "row5".to_string(),
+            "row6".to_string(),
+        ];
+        let window = viewport.apply(grown, 2);
         assert_eq!(window.rows, vec!["row1".to_string(), "row2".to_string()]);
     }
 }

@@ -22,10 +22,14 @@ async fn replaces_exact_match() {
         .unwrap();
     assert!(out.error.is_none(), "edit failed: {:?}", out.error);
     tmp.child("src.txt").assert("foo\nBAR\nbaz\n");
-    let DerivedEvent::FileEdit { kind, .. } = out.derived.unwrap() else {
+    let DerivedEvent::FileEdit { kind, diff, .. } = out.derived.unwrap() else {
         panic!()
     };
     assert_eq!(kind, "modify");
+    assert!(diff.contains("--- a/src.txt"));
+    assert!(diff.contains("+++ b/src.txt"));
+    assert!(diff.contains("-bar"));
+    assert!(diff.contains("+BAR"));
 }
 
 #[tokio::test]

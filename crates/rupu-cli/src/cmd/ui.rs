@@ -516,6 +516,14 @@ pub fn highlight_json(text: &str, prefs: &UiPrefs) -> String {
     highlight_with_extension(text, "json", prefs).unwrap_or_else(|| text.to_string())
 }
 
+/// Highlight a TOML buffer.
+pub fn highlight_toml(text: &str, prefs: &UiPrefs) -> String {
+    if !prefs.use_color() {
+        return text.to_string();
+    }
+    highlight_with_extension(text, "toml", prefs).unwrap_or_else(|| text.to_string())
+}
+
 /// Highlight a unified diff buffer.
 pub fn highlight_diff(text: &str, prefs: &UiPrefs) -> String {
     if !prefs.use_color() {

@@ -34,7 +34,10 @@ use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, Key
 use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use rupu_orchestrator::{FindingRecord, ItemResultRecord, RunRecord, StepKind, StepResultRecord};
+use rupu_app_canvas::{render_rows as render_workflow_graph, GraphCell, GraphRow, NodeStatus};
+use rupu_orchestrator::{
+    FindingRecord, ItemResultRecord, RunRecord, StepKind, StepResultRecord, Workflow,
+};
 use rupu_transcript::Event as TxEvent;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
@@ -115,6 +118,8 @@ enum WorkflowViewLineKind {
 
 struct WorkflowInteractiveState {
     seen_step_results: usize,
+    workflow: Option<Workflow>,
+    step_results: BTreeMap<String, StepResultRecord>,
     followed_step_id: Option<String>,
     followed_transcript_path: Option<PathBuf>,
     tailer: Option<TranscriptTailer>,
@@ -126,9 +131,11 @@ struct WorkflowInteractiveState {
 }
 
 impl WorkflowInteractiveState {
-    fn new(skip_count: usize) -> Self {
+    fn new(skip_count: usize, workflow: Option<Workflow>) -> Self {
         Self {
             seen_step_results: skip_count,
+            workflow,
+            step_results: BTreeMap::new(),
             followed_step_id: None,
             followed_transcript_path: None,
             tailer: None,
@@ -531,6 +538,7 @@ pub fn attach_and_render_interactive_with(
     let (final_outcome, final_record, final_tokens) = {
         let _raw_mode = WorkflowRawModeGuard::enter()?;
         let _screen = WorkflowScreenGuard::enter()?;
+        let workflow = load_workflow_definition(&run_dir);
         let prefs = retained_workflow_ui_prefs().unwrap_or_else(|_| {
             UiPrefs::resolve(
                 &rupu_config::UiConfig::default(),
@@ -541,7 +549,7 @@ pub fn attach_and_render_interactive_with(
             )
         });
         let mut view_mode = opts.view_mode;
-        let mut state = WorkflowInteractiveState::new(opts.skip_count);
+        let mut state = WorkflowInteractiveState::new(opts.skip_count, workflow.clone());
         let mut last_rows: Vec<String> = Vec::new();
 
         loop {
@@ -581,6 +589,7 @@ pub fn attach_and_render_interactive_with(
                                                 opts.skip_count,
                                                 view_mode,
                                                 &prefs,
+                                                workflow.clone(),
                                             );
                                             state.viewport = viewport;
                                         }
@@ -656,6 +665,7 @@ pub fn attach_and_render_interactive_with(
                                                 opts.skip_count,
                                                 view_mode,
                                                 &prefs,
+                                                workflow.clone(),
                                             );
                                             state.viewport = viewport;
                                         }
@@ -720,8 +730,9 @@ fn rebuild_workflow_interactive_state(
     skip_count: usize,
     view_mode: LiveViewMode,
     prefs: &UiPrefs,
+    workflow: Option<Workflow>,
 ) -> WorkflowInteractiveState {
-    let mut state = WorkflowInteractiveState::new(skip_count);
+    let mut state = WorkflowInteractiveState::new(skip_count, workflow);
     replay_step_results_interactive(step_results_log, &mut state, view_mode, prefs);
     follow_active_transcript(record, &mut state, view_mode, prefs);
     drain_workflow_transcript_events(&mut state, view_mode, prefs);
@@ -733,6 +744,11 @@ fn rebuild_workflow_interactive_state(
 fn load_run_record(run_json: &Path) -> Option<RunRecord> {
     let bytes = std::fs::read(run_json).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn load_workflow_definition(run_dir: &Path) -> Option<Workflow> {
+    let yaml = std::fs::read_to_string(run_dir.join("workflow.yaml")).ok()?;
+    Workflow::parse(&yaml).ok()
 }
 
 fn follow_active_transcript(
@@ -781,6 +797,7 @@ fn replay_step_results_interactive(
     let records = load_step_result_records(log);
     state.seen_step_results = records.len();
     for rec in records {
+        state.step_results.insert(rec.step_id.clone(), rec.clone());
         if rec.skipped {
             state.push_line(UiStatus::Skipped, format!("skipped  ·  {}", rec.step_id));
             continue;
@@ -968,6 +985,7 @@ fn drain_step_results_interactive(
         let Ok(rec): Result<StepResultRecord, _> = serde_json::from_slice(line) else {
             continue;
         };
+        state.step_results.insert(rec.step_id.clone(), rec.clone());
         if rec.skipped {
             state.push_line(UiStatus::Skipped, format!("skipped  ·  {}", rec.step_id));
             continue;
@@ -1249,7 +1267,12 @@ fn workflow_transcript_event_lines(
                         }),
                     LiveViewMode::Compact => {}
                     LiveViewMode::Full => {
-                        let highlighted = render_payload(content.trim(), prefs).rendered;
+                        let highlighted =
+                            crate::output::rich_payload::render_assistant_content(
+                                content.trim(),
+                                prefs,
+                            )
+                            .rendered;
                         let mut lines = highlighted.split('\n');
                         if let Some(first) = lines.next() {
                             out.push(WorkflowViewLine {
@@ -1361,17 +1384,40 @@ fn workflow_transcript_event_lines(
                 }
             }
         }
-        TxEvent::FileEdit { path, kind, .. } => vec![WorkflowViewLine {
-            status: UiStatus::Complete,
-            text: retained_workflow_event_line(
-                UiStatus::Complete,
-                "file edit",
-                &format!("{} {}", format!("{kind:?}").to_lowercase(), path),
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
+        TxEvent::FileEdit { path, kind, diff } => match view_mode {
+            LiveViewMode::Focused | LiveViewMode::Compact => vec![WorkflowViewLine {
+                status: UiStatus::Complete,
+                text: retained_workflow_event_line(
+                    UiStatus::Complete,
+                    "file edit",
+                    &format!("{} {}", format!("{kind:?}").to_lowercase(), path),
+                ),
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }],
+            LiveViewMode::Full => {
+                let payload = render_payload(diff, prefs);
+                let mut out = vec![WorkflowViewLine {
+                    status: UiStatus::Complete,
+                    text: retained_workflow_event_line(
+                        UiStatus::Complete,
+                        "file edit",
+                        &format!(
+                            "{} {}  ·  {}",
+                            format!("{kind:?}").to_lowercase(),
+                            path,
+                            payload.headline
+                        ),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                    kind: WorkflowViewLineKind::Event,
+                }];
+                out.extend(retained_payload_lines(&payload, UiStatus::Complete, 1));
+                out
+            }
+        },
         TxEvent::CommandRun {
             argv,
             cwd,
@@ -1988,6 +2034,23 @@ fn build_workflow_screen_rows_for_size(
     rows.push(String::new());
 
     let footer_reserved = 2usize;
+    let body_capacity = height
+        .saturating_sub(rows.len())
+        .saturating_sub(footer_reserved)
+        .max(1);
+    if matches!(view_mode, LiveViewMode::Focused | LiveViewMode::Compact) {
+        let max_graph_rows = body_capacity
+            .saturating_sub(4)
+            .min(if view_mode == LiveViewMode::Focused { 10 } else { 7 });
+        let graph_rows =
+            render_workflow_graph_block(&state.workflow, &state.step_results, record, width, max_graph_rows);
+        if !graph_rows.is_empty() {
+            rows.push(render_workflow_graph_title_line(width));
+            rows.extend(graph_rows);
+            rows.push(String::new());
+        }
+    }
+
     let available_event_rows = height
         .saturating_sub(rows.len())
         .saturating_sub(footer_reserved)
@@ -2002,6 +2065,158 @@ fn build_workflow_screen_rows_for_size(
     rows.push(render_workflow_status_line(record, state, view_mode, width));
     rows.truncate(height);
     rows
+}
+
+fn render_workflow_graph_title_line(width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, "graph", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        "  ·  workflow topology with live step state",
+        DIM,
+    );
+    truncate_workflow_ansi_line(&buf, width)
+}
+
+fn render_workflow_graph_block(
+    workflow: &Option<Workflow>,
+    step_results: &BTreeMap<String, StepResultRecord>,
+    record: &RunRecord,
+    width: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    let Some(workflow) = workflow.as_ref() else {
+        return Vec::new();
+    };
+    let rows = render_workflow_graph(workflow, |node_id| {
+        workflow_node_status(node_id, workflow, step_results, record)
+    });
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut rendered = rows
+        .iter()
+        .map(|row| truncate_workflow_ansi_line(&render_graph_row(row), width))
+        .collect::<Vec<_>>();
+    if rendered.len() > max_rows {
+        let hidden = rendered.len() - max_rows + 1;
+        rendered.truncate(max_rows.saturating_sub(1));
+        let mut line = String::new();
+        let _ = palette::write_colored(&mut line, "…", DIM);
+        let _ = palette::write_colored(
+            &mut line,
+            &format!(" {hidden} more graph row(s)"),
+            DIM,
+        );
+        rendered.push(truncate_workflow_ansi_line(&line, width));
+    }
+    rendered
+}
+
+fn workflow_node_status(
+    node_id: &str,
+    workflow: &Workflow,
+    step_results: &BTreeMap<String, StepResultRecord>,
+    record: &RunRecord,
+) -> NodeStatus {
+    if record.awaiting_step_id.as_deref() == Some(node_id) {
+        return NodeStatus::Awaiting;
+    }
+    if record.active_step_id.as_deref() == Some(node_id) {
+        return NodeStatus::Working;
+    }
+    if let Some(step) = workflow.steps.iter().find(|step| step.id == node_id) {
+        if let Some(rec) = step_results.get(&step.id) {
+            return step_record_status(rec);
+        }
+        return NodeStatus::Waiting;
+    }
+    if let Some((_, parent)) = step_results.iter().find(|(_, rec)| {
+        rec.items
+            .iter()
+            .any(|item| item.sub_id == node_id || item_input_label(&item.item) == node_id)
+    }) {
+        if let Some(item) = parent
+            .items
+            .iter()
+            .find(|item| item.sub_id == node_id || item_input_label(&item.item) == node_id)
+        {
+            return if item.success {
+                NodeStatus::Complete
+            } else {
+                NodeStatus::Failed
+            };
+        }
+    }
+    NodeStatus::Waiting
+}
+
+fn step_record_status(record: &StepResultRecord) -> NodeStatus {
+    if record.skipped {
+        NodeStatus::Skipped
+    } else if record.success {
+        NodeStatus::Complete
+    } else {
+        NodeStatus::Failed
+    }
+}
+
+fn render_graph_row(row: &GraphRow) -> String {
+    let anchor_status = row
+        .anchor_status()
+        .map(node_status_ui_status)
+        .unwrap_or(UiStatus::Waiting);
+    let mut buf = String::new();
+    for cell in &row.cells {
+        match cell {
+            GraphCell::Pipe(status) => {
+                let _ = palette::write_colored(
+                    &mut buf,
+                    "│",
+                    node_status_ui_status(*status).color(),
+                );
+            }
+            GraphCell::Branch(branch, status) => {
+                let _ = palette::write_colored(
+                    &mut buf,
+                    branch.as_str(),
+                    node_status_ui_status(*status).color(),
+                );
+            }
+            GraphCell::Bullet(status) => {
+                let _ = palette::write_bold_colored(
+                    &mut buf,
+                    &node_status_ui_status(*status).glyph().to_string(),
+                    node_status_ui_status(*status).color(),
+                );
+            }
+            GraphCell::Space(n) => buf.push_str(&" ".repeat(*n as usize)),
+            GraphCell::Label(label) => {
+                let _ = palette::write_bold_colored(&mut buf, label, anchor_status.color());
+            }
+            GraphCell::Meta(meta) => {
+                let _ = palette::write_colored(&mut buf, meta, DIM);
+            }
+        }
+    }
+    buf
+}
+
+fn node_status_ui_status(status: NodeStatus) -> UiStatus {
+    match status {
+        NodeStatus::Waiting => UiStatus::Waiting,
+        NodeStatus::Active => UiStatus::Active,
+        NodeStatus::Working => UiStatus::Working,
+        NodeStatus::Complete => UiStatus::Complete,
+        NodeStatus::Failed => UiStatus::Failed,
+        NodeStatus::SoftFailed => UiStatus::SoftFailed,
+        NodeStatus::Awaiting => UiStatus::Awaiting,
+        NodeStatus::Retrying => UiStatus::Retrying,
+        NodeStatus::Skipped => UiStatus::Skipped,
+    }
 }
 
 fn render_workflow_controls_line(status: rupu_orchestrator::RunStatus, width: usize) -> String {
@@ -3527,7 +3742,7 @@ mod tests {
             None,
             Some(LiveViewMode::Focused),
         );
-        let mut state = WorkflowInteractiveState::new(0);
+        let mut state = WorkflowInteractiveState::new(0, None);
         state.push_line(
             UiStatus::Active,
             "assistant output  ·  this is a deliberately long workflow event line that should wrap cleanly inside the retained workflow screen",
@@ -3556,7 +3771,7 @@ mod tests {
             None,
             Some(LiveViewMode::Focused),
         );
-        let mut state = WorkflowInteractiveState::new(0);
+        let mut state = WorkflowInteractiveState::new(0, None);
         for index in 0..800 {
             state.push_line(UiStatus::Active, format!("workflow line {index:03}"));
         }
@@ -3639,6 +3854,7 @@ mod tests {
             0,
             LiveViewMode::Focused,
             &prefs,
+            None,
         );
         assert!(state.lines.iter().any(|line| line.text.contains("understand")));
         assert!(state
@@ -3860,7 +4076,7 @@ mod tests {
             None,
             Some(LiveViewMode::Full),
         );
-        let mut state = WorkflowInteractiveState::new(0);
+        let mut state = WorkflowInteractiveState::new(0, None);
         append_step_result_lines(&mut state, &rec, LiveViewMode::Full, &prefs);
         assert!(state
             .lines
@@ -3873,6 +4089,53 @@ mod tests {
         assert!(state.lines.iter().any(|line| line.indent >= 2));
         let rendered = render_workflow_event_rows(&mut state, 120, 20);
         assert!(rendered.iter().any(|row| row.contains("├─")));
+    }
+
+    #[test]
+    fn focused_workflow_screen_includes_graph_section() {
+        let mut record = sample_run_record();
+        record.active_step_id = Some("review_panel".into());
+        let workflow = Workflow::parse(
+            r#"
+name: demo
+steps:
+  - id: classify
+    agent: issue-reader
+    actions: []
+    prompt: hi
+  - id: review_panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - perf-reviewer
+      subject: review
+"#,
+        )
+        .unwrap();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let mut state = WorkflowInteractiveState::new(0, Some(workflow));
+        let rows = build_workflow_screen_rows_for_size(
+            "demo",
+            &record,
+            &mut state,
+            LiveViewMode::Focused,
+            &prefs,
+            80,
+            20,
+        );
+        assert!(rows.iter().any(|row| row.contains("graph")));
+        assert!(rows.iter().any(|row| row.contains("review_panel")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("security-reviewer") || row.contains("perf-reviewer")));
+        assert!(rows.iter().any(|row| row.contains("╭─")));
     }
 
     #[test]

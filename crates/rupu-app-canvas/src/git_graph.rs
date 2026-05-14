@@ -109,24 +109,10 @@ where
 
         if let Some(panel) = &step.panel {
             emit_panel_step(&mut rows, &step.id, &panel.panelists, &status_lookup);
-        } else if step.parallel.is_some() {
-            // Parallel: rendered as a single linear-shaped row with
-            // kind in meta. Proper sub-step branching lands in D-3.
-            let n = step.parallel.as_ref().map(|p| p.len()).unwrap_or(0);
-            emit_linear_step(
-                &mut rows,
-                &step.id,
-                format!("parallel · {n} sub-steps"),
-                &status_lookup,
-            );
+        } else if let Some(subs) = &step.parallel {
+            emit_parallel_step(&mut rows, &step.id, subs, &status_lookup);
         } else if step.for_each.is_some() {
-            // ForEach: same — proper per-item branching lands in D-3.
-            emit_linear_step(
-                &mut rows,
-                &step.id,
-                "for_each · runtime fan-out".into(),
-                &status_lookup,
-            );
+            emit_for_each_step(&mut rows, &step.id, &status_lookup);
         } else {
             // Plain linear step. agent may be None if the step uses
             // some other mode (dispatch agent in-prompt etc.); render
@@ -137,6 +123,129 @@ where
     }
 
     rows
+}
+
+fn emit_parallel_step<F: Fn(&str) -> NodeStatus>(
+    rows: &mut Vec<GraphRow>,
+    step_id: &str,
+    sub_steps: &[rupu_orchestrator::SubStep],
+    status_lookup: &F,
+) {
+    let step_status = status_lookup(step_id);
+    let n = sub_steps.len();
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Branch(BranchGlyph::Mid, step_status),
+            GraphCell::Branch(BranchGlyph::Top, step_status),
+            GraphCell::Space(1),
+            GraphCell::Label(step_id.to_string()),
+            GraphCell::Space(2),
+            GraphCell::Meta(format!(
+                "parallel · {n} sub-step{}",
+                if n == 1 { "" } else { "s" }
+            )),
+        ],
+        anchor: Some((step_id.to_string(), step_status)),
+    });
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(step_status),
+            GraphCell::Space(1),
+            GraphCell::Pipe(step_status),
+        ],
+        anchor: None,
+    });
+    for sub in sub_steps {
+        let sub_status = status_lookup(&sub.id);
+        let mut cells = vec![
+            GraphCell::Pipe(step_status),
+            GraphCell::Space(1),
+            GraphCell::Bullet(sub_status),
+            GraphCell::Branch(BranchGlyph::Mid, sub_status),
+            GraphCell::Space(1),
+            GraphCell::Label(sub.id.clone()),
+        ];
+        if !sub.agent.is_empty() {
+            cells.push(GraphCell::Space(2));
+            cells.push(GraphCell::Meta(sub.agent.clone()));
+        }
+        rows.push(GraphRow {
+            cells,
+            anchor: Some((sub.id.clone(), sub_status)),
+        });
+    }
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(step_status),
+            GraphCell::Space(1),
+            GraphCell::Pipe(step_status),
+        ],
+        anchor: None,
+    });
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(step_status),
+            GraphCell::Space(1),
+            GraphCell::Branch(BranchGlyph::Merge, step_status),
+            GraphCell::Branch(BranchGlyph::Bot, step_status),
+        ],
+        anchor: None,
+    });
+}
+
+fn emit_for_each_step<F: Fn(&str) -> NodeStatus>(
+    rows: &mut Vec<GraphRow>,
+    step_id: &str,
+    status_lookup: &F,
+) {
+    let step_status = status_lookup(step_id);
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Branch(BranchGlyph::Mid, step_status),
+            GraphCell::Branch(BranchGlyph::Top, step_status),
+            GraphCell::Space(1),
+            GraphCell::Label(step_id.to_string()),
+            GraphCell::Space(2),
+            GraphCell::Meta("for_each · runtime fan-out".into()),
+        ],
+        anchor: Some((step_id.to_string(), step_status)),
+    });
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(step_status),
+            GraphCell::Space(1),
+            GraphCell::Pipe(step_status),
+        ],
+        anchor: None,
+    });
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(step_status),
+            GraphCell::Space(1),
+            GraphCell::Bullet(NodeStatus::Waiting),
+            GraphCell::Branch(BranchGlyph::Mid, NodeStatus::Waiting),
+            GraphCell::Space(1),
+            GraphCell::Label("runtime items".into()),
+        ],
+        anchor: None,
+    });
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(step_status),
+            GraphCell::Space(1),
+            GraphCell::Pipe(step_status),
+        ],
+        anchor: None,
+    });
+    rows.push(GraphRow {
+        cells: vec![
+            GraphCell::Pipe(step_status),
+            GraphCell::Space(1),
+            GraphCell::Branch(BranchGlyph::Merge, step_status),
+            GraphCell::Branch(BranchGlyph::Bot, step_status),
+        ],
+        anchor: None,
+    });
 }
 
 /// Emit a single linear-step row: `● <step_id>   <meta>`.
@@ -395,5 +504,41 @@ steps:
             .cells
             .iter()
             .any(|c| matches!(c, GraphCell::Label(s) if s == "x")));
+    }
+
+    #[test]
+    fn parallel_step_emits_nested_substeps() {
+        let wf = parse(
+            r#"
+name: p
+steps:
+  - id: gather
+    parallel:
+      - id: spec
+        agent: writer
+        prompt: hi
+      - id: verify
+        agent: reviewer
+        prompt: hi
+    actions: []
+"#,
+        );
+        let rows = render_rows(&wf, |_| NodeStatus::Waiting);
+        assert!(rows
+            .iter()
+            .any(|row| row
+                .cells
+                .iter()
+                .any(|cell| matches!(cell, GraphCell::Label(label) if label == "spec"))));
+        assert!(rows
+            .iter()
+            .any(|row| row
+                .cells
+                .iter()
+                .any(|cell| matches!(cell, GraphCell::Label(label) if label == "verify"))));
+        assert!(rows.iter().any(|row| row
+            .cells
+            .iter()
+            .any(|cell| matches!(cell, GraphCell::Branch(BranchGlyph::Merge, _)))));
     }
 }

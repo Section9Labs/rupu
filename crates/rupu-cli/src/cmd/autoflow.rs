@@ -2312,7 +2312,7 @@ fn retained_serve_controls_line(width: usize) -> String {
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
     let _ = palette::write_colored(
         &mut buf,
-        "  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  Ctrl-C quit",
+        "  f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  Ctrl-C quit",
         DIM,
     );
     truncate_retained_ansi_line(&buf, width)
@@ -2580,7 +2580,12 @@ fn live_run_event_lines(
                 LiveViewMode::Compact => Vec::new(),
                 LiveViewMode::Full => {
                     let prefs = retained_serve_ui_prefs();
-                    let highlighted = render_payload(content.trim(), &prefs).rendered;
+                    let highlighted =
+                        crate::output::rich_payload::render_assistant_content(
+                            content.trim(),
+                            &prefs,
+                        )
+                        .rendered;
                     let mut out = Vec::new();
                     for (index, line) in highlighted.lines().enumerate() {
                         out.push(AutoflowServeViewLine {
@@ -2689,32 +2694,71 @@ fn live_run_event_lines(
                 }
             }
         }
+        TranscriptEvent::FileEdit { path, kind, diff } => {
+            let prefs = retained_serve_ui_prefs();
+            match view_mode {
+                LiveViewMode::Focused | LiveViewMode::Compact => vec![AutoflowServeViewLine {
+                    status: UiStatus::Complete,
+                    text: format!("file edit  ·  {} {}", format!("{kind:?}").to_lowercase(), path),
+                    continuation: false,
+                }],
+                LiveViewMode::Full => {
+                    let payload = render_payload(diff, &prefs);
+                    let mut out = vec![AutoflowServeViewLine {
+                        status: UiStatus::Complete,
+                        text: format!(
+                            "file edit  ·  {} {}  ·  {}",
+                            format!("{kind:?}").to_lowercase(),
+                            path,
+                            payload.headline
+                        ),
+                        continuation: false,
+                    }];
+                    out.extend(payload.rendered.lines().map(|line| AutoflowServeViewLine {
+                        status: UiStatus::Complete,
+                        text: line.to_string(),
+                        continuation: true,
+                    }));
+                    out
+                }
+            }
+        }
         TranscriptEvent::Usage {
             provider,
             model,
             input_tokens,
             output_tokens,
             cached_tokens,
-        } => vec![AutoflowServeViewLine {
-            status: UiStatus::Active,
-            text: format!(
-                "usage  ·  {provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
-            ),
-            continuation: false,
-        }],
+        } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![AutoflowServeViewLine {
+                status: UiStatus::Active,
+                text: format!(
+                    "usage  ·  {provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+                ),
+                continuation: false,
+            }]
+        }
         TranscriptEvent::TurnEnd {
             turn_idx,
             tokens_in,
             tokens_out,
-        } => vec![AutoflowServeViewLine {
-            status: UiStatus::Complete,
-            text: format!(
-                "turn complete  ·  turn {turn_idx}  ·  in {} out {}",
-                tokens_in.unwrap_or(0),
-                tokens_out.unwrap_or(0)
-            ),
-            continuation: false,
-        }],
+        } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![AutoflowServeViewLine {
+                status: UiStatus::Complete,
+                text: format!(
+                    "turn complete  ·  turn {turn_idx}  ·  in {} out {}",
+                    tokens_in.unwrap_or(0),
+                    tokens_out.unwrap_or(0)
+                ),
+                continuation: false,
+            }]
+        }
         TranscriptEvent::RunComplete {
             status,
             total_tokens,

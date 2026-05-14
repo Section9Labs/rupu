@@ -1802,30 +1802,40 @@ fn transcript_event_lines(
             mode,
             started_at,
             ..
-        } => vec![SessionViewLine {
-            status: Status::Active,
-            text: retained_session_event_line(
-                Status::Active,
-                "run started",
-                &format!(
-                    "{}  ·  workspace {}  ·  mode {}  ·  {}",
-                    compact_session_run_id(run_id),
-                    workspace_id,
-                    format!("{mode:?}").to_lowercase(),
-                    started_at.format("%Y-%m-%d %H:%M:%S UTC")
+        } => {
+            if view_mode == LiveViewMode::Compact {
+                return Vec::new();
+            }
+            vec![SessionViewLine {
+                status: Status::Active,
+                text: retained_session_event_line(
+                    Status::Active,
+                    "run started",
+                    &format!(
+                        "{}  ·  workspace {}  ·  mode {}  ·  {}",
+                        compact_session_run_id(run_id),
+                        workspace_id,
+                        format!("{mode:?}").to_lowercase(),
+                        started_at.format("%Y-%m-%d %H:%M:%S UTC")
+                    ),
                 ),
-            ),
-            continuation: false,
-        }],
-        TranscriptEvent::TurnStart { turn_idx } => vec![SessionViewLine {
-            status: Status::Working,
-            text: retained_session_event_line(
-                Status::Working,
-                &format!("turn {turn_idx}"),
-                "assistant turn started",
-            ),
-            continuation: false,
-        }],
+                continuation: false,
+            }]
+        }
+        TranscriptEvent::TurnStart { turn_idx } => {
+            if view_mode == LiveViewMode::Compact {
+                return Vec::new();
+            }
+            vec![SessionViewLine {
+                status: Status::Working,
+                text: retained_session_event_line(
+                    Status::Working,
+                    &format!("turn {turn_idx}"),
+                    "assistant turn started",
+                ),
+                continuation: false,
+            }]
+        }
         TranscriptEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -1852,7 +1862,12 @@ fn transcript_event_lines(
                     }),
                     LiveViewMode::Compact => {}
                     LiveViewMode::Full => {
-                        let highlighted = render_payload(content.trim(), prefs).rendered;
+                        let highlighted =
+                            crate::output::rich_payload::render_assistant_content(
+                                content.trim(),
+                                prefs,
+                            )
+                            .rendered;
                         let mut lines = highlighted.split('\n');
                         if let Some(first) = lines.next() {
                             out.push(SessionViewLine {
@@ -1956,15 +1971,42 @@ fn transcript_event_lines(
                 }
             }
         }
-        TranscriptEvent::FileEdit { path, kind, .. } => vec![SessionViewLine {
-            status: Status::Complete,
-            text: retained_session_event_line(
-                Status::Complete,
-                "file edit",
-                &format!("{} {}", format!("{kind:?}").to_lowercase(), path),
-            ),
-            continuation: false,
-        }],
+        TranscriptEvent::FileEdit { path, kind, diff } => match view_mode {
+            LiveViewMode::Focused | LiveViewMode::Compact => vec![SessionViewLine {
+                status: Status::Complete,
+                text: retained_session_event_line(
+                    Status::Complete,
+                    "file edit",
+                    &format!("{} {}", format!("{kind:?}").to_lowercase(), path),
+                ),
+                continuation: false,
+            }],
+            LiveViewMode::Full => {
+                let payload = render_payload(diff, prefs);
+                let mut out = vec![SessionViewLine {
+                    status: Status::Complete,
+                    text: retained_session_event_line(
+                        Status::Complete,
+                        "file edit",
+                        &format!(
+                            "{} {}  ·  {}",
+                            format!("{kind:?}").to_lowercase(),
+                            path,
+                            payload.headline
+                        ),
+                    ),
+                    continuation: false,
+                }];
+                for line in session_rich_payload_lines(&payload) {
+                    out.push(SessionViewLine {
+                        status: Status::Complete,
+                        text: line,
+                        continuation: true,
+                    });
+                }
+                out
+            }
+        },
         TranscriptEvent::CommandRun {
             argv,
             cwd,
@@ -2052,36 +2094,46 @@ fn transcript_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
-        } => vec![SessionViewLine {
-            status: Status::Complete,
-            text: retained_session_event_line(
-                Status::Complete,
-                "turn complete",
-                &format!(
-                    "turn {turn_idx}  ·  in {} out {}",
-                tokens_in.unwrap_or(0),
-                tokens_out.unwrap_or(0)
+        } => {
+            if view_mode == LiveViewMode::Compact {
+                return Vec::new();
+            }
+            vec![SessionViewLine {
+                status: Status::Complete,
+                text: retained_session_event_line(
+                    Status::Complete,
+                    "turn complete",
+                    &format!(
+                        "turn {turn_idx}  ·  in {} out {}",
+                        tokens_in.unwrap_or(0),
+                        tokens_out.unwrap_or(0)
+                    ),
                 ),
-            ),
-            continuation: false,
-        }],
+                continuation: false,
+            }]
+        }
         TranscriptEvent::Usage {
             provider,
             model,
             input_tokens,
             output_tokens,
             cached_tokens,
-        } => vec![SessionViewLine {
-            status: Status::Active,
-            text: retained_session_event_line_raw(
-                Status::Active,
-                "usage",
-                &format!(
-                    "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+        } => {
+            if view_mode == LiveViewMode::Compact {
+                return Vec::new();
+            }
+            vec![SessionViewLine {
+                status: Status::Active,
+                text: retained_session_event_line_raw(
+                    Status::Active,
+                    "usage",
+                    &format!(
+                        "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+                    ),
                 ),
-            ),
-            continuation: false,
-        }],
+                continuation: false,
+            }]
+        }
         TranscriptEvent::RunComplete {
             status,
             total_tokens,

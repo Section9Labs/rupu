@@ -19,6 +19,7 @@ use super::palette::{
     self, Status, AWAITING, BRAND, BRAND_300, COMPLETE, DIM, FAILED, RUNNING, SEPARATOR, TOOL_ARROW,
 };
 use super::spinner::{Spinner, SpinnerHandle};
+use crate::cmd::ui::UiPrefs;
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal;
@@ -644,6 +645,10 @@ impl LineStreamPrinter {
                 self.out(&buf);
             }
         }
+    }
+
+    pub fn prefs(&self) -> &UiPrefs {
+        &self.prefs
     }
 
     /// Tool call: `│  → <tool>  <summary>`
