@@ -91,6 +91,7 @@ insta = { version = "1", features = ["yaml"] }
 
 minijinja = "2"
 dirs = "5"
+unicode-segmentation = "1.10"
 walkdir = "2"
 which = "6"
 whoami = "1"
