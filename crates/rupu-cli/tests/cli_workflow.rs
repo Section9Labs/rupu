@@ -6,6 +6,7 @@
 
 use assert_cmd::Command as AssertCommand;
 use assert_fs::prelude::*;
+use predicates::prelude::PredicateBooleanExt;
 use std::process::Command;
 use tokio::sync::Mutex;
 
@@ -223,6 +224,49 @@ async fn workflow_run_executes_one_step_via_mock() {
     let workers = worker_store.list().unwrap();
     assert_eq!(workers.len(), 1, "expected exactly one persisted worker");
     assert_eq!(workers[0].worker_id, runs[0].worker_id.clone().unwrap());
+}
+
+#[tokio::test]
+async fn workflow_run_supports_focused_and_full_view_modes() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/echo.md")
+        .write_str("---\nname: echo\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\nyou echo.")
+        .unwrap();
+    global.child("workflows").create_dir_all().unwrap();
+    global
+        .child("workflows/hello-wf.yaml")
+        .write_str(WORKFLOW_YAML)
+        .unwrap();
+
+    let project = assert_fs::TempDir::new().unwrap();
+
+    AssertCommand::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .env("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT)
+        .current_dir(project.path())
+        .args(["workflow", "run", "hello-wf", "--mode", "bypass"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("assistant output"));
+
+    AssertCommand::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .env("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT)
+        .current_dir(project.path())
+        .args([
+            "workflow", "run", "hello-wf", "--mode", "bypass", "--view", "full",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("step output"))
+        .stdout(predicates::str::contains("assistant output").not());
 }
 
 #[tokio::test]

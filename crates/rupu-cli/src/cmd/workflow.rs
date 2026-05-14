@@ -11,6 +11,7 @@
 //! step's `agent:` field is honored (no hardcoded agent name).
 
 use crate::cmd::completers::workflow_names;
+use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
 use crate::output::palette::Status as UiStatus;
 use crate::output::report::{self, CollectionOutput, DetailOutput, EventOutput};
@@ -112,6 +113,9 @@ pub enum Action {
         /// Override permission mode (`ask` | `bypass` | `readonly`).
         #[arg(long)]
         mode: Option<String>,
+        /// Control live output density (`focused` | `full`).
+        #[arg(long, value_enum)]
+        view: Option<LiveViewMode>,
     },
     /// List recent workflow runs from the persistent run-store
     /// (`<global>/runs/`). Newest first.
@@ -198,7 +202,8 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             target,
             input,
             mode,
-        } => run(&name, target.as_deref(), input, mode.as_deref(), None).await,
+            view,
+        } => run(&name, target.as_deref(), input, mode.as_deref(), None, view).await,
         Action::Runs {
             limit,
             status,
@@ -1366,6 +1371,7 @@ pub struct ExplicitWorkflowRunContext {
     pub worker: Option<ExecutionWorkerContext>,
     pub live_event_hook: Option<crate::output::workflow_printer::LiveWorkflowEventHook>,
     pub shared_printer: Option<Arc<Mutex<crate::output::LineStreamPrinter>>>,
+    pub live_view: LiveViewMode,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1411,7 +1417,7 @@ pub async fn run_by_name(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event, false, None).await
+    run_with_outcome(name, None, inputs, mode, event, false, None, None).await
 }
 
 /// Variant of [`run_by_name`] that pins the run-id. Used by the
@@ -1427,7 +1433,7 @@ pub async fn run_by_name_with_run_id(
     event: Option<serde_json::Value>,
     run_id: String,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event, false, Some(run_id)).await
+    run_with_outcome(name, None, inputs, mode, event, false, Some(run_id), None).await
 }
 
 /// Run a specific workflow file using the same execution pipeline as
@@ -1452,6 +1458,7 @@ pub async fn run_by_path(
         event,
         false,
         None,
+        None,
     )
     .await
 }
@@ -1462,7 +1469,7 @@ pub async fn run_by_path(
 /// (interactive line-stream by default) so the issue-targeted run
 /// looks identical to the user.
 pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyhow::Result<()> {
-    run(name, Some(target), Vec::new(), mode, None).await
+    run(name, Some(target), Vec::new(), mode, None, None).await
 }
 
 async fn run(
@@ -1471,8 +1478,9 @@ async fn run(
     inputs: Vec<(String, String)>,
     mode: Option<&str>,
     event: Option<serde_json::Value>,
+    view: Option<LiveViewMode>,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event, true, None)
+    run_with_outcome(name, target, inputs, mode, event, true, None, view)
         .await
         .map(|_| ())
 }
@@ -1489,6 +1497,7 @@ async fn run_with_outcome(
     event: Option<serde_json::Value>,
     attach_ui: bool,
     run_id_override: Option<String>,
+    view: Option<LiveViewMode>,
 ) -> anyhow::Result<RunOutcomeSummary> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
@@ -1516,6 +1525,7 @@ async fn run_with_outcome(
     let global_cfg_path = global.join("config.toml");
     let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let live_view = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, view).live_view;
 
     // Build the SCM/issue registry once for the entire workflow run.
     // Cheap when no platforms are configured; missing credentials are
@@ -1654,6 +1664,7 @@ async fn run_with_outcome(
             worker: None,
             live_event_hook: None,
             shared_printer: None,
+            live_view,
         },
     )
     .await
@@ -1669,6 +1680,7 @@ async fn run_path_with_outcome(
     event: Option<serde_json::Value>,
     attach_ui: bool,
     run_id_override: Option<String>,
+    view: Option<LiveViewMode>,
 ) -> anyhow::Result<RunOutcomeSummary> {
     let body = std::fs::read_to_string(&workflow_path)?;
     let workflow = Workflow::parse(&body)?;
@@ -1719,6 +1731,7 @@ async fn run_path_with_outcome(
             worker: None,
             live_event_hook: None,
             shared_printer: None,
+            live_view: view.unwrap_or(LiveViewMode::Focused),
         },
     )
     .await
@@ -2205,6 +2218,7 @@ async fn execute_workflow_invocation(
             skip_header: false,
             skip_count: 0,
             live_event_hook: ctx.live_event_hook.clone(),
+            view_mode: ctx.live_view,
         };
         let mut current_runner = runner_task;
         let mut current_run_id = rid.clone();
@@ -2320,6 +2334,7 @@ async fn execute_workflow_invocation(
                         skip_header: true,
                         skip_count: prior_count,
                         live_event_hook: ctx.live_event_hook.clone(),
+                        view_mode: ctx.live_view,
                     };
                     let _ = result;
                 }

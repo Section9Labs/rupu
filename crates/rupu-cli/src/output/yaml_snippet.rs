@@ -213,6 +213,7 @@ mod tests {
             theme: String::new(),
             palette_theme: "rupu-dark".into(),
             palette: crate::output::palette::UiPaletteTheme::default(),
+            live_view: crate::cmd::ui::LiveViewMode::Focused,
             pager: crate::cmd::ui::PagerMode::Never,
         }
     }
