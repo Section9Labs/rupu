@@ -4,15 +4,15 @@ pub mod sidebar;
 pub mod titlebar;
 
 use crate::executor::AppExecutor;
-use crate::menu::app_menu::{ApproveFocused, LaunchSelected, RejectFocused};
+use crate::menu::app_menu::{ApproveFocused, LaunchSelected, RejectFocused, ToggleSidebar};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
-use crate::window::sidebar::{ActiveRunMap, WorkflowClickCb};
+use crate::window::sidebar::{ActiveRunMap, SectionToggleCb, WorkflowClickCb};
 use crate::workspace::Workspace;
 use gpui::{
-    div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, WeakEntity,
-    Window, WindowBounds, WindowHandle, WindowOptions,
+    div, point, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,7 +50,16 @@ impl WorkspaceWindow {
         let bounds = Bounds::centered(None, size(px(1240.0), px(800.0)), cx);
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: None, // we draw our own titlebar inside the view
+            // appears_transparent = true keeps the custom titlebar we draw in
+            // `titlebar::render` (color chip + name + in-flight badge) while
+            // restoring the native macOS traffic-light controls. The 80px
+            // left-padding on the custom titlebar leaves room for the lights.
+            // Position mirrors Zed (crates/zed/src/zed.rs:352).
+            titlebar: Some(TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(9.0), px(9.0))),
+            }),
             ..Default::default()
         };
         let handle = cx
@@ -86,6 +95,16 @@ impl WorkspaceWindow {
                     if let Some(step) = this.run_model.as_ref().and_then(|m| m.focused_step.clone())
                     {
                         this.handle_reject(step, "rejected via keyboard".into(), cx);
+                    }
+                });
+            });
+            let weak_t = entity.downgrade();
+            cx.on_action(move |_: &ToggleSidebar, cx| {
+                let _ = weak_t.update(cx, |this, cx| {
+                    // Toggle every section as a proxy for sidebar hide/show.
+                    // A future task may add a dedicated `sidebar_hidden` flag.
+                    for section in ["workflows", "runs", "repos", "agents", "issues"] {
+                        this.handle_section_toggle(section, cx);
                     }
                 });
             });
@@ -284,6 +303,50 @@ impl WorkspaceWindow {
     pub fn handle_workflow_right_clicked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.focused_workflow = Some(path.clone());
         self.open_launcher(path, cx);
+    }
+
+    /// Toggle a sidebar section's collapsed state and persist.
+    pub fn handle_section_toggle(&mut self, section: &'static str, cx: &mut Context<Self>) {
+        self.workspace
+            .manifest
+            .ui
+            .toggle_section_collapsed(section);
+        if let Err(e) = crate::workspace::storage::save(&self.workspace.manifest) {
+            tracing::warn!(%e, "persist sidebar collapse state");
+        }
+        cx.notify();
+    }
+
+    /// Open an agent's `.md` source file in the user's default app.
+    pub fn handle_agent_clicked(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(e) = std::process::Command::new("open").arg(&path).spawn() {
+                tracing::warn!(?path, %e, "open agent file");
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tracing::info!(?path, "agent click: no-op on non-macOS");
+        }
+    }
+
+    /// Reveal the agent file in Finder. macOS: `open -R <path>`.
+    pub fn handle_agent_reveal(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(e) = std::process::Command::new("open")
+                .args(["-R"])
+                .arg(&path)
+                .spawn()
+            {
+                tracing::warn!(?path, %e, "reveal agent in Finder");
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tracing::info!(?path, "reveal: no-op on non-macOS");
+        }
     }
 
     /// Called when the user clicks the Run button in the toolbar.
@@ -521,6 +584,9 @@ impl Render for WorkspaceWindow {
         let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
         let weak_sidebar_click = weak.clone();
         let weak_sidebar_right = weak.clone();
+        let weak_section_toggle = weak.clone();
+        let weak_agent_click = weak.clone();
+        let weak_agent_reveal = weak.clone();
         let weak2 = weak.clone();
         // Pre-cloned for the launcher overlay branch below.
         let weak_launcher = weak.clone();
@@ -593,7 +659,10 @@ impl Render for WorkspaceWindow {
             .text_color(palette::TEXT_PRIMARY)
             .flex()
             .flex_col()
-            .child(titlebar::render(&self.workspace))
+            .child(titlebar::render(
+                &self.workspace,
+                titlebar::in_flight_count(&active_run_map),
+            ))
             .child(
                 div()
                     .flex()
@@ -616,11 +685,42 @@ impl Render for WorkspaceWindow {
                                     });
                                 });
                             });
+                        let on_section_toggle: SectionToggleCb =
+                            Arc::new(move |section, _w, cx| {
+                                let weak = weak_section_toggle.clone();
+                                cx.defer(move |cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.handle_section_toggle(section, cx)
+                                    });
+                                });
+                            });
+                        let on_agent_click: sidebar::AgentClickCb =
+                            Arc::new(move |path, _w, cx| {
+                                let weak = weak_agent_click.clone();
+                                cx.defer(move |cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.handle_agent_clicked(path, cx)
+                                    });
+                                });
+                            });
+                        let on_agent_right_click: sidebar::AgentClickCb =
+                            Arc::new(move |path, _w, cx| {
+                                let weak = weak_agent_reveal.clone();
+                                cx.defer(move |cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.handle_agent_reveal(path, cx)
+                                    });
+                                });
+                            });
                         sidebar::render(
                             &self.workspace,
                             &active_run_map,
+                            self.focused_workflow.as_ref(),
                             on_workflow_click,
                             on_workflow_right_click,
+                            on_agent_click,
+                            on_agent_right_click,
+                            on_section_toggle,
                         )
                     })
                     .child(main_area),
