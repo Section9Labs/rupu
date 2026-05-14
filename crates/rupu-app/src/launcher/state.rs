@@ -108,15 +108,19 @@ impl LauncherState {
         if self.validation.is_some() {
             return false;
         }
-        matches!(
-            &self.target,
-            LauncherTarget::ThisWorkspace
-                | LauncherTarget::Directory(_)
-                | LauncherTarget::Clone {
-                    status: CloneStatus::Done(_) | CloneStatus::NotStarted | CloneStatus::Failed(_),
-                    ..
-                }
-        )
+        match &self.target {
+            LauncherTarget::ThisWorkspace | LauncherTarget::Directory(_) => true,
+            // Clone is runnable only when there's actually a repo ref to clone.
+            // Otherwise the user could click Run on a blank Clone field and get
+            // a "missing ':' separator" parse error from the SCM layer.
+            LauncherTarget::Clone { repo_ref, status } => {
+                !repo_ref.is_empty()
+                    && matches!(
+                        status,
+                        CloneStatus::Done(_) | CloneStatus::NotStarted | CloneStatus::Failed(_)
+                    )
+            }
+        }
     }
 }
 
