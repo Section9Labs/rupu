@@ -4,6 +4,7 @@ use super::autoflow_wake::wake_requests_from_polled_event_for_repo;
 use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref as canonical_repo_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
+use crate::cmd::transcript::truncate_single_line;
 use crate::cmd::ui::UiPrefs;
 use crate::cmd::workflow::{
     locate_workflow_in, run_with_explicit_context, ExecutionWorkerContext,
@@ -21,6 +22,10 @@ use anyhow::{anyhow, bail, Context};
 use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::style::Print;
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, queue};
 use jsonschema::JSONSchema;
 use rupu_auth::{CredentialResolver, KeychainResolver};
 use rupu_config::{AutoflowCheckout, Config, PollSourceEntry};
@@ -91,6 +96,9 @@ pub enum Action {
         /// Idle sleep between reconciliation passes, for example `10s`.
         #[arg(long, default_value = "10s")]
         idle_sleep: String,
+        /// Live operator view mode (`focused` or `full`).
+        #[arg(long, value_enum)]
+        view: Option<crate::cmd::ui::LiveViewMode>,
         /// Suppress the live interactive serve view.
         #[arg(long)]
         quiet: bool,
@@ -1013,6 +1021,27 @@ struct ServeProgressSnapshot {
     cycle_running: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoflowServeViewLine {
+    status: UiStatus,
+    text: String,
+}
+
+struct AutoflowServeScreenGuard;
+
+impl AutoflowServeScreenGuard {
+    fn enter() -> anyhow::Result<Self> {
+        execute!(std::io::stdout(), EnterAlternateScreen, Hide)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AutoflowServeScreenGuard {
+    fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AutoflowRunStepSummary {
     step_id: String,
@@ -1170,12 +1199,14 @@ async fn handle_with_resolver(
             repo,
             worker,
             idle_sleep,
+            view,
             quiet,
         } => {
             serve(
                 repo.as_deref(),
                 worker.as_deref(),
                 &idle_sleep,
+                view,
                 quiet,
                 resolver,
             )
@@ -1536,16 +1567,27 @@ async fn serve(
     repo: Option<&str>,
     worker: Option<&str>,
     idle_sleep: &str,
+    view: Option<crate::cmd::ui::LiveViewMode>,
     quiet: bool,
     resolver: Arc<dyn CredentialResolver>,
 ) -> anyhow::Result<()> {
+    let cfg = autoflow_ui_config().unwrap_or_default();
+    let prefs = UiPrefs::resolve(&cfg.ui, false, None, None, view);
+    let view_mode = prefs.live_view;
     let repo_filter = normalize_repo_filter(repo)?;
     let idle_sleep = parse_duration(idle_sleep)?
         .to_std()
         .map_err(|_| anyhow!("idle sleep must be non-negative"))?;
     let live_view = std::io::stdout().is_terminal() && !quiet;
     if live_view {
-        render_serve_live_header(repo_filter.as_deref(), worker, idle_sleep)?;
+        return serve_retained(
+            repo_filter.as_deref(),
+            worker,
+            idle_sleep,
+            view_mode,
+            resolver,
+        )
+        .await;
     }
 
     let live_printer = live_view.then(|| Arc::new(Mutex::new(LineStreamPrinter::new())));
@@ -1580,6 +1622,7 @@ async fn serve(
                 idle_sleep,
                 max_cycles: None,
                 shared_printer: live_printer_for_task.clone(),
+                attach_workflow_ui: true,
             },
             move || {
                 if let Ok(mut snapshot) = progress_for_cycle_start.lock() {
@@ -1689,6 +1732,625 @@ async fn serve(
         }
     }
     Ok(())
+}
+
+enum RetainedServeExit {
+    Completed(crate::cmd::autoflow_runtime::ServeReport),
+    Interrupted(ServeProgressSnapshot),
+}
+
+async fn serve_retained(
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+    idle_sleep: std::time::Duration,
+    view_mode: crate::cmd::ui::LiveViewMode,
+    resolver: Arc<dyn CredentialResolver>,
+) -> anyhow::Result<()> {
+    let progress = Arc::new(Mutex::new(ServeProgressSnapshot::default()));
+    let progress_capture = Arc::clone(&progress);
+    let progress_for_cycle_start = Arc::clone(&progress);
+    let repo_filter_for_task = repo_filter.map(ToOwned::to_owned);
+    let worker_name = worker_filter.map(ToOwned::to_owned);
+    let resolver_for_task = Arc::clone(&resolver);
+
+    let mut serve_task = tokio::spawn(async move {
+        crate::cmd::autoflow_runtime::serve_with_resolver_and_hooks(
+            resolver_for_task,
+            crate::cmd::autoflow_runtime::ServeOptions {
+                repo_filter: repo_filter_for_task.clone(),
+                worker_name: worker_name.clone(),
+                idle_sleep,
+                max_cycles: None,
+                shared_printer: None,
+                attach_workflow_ui: false,
+            },
+            move || {
+                if let Ok(mut snapshot) = progress_for_cycle_start.lock() {
+                    snapshot.cycle_running = true;
+                }
+                Ok(())
+            },
+            move |report, _last_tick, _cycle| {
+                if let Ok(mut snapshot) = progress_capture.lock() {
+                    snapshot.cycles = report.cycles;
+                    snapshot.total = report.total.clone();
+                    snapshot.last_cycle_rendered_at = Some(std::time::Instant::now());
+                    snapshot.cycle_running = false;
+                }
+                Ok(())
+            },
+        )
+        .await
+    });
+
+    let exit = {
+        let _screen = AutoflowServeScreenGuard::enter()?;
+        let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(250));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_rows: Vec<String> = Vec::new();
+
+        loop {
+            tokio::select! {
+                result = &mut serve_task => {
+                    let report = result
+                        .map_err(|error| anyhow!("autoflow serve task failed: {error}"))??;
+                    break RetainedServeExit::Completed(report);
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    serve_task.abort();
+                    let _ = serve_task.await;
+                    let snapshot = progress.lock().map(|guard| guard.clone()).unwrap_or_default();
+                    break RetainedServeExit::Interrupted(snapshot);
+                }
+                _ = heartbeat.tick() => {
+                    let snapshot = progress.lock().map(|guard| guard.clone()).unwrap_or_default();
+                    let rows = build_retained_serve_rows(
+                        repo_filter,
+                        worker_filter,
+                        idle_sleep,
+                        view_mode,
+                        &snapshot,
+                    )?;
+                    if rows != last_rows {
+                        render_retained_serve_rows(&rows)?;
+                        last_rows = rows;
+                    }
+                }
+            }
+        }
+    };
+
+    match exit {
+        RetainedServeExit::Completed(report) => {
+            println!(
+                "autoflow serve stopped after {} cycle(s): ran={} skipped={} failed={} cleaned={}",
+                report.cycles,
+                report.total.ran_cycles,
+                report.total.skipped_cycles,
+                report.total.failed_cycles,
+                report.total.cleaned_claims
+            );
+        }
+        RetainedServeExit::Interrupted(snapshot) => {
+            println!(
+                "autoflow serve interrupted after {} cycle(s): ran={} skipped={} failed={} cleaned={}",
+                snapshot.cycles,
+                snapshot.total.ran_cycles,
+                snapshot.total.skipped_cycles,
+                snapshot.total.failed_cycles,
+                snapshot.total.cleaned_claims
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn build_retained_serve_rows(
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+    idle_sleep: std::time::Duration,
+    view_mode: crate::cmd::ui::LiveViewMode,
+    snapshot: &ServeProgressSnapshot,
+) -> anyhow::Result<Vec<String>> {
+    let monitor = build_monitor_report(repo_filter, worker_filter)?;
+    let global = paths::global_dir()?;
+    let run_store = RunStore::new(global.join("runs"));
+    let pricing = autoflow_pricing_config();
+    let (width, height) = crossterm::terminal::size().unwrap_or((100, 30));
+    Ok(build_retained_serve_rows_for_size(
+        &monitor,
+        &run_store,
+        &pricing,
+        repo_filter,
+        worker_filter,
+        idle_sleep,
+        view_mode,
+        snapshot,
+        width.max(50) as usize,
+        height.max(14) as usize,
+    ))
+}
+
+fn build_retained_serve_rows_for_size(
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+    idle_sleep: std::time::Duration,
+    view_mode: crate::cmd::ui::LiveViewMode,
+    snapshot: &ServeProgressSnapshot,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let mut rows = vec![
+        truncate_single_line(
+            &format!(
+                "▶ autoflow serve  ·  repo {}  ·  worker {}  ·  idle {}s",
+                repo_filter.unwrap_or("(all)"),
+                worker_filter.unwrap_or("(auto)"),
+                idle_sleep.as_secs_f32(),
+            ),
+            width,
+        ),
+        String::new(),
+        format!(
+            "serve      {}",
+            truncate_single_line(
+                &format!(
+                    "cycles {}  ·  ran {}  ·  skipped {}  ·  failed {}  ·  cleaned {}  ·  {}",
+                    snapshot.cycles,
+                    snapshot.total.ran_cycles,
+                    snapshot.total.skipped_cycles,
+                    snapshot.total.failed_cycles,
+                    snapshot.total.cleaned_claims,
+                    if snapshot.cycle_running {
+                        "reconciling"
+                    } else {
+                        "watching"
+                    }
+                ),
+                width.saturating_sub(11),
+            )
+        ),
+    ];
+
+    let primary = build_serve_issue_entries(&monitor.claims, &[])
+        .into_iter()
+        .find_map(|entry| entry.claim.cloned());
+
+    if let Some(claim) = primary.as_ref() {
+        rows.push(format!(
+            "active     {}",
+            truncate_single_line(
+                &format!(
+                    "{}  ·  {}  ·  {}",
+                    display_issue_headline(claim),
+                    truncate_text(&claim.workflow, 30),
+                    claim.status
+                ),
+                width.saturating_sub(11),
+            )
+        ));
+
+        let mut route = vec![format!("repo {}", short_locator(&claim.repo, 28))];
+        if claim.branch != "-" {
+            route.push(format!("branch {}", truncate_text(&claim.branch, 22)));
+        }
+        if claim.pr != "-" {
+            route.push(format!("pr {}", short_url_like(&claim.pr, 22)));
+        }
+        rows.push(format!(
+            "route      {}",
+            truncate_single_line(&route.join("  ·  "), width.saturating_sub(11))
+        ));
+
+        if let Some((record, summary, live_lines)) =
+            resolve_live_claim_run(run_store, pricing, claim)
+        {
+            rows.push(format!(
+                "run        {}",
+                truncate_single_line(
+                    &format!(
+                        "{}  ·  {}  ·  {}",
+                        short_run_id(&summary.run_id),
+                        summary.status,
+                        format_duration(std::time::Duration::from_millis(
+                            summary.duration_ms.unwrap_or_default()
+                        ))
+                    ),
+                    width.saturating_sub(11),
+                )
+            ));
+
+            let current_step = record
+                .active_step_id
+                .as_deref()
+                .or(record.awaiting_step_id.as_deref())
+                .unwrap_or("-");
+            rows.push(format!(
+                "step       {}",
+                truncate_single_line(
+                    &format!(
+                        "{}  ·  {}/{} complete",
+                        current_step,
+                        completed_steps(&summary),
+                        summary.steps.len()
+                    ),
+                    width.saturating_sub(11),
+                )
+            ));
+
+            if let Some(usage) = &summary.usage {
+                rows.push(format!(
+                    "usage      {}",
+                    truncate_single_line(
+                        &format!(
+                            "in {}  ·  out {}  ·  total {}{}",
+                            format_count(usage.input_tokens),
+                            format_count(usage.output_tokens),
+                            format_count(usage.total_tokens),
+                            usage
+                                .cost_usd
+                                .map(|cost| format!("  ·  ${cost:.2}"))
+                                .unwrap_or_default()
+                        ),
+                        width.saturating_sub(11),
+                    )
+                ));
+            }
+
+            rows.push(String::new());
+            rows.extend(render_retained_serve_event_rows(
+                &live_lines,
+                width,
+                match view_mode {
+                    crate::cmd::ui::LiveViewMode::Focused => 6,
+                    crate::cmd::ui::LiveViewMode::Full => 10,
+                },
+            ));
+        } else if claim.summary != "-" {
+            rows.push(format!(
+                "summary    {}",
+                truncate_single_line(&claim.summary, width.saturating_sub(11))
+            ));
+        }
+    } else {
+        rows.push("active     no active issues".into());
+    }
+
+    if view_mode == crate::cmd::ui::LiveViewMode::Full && !monitor.claims.is_empty() {
+        rows.push(String::new());
+        rows.push("claims".into());
+        for claim in monitor.claims.iter().take(6) {
+            let status = claim_status_ui(&claim.status);
+            rows.push(truncate_single_line(
+                &format!(
+                    "{} {}  ·  {}  ·  {}",
+                    status.glyph(),
+                    display_issue_headline(claim),
+                    truncate_text(&claim.workflow, 24),
+                    claim.status
+                ),
+                width,
+            ));
+        }
+    }
+
+    rows.push(String::new());
+    rows.push("recent".into());
+    let recent_limit = match view_mode {
+        crate::cmd::ui::LiveViewMode::Focused => 4,
+        crate::cmd::ui::LiveViewMode::Full => 8,
+    };
+    for activity in monitor.activity.iter().take(recent_limit) {
+        let (status, label) = activity_status_and_label(&activity.event);
+        rows.push(truncate_single_line(
+            &format!(
+                "{} {}  ·  {}  ·  {}",
+                status.glyph(),
+                activity.issue,
+                label,
+                truncate_text(&activity.workflow, 24)
+            ),
+            width,
+        ));
+        if activity.detail != "-" {
+            rows.push(truncate_single_line(
+                &format!(
+                    "  {}",
+                    truncate_text(&activity.detail, width.saturating_sub(2))
+                ),
+                width,
+            ));
+        }
+    }
+
+    rows.push(String::new());
+    rows.push(format!(
+        "queue      queued {}  ·  due {}  ·  processed {}",
+        monitor.wakes.queued, monitor.wakes.due, monitor.wakes.processed_recent
+    ));
+
+    rows.truncate(height);
+    rows
+}
+
+fn render_retained_serve_rows(rows: &[String]) -> anyhow::Result<()> {
+    let mut stdout = std::io::stdout();
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+    for (idx, row) in rows.iter().enumerate() {
+        queue!(stdout, MoveTo(0, idx as u16), Print(row))?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+fn render_retained_serve_event_rows(
+    lines: &[AutoflowServeViewLine],
+    width: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    let mut rendered = Vec::new();
+    for line in lines {
+        let prefix = format!("{} ", line.status.glyph());
+        let content_width = width.saturating_sub(2).max(1);
+        for (idx, segment) in wrap_retained_serve_plain(&line.text, content_width)
+            .into_iter()
+            .enumerate()
+        {
+            if idx == 0 {
+                rendered.push(format!("{prefix}{segment}"));
+            } else {
+                rendered.push(format!("  {segment}"));
+            }
+        }
+    }
+    if rendered.len() > max_rows {
+        rendered.split_off(rendered.len() - max_rows)
+    } else {
+        rendered
+    }
+}
+
+fn wrap_retained_serve_plain(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        let current_len = current.chars().count();
+        if current.is_empty() {
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    if chunk.chars().count() >= width {
+                        out.push(chunk);
+                        chunk = String::new();
+                    }
+                    chunk.push(ch);
+                }
+                if !chunk.is_empty() {
+                    current = chunk;
+                }
+            }
+        } else if current_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            out.push(current);
+            current = String::new();
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    if chunk.chars().count() >= width {
+                        out.push(chunk);
+                        chunk = String::new();
+                    }
+                    chunk.push(ch);
+                }
+                current = chunk;
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn resolve_live_claim_run(
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    claim: &AutoflowClaimRow,
+) -> Option<(
+    rupu_orchestrator::RunRecord,
+    AutoflowRunSummary,
+    Vec<AutoflowServeViewLine>,
+)> {
+    let record = find_live_autoflow_run(claim).or_else(|| {
+        (claim.last_run != "-")
+            .then(|| run_store.load(&claim.last_run).ok())
+            .flatten()
+    })?;
+    let summary = load_run_summary(run_store, &record.id, pricing)?;
+    let live_lines = load_live_run_lines(&record, 6);
+    Some((record, summary, live_lines))
+}
+
+fn find_live_autoflow_run(claim: &AutoflowClaimRow) -> Option<rupu_orchestrator::RunRecord> {
+    let global = paths::global_dir().ok()?;
+    let runs_root = global.join("runs");
+    let mut best: Option<rupu_orchestrator::RunRecord> = None;
+    for entry in std::fs::read_dir(runs_root).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path().join("run.json");
+        if !path.is_file() {
+            continue;
+        }
+        let body = std::fs::read(&path).ok()?;
+        let record: rupu_orchestrator::RunRecord = serde_json::from_slice(&body).ok()?;
+        if record.parent_run_id.is_some() {
+            continue;
+        }
+        if record.issue_ref.as_deref() != Some(claim.issue.as_str()) {
+            continue;
+        }
+        if record.workflow_name != claim.workflow {
+            continue;
+        }
+        if matches!(
+            record.status,
+            RunStatus::Completed | RunStatus::Failed | RunStatus::Rejected
+        ) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .map(|current| record.started_at > current.started_at)
+            .unwrap_or(true)
+        {
+            best = Some(record);
+        }
+    }
+    best
+}
+
+fn load_live_run_lines(
+    record: &rupu_orchestrator::RunRecord,
+    max_rows: usize,
+) -> Vec<AutoflowServeViewLine> {
+    let Some(path) = record.active_step_transcript_path.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(iter) = JsonlReader::iter(path) else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for event in iter.flatten() {
+        if let Some(line) = live_run_event_line(&event) {
+            lines.push(line);
+            if lines.len() > max_rows {
+                let keep_from = lines.len().saturating_sub(max_rows);
+                lines.drain(0..keep_from);
+            }
+        }
+    }
+    lines
+}
+
+fn live_run_event_line(event: &TranscriptEvent) -> Option<AutoflowServeViewLine> {
+    match event {
+        TranscriptEvent::TurnStart { turn_idx } => Some(AutoflowServeViewLine {
+            status: UiStatus::Working,
+            text: format!("turn {turn_idx}  ·  assistant turn started"),
+        }),
+        TranscriptEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
+            Some(AutoflowServeViewLine {
+                status: UiStatus::Active,
+                text: format!("assistant  ·  {}", truncate_single_line(content, 96)),
+            })
+        }
+        TranscriptEvent::ToolCall { tool, input, .. } => Some(AutoflowServeViewLine {
+            status: UiStatus::Working,
+            text: format!(
+                "{}  ·  {}",
+                tool,
+                crate::output::workflow_printer::tool_summary(tool, input)
+            ),
+        }),
+        TranscriptEvent::ToolResult {
+            output,
+            error,
+            duration_ms,
+            ..
+        } => {
+            let status = if error.is_some() {
+                UiStatus::Failed
+            } else {
+                UiStatus::Complete
+            };
+            let mut detail =
+                truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 88);
+            if *duration_ms > 0 {
+                detail.push_str(&format!("  ·  {}ms", duration_ms));
+            }
+            Some(AutoflowServeViewLine {
+                status,
+                text: format!(
+                    "{}  ·  {}",
+                    if error.is_some() {
+                        "tool error"
+                    } else {
+                        "tool result"
+                    },
+                    detail
+                ),
+            })
+        }
+        TranscriptEvent::Usage {
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        } => Some(AutoflowServeViewLine {
+            status: UiStatus::Active,
+            text: format!(
+                "usage  ·  {provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+            ),
+        }),
+        TranscriptEvent::TurnEnd {
+            turn_idx,
+            tokens_in,
+            tokens_out,
+        } => Some(AutoflowServeViewLine {
+            status: UiStatus::Complete,
+            text: format!(
+                "turn complete  ·  turn {turn_idx}  ·  in {} out {}",
+                tokens_in.unwrap_or(0),
+                tokens_out.unwrap_or(0)
+            ),
+        }),
+        TranscriptEvent::RunComplete {
+            status,
+            total_tokens,
+            duration_ms,
+            error,
+            ..
+        } => Some(AutoflowServeViewLine {
+            status: match status {
+                rupu_transcript::RunStatus::Ok => UiStatus::Complete,
+                rupu_transcript::RunStatus::Error | rupu_transcript::RunStatus::Aborted => {
+                    UiStatus::Failed
+                }
+            },
+            text: {
+                let mut text = format!(
+                    "run complete  ·  status {}  ·  {}ms  ·  {} tokens",
+                    format!("{status:?}").to_lowercase(),
+                    duration_ms,
+                    total_tokens
+                );
+                if let Some(error) = error.as_deref().filter(|value| !value.trim().is_empty()) {
+                    text.push_str("  ·  ");
+                    text.push_str(&truncate_single_line(error, 64));
+                }
+                text
+            },
+        }),
+        _ => None,
+    }
 }
 
 async fn wakes(
@@ -2125,24 +2787,6 @@ fn render_monitor_snapshot(report: &AutoflowMonitorReport, watch_mode: bool) -> 
     Ok(())
 }
 
-fn render_serve_live_header(
-    repo_filter: Option<&str>,
-    worker_filter: Option<&str>,
-    idle_sleep: std::time::Duration,
-) -> anyhow::Result<()> {
-    render_autoflow_header(
-        "autoflow serve",
-        &[
-            format!("repo {}", repo_filter.unwrap_or("(all)")),
-            format!("worker {}", worker_filter.unwrap_or("(auto)")),
-            format!("idle {}s", idle_sleep.as_secs_f32()),
-            "Ctrl-C to stop".into(),
-        ],
-    );
-    std::io::stdout().flush()?;
-    Ok(())
-}
-
 fn render_serve_cycle_timeline(
     report: &crate::cmd::autoflow_runtime::ServeReport,
     last_tick: &crate::cmd::autoflow_runtime::TickReport,
@@ -2275,6 +2919,7 @@ fn heartbeat_action_label(claim: &AutoflowClaimRow) -> &'static str {
 #[cfg(test)]
 mod serve_heartbeat_tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn claim_with_status(status: &str) -> AutoflowClaimRow {
         AutoflowClaimRow {
@@ -2296,6 +2941,53 @@ mod serve_heartbeat_tests {
             last_cycle: "-".into(),
             last_event: "-".into(),
             last_run: "-".into(),
+        }
+    }
+
+    fn sample_monitor_report() -> AutoflowMonitorReport {
+        let mut running = claim_with_status("running");
+        running.issue = "github:Section9Labs/rupu/issues/7".into();
+        running.issue_display = Some("7".into());
+        running.workflow = "storefront-feature-delivery".into();
+        running.branch = "rupu/issue-7".into();
+        running.summary = "implementing storefront feature".into();
+
+        let mut blocked = claim_with_status("blocked");
+        blocked.issue = "github:Section9Labs/rupu/issues/8".into();
+        blocked.issue_display = Some("8".into());
+        blocked.workflow = "verify-followup".into();
+        blocked.summary = "waiting on approval".into();
+
+        AutoflowMonitorReport {
+            kind: "autoflow_monitor",
+            version: 1,
+            workers: Vec::new(),
+            claims: vec![running],
+            activity: vec![
+                AutoflowMonitorActivityRow {
+                    at: "2026-05-14T05:00:00Z".into(),
+                    worker: "team-mini-01".into(),
+                    event: "issue_commented".into(),
+                    issue: "github:Section9Labs/rupu/issues/7".into(),
+                    workflow: "storefront-feature-delivery".into(),
+                    repo: "github:Section9Labs/rupu".into(),
+                    detail: "commented on issue".into(),
+                },
+                AutoflowMonitorActivityRow {
+                    at: "2026-05-14T05:01:00Z".into(),
+                    worker: "team-mini-01".into(),
+                    event: "cycle_failed".into(),
+                    issue: "github:Section9Labs/rupu/issues/8".into(),
+                    workflow: "verify-followup".into(),
+                    repo: "github:Section9Labs/rupu".into(),
+                    detail: "waiting on approval".into(),
+                },
+            ],
+            wakes: AutoflowMonitorWakeSummary {
+                queued: 1,
+                due: 2,
+                processed_recent: 3,
+            },
         }
     }
 
@@ -2399,6 +3091,48 @@ mod serve_heartbeat_tests {
         };
         assert_eq!(cycle_event_status_and_label(&draft_pr).1, "opened draft PR");
         assert_eq!(monitor_event_name(&draft_pr), "draft_pr_opened");
+    }
+
+    #[test]
+    fn retained_serve_focused_mode_omits_claims_section() {
+        let tmp = tempdir().unwrap();
+        let run_store = RunStore::new(tmp.path().join("runs"));
+        let rows = build_retained_serve_rows_for_size(
+            &sample_monitor_report(),
+            &run_store,
+            &autoflow_pricing_config(),
+            Some("github:Section9Labs/rupu"),
+            Some("team-mini-01"),
+            std::time::Duration::from_secs(10),
+            crate::cmd::ui::LiveViewMode::Focused,
+            &ServeProgressSnapshot::default(),
+            80,
+            24,
+        );
+        assert!(rows.iter().any(|row| row.starts_with("active     ")));
+        assert!(!rows.iter().any(|row| row == "claims"));
+    }
+
+    #[test]
+    fn retained_serve_full_mode_includes_claims_section() {
+        let tmp = tempdir().unwrap();
+        let run_store = RunStore::new(tmp.path().join("runs"));
+        let rows = build_retained_serve_rows_for_size(
+            &sample_monitor_report(),
+            &run_store,
+            &autoflow_pricing_config(),
+            Some("github:Section9Labs/rupu"),
+            Some("team-mini-01"),
+            std::time::Duration::from_secs(10),
+            crate::cmd::ui::LiveViewMode::Full,
+            &ServeProgressSnapshot::default(),
+            80,
+            24,
+        );
+        assert!(rows.iter().any(|row| row == "claims"));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("storefront-feature-delivery")));
     }
 }
 
@@ -10312,6 +11046,7 @@ steps:
                 idle_sleep: std::time::Duration::from_millis(1),
                 max_cycles: Some(1),
                 shared_printer: None,
+                attach_workflow_ui: true,
             },
         )
         .await
@@ -10393,6 +11128,7 @@ steps:
                 idle_sleep: std::time::Duration::from_millis(1),
                 max_cycles: Some(1),
                 shared_printer: None,
+                attach_workflow_ui: true,
             },
         )
         .await
@@ -10492,6 +11228,7 @@ steps:
                 idle_sleep: std::time::Duration::from_millis(1),
                 max_cycles: Some(1),
                 shared_printer: None,
+                attach_workflow_ui: true,
             },
             move |report, tick, _cycle| {
                 let seen_capture = Arc::clone(&seen_capture);
@@ -10624,6 +11361,7 @@ steps:
                 idle_sleep: std::time::Duration::from_millis(1),
                 max_cycles: Some(1),
                 shared_printer: None,
+                attach_workflow_ui: true,
             },
         )
         .await
@@ -10744,6 +11482,7 @@ steps:
                 idle_sleep: std::time::Duration::from_millis(1),
                 max_cycles: Some(1),
                 shared_printer: None,
+                attach_workflow_ui: true,
             },
         )
         .await
