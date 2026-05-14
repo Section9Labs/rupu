@@ -38,7 +38,6 @@ hex.workspace = true
 
 # In-workspace
 rupu-agent = { path = "../rupu-agent" }
-rupu-app-canvas = { path = "../rupu-app-canvas" }
 rupu-orchestrator = { path = "../rupu-orchestrator" }
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-config = { path = "../rupu-config" }

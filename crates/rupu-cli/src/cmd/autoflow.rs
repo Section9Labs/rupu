@@ -13,7 +13,9 @@ use crate::cmd::workflow::{
 use crate::output::palette::{self, Status as UiStatus, BRAND, DIM};
 use crate::output::printer::{format_duration, visible_len, wrap_with_ansi};
 use crate::output::report::{self as output_report, CollectionOutput, DetailOutput};
-use crate::output::rich_payload::{render_payload, render_tool_input};
+use crate::output::rich_payload::{
+    render_assistant_content, render_payload, render_payload_preview_lines, render_tool_input,
+};
 use crate::output::viewport::ViewportState;
 use crate::output::workflow_printer::{
     LiveWorkflowEvent, LiveWorkflowEventHook, LiveWorkflowRender,
@@ -2577,15 +2579,9 @@ fn live_run_event_lines(
                     text: format!("assistant  ·  {}", truncate_single_line(content, 96)),
                     continuation: false,
                 }],
-                LiveViewMode::Compact => Vec::new(),
-                LiveViewMode::Full => {
+                LiveViewMode::Compact | LiveViewMode::Full => {
                     let prefs = retained_serve_ui_prefs();
-                    let highlighted =
-                        crate::output::rich_payload::render_assistant_content(
-                            content.trim(),
-                            &prefs,
-                        )
-                        .rendered;
+                    let highlighted = render_assistant_content(content.trim(), &prefs).rendered;
                     let mut out = Vec::new();
                     for (index, line) in highlighted.lines().enumerate() {
                         out.push(AutoflowServeViewLine {
@@ -2648,7 +2644,7 @@ fn live_run_event_lines(
             let raw = error.as_deref().unwrap_or(output.as_str());
             let payload = render_payload(raw, &prefs);
             match view_mode {
-                LiveViewMode::Focused | LiveViewMode::Compact => vec![AutoflowServeViewLine {
+                LiveViewMode::Focused => vec![AutoflowServeViewLine {
                     status,
                     text: format!(
                         "{}  ·  {}{}",
@@ -2666,6 +2662,36 @@ fn live_run_event_lines(
                     ),
                     continuation: false,
                 }],
+                LiveViewMode::Compact => {
+                    let mut out = vec![AutoflowServeViewLine {
+                        status,
+                        text: format!(
+                            "{}  ·  {}{}",
+                            if error.is_some() {
+                                "tool error"
+                            } else {
+                                "tool result"
+                            },
+                            payload.headline,
+                            if *duration_ms > 0 {
+                                format!("  ·  {}ms", duration_ms)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        continuation: false,
+                    }];
+                    out.extend(
+                        render_payload_preview_lines(&payload, 5)
+                            .into_iter()
+                            .map(|line| AutoflowServeViewLine {
+                                status,
+                                text: line,
+                                continuation: true,
+                            }),
+                    );
+                    out
+                }
                 LiveViewMode::Full => {
                     let mut out = vec![AutoflowServeViewLine {
                         status,
@@ -2697,11 +2723,38 @@ fn live_run_event_lines(
         TranscriptEvent::FileEdit { path, kind, diff } => {
             let prefs = retained_serve_ui_prefs();
             match view_mode {
-                LiveViewMode::Focused | LiveViewMode::Compact => vec![AutoflowServeViewLine {
+                LiveViewMode::Focused => vec![AutoflowServeViewLine {
                     status: UiStatus::Complete,
-                    text: format!("file edit  ·  {} {}", format!("{kind:?}").to_lowercase(), path),
+                    text: format!(
+                        "file edit  ·  {} {}",
+                        format!("{kind:?}").to_lowercase(),
+                        path
+                    ),
                     continuation: false,
                 }],
+                LiveViewMode::Compact => {
+                    let payload = render_payload(diff, &prefs);
+                    let mut out = vec![AutoflowServeViewLine {
+                        status: UiStatus::Complete,
+                        text: format!(
+                            "file edit  ·  {} {}  ·  {}",
+                            format!("{kind:?}").to_lowercase(),
+                            path,
+                            payload.headline
+                        ),
+                        continuation: false,
+                    }];
+                    out.extend(
+                        render_payload_preview_lines(&payload, 8)
+                            .into_iter()
+                            .map(|line| AutoflowServeViewLine {
+                                status: UiStatus::Complete,
+                                text: line,
+                                continuation: true,
+                            }),
+                    );
+                    out
+                }
                 LiveViewMode::Full => {
                     let payload = render_payload(diff, &prefs);
                     let mut out = vec![AutoflowServeViewLine {
@@ -3609,6 +3662,36 @@ mod serve_heartbeat_tests {
         );
         assert!(lines.len() > 1);
         assert!(lines[0].text.contains("json payload"));
+    }
+
+    #[test]
+    fn live_run_event_lines_compact_keeps_assistant_body() {
+        let lines = live_run_event_lines(
+            &TranscriptEvent::AssistantMessage {
+                content: "## Summary\n\n- one\n- two".into(),
+                thinking: None,
+            },
+            LiveViewMode::Compact,
+        );
+        assert!(!lines.is_empty());
+        assert!(lines[0].text.contains("assistant output"));
+        assert!(lines.len() > 1);
+    }
+
+    #[test]
+    fn live_run_event_lines_compact_previews_tool_result_payload() {
+        let lines = live_run_event_lines(
+            &TranscriptEvent::ToolResult {
+                call_id: "call_123".into(),
+                output: "line1\nline2\nline3\nline4\nline5\nline6\n".into(),
+                error: None,
+                duration_ms: 9,
+            },
+            LiveViewMode::Compact,
+        );
+        assert!(lines.len() > 1);
+        assert!(lines[0].text.contains("tool result"));
+        assert!(lines.iter().any(|line| line.text.contains("line1")));
     }
 
     #[test]

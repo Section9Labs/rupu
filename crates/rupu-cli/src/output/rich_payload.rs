@@ -3,6 +3,7 @@ use crate::cmd::ui::{
     highlight_diff, highlight_json, highlight_markdown, highlight_shell, highlight_toml,
     highlight_yaml, UiPrefs,
 };
+use crate::output::palette::{self, DIM};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadKind {
@@ -22,6 +23,28 @@ pub struct RenderedPayload {
     pub kind: PayloadKind,
     pub headline: String,
     pub rendered: String,
+}
+
+pub fn render_payload_preview_lines(payload: &RenderedPayload, max_lines: usize) -> Vec<String> {
+    let max_lines = max_lines.max(1);
+    let all_lines = payload
+        .rendered
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if all_lines.is_empty() {
+        return Vec::new();
+    }
+    let total = all_lines.len();
+    let shown = total.min(max_lines);
+    let mut out = all_lines.into_iter().take(shown).collect::<Vec<_>>();
+    if total > shown {
+        let hidden = total - shown;
+        let mut trailer = String::new();
+        let _ = palette::write_colored(&mut trailer, &format!("… +{hidden} more line(s)"), DIM);
+        out.push(trailer);
+    }
+    out
 }
 
 pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {

@@ -6191,7 +6191,6 @@ dependencies = [
  "predicates",
  "reqwest",
  "rupu-agent",
- "rupu-app-canvas",
  "rupu-auth",
  "rupu-config",
  "rupu-mcp",
