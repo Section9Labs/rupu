@@ -1160,7 +1160,7 @@ fn severity_color(severity: &str) -> (owo_colors::Rgb, bool) {
 /// CSI sequences (`ESC [ … m`). Each `ESC[…m` run is zero-width;
 /// every other `char` counts once. Conservative — doesn't try to
 /// account for double-width CJK / emoji glyphs (treated as 1).
-fn visible_len(s: &str) -> usize {
+pub(crate) fn visible_len(s: &str) -> usize {
     let mut n = 0usize;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -1193,7 +1193,7 @@ fn visible_len(s: &str) -> usize {
 /// regardless of word boundaries. This keeps the implementation
 /// short and predictable; the alternative (word-break preferred)
 /// is a polish add-on we can layer on later if matt asks.
-fn wrap_with_ansi(line: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_with_ansi(line: &str, width: usize) -> Vec<String> {
     if width == 0 || visible_len(line) <= width {
         return vec![line.to_string()];
     }

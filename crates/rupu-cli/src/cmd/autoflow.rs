@@ -11,7 +11,7 @@ use crate::cmd::workflow::{
     ExplicitWorkflowRunContext, RunEnvelopeTemplate,
 };
 use crate::output::palette::{self, Status as UiStatus, BRAND, DIM};
-use crate::output::printer::format_duration;
+use crate::output::printer::{format_duration, visible_len, wrap_with_ansi};
 use crate::output::report::{self as output_report, CollectionOutput, DetailOutput};
 use crate::output::workflow_printer::{
     LiveWorkflowEvent, LiveWorkflowEventHook, LiveWorkflowRender,
@@ -1885,34 +1885,29 @@ fn build_retained_serve_rows_for_size(
     height: usize,
 ) -> Vec<String> {
     let mut rows = vec![
-        truncate_single_line(
+        retained_serve_header_line(repo_filter, worker_filter, idle_sleep, width),
+        String::new(),
+        retained_serve_kv_row(
+            "serve",
             &format!(
-                "▶ autoflow serve  ·  repo {}  ·  worker {}  ·  idle {}s",
-                repo_filter.unwrap_or("(all)"),
-                worker_filter.unwrap_or("(auto)"),
-                idle_sleep.as_secs_f32(),
+                "cycles {}  ·  ran {}  ·  skipped {}  ·  failed {}  ·  cleaned {}  ·  {}",
+                snapshot.cycles,
+                snapshot.total.ran_cycles,
+                snapshot.total.skipped_cycles,
+                snapshot.total.failed_cycles,
+                snapshot.total.cleaned_claims,
+                if snapshot.cycle_running {
+                    "reconciling"
+                } else {
+                    "watching"
+                }
             ),
             width,
-        ),
-        String::new(),
-        format!(
-            "serve      {}",
-            truncate_single_line(
-                &format!(
-                    "cycles {}  ·  ran {}  ·  skipped {}  ·  failed {}  ·  cleaned {}  ·  {}",
-                    snapshot.cycles,
-                    snapshot.total.ran_cycles,
-                    snapshot.total.skipped_cycles,
-                    snapshot.total.failed_cycles,
-                    snapshot.total.cleaned_claims,
-                    if snapshot.cycle_running {
-                        "reconciling"
-                    } else {
-                        "watching"
-                    }
-                ),
-                width.saturating_sub(11),
-            )
+            if snapshot.cycle_running {
+                UiStatus::Working
+            } else {
+                UiStatus::Active
+            },
         ),
     ];
 
@@ -1922,15 +1917,17 @@ fn build_retained_serve_rows_for_size(
 
     if let Some(claim) = primary.as_ref() {
         rows.push(format!(
-            "active     {}",
-            truncate_single_line(
+            "{}",
+            retained_serve_kv_row(
+                "active",
                 &format!(
                     "{}  ·  {}  ·  {}",
                     display_issue_headline(claim),
                     truncate_text(&claim.workflow, 30),
                     claim.status
                 ),
-                width.saturating_sub(11),
+                width,
+                claim_status_ui(&claim.status),
             )
         ));
 
@@ -1941,27 +1938,28 @@ fn build_retained_serve_rows_for_size(
         if claim.pr != "-" {
             route.push(format!("pr {}", short_url_like(&claim.pr, 22)));
         }
-        rows.push(format!(
-            "route      {}",
-            truncate_single_line(&route.join("  ·  "), width.saturating_sub(11))
+        rows.push(retained_serve_kv_row(
+            "route",
+            &route.join("  ·  "),
+            width,
+            UiStatus::Active,
         ));
 
         if let Some((record, summary, live_lines)) =
             resolve_live_claim_run(run_store, pricing, claim)
         {
-            rows.push(format!(
-                "run        {}",
-                truncate_single_line(
-                    &format!(
-                        "{}  ·  {}  ·  {}",
-                        short_run_id(&summary.run_id),
-                        summary.status,
-                        format_duration(std::time::Duration::from_millis(
-                            summary.duration_ms.unwrap_or_default()
-                        ))
-                    ),
-                    width.saturating_sub(11),
-                )
+            rows.push(retained_serve_kv_row(
+                "run",
+                &format!(
+                    "{}  ·  {}  ·  {}",
+                    short_run_id(&summary.run_id),
+                    summary.status,
+                    format_duration(std::time::Duration::from_millis(
+                        summary.duration_ms.unwrap_or_default()
+                    ))
+                ),
+                width,
+                activity_status_for_run_summary(&summary),
             ));
 
             let current_step = record
@@ -1969,35 +1967,33 @@ fn build_retained_serve_rows_for_size(
                 .as_deref()
                 .or(record.awaiting_step_id.as_deref())
                 .unwrap_or("-");
-            rows.push(format!(
-                "step       {}",
-                truncate_single_line(
-                    &format!(
-                        "{}  ·  {}/{} complete",
-                        current_step,
-                        completed_steps(&summary),
-                        summary.steps.len()
-                    ),
-                    width.saturating_sub(11),
-                )
+            rows.push(retained_serve_kv_row(
+                "step",
+                &format!(
+                    "{}  ·  {}/{} complete",
+                    current_step,
+                    completed_steps(&summary),
+                    summary.steps.len()
+                ),
+                width,
+                UiStatus::Working,
             ));
 
             if let Some(usage) = &summary.usage {
-                rows.push(format!(
-                    "usage      {}",
-                    truncate_single_line(
-                        &format!(
-                            "in {}  ·  out {}  ·  total {}{}",
-                            format_count(usage.input_tokens),
-                            format_count(usage.output_tokens),
-                            format_count(usage.total_tokens),
-                            usage
-                                .cost_usd
-                                .map(|cost| format!("  ·  ${cost:.2}"))
-                                .unwrap_or_default()
-                        ),
-                        width.saturating_sub(11),
-                    )
+                rows.push(retained_serve_kv_row(
+                    "usage",
+                    &format!(
+                        "in {}  ·  out {}  ·  total {}{}",
+                        format_count(usage.input_tokens),
+                        format_count(usage.output_tokens),
+                        format_count(usage.total_tokens),
+                        usage
+                            .cost_usd
+                            .map(|cost| format!("  ·  ${cost:.2}"))
+                            .unwrap_or_default()
+                    ),
+                    width,
+                    UiStatus::Active,
                 ));
             }
 
@@ -2011,25 +2007,32 @@ fn build_retained_serve_rows_for_size(
                 },
             ));
         } else if claim.summary != "-" {
-            rows.push(format!(
-                "summary    {}",
-                truncate_single_line(&claim.summary, width.saturating_sub(11))
+            rows.push(retained_serve_kv_row(
+                "summary",
+                &claim.summary,
+                width,
+                UiStatus::Active,
             ));
         }
     } else {
-        rows.push("active     no active issues".into());
+        rows.push(retained_serve_kv_row(
+            "active",
+            "no active issues",
+            width,
+            UiStatus::Skipped,
+        ));
     }
 
     if view_mode == crate::cmd::ui::LiveViewMode::Full && !monitor.claims.is_empty() {
         rows.push(String::new());
-        rows.push("claims".into());
+        rows.push(retained_serve_section_title("claims", width));
         for claim in monitor.claims.iter().take(6) {
             let status = claim_status_ui(&claim.status);
-            rows.push(truncate_single_line(
+            rows.push(retained_serve_activity_line(
+                status,
+                &display_issue_headline(claim),
                 &format!(
-                    "{} {}  ·  {}  ·  {}",
-                    status.glyph(),
-                    display_issue_headline(claim),
+                    "{}  ·  {}",
                     truncate_text(&claim.workflow, 24),
                     claim.status
                 ),
@@ -2039,38 +2042,36 @@ fn build_retained_serve_rows_for_size(
     }
 
     rows.push(String::new());
-    rows.push("recent".into());
+    rows.push(retained_serve_section_title("recent", width));
     let recent_limit = match view_mode {
         crate::cmd::ui::LiveViewMode::Focused => 4,
         crate::cmd::ui::LiveViewMode::Full => 8,
     };
     for activity in monitor.activity.iter().take(recent_limit) {
         let (status, label) = activity_status_and_label(&activity.event);
-        rows.push(truncate_single_line(
-            &format!(
-                "{} {}  ·  {}  ·  {}",
-                status.glyph(),
-                activity.issue,
-                label,
-                truncate_text(&activity.workflow, 24)
-            ),
+        rows.push(retained_serve_activity_line(
+            status,
+            &activity.issue,
+            &format!("{label}  ·  {}", truncate_text(&activity.workflow, 24)),
             width,
         ));
         if activity.detail != "-" {
-            rows.push(truncate_single_line(
-                &format!(
-                    "  {}",
-                    truncate_text(&activity.detail, width.saturating_sub(2))
-                ),
+            rows.push(retained_serve_detail_line(
+                &truncate_text(&activity.detail, width.saturating_sub(2)),
                 width,
             ));
         }
     }
 
     rows.push(String::new());
-    rows.push(format!(
-        "queue      queued {}  ·  due {}  ·  processed {}",
-        monitor.wakes.queued, monitor.wakes.due, monitor.wakes.processed_recent
+    rows.push(retained_serve_kv_row(
+        "queue",
+        &format!(
+            "queued {}  ·  due {}  ·  processed {}",
+            monitor.wakes.queued, monitor.wakes.due, monitor.wakes.processed_recent
+        ),
+        width,
+        UiStatus::Active,
     ));
 
     rows.truncate(height);
@@ -2087,6 +2088,89 @@ fn render_retained_serve_rows(rows: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn retained_serve_header_line(
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+    idle_sleep: std::time::Duration,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "autoflow serve", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        &format!(
+            "  ·  repo {}  ·  worker {}  ·  idle {}s",
+            repo_filter.unwrap_or("(all)"),
+            worker_filter.unwrap_or("(auto)"),
+            idle_sleep.as_secs_f32()
+        ),
+        DIM,
+    );
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn retained_serve_kv_row(label: &str, value: &str, width: usize, status: UiStatus) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, &format!("{label:<10}"), status.color());
+    let _ = palette::write_colored(
+        &mut buf,
+        &truncate_single_line(value, width.saturating_sub(11)),
+        DIM,
+    );
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn retained_serve_section_title(title: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, title, BRAND);
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn retained_serve_activity_line(
+    status: UiStatus,
+    issue: &str,
+    detail: &str,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, &status.glyph().to_string(), status.color());
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, &truncate_single_line(issue, 36), status.color());
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, &truncate_single_line(detail, 72), DIM);
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn retained_serve_detail_line(detail: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "  ", DIM);
+    let _ = palette::write_colored(&mut buf, detail, DIM);
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn activity_status_for_run_summary(summary: &AutoflowRunSummary) -> UiStatus {
+    match summary.status.as_str() {
+        "completed" => UiStatus::Complete,
+        "failed" | "rejected" => UiStatus::Failed,
+        "awaiting_approval" => UiStatus::Awaiting,
+        "running" => UiStatus::Working,
+        _ => UiStatus::Active,
+    }
+}
+
+fn truncate_retained_ansi_line(value: &str, width: usize) -> String {
+    if visible_len(value) <= width {
+        value.to_string()
+    } else {
+        wrap_with_ansi(value, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+}
+
 fn render_retained_serve_event_rows(
     lines: &[AutoflowServeViewLine],
     width: usize,
@@ -2094,9 +2178,18 @@ fn render_retained_serve_event_rows(
 ) -> Vec<String> {
     let mut rendered = Vec::new();
     for line in lines {
-        let prefix = format!("{} ", line.status.glyph());
+        let prefix = {
+            let mut value = String::new();
+            let _ = palette::write_bold_colored(
+                &mut value,
+                &line.status.glyph().to_string(),
+                line.status.color(),
+            );
+            value.push(' ');
+            value
+        };
         let content_width = width.saturating_sub(2).max(1);
-        for (idx, segment) in wrap_retained_serve_plain(&line.text, content_width)
+        for (idx, segment) in wrap_with_ansi(&line.text, content_width)
             .into_iter()
             .enumerate()
         {
@@ -2112,61 +2205,6 @@ fn render_retained_serve_event_rows(
     } else {
         rendered
     }
-}
-
-fn wrap_retained_serve_plain(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    let mut out = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-        let current_len = current.chars().count();
-        if current.is_empty() {
-            if word_len <= width {
-                current.push_str(word);
-            } else {
-                let mut chunk = String::new();
-                for ch in word.chars() {
-                    if chunk.chars().count() >= width {
-                        out.push(chunk);
-                        chunk = String::new();
-                    }
-                    chunk.push(ch);
-                }
-                if !chunk.is_empty() {
-                    current = chunk;
-                }
-            }
-        } else if current_len + 1 + word_len <= width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            out.push(current);
-            current = String::new();
-            if word_len <= width {
-                current.push_str(word);
-            } else {
-                let mut chunk = String::new();
-                for ch in word.chars() {
-                    if chunk.chars().count() >= width {
-                        out.push(chunk);
-                        chunk = String::new();
-                    }
-                    chunk.push(ch);
-                }
-                current = chunk;
-            }
-        }
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
 }
 
 fn resolve_live_claim_run(
@@ -3109,8 +3147,10 @@ mod serve_heartbeat_tests {
             80,
             24,
         );
-        assert!(rows.iter().any(|row| row.starts_with("active     ")));
-        assert!(!rows.iter().any(|row| row == "claims"));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("active") && row.contains("storefront-feature-delivery")));
+        assert!(!rows.iter().any(|row| row.contains("claims")));
     }
 
     #[test]
@@ -3129,7 +3169,7 @@ mod serve_heartbeat_tests {
             80,
             24,
         );
-        assert!(rows.iter().any(|row| row == "claims"));
+        assert!(rows.iter().any(|row| row.contains("claims")));
         assert!(rows
             .iter()
             .any(|row| row.contains("storefront-feature-delivery")));
