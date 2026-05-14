@@ -1188,6 +1188,39 @@ fn handle_attach_keypress(
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
             Ok(AttachControl::Exit(AttachExit::Quit))
         }
+        (KeyCode::Esc, _) => {
+            if session.status == SessionStatus::Running {
+                cancel_active_turn(global, &session.session_id, printer)?;
+                printer.sideband_event(
+                    crate::output::palette::Status::Awaiting,
+                    "cancel requested",
+                    Some("press p once the session is idle to send the next prompt"),
+                );
+                return Ok(AttachControl::Continue);
+            }
+            if session.status == SessionStatus::Stopped {
+                printer.sideband_event(
+                    crate::output::palette::Status::Failed,
+                    "session stopped",
+                    Some("use `rupu session start` to create a new one"),
+                );
+                return Ok(AttachControl::Continue);
+            }
+            match prompt_for_session_input(printer, &session.session_id)? {
+                SessionInput::Submit(input) => {
+                    return handle_session_input(global, session, printer, input)
+                }
+                SessionInput::Cancelled => {
+                    printer.sideband_event(
+                        crate::output::palette::Status::Skipped,
+                        "prompt cancelled",
+                        None,
+                    );
+                }
+                SessionInput::Empty => {}
+            }
+            Ok(AttachControl::Continue)
+        }
         (KeyCode::Char('?'), _) => {
             render_attach_help(printer);
             Ok(AttachControl::Continue)
@@ -1402,7 +1435,7 @@ fn render_attach_help_hint(printer: &mut crate::output::LineStreamPrinter) {
     printer.sideband_event(
         crate::output::palette::Status::Active,
         "controls",
-        Some("p prompt  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help"),
+        Some("p/Esc prompt  ·  Esc/x cancel turn  ·  d detach  ·  q quit  ·  ? help"),
     );
 }
 
@@ -1410,7 +1443,7 @@ fn render_attach_help(printer: &mut crate::output::LineStreamPrinter) {
     printer.sideband_event(
         crate::output::palette::Status::Active,
         "keys",
-        Some("p prompt  ·  Esc cancel prompt  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit"),
+        Some("p prompt  ·  Esc prompt/cancel turn  ·  Esc cancel prompt  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit"),
     );
     printer.sideband_event(
         crate::output::palette::Status::Active,
