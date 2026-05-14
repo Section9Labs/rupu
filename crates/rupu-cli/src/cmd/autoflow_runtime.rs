@@ -1370,6 +1370,7 @@ mod tests {
                     backend_id: None,
                     worker_id: None,
                     artifact_manifest_path: None,
+                    runner_pid: None,
                     source_wake_id: None,
                     active_step_id: None,
                     active_step_kind: None,

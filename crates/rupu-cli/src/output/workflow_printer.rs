@@ -201,6 +201,8 @@ pub enum AttachOutcome {
     Approved { awaited_step_id: String },
     /// User pressed `r`. The rejection was persisted; nothing more to run.
     Rejected,
+    /// User requested cancellation of a running workflow.
+    Cancelled,
 }
 
 /// Optional knobs for `attach_and_print`. Defaults preserve the
@@ -546,17 +548,27 @@ pub fn attach_and_render_interactive_with(
                                 if let Some(action) =
                                     handle_workflow_navigation_keypress(&record, &mut state, key)
                                 {
-                                    if matches!(action, WorkflowNavAction::ToggleView) {
-                                        let viewport = state.viewport.clone();
-                                        view_mode = view_mode.toggled();
-                                        state = rebuild_workflow_interactive_state(
-                                            &record,
-                                            &step_results_log,
-                                            opts.skip_count,
-                                            view_mode,
-                                            &prefs,
-                                        );
-                                        state.viewport = viewport;
+                                    match action {
+                                        WorkflowNavAction::Handled => {}
+                                        WorkflowNavAction::ToggleView => {
+                                            let viewport = state.viewport.clone();
+                                            view_mode = view_mode.toggled();
+                                            state = rebuild_workflow_interactive_state(
+                                                &record,
+                                                &step_results_log,
+                                                opts.skip_count,
+                                                view_mode,
+                                                &prefs,
+                                            );
+                                            state.viewport = viewport;
+                                        }
+                                        WorkflowNavAction::Cancel => {
+                                            break (
+                                                AttachOutcome::Cancelled,
+                                                Some(record),
+                                                state.total_tokens,
+                                            );
+                                        }
                                     }
                                     continue;
                                 }
@@ -611,17 +623,27 @@ pub fn attach_and_render_interactive_with(
                                 if let Some(action) =
                                     handle_workflow_navigation_keypress(&record, &mut state, key)
                                 {
-                                    if matches!(action, WorkflowNavAction::ToggleView) {
-                                        let viewport = state.viewport.clone();
-                                        view_mode = view_mode.toggled();
-                                        state = rebuild_workflow_interactive_state(
-                                            &record,
-                                            &step_results_log,
-                                            opts.skip_count,
-                                            view_mode,
-                                            &prefs,
-                                        );
-                                        state.viewport = viewport;
+                                    match action {
+                                        WorkflowNavAction::Handled => {}
+                                        WorkflowNavAction::ToggleView => {
+                                            let viewport = state.viewport.clone();
+                                            view_mode = view_mode.toggled();
+                                            state = rebuild_workflow_interactive_state(
+                                                &record,
+                                                &step_results_log,
+                                                opts.skip_count,
+                                                view_mode,
+                                                &prefs,
+                                            );
+                                            state.viewport = viewport;
+                                        }
+                                        WorkflowNavAction::Cancel => {
+                                            break (
+                                                AttachOutcome::Cancelled,
+                                                Some(record),
+                                                state.total_tokens,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -662,7 +684,8 @@ pub fn attach_and_render_interactive_with(
                 println!("Detached from run. It is still waiting on approval.");
                 println!("Re-attach with: rupu watch {run_id}");
             }
-            AttachOutcome::Approved { .. } | AttachOutcome::Rejected => {}
+            AttachOutcome::Approved { .. } | AttachOutcome::Rejected | AttachOutcome::Cancelled => {
+            }
         }
     }
 
@@ -1421,6 +1444,7 @@ fn retained_payload_lines(
 enum WorkflowNavAction {
     Handled,
     ToggleView,
+    Cancel,
 }
 
 fn handle_workflow_navigation_keypress(
@@ -1457,9 +1481,17 @@ fn handle_workflow_navigation_keypress(
         (KeyCode::Char('?'), _) => {
             state.push_line(
                 UiStatus::Active,
-                "help  ·  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail",
+                "help  ·  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel",
             );
             Some(WorkflowNavAction::Handled)
+        }
+        (KeyCode::Char('x'), _)
+            if matches!(
+                record.status,
+                rupu_orchestrator::RunStatus::Pending | rupu_orchestrator::RunStatus::Running
+            ) =>
+        {
+            Some(WorkflowNavAction::Cancel)
         }
         (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL)
             if record.status != rupu_orchestrator::RunStatus::AwaitingApproval =>
@@ -1703,7 +1735,7 @@ fn render_workflow_controls_line(status: rupu_orchestrator::RunStatus, width: us
         rupu_orchestrator::RunStatus::AwaitingApproval => {
             "f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  a approve  ·  r reject  ·  v findings  ·  q detach"
         }
-        _ => "f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  resize reflows automatically  ·  ? help",
+        _ => "f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel  ·  resize reflows automatically  ·  ? help",
     };
     let mut buf = String::new();
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
@@ -2961,6 +2993,7 @@ mod tests {
             backend_id: None,
             worker_id: None,
             artifact_manifest_path: None,
+            runner_pid: None,
             source_wake_id: None,
             active_step_id: None,
             active_step_kind: None,

@@ -165,6 +165,12 @@ pub enum Action {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Cancel a running workflow run.
+    Cancel {
+        /// Full run id (`run_<ULID>`) as printed by
+        /// `rupu workflow run`.
+        run_id: String,
+    },
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {
@@ -223,6 +229,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::ShowRun { run_id } => show_run(&run_id, global_format).await,
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
+        Action::Cancel { run_id } => cancel(&run_id).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -240,6 +247,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Run { .. } => ("workflow run", report::TABLE_ONLY),
         Action::Approve { .. } => ("workflow approve", report::TABLE_ONLY),
         Action::Reject { .. } => ("workflow reject", report::TABLE_ONLY),
+        Action::Cancel { .. } => ("workflow cancel", report::TABLE_ONLY),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
@@ -1305,6 +1313,103 @@ async fn reject(run_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn cancel(run_id: &str) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let outcome = cancel_with_store(&store, run_id, "cancelled by operator")?;
+    match outcome {
+        CancelOutcome::RejectedAwaitingApproval => {
+            println!("rupu: cancelled paused run {run_id}");
+        }
+        CancelOutcome::MarkedCancelled { pid, was_running } => match (pid, was_running) {
+            (Some(pid), true) => {
+                println!("rupu: cancelled run {run_id} (sent TERM to pid {pid})");
+            }
+            (Some(pid), false) => {
+                println!("rupu: marked run {run_id} cancelled (pid {pid} was not running)");
+            }
+            (None, _) => {
+                println!("rupu: marked run {run_id} cancelled");
+            }
+        },
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelOutcome {
+    RejectedAwaitingApproval,
+    MarkedCancelled { pid: Option<u32>, was_running: bool },
+}
+
+fn cancel_with_store(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+    reason: &str,
+) -> anyhow::Result<CancelOutcome> {
+    let mut record = store
+        .load(run_id)
+        .map_err(|e| anyhow::anyhow!("load run record: {e}"))?;
+    match record.status {
+        rupu_orchestrator::RunStatus::Completed
+        | rupu_orchestrator::RunStatus::Failed
+        | rupu_orchestrator::RunStatus::Rejected => {
+            anyhow::bail!(
+                "run {run_id} is already terminal ({})",
+                record.status.as_str()
+            );
+        }
+        rupu_orchestrator::RunStatus::AwaitingApproval => {
+            let approver = whoami::username();
+            store
+                .reject(run_id, &approver, reason, chrono::Utc::now())
+                .map_err(|e| anyhow::anyhow!("cancel awaiting run: {e}"))?;
+            Ok(CancelOutcome::RejectedAwaitingApproval)
+        }
+        rupu_orchestrator::RunStatus::Pending | rupu_orchestrator::RunStatus::Running => {
+            let pid = record.runner_pid;
+            let was_running = pid.is_some_and(pid_is_running);
+            if let Some(pid) = pid.filter(|pid| pid_is_running(*pid)) {
+                let _ = terminate_pid(pid);
+            }
+            record.status = rupu_orchestrator::RunStatus::Failed;
+            record.finished_at = Some(chrono::Utc::now());
+            record.error_message = Some(reason.to_string());
+            record.awaiting_step_id = None;
+            record.approval_prompt = None;
+            record.awaiting_since = None;
+            record.expires_at = None;
+            record.runner_pid = None;
+            record.active_step_id = None;
+            record.active_step_kind = None;
+            record.active_step_agent = None;
+            record.active_step_transcript_path = None;
+            store
+                .update(&record)
+                .map_err(|e| anyhow::anyhow!("persist cancelled run: {e}"))?;
+            Ok(CancelOutcome::MarkedCancelled { pid, was_running })
+        }
+    }
+}
+
+fn pid_is_running(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn terminate_pid(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub(crate) fn locate_workflow_in(
     global: &Path,
     project_root: Option<&Path>,
@@ -2282,15 +2387,35 @@ async fn execute_workflow_invocation(
                 }
             };
 
+            use crate::output::workflow_printer::AttachOutcome;
+            if matches!(outcome, AttachOutcome::Cancelled) {
+                current_runner.abort();
+                let _ = current_runner.await;
+                cancel_with_store(
+                    run_store_for_resume.as_ref(),
+                    &current_run_id,
+                    "cancelled by operator",
+                )?;
+                return Ok(RunOutcomeSummary {
+                    run_id: current_run_id,
+                    awaiting_step_id: None,
+                    artifact_manifest_path: None,
+                    backend_id: Some(prepared_run.backend_id.clone()),
+                    worker_id: prepared_run.worker_id.clone(),
+                });
+            }
+
             let result = current_runner
                 .await
                 .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
                 .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?;
 
-            use crate::output::workflow_printer::AttachOutcome;
             match outcome {
                 AttachOutcome::Done | AttachOutcome::Detached | AttachOutcome::Rejected => {
                     break result;
+                }
+                AttachOutcome::Cancelled => {
+                    unreachable!("cancelled outcome is handled before join")
                 }
                 AttachOutcome::Approved { awaited_step_id } => {
                     let prior_records = run_store_for_resume
@@ -2474,3 +2599,94 @@ async fn post_run_summary_to_issue(
 
 // DefaultStepFactory is now defined in rupu-orchestrator::step_factory.
 // Construction sites below use rupu_orchestrator::DefaultStepFactory directly.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use rupu_orchestrator::{RunRecord, RunStatus};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn sample_run_record(status: RunStatus, runner_pid: Option<u32>) -> RunRecord {
+        RunRecord {
+            id: "run_test_cancel".into(),
+            workflow_name: "sample".into(),
+            status,
+            inputs: BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_test".into(),
+            workspace_path: PathBuf::from("/tmp/workspace"),
+            transcript_dir: PathBuf::from("/tmp/transcripts"),
+            started_at: Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting_step_id: Some("step_approve".into()),
+            approval_prompt: Some("approve?".into()),
+            awaiting_since: Some(Utc::now()),
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid,
+            source_wake_id: None,
+            active_step_id: Some("step_run".into()),
+            active_step_kind: None,
+            active_step_agent: Some("writer".into()),
+            active_step_transcript_path: Some(PathBuf::from("/tmp/transcripts/step.jsonl")),
+        }
+    }
+
+    #[test]
+    fn cancel_with_store_marks_running_run_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::Running, Some(999_999));
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        let outcome =
+            cancel_with_store(&store, "run_test_cancel", "cancelled by operator").unwrap();
+        assert_eq!(
+            outcome,
+            CancelOutcome::MarkedCancelled {
+                pid: Some(999_999),
+                was_running: false,
+            }
+        );
+
+        let persisted = store.load("run_test_cancel").unwrap();
+        assert_eq!(persisted.status, RunStatus::Failed);
+        assert_eq!(
+            persisted.error_message.as_deref(),
+            Some("cancelled by operator")
+        );
+        assert!(persisted.finished_at.is_some());
+        assert_eq!(persisted.runner_pid, None);
+        assert_eq!(persisted.awaiting_step_id, None);
+        assert_eq!(persisted.active_step_id, None);
+        assert_eq!(persisted.active_step_agent, None);
+        assert_eq!(persisted.active_step_transcript_path, None);
+    }
+
+    #[test]
+    fn cancel_with_store_rejects_awaiting_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::AwaitingApproval, None);
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        let outcome =
+            cancel_with_store(&store, "run_test_cancel", "cancelled by operator").unwrap();
+        assert_eq!(outcome, CancelOutcome::RejectedAwaitingApproval);
+
+        let persisted = store.load("run_test_cancel").unwrap();
+        assert_eq!(persisted.status, RunStatus::Rejected);
+        assert_eq!(
+            persisted.error_message.as_deref(),
+            Some("rejected: cancelled by operator")
+        );
+    }
+}
