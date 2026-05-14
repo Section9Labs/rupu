@@ -98,6 +98,22 @@ pub struct UiState {
     pub active_view_per_tab: BTreeMap<String, String>,
 }
 
+impl UiState {
+    /// Toggle whether `section` is in `sidebar_collapsed_sections`.
+    /// Adds the section if absent, removes it if present.
+    pub fn toggle_section_collapsed(&mut self, section: &str) {
+        if let Some(idx) = self
+            .sidebar_collapsed_sections
+            .iter()
+            .position(|s| s == section)
+        {
+            self.sidebar_collapsed_sections.remove(idx);
+        } else {
+            self.sidebar_collapsed_sections.push(section.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +161,23 @@ mod tests {
             "empty collapsed should be omitted: {s}"
         );
         assert!(!s.contains("repos"), "empty repos should be omitted: {s}");
+    }
+
+    #[test]
+    fn toggle_section_collapsed_adds_and_removes() {
+        let mut ui = UiState::default();
+        assert!(ui.sidebar_collapsed_sections.is_empty());
+
+        ui.toggle_section_collapsed("agents");
+        assert_eq!(ui.sidebar_collapsed_sections, vec!["agents".to_string()]);
+
+        ui.toggle_section_collapsed("workflows");
+        assert_eq!(
+            ui.sidebar_collapsed_sections,
+            vec!["agents".to_string(), "workflows".to_string()]
+        );
+
+        ui.toggle_section_collapsed("agents");
+        assert_eq!(ui.sidebar_collapsed_sections, vec!["workflows".to_string()]);
     }
 }
