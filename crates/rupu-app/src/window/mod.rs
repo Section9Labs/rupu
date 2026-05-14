@@ -8,7 +8,7 @@ use crate::menu::app_menu::{ApproveFocused, LaunchSelected, RejectFocused};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
-use crate::window::sidebar::{ActiveRunMap, WorkflowClickCb};
+use crate::window::sidebar::{ActiveRunMap, SectionToggleCb, WorkflowClickCb};
 use crate::workspace::Workspace;
 use gpui::{
     div, prelude::*, px, size, AnyElement, App, Bounds, Context, IntoElement, Render, WeakEntity,
@@ -286,6 +286,18 @@ impl WorkspaceWindow {
         self.open_launcher(path, cx);
     }
 
+    /// Toggle a sidebar section's collapsed state and persist.
+    pub fn handle_section_toggle(&mut self, section: &'static str, cx: &mut Context<Self>) {
+        self.workspace
+            .manifest
+            .ui
+            .toggle_section_collapsed(section);
+        if let Err(e) = crate::workspace::storage::save(&self.workspace.manifest) {
+            tracing::warn!(%e, "persist sidebar collapse state");
+        }
+        cx.notify();
+    }
+
     /// Called when the user clicks the Run button in the toolbar.
     /// Opens the launcher modal with the current workflow.
     pub fn handle_run_clicked(&mut self, cx: &mut Context<Self>) {
@@ -521,6 +533,7 @@ impl Render for WorkspaceWindow {
         let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
         let weak_sidebar_click = weak.clone();
         let weak_sidebar_right = weak.clone();
+        let weak_section_toggle = weak.clone();
         let weak2 = weak.clone();
         // Pre-cloned for the launcher overlay branch below.
         let weak_launcher = weak.clone();
@@ -616,11 +629,21 @@ impl Render for WorkspaceWindow {
                                     });
                                 });
                             });
+                        let on_section_toggle: SectionToggleCb =
+                            Arc::new(move |section, _w, cx| {
+                                let weak = weak_section_toggle.clone();
+                                cx.defer(move |cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.handle_section_toggle(section, cx)
+                                    });
+                                });
+                            });
                         sidebar::render(
                             &self.workspace,
                             &active_run_map,
                             on_workflow_click,
                             on_workflow_right_click,
+                            on_section_toggle,
                         )
                     })
                     .child(main_area),

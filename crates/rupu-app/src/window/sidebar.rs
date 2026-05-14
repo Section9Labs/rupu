@@ -25,11 +25,17 @@ pub type ActiveRunMap = HashMap<PathBuf, RunStatus>;
 /// the current GPUI window handle, and the app context.
 pub type WorkflowClickCb = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync + 'static>;
 
+/// Callback type for sidebar section-header clicks. Receives the section
+/// name (`"workflows"` / `"runs"` / `"repos"` / `"agents"` / `"issues"`),
+/// the current GPUI window handle, and the app context.
+pub type SectionToggleCb = Arc<dyn Fn(&'static str, &mut Window, &mut App) + Send + Sync + 'static>;
+
 pub fn render(
     workspace: &Workspace,
     active_runs: &ActiveRunMap,
     on_workflow_click: WorkflowClickCb,
     on_workflow_right_click: WorkflowClickCb,
+    on_section_toggle: SectionToggleCb,
 ) -> impl IntoElement {
     let collapsed = &workspace.manifest.ui.sidebar_collapsed_sections;
     let project = &workspace.project_assets;
@@ -58,13 +64,14 @@ pub fn render(
             _ => Vec::new(), // runs/repos/issues land in D-3/D-9
         };
         container = container.child(render_section(
-            section,
+            *section,
             &items,
             is_collapsed,
             i == 0,
             active_runs,
             on_workflow_click.clone(),
             on_workflow_right_click.clone(),
+            on_section_toggle.clone(),
         ));
     }
 
@@ -72,35 +79,19 @@ pub fn render(
 }
 
 fn render_section(
-    name: &str,
+    name: &'static str,
     items: &[&Asset],
     is_collapsed: bool,
     is_first: bool,
     active_runs: &ActiveRunMap,
     on_workflow_click: WorkflowClickCb,
     on_workflow_right_click: WorkflowClickCb,
+    on_section_toggle: SectionToggleCb,
 ) -> impl IntoElement {
-    // Header: uppercase label + optional caret + count when collapsed.
-    let caret_child: AnyElement = if is_collapsed {
-        div()
-            .text_color(palette::TEXT_DIMMEST)
-            .child("▸")
-            .into_any_element()
-    } else {
-        div().into_any_element()
-    };
-
-    let count_child: AnyElement = if is_collapsed {
-        div()
-            .ml_auto()
-            .text_color(palette::TEXT_DIMMEST)
-            .child(format!("{}", items.len()))
-            .into_any_element()
-    } else {
-        div().into_any_element()
-    };
-
+    // Header: clickable row with caret + uppercase label + count badge.
+    let caret = if is_collapsed { "▸" } else { "▾" };
     let header = div()
+        .id(gpui::SharedString::from(format!("sec-{name}")))
         .text_xs()
         .text_color(palette::TEXT_DIMMEST)
         .mb(px(4.0))
@@ -108,9 +99,20 @@ fn render_section(
         .flex()
         .items_center()
         .gap(px(6.0))
+        .cursor_pointer()
+        .child(div().child(caret))
         .child(div().child(name.to_uppercase()))
-        .child(caret_child)
-        .child(count_child);
+        .child(
+            // Count badge always shown
+            div()
+                .ml_auto()
+                .text_color(palette::TEXT_DIMMEST)
+                .child(format!("{}", items.len())),
+        )
+        .on_click({
+            let cb = on_section_toggle.clone();
+            move |_, w, cx| cb(name, w, cx)
+        });
 
     // Body: nothing when collapsed, em-dash placeholder when empty, items otherwise.
     let body: AnyElement = if is_collapsed {
