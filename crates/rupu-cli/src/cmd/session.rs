@@ -12,7 +12,10 @@ use crate::output::formats::OutputFormat;
 use crate::output::palette::{self, BRAND, DIM};
 use crate::output::printer::{visible_len, wrap_with_ansi};
 use crate::output::report::{self, CollectionOutput, DetailOutput};
-use crate::output::rich_payload::{render_payload, render_tool_input, RenderedPayload};
+use crate::output::rich_payload::{
+    render_assistant_content, render_payload, render_payload_preview_lines, render_tool_input,
+    RenderedPayload,
+};
 use crate::output::viewport::ViewportState;
 use crate::paths;
 use crate::standalone_run_metadata::{
@@ -1860,14 +1863,8 @@ fn transcript_event_lines(
                         ),
                         continuation: false,
                     }),
-                    LiveViewMode::Compact => {}
-                    LiveViewMode::Full => {
-                        let highlighted =
-                            crate::output::rich_payload::render_assistant_content(
-                                content.trim(),
-                                prefs,
-                            )
-                            .rendered;
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let highlighted = render_assistant_content(content.trim(), prefs).rendered;
                         let mut lines = highlighted.split('\n');
                         if let Some(first) = lines.next() {
                             out.push(SessionViewLine {
@@ -1941,7 +1938,7 @@ fn transcript_event_lines(
             let raw = error.as_deref().unwrap_or(output.as_str());
             let payload = render_payload(raw, prefs);
             match view_mode {
-                LiveViewMode::Focused | LiveViewMode::Compact => vec![SessionViewLine {
+                LiveViewMode::Focused => vec![SessionViewLine {
                     status,
                     text: retained_session_event_line(
                         status,
@@ -1950,6 +1947,25 @@ fn transcript_event_lines(
                     ),
                     continuation: false,
                 }],
+                LiveViewMode::Compact => {
+                    let mut out = vec![SessionViewLine {
+                        status,
+                        text: retained_session_event_line(
+                            status,
+                            label,
+                            &session_payload_summary(&payload, *duration_ms),
+                        ),
+                        continuation: false,
+                    }];
+                    for line in render_payload_preview_lines(&payload, 5) {
+                        out.push(SessionViewLine {
+                            status,
+                            text: line,
+                            continuation: true,
+                        });
+                    }
+                    out
+                }
                 LiveViewMode::Full => {
                     let mut out = vec![SessionViewLine {
                         status,
@@ -1972,7 +1988,7 @@ fn transcript_event_lines(
             }
         }
         TranscriptEvent::FileEdit { path, kind, diff } => match view_mode {
-            LiveViewMode::Focused | LiveViewMode::Compact => vec![SessionViewLine {
+            LiveViewMode::Focused => vec![SessionViewLine {
                 status: Status::Complete,
                 text: retained_session_event_line(
                     Status::Complete,
@@ -1981,6 +1997,31 @@ fn transcript_event_lines(
                 ),
                 continuation: false,
             }],
+            LiveViewMode::Compact => {
+                let payload = render_payload(diff, prefs);
+                let mut out = vec![SessionViewLine {
+                    status: Status::Complete,
+                    text: retained_session_event_line(
+                        Status::Complete,
+                        "file edit",
+                        &format!(
+                            "{} {}  ·  {}",
+                            format!("{kind:?}").to_lowercase(),
+                            path,
+                            payload.headline
+                        ),
+                    ),
+                    continuation: false,
+                }];
+                for line in render_payload_preview_lines(&payload, 8) {
+                    out.push(SessionViewLine {
+                        status: Status::Complete,
+                        text: line,
+                        continuation: true,
+                    });
+                }
+                out
+            }
             LiveViewMode::Full => {
                 let payload = render_payload(diff, prefs);
                 let mut out = vec![SessionViewLine {
@@ -2027,9 +2068,9 @@ fn transcript_event_lines(
                 "command",
                 &format!(
                     "{}  ·  cwd {}  ·  exit {}",
-                truncate_single_line(&argv.join(" "), 64),
-                truncate_single_line(cwd, 24),
-                exit_code
+                    truncate_single_line(&argv.join(" "), 64),
+                    truncate_single_line(cwd, 24),
+                    exit_code
                 ),
             ),
             continuation: false,
@@ -3755,6 +3796,25 @@ mod tests {
     }
 
     #[test]
+    fn transcript_event_lines_compact_keeps_assistant_body() {
+        let event = TranscriptEvent::AssistantMessage {
+            content: "## Summary\n\n- first\n- second".into(),
+            thinking: None,
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let compact = transcript_event_lines(&event, LiveViewMode::Compact, &prefs);
+        assert!(!compact.is_empty());
+        assert!(compact[0].text.contains("assistant output"));
+        assert!(compact.len() > 1);
+    }
+
+    #[test]
     fn transcript_event_lines_full_expands_json_tool_results() {
         let event = TranscriptEvent::ToolResult {
             output: "{\"status\":\"ok\",\"items\":[1,2]}".into(),
@@ -3781,6 +3841,27 @@ mod tests {
         assert_eq!(focused.len(), 1);
         assert!(full.len() > 1);
         assert!(full[0].text.contains("json payload"));
+    }
+
+    #[test]
+    fn transcript_event_lines_compact_previews_tool_result_payload() {
+        let event = TranscriptEvent::ToolResult {
+            output: "line1\nline2\nline3\nline4\nline5\nline6\n".into(),
+            error: None,
+            duration_ms: 12,
+            call_id: "call_123".into(),
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let compact = transcript_event_lines(&event, LiveViewMode::Compact, &prefs);
+        assert!(compact.len() > 1);
+        assert!(compact[0].text.contains("tool result"));
+        assert!(compact.iter().any(|line| line.text.contains("line1")));
     }
 
     fn test_session_record() -> SessionRecord {
