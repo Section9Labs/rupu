@@ -5,7 +5,7 @@ use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref as canonical_repo_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::transcript::truncate_single_line;
-use crate::cmd::ui::UiPrefs;
+use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::cmd::workflow::{
     locate_workflow_in, run_with_explicit_context, ExecutionWorkerContext,
     ExplicitWorkflowRunContext, RunEnvelopeTemplate,
@@ -13,6 +13,8 @@ use crate::cmd::workflow::{
 use crate::output::palette::{self, Status as UiStatus, BRAND, DIM};
 use crate::output::printer::{format_duration, visible_len, wrap_with_ansi};
 use crate::output::report::{self as output_report, CollectionOutput, DetailOutput};
+use crate::output::rich_payload::{render_payload, render_tool_input};
+use crate::output::viewport::ViewportState;
 use crate::output::workflow_printer::{
     LiveWorkflowEvent, LiveWorkflowEventHook, LiveWorkflowRender,
 };
@@ -23,8 +25,9 @@ use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
 use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
-use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use jsonschema::JSONSchema;
 use rupu_auth::{CredentialResolver, KeychainResolver};
@@ -1025,9 +1028,25 @@ struct ServeProgressSnapshot {
 struct AutoflowServeViewLine {
     status: UiStatus,
     text: String,
+    continuation: bool,
 }
 
 struct AutoflowServeScreenGuard;
+
+struct AutoflowServeRawModeGuard;
+
+impl AutoflowServeRawModeGuard {
+    fn enter() -> anyhow::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AutoflowServeRawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
 
 impl AutoflowServeScreenGuard {
     fn enter() -> anyhow::Result<Self> {
@@ -1743,7 +1762,7 @@ async fn serve_retained(
     repo_filter: Option<&str>,
     worker_filter: Option<&str>,
     idle_sleep: std::time::Duration,
-    view_mode: crate::cmd::ui::LiveViewMode,
+    view_mode: LiveViewMode,
     resolver: Arc<dyn CredentialResolver>,
 ) -> anyhow::Result<()> {
     let progress = Arc::new(Mutex::new(ServeProgressSnapshot::default()));
@@ -1784,10 +1803,13 @@ async fn serve_retained(
     });
 
     let exit = {
+        let _raw_mode = AutoflowServeRawModeGuard::enter()?;
         let _screen = AutoflowServeScreenGuard::enter()?;
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(250));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_rows: Vec<String> = Vec::new();
+        let mut live_view_mode = view_mode;
+        let mut viewport = ViewportState::default();
 
         loop {
             tokio::select! {
@@ -1808,12 +1830,34 @@ async fn serve_retained(
                         repo_filter,
                         worker_filter,
                         idle_sleep,
-                        view_mode,
+                        live_view_mode,
+                        &mut viewport,
                         &snapshot,
                     )?;
                     if rows != last_rows {
                         render_retained_serve_rows(&rows)?;
                         last_rows = rows;
+                    }
+                    while event::poll(std::time::Duration::from_millis(0))? {
+                        match event::read()? {
+                            CrosstermEvent::Resize(_, _) => {}
+                            CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                                match (key.code, key.modifiers) {
+                                    (KeyCode::Char('f'), _) => {
+                                        live_view_mode = live_view_mode.toggled();
+                                        last_rows.clear();
+                                    }
+                                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => viewport.scroll_up(1),
+                                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => viewport.scroll_down(1),
+                                    (KeyCode::PageUp, _) => viewport.page_up(),
+                                    (KeyCode::PageDown, _) => viewport.page_down(),
+                                    (KeyCode::Char('g'), KeyModifiers::NONE) => viewport.jump_top(),
+                                    (KeyCode::Char('G'), _) | (KeyCode::End, _) => viewport.jump_bottom(),
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -1850,7 +1894,8 @@ fn build_retained_serve_rows(
     repo_filter: Option<&str>,
     worker_filter: Option<&str>,
     idle_sleep: std::time::Duration,
-    view_mode: crate::cmd::ui::LiveViewMode,
+    view_mode: LiveViewMode,
+    viewport: &mut ViewportState,
     snapshot: &ServeProgressSnapshot,
 ) -> anyhow::Result<Vec<String>> {
     let monitor = build_monitor_report(repo_filter, worker_filter)?;
@@ -1866,6 +1911,7 @@ fn build_retained_serve_rows(
         worker_filter,
         idle_sleep,
         view_mode,
+        viewport,
         snapshot,
         width.max(50) as usize,
         height.max(14) as usize,
@@ -1879,7 +1925,8 @@ fn build_retained_serve_rows_for_size(
     repo_filter: Option<&str>,
     worker_filter: Option<&str>,
     idle_sleep: std::time::Duration,
-    view_mode: crate::cmd::ui::LiveViewMode,
+    view_mode: LiveViewMode,
+    viewport: &mut ViewportState,
     snapshot: &ServeProgressSnapshot,
     width: usize,
     height: usize,
@@ -1911,12 +1958,14 @@ fn build_retained_serve_rows_for_size(
         ),
     ];
 
+    let mut body_rows = Vec::new();
+
     let primary = build_serve_issue_entries(&monitor.claims, &[])
         .into_iter()
         .find_map(|entry| entry.claim.cloned());
 
     if let Some(claim) = primary.as_ref() {
-        rows.push(format!(
+        body_rows.push(format!(
             "{}",
             retained_serve_kv_row(
                 "active",
@@ -1938,7 +1987,7 @@ fn build_retained_serve_rows_for_size(
         if claim.pr != "-" {
             route.push(format!("pr {}", short_url_like(&claim.pr, 22)));
         }
-        rows.push(retained_serve_kv_row(
+        body_rows.push(retained_serve_kv_row(
             "route",
             &route.join("  ·  "),
             width,
@@ -1946,9 +1995,9 @@ fn build_retained_serve_rows_for_size(
         ));
 
         if let Some((record, summary, live_lines)) =
-            resolve_live_claim_run(run_store, pricing, claim)
+            resolve_live_claim_run(run_store, pricing, claim, view_mode)
         {
-            rows.push(retained_serve_kv_row(
+            body_rows.push(retained_serve_kv_row(
                 "run",
                 &format!(
                     "{}  ·  {}  ·  {}",
@@ -1967,7 +2016,7 @@ fn build_retained_serve_rows_for_size(
                 .as_deref()
                 .or(record.awaiting_step_id.as_deref())
                 .unwrap_or("-");
-            rows.push(retained_serve_kv_row(
+            body_rows.push(retained_serve_kv_row(
                 "step",
                 &format!(
                     "{}  ·  {}/{} complete",
@@ -1980,7 +2029,7 @@ fn build_retained_serve_rows_for_size(
             ));
 
             if let Some(usage) = &summary.usage {
-                rows.push(retained_serve_kv_row(
+                body_rows.push(retained_serve_kv_row(
                     "usage",
                     &format!(
                         "in {}  ·  out {}  ·  total {}{}",
@@ -1997,17 +2046,14 @@ fn build_retained_serve_rows_for_size(
                 ));
             }
 
-            rows.push(String::new());
-            rows.extend(render_retained_serve_event_rows(
+            body_rows.push(String::new());
+            body_rows.extend(render_retained_serve_event_rows(
                 &live_lines,
                 width,
-                match view_mode {
-                    crate::cmd::ui::LiveViewMode::Focused => 6,
-                    crate::cmd::ui::LiveViewMode::Full => 10,
-                },
+                usize::MAX,
             ));
         } else if claim.summary != "-" {
-            rows.push(retained_serve_kv_row(
+            body_rows.push(retained_serve_kv_row(
                 "summary",
                 &claim.summary,
                 width,
@@ -2015,7 +2061,7 @@ fn build_retained_serve_rows_for_size(
             ));
         }
     } else {
-        rows.push(retained_serve_kv_row(
+        body_rows.push(retained_serve_kv_row(
             "active",
             "no active issues",
             width,
@@ -2023,12 +2069,12 @@ fn build_retained_serve_rows_for_size(
         ));
     }
 
-    if view_mode == crate::cmd::ui::LiveViewMode::Full && !monitor.claims.is_empty() {
-        rows.push(String::new());
-        rows.push(retained_serve_section_title("claims", width));
+    if view_mode == LiveViewMode::Full && !monitor.claims.is_empty() {
+        body_rows.push(String::new());
+        body_rows.push(retained_serve_section_title("claims", width));
         for claim in monitor.claims.iter().take(6) {
             let status = claim_status_ui(&claim.status);
-            rows.push(retained_serve_activity_line(
+            body_rows.push(retained_serve_activity_line(
                 status,
                 &display_issue_headline(claim),
                 &format!(
@@ -2041,30 +2087,30 @@ fn build_retained_serve_rows_for_size(
         }
     }
 
-    rows.push(String::new());
-    rows.push(retained_serve_section_title("recent", width));
+    body_rows.push(String::new());
+    body_rows.push(retained_serve_section_title("recent", width));
     let recent_limit = match view_mode {
-        crate::cmd::ui::LiveViewMode::Focused => 4,
-        crate::cmd::ui::LiveViewMode::Full => 8,
+        LiveViewMode::Focused => 4,
+        LiveViewMode::Full => 8,
     };
     for activity in monitor.activity.iter().take(recent_limit) {
         let (status, label) = activity_status_and_label(&activity.event);
-        rows.push(retained_serve_activity_line(
+        body_rows.push(retained_serve_activity_line(
             status,
             &activity.issue,
             &format!("{label}  ·  {}", truncate_text(&activity.workflow, 24)),
             width,
         ));
         if activity.detail != "-" {
-            rows.push(retained_serve_detail_line(
+            body_rows.push(retained_serve_detail_line(
                 &truncate_text(&activity.detail, width.saturating_sub(2)),
                 width,
             ));
         }
     }
 
-    rows.push(String::new());
-    rows.push(retained_serve_kv_row(
+    body_rows.push(String::new());
+    body_rows.push(retained_serve_kv_row(
         "queue",
         &format!(
             "queued {}  ·  due {}  ·  processed {}",
@@ -2074,8 +2120,58 @@ fn build_retained_serve_rows_for_size(
         UiStatus::Active,
     ));
 
+    let footer_reserved = 2usize;
+    let available_body_rows = height
+        .saturating_sub(rows.len())
+        .saturating_sub(footer_reserved)
+        .max(1);
+    let body = viewport.apply(body_rows, available_body_rows).rows;
+    rows.extend(body);
+    while rows.len() < height.saturating_sub(footer_reserved) {
+        rows.push(String::new());
+    }
+
+    rows.push(retained_serve_controls_line(width));
+    rows.push(retained_serve_status_line(
+        view_mode, viewport, snapshot, width,
+    ));
     rows.truncate(height);
     rows
+}
+
+fn retained_serve_controls_line(width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        "  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  Ctrl-C quit",
+        DIM,
+    );
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn retained_serve_status_line(
+    view_mode: LiveViewMode,
+    viewport: &ViewportState,
+    snapshot: &ServeProgressSnapshot,
+    width: usize,
+) -> String {
+    retained_serve_kv_row(
+        "view",
+        &format!(
+            "{}  ·  {}  ·  cycles {}  ·  {}",
+            view_mode.as_str(),
+            viewport.status_text(),
+            snapshot.cycles,
+            if snapshot.cycle_running {
+                "reconciling"
+            } else {
+                "watching"
+            }
+        ),
+        width,
+        UiStatus::Active,
+    )
 }
 
 fn render_retained_serve_rows(rows: &[String]) -> anyhow::Result<()> {
@@ -2171,6 +2267,26 @@ fn truncate_retained_ansi_line(value: &str, width: usize) -> String {
     }
 }
 
+fn retained_serve_ui_prefs() -> UiPrefs {
+    let global = paths::global_dir().ok();
+    let pwd = std::env::current_dir().ok();
+    let project_root = pwd
+        .as_ref()
+        .and_then(|dir| paths::project_root_for(dir).ok().flatten());
+    let cfg = match global.as_ref() {
+        Some(global_dir) => rupu_config::layer_files(
+            Some(&global_dir.join("config.toml")),
+            project_root
+                .as_deref()
+                .map(|root| root.join(".rupu/config.toml"))
+                .as_deref(),
+        )
+        .unwrap_or_default(),
+        None => rupu_config::Config::default(),
+    };
+    UiPrefs::resolve(&cfg.ui, false, None, None, None)
+}
+
 fn render_retained_serve_event_rows(
     lines: &[AutoflowServeViewLine],
     width: usize,
@@ -2178,7 +2294,9 @@ fn render_retained_serve_event_rows(
 ) -> Vec<String> {
     let mut rendered = Vec::new();
     for line in lines {
-        let prefix = {
+        let prefix = if line.continuation {
+            "  ".to_string()
+        } else {
             let mut value = String::new();
             let _ = palette::write_bold_colored(
                 &mut value,
@@ -2188,12 +2306,12 @@ fn render_retained_serve_event_rows(
             value.push(' ');
             value
         };
-        let content_width = width.saturating_sub(2).max(1);
+        let content_width = width.saturating_sub(visible_len(&prefix)).max(1);
         for (idx, segment) in wrap_with_ansi(&line.text, content_width)
             .into_iter()
             .enumerate()
         {
-            if idx == 0 {
+            if idx == 0 && !line.continuation {
                 rendered.push(format!("{prefix}{segment}"));
             } else {
                 rendered.push(format!("  {segment}"));
@@ -2211,6 +2329,7 @@ fn resolve_live_claim_run(
     run_store: &RunStore,
     pricing: &rupu_config::PricingConfig,
     claim: &AutoflowClaimRow,
+    view_mode: LiveViewMode,
 ) -> Option<(
     rupu_orchestrator::RunRecord,
     AutoflowRunSummary,
@@ -2222,7 +2341,7 @@ fn resolve_live_claim_run(
             .flatten()
     })?;
     let summary = load_run_summary(run_store, &record.id, pricing)?;
-    let live_lines = load_live_run_lines(&record, 6);
+    let live_lines = load_live_run_lines(&record, view_mode);
     Some((record, summary, live_lines))
 }
 
@@ -2266,7 +2385,7 @@ fn find_live_autoflow_run(claim: &AutoflowClaimRow) -> Option<rupu_orchestrator:
 
 fn load_live_run_lines(
     record: &rupu_orchestrator::RunRecord,
-    max_rows: usize,
+    view_mode: LiveViewMode,
 ) -> Vec<AutoflowServeViewLine> {
     let Some(path) = record.active_step_transcript_path.as_ref() else {
         return Vec::new();
@@ -2276,37 +2395,78 @@ fn load_live_run_lines(
     };
     let mut lines = Vec::new();
     for event in iter.flatten() {
-        if let Some(line) = live_run_event_line(&event) {
-            lines.push(line);
-            if lines.len() > max_rows {
-                let keep_from = lines.len().saturating_sub(max_rows);
-                lines.drain(0..keep_from);
-            }
-        }
+        lines.extend(live_run_event_lines(&event, view_mode));
     }
     lines
 }
 
-fn live_run_event_line(event: &TranscriptEvent) -> Option<AutoflowServeViewLine> {
+fn live_run_event_lines(
+    event: &TranscriptEvent,
+    view_mode: LiveViewMode,
+) -> Vec<AutoflowServeViewLine> {
     match event {
-        TranscriptEvent::TurnStart { turn_idx } => Some(AutoflowServeViewLine {
+        TranscriptEvent::TurnStart { turn_idx } => vec![AutoflowServeViewLine {
             status: UiStatus::Working,
             text: format!("turn {turn_idx}  ·  assistant turn started"),
-        }),
+            continuation: false,
+        }],
         TranscriptEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-            Some(AutoflowServeViewLine {
-                status: UiStatus::Active,
-                text: format!("assistant  ·  {}", truncate_single_line(content, 96)),
-            })
+            match view_mode {
+                LiveViewMode::Focused => vec![AutoflowServeViewLine {
+                    status: UiStatus::Active,
+                    text: format!("assistant  ·  {}", truncate_single_line(content, 96)),
+                    continuation: false,
+                }],
+                LiveViewMode::Full => {
+                    let prefs = retained_serve_ui_prefs();
+                    let highlighted = crate::cmd::ui::highlight_markdown(content.trim(), &prefs);
+                    let mut out = Vec::new();
+                    for (index, line) in highlighted.lines().enumerate() {
+                        out.push(AutoflowServeViewLine {
+                            status: UiStatus::Active,
+                            text: if index == 0 {
+                                format!("assistant output  ·  {line}")
+                            } else {
+                                line.to_string()
+                            },
+                            continuation: index > 0,
+                        });
+                    }
+                    out
+                }
+            }
         }
-        TranscriptEvent::ToolCall { tool, input, .. } => Some(AutoflowServeViewLine {
-            status: UiStatus::Working,
-            text: format!(
-                "{}  ·  {}",
-                tool,
-                crate::output::workflow_printer::tool_summary(tool, input)
-            ),
-        }),
+        TranscriptEvent::ToolCall { tool, input, .. } => match view_mode {
+            LiveViewMode::Focused => vec![AutoflowServeViewLine {
+                status: UiStatus::Working,
+                text: format!(
+                    "{}  ·  {}",
+                    tool,
+                    crate::output::workflow_printer::tool_summary(tool, input)
+                ),
+                continuation: false,
+            }],
+            LiveViewMode::Full => {
+                let prefs = retained_serve_ui_prefs();
+                let mut out = vec![AutoflowServeViewLine {
+                    status: UiStatus::Working,
+                    text: format!(
+                        "{}  ·  {}",
+                        tool,
+                        crate::output::workflow_printer::tool_summary(tool, input)
+                    ),
+                    continuation: false,
+                }];
+                if let Some(rendered) = render_tool_input(tool, input, &prefs) {
+                    out.extend(rendered.lines().map(|line| AutoflowServeViewLine {
+                        status: UiStatus::Working,
+                        text: line.to_string(),
+                        continuation: true,
+                    }));
+                }
+                out
+            }
+        },
         TranscriptEvent::ToolResult {
             output,
             error,
@@ -2318,23 +2478,57 @@ fn live_run_event_line(event: &TranscriptEvent) -> Option<AutoflowServeViewLine>
             } else {
                 UiStatus::Complete
             };
-            let mut detail =
-                truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 88);
-            if *duration_ms > 0 {
-                detail.push_str(&format!("  ·  {}ms", duration_ms));
+            match view_mode {
+                LiveViewMode::Focused => {
+                    let mut detail =
+                        truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 88);
+                    if *duration_ms > 0 {
+                        detail.push_str(&format!("  ·  {}ms", duration_ms));
+                    }
+                    vec![AutoflowServeViewLine {
+                        status,
+                        text: format!(
+                            "{}  ·  {}",
+                            if error.is_some() {
+                                "tool error"
+                            } else {
+                                "tool result"
+                            },
+                            detail
+                        ),
+                        continuation: false,
+                    }]
+                }
+                LiveViewMode::Full => {
+                    let prefs = retained_serve_ui_prefs();
+                    let raw = error.as_deref().unwrap_or(output.as_str());
+                    let payload = render_payload(raw, &prefs);
+                    let mut out = vec![AutoflowServeViewLine {
+                        status,
+                        text: format!(
+                            "{}  ·  {}{}",
+                            if error.is_some() {
+                                "tool error"
+                            } else {
+                                "tool result"
+                            },
+                            payload.headline,
+                            if *duration_ms > 0 {
+                                format!("  ·  {}ms", duration_ms)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        continuation: false,
+                    }];
+                    out.extend(payload.rendered.lines().map(|line| AutoflowServeViewLine {
+                        status,
+                        text: line.to_string(),
+                        continuation: true,
+                    }));
+                    out
+                }
             }
-            Some(AutoflowServeViewLine {
-                status,
-                text: format!(
-                    "{}  ·  {}",
-                    if error.is_some() {
-                        "tool error"
-                    } else {
-                        "tool result"
-                    },
-                    detail
-                ),
-            })
         }
         TranscriptEvent::Usage {
             provider,
@@ -2342,31 +2536,33 @@ fn live_run_event_line(event: &TranscriptEvent) -> Option<AutoflowServeViewLine>
             input_tokens,
             output_tokens,
             cached_tokens,
-        } => Some(AutoflowServeViewLine {
+        } => vec![AutoflowServeViewLine {
             status: UiStatus::Active,
             text: format!(
                 "usage  ·  {provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
             ),
-        }),
+            continuation: false,
+        }],
         TranscriptEvent::TurnEnd {
             turn_idx,
             tokens_in,
             tokens_out,
-        } => Some(AutoflowServeViewLine {
+        } => vec![AutoflowServeViewLine {
             status: UiStatus::Complete,
             text: format!(
                 "turn complete  ·  turn {turn_idx}  ·  in {} out {}",
                 tokens_in.unwrap_or(0),
                 tokens_out.unwrap_or(0)
             ),
-        }),
+            continuation: false,
+        }],
         TranscriptEvent::RunComplete {
             status,
             total_tokens,
             duration_ms,
             error,
             ..
-        } => Some(AutoflowServeViewLine {
+        } => vec![AutoflowServeViewLine {
             status: match status {
                 rupu_transcript::RunStatus::Ok => UiStatus::Complete,
                 rupu_transcript::RunStatus::Error | rupu_transcript::RunStatus::Aborted => {
@@ -2386,8 +2582,9 @@ fn live_run_event_line(event: &TranscriptEvent) -> Option<AutoflowServeViewLine>
                 }
                 text
             },
-        }),
-        _ => None,
+            continuation: false,
+        }],
+        _ => Vec::new(),
     }
 }
 
@@ -3135,6 +3332,7 @@ mod serve_heartbeat_tests {
     fn retained_serve_focused_mode_omits_claims_section() {
         let tmp = tempdir().unwrap();
         let run_store = RunStore::new(tmp.path().join("runs"));
+        let mut viewport = ViewportState::default();
         let rows = build_retained_serve_rows_for_size(
             &sample_monitor_report(),
             &run_store,
@@ -3143,6 +3341,7 @@ mod serve_heartbeat_tests {
             Some("team-mini-01"),
             std::time::Duration::from_secs(10),
             crate::cmd::ui::LiveViewMode::Focused,
+            &mut viewport,
             &ServeProgressSnapshot::default(),
             80,
             24,
@@ -3157,6 +3356,7 @@ mod serve_heartbeat_tests {
     fn retained_serve_full_mode_includes_claims_section() {
         let tmp = tempdir().unwrap();
         let run_store = RunStore::new(tmp.path().join("runs"));
+        let mut viewport = ViewportState::default();
         let rows = build_retained_serve_rows_for_size(
             &sample_monitor_report(),
             &run_store,
@@ -3165,6 +3365,7 @@ mod serve_heartbeat_tests {
             Some("team-mini-01"),
             std::time::Duration::from_secs(10),
             crate::cmd::ui::LiveViewMode::Full,
+            &mut viewport,
             &ServeProgressSnapshot::default(),
             80,
             24,
@@ -3173,6 +3374,38 @@ mod serve_heartbeat_tests {
         assert!(rows
             .iter()
             .any(|row| row.contains("storefront-feature-delivery")));
+    }
+
+    #[test]
+    fn live_run_event_lines_focused_summarize_read_file_tool_call() {
+        let lines = live_run_event_lines(
+            &TranscriptEvent::ToolCall {
+                call_id: "call_123".into(),
+                tool: "read_file".into(),
+                input: serde_json::json!({"path": ".git/logs/refs/heads/storefront/issue-19"}),
+            },
+            LiveViewMode::Focused,
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0]
+            .text
+            .contains(".git/logs/refs/heads/storefront/issue-19"));
+        assert!(!lines[0].text.contains("{\"path\""));
+    }
+
+    #[test]
+    fn live_run_event_lines_full_expand_json_tool_result() {
+        let lines = live_run_event_lines(
+            &TranscriptEvent::ToolResult {
+                call_id: "call_123".into(),
+                output: "{\"status\":\"ok\",\"items\":[1,2]}".into(),
+                error: None,
+                duration_ms: 7,
+            },
+            LiveViewMode::Full,
+        );
+        assert!(lines.len() > 1);
+        assert!(lines[0].text.contains("json payload"));
     }
 }
 

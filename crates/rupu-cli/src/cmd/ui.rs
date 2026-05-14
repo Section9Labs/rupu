@@ -99,6 +99,13 @@ impl LiveViewMode {
             Self::Full => "full",
         }
     }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Focused => Self::Full,
+            Self::Full => Self::Focused,
+        }
+    }
 }
 
 impl Default for LiveViewMode {
@@ -491,6 +498,22 @@ pub fn highlight_json(text: &str, prefs: &UiPrefs) -> String {
         return text.to_string();
     }
     highlight_with_extension(text, "json", prefs).unwrap_or_else(|| text.to_string())
+}
+
+/// Highlight a unified diff buffer.
+pub fn highlight_diff(text: &str, prefs: &UiPrefs) -> String {
+    if !prefs.use_color() {
+        return text.to_string();
+    }
+    highlight_with_extension(text, "diff", prefs).unwrap_or_else(|| text.to_string())
+}
+
+/// Highlight a shell snippet buffer.
+pub fn highlight_shell(text: &str, prefs: &UiPrefs) -> String {
+    if !prefs.use_color() {
+        return text.to_string();
+    }
+    highlight_with_extension(text, "sh", prefs).unwrap_or_else(|| text.to_string())
 }
 
 /// Highlight an agent file: split on the trailing `---` of the YAML
