@@ -133,12 +133,28 @@ fn render_section(
     let body: AnyElement = if is_collapsed {
         div().into_any_element()
     } else if items.is_empty() {
-        div()
-            .mt(px(2.0))
-            .text_xs()
-            .text_color(palette::TEXT_DIMMEST)
-            .child("—")
-            .into_any_element()
+        let hint = match name {
+            "workflows" => Some("File → New Workspace to add"),
+            "agents" => Some("Drop a `.md` agent into `~/.rupu/agents/`"),
+            // Runs / repos / issues come alive in D-3 / D-9; leave a dash
+            // until then.
+            _ => None,
+        };
+        match hint {
+            Some(h) => div()
+                .mt(px(2.0))
+                .text_xs()
+                .text_color(palette::TEXT_DIMMEST)
+                .italic()
+                .child(h)
+                .into_any_element(),
+            None => div()
+                .mt(px(2.0))
+                .text_xs()
+                .text_color(palette::TEXT_DIMMEST)
+                .child("—")
+                .into_any_element(),
+        }
     } else {
         let mut list = div().flex().flex_col().gap(px(2.0));
         for asset in items {
