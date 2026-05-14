@@ -10,6 +10,7 @@ pub mod jsonl_reader;
 pub mod palette;
 pub mod printer;
 pub mod report;
+pub mod rich_payload;
 pub mod spinner;
 pub mod tables;
 pub mod theme;

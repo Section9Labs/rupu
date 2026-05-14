@@ -26,6 +26,7 @@ use crate::cmd::transcript::truncate_single_line;
 use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::output::palette::{self, BRAND, DIM};
 use crate::output::printer::{visible_len, wrap_with_ansi};
+use crate::output::rich_payload::{render_payload, render_tool_input, RenderedPayload};
 use crate::paths;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
@@ -805,9 +806,9 @@ fn append_step_result_lines(
                         );
                     }
                     LiveViewMode::Full => {
+                        let payload = render_payload(&rec.output, prefs);
                         for line in retained_payload_lines(
-                            &rec.output,
-                            prefs,
+                            &payload,
                             if rec.success {
                                 UiStatus::Active
                             } else {
@@ -1020,16 +1021,39 @@ fn workflow_transcript_event_lines(
             }
             out
         }
-        TxEvent::ToolCall { tool, input, .. } => vec![WorkflowViewLine {
-            status: UiStatus::Working,
-            text: retained_workflow_event_line(
-                UiStatus::Working,
-                &format!("tool {tool}"),
-                &summarize_tool_input(tool, input),
-            ),
-            continuation: false,
-            indent: 0,
-        }],
+        TxEvent::ToolCall { tool, input, .. } => match view_mode {
+            LiveViewMode::Focused => vec![WorkflowViewLine {
+                status: UiStatus::Working,
+                text: retained_workflow_event_line(
+                    UiStatus::Working,
+                    &format!("tool {tool}"),
+                    &summarize_tool_input(tool, input),
+                ),
+                continuation: false,
+                indent: 0,
+            }],
+            LiveViewMode::Full => {
+                let mut out = vec![WorkflowViewLine {
+                    status: UiStatus::Working,
+                    text: retained_workflow_event_line(
+                        UiStatus::Working,
+                        &format!("tool {tool}"),
+                        &summarize_tool_input(tool, input),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                }];
+                if let Some(rendered) = render_tool_input(tool, input, prefs) {
+                    out.extend(rendered.lines().map(|line| WorkflowViewLine {
+                        status: UiStatus::Working,
+                        text: line.to_string(),
+                        continuation: true,
+                        indent: 1,
+                    }));
+                }
+                out
+            }
+        },
         TxEvent::ToolResult {
             output,
             error,
@@ -1062,17 +1086,18 @@ fn workflow_transcript_event_lines(
                 }
                 LiveViewMode::Full => {
                     let raw = error.as_deref().unwrap_or(output.as_str());
+                    let payload = render_payload(raw, prefs);
                     let mut out = vec![WorkflowViewLine {
                         status,
                         text: retained_workflow_event_line(
                             status,
                             label,
-                            &workflow_payload_summary(raw, *duration_ms),
+                            &workflow_payload_summary(&payload, *duration_ms),
                         ),
                         continuation: false,
                         indent: 0,
                     }];
-                    out.extend(retained_payload_lines(raw, prefs, status, 1));
+                    out.extend(retained_payload_lines(&payload, status, 1));
                     out
                 }
             }
@@ -1325,8 +1350,8 @@ fn retained_dispatch_outcome_lines(
     out
 }
 
-fn workflow_payload_summary(raw: &str, duration_ms: u64) -> String {
-    let detail = truncate_single_line(&workflow_payload_headline(raw), 90);
+fn workflow_payload_summary(payload: &RenderedPayload, duration_ms: u64) -> String {
+    let detail = truncate_single_line(&payload.headline, 90);
     if duration_ms > 0 {
         format!("{detail}  ·  {duration_ms}ms")
     } else {
@@ -1334,40 +1359,13 @@ fn workflow_payload_summary(raw: &str, duration_ms: u64) -> String {
     }
 }
 
-fn workflow_payload_headline(raw: &str) -> String {
-    if raw.trim().is_empty() {
-        return "empty payload".into();
-    }
-    if let Some(lines) = workflow_try_pretty_jsonl(raw) {
-        return format!("jsonl payload  ·  {} record(s)", lines.len());
-    }
-    if workflow_try_pretty_json(raw).is_some() {
-        return "json payload".into();
-    }
-    let line_count = raw.lines().count();
-    if line_count > 1 {
-        format!("{line_count} lines")
-    } else {
-        truncate_single_line(raw, 90)
-    }
-}
-
 fn retained_payload_lines(
-    raw: &str,
-    prefs: &UiPrefs,
+    payload: &RenderedPayload,
     status: UiStatus,
     indent: usize,
 ) -> Vec<WorkflowViewLine> {
-    let rendered = if let Some(pretty) = workflow_try_pretty_json(raw) {
-        crate::cmd::ui::highlight_json(&pretty, prefs)
-    } else if let Some(records) = workflow_try_pretty_jsonl(raw) {
-        crate::cmd::ui::highlight_json(&records.join("\n\n"), prefs)
-    } else if workflow_looks_like_markdown(raw) {
-        crate::cmd::ui::highlight_markdown(raw.trim(), prefs)
-    } else {
-        raw.trim_end().to_string()
-    };
-    rendered
+    payload
+        .rendered
         .lines()
         .map(|line| WorkflowViewLine {
             status,
@@ -1376,35 +1374,6 @@ fn retained_payload_lines(
             indent,
         })
         .collect()
-}
-
-fn workflow_try_pretty_json(raw: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
-    serde_json::to_string_pretty(&value).ok()
-}
-
-fn workflow_try_pretty_jsonl(raw: &str) -> Option<Vec<String>> {
-    let mut rows = Vec::new();
-    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let value: serde_json::Value = serde_json::from_str(line).ok()?;
-        rows.push(serde_json::to_string_pretty(&value).ok()?);
-    }
-    if rows.len() > 1 {
-        Some(rows)
-    } else {
-        None
-    }
-}
-
-fn workflow_looks_like_markdown(raw: &str) -> bool {
-    let trimmed = raw.trim_start();
-    trimmed.starts_with('#')
-        || trimmed.starts_with("- ")
-        || trimmed.starts_with("* ")
-        || trimmed.starts_with("```")
-        || trimmed.contains("\n#")
-        || trimmed.contains("\n- ")
-        || trimmed.contains("\n* ")
 }
 
 fn handle_running_workflow_keypress(
@@ -2751,6 +2720,39 @@ fn summarize_tool_input(tool: &str, input: &serde_json::Value) -> String {
             .unwrap_or_default(),
         "write_file" | "edit_file" => s_str("path").unwrap_or_default(),
         "read_file" => s_str("path").unwrap_or_default(),
+        "glob" => s_str("pattern").unwrap_or_default(),
+        "grep" => {
+            let pattern = s_str("pattern").unwrap_or_default();
+            let path = s_str("path").unwrap_or_default();
+            match (pattern.is_empty(), path.is_empty()) {
+                (false, false) => format!("{pattern}  ·  {path}"),
+                (false, true) => pattern,
+                (true, false) => path,
+                _ => String::new(),
+            }
+        }
+        "dispatch_agent" => {
+            let agent = s_str("agent").unwrap_or_else(|| "?".into());
+            let prompt = s_str("prompt").unwrap_or_default();
+            if prompt.is_empty() {
+                agent
+            } else {
+                format!("{agent}  ·  {}", truncate(prompt, 56))
+            }
+        }
+        "dispatch_agents_parallel" => {
+            let count = input
+                .get("agents")
+                .and_then(|value| value.as_array())
+                .map(|agents| agents.len())
+                .unwrap_or(0);
+            let max_parallel = input.get("max_parallel").and_then(|value| value.as_u64());
+            match (count, max_parallel) {
+                (0, Some(limit)) => format!("parallel  ·  max {limit}"),
+                (count, Some(limit)) => format!("{count} child agents  ·  max {limit}"),
+                (count, None) => format!("{count} child agents"),
+            }
+        }
 
         // ── MCP scm.* tools ──────────────────────────────────────────
         "scm.repos.get" | "scm.repos.list" => owner_repo().unwrap_or_default(),
@@ -3166,6 +3168,53 @@ mod tests {
         assert_eq!(focused.len(), 1);
         assert!(full.len() > 1);
         assert!(full[0].text.contains("json payload"));
+    }
+
+    #[test]
+    fn workflow_transcript_event_lines_focused_summarizes_read_file_tool_call() {
+        let event = TxEvent::ToolCall {
+            call_id: "call_123".into(),
+            tool: "read_file".into(),
+            input: serde_json::json!({"path": ".git/logs/refs/heads/storefront/issue-19"}),
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let lines = workflow_transcript_event_lines(&event, LiveViewMode::Focused, &prefs);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0]
+            .text
+            .contains(".git/logs/refs/heads/storefront/issue-19"));
+        assert!(!lines[0].text.contains("{\"path\""));
+    }
+
+    #[test]
+    fn workflow_transcript_event_lines_full_expands_tool_call_payload() {
+        let event = TxEvent::ToolCall {
+            call_id: "call_123".into(),
+            tool: "read_file".into(),
+            input: serde_json::json!({"path": ".git/logs/refs/heads/storefront/issue-19"}),
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+        let lines = workflow_transcript_event_lines(&event, LiveViewMode::Full, &prefs);
+        assert!(lines.len() > 1);
+        assert!(lines[0]
+            .text
+            .contains(".git/logs/refs/heads/storefront/issue-19"));
+        assert!(lines
+            .iter()
+            .skip(1)
+            .any(|line| line.text.contains("\"path\"")));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::output::formats::OutputFormat;
 use crate::output::palette::{self, BRAND, DIM};
 use crate::output::printer::{visible_len, wrap_with_ansi};
 use crate::output::report::{self, CollectionOutput, DetailOutput};
+use crate::output::rich_payload::{render_payload, render_tool_input, RenderedPayload};
 use crate::paths;
 use crate::standalone_run_metadata::{
     metadata_path_for_run, write_metadata, StandaloneRunMetadata,
@@ -1834,15 +1835,36 @@ fn transcript_event_lines(
             }
             out
         }
-        TranscriptEvent::ToolCall { tool, input, .. } => vec![SessionViewLine {
-            status: Status::Working,
-            text: retained_session_event_line(
-                Status::Working,
-                &format!("tool {tool}"),
-                &transcript_tool_summary(tool, input),
-            ),
-            continuation: false,
-        }],
+        TranscriptEvent::ToolCall { tool, input, .. } => match view_mode {
+            LiveViewMode::Focused => vec![SessionViewLine {
+                status: Status::Working,
+                text: retained_session_event_line(
+                    Status::Working,
+                    &format!("tool {tool}"),
+                    &transcript_tool_summary(tool, input),
+                ),
+                continuation: false,
+            }],
+            LiveViewMode::Full => {
+                let mut out = vec![SessionViewLine {
+                    status: Status::Working,
+                    text: retained_session_event_line(
+                        Status::Working,
+                        &format!("tool {tool}"),
+                        &transcript_tool_summary(tool, input),
+                    ),
+                    continuation: false,
+                }];
+                if let Some(rendered) = render_tool_input(tool, input, prefs) {
+                    out.extend(rendered.lines().map(|line| SessionViewLine {
+                        status: Status::Working,
+                        text: line.to_string(),
+                        continuation: true,
+                    }));
+                }
+                out
+            }
+        },
         TranscriptEvent::ToolResult {
             output,
             error,
@@ -1873,16 +1895,17 @@ fn transcript_event_lines(
                     }]
                 }
                 LiveViewMode::Full => {
+                    let payload = render_payload(raw, prefs);
                     let mut out = vec![SessionViewLine {
                         status,
                         text: retained_session_event_line(
                             status,
                             label,
-                            &session_payload_summary(raw, *duration_ms),
+                            &session_payload_summary(&payload, *duration_ms),
                         ),
                         continuation: false,
                     }];
-                    for line in session_rich_payload_lines(raw, prefs) {
+                    for line in session_rich_payload_lines(&payload) {
                         out.push(SessionViewLine {
                             status,
                             text: line,
@@ -2055,8 +2078,8 @@ fn transcript_event_lines(
     }
 }
 
-fn session_payload_summary(raw: &str, duration_ms: u64) -> String {
-    let detail = truncate_single_line(&session_payload_headline(raw), 84);
+fn session_payload_summary(payload: &RenderedPayload, duration_ms: u64) -> String {
+    let detail = truncate_single_line(&payload.headline, 84);
     if duration_ms > 0 {
         format!("{detail}  ·  {duration_ms}ms")
     } else {
@@ -2064,65 +2087,12 @@ fn session_payload_summary(raw: &str, duration_ms: u64) -> String {
     }
 }
 
-fn session_payload_headline(raw: &str) -> String {
-    if raw.trim().is_empty() {
-        return "empty payload".into();
-    }
-    if let Some(lines) = try_pretty_jsonl(raw) {
-        return format!("jsonl payload  ·  {} record(s)", lines.len());
-    }
-    if try_pretty_json(raw).is_some() {
-        return "json payload".into();
-    }
-    let line_count = raw.lines().count();
-    if line_count > 1 {
-        format!("{line_count} lines")
-    } else {
-        truncate_single_line(raw, 84)
-    }
-}
-
-fn session_rich_payload_lines(raw: &str, prefs: &UiPrefs) -> Vec<String> {
-    let rendered = if let Some(pretty) = try_pretty_json(raw) {
-        crate::cmd::ui::highlight_json(&pretty, prefs)
-    } else if let Some(records) = try_pretty_jsonl(raw) {
-        let joined = records.join("\n\n");
-        crate::cmd::ui::highlight_json(&joined, prefs)
-    } else if looks_like_markdown(raw) {
-        crate::cmd::ui::highlight_markdown(raw.trim(), prefs)
-    } else {
-        raw.trim_end().to_string()
-    };
-    rendered.lines().map(|line| line.to_string()).collect()
-}
-
-fn try_pretty_json(raw: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
-    serde_json::to_string_pretty(&value).ok()
-}
-
-fn try_pretty_jsonl(raw: &str) -> Option<Vec<String>> {
-    let mut rows = Vec::new();
-    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let value: serde_json::Value = serde_json::from_str(line).ok()?;
-        rows.push(serde_json::to_string_pretty(&value).ok()?);
-    }
-    if rows.len() > 1 {
-        Some(rows)
-    } else {
-        None
-    }
-}
-
-fn looks_like_markdown(raw: &str) -> bool {
-    let trimmed = raw.trim_start();
-    trimmed.starts_with('#')
-        || trimmed.starts_with("- ")
-        || trimmed.starts_with("* ")
-        || trimmed.starts_with("```")
-        || trimmed.contains("\n#")
-        || trimmed.contains("\n- ")
-        || trimmed.contains("\n* ")
+fn session_rich_payload_lines(payload: &RenderedPayload) -> Vec<String> {
+    payload
+        .rendered
+        .lines()
+        .map(|line| line.to_string())
+        .collect()
 }
 
 fn retained_session_kv_row(
@@ -2179,22 +2149,7 @@ fn truncate_ansi_line(value: &str, width: usize) -> String {
 }
 
 fn transcript_tool_summary(tool: &str, input: &serde_json::Value) -> String {
-    match tool {
-        "issues.comment" => input
-            .get("ref")
-            .and_then(|v| v.as_str())
-            .map(|r| format!("commented on {r}"))
-            .unwrap_or_else(|| "commented".into()),
-        "issues.update_state" => {
-            let r = input.get("ref").and_then(|v| v.as_str()).unwrap_or("issue");
-            let state = input
-                .get("state")
-                .and_then(|v| v.as_str())
-                .unwrap_or("updated");
-            format!("{r} → {state}")
-        }
-        _ => truncate_single_line(&input.to_string(), 72),
-    }
+    crate::output::workflow_printer::tool_summary(tool, input)
 }
 
 fn append_session_help_lines(state: &mut SessionInteractiveState) {
@@ -3769,5 +3724,52 @@ mod tests {
                 error: None,
             }],
         }
+    }
+
+    #[test]
+    fn transcript_event_lines_focused_summarizes_read_file_tool_call() {
+        let event = TranscriptEvent::ToolCall {
+            call_id: "call_123".into(),
+            tool: "read_file".into(),
+            input: serde_json::json!({"path": ".git/logs/refs/heads/storefront/issue-19"}),
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let lines = transcript_event_lines(&event, LiveViewMode::Focused, &prefs);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0]
+            .text
+            .contains(".git/logs/refs/heads/storefront/issue-19"));
+        assert!(!lines[0].text.contains("{\"path\""));
+    }
+
+    #[test]
+    fn transcript_event_lines_full_expands_tool_call_payload() {
+        let event = TranscriptEvent::ToolCall {
+            call_id: "call_123".into(),
+            tool: "read_file".into(),
+            input: serde_json::json!({"path": ".git/logs/refs/heads/storefront/issue-19"}),
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Full),
+        );
+        let lines = transcript_event_lines(&event, LiveViewMode::Full, &prefs);
+        assert!(lines.len() > 1);
+        assert!(lines[0]
+            .text
+            .contains(".git/logs/refs/heads/storefront/issue-19"));
+        assert!(lines
+            .iter()
+            .skip(1)
+            .any(|line| line.text.contains("\"path\"")));
     }
 }
