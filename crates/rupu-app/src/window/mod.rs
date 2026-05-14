@@ -279,11 +279,25 @@ impl WorkspaceWindow {
         .detach();
     }
 
-    /// Returns the path of the workflow currently displayed in the main area,
-    /// i.e. the first workflow in the project asset list. D-3 simplification:
-    /// the app always shows `workflows.first()`; a later task will add
-    /// per-row click selection.
+    /// Returns the path of the workflow currently displayed in the main area.
+    /// Prefers `focused_workflow` (last sidebar click); falls back to the
+    /// first project workflow when no row has been clicked yet (workspace
+    /// just opened) or the focused workflow has been removed from disk.
     pub fn current_workflow_path(&self) -> Option<PathBuf> {
+        if let Some(p) = &self.focused_workflow {
+            // Confirm it still exists in the asset list — if a workflow file
+            // was deleted mid-session we don't want to keep pointing at it.
+            let known = self
+                .workspace
+                .project_assets
+                .workflows
+                .iter()
+                .chain(self.workspace.global_assets.workflows.iter())
+                .any(|a| &a.path == p);
+            if known {
+                return Some(p.clone());
+            }
+        }
         self.workspace
             .project_assets
             .workflows
@@ -701,12 +715,23 @@ impl Render for WorkspaceWindow {
             })
             .collect();
 
-        let main_area = match self.workspace.project_assets.workflows.first() {
+        // Display whichever workflow the user most recently clicked in the
+        // sidebar; fall back to the first project workflow if none has been
+        // clicked yet. `current_workflow_path` handles both cases.
+        let main_area = match self.current_workflow_path().and_then(|path| {
+            self.workspace
+                .project_assets
+                .workflows
+                .iter()
+                .chain(self.workspace.global_assets.workflows.iter())
+                .find(|a| a.path == path)
+                .cloned()
+        }) {
             Some(asset) => {
                 let wf_path = asset.path.clone();
                 let has_active = active_run_map.contains_key(&wf_path);
                 render_main_for_workflow(
-                    asset,
+                    &asset,
                     run_model.as_ref(),
                     &transcript_lines,
                     on_approve.clone(),
