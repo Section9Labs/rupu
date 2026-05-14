@@ -64,7 +64,7 @@ pub struct UiConfig {
     #[serde(default)]
     pub palette: UiPaletteConfig,
     /// Default live renderer mode for interactive/event-driven views:
-    /// `focused` (default) or `full`.
+    /// `focused` (default), `compact`, or `full`.
     pub live_view: Option<String>,
     /// `auto` (default — page when stdout is a tty and the output
     /// exceeds one screen), `always`, or `never`.

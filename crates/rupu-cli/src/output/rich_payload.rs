@@ -1,6 +1,7 @@
 use crate::cmd::transcript::truncate_single_line;
 use crate::cmd::ui::{
-    highlight_diff, highlight_json, highlight_markdown, highlight_shell, highlight_yaml, UiPrefs,
+    highlight_diff, highlight_json, highlight_markdown, highlight_shell, highlight_toml,
+    highlight_yaml, UiPrefs,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +10,7 @@ pub enum PayloadKind {
     Json,
     Jsonl { records: usize },
     Yaml,
+    Toml,
     Diff,
     Shell,
     Markdown,
@@ -58,6 +60,14 @@ pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
         };
     }
 
+    if let Some(pretty) = try_pretty_toml(raw) {
+        return RenderedPayload {
+            kind: PayloadKind::Toml,
+            headline: "toml payload".into(),
+            rendered: highlight_toml(&pretty, prefs),
+        };
+    }
+
     if looks_like_diff(raw) {
         return RenderedPayload {
             kind: PayloadKind::Diff,
@@ -95,16 +105,71 @@ pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
     }
 }
 
+pub fn render_assistant_content(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return RenderedPayload {
+            kind: PayloadKind::Empty,
+            headline: "empty payload".into(),
+            rendered: String::new(),
+        };
+    }
+    if let Some(records) = try_pretty_jsonl(trimmed) {
+        let rendered = highlight_json(&records.join("\n\n"), prefs);
+        return RenderedPayload {
+            kind: PayloadKind::Jsonl {
+                records: records.len(),
+            },
+            headline: format!("jsonl payload  ·  {} record(s)", records.len()),
+            rendered,
+        };
+    }
+    if let Some(pretty) = try_pretty_json(trimmed) {
+        return RenderedPayload {
+            kind: PayloadKind::Json,
+            headline: "json payload".into(),
+            rendered: highlight_json(&pretty, prefs),
+        };
+    }
+    if let Some(pretty) = try_pretty_yaml(trimmed) {
+        return RenderedPayload {
+            kind: PayloadKind::Yaml,
+            headline: "yaml payload".into(),
+            rendered: highlight_yaml(&pretty, prefs),
+        };
+    }
+    if let Some(pretty) = try_pretty_toml(trimmed) {
+        return RenderedPayload {
+            kind: PayloadKind::Toml,
+            headline: "toml payload".into(),
+            rendered: highlight_toml(&pretty, prefs),
+        };
+    }
+    if looks_like_diff(trimmed) {
+        return RenderedPayload {
+            kind: PayloadKind::Diff,
+            headline: "diff payload".into(),
+            rendered: highlight_diff(trimmed, prefs),
+        };
+    }
+    if looks_like_shell(trimmed) {
+        return RenderedPayload {
+            kind: PayloadKind::Shell,
+            headline: "shell payload".into(),
+            rendered: highlight_shell(trimmed, prefs),
+        };
+    }
+    RenderedPayload {
+        kind: PayloadKind::Markdown,
+        headline: "assistant output".into(),
+        rendered: highlight_markdown(trimmed, prefs),
+    }
+}
+
 pub fn render_tool_input(tool: &str, input: &serde_json::Value, prefs: &UiPrefs) -> Option<String> {
     match tool {
-        "bash" => input
-            .get("command")
-            .and_then(|value| value.as_str())
-            .map(|command| highlight_shell(command.trim_end(), prefs)),
-        "read_file" | "write_file" | "edit_file" => render_labeled_fields(
-            &[("path", input.get("path").and_then(|value| value.as_str()))],
-            prefs,
-        ),
+        "bash" => render_bash_input(input, prefs),
+        "read_file" | "write_file" | "edit_file" => render_file_tool_input(input, prefs),
         "glob" => render_labeled_fields(
             &[(
                 "pattern",
@@ -112,16 +177,7 @@ pub fn render_tool_input(tool: &str, input: &serde_json::Value, prefs: &UiPrefs)
             )],
             prefs,
         ),
-        "grep" => render_labeled_fields(
-            &[
-                (
-                    "pattern",
-                    input.get("pattern").and_then(|value| value.as_str()),
-                ),
-                ("path", input.get("path").and_then(|value| value.as_str())),
-            ],
-            prefs,
-        ),
+        "grep" => render_grep_input(input, prefs),
         "dispatch_agent" => render_labeled_fields(
             &[
                 ("agent", input.get("agent").and_then(|value| value.as_str())),
@@ -196,6 +252,11 @@ fn try_pretty_yaml(raw: &str) -> Option<String> {
     serde_yaml::to_string(&value).ok()
 }
 
+fn try_pretty_toml(raw: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(raw.trim()).ok()?;
+    toml::to_string_pretty(&value).ok()
+}
+
 fn looks_like_markdown(raw: &str) -> bool {
     let trimmed = raw.trim_start();
     trimmed.starts_with('#')
@@ -250,6 +311,76 @@ fn render_labeled_fields(fields: &[(&str, Option<&str>)], prefs: &UiPrefs) -> Op
     wrote.then(|| highlight_yaml(text.trim_end(), prefs))
 }
 
+fn render_bash_input(input: &serde_json::Value, prefs: &UiPrefs) -> Option<String> {
+    let command = input.get("command").and_then(|value| value.as_str())?;
+    let cwd = input.get("cwd").and_then(|value| value.as_str());
+    let mut text = String::new();
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        text.push_str("cwd: ");
+        text.push_str(cwd.trim());
+        text.push('\n');
+    }
+    text.push_str("command: |\n");
+    for line in command.trim_end().lines() {
+        text.push_str("  ");
+        text.push_str(line);
+        text.push('\n');
+    }
+    Some(highlight_yaml(text.trim_end(), prefs))
+}
+
+fn render_file_tool_input(input: &serde_json::Value, prefs: &UiPrefs) -> Option<String> {
+    let mut fields = vec![("path", input.get("path").and_then(|value| value.as_str()))];
+    let range = file_range_label(input);
+    if let Some(range) = range.as_deref() {
+        fields.push(("range", Some(range)));
+    }
+    render_labeled_fields(&fields, prefs)
+}
+
+fn render_grep_input(input: &serde_json::Value, prefs: &UiPrefs) -> Option<String> {
+    let mut text = String::new();
+    let mut wrote = false;
+    if let Some(pattern) = input.get("pattern").and_then(|value| value.as_str()) {
+        text.push_str("pattern: ");
+        text.push_str(pattern.trim());
+        text.push('\n');
+        wrote = true;
+    }
+    if let Some(path) = input.get("path").and_then(|value| value.as_str()) {
+        text.push_str("path: ");
+        text.push_str(path.trim());
+        text.push('\n');
+        wrote = true;
+    }
+    if let Some(glob) = input.get("glob").and_then(|value| value.as_str()) {
+        text.push_str("glob: ");
+        text.push_str(glob.trim());
+        text.push('\n');
+        wrote = true;
+    }
+    wrote.then(|| highlight_yaml(text.trim_end(), prefs))
+}
+
+fn file_range_label(input: &serde_json::Value) -> Option<String> {
+    let line_start = input
+        .get("start_line")
+        .or_else(|| input.get("line_start"))
+        .or_else(|| input.get("start"))
+        .and_then(|value| value.as_u64());
+    let line_end = input
+        .get("end_line")
+        .or_else(|| input.get("line_end"))
+        .or_else(|| input.get("end"))
+        .and_then(|value| value.as_u64());
+    match (line_start, line_end) {
+        (Some(start), Some(end)) => Some(format!("{start}..{end}")),
+        (Some(start), None) => Some(start.to_string()),
+        (None, Some(end)) => Some(end.to_string()),
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +409,19 @@ mod tests {
         let payload = render_payload(raw, &prefs());
         assert_eq!(payload.kind, PayloadKind::Diff);
         assert!(payload.headline.contains("diff payload"));
+    }
+
+    #[test]
+    fn render_payload_detects_toml() {
+        let payload = render_payload("[package]\nname = \"demo\"\n", &prefs());
+        assert_eq!(payload.kind, PayloadKind::Toml);
+        assert!(payload.headline.contains("toml payload"));
+    }
+
+    #[test]
+    fn render_assistant_content_prefers_markdown_highlighting_for_plain_prose() {
+        let payload = render_assistant_content("# Title\n- item\n", &prefs());
+        assert_eq!(payload.kind, PayloadKind::Markdown);
+        assert_eq!(payload.headline, "assistant output");
     }
 }

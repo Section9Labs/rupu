@@ -432,6 +432,7 @@ pub(crate) fn render_pretty_transcript_event(
                         "assistant output",
                         Some(&truncate_single_line(content, 96)),
                     ),
+                    LiveViewMode::Compact => {}
                 }
             }
         }
@@ -454,7 +455,11 @@ pub(crate) fn render_pretty_transcript_event(
             } else {
                 Status::Complete
             };
-            let mut detail = truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 84);
+            let payload = crate::output::rich_payload::render_payload(
+                error.as_deref().unwrap_or(output.as_str()),
+                printer.prefs(),
+            );
+            let mut detail = truncate_single_line(&payload.headline, 84);
             if *duration_ms > 0 {
                 detail.push_str(&format!("  ·  {}ms", duration_ms));
             }

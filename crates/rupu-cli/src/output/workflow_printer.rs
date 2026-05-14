@@ -34,7 +34,10 @@ use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, Key
 use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
-use rupu_orchestrator::{FindingRecord, ItemResultRecord, RunRecord, StepKind, StepResultRecord};
+use rupu_app_canvas::{render_rows as render_workflow_graph, GraphCell, GraphRow, NodeStatus};
+use rupu_orchestrator::{
+    FindingRecord, ItemResultRecord, RunRecord, StepKind, StepResultRecord, Workflow,
+};
 use rupu_transcript::Event as TxEvent;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
@@ -115,9 +118,12 @@ enum WorkflowViewLineKind {
 
 struct WorkflowInteractiveState {
     seen_step_results: usize,
+    workflow: Option<Workflow>,
+    step_results: BTreeMap<String, StepResultRecord>,
     followed_step_id: Option<String>,
     followed_transcript_path: Option<PathBuf>,
     tailer: Option<TranscriptTailer>,
+    active_transcript_indent: usize,
     lines: Vec<WorkflowViewLine>,
     total_tokens: u64,
     dispatches: BTreeMap<String, InFlightDispatch>,
@@ -125,12 +131,15 @@ struct WorkflowInteractiveState {
 }
 
 impl WorkflowInteractiveState {
-    fn new(skip_count: usize) -> Self {
+    fn new(skip_count: usize, workflow: Option<Workflow>) -> Self {
         Self {
             seen_step_results: skip_count,
+            workflow,
+            step_results: BTreeMap::new(),
             followed_step_id: None,
             followed_transcript_path: None,
             tailer: None,
+            active_transcript_indent: 0,
             lines: Vec::new(),
             total_tokens: 0,
             dispatches: BTreeMap::new(),
@@ -529,6 +538,7 @@ pub fn attach_and_render_interactive_with(
     let (final_outcome, final_record, final_tokens) = {
         let _raw_mode = WorkflowRawModeGuard::enter()?;
         let _screen = WorkflowScreenGuard::enter()?;
+        let workflow = load_workflow_definition(&run_dir);
         let prefs = retained_workflow_ui_prefs().unwrap_or_else(|_| {
             UiPrefs::resolve(
                 &rupu_config::UiConfig::default(),
@@ -539,7 +549,7 @@ pub fn attach_and_render_interactive_with(
             )
         });
         let mut view_mode = opts.view_mode;
-        let mut state = WorkflowInteractiveState::new(opts.skip_count);
+        let mut state = WorkflowInteractiveState::new(opts.skip_count, workflow.clone());
         let mut last_rows: Vec<String> = Vec::new();
 
         loop {
@@ -579,6 +589,7 @@ pub fn attach_and_render_interactive_with(
                                                 opts.skip_count,
                                                 view_mode,
                                                 &prefs,
+                                                workflow.clone(),
                                             );
                                             state.viewport = viewport;
                                         }
@@ -654,6 +665,7 @@ pub fn attach_and_render_interactive_with(
                                                 opts.skip_count,
                                                 view_mode,
                                                 &prefs,
+                                                workflow.clone(),
                                             );
                                             state.viewport = viewport;
                                         }
@@ -718,9 +730,10 @@ fn rebuild_workflow_interactive_state(
     skip_count: usize,
     view_mode: LiveViewMode,
     prefs: &UiPrefs,
+    workflow: Option<Workflow>,
 ) -> WorkflowInteractiveState {
-    let mut state = WorkflowInteractiveState::new(skip_count);
-    drain_step_results_interactive(step_results_log, &mut state, view_mode, prefs);
+    let mut state = WorkflowInteractiveState::new(skip_count, workflow);
+    replay_step_results_interactive(step_results_log, &mut state, view_mode, prefs);
     follow_active_transcript(record, &mut state, view_mode, prefs);
     drain_workflow_transcript_events(&mut state, view_mode, prefs);
     state
@@ -731,6 +744,11 @@ fn rebuild_workflow_interactive_state(
 fn load_run_record(run_json: &Path) -> Option<RunRecord> {
     let bytes = std::fs::read(run_json).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn load_workflow_definition(run_dir: &Path) -> Option<Workflow> {
+    let yaml = std::fs::read_to_string(run_dir.join("workflow.yaml")).ok()?;
+    Workflow::parse(&yaml).ok()
 }
 
 fn follow_active_transcript(
@@ -747,15 +765,129 @@ fn follow_active_transcript(
     state.followed_step_id = record.active_step_id.clone();
     state.followed_transcript_path = desired_path.clone();
     state.tailer = desired_path.map(TranscriptTailer::new);
+    state.active_transcript_indent = 1;
     state.dispatches.clear();
     if let Some(step_id) = record.active_step_id.as_deref() {
-        let detail = if let Some(agent) = record.active_step_agent.as_deref() {
-            format!("{step_id}  ·  {agent}")
-        } else {
-            step_id.to_string()
-        };
-        state.push_line(UiStatus::Working, format!("active step  ·  {detail}"));
+        let detail = record.active_step_agent.as_deref().unwrap_or("running");
+        state.push_tree_item(
+            UiStatus::Working,
+            0,
+            retained_tree_item_text(UiStatus::Working, step_id, detail),
+        );
     }
+}
+
+fn load_step_result_records(log: &Path) -> Vec<StepResultRecord> {
+    let Ok(bytes) = std::fs::read(log) else {
+        return Vec::new();
+    };
+    bytes
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_slice::<StepResultRecord>(line).ok())
+        .collect()
+}
+
+fn replay_step_results_interactive(
+    log: &Path,
+    state: &mut WorkflowInteractiveState,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) {
+    let records = load_step_result_records(log);
+    state.seen_step_results = records.len();
+    for rec in records {
+        state.step_results.insert(rec.step_id.clone(), rec.clone());
+        if rec.skipped {
+            state.push_line(UiStatus::Skipped, format!("skipped  ·  {}", rec.step_id));
+            continue;
+        }
+        replay_step_result_history(state, &rec, view_mode, prefs);
+    }
+}
+
+fn replay_step_result_history(
+    state: &mut WorkflowInteractiveState,
+    rec: &StepResultRecord,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) {
+    match rec.kind {
+        StepKind::Linear => replay_linear_step_history(state, rec, view_mode, prefs),
+        StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
+            append_step_result_lines(state, rec, view_mode, prefs)
+        }
+    }
+}
+
+fn replay_linear_step_history(
+    state: &mut WorkflowInteractiveState,
+    rec: &StepResultRecord,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) {
+    let events = transcript_events_for_path(&rec.transcript_path);
+    let mut summary = summarize_compact_child_events(&events);
+    if !rec.success && summary.error.is_none() {
+        summary.error = Some("step failed".into());
+    }
+    let status = if rec.success {
+        UiStatus::Complete
+    } else {
+        UiStatus::Failed
+    };
+    state.total_tokens += summary.total_tokens;
+    state.push_tree_item(
+        status,
+        0,
+        retained_tree_item_text(
+            status,
+            &rec.step_id,
+            &compact_child_detail(
+                status,
+                &summary.provider,
+                &summary.model,
+                summary.duration_ms,
+                summary.total_tokens,
+                None,
+            ),
+        ),
+    );
+    if view_mode.shows_full_payloads() {
+        for event in &events {
+            for line in workflow_transcript_event_lines(event, view_mode, prefs) {
+                state.push_view_line(WorkflowViewLine {
+                    indent: line.indent + 1,
+                    ..line
+                });
+            }
+        }
+    } else if !rec.success {
+        let reason = summary.error.as_deref().unwrap_or("step failed");
+        state.push_tree_note(
+            UiStatus::Failed,
+            1,
+            retained_tree_note_text(
+                UiStatus::Failed,
+                &format!("error  {}", truncate_single_line(reason, 88)),
+            ),
+        );
+    } else if view_mode == LiveViewMode::Focused {
+        if let Some(note) = compact_child_note(&summary) {
+            state.push_tree_note(
+                UiStatus::Active,
+                1,
+                retained_tree_note_text(UiStatus::Active, &note),
+            );
+        }
+    }
+}
+
+fn transcript_events_for_path(path: &Path) -> Vec<TxEvent> {
+    if path.as_os_str().is_empty() || !path.exists() {
+        return Vec::new();
+    }
+    TranscriptTailer::new(path).drain()
 }
 
 fn drain_workflow_transcript_events(
@@ -768,63 +900,67 @@ fn drain_workflow_transcript_events(
             if let TxEvent::RunComplete { total_tokens, .. } = &event {
                 state.total_tokens += *total_tokens;
             }
-            if view_mode == LiveViewMode::Full {
-                match &event {
-                    TxEvent::ToolCall {
-                        call_id,
-                        tool,
-                        input,
-                    } => match tool.as_str() {
-                        "dispatch_agent" => {
-                            let agent = input
-                                .get("agent")
-                                .and_then(|value| value.as_str())
-                                .unwrap_or("?")
-                                .to_string();
-                            state
-                                .dispatches
-                                .insert(call_id.clone(), InFlightDispatch::Single { agent });
-                        }
-                        "dispatch_agents_parallel" => {
-                            state
-                                .dispatches
-                                .insert(call_id.clone(), InFlightDispatch::Parallel);
-                        }
-                        _ => {}
-                    },
-                    TxEvent::ToolResult {
-                        call_id,
-                        output,
-                        error,
-                        ..
-                    } => {
-                        if let Some(dispatch) = state.dispatches.remove(call_id) {
-                            let nested = match dispatch {
-                                InFlightDispatch::Single { agent } => {
-                                    retained_dispatch_child_lines(
-                                        &agent,
-                                        output,
-                                        error.as_deref(),
-                                        prefs,
-                                    )
-                                }
-                                InFlightDispatch::Parallel => {
-                                    retained_dispatch_children_lines(output, prefs)
-                                }
-                            };
-                            if !nested.is_empty() {
-                                for line in nested {
-                                    state.push_view_line(line);
-                                }
-                                continue;
-                            }
-                        }
+            match &event {
+                TxEvent::ToolCall {
+                    call_id,
+                    tool,
+                    input,
+                } => match tool.as_str() {
+                    "dispatch_agent" => {
+                        let agent = input
+                            .get("agent")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        state
+                            .dispatches
+                            .insert(call_id.clone(), InFlightDispatch::Single { agent });
+                    }
+                    "dispatch_agents_parallel" => {
+                        state
+                            .dispatches
+                            .insert(call_id.clone(), InFlightDispatch::Parallel);
                     }
                     _ => {}
+                },
+                TxEvent::ToolResult {
+                    call_id,
+                    output,
+                    error,
+                    ..
+                } => {
+                    if let Some(dispatch) = state.dispatches.remove(call_id) {
+                        let nested = match dispatch {
+                            InFlightDispatch::Single { agent } => retained_dispatch_child_lines(
+                                &agent,
+                                output,
+                                error.as_deref(),
+                                prefs,
+                                view_mode,
+                                state.active_transcript_indent + 1,
+                            ),
+                            InFlightDispatch::Parallel => retained_dispatch_children_lines(
+                                output,
+                                prefs,
+                                view_mode,
+                                state.active_transcript_indent + 1,
+                            ),
+                        };
+                        if !nested.is_empty() {
+                            for line in nested {
+                                state.push_view_line(line);
+                            }
+                            continue;
+                        }
+                    }
                 }
+                _ => {}
             }
             for line in workflow_transcript_event_lines(&event, view_mode, prefs) {
-                state.push_view_line(line);
+                state.push_view_line(WorkflowViewLine {
+                    indent: line.indent + state.active_transcript_indent,
+                    ..line
+                });
             }
         }
     }
@@ -849,6 +985,7 @@ fn drain_step_results_interactive(
         let Ok(rec): Result<StepResultRecord, _> = serde_json::from_slice(line) else {
             continue;
         };
+        state.step_results.insert(rec.step_id.clone(), rec.clone());
         if rec.skipped {
             state.push_line(UiStatus::Skipped, format!("skipped  ·  {}", rec.step_id));
             continue;
@@ -870,26 +1007,37 @@ fn append_step_result_lines(
             } else {
                 UiStatus::Failed
             };
-            let label = if rec.success {
-                "step complete"
-            } else {
-                "step failed"
-            };
-            let detail = truncate_single_line(&rec.step_id, 96);
-            state.push_line(status, format!("{label}  ·  {detail}"));
+            state.push_tree_item(
+                status,
+                0,
+                retained_tree_item_text(
+                    status,
+                    &rec.step_id,
+                    if rec.success { "step complete" } else { "step failed" },
+                ),
+            );
             if !rec.output.trim().is_empty() {
                 match view_mode {
                     LiveViewMode::Focused => {
                         let label = if rec.success { "output" } else { "error" };
-                        state.push_line(
+                        state.push_tree_note(
                             if rec.success {
                                 UiStatus::Active
                             } else {
                                 UiStatus::Failed
                             },
-                            format!("{label}  ·  {}", truncate_single_line(&rec.output, 96)),
+                            1,
+                            retained_tree_note_text(
+                                if rec.success {
+                                    UiStatus::Active
+                                } else {
+                                    UiStatus::Failed
+                                },
+                                &format!("{label}  {}", truncate_single_line(&rec.output, 96)),
+                            ),
                         );
                     }
+                    LiveViewMode::Compact => {}
                     LiveViewMode::Full => {
                         let payload = render_payload(&rec.output, prefs);
                         for line in retained_payload_lines(
@@ -919,11 +1067,14 @@ fn append_step_result_lines(
                 StepKind::Panel => "panel",
                 StepKind::Linear => unreachable!(),
             };
-            state.push_line(
+            state.push_tree_item(
                 status,
-                format!(
-                    "{}  ·  {}  ·  {} {}",
-                    rec.step_id,
+                0,
+                retained_tree_item_text(
+                    status,
+                    &rec.step_id,
+                    &format!(
+                        "{}  ·  {} {}",
                     kind,
                     rec.items.len(),
                     if rec.items.len() == 1 {
@@ -931,6 +1082,7 @@ fn append_step_result_lines(
                     } else {
                         "items"
                     }
+                    ),
                 ),
             );
             append_fanout_item_lines(state, rec, view_mode, prefs);
@@ -989,7 +1141,7 @@ fn append_fanout_item_lines(
         );
         state.push_tree_item(
             status,
-            0,
+            1,
             retained_tree_item_text(status, &headline, &detail),
         );
         if view_mode == LiveViewMode::Full {
@@ -1005,7 +1157,7 @@ fn append_fanout_item_lines(
             let reason = summary.error.as_deref().unwrap_or("item failed");
             state.push_tree_note(
                 UiStatus::Failed,
-                1,
+                2,
                 retained_tree_note_text(
                     UiStatus::Failed,
                     &format!("error  {}", truncate_single_line(reason, 88)),
@@ -1015,16 +1167,18 @@ fn append_fanout_item_lines(
             if let Some(note) = compact_child_note(&summary) {
                 state.push_tree_note(
                     UiStatus::Active,
-                    1,
+                    2,
                     retained_tree_note_text(UiStatus::Active, &note),
                 );
             }
-        } else if let Some(note) = compact_child_note(&summary) {
+        } else if view_mode == LiveViewMode::Full {
+            if let Some(note) = compact_child_note(&summary) {
             state.push_tree_note(
                 UiStatus::Active,
-                1,
+                2,
                 retained_tree_note_text(UiStatus::Active, &note),
             );
+            }
         }
     }
 }
@@ -1041,48 +1195,62 @@ fn workflow_transcript_event_lines(
             mode,
             started_at,
             ..
-        } => vec![WorkflowViewLine {
-            status: UiStatus::Active,
-            text: retained_workflow_event_line(
-                UiStatus::Active,
-                "run started",
-                &format!(
-                    "{}  ·  workspace {}  ·  mode {}  ·  {}",
-                    compact_workflow_run_id(run_id),
-                    workspace_id,
-                    format!("{mode:?}").to_lowercase(),
-                    started_at.format("%Y-%m-%d %H:%M:%S UTC")
+        } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![WorkflowViewLine {
+                status: UiStatus::Active,
+                text: retained_workflow_event_line(
+                    UiStatus::Active,
+                    "run started",
+                    &format!(
+                        "{}  ·  workspace {}  ·  mode {}  ·  {}",
+                        compact_workflow_run_id(run_id),
+                        workspace_id,
+                        format!("{mode:?}").to_lowercase(),
+                        started_at.format("%Y-%m-%d %H:%M:%S UTC")
+                    ),
                 ),
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
-        TxEvent::TurnStart { turn_idx } => vec![WorkflowViewLine {
-            status: UiStatus::Working,
-            text: retained_workflow_event_line(
-                UiStatus::Working,
-                &format!("turn {turn_idx}"),
-                "assistant turn started",
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
+        TxEvent::TurnStart { turn_idx } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![WorkflowViewLine {
+                status: UiStatus::Working,
+                text: retained_workflow_event_line(
+                    UiStatus::Working,
+                    &format!("turn {turn_idx}"),
+                    "assistant turn started",
+                ),
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
         TxEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
-            if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
-                out.push(WorkflowViewLine {
-                    status: UiStatus::Active,
-                    text: retained_workflow_event_line(
-                        UiStatus::Active,
-                        "thinking",
-                        &truncate_single_line(thinking, 96),
-                    ),
-                    continuation: false,
-                    indent: 0,
-                    kind: WorkflowViewLineKind::Event,
-                });
+            if view_mode.shows_full_payloads() {
+                if let Some(thinking) =
+                    thinking.as_deref().filter(|value| !value.trim().is_empty())
+                {
+                    out.push(WorkflowViewLine {
+                        status: UiStatus::Active,
+                        text: retained_workflow_event_line(
+                            UiStatus::Active,
+                            "thinking",
+                            &truncate_single_line(thinking, 96),
+                        ),
+                        continuation: false,
+                        indent: 0,
+                        kind: WorkflowViewLineKind::Event,
+                    });
+                }
             }
             if !content.trim().is_empty() {
                 match view_mode {
@@ -1096,9 +1264,15 @@ fn workflow_transcript_event_lines(
                         continuation: false,
                         indent: 0,
                         kind: WorkflowViewLineKind::Event,
-                    }),
+                        }),
+                    LiveViewMode::Compact => {}
                     LiveViewMode::Full => {
-                        let highlighted = render_payload(content.trim(), prefs).rendered;
+                        let highlighted =
+                            crate::output::rich_payload::render_assistant_content(
+                                content.trim(),
+                                prefs,
+                            )
+                            .rendered;
                         let mut lines = highlighted.split('\n');
                         if let Some(first) = lines.next() {
                             out.push(WorkflowViewLine {
@@ -1128,7 +1302,7 @@ fn workflow_transcript_event_lines(
             out
         }
         TxEvent::ToolCall { tool, input, .. } => match view_mode {
-            LiveViewMode::Focused => vec![WorkflowViewLine {
+            LiveViewMode::Focused | LiveViewMode::Compact => vec![WorkflowViewLine {
                 status: UiStatus::Working,
                 text: retained_workflow_event_line(
                     UiStatus::Working,
@@ -1179,24 +1353,21 @@ fn workflow_transcript_event_lines(
             } else {
                 "tool result"
             };
+            let raw = error.as_deref().unwrap_or(output.as_str());
+            let payload = render_payload(raw, prefs);
             match view_mode {
-                LiveViewMode::Focused => {
-                    let mut detail =
-                        truncate_single_line(error.as_deref().unwrap_or(output.as_str()), 90);
-                    if *duration_ms > 0 {
-                        detail.push_str(&format!("  ·  {}ms", duration_ms));
-                    }
-                    vec![WorkflowViewLine {
+                LiveViewMode::Focused | LiveViewMode::Compact => vec![WorkflowViewLine {
+                    status,
+                    text: retained_workflow_event_line(
                         status,
-                        text: retained_workflow_event_line(status, label, &detail),
-                        continuation: false,
-                        indent: 0,
-                        kind: WorkflowViewLineKind::Event,
-                    }]
-                }
+                        label,
+                        &workflow_payload_summary(&payload, *duration_ms),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                    kind: WorkflowViewLineKind::Event,
+                }],
                 LiveViewMode::Full => {
-                    let raw = error.as_deref().unwrap_or(output.as_str());
-                    let payload = render_payload(raw, prefs);
                     let mut out = vec![WorkflowViewLine {
                         status,
                         text: retained_workflow_event_line(
@@ -1213,17 +1384,40 @@ fn workflow_transcript_event_lines(
                 }
             }
         }
-        TxEvent::FileEdit { path, kind, .. } => vec![WorkflowViewLine {
-            status: UiStatus::Complete,
-            text: retained_workflow_event_line(
-                UiStatus::Complete,
-                "file edit",
-                &format!("{} {}", format!("{kind:?}").to_lowercase(), path),
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
+        TxEvent::FileEdit { path, kind, diff } => match view_mode {
+            LiveViewMode::Focused | LiveViewMode::Compact => vec![WorkflowViewLine {
+                status: UiStatus::Complete,
+                text: retained_workflow_event_line(
+                    UiStatus::Complete,
+                    "file edit",
+                    &format!("{} {}", format!("{kind:?}").to_lowercase(), path),
+                ),
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }],
+            LiveViewMode::Full => {
+                let payload = render_payload(diff, prefs);
+                let mut out = vec![WorkflowViewLine {
+                    status: UiStatus::Complete,
+                    text: retained_workflow_event_line(
+                        UiStatus::Complete,
+                        "file edit",
+                        &format!(
+                            "{} {}  ·  {}",
+                            format!("{kind:?}").to_lowercase(),
+                            path,
+                            payload.headline
+                        ),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                    kind: WorkflowViewLineKind::Event,
+                }];
+                out.extend(retained_payload_lines(&payload, UiStatus::Complete, 1));
+                out
+            }
+        },
         TxEvent::CommandRun {
             argv,
             cwd,
@@ -1305,40 +1499,50 @@ fn workflow_transcript_event_lines(
             turn_idx,
             tokens_in,
             tokens_out,
-        } => vec![WorkflowViewLine {
-            status: UiStatus::Complete,
-            text: retained_workflow_event_line(
-                UiStatus::Complete,
-                "turn complete",
-                &format!(
-                    "turn {turn_idx}  ·  in {} out {}",
-                    tokens_in.unwrap_or(0),
-                    tokens_out.unwrap_or(0)
+        } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![WorkflowViewLine {
+                status: UiStatus::Complete,
+                text: retained_workflow_event_line(
+                    UiStatus::Complete,
+                    "turn complete",
+                    &format!(
+                        "turn {turn_idx}  ·  in {} out {}",
+                        tokens_in.unwrap_or(0),
+                        tokens_out.unwrap_or(0)
+                    ),
                 ),
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
         TxEvent::Usage {
             provider,
             model,
             input_tokens,
             output_tokens,
             cached_tokens,
-        } => vec![WorkflowViewLine {
-            status: UiStatus::Active,
-            text: retained_workflow_event_line_raw(
-                UiStatus::Active,
-                "usage",
-                &format!(
-                    "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+        } => {
+            if !view_mode.shows_full_payloads() {
+                return Vec::new();
+            }
+            vec![WorkflowViewLine {
+                status: UiStatus::Active,
+                text: retained_workflow_event_line_raw(
+                    UiStatus::Active,
+                    "usage",
+                    &format!(
+                        "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+                    ),
                 ),
-            ),
-            continuation: false,
-            indent: 0,
-            kind: WorkflowViewLineKind::Event,
-        }],
+                continuation: false,
+                indent: 0,
+                kind: WorkflowViewLineKind::Event,
+            }]
+        }
         TxEvent::RunComplete {
             status,
             total_tokens,
@@ -1378,15 +1582,22 @@ fn retained_dispatch_child_lines(
     output: &str,
     fallback_error: Option<&str>,
     prefs: &UiPrefs,
+    view_mode: LiveViewMode,
+    indent: usize,
 ) -> Vec<WorkflowViewLine> {
     let parsed: serde_json::Value = match serde_json::from_str(output) {
         Ok(value) => value,
         Err(_) => return Vec::new(),
     };
-    retained_dispatch_outcome_lines(headline, &parsed, fallback_error, prefs)
+    retained_dispatch_outcome_lines(headline, &parsed, fallback_error, prefs, view_mode, indent)
 }
 
-fn retained_dispatch_children_lines(output: &str, prefs: &UiPrefs) -> Vec<WorkflowViewLine> {
+fn retained_dispatch_children_lines(
+    output: &str,
+    prefs: &UiPrefs,
+    view_mode: LiveViewMode,
+    indent: usize,
+) -> Vec<WorkflowViewLine> {
     let parsed: serde_json::Value = match serde_json::from_str(output) {
         Ok(value) => value,
         Err(_) => return Vec::new(),
@@ -1396,7 +1607,9 @@ fn retained_dispatch_children_lines(output: &str, prefs: &UiPrefs) -> Vec<Workfl
     };
     let mut out = Vec::new();
     for (id, outcome) in results {
-        out.extend(retained_dispatch_outcome_lines(id, outcome, None, prefs));
+        out.extend(retained_dispatch_outcome_lines(
+            id, outcome, None, prefs, view_mode, indent,
+        ));
     }
     out
 }
@@ -1406,6 +1619,8 @@ fn retained_dispatch_outcome_lines(
     outcome: &serde_json::Value,
     fallback_error: Option<&str>,
     prefs: &UiPrefs,
+    view_mode: LiveViewMode,
+    indent: usize,
 ) -> Vec<WorkflowViewLine> {
     let transcript_path = outcome["transcript_path"]
         .as_str()
@@ -1447,18 +1662,48 @@ fn retained_dispatch_outcome_lines(
         status,
         text: retained_tree_item_text(status, headline, &detail),
         continuation: false,
-        indent: 0,
+        indent,
         kind: WorkflowViewLineKind::TreeItem,
     }];
-    for event in &events {
-        for line in workflow_transcript_event_lines(event, LiveViewMode::Full, prefs) {
-            out.push(WorkflowViewLine {
-                indent: line.indent + 2,
-                ..line
-            });
+    match view_mode {
+        LiveViewMode::Full => {
+            for event in &events {
+                for line in workflow_transcript_event_lines(event, LiveViewMode::Full, prefs) {
+                    out.push(WorkflowViewLine {
+                        indent: line.indent + indent + 1,
+                        ..line
+                    });
+                }
+            }
         }
+        LiveViewMode::Focused => {
+            if !success {
+                out.push(WorkflowViewLine {
+                    status: UiStatus::Failed,
+                    text: retained_tree_note_text(
+                        UiStatus::Failed,
+                        &format!(
+                            "error  {}",
+                            truncate_single_line(dispatch_error.unwrap_or("dispatch failed"), 96)
+                        ),
+                    ),
+                    continuation: false,
+                    indent: indent + 1,
+                    kind: WorkflowViewLineKind::TreeNote,
+                });
+            } else if let Some(note) = compact_child_note(&summary) {
+                out.push(WorkflowViewLine {
+                    status: UiStatus::Active,
+                    text: retained_tree_note_text(UiStatus::Active, &note),
+                    continuation: false,
+                    indent: indent + 1,
+                    kind: WorkflowViewLineKind::TreeNote,
+                });
+            }
+        }
+        LiveViewMode::Compact => {}
     }
-    if !success && events.is_empty() {
+    if !success && events.is_empty() && !matches!(view_mode, LiveViewMode::Focused) {
         out.push(WorkflowViewLine {
             status: UiStatus::Failed,
             text: retained_tree_note_text(
@@ -1466,7 +1711,7 @@ fn retained_dispatch_outcome_lines(
                 &truncate_single_line(dispatch_error.unwrap_or("dispatch failed"), 96),
             ),
             continuation: false,
-            indent: 1,
+            indent: indent + 1,
             kind: WorkflowViewLineKind::TreeNote,
         });
     }
@@ -1556,7 +1801,7 @@ fn handle_workflow_navigation_keypress(
         (KeyCode::Char('?'), _) => {
             state.push_line(
                 UiStatus::Active,
-                "help  ·  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel",
+                "help  ·  f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel",
             );
             Some(WorkflowNavAction::Handled)
         }
@@ -1789,6 +2034,23 @@ fn build_workflow_screen_rows_for_size(
     rows.push(String::new());
 
     let footer_reserved = 2usize;
+    let body_capacity = height
+        .saturating_sub(rows.len())
+        .saturating_sub(footer_reserved)
+        .max(1);
+    if matches!(view_mode, LiveViewMode::Focused | LiveViewMode::Compact) {
+        let max_graph_rows = body_capacity
+            .saturating_sub(4)
+            .min(if view_mode == LiveViewMode::Focused { 10 } else { 7 });
+        let graph_rows =
+            render_workflow_graph_block(&state.workflow, &state.step_results, record, width, max_graph_rows);
+        if !graph_rows.is_empty() {
+            rows.push(render_workflow_graph_title_line(width));
+            rows.extend(graph_rows);
+            rows.push(String::new());
+        }
+    }
+
     let available_event_rows = height
         .saturating_sub(rows.len())
         .saturating_sub(footer_reserved)
@@ -1805,12 +2067,164 @@ fn build_workflow_screen_rows_for_size(
     rows
 }
 
+fn render_workflow_graph_title_line(width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, "graph", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        "  ·  workflow topology with live step state",
+        DIM,
+    );
+    truncate_workflow_ansi_line(&buf, width)
+}
+
+fn render_workflow_graph_block(
+    workflow: &Option<Workflow>,
+    step_results: &BTreeMap<String, StepResultRecord>,
+    record: &RunRecord,
+    width: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+    let Some(workflow) = workflow.as_ref() else {
+        return Vec::new();
+    };
+    let rows = render_workflow_graph(workflow, |node_id| {
+        workflow_node_status(node_id, workflow, step_results, record)
+    });
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut rendered = rows
+        .iter()
+        .map(|row| truncate_workflow_ansi_line(&render_graph_row(row), width))
+        .collect::<Vec<_>>();
+    if rendered.len() > max_rows {
+        let hidden = rendered.len() - max_rows + 1;
+        rendered.truncate(max_rows.saturating_sub(1));
+        let mut line = String::new();
+        let _ = palette::write_colored(&mut line, "…", DIM);
+        let _ = palette::write_colored(
+            &mut line,
+            &format!(" {hidden} more graph row(s)"),
+            DIM,
+        );
+        rendered.push(truncate_workflow_ansi_line(&line, width));
+    }
+    rendered
+}
+
+fn workflow_node_status(
+    node_id: &str,
+    workflow: &Workflow,
+    step_results: &BTreeMap<String, StepResultRecord>,
+    record: &RunRecord,
+) -> NodeStatus {
+    if record.awaiting_step_id.as_deref() == Some(node_id) {
+        return NodeStatus::Awaiting;
+    }
+    if record.active_step_id.as_deref() == Some(node_id) {
+        return NodeStatus::Working;
+    }
+    if let Some(step) = workflow.steps.iter().find(|step| step.id == node_id) {
+        if let Some(rec) = step_results.get(&step.id) {
+            return step_record_status(rec);
+        }
+        return NodeStatus::Waiting;
+    }
+    if let Some((_, parent)) = step_results.iter().find(|(_, rec)| {
+        rec.items
+            .iter()
+            .any(|item| item.sub_id == node_id || item_input_label(&item.item) == node_id)
+    }) {
+        if let Some(item) = parent
+            .items
+            .iter()
+            .find(|item| item.sub_id == node_id || item_input_label(&item.item) == node_id)
+        {
+            return if item.success {
+                NodeStatus::Complete
+            } else {
+                NodeStatus::Failed
+            };
+        }
+    }
+    NodeStatus::Waiting
+}
+
+fn step_record_status(record: &StepResultRecord) -> NodeStatus {
+    if record.skipped {
+        NodeStatus::Skipped
+    } else if record.success {
+        NodeStatus::Complete
+    } else {
+        NodeStatus::Failed
+    }
+}
+
+fn render_graph_row(row: &GraphRow) -> String {
+    let anchor_status = row
+        .anchor_status()
+        .map(node_status_ui_status)
+        .unwrap_or(UiStatus::Waiting);
+    let mut buf = String::new();
+    for cell in &row.cells {
+        match cell {
+            GraphCell::Pipe(status) => {
+                let _ = palette::write_colored(
+                    &mut buf,
+                    "│",
+                    node_status_ui_status(*status).color(),
+                );
+            }
+            GraphCell::Branch(branch, status) => {
+                let _ = palette::write_colored(
+                    &mut buf,
+                    branch.as_str(),
+                    node_status_ui_status(*status).color(),
+                );
+            }
+            GraphCell::Bullet(status) => {
+                let _ = palette::write_bold_colored(
+                    &mut buf,
+                    &node_status_ui_status(*status).glyph().to_string(),
+                    node_status_ui_status(*status).color(),
+                );
+            }
+            GraphCell::Space(n) => buf.push_str(&" ".repeat(*n as usize)),
+            GraphCell::Label(label) => {
+                let _ = palette::write_bold_colored(&mut buf, label, anchor_status.color());
+            }
+            GraphCell::Meta(meta) => {
+                let _ = palette::write_colored(&mut buf, meta, DIM);
+            }
+        }
+    }
+    buf
+}
+
+fn node_status_ui_status(status: NodeStatus) -> UiStatus {
+    match status {
+        NodeStatus::Waiting => UiStatus::Waiting,
+        NodeStatus::Active => UiStatus::Active,
+        NodeStatus::Working => UiStatus::Working,
+        NodeStatus::Complete => UiStatus::Complete,
+        NodeStatus::Failed => UiStatus::Failed,
+        NodeStatus::SoftFailed => UiStatus::SoftFailed,
+        NodeStatus::Awaiting => UiStatus::Awaiting,
+        NodeStatus::Retrying => UiStatus::Retrying,
+        NodeStatus::Skipped => UiStatus::Skipped,
+    }
+}
+
 fn render_workflow_controls_line(status: rupu_orchestrator::RunStatus, width: usize) -> String {
     let line = match status {
         rupu_orchestrator::RunStatus::AwaitingApproval => {
-            "f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  a approve  ·  r reject  ·  v findings  ·  q detach"
+            "f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  a approve  ·  r reject  ·  v findings  ·  q detach"
         }
-        _ => "f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel  ·  resize reflows automatically  ·  ? help",
+        _ => "f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  x cancel  ·  resize reflows automatically  ·  ? help",
     };
     let mut buf = String::new();
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
@@ -2654,6 +3068,7 @@ fn render_assistant_output(
             "assistant output",
             Some(&truncate_single_line(content, 96)),
         ),
+        LiveViewMode::Compact => {}
     }
 }
 
@@ -3082,6 +3497,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
+    fn write_transcript(path: &Path, events: &[TxEvent]) {
+        let mut buf = String::new();
+        for event in events {
+            buf.push_str(&serde_json::to_string(event).unwrap());
+            buf.push('\n');
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
     fn sample_run_record() -> RunRecord {
         RunRecord {
             id: "run_test".into(),
@@ -3318,7 +3742,7 @@ mod tests {
             None,
             Some(LiveViewMode::Focused),
         );
-        let mut state = WorkflowInteractiveState::new(0);
+        let mut state = WorkflowInteractiveState::new(0, None);
         state.push_line(
             UiStatus::Active,
             "assistant output  ·  this is a deliberately long workflow event line that should wrap cleanly inside the retained workflow screen",
@@ -3347,7 +3771,7 @@ mod tests {
             None,
             Some(LiveViewMode::Focused),
         );
-        let mut state = WorkflowInteractiveState::new(0);
+        let mut state = WorkflowInteractiveState::new(0, None);
         for index in 0..800 {
             state.push_line(UiStatus::Active, format!("workflow line {index:03}"));
         }
@@ -3363,6 +3787,127 @@ mod tests {
         );
         assert!(rows.iter().any(|row| row.contains("workflow line 000")));
         assert!(!rows.iter().any(|row| row.contains("workflow line 799")));
+    }
+
+    #[test]
+    fn rebuild_workflow_state_replays_completed_linear_transcript_history() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("step.jsonl");
+        let step_results = dir.path().join("step_results.jsonl");
+        let run_started = Utc::now();
+        write_transcript(
+            &transcript,
+            &[
+                TxEvent::RunStart {
+                    run_id: "run_linear".into(),
+                    workspace_id: "ws".into(),
+                    agent: "builder".into(),
+                    provider: "anthropic".into(),
+                    model: "claude-sonnet-4-6".into(),
+                    started_at: run_started,
+                    mode: rupu_transcript::RunMode::Readonly,
+                },
+                TxEvent::AssistantMessage {
+                    content: "Summarized the implementation plan.".into(),
+                    thinking: None,
+                },
+                TxEvent::RunComplete {
+                    run_id: "run_linear".into(),
+                    status: rupu_transcript::RunStatus::Ok,
+                    total_tokens: 321,
+                    duration_ms: 1200,
+                    error: None,
+                },
+            ],
+        );
+        let record = StepResultRecord {
+            step_id: "understand".into(),
+            run_id: "run_linear".into(),
+            transcript_path: transcript,
+            output: "Summarized the implementation plan.".into(),
+            success: true,
+            skipped: false,
+            rendered_prompt: "Read the repo".into(),
+            kind: StepKind::Linear,
+            items: Vec::new(),
+            findings: Vec::new(),
+            iterations: 0,
+            resolved: true,
+            finished_at: Utc::now(),
+        };
+        std::fs::write(
+            &step_results,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let state = rebuild_workflow_interactive_state(
+            &sample_run_record(),
+            &step_results,
+            0,
+            LiveViewMode::Focused,
+            &prefs,
+            None,
+        );
+        assert!(state.lines.iter().any(|line| line.text.contains("understand")));
+        assert!(state
+            .lines
+            .iter()
+            .any(|line| line.text.contains("assistant output")));
+    }
+
+    #[test]
+    fn retained_dispatch_child_lines_focused_emit_tree_summary() {
+        let dir = tempdir().unwrap();
+        let transcript = dir.path().join("child.jsonl");
+        write_transcript(
+            &transcript,
+            &[
+                TxEvent::AssistantMessage {
+                    content: "Investigated the target repo.".into(),
+                    thinking: None,
+                },
+                TxEvent::RunComplete {
+                    run_id: "sub_1".into(),
+                    status: rupu_transcript::RunStatus::Ok,
+                    total_tokens: 42,
+                    duration_ms: 250,
+                    error: None,
+                },
+            ],
+        );
+        let output = serde_json::json!({
+            "ok": true,
+            "transcript_path": transcript,
+            "tokens_used": 42,
+            "duration_ms": 250,
+        });
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let lines = retained_dispatch_child_lines(
+            "repo-investigator",
+            &output.to_string(),
+            None,
+            &prefs,
+            LiveViewMode::Focused,
+            1,
+        );
+        assert!(lines.iter().any(|line| line.kind == WorkflowViewLineKind::TreeItem));
+        assert!(lines
+            .iter()
+            .any(|line| line.text.contains("assistant output")));
     }
 
     #[test]
@@ -3531,7 +4076,7 @@ mod tests {
             None,
             Some(LiveViewMode::Full),
         );
-        let mut state = WorkflowInteractiveState::new(0);
+        let mut state = WorkflowInteractiveState::new(0, None);
         append_step_result_lines(&mut state, &rec, LiveViewMode::Full, &prefs);
         assert!(state
             .lines
@@ -3544,6 +4089,53 @@ mod tests {
         assert!(state.lines.iter().any(|line| line.indent >= 2));
         let rendered = render_workflow_event_rows(&mut state, 120, 20);
         assert!(rendered.iter().any(|row| row.contains("├─")));
+    }
+
+    #[test]
+    fn focused_workflow_screen_includes_graph_section() {
+        let mut record = sample_run_record();
+        record.active_step_id = Some("review_panel".into());
+        let workflow = Workflow::parse(
+            r#"
+name: demo
+steps:
+  - id: classify
+    agent: issue-reader
+    actions: []
+    prompt: hi
+  - id: review_panel
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - perf-reviewer
+      subject: review
+"#,
+        )
+        .unwrap();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let mut state = WorkflowInteractiveState::new(0, Some(workflow));
+        let rows = build_workflow_screen_rows_for_size(
+            "demo",
+            &record,
+            &mut state,
+            LiveViewMode::Focused,
+            &prefs,
+            80,
+            20,
+        );
+        assert!(rows.iter().any(|row| row.contains("graph")));
+        assert!(rows.iter().any(|row| row.contains("review_panel")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("security-reviewer") || row.contains("perf-reviewer")));
+        assert!(rows.iter().any(|row| row.contains("╭─")));
     }
 
     #[test]
@@ -3596,11 +4188,18 @@ mod tests {
             None,
             Some(LiveViewMode::Full),
         );
-        let lines = retained_dispatch_child_lines("reviewer", &output.to_string(), None, &prefs);
+        let lines = retained_dispatch_child_lines(
+            "reviewer",
+            &output.to_string(),
+            None,
+            &prefs,
+            LiveViewMode::Full,
+            0,
+        );
         assert!(lines.iter().any(|line| line.text.contains("reviewer")));
         assert!(lines
             .iter()
             .any(|line| line.text.contains("assistant output")));
-        assert!(lines.iter().any(|line| line.indent >= 2));
+        assert!(lines.iter().any(|line| line.indent >= 1));
     }
 }

@@ -201,6 +201,54 @@ pub enum DerivedEvent {
     },
 }
 
+/// Render a lightweight unified diff for file edits.
+///
+/// The output is intentionally simple but starts with standard
+/// `diff --git` / `---` / `+++` / `@@` headers so downstream renderers
+/// can syntax-highlight it consistently.
+pub fn render_file_edit_diff(path: &str, before: Option<&str>, after: Option<&str>) -> String {
+    let before = before.unwrap_or_default();
+    let after = after.unwrap_or_default();
+    if before == after {
+        return String::new();
+    }
+
+    let old_label = if before.is_empty() {
+        "/dev/null".to_string()
+    } else {
+        format!("a/{path}")
+    };
+    let new_label = if after.is_empty() {
+        "/dev/null".to_string()
+    } else {
+        format!("b/{path}")
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("diff --git a/{path} b/{path}\n"));
+    if before.is_empty() && !after.is_empty() {
+        out.push_str("new file mode 100644\n");
+    } else if !before.is_empty() && after.is_empty() {
+        out.push_str("deleted file mode 100644\n");
+    }
+    out.push_str(&format!("--- {old_label}\n"));
+    out.push_str(&format!("+++ {new_label}\n"));
+    out.push_str("@@\n");
+
+    for line in before.lines() {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in after.lines() {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    out
+}
+
 /// One verb the agent can invoke. Implementations live one per file
 /// in this crate (`bash.rs`, `read_file.rs`, etc).
 #[async_trait]

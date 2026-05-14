@@ -22,10 +22,13 @@ async fn creates_new_file_and_emits_create_derived() {
     assert!(out.error.is_none());
     tmp.child("new.txt").assert("hello\n");
     let derived = out.derived.unwrap();
-    let DerivedEvent::FileEdit { kind, .. } = derived else {
+    let DerivedEvent::FileEdit { kind, diff, .. } = derived else {
         panic!("expected FileEdit derived");
     };
     assert_eq!(kind, "create");
+    assert!(diff.contains("diff --git a/new.txt b/new.txt"));
+    assert!(diff.contains("+++ b/new.txt"));
+    assert!(diff.contains("+hello"));
 }
 
 #[tokio::test]
@@ -40,10 +43,14 @@ async fn overwrites_existing_file_and_emits_modify_derived() {
         .await
         .unwrap();
     tmp.child("x.txt").assert("new\n");
-    let DerivedEvent::FileEdit { kind, .. } = out.derived.unwrap() else {
+    let DerivedEvent::FileEdit { kind, diff, .. } = out.derived.unwrap() else {
         panic!()
     };
     assert_eq!(kind, "modify");
+    assert!(diff.contains("--- a/x.txt"));
+    assert!(diff.contains("+++ b/x.txt"));
+    assert!(diff.contains("-old"));
+    assert!(diff.contains("+new"));
 }
 
 #[tokio::test]

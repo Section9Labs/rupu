@@ -9,7 +9,7 @@
 //! already exist (no implicit create — use `write_file` for that).
 
 use crate::path_scope::is_inside;
-use crate::tool::{DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
+use crate::tool::{render_file_edit_diff, DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
@@ -99,9 +99,9 @@ impl Tool for EditFileTool {
             error: None,
             duration_ms: started.elapsed().as_millis() as u64,
             derived: Some(DerivedEvent::FileEdit {
-                path: i.path,
+                path: i.path.clone(),
                 kind: "modify".into(),
-                diff: simple_diff(&i.old_string, &i.new_string),
+                diff: render_file_edit_diff(&i.path, Some(&text), Some(&new_text)),
             }),
         })
     }
@@ -114,22 +114,4 @@ fn err_output(started: Instant, msg: String) -> ToolOutput {
         duration_ms: started.elapsed().as_millis() as u64,
         derived: None,
     }
-}
-
-/// Minimal +/- diff of the replaced region. Not a full unified diff —
-/// the transcript layer in Plan 2 may compute a more sophisticated
-/// representation; this is the line-prefixed minimum the schema needs.
-fn simple_diff(old: &str, new: &str) -> String {
-    let mut s = String::with_capacity(old.len() + new.len() + 16);
-    for line in old.lines() {
-        s.push_str("- ");
-        s.push_str(line);
-        s.push('\n');
-    }
-    for line in new.lines() {
-        s.push_str("+ ");
-        s.push_str(line);
-        s.push('\n');
-    }
-    s
 }

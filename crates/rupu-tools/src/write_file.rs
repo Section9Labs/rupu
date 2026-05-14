@@ -7,7 +7,7 @@
 //! directories are created as needed (mkdir -p semantics).
 
 use crate::path_scope::is_inside;
-use crate::tool::{DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
+use crate::tool::{render_file_edit_diff, DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
@@ -63,6 +63,7 @@ impl Tool for WriteFileTool {
                 format!("path {} escapes workspace", i.path),
             ));
         }
+        let previous = std::fs::read_to_string(&abs).ok();
         let kind = if abs.exists() { "modify" } else { "create" };
         if let Some(parent) = abs.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -80,9 +81,9 @@ impl Tool for WriteFileTool {
             error: None,
             duration_ms: started.elapsed().as_millis() as u64,
             derived: Some(DerivedEvent::FileEdit {
-                path: i.path,
+                path: i.path.clone(),
                 kind: kind.to_string(),
-                diff: String::new(), // full-content writes; no minimal diff in v0
+                diff: render_file_edit_diff(&i.path, previous.as_deref(), Some(&i.content)),
             }),
         })
     }
