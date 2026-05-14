@@ -2047,11 +2047,7 @@ fn build_retained_serve_rows_for_size(
             }
 
             body_rows.push(String::new());
-            body_rows.extend(render_retained_serve_event_rows(
-                &live_lines,
-                width,
-                usize::MAX,
-            ));
+            body_rows.extend(render_retained_serve_event_rows(&live_lines, width));
         } else if claim.summary != "-" {
             body_rows.push(retained_serve_kv_row(
                 "summary",
@@ -2287,11 +2283,7 @@ fn retained_serve_ui_prefs() -> UiPrefs {
     UiPrefs::resolve(&cfg.ui, false, None, None, None)
 }
 
-fn render_retained_serve_event_rows(
-    lines: &[AutoflowServeViewLine],
-    width: usize,
-    max_rows: usize,
-) -> Vec<String> {
+fn render_retained_serve_event_rows(lines: &[AutoflowServeViewLine], width: usize) -> Vec<String> {
     let mut rendered = Vec::new();
     for line in lines {
         let prefix = if line.continuation {
@@ -2318,11 +2310,7 @@ fn render_retained_serve_event_rows(
             }
         }
     }
-    if rendered.len() > max_rows {
-        rendered.split_off(rendered.len() - max_rows)
-    } else {
-        rendered
-    }
+    rendered
 }
 
 fn resolve_live_claim_run(
@@ -3406,6 +3394,21 @@ mod serve_heartbeat_tests {
         );
         assert!(lines.len() > 1);
         assert!(lines[0].text.contains("json payload"));
+    }
+
+    #[test]
+    fn retained_serve_event_rows_keep_oldest_history() {
+        let lines = (0..40)
+            .map(|index| AutoflowServeViewLine {
+                status: UiStatus::Active,
+                text: format!("event line {index:03}"),
+                continuation: false,
+            })
+            .collect::<Vec<_>>();
+        let rendered = render_retained_serve_event_rows(&lines, 72);
+        assert!(rendered.iter().any(|row| row.contains("event line 000")));
+        assert!(rendered.iter().any(|row| row.contains("event line 039")));
+        assert!(rendered.len() >= 40);
     }
 }
 
