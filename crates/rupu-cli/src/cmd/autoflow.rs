@@ -50,7 +50,7 @@ use rupu_workspace::{
     ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
     AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
@@ -105,6 +105,15 @@ pub enum Action {
         /// Suppress the live interactive serve view.
         #[arg(long)]
         quiet: bool,
+    },
+    /// Stop a running local autoflow serve worker.
+    Stop {
+        /// Limit to one worker id or display name.
+        #[arg(long)]
+        worker: Option<String>,
+        /// Limit to one repo filter, for example `github:owner/repo`.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Inspect queued and recently processed wakes.
     Wakes(RepoFilterArgs),
@@ -1231,6 +1240,7 @@ async fn handle_with_resolver(
             )
             .await
         }
+        Action::Stop { worker, repo } => stop_worker(worker.as_deref(), repo.as_deref()),
         Action::Wakes(args) => wakes(args.repo.as_deref(), global_format).await,
         Action::Monitor {
             repo,
@@ -1295,6 +1305,7 @@ pub fn ensure_output_format(
         Action::Run { .. } => ("autoflow run", output_report::TABLE_ONLY),
         Action::Tick => ("autoflow tick", output_report::TABLE_ONLY),
         Action::Serve { .. } => ("autoflow serve", output_report::TABLE_ONLY),
+        Action::Stop { .. } => ("autoflow stop", output_report::TABLE_ONLY),
         Action::Wakes(_) => ("autoflow wakes", output_report::TABLE_JSON_CSV),
         Action::Monitor { watch, .. } => {
             if *watch {
@@ -1751,6 +1762,166 @@ async fn serve(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ServeLockRecord {
+    worker_id: String,
+    name: String,
+    repo_filter: Option<String>,
+    pid: u32,
+    started_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct ServeWorkerHandle {
+    lock_path: PathBuf,
+    record: ServeLockRecord,
+}
+
+fn stop_worker(worker: Option<&str>, repo: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let repo_filter = normalize_repo_filter(repo)?;
+    let matches = load_matching_serve_workers(&global, worker, repo_filter.as_deref())?;
+    match matches.as_slice() {
+        [] => {
+            let mut parts = Vec::new();
+            if let Some(worker) = worker {
+                parts.push(format!("worker `{worker}`"));
+            }
+            if let Some(repo) = repo_filter.as_deref() {
+                parts.push(format!("repo `{repo}`"));
+            }
+            if parts.is_empty() {
+                bail!("no running autoflow serve worker found");
+            }
+            bail!(
+                "no running autoflow serve worker found for {}",
+                parts.join(" and ")
+            );
+        }
+        [handle] => {
+            let pid = handle.record.pid;
+            let was_running = pid_is_running(pid);
+            if was_running {
+                let _ = terminate_pid(pid);
+            }
+            match std::fs::remove_file(&handle.lock_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        path = %handle.lock_path.display(),
+                        "failed to remove serve lock after stop request"
+                    );
+                }
+            }
+            if was_running {
+                println!(
+                    "rupu: stopped autoflow worker {} (pid {}, repo {})",
+                    handle.record.name,
+                    pid,
+                    handle.record.repo_filter.as_deref().unwrap_or("-"),
+                );
+            } else {
+                println!(
+                    "rupu: cleared stale autoflow worker lock {} (pid {}, repo {})",
+                    handle.record.name,
+                    pid,
+                    handle.record.repo_filter.as_deref().unwrap_or("-"),
+                );
+            }
+            Ok(())
+        }
+        many => {
+            let mut detail = String::new();
+            for handle in many {
+                let _ = writeln!(
+                    detail,
+                    "  - {} ({}) pid {} repo {} started {}",
+                    handle.record.name,
+                    handle.record.worker_id,
+                    handle.record.pid,
+                    handle.record.repo_filter.as_deref().unwrap_or("-"),
+                    handle.record.started_at,
+                );
+            }
+            bail!(
+                "multiple autoflow serve workers matched; refine with --worker and/or --repo\n{}",
+                detail.trim_end()
+            );
+        }
+    }
+}
+
+fn load_matching_serve_workers(
+    global: &Path,
+    worker_filter: Option<&str>,
+    repo_filter: Option<&str>,
+) -> anyhow::Result<Vec<ServeWorkerHandle>> {
+    let workers_dir = paths::autoflow_workers_dir(global);
+    if !workers_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut handles = Vec::new();
+    for entry in std::fs::read_dir(&workers_dir)
+        .with_context(|| format!("read serve workers dir {}", workers_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".serve.lock"))
+        {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!(error = %err, path = %path.display(), "failed to read serve lock");
+                continue;
+            }
+        };
+        let record: ServeLockRecord = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(err) => {
+                warn!(error = %err, path = %path.display(), "failed to parse serve lock");
+                continue;
+            }
+        };
+        if !worker_filter_matches(worker_filter, &record.worker_id, &record.name) {
+            continue;
+        }
+        if repo_filter.is_some_and(|repo| record.repo_filter.as_deref() != Some(repo)) {
+            continue;
+        }
+        handles.push(ServeWorkerHandle {
+            lock_path: path,
+            record,
+        });
+    }
+    handles.sort_by(|left, right| left.record.name.cmp(&right.record.name));
+    Ok(handles)
+}
+
+fn pid_is_running(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn terminate_pid(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 enum RetainedServeExit {
@@ -8711,6 +8882,7 @@ mod tests {
     use rupu_providers::AuthMode;
     use rupu_runtime::{AutoflowCycleEventKind, AutoflowCycleMode, AutoflowHistoryStore};
     use std::io::Write;
+    use std::path::PathBuf;
 
     const COMPLETE_SCRIPT: &str = r#"
 [
@@ -8915,6 +9087,74 @@ base_url = "{base_url}"
             canonical_autoflow_issue_ref("github:Section9Labs/rupu/issues/42").unwrap(),
             "github:Section9Labs/rupu/issues/42"
         );
+    }
+
+    fn write_serve_lock(
+        global: &Path,
+        worker_id: &str,
+        name: &str,
+        repo_filter: Option<&str>,
+        pid: u32,
+    ) -> PathBuf {
+        let workers_dir = paths::autoflow_workers_dir(global);
+        std::fs::create_dir_all(&workers_dir).unwrap();
+        let lock_path = workers_dir.join(format!("{worker_id}.serve.lock"));
+        let payload = serde_json::json!({
+            "worker_id": worker_id,
+            "name": name,
+            "repo_filter": repo_filter,
+            "pid": pid,
+            "started_at": "2026-05-14T00:00:00Z",
+        });
+        std::fs::write(&lock_path, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
+        lock_path
+    }
+
+    #[tokio::test]
+    async fn stop_worker_removes_matching_stale_serve_lock() {
+        let _guard = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        std::env::set_var("RUPU_HOME", &global);
+
+        let lock_path = write_serve_lock(
+            &global,
+            "worker_123",
+            "team-mini-01",
+            Some("github:Section9Labs/rupu"),
+            999_999,
+        );
+
+        stop_worker(Some("team-mini-01"), Some("github:Section9Labs/rupu")).unwrap();
+
+        assert!(!lock_path.exists());
+        std::env::remove_var("RUPU_HOME");
+    }
+
+    #[test]
+    fn load_matching_serve_workers_reports_multiple_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        write_serve_lock(
+            &global,
+            "worker_a",
+            "team-a",
+            Some("github:Section9Labs/rupu"),
+            999_998,
+        );
+        write_serve_lock(
+            &global,
+            "worker_b",
+            "team-b",
+            Some("github:Section9Labs/rupu"),
+            999_997,
+        );
+
+        let matches =
+            load_matching_serve_workers(&global, None, Some("github:Section9Labs/rupu")).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].record.name, "team-a");
+        assert_eq!(matches[1].record.name, "team-b");
     }
 
     #[tokio::test]
@@ -9759,6 +9999,7 @@ steps:
             backend_id: None,
             worker_id: None,
             artifact_manifest_path: None,
+            runner_pid: None,
             source_wake_id: None,
             active_step_id: None,
             active_step_kind: None,
@@ -9899,6 +10140,7 @@ steps:
             backend_id: None,
             worker_id: None,
             artifact_manifest_path: None,
+            runner_pid: None,
             source_wake_id: None,
             active_step_id: None,
             active_step_kind: None,
@@ -10024,6 +10266,7 @@ steps:
             backend_id: None,
             worker_id: None,
             artifact_manifest_path: None,
+            runner_pid: None,
             source_wake_id: None,
             active_step_id: None,
             active_step_kind: None,
@@ -10164,6 +10407,7 @@ steps:
             backend_id: None,
             worker_id: None,
             artifact_manifest_path: None,
+            runner_pid: None,
             source_wake_id: None,
             active_step_id: None,
             active_step_kind: None,
@@ -10294,6 +10538,7 @@ steps:
             backend_id: None,
             worker_id: None,
             artifact_manifest_path: None,
+            runner_pid: None,
             source_wake_id: None,
             active_step_id: None,
             active_step_kind: None,
@@ -10416,6 +10661,7 @@ steps:
                     backend_id: None,
                     worker_id: None,
                     artifact_manifest_path: None,
+                    runner_pid: None,
                     source_wake_id: None,
                     active_step_id: None,
                     active_step_kind: None,
@@ -10553,6 +10799,7 @@ steps:
                     backend_id: None,
                     worker_id: None,
                     artifact_manifest_path: None,
+                    runner_pid: None,
                     source_wake_id: None,
                     active_step_id: None,
                     active_step_kind: None,
@@ -10715,6 +10962,7 @@ steps:
                     backend_id: None,
                     worker_id: None,
                     artifact_manifest_path: None,
+                    runner_pid: None,
                     source_wake_id: None,
                     active_step_id: None,
                     active_step_kind: None,
