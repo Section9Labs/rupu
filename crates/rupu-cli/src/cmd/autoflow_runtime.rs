@@ -39,11 +39,23 @@ pub struct TickOutcome {
     pub cycle: AutoflowCycleRecord,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TickOptions {
     pub repo_filter: Option<String>,
     pub worker: Option<ExecutionWorkerContext>,
     pub shared_printer: Option<Arc<Mutex<LineStreamPrinter>>>,
+    pub attach_workflow_ui: bool,
+}
+
+impl Default for TickOptions {
+    fn default() -> Self {
+        Self {
+            repo_filter: None,
+            worker: None,
+            shared_printer: None,
+            attach_workflow_ui: true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -53,6 +65,7 @@ pub struct ServeOptions {
     pub idle_sleep: std::time::Duration,
     pub max_cycles: Option<usize>,
     pub shared_printer: Option<Arc<Mutex<LineStreamPrinter>>>,
+    pub attach_workflow_ui: bool,
 }
 
 impl Default for ServeOptions {
@@ -63,6 +76,7 @@ impl Default for ServeOptions {
             idle_sleep: std::time::Duration::from_secs(10),
             max_cycles: None,
             shared_printer: None,
+            attach_workflow_ui: true,
         }
     }
 }
@@ -167,6 +181,7 @@ pub(crate) async fn tick_with_options(
     }
 
     let serve_mode = matches!(cycle_mode(&options), AutoflowCycleMode::Serve);
+    let attach_workflow_ui = serve_mode && options.attach_workflow_ui;
     let live_cycle_recorder = serve_mode.then(|| {
         Arc::new(LiveCycleRecorder::new(
             history_store.clone(),
@@ -377,7 +392,7 @@ pub(crate) async fn tick_with_options(
                                     &issue,
                                     &issue_ref_text,
                                     None,
-                                    serve_mode,
+                                    attach_workflow_ui,
                                     dispatch.inputs,
                                     current.contenders.clone(),
                                     options.worker.clone(),
@@ -396,7 +411,7 @@ pub(crate) async fn tick_with_options(
                                     &issue_ref_text,
                                     &dispatch.workflow,
                                     dispatch.inputs,
-                                    serve_mode,
+                                    attach_workflow_ui,
                                     options.worker.clone(),
                                     options.shared_printer.clone(),
                                     live_cycle_recorder.clone(),
@@ -431,7 +446,7 @@ pub(crate) async fn tick_with_options(
                                 &issue,
                                 &issue_ref_text,
                                 None,
-                                serve_mode,
+                                attach_workflow_ui,
                                 BTreeMap::new(),
                                 current.contenders.clone(),
                                 options.worker.clone(),
@@ -479,7 +494,7 @@ pub(crate) async fn tick_with_options(
                     &winner.issue,
                     &winner.issue_ref_text,
                     None,
-                    serve_mode,
+                    attach_workflow_ui,
                     BTreeMap::new(),
                     legacy::active_or_fallback_contenders(
                         &contenders,
@@ -669,6 +684,7 @@ where
                 repo_filter: options.repo_filter.clone(),
                 worker: Some(worker.execution_worker()),
                 shared_printer: options.shared_printer.clone(),
+                attach_workflow_ui: options.attach_workflow_ui,
             },
         )
         .await?;
