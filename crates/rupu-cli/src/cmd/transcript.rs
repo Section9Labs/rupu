@@ -366,7 +366,13 @@ fn render_pretty_transcript(
     let mut saw_header = false;
 
     for event in events {
-        render_pretty_transcript_event(&mut printer, event, &mut saw_header, view_mode);
+        render_pretty_transcript_event(
+            &mut printer,
+            event,
+            &mut saw_header,
+            view_mode,
+            TranscriptPrettyContext::Standalone,
+        );
     }
 
     if !saw_header {
@@ -382,6 +388,7 @@ pub(crate) fn render_pretty_transcript_event(
     event: &TranscriptEvent,
     saw_header: &mut bool,
     view_mode: LiveViewMode,
+    context: TranscriptPrettyContext,
 ) {
     match event {
         TranscriptEvent::RunStart {
@@ -393,9 +400,12 @@ pub(crate) fn render_pretty_transcript_event(
             started_at,
             mode,
         } => {
-            printer.agent_header(agent, provider, model, run_id);
+            if context == TranscriptPrettyContext::Standalone {
+                printer.agent_header(agent, provider, model, run_id);
+            }
             let detail = format!(
-                "workspace {workspace_id}  ·  mode {}  ·  {}",
+                "{}  ·  workspace {workspace_id}  ·  mode {}  ·  {}",
+                compact_run_id(run_id),
                 format!("{mode:?}").to_lowercase(),
                 started_at.format("%Y-%m-%d %H:%M:%S UTC")
             );
@@ -570,6 +580,29 @@ pub(crate) fn truncate_single_line(value: &str, max: usize) -> String {
             .collect::<String>();
         out.push('…');
         out
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TranscriptPrettyContext {
+    Standalone,
+    SessionAttached,
+}
+
+fn compact_run_id(run_id: &str) -> String {
+    if run_id.chars().count() <= 18 {
+        run_id.to_string()
+    } else {
+        let head = run_id.chars().take(12).collect::<String>();
+        let tail = run_id
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        format!("{head}…{tail}")
     }
 }
 
