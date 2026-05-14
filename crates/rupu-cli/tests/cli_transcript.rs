@@ -48,6 +48,41 @@ fn write_transcript(
     path
 }
 
+fn write_transcript_with_assistant(
+    dir: &std::path::Path,
+    run_id: &str,
+    agent: &str,
+    assistant_content: &str,
+) -> std::path::PathBuf {
+    let path = dir.join(format!("{run_id}.jsonl"));
+    let mut w = JsonlWriter::create(&path).unwrap();
+    w.write(&Event::RunStart {
+        run_id: run_id.to_string(),
+        workspace_id: "ws-test".to_string(),
+        agent: agent.to_string(),
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4-6".to_string(),
+        started_at: Utc::now(),
+        mode: RunMode::Bypass,
+    })
+    .unwrap();
+    w.write(&Event::AssistantMessage {
+        content: assistant_content.to_string(),
+        thinking: None,
+    })
+    .unwrap();
+    w.write(&Event::RunComplete {
+        run_id: run_id.to_string(),
+        status: RunStatus::Ok,
+        total_tokens: 123,
+        duration_ms: 100,
+        error: None,
+    })
+    .unwrap();
+    w.flush().unwrap();
+    path
+}
+
 fn write_metadata_sidecar(
     dir: &std::path::Path,
     run_id: &str,
@@ -231,6 +266,50 @@ async fn show_supports_pretty_output() {
         .stdout(predicate::str::contains("pretty-agent"))
         .stdout(predicate::str::contains("run started"))
         .stdout(predicate::str::contains("run complete"));
+}
+
+#[tokio::test]
+async fn show_pretty_supports_focused_and_full_view_modes() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("transcripts").create_dir_all().unwrap();
+
+    let transcripts_dir = global.path().join("transcripts");
+    write_transcript_with_assistant(
+        &transcripts_dir,
+        "run_view123",
+        "view-agent",
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega OMEGA-SENTINEL",
+    );
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args(["--format", "pretty", "transcript", "show", "run_view123"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("assistant output"))
+        .stdout(predicate::str::contains("OMEGA-SENTINEL").not());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args([
+            "--format",
+            "pretty",
+            "transcript",
+            "show",
+            "run_view123",
+            "--view",
+            "full",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OMEGA-SENTINEL"));
 }
 
 #[tokio::test]

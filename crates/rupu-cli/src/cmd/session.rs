@@ -1,9 +1,11 @@
+use crate::cmd::completers::{active_session_ids, archived_session_ids, session_ids};
 use crate::cmd::retention::parse_retention_duration;
 use crate::cmd::run::{
     canonicalize_if_exists, resolve_clone_dest, standalone_issue_ref, standalone_repo_ref,
     standalone_workspace_strategy, ReadonlyDecider,
 };
 use crate::cmd::transcript::{render_pretty_transcript_event, truncate_single_line};
+use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
 use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::paths;
@@ -13,8 +15,11 @@ use crate::standalone_run_metadata::{
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use clap::{Args as ClapArgs, Subcommand};
+use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
-use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crossterm::terminal;
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_agent::{load_agent, parse_mode, resolve_mode};
@@ -44,11 +49,20 @@ pub enum Action {
     /// List persistent agent sessions.
     List(ListArgs),
     /// Show session details.
-    Show { session_id: String },
+    Show {
+        #[arg(add = ArgValueCompleter::new(session_ids))]
+        session_id: String,
+    },
     /// Archive an inactive session and its owned transcripts.
-    Archive { session_id: String },
+    Archive {
+        #[arg(add = ArgValueCompleter::new(active_session_ids))]
+        session_id: String,
+    },
     /// Restore an archived session and its owned transcripts.
-    Restore { session_id: String },
+    Restore {
+        #[arg(add = ArgValueCompleter::new(archived_session_ids))]
+        session_id: String,
+    },
     /// Permanently delete a session and its owned transcripts.
     Delete(DeleteArgs),
     /// Delete archived sessions older than a cutoff.
@@ -56,9 +70,17 @@ pub enum Action {
     /// Send a follow-up prompt to an existing session.
     Send(SendArgs),
     /// Attach to the current or last run in a session.
-    Attach { session_id: String },
+    Attach {
+        #[arg(add = ArgValueCompleter::new(active_session_ids))]
+        session_id: String,
+        #[arg(long, value_enum)]
+        view: Option<LiveViewMode>,
+    },
     /// Stop an active session worker.
-    Stop { session_id: String },
+    Stop {
+        #[arg(add = ArgValueCompleter::new(active_session_ids))]
+        session_id: String,
+    },
     #[command(name = "_run-turn", hide = true)]
     RunTurn(RunTurnArgs),
 }
@@ -97,6 +119,7 @@ pub struct ListArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct SendArgs {
+    #[arg(add = ArgValueCompleter::new(active_session_ids))]
     pub session_id: String,
     pub prompt: String,
     #[arg(long)]
@@ -105,6 +128,7 @@ pub struct SendArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct DeleteArgs {
+    #[arg(add = ArgValueCompleter::new(session_ids))]
     pub session_id: String,
     #[arg(long)]
     pub force: bool,
@@ -154,6 +178,59 @@ impl SessionStatus {
 enum SessionScope {
     Active,
     Archived,
+}
+
+enum AttachExit {
+    Detach,
+    Quit,
+}
+
+enum AttachCommand {
+    Help,
+    Status,
+    Detach,
+    Quit,
+    Cancel,
+    Stop,
+    History,
+    Transcript,
+    Runs,
+}
+
+enum SessionInput {
+    Submit(String),
+    Cancelled,
+    Empty,
+}
+
+enum AttachControl {
+    Continue,
+    Exit(AttachExit),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionAttachSnapshot {
+    status: SessionStatus,
+    active_run_id: Option<String>,
+    last_run_id: Option<String>,
+    total_turns: u32,
+    total_tokens_in: u64,
+    total_tokens_out: u64,
+    last_error: Option<String>,
+}
+
+impl From<&SessionRecord> for SessionAttachSnapshot {
+    fn from(session: &SessionRecord) -> Self {
+        Self {
+            status: session.status,
+            active_run_id: session.active_run_id.clone(),
+            last_run_id: session.last_run_id.clone(),
+            total_turns: session.total_turns,
+            total_tokens_in: session.total_tokens_in,
+            total_tokens_out: session.total_tokens_out,
+            last_error: session.last_error.clone(),
+        }
+    }
 }
 
 impl SessionScope {
@@ -545,7 +622,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::Delete(args) => delete(args).await,
         Action::Prune(args) => prune(args, global_format).await,
         Action::Send(args) => send(args).await,
-        Action::Attach { session_id } => attach(&session_id).await,
+        Action::Attach { session_id, view } => attach(&session_id, view).await,
         Action::Stop { session_id } => stop(&session_id).await,
         Action::RunTurn(args) => run_turn(args).await,
     };
@@ -875,7 +952,7 @@ async fn launch_turn(
         return Ok(());
     }
 
-    attach(session_id).await
+    attach(session_id, None).await
 }
 
 fn launch_turn_detached(global: &Path, session_id: &str, prompt: String) -> anyhow::Result<String> {
@@ -938,15 +1015,30 @@ fn launch_turn_detached(global: &Path, session_id: &str, prompt: String) -> anyh
     Ok(run_id)
 }
 
-async fn attach(session_id: &str) -> anyhow::Result<()> {
+async fn attach(session_id: &str, view: Option<LiveViewMode>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let session_id = session_id.to_string();
-    tokio::task::spawn_blocking(move || attach_blocking(&global, &session_id))
+    tokio::task::spawn_blocking(move || attach_blocking(&global, &session_id, view))
         .await
         .map_err(|e| anyhow::anyhow!("session attach task failed: {e}"))?
 }
 
-fn attach_blocking(global: &Path, session_id: &str) -> anyhow::Result<()> {
+fn attach_blocking(
+    global: &Path,
+    session_id: &str,
+    view: Option<LiveViewMode>,
+) -> anyhow::Result<()> {
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let cfg = rupu_config::layer_files(
+        Some(&global.join("config.toml")),
+        project_root
+            .as_deref()
+            .map(|root| root.join(".rupu/config.toml"))
+            .as_deref(),
+    )?;
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, view);
+    let view_mode = prefs.live_view;
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session attach")?;
     if reconcile_stale_session(&mut session) {
@@ -967,24 +1059,26 @@ fn attach_blocking(global: &Path, session_id: &str) -> anyhow::Result<()> {
     let mut saw_any = false;
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let _raw_mode = RawModeGuard::new(interactive)?;
+    let mut last_snapshot = SessionAttachSnapshot::from(&session);
 
-    printer.sideband_event(
-        crate::output::palette::Status::Active,
-        "session attached",
-        Some("p prompt  ·  d detach"),
-    );
-    if let Some(run_id) = followed_run_id.as_deref() {
-        printer.sideband_event(
-            crate::output::palette::Status::Working,
-            "waiting for session output",
-            Some(run_id),
-        );
+    if view_mode == LiveViewMode::Focused {
+        render_session_attach_intro(&mut printer, &session);
+    } else {
+        render_attach_help_hint(&mut printer);
+        if let Some(run_id) = followed_run_id.as_deref() {
+            printer.sideband_event(
+                crate::output::palette::Status::Working,
+                "waiting for session output",
+                Some(run_id),
+            );
+        }
     }
+    sync_session_attach_ticker(&mut printer, &session);
 
     loop {
         let events = tailer.drain();
         for event in &events {
-            render_pretty_transcript_event(&mut printer, event, &mut saw_header);
+            render_pretty_transcript_event(&mut printer, event, &mut saw_header, view_mode);
             saw_any = true;
         }
 
@@ -992,6 +1086,14 @@ fn attach_blocking(global: &Path, session_id: &str) -> anyhow::Result<()> {
         ensure_active_scope(scope, "session attach")?;
         if reconcile_stale_session(&mut session) {
             write_session(global, scope, &session)?;
+        }
+        sync_session_attach_ticker(&mut printer, &session);
+        if view_mode == LiveViewMode::Focused {
+            let snapshot = SessionAttachSnapshot::from(&session);
+            if snapshot != last_snapshot {
+                render_session_attach_update(&mut printer, &last_snapshot, &session);
+                last_snapshot = snapshot;
+            }
         }
 
         let desired_run_id = session
@@ -1005,7 +1107,7 @@ fn attach_blocking(global: &Path, session_id: &str) -> anyhow::Result<()> {
         if desired_run_id != followed_run_id {
             let final_events = tailer.drain();
             for event in &final_events {
-                render_pretty_transcript_event(&mut printer, event, &mut saw_header);
+                render_pretty_transcript_event(&mut printer, event, &mut saw_header, view_mode);
                 saw_any = true;
             }
             if let Some(next_path) = desired_transcript_path {
@@ -1017,29 +1119,47 @@ fn attach_blocking(global: &Path, session_id: &str) -> anyhow::Result<()> {
                 if let Some(run_id) = desired_run_id.as_deref() {
                     printer.sideband_event(
                         crate::output::palette::Status::Working,
-                        "following run",
+                        if view_mode == LiveViewMode::Focused {
+                            "active run"
+                        } else {
+                            "following run"
+                        },
                         Some(run_id),
                     );
                 }
             }
         }
 
-        if interactive && handle_attach_keypress(global, &session, &mut printer)? {
-            printer.sideband_event(
-                crate::output::palette::Status::Awaiting,
-                "detached",
-                Some(&format!(
-                    "re-attach with: rupu session attach {}",
-                    session.session_id
-                )),
-            );
-            return Ok(());
+        if interactive {
+            match handle_attach_keypress(global, &session, &mut printer)? {
+                AttachControl::Continue => {}
+                AttachControl::Exit(kind) => {
+                    printer.stop_ticker();
+                    match kind {
+                        AttachExit::Detach => printer.sideband_event(
+                            crate::output::palette::Status::Awaiting,
+                            "detached",
+                            Some(&format!(
+                                "re-attach with: rupu session attach {}",
+                                session.session_id
+                            )),
+                        ),
+                        AttachExit::Quit => printer.sideband_event(
+                            crate::output::palette::Status::Skipped,
+                            "viewer closed",
+                            Some(&format!("session still available: {}", session.session_id)),
+                        ),
+                    }
+                    return Ok(());
+                }
+            }
         }
 
         if !interactive && session.status != SessionStatus::Running {
+            printer.stop_ticker();
             let final_events = tailer.drain();
             for event in &final_events {
-                render_pretty_transcript_event(&mut printer, event, &mut saw_header);
+                render_pretty_transcript_event(&mut printer, event, &mut saw_header, view_mode);
                 saw_any = true;
             }
             if !saw_any && transcript_path.exists() {
@@ -1049,7 +1169,12 @@ fn attach_blocking(global: &Path, session_id: &str) -> anyhow::Result<()> {
                     .filter(|line| !line.is_empty())
                 {
                     let event: TranscriptEvent = serde_json::from_slice(line)?;
-                    render_pretty_transcript_event(&mut printer, &event, &mut saw_header);
+                    render_pretty_transcript_event(
+                        &mut printer,
+                        &event,
+                        &mut saw_header,
+                        view_mode,
+                    );
                 }
             }
             return Ok(());
@@ -1063,18 +1188,40 @@ fn handle_attach_keypress(
     global: &Path,
     session: &SessionRecord,
     printer: &mut crate::output::LineStreamPrinter,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<AttachControl> {
     if !event::poll(std::time::Duration::from_millis(10))? {
-        return Ok(false);
+        return Ok(AttachControl::Continue);
     }
     let CrosstermEvent::Key(key) = event::read()? else {
-        return Ok(false);
+        return Ok(AttachControl::Continue);
     };
     if key.kind != KeyEventKind::Press {
-        return Ok(false);
+        return Ok(AttachControl::Continue);
     }
     match (key.code, key.modifiers) {
-        (KeyCode::Char('d'), _) | (KeyCode::Char(']'), KeyModifiers::CONTROL) => Ok(true),
+        (KeyCode::Char('d'), _) | (KeyCode::Char(']'), KeyModifiers::CONTROL) => {
+            Ok(AttachControl::Exit(AttachExit::Detach))
+        }
+        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            Ok(AttachControl::Exit(AttachExit::Quit))
+        }
+        (KeyCode::Char('?'), _) => {
+            render_attach_help(printer);
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Char('x'), _) => {
+            cancel_active_turn(global, &session.session_id, printer)?;
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Char('s'), _) => {
+            stop_session_in_place(global, &session.session_id)?;
+            printer.sideband_event(
+                crate::output::palette::Status::Failed,
+                "session stopped",
+                Some(&session.session_id),
+            );
+            Ok(AttachControl::Continue)
+        }
         (KeyCode::Char('p'), _) | (KeyCode::Enter, _) => {
             if session.status == SessionStatus::Running {
                 printer.sideband_event(
@@ -1087,7 +1234,7 @@ fn handle_attach_keypress(
                             .unwrap_or("turn still running"),
                     ),
                 );
-                return Ok(false);
+                return Ok(AttachControl::Continue);
             }
             if session.status == SessionStatus::Stopped {
                 printer.sideband_event(
@@ -1095,41 +1242,434 @@ fn handle_attach_keypress(
                     "session stopped",
                     Some("use `rupu session start` to create a new one"),
                 );
-                return Ok(false);
+                return Ok(AttachControl::Continue);
             }
-            if let Some(prompt) = prompt_for_session_input(printer, &session.session_id)? {
-                let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
-                let detail = format!("{run_id}  ·  {}", truncate_single_line(prompt.as_str(), 72));
-                printer.sideband_event(
-                    crate::output::palette::Status::Working,
-                    "queued prompt",
-                    Some(&detail),
-                );
+            match prompt_for_session_input(printer, &session.session_id)? {
+                SessionInput::Submit(input) => {
+                    return handle_session_input(global, session, printer, input)
+                }
+                SessionInput::Cancelled => {
+                    printer.sideband_event(
+                        crate::output::palette::Status::Skipped,
+                        "prompt cancelled",
+                        None,
+                    );
+                }
+                SessionInput::Empty => {}
             }
-            Ok(false)
+            Ok(AttachControl::Continue)
         }
-        _ => Ok(false),
+        _ => Ok(AttachControl::Continue),
     }
 }
 
 fn prompt_for_session_input(
     printer: &crate::output::LineStreamPrinter,
     session_id: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<SessionInput> {
     let multi = printer.multi_handle();
-    multi.suspend(|| -> anyhow::Result<Option<String>> {
-        let _ = terminal::disable_raw_mode();
-        eprint!("session {session_id} prompt> ");
-        io::stderr().flush()?;
+    multi.suspend(|| -> anyhow::Result<SessionInput> {
+        let mut stderr = io::stderr();
         let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        terminal::enable_raw_mode()?;
-        let prompt = line.trim().to_string();
-        if prompt.is_empty() {
-            return Ok(None);
+        draw_session_prompt(&mut stderr, session_id, &line)?;
+        loop {
+            let CrosstermEvent::Key(KeyEvent {
+                code,
+                modifiers,
+                kind,
+                ..
+            }) = event::read()?
+            else {
+                continue;
+            };
+            if kind != KeyEventKind::Press {
+                continue;
+            }
+            match (code, modifiers) {
+                (KeyCode::Esc, _) => {
+                    clear_session_prompt(&mut stderr)?;
+                    writeln!(stderr)?;
+                    return Ok(SessionInput::Cancelled);
+                }
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    clear_session_prompt(&mut stderr)?;
+                    writeln!(stderr)?;
+                    return Ok(SessionInput::Cancelled);
+                }
+                (KeyCode::Enter, _) => {
+                    clear_session_prompt(&mut stderr)?;
+                    writeln!(stderr)?;
+                    let value = line.trim().to_string();
+                    if value.is_empty() {
+                        return Ok(SessionInput::Empty);
+                    }
+                    return Ok(SessionInput::Submit(value));
+                }
+                (KeyCode::Backspace, _) => {
+                    line.pop();
+                }
+                (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                    line.push(ch);
+                }
+                _ => {}
+            }
+            draw_session_prompt(&mut stderr, session_id, &line)?;
         }
-        Ok(Some(prompt))
     })
+}
+
+fn draw_session_prompt(
+    stderr: &mut io::Stderr,
+    session_id: &str,
+    line: &str,
+) -> anyhow::Result<()> {
+    write!(stderr, "\r\x1b[2Ksession {session_id}> {line}")?;
+    stderr.flush()?;
+    Ok(())
+}
+
+fn clear_session_prompt(stderr: &mut io::Stderr) -> anyhow::Result<()> {
+    write!(stderr, "\r\x1b[2K")?;
+    stderr.flush()?;
+    Ok(())
+}
+
+fn handle_session_input(
+    global: &Path,
+    session: &SessionRecord,
+    printer: &mut crate::output::LineStreamPrinter,
+    input: String,
+) -> anyhow::Result<AttachControl> {
+    if let Some(command) = parse_attach_command(&input) {
+        return execute_attach_command(global, session, printer, command);
+    }
+    if input.starts_with('/') && !input.starts_with("//") {
+        printer.sideband_event(
+            crate::output::palette::Status::Failed,
+            "unknown command",
+            Some(input.trim()),
+        );
+        return Ok(AttachControl::Continue);
+    }
+    let prompt = if let Some(escaped) = input.strip_prefix("//") {
+        format!("/{escaped}")
+    } else {
+        input.clone()
+    };
+    let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
+    let detail = format!("{run_id}  ·  {}", truncate_single_line(prompt.as_str(), 72));
+    printer.sideband_event(
+        crate::output::palette::Status::Working,
+        "queued prompt",
+        Some(&detail),
+    );
+    Ok(AttachControl::Continue)
+}
+
+fn parse_attach_command(input: &str) -> Option<AttachCommand> {
+    let command = input.strip_prefix('/')?.trim();
+    match command {
+        "help" | "h" | "?" => Some(AttachCommand::Help),
+        "status" => Some(AttachCommand::Status),
+        "detach" => Some(AttachCommand::Detach),
+        "quit" | "exit" => Some(AttachCommand::Quit),
+        "cancel" => Some(AttachCommand::Cancel),
+        "stop" => Some(AttachCommand::Stop),
+        "history" => Some(AttachCommand::History),
+        "transcript" => Some(AttachCommand::Transcript),
+        "runs" => Some(AttachCommand::Runs),
+        _ => None,
+    }
+}
+
+fn execute_attach_command(
+    global: &Path,
+    session: &SessionRecord,
+    printer: &mut crate::output::LineStreamPrinter,
+    command: AttachCommand,
+) -> anyhow::Result<AttachControl> {
+    match command {
+        AttachCommand::Help => render_attach_help(printer),
+        AttachCommand::Status => render_session_status(printer, session),
+        AttachCommand::History => render_session_history(printer, session),
+        AttachCommand::Transcript => render_session_transcript(printer, session),
+        AttachCommand::Runs => render_session_runs(printer, session),
+        AttachCommand::Cancel => cancel_active_turn(global, &session.session_id, printer)?,
+        AttachCommand::Stop => {
+            stop_session_in_place(global, &session.session_id)?;
+            printer.sideband_event(
+                crate::output::palette::Status::Failed,
+                "session stopped",
+                Some(&session.session_id),
+            );
+        }
+        AttachCommand::Detach => return Ok(AttachControl::Exit(AttachExit::Detach)),
+        AttachCommand::Quit => return Ok(AttachControl::Exit(AttachExit::Quit)),
+    }
+    Ok(AttachControl::Continue)
+}
+
+fn render_attach_help_hint(printer: &mut crate::output::LineStreamPrinter) {
+    printer.sideband_event(
+        crate::output::palette::Status::Active,
+        "controls",
+        Some("p prompt  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help"),
+    );
+}
+
+fn render_attach_help(printer: &mut crate::output::LineStreamPrinter) {
+    printer.sideband_event(
+        crate::output::palette::Status::Active,
+        "keys",
+        Some("p prompt  ·  Esc cancel prompt  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit"),
+    );
+    printer.sideband_event(
+        crate::output::palette::Status::Active,
+        "commands",
+        Some("/help /status /history /runs /transcript /cancel /stop"),
+    );
+}
+
+fn render_session_status(printer: &mut crate::output::LineStreamPrinter, session: &SessionRecord) {
+    printer.sideband_event(
+        session_attach_status(session.status),
+        "status",
+        Some(&session_status_detail(session)),
+    );
+    if let Some(detail) = session_route_detail(session) {
+        printer.sideband_event(
+            crate::output::palette::Status::Active,
+            "route",
+            Some(&detail),
+        );
+    }
+    printer.sideband_event(
+        crate::output::palette::Status::Active,
+        "workspace",
+        Some(&session_workspace_detail(session)),
+    );
+    printer.sideband_event(
+        crate::output::palette::Status::Active,
+        "usage",
+        Some(&session_usage_detail(session)),
+    );
+    if let Some(prompt) = session_recent_prompt(session) {
+        printer.sideband_event(
+            crate::output::palette::Status::Active,
+            "last prompt",
+            Some(&prompt),
+        );
+    }
+    if let Some(error) = session
+        .last_error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        printer.sideband_event(
+            crate::output::palette::Status::Failed,
+            "last error",
+            Some(&truncate_single_line(error, 96)),
+        );
+    }
+}
+
+fn render_session_history(printer: &mut crate::output::LineStreamPrinter, session: &SessionRecord) {
+    if session.runs.is_empty() {
+        printer.sideband_event(
+            crate::output::palette::Status::Skipped,
+            "history",
+            Some("no prior turns"),
+        );
+        return;
+    }
+    for run in session.runs.iter().rev().take(5) {
+        let detail = format!(
+            "{}  ·  {}",
+            run.run_id,
+            truncate_single_line(&run.prompt, 72)
+        );
+        printer.sideband_event(
+            crate::output::palette::Status::Active,
+            "history",
+            Some(&detail),
+        );
+    }
+}
+
+fn render_session_transcript(
+    printer: &mut crate::output::LineStreamPrinter,
+    session: &SessionRecord,
+) {
+    let detail = session
+        .active_transcript_path
+        .as_ref()
+        .or(session.last_transcript_path.as_ref())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "no transcript".into());
+    printer.sideband_event(
+        crate::output::palette::Status::Active,
+        "transcript",
+        Some(&detail),
+    );
+}
+
+fn render_session_runs(printer: &mut crate::output::LineStreamPrinter, session: &SessionRecord) {
+    if session.runs.is_empty() {
+        printer.sideband_event(
+            crate::output::palette::Status::Skipped,
+            "runs",
+            Some("no runs"),
+        );
+        return;
+    }
+    for run in session.runs.iter().rev().take(5) {
+        let status = run
+            .status
+            .map(|value| format!("{:?}", value).to_lowercase())
+            .unwrap_or_else(|| "running".into());
+        let detail = format!("{status}  ·  {}", run.run_id);
+        printer.sideband_event(crate::output::palette::Status::Active, "run", Some(&detail));
+    }
+}
+
+fn render_session_attach_intro(
+    printer: &mut crate::output::LineStreamPrinter,
+    session: &SessionRecord,
+) {
+    printer.session_header(&session.session_id, &session.agent_name);
+    render_session_status(printer, session);
+    render_attach_help_hint(printer);
+}
+
+fn render_session_attach_update(
+    printer: &mut crate::output::LineStreamPrinter,
+    previous: &SessionAttachSnapshot,
+    session: &SessionRecord,
+) {
+    let snapshot = SessionAttachSnapshot::from(session);
+    if previous.status != snapshot.status
+        || previous.total_turns != snapshot.total_turns
+        || previous.active_run_id != snapshot.active_run_id
+        || previous.last_run_id != snapshot.last_run_id
+        || previous.total_tokens_in != snapshot.total_tokens_in
+        || previous.total_tokens_out != snapshot.total_tokens_out
+    {
+        printer.sideband_event(
+            session_attach_status(session.status),
+            "session",
+            Some(&session_status_detail(session)),
+        );
+    }
+    if previous.last_error != snapshot.last_error {
+        if let Some(error) = session
+            .last_error
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            printer.sideband_event(
+                crate::output::palette::Status::Failed,
+                "last error",
+                Some(&truncate_single_line(error, 96)),
+            );
+        }
+    }
+}
+
+fn sync_session_attach_ticker(
+    printer: &mut crate::output::LineStreamPrinter,
+    session: &SessionRecord,
+) {
+    let message = session_ticker_message(session);
+    printer.start_ticker(message.clone());
+    printer.tick_with(message);
+}
+
+fn session_attach_status(status: SessionStatus) -> crate::output::palette::Status {
+    match status {
+        SessionStatus::Idle => crate::output::palette::Status::Waiting,
+        SessionStatus::Running => crate::output::palette::Status::Working,
+        SessionStatus::Failed | SessionStatus::Stopped => crate::output::palette::Status::Failed,
+    }
+}
+
+fn session_status_detail(session: &SessionRecord) -> String {
+    let mut parts = vec![
+        session.agent_name.clone(),
+        session.status.as_str().to_string(),
+        format!("turns {}", session.total_turns),
+        format!("mode {}", session.permission_mode),
+    ];
+    if let Some(run_id) = session
+        .active_run_id
+        .as_deref()
+        .or(session.last_run_id.as_deref())
+    {
+        parts.push(format!("run {run_id}"));
+    }
+    parts.join("  ·  ")
+}
+
+fn session_route_detail(session: &SessionRecord) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(repo_ref) = session.repo_ref.as_deref() {
+        parts.push(format!("repo {}", truncate_single_line(repo_ref, 56)));
+    }
+    if let Some(target) = session.target.as_deref() {
+        parts.push(format!("target {}", truncate_single_line(target, 72)));
+    }
+    if let Some(issue_ref) = session.issue_ref.as_deref() {
+        parts.push(format!("issue {}", truncate_single_line(issue_ref, 72)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("  ·  "))
+    }
+}
+
+fn session_workspace_detail(session: &SessionRecord) -> String {
+    let mut parts = vec![truncate_single_line(
+        &session.workspace_path.display().to_string(),
+        84,
+    )];
+    if let Some(strategy) = session.workspace_strategy.as_deref() {
+        parts.push(strategy.to_string());
+    }
+    parts.join("  ·  ")
+}
+
+fn session_usage_detail(session: &SessionRecord) -> String {
+    format!(
+        "{}  ·  {}  ·  in {} out {}",
+        session.provider_name, session.model, session.total_tokens_in, session.total_tokens_out
+    )
+}
+
+fn session_recent_prompt(session: &SessionRecord) -> Option<String> {
+    session
+        .runs
+        .last()
+        .map(|run| truncate_single_line(&run.prompt, 96))
+}
+
+fn session_ticker_message(session: &SessionRecord) -> String {
+    match session.status {
+        SessionStatus::Running => format!(
+            "session {}  ·  run {}  ·  turns {}",
+            session.agent_name,
+            session.active_run_id.as_deref().unwrap_or("starting"),
+            session.total_turns
+        ),
+        SessionStatus::Idle => format!(
+            "session {}  ·  idle  ·  press p to prompt",
+            session.agent_name
+        ),
+        SessionStatus::Failed => format!(
+            "session {}  ·  failed  ·  /status for detail",
+            session.agent_name
+        ),
+        SessionStatus::Stopped => format!("session {}  ·  stopped", session.agent_name),
+    }
 }
 
 struct RawModeGuard {
@@ -1282,7 +1822,12 @@ pub(crate) fn prune_archived_sessions(
 }
 
 async fn stop(session_id: &str) -> anyhow::Result<()> {
-    let global = paths::global_dir()?;
+    stop_session_in_place(&paths::global_dir()?, session_id)?;
+    println!("stopped session {session_id}");
+    Ok(())
+}
+
+fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> {
     let (mut session, scope) = read_session(&global, session_id)?;
     ensure_active_scope(scope, "session stop")?;
     if reconcile_stale_session(&mut session) {
@@ -1315,7 +1860,49 @@ async fn stop(session_id: &str) -> anyhow::Result<()> {
         run.error = Some("stopped by operator".into());
     }
     write_session(&global, scope, &session)?;
-    println!("stopped session {}", session.session_id);
+    Ok(())
+}
+
+fn cancel_active_turn(
+    global: &Path,
+    session_id: &str,
+    printer: &mut crate::output::LineStreamPrinter,
+) -> anyhow::Result<()> {
+    let (mut session, scope) = read_session(global, session_id)?;
+    ensure_active_scope(scope, "session cancel")?;
+    if reconcile_stale_session(&mut session) {
+        write_session(global, scope, &session)?;
+    }
+    let Some(run_id) = session.active_run_id.clone() else {
+        printer.sideband_event(
+            crate::output::palette::Status::Skipped,
+            "no active turn",
+            Some(&session.session_id),
+        );
+        return Ok(());
+    };
+    if let Some(pid) = session.active_pid.filter(|pid| pid_is_running(*pid)) {
+        let _ = terminate_pid(pid);
+    }
+    session.status = SessionStatus::Idle;
+    session.updated_at = Utc::now();
+    session.last_error = Some("turn cancelled by operator".into());
+    session.last_run_id = Some(run_id.clone());
+    session.last_transcript_path = session.active_transcript_path.clone();
+    session.active_run_id = None;
+    session.active_transcript_path = None;
+    session.active_pid = None;
+    if let Some(run) = session.runs.iter_mut().find(|run| run.run_id == run_id) {
+        run.completed_at = Some(Utc::now());
+        run.status = Some(RunStatus::Aborted);
+        run.error = Some("turn cancelled by operator".into());
+    }
+    write_session(global, scope, &session)?;
+    printer.sideband_event(
+        crate::output::palette::Status::Awaiting,
+        "cancel requested",
+        Some(&run_id),
+    );
     Ok(())
 }
 
@@ -1811,4 +2398,140 @@ fn terminate_pid(pid: u32) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_attach_command_handles_known_commands() {
+        assert!(matches!(
+            parse_attach_command("/help"),
+            Some(AttachCommand::Help)
+        ));
+        assert!(matches!(
+            parse_attach_command("/status"),
+            Some(AttachCommand::Status)
+        ));
+        assert!(matches!(
+            parse_attach_command("/cancel"),
+            Some(AttachCommand::Cancel)
+        ));
+        assert!(matches!(
+            parse_attach_command("/stop"),
+            Some(AttachCommand::Stop)
+        ));
+        assert!(matches!(
+            parse_attach_command("/runs"),
+            Some(AttachCommand::Runs)
+        ));
+        assert!(parse_attach_command("plain prompt").is_none());
+        assert!(parse_attach_command("/unknown").is_none());
+    }
+
+    #[test]
+    fn session_status_detail_includes_current_run_and_mode() {
+        let session = test_session_record();
+        let detail = session_status_detail(&session);
+        assert!(detail.contains("issue-reader"));
+        assert!(detail.contains("running"));
+        assert!(detail.contains("turns 3"));
+        assert!(detail.contains("mode bypass"));
+        assert!(detail.contains("run run_live123"));
+    }
+
+    #[test]
+    fn session_route_detail_includes_repo_target_and_issue() {
+        let session = test_session_record();
+        let detail = session_route_detail(&session).expect("route detail");
+        assert!(detail.contains("repo github:Section9Labs/rupu"));
+        assert!(detail.contains("target github:Section9Labs/rupu/issues/42"));
+        assert!(detail.contains("issue github:Section9Labs/rupu/issues/42"));
+    }
+
+    #[test]
+    fn session_ticker_message_changes_with_status() {
+        let mut session = test_session_record();
+        assert_eq!(
+            session_ticker_message(&session),
+            "session issue-reader  ·  run run_live123  ·  turns 3"
+        );
+
+        session.status = SessionStatus::Idle;
+        session.active_run_id = None;
+        assert_eq!(
+            session_ticker_message(&session),
+            "session issue-reader  ·  idle  ·  press p to prompt"
+        );
+
+        session.status = SessionStatus::Failed;
+        assert_eq!(
+            session_ticker_message(&session),
+            "session issue-reader  ·  failed  ·  /status for detail"
+        );
+    }
+
+    fn test_session_record() -> SessionRecord {
+        SessionRecord {
+            version: SessionRecord::VERSION,
+            session_id: "ses_test01".into(),
+            agent_name: "issue-reader".into(),
+            description: Some("Persistent issue reader".into()),
+            provider_name: "anthropic".into(),
+            auth_mode: None,
+            model: "claude-sonnet-4-6".into(),
+            agent_system_prompt: "You are a test agent.".into(),
+            agent_tools: Some(vec!["read_file".into()]),
+            max_turns: 50,
+            permission_mode: "bypass".into(),
+            no_stream: false,
+            anthropic_oauth_prefix: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            dispatchable_agents: None,
+            workspace_id: "ws_test".into(),
+            workspace_path: PathBuf::from("/tmp/repo"),
+            project_root: Some(PathBuf::from("/tmp/repo")),
+            transcripts_dir: PathBuf::from("/tmp/repo/.rupu/transcripts"),
+            repo_ref: Some("github:Section9Labs/rupu".into()),
+            issue_ref: Some("github:Section9Labs/rupu/issues/42".into()),
+            target: Some("github:Section9Labs/rupu/issues/42".into()),
+            workspace_strategy: Some("direct_checkout".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            status: SessionStatus::Running,
+            active_run_id: Some("run_live123".into()),
+            active_transcript_path: Some(PathBuf::from(
+                "/tmp/repo/.rupu/transcripts/run_live123.jsonl",
+            )),
+            active_pid: Some(1234),
+            last_run_id: Some("run_prev123".into()),
+            last_transcript_path: Some(PathBuf::from(
+                "/tmp/repo/.rupu/transcripts/run_prev123.jsonl",
+            )),
+            last_error: None,
+            total_turns: 3,
+            total_tokens_in: 120,
+            total_tokens_out: 45,
+            message_history: Vec::new(),
+            runs: vec![SessionRunRecord {
+                run_id: "run_prev123".into(),
+                prompt: "Summarize the issue.".into(),
+                transcript_path: PathBuf::from("/tmp/repo/.rupu/transcripts/run_prev123.jsonl"),
+                started_at: Utc::now(),
+                completed_at: Some(Utc::now()),
+                status: Some(RunStatus::Ok),
+                total_tokens_in: 100,
+                total_tokens_out: 40,
+                duration_ms: 1234,
+                pid: None,
+                error: None,
+            }],
+        }
+    }
 }

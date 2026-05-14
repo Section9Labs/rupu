@@ -19,8 +19,8 @@ transcript on every run. A single Rust binary that:
 - Fires workflows on cron schedules OR external SCM events (GitHub / GitLab),
   via either a system-cron poll loop (no daemon) or a user-managed
   `rupu webhook serve` long-running process.
-- Renders runs as a live terminal canvas (`rupu workflow run`) or a streaming
-  line view, with `rupu watch <run_id>` to re-attach to anything in flight.
+- Renders runs as live terminal streams (`rupu workflow run` / `rupu run`),
+  with `rupu watch <run_id>` to re-attach to anything in flight.
 
 What's NOT in this binary yet: the SaaS dashboard, the remote sandbox runtime,
 and the native desktop app — those are slices D + E. See [TODO.md](TODO.md) for
@@ -67,11 +67,6 @@ to overwrite local template customizations with the latest embedded
 versions.
 
 ---
-
-## TUI
-
-`rupu workflow run` opens a live terminal canvas of the in-flight run.
-See `docs/tui.md` for full key bindings and surfaces.
 
 `rupu watch <run_id>` re-attaches to any historic run. Add `--replay
 --pace=20` to replay a finished run for review.
@@ -268,7 +263,7 @@ rupu workflow {list, show, edit}      Manage workflows
 rupu workflow run <name> [target]     Run a workflow (target: repo, PR, or issue ref)
 rupu workflow runs                    List recent persisted runs
 rupu workflow {approve, reject} <id>  Resume / cancel a paused-for-approval run
-rupu watch <run_id> [--replay]        Re-attach the TUI to any past or in-flight run
+rupu watch <run_id> [--replay]        Re-attach to any past or in-flight run
 rupu transcript {list, show}          Browse JSONL transcripts
 rupu issues {list, show, run}         Issue-tracker surface (auto-detects from cwd)
 rupu repos list                       List configured-platform repositories
@@ -284,8 +279,9 @@ rupu usage                            Usage reports across transcripts + workflo
 ```
 
 Run `rupu <subcommand> --help` for the full surface of any one. Tab completion
-covers every flag and dynamically lists agent / workflow names for the
-positional slots.
+covers every flag and dynamically lists agent / workflow names plus session /
+transcript ids for the relevant positional slots once shell integration is
+installed.
 
 Structured output is standardized as:
 
@@ -355,6 +351,7 @@ The simple path is a single shared selector:
 ```toml
 [ui]
 theme = "catppuccin-mocha"
+live_view = "focused"
 ```
 
 That applies the same named theme across syntax and palette when both exist. If the
@@ -374,6 +371,19 @@ theme = "tokyo-night"
 Use `rupu ui themes` to list built-in and installed themes, and `rupu ui theme import`
 to install a local or remote Base16/native theme file into `~/.rupu/themes/` or
 `<repo>/.rupu/themes/`.
+
+Interactive/event-driven surfaces also support a shared live view mode:
+
+- `[ui].live_view = "focused" | "full"`
+- per-command override: `--view focused|full`
+
+The first commands wired to this are:
+
+- `rupu run`
+- `rupu transcript show`
+- `rupu session attach`
+- `rupu workflow run`
+- `rupu autoflow serve`
 
 Built-in parity names currently include:
 

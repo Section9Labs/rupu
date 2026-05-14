@@ -208,7 +208,7 @@ async fn list(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::Re
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
     let agents = load_agents(&global, project_agents_parent.as_deref())?;
     let cfg = layered_config(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
 
     if agents.is_empty()
         && matches!(
@@ -266,7 +266,7 @@ async fn show(
     let body = std::fs::read_to_string(&path)?;
 
     let cfg = layered_config(&global, project_root.as_deref());
-    let prefs = UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag);
+    let prefs = UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag, None);
     let report = AgentShowReport {
         kind: "agent_show",
         version: 1,

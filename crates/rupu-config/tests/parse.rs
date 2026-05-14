@@ -31,6 +31,7 @@ fn parses_full_config() {
         [ui]
         color = "always"
         theme = "Solarized (light)"
+        live_view = "full"
         pager = "never"
 
         [ui.syntax]
@@ -64,6 +65,7 @@ fn parses_full_config() {
     assert_eq!(cfg.retry.max_attempts, Some(3));
     assert_eq!(cfg.ui.color.as_deref(), Some("always"));
     assert_eq!(cfg.ui.theme.as_deref(), Some("Solarized (light)"));
+    assert_eq!(cfg.ui.live_view.as_deref(), Some("full"));
     assert_eq!(cfg.ui.syntax.theme.as_deref(), Some("InspiredGitHub"));
     assert_eq!(cfg.ui.palette.theme.as_deref(), Some("github-light"));
     assert_eq!(cfg.autoflow.enabled, Some(true));

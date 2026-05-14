@@ -12,7 +12,9 @@
 //! and renders it as a timeline (`pretty`, the default), a structured
 //! `json` envelope, or raw `jsonl`.
 
+use crate::cmd::completers::{standalone_transcript_run_ids, transcript_run_ids};
 use crate::cmd::retention::parse_retention_duration;
+use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
 use crate::output::palette::Status;
 use crate::output::report::{self, CollectionOutput, EventOutput};
@@ -21,6 +23,7 @@ use crate::output::LineStreamPrinter;
 use crate::paths;
 use crate::standalone_run_metadata::{metadata_path_for_run, read_metadata};
 use clap::{Args as ClapArgs, Subcommand};
+use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader, RunStatus};
 use serde::Serialize;
@@ -46,9 +49,17 @@ pub enum Action {
         archived: bool,
     },
     /// Print a transcript's full event stream.
-    Show { run_id: String },
+    Show {
+        #[arg(add = ArgValueCompleter::new(transcript_run_ids))]
+        run_id: String,
+        #[arg(long, value_enum)]
+        view: Option<LiveViewMode>,
+    },
     /// Archive a standalone transcript and its metadata.
-    Archive { run_id: String },
+    Archive {
+        #[arg(add = ArgValueCompleter::new(standalone_transcript_run_ids))]
+        run_id: String,
+    },
     /// Permanently delete a standalone transcript and its metadata.
     Delete(DeleteArgs),
     /// Delete archived standalone transcripts older than a cutoff.
@@ -57,6 +68,7 @@ pub enum Action {
 
 #[derive(ClapArgs, Debug)]
 pub struct DeleteArgs {
+    #[arg(add = ArgValueCompleter::new(standalone_transcript_run_ids))]
     pub run_id: String,
     #[arg(long)]
     pub force: bool,
@@ -79,7 +91,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             all,
             archived,
         } => list(no_color, all, archived, global_format).await,
-        Action::Show { run_id } => show(&run_id, global_format).await,
+        Action::Show { run_id, view } => show(&run_id, view, global_format).await,
         Action::Archive { run_id } => archive(&run_id).await,
         Action::Delete(args) => delete(args).await,
         Action::Prune(args) => prune(args, global_format).await,
@@ -222,6 +234,7 @@ struct TranscriptShowReport {
 struct TranscriptShowOutput {
     report: TranscriptShowReport,
     events: Vec<TranscriptEvent>,
+    view_mode: LiveViewMode,
 }
 
 impl CollectionOutput for TranscriptListOutput {
@@ -341,16 +354,19 @@ impl EventOutput for TranscriptShowOutput {
     }
 
     fn render_pretty(&self) -> anyhow::Result<()> {
-        render_pretty_transcript(&self.events)
+        render_pretty_transcript(&self.events, self.view_mode)
     }
 }
 
-fn render_pretty_transcript(events: &[TranscriptEvent]) -> anyhow::Result<()> {
+fn render_pretty_transcript(
+    events: &[TranscriptEvent],
+    view_mode: LiveViewMode,
+) -> anyhow::Result<()> {
     let mut printer = LineStreamPrinter::new();
     let mut saw_header = false;
 
     for event in events {
-        render_pretty_transcript_event(&mut printer, event, &mut saw_header);
+        render_pretty_transcript_event(&mut printer, event, &mut saw_header, view_mode);
     }
 
     if !saw_header {
@@ -365,6 +381,7 @@ pub(crate) fn render_pretty_transcript_event(
     printer: &mut LineStreamPrinter,
     event: &TranscriptEvent,
     saw_header: &mut bool,
+    view_mode: LiveViewMode,
 ) {
     match event {
         TranscriptEvent::RunStart {
@@ -398,7 +415,14 @@ pub(crate) fn render_pretty_transcript_event(
                 printer.sideband_event(Status::Active, "thinking", Some(&detail));
             }
             if !content.trim().is_empty() {
-                printer.assistant_chunk(content);
+                match view_mode {
+                    LiveViewMode::Full => printer.assistant_chunk(content),
+                    LiveViewMode::Focused => printer.sideband_event(
+                        Status::Active,
+                        "assistant output",
+                        Some(&truncate_single_line(content, 96)),
+                    ),
+                }
             }
         }
         TranscriptEvent::ToolCall { tool, input, .. } => {
@@ -679,7 +703,7 @@ async fn list(
         let project_cfg = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default()
     };
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
     let report_rows: Vec<TranscriptListRow> = rows
         .iter()
         .map(|row| TranscriptListRow {
@@ -720,8 +744,23 @@ async fn list(
     report::emit_collection(global_format, &output)
 }
 
-async fn show(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn show(
+    run_id: &str,
+    view: Option<LiveViewMode>,
+    global_format: Option<OutputFormat>,
+) -> anyhow::Result<()> {
     let path = locate_transcript(run_id)?.transcript_path;
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let cfg = rupu_config::layer_files(
+        Some(&global.join("config.toml")),
+        project_root
+            .as_deref()
+            .map(|root| root.join(".rupu/config.toml"))
+            .as_deref(),
+    )?;
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, view);
     let mut events = Vec::new();
     let mut raw_events = Vec::new();
     for event in JsonlReader::iter(&path)? {
@@ -731,6 +770,7 @@ async fn show(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::Resu
     }
     let output = TranscriptShowOutput {
         events: raw_events,
+        view_mode: prefs.live_view,
         report: TranscriptShowReport {
             kind: "transcript_show",
             version: 1,

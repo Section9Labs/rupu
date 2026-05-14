@@ -392,7 +392,21 @@ turn. Re-attach later with `rupu session attach <session-id>`.
 While attached:
 
 - press `p` or `Enter` to submit the next prompt once the session is idle
+- press `Esc` to cancel local prompt composition without sending
+- press `x` to cancel the active turn and return the session to idle
+- press `q` to leave the viewer while keeping the session alive
 - press `d` or `Ctrl-]` to detach without stopping the worker
+- press `?` for attach help
+- prompt input also accepts slash commands:
+  - `/help`
+  - `/status`
+  - `/history`
+  - `/runs`
+  - `/transcript`
+  - `/cancel`
+  - `/stop`
+  - `/detach`
+  - `/quit`
 
 Lifecycle notes:
 
@@ -410,6 +424,9 @@ Standalone transcript lifecycle:
 - `rupu transcript prune [--older-than 30d] [--dry-run]`
 - `rupu cleanup [--older-than 30d] [--dry-run] [--sessions|--transcripts]`
 - `rupu cleanup --stats [--sessions|--transcripts]`
+
+Install shell completion with `rupu completions install` to get dynamic
+tab-completion for session ids and transcript run ids.
 
 Transcript archive/delete is only available for standalone runs. If a transcript is owned
 by a session, manage it through `rupu session archive|delete` instead.
@@ -458,6 +475,7 @@ falls back to the palette theme's syntax hint.
 [ui]
 color = "always"
 pager = "never"
+live_view = "focused"
 
 [ui.syntax]
 theme = "Solarized (dark)"
@@ -473,6 +491,13 @@ Notes:
   `solarized-light`.
 - `[ui].theme` is the simple shared selector; `[ui.syntax]` and `[ui.palette]` are the
   advanced override knobs.
+- `[ui].live_view` sets the default live event density for:
+  - `rupu run`
+  - `rupu transcript show`
+  - `rupu session attach`
+  - `rupu workflow run`
+  - `rupu autoflow serve`
+- `--view focused|full` overrides the config per command.
 - Global custom themes live in `~/.rupu/themes/`.
 - Project-local themes live in `<repo>/.rupu/themes/`.
 - Phase 1 import supports native rupu theme files and Base16 themes.

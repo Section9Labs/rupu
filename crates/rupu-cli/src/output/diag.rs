@@ -190,7 +190,7 @@ pub fn prefs_for_diag(no_color: bool) -> UiPrefs {
             rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).ok()
         })
         .unwrap_or_default();
-    UiPrefs::resolve(&cfg.ui, no_color, None, None)
+    UiPrefs::resolve(&cfg.ui, no_color, None, None, None)
 }
 
 #[cfg(test)]

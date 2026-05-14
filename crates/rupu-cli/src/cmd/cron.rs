@@ -279,7 +279,7 @@ fn ui_prefs(no_color: bool) -> anyhow::Result<crate::cmd::ui::UiPrefs> {
     let cfg =
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
     Ok(crate::cmd::ui::UiPrefs::resolve(
-        &cfg.ui, no_color, None, None,
+        &cfg.ui, no_color, None, None, None,
     ))
 }
 
@@ -598,7 +598,7 @@ async fn events(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::
         );
     }
 
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
     let poll_sources: Vec<String> = cfg
         .triggers
         .poll_sources

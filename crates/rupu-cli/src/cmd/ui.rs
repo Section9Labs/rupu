@@ -68,6 +68,7 @@ pub struct UiPrefs {
     pub theme: String,
     pub palette_theme: String,
     pub palette: crate::output::palette::UiPaletteTheme,
+    pub live_view: LiveViewMode,
     pub pager: PagerMode,
 }
 
@@ -85,6 +86,27 @@ pub enum PagerMode {
     Never,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum LiveViewMode {
+    Focused,
+    Full,
+}
+
+impl LiveViewMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Focused => "focused",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl Default for LiveViewMode {
+    fn default() -> Self {
+        Self::Focused
+    }
+}
+
 impl UiPrefs {
     /// Resolve preferences from (in priority order): CLI flags, env
     /// vars (`NO_COLOR`, `PAGER`-presence), the `[ui]` section of
@@ -94,6 +116,7 @@ impl UiPrefs {
         flag_no_color: bool,
         flag_theme: Option<&str>,
         flag_pager: Option<bool>,
+        flag_live_view: Option<LiveViewMode>,
     ) -> Self {
         let color = if flag_no_color || std::env::var_os("NO_COLOR").is_some() {
             ColorMode::Never
@@ -139,6 +162,9 @@ impl UiPrefs {
                     .unwrap_or_else(|| DEFAULT_THEME.to_string())
             });
         crate::output::palette::set_active_palette(palette_spec.palette.clone());
+        let live_view = flag_live_view
+            .or_else(|| parse_live_view(cfg.live_view.as_deref()))
+            .unwrap_or(LiveViewMode::Focused);
         let pager = match flag_pager {
             Some(true) => PagerMode::Always,
             Some(false) => PagerMode::Never,
@@ -149,6 +175,7 @@ impl UiPrefs {
             theme,
             palette_theme: palette_spec.name,
             palette: palette_spec.palette,
+            live_view,
             pager,
         }
     }
@@ -425,6 +452,14 @@ fn parse_pager(raw: Option<&str>) -> Option<PagerMode> {
         "auto" => Some(PagerMode::Auto),
         "always" => Some(PagerMode::Always),
         "never" => Some(PagerMode::Never),
+        _ => None,
+    }
+}
+
+fn parse_live_view(raw: Option<&str>) -> Option<LiveViewMode> {
+    match raw?.to_ascii_lowercase().as_str() {
+        "focused" => Some(LiveViewMode::Focused),
+        "full" => Some(LiveViewMode::Full),
         _ => None,
     }
 }
@@ -769,9 +804,10 @@ mod tests {
             theme: None,
             syntax: Default::default(),
             palette: Default::default(),
+            live_view: None,
             pager: None,
         };
-        let prefs = UiPrefs::resolve(&cfg, false, None, None);
+        let prefs = UiPrefs::resolve(&cfg, false, None, None, None);
         assert_eq!(prefs.color, ColorMode::Never);
         std::env::remove_var("NO_COLOR");
     }
