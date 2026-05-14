@@ -1001,6 +1001,7 @@ steps:
         worker: None,
         live_event_hook: None,
         shared_printer: None,
+        live_view: rupu_cli::cmd::ui::LiveViewMode::Focused,
     };
     let summary = rupu_cli::cmd::workflow::run_with_explicit_context("auto-wf", ctx)
         .await
@@ -1069,6 +1070,7 @@ steps:
         worker: None,
         live_event_hook: None,
         shared_printer: None,
+        live_view: rupu_cli::cmd::ui::LiveViewMode::Focused,
     };
     let err = rupu_cli::cmd::workflow::run_with_explicit_context("auto-wf", strict_ctx)
         .await

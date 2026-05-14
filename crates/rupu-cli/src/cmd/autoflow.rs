@@ -2181,17 +2181,11 @@ fn render_serve_cycle_timeline(
     render_cycle_header(report.cycles, last_tick, cycle);
     if eventful {
         render_frame_spacer(0);
-        render_cycle_issue_frames(
-            &monitor.claims,
-            &interesting_events,
-            &run_store,
-            &pricing,
-            5,
-        )?;
+        render_cycle_operator_layout(&monitor.claims, &interesting_events, &run_store, &pricing)?;
     } else {
         render_dim_branch("idle");
     }
-    render_wake_summary(&monitor.wakes);
+    render_queue_section(&monitor.wakes);
     std::io::stdout().flush()?;
     Ok(())
 }
@@ -2345,6 +2339,43 @@ mod serve_heartbeat_tests {
     }
 
     #[test]
+    fn serve_entries_prioritize_running_issue_with_events() {
+        let running = claim_with_status("running");
+        let mut complete = claim_with_status("complete");
+        complete.issue = "github:Section9Labs/rupu/issues/2".into();
+        complete.issue_display = Some("2".into());
+        let event = AutoflowCycleEvent {
+            kind: rupu_runtime::AutoflowCycleEventKind::RunLaunched,
+            issue_ref: Some(running.issue.clone()),
+            ..Default::default()
+        };
+
+        let claims = [complete, running.clone()];
+        let entries = build_serve_issue_entries(&claims, &[&event]);
+        assert_eq!(
+            entries
+                .first()
+                .and_then(|entry| entry.claim)
+                .map(|claim| claim.issue.as_str()),
+            Some(running.issue.as_str())
+        );
+    }
+
+    #[test]
+    fn serve_entries_include_event_only_issues() {
+        let event = AutoflowCycleEvent {
+            kind: rupu_runtime::AutoflowCycleEventKind::IssueCommented,
+            issue_ref: Some("github:Section9Labs/rupu/issues/99".into()),
+            ..Default::default()
+        };
+
+        let entries = build_serve_issue_entries(&[], &[&event]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].issue_ref, "github:Section9Labs/rupu/issues/99");
+        assert!(entries[0].claim.is_none());
+    }
+
+    #[test]
     fn promoted_issue_events_use_specific_labels() {
         let commented = AutoflowCycleEvent {
             kind: rupu_runtime::AutoflowCycleEventKind::IssueCommented,
@@ -2420,47 +2451,34 @@ fn render_cycle_header(
     println!("{line}");
 }
 
-fn render_cycle_issue_frames(
+#[derive(Debug, Clone)]
+struct ServeIssueEntry<'a> {
+    issue_ref: String,
+    claim: Option<&'a AutoflowClaimRow>,
+    events: Vec<&'a AutoflowCycleEvent>,
+}
+
+fn render_cycle_operator_layout(
     claims: &[AutoflowClaimRow],
     events: &[&AutoflowCycleEvent],
     run_store: &RunStore,
     pricing: &rupu_config::PricingConfig,
-    max_rows: usize,
 ) -> anyhow::Result<()> {
-    let mut event_map: BTreeMap<String, Vec<&AutoflowCycleEvent>> = BTreeMap::new();
-    for event in events {
-        if let Some(issue_ref) = event.issue_ref.as_ref() {
-            event_map.entry(issue_ref.clone()).or_default().push(*event);
-        }
+    let entries = build_serve_issue_entries(claims, events);
+    let Some(primary) = entries.first() else {
+        render_dim_branch("no active issues");
+        return Ok(());
+    };
+
+    match primary.claim {
+        Some(claim) => render_issue_frame(claim, &primary.events, run_store, pricing)?,
+        None => render_event_only_frame(&primary.issue_ref, &primary.events),
     }
 
-    let mut shown = 0usize;
-    for claim in claims {
-        if shown >= max_rows {
-            break;
-        }
-        let claim_events = event_map.remove(&claim.issue).unwrap_or_default();
-        if !claim_should_render_in_cycle_frame(claim, &claim_events) {
-            continue;
-        }
-        if shown > 0 {
-            render_frame_spacer(0);
-        }
-        render_issue_frame(claim, &claim_events, run_store, pricing)?;
-        shown += 1;
+    if entries.len() > 1 {
+        render_frame_spacer(0);
+        render_recent_issue_section(&entries[1..], run_store, pricing, 4);
     }
-
-    for (issue_ref, claim_events) in event_map {
-        if shown >= max_rows {
-            break;
-        }
-        if shown > 0 {
-            render_frame_spacer(0);
-        }
-        render_event_only_frame(&issue_ref, &claim_events);
-        shown += 1;
-    }
-
     Ok(())
 }
 
@@ -2469,6 +2487,193 @@ fn claim_should_render_in_cycle_frame(
     claim_events: &[&AutoflowCycleEvent],
 ) -> bool {
     !claim_events.is_empty() || claim_is_live_for_heartbeat(claim)
+}
+
+fn build_serve_issue_entries<'a>(
+    claims: &'a [AutoflowClaimRow],
+    events: &[&'a AutoflowCycleEvent],
+) -> Vec<ServeIssueEntry<'a>> {
+    let mut event_map: BTreeMap<String, Vec<&'a AutoflowCycleEvent>> = BTreeMap::new();
+    for event in events {
+        if let Some(issue_ref) = event.issue_ref.as_ref() {
+            event_map.entry(issue_ref.clone()).or_default().push(*event);
+        }
+    }
+
+    let mut entries = Vec::new();
+    for claim in claims {
+        let claim_events = event_map.remove(&claim.issue).unwrap_or_default();
+        if !claim_should_render_in_cycle_frame(claim, &claim_events) {
+            continue;
+        }
+        entries.push(ServeIssueEntry {
+            issue_ref: claim.issue.clone(),
+            claim: Some(claim),
+            events: claim_events,
+        });
+    }
+
+    for (issue_ref, claim_events) in event_map {
+        entries.push(ServeIssueEntry {
+            issue_ref,
+            claim: None,
+            events: claim_events,
+        });
+    }
+
+    entries.sort_by(|left, right| {
+        serve_issue_entry_sort_key(left).cmp(&serve_issue_entry_sort_key(right))
+    });
+    entries
+}
+
+fn serve_issue_entry_sort_key(entry: &ServeIssueEntry<'_>) -> (u8, u8, String) {
+    let claim_status = entry
+        .claim
+        .map(|claim| claim.status.as_str())
+        .unwrap_or("detached");
+    let primary_rank = match (claim_status, entry.events.is_empty()) {
+        ("running" | "claimed", false) => 0,
+        ("running" | "claimed", true) => 1,
+        ("await_human" | "await_external" | "retry_backoff" | "blocked", false) => 2,
+        (_, false) => 3,
+        ("complete", true) => 5,
+        _ => 4,
+    };
+    let status_rank = match claim_status {
+        "running" => 0,
+        "claimed" => 1,
+        "await_human" => 2,
+        "await_external" => 3,
+        "retry_backoff" => 4,
+        "blocked" => 5,
+        "complete" => 7,
+        _ => 6,
+    };
+    (primary_rank, status_rank, entry.issue_ref.clone())
+}
+
+fn render_recent_issue_section(
+    entries: &[ServeIssueEntry<'_>],
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    max_rows: usize,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    render_section_heading("recent");
+    for entry in entries.iter().take(max_rows) {
+        match entry.claim {
+            Some(claim) => render_compact_issue_row(claim, &entry.events, run_store, pricing),
+            None => render_compact_event_row(&entry.issue_ref, &entry.events),
+        }
+    }
+    if entries.len() > max_rows {
+        render_dim_detail(&format!(
+            "+{} more recent item(s)",
+            entries.len() - max_rows
+        ));
+    }
+}
+
+fn render_compact_issue_row(
+    claim: &AutoflowClaimRow,
+    events: &[&AutoflowCycleEvent],
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+) {
+    let status = claim_status_ui(&claim.status);
+    let issue = display_issue_headline(claim);
+    let mut line = String::new();
+    let _ = palette::write_colored(&mut line, "│", palette::BRAND_300);
+    line.push(' ');
+    let _ = palette::write_bold_colored(&mut line, &status.glyph().to_string(), status.color());
+    line.push(' ');
+    let _ = palette::write_bold_colored(&mut line, &issue, status.color());
+    line.push_str("  ");
+    let _ = palette::write_bold_colored(
+        &mut line,
+        &truncate_text(&claim.workflow, 30),
+        palette::BRAND,
+    );
+    line.push_str("  ");
+    let _ = palette::write_colored(&mut line, &claim.status, DIM);
+    println!("{line}");
+
+    if let Some(detail) = compact_issue_detail(claim, events, run_store, pricing) {
+        render_dim_detail(&truncate_text(&detail, 104));
+    }
+}
+
+fn render_compact_event_row(issue_ref: &str, events: &[&AutoflowCycleEvent]) {
+    let mut line = String::new();
+    let _ = palette::write_colored(&mut line, "│", palette::BRAND_300);
+    line.push(' ');
+    let _ = palette::write_bold_colored(&mut line, "○", palette::SKIPPED);
+    line.push(' ');
+    let _ = palette::write_bold_colored(&mut line, issue_ref, palette::SKIPPED);
+    line.push_str("  ");
+    let _ = palette::write_colored(&mut line, "detached", DIM);
+    println!("{line}");
+    if let Some(event) = events.first() {
+        let (_, label) = cycle_event_status_and_label(event);
+        let detail = event.detail.as_deref().unwrap_or("").trim();
+        let message = if detail.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label}  ·  {detail}")
+        };
+        render_dim_detail(&truncate_text(&message, 104));
+    }
+}
+
+fn compact_issue_detail(
+    claim: &AutoflowClaimRow,
+    events: &[&AutoflowCycleEvent],
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+) -> Option<String> {
+    if let Some(event) = events.first() {
+        let (_, label) = cycle_event_status_and_label(event);
+        let detail = event.detail.as_deref().unwrap_or("").trim();
+        return Some(if detail.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label}  ·  {detail}")
+        });
+    }
+
+    if claim.last_run != "-" {
+        if let Some(summary) = load_run_summary(run_store, &claim.last_run, pricing) {
+            if let Some(diff) = &summary.diff {
+                return Some(format!(
+                    "changes {} file(s)  ·  +{}/-{}",
+                    diff.files_changed,
+                    format_count(diff.insertions),
+                    format_count(diff.deletions),
+                ));
+            }
+            if let Some(duration_ms) = summary.duration_ms {
+                return Some(format!(
+                    "{}  ·  duration {}",
+                    summary.status,
+                    format_duration(std::time::Duration::from_millis(duration_ms))
+                ));
+            }
+        }
+    }
+
+    if claim.next != "-" {
+        return Some(format!("next  {}", claim.next));
+    }
+    if claim.summary != "-" {
+        return Some(claim.summary.clone());
+    }
+    if claim.branch != "-" {
+        return Some(format!("branch  {}", claim.branch));
+    }
+    None
 }
 
 fn render_claim_snapshot_section(
@@ -2836,6 +3041,20 @@ fn render_wake_summary(wakes: &AutoflowMonitorWakeSummary) {
         DIM,
     );
     println!("{line}");
+}
+
+fn render_queue_section(wakes: &AutoflowMonitorWakeSummary) {
+    render_section_heading("queue");
+    render_key_value_detail(
+        0,
+        "◌",
+        palette::AWAITING,
+        &[
+            ("queued", wakes.queued.to_string()),
+            ("due", wakes.due.to_string()),
+            ("processed", wakes.processed_recent.to_string()),
+        ],
+    );
 }
 
 fn render_section_heading(title: &str) {
