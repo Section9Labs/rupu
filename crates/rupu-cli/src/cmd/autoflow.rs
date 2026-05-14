@@ -36,8 +36,8 @@ use rupu_auth::{CredentialResolver, KeychainResolver};
 use rupu_config::{AutoflowCheckout, Config, PollSourceEntry};
 use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
-    AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepResultRecord, Workflow,
-    WorkflowOutputContract,
+    AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepKind,
+    StepResultRecord, Workflow, WorkflowOutputContract,
 };
 use rupu_runtime::{
     AutoflowCycleEvent, AutoflowCycleRecord, AutoflowHistoryEventRecord, AutoflowHistoryStore,
@@ -101,7 +101,7 @@ pub enum Action {
         /// Idle sleep between reconciliation passes, for example `10s`.
         #[arg(long, default_value = "10s")]
         idle_sleep: String,
-        /// Live operator view mode (`focused` or `full`).
+        /// Live operator view mode (`focused`, `compact`, or `full`).
         #[arg(long, value_enum)]
         view: Option<crate::cmd::ui::LiveViewMode>,
         /// Suppress the live interactive serve view.
@@ -1035,11 +1035,111 @@ struct ServeProgressSnapshot {
     cycle_running: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoflowServeFocus {
+    Issues,
+    Detail,
+}
+
+#[derive(Debug, Clone)]
+struct AutoflowServeUiState {
+    focus: AutoflowServeFocus,
+    detail_viewport: ViewportState,
+    selected_issue_ref: Option<String>,
+    follow_hottest: bool,
+    issue_scroll: usize,
+}
+
+impl Default for AutoflowServeUiState {
+    fn default() -> Self {
+        Self {
+            focus: AutoflowServeFocus::Issues,
+            detail_viewport: ViewportState::default(),
+            selected_issue_ref: None,
+            follow_hottest: true,
+            issue_scroll: 0,
+        }
+    }
+}
+
+impl AutoflowServeUiState {
+    fn sync_selection<'a>(&mut self, entries: &[ServeIssueEntry<'a>]) -> Option<usize> {
+        if entries.is_empty() {
+            self.selected_issue_ref = None;
+            self.issue_scroll = 0;
+            return None;
+        }
+        let needs_reset = self
+            .selected_issue_ref
+            .as_ref()
+            .is_none_or(|selected| !entries.iter().any(|entry| &entry.issue_ref == selected));
+        if self.follow_hottest || needs_reset {
+            self.selected_issue_ref = Some(entries[0].issue_ref.clone());
+        }
+        entries
+            .iter()
+            .position(|entry| self.selected_issue_ref.as_deref() == Some(entry.issue_ref.as_str()))
+    }
+
+    fn move_selection<'a>(&mut self, entries: &[ServeIssueEntry<'a>], delta: isize) {
+        let Some(current) = self.sync_selection(entries) else {
+            return;
+        };
+        let limit = entries.len().saturating_sub(1) as isize;
+        let next = (current as isize + delta).clamp(0, limit) as usize;
+        self.follow_hottest = false;
+        self.selected_issue_ref = Some(entries[next].issue_ref.clone());
+    }
+
+    fn toggle_follow<'a>(&mut self, entries: &[ServeIssueEntry<'a>]) {
+        self.follow_hottest = !self.follow_hottest;
+        if self.follow_hottest {
+            self.issue_scroll = 0;
+            self.sync_selection(entries);
+        }
+    }
+
+    fn follow_hottest<'a>(&mut self, entries: &[ServeIssueEntry<'a>]) {
+        self.follow_hottest = true;
+        self.issue_scroll = 0;
+        self.sync_selection(entries);
+    }
+
+    fn switch_focus(&mut self) {
+        self.focus = match self.focus {
+            AutoflowServeFocus::Issues => AutoflowServeFocus::Detail,
+            AutoflowServeFocus::Detail => AutoflowServeFocus::Issues,
+        };
+    }
+
+    fn focus_label(&self) -> &'static str {
+        match self.focus {
+            AutoflowServeFocus::Issues => "issues",
+            AutoflowServeFocus::Detail => "detail",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowStepOutline {
+    step_id: String,
+    kind: StepKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoflowServeViewLineKind {
+    Event,
+    TreeItem,
+    TreeNote,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoflowServeViewLine {
     status: UiStatus,
     text: String,
     continuation: bool,
+    indent: usize,
+    kind: AutoflowServeViewLineKind,
 }
 
 struct AutoflowServeScreenGuard;
@@ -1982,7 +2082,7 @@ async fn serve_retained(
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_rows: Vec<String> = Vec::new();
         let mut live_view_mode = view_mode;
-        let mut viewport = ViewportState::default();
+        let mut ui_state = AutoflowServeUiState::default();
 
         loop {
             tokio::select! {
@@ -2004,7 +2104,7 @@ async fn serve_retained(
                         worker_filter,
                         idle_sleep,
                         live_view_mode,
-                        &mut viewport,
+                        &mut ui_state,
                         &snapshot,
                     )?;
                     if rows != last_rows {
@@ -2020,12 +2120,37 @@ async fn serve_retained(
                                         live_view_mode = live_view_mode.toggled();
                                         last_rows.clear();
                                     }
-                                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => viewport.scroll_up(1),
-                                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => viewport.scroll_down(1),
-                                    (KeyCode::PageUp, _) => viewport.page_up(),
-                                    (KeyCode::PageDown, _) => viewport.page_down(),
-                                    (KeyCode::Char('g'), KeyModifiers::NONE) => viewport.jump_top(),
-                                    (KeyCode::Char('G'), _) | (KeyCode::End, _) => viewport.jump_bottom(),
+                                    (KeyCode::Tab, _) => ui_state.switch_focus(),
+                                    (KeyCode::Enter, _) => {
+                                        let monitor = build_monitor_report(repo_filter, worker_filter)?;
+                                        let entries = build_serve_issue_entries(&monitor.claims, &[]);
+                                        ui_state.toggle_follow(&entries);
+                                    }
+                                    (KeyCode::Char(' '), _) => {
+                                        let monitor = build_monitor_report(repo_filter, worker_filter)?;
+                                        let entries = build_serve_issue_entries(&monitor.claims, &[]);
+                                        ui_state.follow_hottest(&entries);
+                                    }
+                                    (KeyCode::Up, _) | (KeyCode::Char('k'), _)
+                                        if ui_state.focus == AutoflowServeFocus::Issues =>
+                                    {
+                                        let monitor = build_monitor_report(repo_filter, worker_filter)?;
+                                        let entries = build_serve_issue_entries(&monitor.claims, &[]);
+                                        ui_state.move_selection(&entries, -1);
+                                    }
+                                    (KeyCode::Down, _) | (KeyCode::Char('j'), _)
+                                        if ui_state.focus == AutoflowServeFocus::Issues =>
+                                    {
+                                        let monitor = build_monitor_report(repo_filter, worker_filter)?;
+                                        let entries = build_serve_issue_entries(&monitor.claims, &[]);
+                                        ui_state.move_selection(&entries, 1);
+                                    }
+                                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => ui_state.detail_viewport.scroll_up(1),
+                                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => ui_state.detail_viewport.scroll_down(1),
+                                    (KeyCode::PageUp, _) => ui_state.detail_viewport.page_up(),
+                                    (KeyCode::PageDown, _) => ui_state.detail_viewport.page_down(),
+                                    (KeyCode::Char('g'), KeyModifiers::NONE) => ui_state.detail_viewport.jump_top(),
+                                    (KeyCode::Char('G'), _) | (KeyCode::End, _) => ui_state.detail_viewport.jump_bottom(),
                                     _ => {}
                                 }
                             }
@@ -2068,7 +2193,7 @@ fn build_retained_serve_rows(
     worker_filter: Option<&str>,
     idle_sleep: std::time::Duration,
     view_mode: LiveViewMode,
-    viewport: &mut ViewportState,
+    ui_state: &mut AutoflowServeUiState,
     snapshot: &ServeProgressSnapshot,
 ) -> anyhow::Result<Vec<String>> {
     let monitor = build_monitor_report(repo_filter, worker_filter)?;
@@ -2084,7 +2209,7 @@ fn build_retained_serve_rows(
         worker_filter,
         idle_sleep,
         view_mode,
-        viewport,
+        ui_state,
         snapshot,
         width.max(50) as usize,
         height.max(14) as usize,
@@ -2099,23 +2224,40 @@ fn build_retained_serve_rows_for_size(
     worker_filter: Option<&str>,
     idle_sleep: std::time::Duration,
     view_mode: LiveViewMode,
-    viewport: &mut ViewportState,
+    ui_state: &mut AutoflowServeUiState,
     snapshot: &ServeProgressSnapshot,
     width: usize,
     height: usize,
 ) -> Vec<String> {
+    let entries = build_serve_issue_entries(&monitor.claims, &[]);
+    let selected_index = ui_state.sync_selection(&entries);
+    let active = monitor
+        .claims
+        .iter()
+        .filter(|claim| matches!(claim.status.as_str(), "running" | "claimed"))
+        .count();
+    let blocked = monitor
+        .claims
+        .iter()
+        .filter(|claim| matches!(claim.status.as_str(), "await_human" | "await_external" | "retry_backoff" | "blocked"))
+        .count();
+    let failed = monitor
+        .claims
+        .iter()
+        .filter(|claim| claim.status == "failed")
+        .count();
+
     let mut rows = vec![
-        retained_serve_header_line(repo_filter, worker_filter, idle_sleep, width),
-        String::new(),
+        retained_serve_header_line(repo_filter, worker_filter, idle_sleep, view_mode, width),
         retained_serve_kv_row(
             "serve",
             &format!(
-                "cycles {}  ·  ran {}  ·  skipped {}  ·  failed {}  ·  cleaned {}  ·  {}",
+                "cycles {}  ·  active {}  ·  claims {}  ·  blocked {}  ·  failed {}  ·  {}",
                 snapshot.cycles,
-                snapshot.total.ran_cycles,
-                snapshot.total.skipped_cycles,
-                snapshot.total.failed_cycles,
-                snapshot.total.cleaned_claims,
+                active,
+                monitor.claims.len(),
+                blocked,
+                failed,
                 if snapshot.cycle_running {
                     "reconciling"
                 } else {
@@ -2129,182 +2271,57 @@ fn build_retained_serve_rows_for_size(
                 UiStatus::Active
             },
         ),
-    ];
-
-    let mut body_rows = Vec::new();
-
-    let primary = build_serve_issue_entries(&monitor.claims, &[])
-        .into_iter()
-        .find_map(|entry| entry.claim.cloned());
-
-    if let Some(claim) = primary.as_ref() {
-        body_rows.push(format!(
-            "{}",
-            retained_serve_kv_row(
-                "active",
-                &format!(
-                    "{}  ·  {}  ·  {}",
-                    display_issue_headline(claim),
-                    truncate_text(&claim.workflow, 30),
-                    claim.status
-                ),
-                width,
-                claim_status_ui(&claim.status),
-            )
-        ));
-
-        let mut route = vec![format!("repo {}", short_locator(&claim.repo, 28))];
-        if claim.branch != "-" {
-            route.push(format!("branch {}", truncate_text(&claim.branch, 22)));
-        }
-        if claim.pr != "-" {
-            route.push(format!("pr {}", short_url_like(&claim.pr, 22)));
-        }
-        body_rows.push(retained_serve_kv_row(
-            "route",
-            &route.join("  ·  "),
+        retained_serve_kv_row(
+            "queue",
+            &format!(
+                "due {}  ·  queued {}  ·  processed {}  ·  workers {}",
+                monitor.wakes.due,
+                monitor.wakes.queued,
+                monitor.wakes.processed_recent,
+                monitor.workers.len()
+            ),
             width,
             UiStatus::Active,
-        ));
-
-        if let Some((record, summary, live_lines)) =
-            resolve_live_claim_run(run_store, pricing, claim, view_mode)
-        {
-            body_rows.push(retained_serve_kv_row(
-                "run",
-                &format!(
-                    "{}  ·  {}  ·  {}",
-                    short_run_id(&summary.run_id),
-                    summary.status,
-                    format_duration(std::time::Duration::from_millis(
-                        summary.duration_ms.unwrap_or_default()
-                    ))
-                ),
-                width,
-                activity_status_for_run_summary(&summary),
-            ));
-
-            let current_step = record
-                .active_step_id
-                .as_deref()
-                .or(record.awaiting_step_id.as_deref())
-                .unwrap_or("-");
-            body_rows.push(retained_serve_kv_row(
-                "step",
-                &format!(
-                    "{}  ·  {}/{} complete",
-                    current_step,
-                    completed_steps(&summary),
-                    summary.steps.len()
-                ),
-                width,
-                UiStatus::Working,
-            ));
-
-            if let Some(usage) = &summary.usage {
-                body_rows.push(retained_serve_kv_row(
-                    "usage",
-                    &format!(
-                        "in {}  ·  out {}  ·  total {}{}",
-                        format_count(usage.input_tokens),
-                        format_count(usage.output_tokens),
-                        format_count(usage.total_tokens),
-                        usage
-                            .cost_usd
-                            .map(|cost| format!("  ·  ${cost:.2}"))
-                            .unwrap_or_default()
-                    ),
-                    width,
-                    UiStatus::Active,
-                ));
-            }
-
-            body_rows.push(String::new());
-            body_rows.extend(render_retained_serve_event_rows(&live_lines, width));
-        } else if claim.summary != "-" {
-            body_rows.push(retained_serve_kv_row(
-                "summary",
-                &claim.summary,
-                width,
-                UiStatus::Active,
-            ));
-        }
-    } else {
-        body_rows.push(retained_serve_kv_row(
-            "active",
-            "no active issues",
-            width,
-            UiStatus::Skipped,
-        ));
-    }
-
-    if view_mode == LiveViewMode::Full && !monitor.claims.is_empty() {
-        body_rows.push(String::new());
-        body_rows.push(retained_serve_section_title("claims", width));
-        for claim in monitor.claims.iter().take(6) {
-            let status = claim_status_ui(&claim.status);
-            body_rows.push(retained_serve_activity_line(
-                status,
-                &display_issue_headline(claim),
-                &format!(
-                    "{}  ·  {}",
-                    truncate_text(&claim.workflow, 24),
-                    claim.status
-                ),
-                width,
-            ));
-        }
-    }
-
-    body_rows.push(String::new());
-    body_rows.push(retained_serve_section_title("recent", width));
-    let recent_limit = match view_mode {
-        LiveViewMode::Compact => 2,
-        LiveViewMode::Focused => 4,
-        LiveViewMode::Full => 8,
-    };
-    for activity in monitor.activity.iter().take(recent_limit) {
-        let (status, label) = activity_status_and_label(&activity.event);
-        body_rows.push(retained_serve_activity_line(
-            status,
-            &activity.issue,
-            &format!("{label}  ·  {}", truncate_text(&activity.workflow, 24)),
-            width,
-        ));
-        if activity.detail != "-" {
-            body_rows.push(retained_serve_detail_line(
-                &truncate_text(&activity.detail, width.saturating_sub(2)),
-                width,
-            ));
-        }
-    }
-
-    body_rows.push(String::new());
-    body_rows.push(retained_serve_kv_row(
-        "queue",
-        &format!(
-            "queued {}  ·  due {}  ·  processed {}",
-            monitor.wakes.queued, monitor.wakes.due, monitor.wakes.processed_recent
         ),
-        width,
-        UiStatus::Active,
-    ));
+        String::new(),
+    ];
 
     let footer_reserved = 2usize;
     let available_body_rows = height
         .saturating_sub(rows.len())
         .saturating_sub(footer_reserved)
-        .max(1);
-    let body = viewport.apply(body_rows, available_body_rows).rows;
-    rows.extend(body);
+        .max(4);
+    let body_rows = if width >= 132 {
+        build_retained_serve_two_pane_rows(
+            &entries,
+            selected_index,
+            &monitor,
+            run_store,
+            pricing,
+            view_mode,
+            ui_state,
+            width,
+            available_body_rows,
+        )
+    } else {
+        build_retained_serve_stacked_rows(
+            &entries,
+            selected_index,
+            &monitor,
+            run_store,
+            pricing,
+            view_mode,
+            ui_state,
+            width,
+            available_body_rows,
+        )
+    };
+    rows.extend(body_rows);
     while rows.len() < height.saturating_sub(footer_reserved) {
         rows.push(String::new());
     }
-
     rows.push(retained_serve_controls_line(width));
-    rows.push(retained_serve_status_line(
-        view_mode, viewport, snapshot, width,
-    ));
+    rows.push(retained_serve_status_line(view_mode, ui_state, snapshot, width));
     rows.truncate(height);
     rows
 }
@@ -2314,7 +2331,7 @@ fn retained_serve_controls_line(width: usize) -> String {
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
     let _ = palette::write_colored(
         &mut buf,
-        "  f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  Ctrl-C quit",
+        "  Tab focus  ·  Enter pin  ·  Space hottest  ·  f cycle view  ·  ↑/↓ or j/k  ·  PgUp/PgDn  ·  g/G  ·  Ctrl-C quit",
         DIM,
     );
     truncate_retained_ansi_line(&buf, width)
@@ -2322,22 +2339,28 @@ fn retained_serve_controls_line(width: usize) -> String {
 
 fn retained_serve_status_line(
     view_mode: LiveViewMode,
-    viewport: &ViewportState,
+    ui_state: &AutoflowServeUiState,
     snapshot: &ServeProgressSnapshot,
     width: usize,
 ) -> String {
     retained_serve_kv_row(
         "view",
         &format!(
-            "{}  ·  {}  ·  cycles {}  ·  {}",
+            "{}  ·  focus {}  ·  {}  ·  {}  ·  cycles {}  ·  {}",
             view_mode.as_str(),
-            viewport.status_text(),
-            snapshot.cycles,
+            ui_state.focus_label(),
+            if ui_state.follow_hottest {
+                "following hottest"
+            } else {
+                "pinned selection"
+            },
+            ui_state.detail_viewport.status_text(),
             if snapshot.cycle_running {
                 "reconciling"
             } else {
                 "watching"
-            }
+            },
+            snapshot.cycles,
         ),
         width,
         UiStatus::Active,
@@ -2358,6 +2381,7 @@ fn retained_serve_header_line(
     repo_filter: Option<&str>,
     worker_filter: Option<&str>,
     idle_sleep: std::time::Duration,
+    view_mode: LiveViewMode,
     width: usize,
 ) -> String {
     let mut buf = String::new();
@@ -2367,10 +2391,11 @@ fn retained_serve_header_line(
     let _ = palette::write_colored(
         &mut buf,
         &format!(
-            "  ·  repo {}  ·  worker {}  ·  idle {}s",
+            "  ·  repo {}  ·  worker {}  ·  idle {}s  ·  {}",
             repo_filter.unwrap_or("(all)"),
             worker_filter.unwrap_or("(auto)"),
-            idle_sleep.as_secs_f32()
+            idle_sleep.as_secs_f32(),
+            view_mode.as_str(),
         ),
         DIM,
     );
@@ -2409,11 +2434,605 @@ fn retained_serve_activity_line(
     truncate_retained_ansi_line(&buf, width)
 }
 
-fn retained_serve_detail_line(detail: &str, width: usize) -> String {
+fn build_retained_serve_two_pane_rows(
+    entries: &[ServeIssueEntry<'_>],
+    selected_index: Option<usize>,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    view_mode: LiveViewMode,
+    ui_state: &mut AutoflowServeUiState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let gap = 2usize;
+    let left_width = (width / 3).clamp(34, 50);
+    let right_width = width.saturating_sub(left_width + gap).max(40);
+    let left_rows = build_issue_list_rows(
+        entries,
+        selected_index,
+        run_store,
+        pricing,
+        ui_state,
+        left_width,
+        height,
+    );
+    let right_rows = build_selected_issue_rows(
+        entries,
+        selected_index,
+        monitor,
+        run_store,
+        pricing,
+        view_mode,
+        ui_state,
+        right_width,
+        height,
+    );
+    merge_retained_columns(&left_rows, &right_rows, left_width, right_width, gap, height)
+}
+
+fn build_retained_serve_stacked_rows(
+    entries: &[ServeIssueEntry<'_>],
+    selected_index: Option<usize>,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    view_mode: LiveViewMode,
+    ui_state: &mut AutoflowServeUiState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let issue_height = height
+        .min(entries.len().saturating_add(3))
+        .clamp(4, height.saturating_sub(4).max(4));
+    let mut rows = build_issue_list_rows(
+        entries,
+        selected_index,
+        run_store,
+        pricing,
+        ui_state,
+        width,
+        issue_height,
+    );
+    if rows.len() < issue_height {
+        rows.resize(issue_height, String::new());
+    }
+    let detail_height = height.saturating_sub(rows.len() + 1).max(1);
+    rows.push(String::new());
+    rows.extend(build_selected_issue_rows(
+        entries,
+        selected_index,
+        monitor,
+        run_store,
+        pricing,
+        view_mode,
+        ui_state,
+        width,
+        detail_height,
+    ));
+    rows.truncate(height);
+    rows
+}
+
+fn build_issue_list_rows(
+    entries: &[ServeIssueEntry<'_>],
+    selected_index: Option<usize>,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    ui_state: &mut AutoflowServeUiState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let mut rows = vec![retained_serve_focus_section_title(
+        "issues",
+        ui_state.focus == AutoflowServeFocus::Issues,
+        Some(if ui_state.follow_hottest {
+            "following hottest"
+        } else {
+            "pinned"
+        }),
+        width,
+    )];
+    if entries.is_empty() {
+        rows.push(retained_serve_kv_row(
+            "items",
+            "no visible issues",
+            width,
+            UiStatus::Skipped,
+        ));
+        return rows;
+    }
+    let visible_slots = height.saturating_sub(rows.len()).max(1);
+    let selected_index = selected_index.unwrap_or(0);
+    if selected_index < ui_state.issue_scroll {
+        ui_state.issue_scroll = selected_index;
+    } else {
+        let end = ui_state.issue_scroll.saturating_add(visible_slots);
+        if selected_index >= end {
+            ui_state.issue_scroll = selected_index.saturating_sub(visible_slots.saturating_sub(1));
+        }
+    }
+    let start = ui_state.issue_scroll.min(entries.len().saturating_sub(1));
+    let end = (start + visible_slots).min(entries.len());
+    for (offset, entry) in entries[start..end].iter().enumerate() {
+        let idx = start + offset;
+        rows.push(render_issue_list_row(
+            entry,
+            idx == selected_index,
+            run_store,
+            pricing,
+            width,
+        ));
+    }
+    rows
+}
+
+fn render_issue_list_row(
+    entry: &ServeIssueEntry<'_>,
+    selected: bool,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    width: usize,
+) -> String {
     let mut buf = String::new();
-    let _ = palette::write_colored(&mut buf, "  ", DIM);
-    let _ = palette::write_colored(&mut buf, detail, DIM);
+    let selected_color = if selected { BRAND } else { DIM };
+    let _ = palette::write_bold_colored(&mut buf, if selected { "▸" } else { " " }, selected_color);
+    buf.push(' ');
+    match entry.claim {
+        Some(claim) => {
+            let status = claim_status_ui(&claim.status);
+            let _ = palette::write_bold_colored(&mut buf, &status.glyph().to_string(), status.color());
+            buf.push(' ');
+            let _ = palette::write_bold_colored(
+                &mut buf,
+                &truncate_single_line(&display_issue_headline(claim), 28),
+                if selected { BRAND } else { status.color() },
+            );
+            let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+            let _ = palette::write_colored(
+                &mut buf,
+                &truncate_single_line(&claim.workflow, 22),
+                BRAND,
+            );
+            if let Some(chip) = issue_stage_chip(claim, run_store, pricing) {
+                let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+                let _ = palette::write_colored(&mut buf, &truncate_single_line(&chip, 36), DIM);
+            } else if claim.status != "-" {
+                let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+                let _ = palette::write_colored(&mut buf, &truncate_single_line(&claim.status, 18), DIM);
+            }
+        }
+        None => {
+            let _ = palette::write_bold_colored(&mut buf, "○", UiStatus::Skipped.color());
+            buf.push(' ');
+            let _ = palette::write_bold_colored(
+                &mut buf,
+                &truncate_single_line(&entry.issue_ref, 36),
+                UiStatus::Skipped.color(),
+            );
+            let _ = palette::write_colored(&mut buf, "  ·  detached", DIM);
+        }
+    }
     truncate_retained_ansi_line(&buf, width)
+}
+
+fn build_selected_issue_rows(
+    entries: &[ServeIssueEntry<'_>],
+    selected_index: Option<usize>,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    view_mode: LiveViewMode,
+    ui_state: &mut AutoflowServeUiState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let mut pinned = vec![retained_serve_focus_section_title(
+        "selected",
+        ui_state.focus == AutoflowServeFocus::Detail,
+        selected_index
+            .map(|idx| format!("issue {}/{}", idx + 1, entries.len()))
+            .as_deref(),
+        width,
+    )];
+
+    let Some(selected_index) = selected_index else {
+        pinned.push(retained_serve_kv_row(
+            "detail",
+            "no issue selected",
+            width,
+            UiStatus::Skipped,
+        ));
+        return pinned;
+    };
+    let entry = &entries[selected_index];
+    let Some(claim) = entry.claim else {
+        pinned.push(retained_serve_kv_row(
+            "detail",
+            &entry.issue_ref,
+            width,
+            UiStatus::Skipped,
+        ));
+        return pinned;
+    };
+
+    pinned.push(retained_serve_kv_row(
+        "issue",
+        &format!(
+            "{}  ·  {}",
+            display_issue_headline(claim),
+            truncate_single_line(&claim.workflow, 28)
+        ),
+        width,
+        claim_status_ui(&claim.status),
+    ));
+
+    let mut route = vec![format!("repo {}", short_locator(&claim.repo, 28))];
+    if claim.branch != "-" {
+        route.push(format!("branch {}", truncate_text(&claim.branch, 22)));
+    }
+    if claim.pr != "-" {
+        route.push(format!("pr {}", short_url_like(&claim.pr, 22)));
+    }
+    pinned.push(retained_serve_kv_row(
+        "route",
+        &route.join("  ·  "),
+        width,
+        UiStatus::Active,
+    ));
+
+    let mut scrollable = Vec::new();
+    if let Some((record, summary, live_lines)) = resolve_live_claim_run(run_store, pricing, claim, view_mode) {
+        pinned.push(retained_serve_kv_row(
+            "run",
+            &format!(
+                "{}  ·  {}  ·  {}",
+                short_run_id(&summary.run_id),
+                summary.status,
+                format_duration(std::time::Duration::from_millis(
+                    summary.duration_ms.unwrap_or_default()
+                ))
+            ),
+            width,
+            activity_status_for_run_summary(&summary),
+        ));
+
+        let current_step = record
+            .active_step_id
+            .as_deref()
+            .or(record.awaiting_step_id.as_deref())
+            .unwrap_or("-");
+        pinned.push(retained_serve_kv_row(
+            "stage",
+            &format!(
+                "{}  ·  {}/{} complete",
+                current_step,
+                completed_steps(&summary),
+                summary.steps.len().max(1)
+            ),
+            width,
+            if record.awaiting_step_id.is_some() {
+                UiStatus::Awaiting
+            } else {
+                UiStatus::Working
+            },
+        ));
+        if let Some(usage) = &summary.usage {
+            pinned.push(retained_serve_kv_row(
+                "usage",
+                &format!(
+                    "in {}  ·  out {}  ·  total {}{}",
+                    format_count(usage.input_tokens),
+                    format_count(usage.output_tokens),
+                    format_count(usage.total_tokens),
+                    usage
+                        .cost_usd
+                        .map(|cost| format!("  ·  ${cost:.2}"))
+                        .unwrap_or_default()
+                ),
+                width,
+                UiStatus::Active,
+            ));
+        }
+        if let Some(diff) = &summary.diff {
+            pinned.push(retained_serve_kv_row(
+                "changes",
+                &format!(
+                    "{} file(s)  ·  +{}/-{}",
+                    diff.files_changed,
+                    format_compact_count(diff.insertions),
+                    format_compact_count(diff.deletions)
+                ),
+                width,
+                UiStatus::Complete,
+            ));
+        }
+        pinned.push(String::new());
+        pinned.push(retained_serve_section_title("timeline", width));
+        scrollable.extend(build_issue_canvas_rows(
+            claim,
+            &record,
+            &summary,
+            &live_lines,
+            width,
+        ));
+    } else {
+        pinned.push(retained_serve_kv_row(
+            "state",
+            &format!("{}  ·  {}", claim.status, truncate_text(&claim.next, 42)),
+            width,
+            claim_status_ui(&claim.status),
+        ));
+        if claim.summary != "-" {
+            pinned.push(retained_serve_kv_row(
+                "summary",
+                &claim.summary,
+                width,
+                UiStatus::Active,
+            ));
+        }
+    }
+
+    let issue_recent = monitor
+        .activity
+        .iter()
+        .filter(|activity| activity_matches_claim(activity, claim))
+        .take(match view_mode {
+            LiveViewMode::Focused => 3,
+            LiveViewMode::Compact => 5,
+            LiveViewMode::Full => 8,
+        })
+        .collect::<Vec<_>>();
+    if !issue_recent.is_empty() {
+        if !scrollable.is_empty() {
+            scrollable.push(String::new());
+        }
+        scrollable.push(retained_serve_section_title("recent issue activity", width));
+        for activity in issue_recent {
+            let (status, label) = activity_status_and_label(&activity.event);
+            scrollable.push(retained_serve_activity_line(
+                status,
+                &short_timestamp(&activity.at),
+                &format!("{label}  ·  {}", truncate_text(&activity.detail, 64)),
+                width,
+            ));
+        }
+    }
+
+    let body_slots = height.saturating_sub(pinned.len()).max(1);
+    let window = ui_state.detail_viewport.apply(scrollable, body_slots);
+    pinned.extend(window.rows);
+    pinned.truncate(height);
+    pinned
+}
+
+fn build_issue_canvas_rows(
+    claim: &AutoflowClaimRow,
+    record: &rupu_orchestrator::RunRecord,
+    summary: &AutoflowRunSummary,
+    live_lines: &[AutoflowServeViewLine],
+    width: usize,
+) -> Vec<String> {
+    render_retained_serve_event_rows(
+        &build_issue_canvas_lines(claim, record, summary, live_lines),
+        width,
+    )
+}
+
+fn build_issue_canvas_lines(
+    claim: &AutoflowClaimRow,
+    record: &rupu_orchestrator::RunRecord,
+    summary: &AutoflowRunSummary,
+    live_lines: &[AutoflowServeViewLine],
+) -> Vec<AutoflowServeViewLine> {
+    let outline = load_workflow_outline(record);
+    let completed = summary
+        .steps
+        .iter()
+        .map(|step| (step.step_id.as_str(), step))
+        .collect::<BTreeMap<_, _>>();
+    let active_step = record.active_step_id.as_deref();
+    let awaiting_step = record.awaiting_step_id.as_deref();
+    let mut order = outline;
+    if order.is_empty() {
+        for step in &summary.steps {
+            order.push(WorkflowStepOutline {
+                step_id: step.step_id.clone(),
+                kind: StepKind::Linear,
+            });
+        }
+    }
+    if let Some(step_id) = active_step.or(awaiting_step) {
+        if !order.iter().any(|step| step.step_id == step_id) {
+            order.push(WorkflowStepOutline {
+                step_id: step_id.to_string(),
+                kind: record.active_step_kind.unwrap_or_default(),
+            });
+        }
+    }
+
+    let mut lines = Vec::new();
+    if order.is_empty() {
+        lines.push(AutoflowServeViewLine {
+            status: claim_status_ui(&claim.status),
+            text: format!("workflow  ·  {}", claim.workflow),
+            continuation: false,
+            indent: 0,
+            kind: AutoflowServeViewLineKind::TreeItem,
+        });
+        return lines;
+    }
+
+    for step in order {
+        let completed_step = completed.get(step.step_id.as_str()).copied();
+        let status = if Some(step.step_id.as_str()) == active_step {
+            UiStatus::Working
+        } else if Some(step.step_id.as_str()) == awaiting_step {
+            UiStatus::Awaiting
+        } else if let Some(step) = completed_step {
+            step.status
+        } else {
+            UiStatus::Waiting
+        };
+        let mut detail_parts = Vec::new();
+        if step.kind != StepKind::Linear {
+            detail_parts.push(step_kind_label(step.kind).to_string());
+        }
+        if Some(step.step_id.as_str()) == active_step {
+            if let Some(agent) = record.active_step_agent.as_deref() {
+                detail_parts.push(truncate_text(agent, 24));
+            } else {
+                detail_parts.push("running".into());
+            }
+        } else if Some(step.step_id.as_str()) == awaiting_step {
+            detail_parts.push("awaiting approval".into());
+        } else if let Some(step) = completed_step {
+            if let Some(detail) = step.detail.as_deref() {
+                detail_parts.push(truncate_text(detail, 52));
+            }
+        }
+
+        lines.push(AutoflowServeViewLine {
+            status,
+            text: retained_workflow_step_line(&step.step_id, &detail_parts.join("  ·  ")),
+            continuation: false,
+            indent: 0,
+            kind: AutoflowServeViewLineKind::TreeItem,
+        });
+
+        if Some(step.step_id.as_str()) == active_step {
+            for line in live_lines {
+                let mut nested = line.clone();
+                nested.indent += 1;
+                if nested.kind == AutoflowServeViewLineKind::Event {
+                    nested.kind = AutoflowServeViewLineKind::TreeItem;
+                }
+                lines.push(nested);
+            }
+        }
+    }
+    lines
+}
+
+fn load_workflow_outline(record: &rupu_orchestrator::RunRecord) -> Vec<WorkflowStepOutline> {
+    let Ok(global) = paths::global_dir() else {
+        return Vec::new();
+    };
+    let Ok(path) = locate_workflow_in(&global, Some(&record.workspace_path), &record.workflow_name) else {
+        return Vec::new();
+    };
+    let Ok(workflow) = Workflow::parse_file(&path) else {
+        return Vec::new();
+    };
+    workflow
+        .steps
+        .into_iter()
+        .map(|step| WorkflowStepOutline {
+            step_id: step.id,
+            kind: if step.panel.is_some() {
+                StepKind::Panel
+            } else if step.parallel.is_some() {
+                StepKind::Parallel
+            } else if step.for_each.is_some() {
+                StepKind::ForEach
+            } else {
+                StepKind::Linear
+            },
+        })
+        .collect()
+}
+
+fn retained_workflow_step_line(step_id: &str, detail: &str) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, step_id, BRAND);
+    if !detail.is_empty() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+        let _ = palette::write_colored(&mut buf, detail, DIM);
+    }
+    buf
+}
+
+fn issue_stage_chip(
+    claim: &AutoflowClaimRow,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+) -> Option<String> {
+    let run_id = (claim.last_run != "-").then_some(claim.last_run.as_str())?;
+    let summary = load_run_summary(run_store, run_id, pricing)?;
+    let mut parts = summary
+        .steps
+        .iter()
+        .take(3)
+        .map(|step| step.step_id.clone())
+        .collect::<Vec<_>>();
+    if claim.status != "complete" && claim.next != "-" && !parts.iter().any(|part| part == &claim.next)
+    {
+        parts.push(format!("[{}]", truncate_text(&claim.next, 18)));
+    }
+    (!parts.is_empty()).then(|| truncate_text(&parts.join(" → "), 40))
+}
+
+fn activity_matches_claim(activity: &AutoflowMonitorActivityRow, claim: &AutoflowClaimRow) -> bool {
+    activity.issue == claim.issue
+        || claim
+            .issue_display
+            .as_deref()
+            .is_some_and(|display| activity.issue == display)
+}
+
+fn retained_serve_focus_section_title(
+    title: &str,
+    focused: bool,
+    suffix: Option<&str>,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    let marker = if focused { "▸" } else { " " };
+    let _ = palette::write_bold_colored(&mut buf, marker, if focused { BRAND } else { DIM });
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, title, BRAND);
+    if let Some(suffix) = suffix.filter(|suffix| !suffix.is_empty()) {
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+        let _ = palette::write_colored(&mut buf, suffix, DIM);
+    }
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn merge_retained_columns(
+    left_rows: &[String],
+    right_rows: &[String],
+    left_width: usize,
+    right_width: usize,
+    gap: usize,
+    height: usize,
+) -> Vec<String> {
+    let mut rows = Vec::new();
+    let spacer = " ".repeat(gap);
+    let count = left_rows.len().max(right_rows.len()).min(height);
+    for idx in 0..count {
+        let left = fit_retained_ansi_line(left_rows.get(idx).map(String::as_str).unwrap_or(""), left_width);
+        let right = fit_retained_ansi_line(right_rows.get(idx).map(String::as_str).unwrap_or(""), right_width);
+        rows.push(format!("{left}{spacer}{right}"));
+    }
+    rows
+}
+
+fn fit_retained_ansi_line(value: &str, width: usize) -> String {
+    let mut line = truncate_retained_ansi_line(value, width);
+    let pad = width.saturating_sub(visible_len(&line));
+    if pad > 0 {
+        line.push_str(&" ".repeat(pad));
+    }
+    line
+}
+
+fn step_kind_label(kind: StepKind) -> &'static str {
+    match kind {
+        StepKind::Linear => "linear",
+        StepKind::ForEach => "for_each",
+        StepKind::Parallel => "parallel",
+        StepKind::Panel => "panel",
+    }
 }
 
 fn activity_status_for_run_summary(summary: &AutoflowRunSummary) -> UiStatus {
@@ -2460,18 +3079,7 @@ fn retained_serve_ui_prefs() -> UiPrefs {
 fn render_retained_serve_event_rows(lines: &[AutoflowServeViewLine], width: usize) -> Vec<String> {
     let mut rendered = Vec::new();
     for line in lines {
-        let prefix = if line.continuation {
-            "  ".to_string()
-        } else {
-            let mut value = String::new();
-            let _ = palette::write_bold_colored(
-                &mut value,
-                &line.status.glyph().to_string(),
-                line.status.color(),
-            );
-            value.push(' ');
-            value
-        };
+        let prefix = retained_serve_line_prefix(line);
         let content_width = width.saturating_sub(visible_len(&prefix)).max(1);
         for (idx, segment) in wrap_with_ansi(&line.text, content_width)
             .into_iter()
@@ -2480,11 +3088,61 @@ fn render_retained_serve_event_rows(lines: &[AutoflowServeViewLine], width: usiz
             if idx == 0 && !line.continuation {
                 rendered.push(format!("{prefix}{segment}"));
             } else {
-                rendered.push(format!("  {segment}"));
+                rendered.push(format!(
+                    "{}{}",
+                    retained_serve_continuation_prefix(line),
+                    segment
+                ));
             }
         }
     }
     rendered
+}
+
+fn retained_serve_line_prefix(line: &AutoflowServeViewLine) -> String {
+    let mut value = retained_serve_rail_prefix(line.indent);
+    match line.kind {
+        AutoflowServeViewLineKind::Event => {
+            let _ = palette::write_bold_colored(
+                &mut value,
+                &line.status.glyph().to_string(),
+                line.status.color(),
+            );
+            value.push(' ');
+        }
+        AutoflowServeViewLineKind::TreeItem => {
+            let _ = palette::write_colored(&mut value, "├─ ", BRAND);
+            let _ = palette::write_bold_colored(
+                &mut value,
+                &line.status.glyph().to_string(),
+                line.status.color(),
+            );
+            value.push(' ');
+        }
+        AutoflowServeViewLineKind::TreeNote => {
+            let _ = palette::write_colored(&mut value, "│  ", BRAND);
+        }
+    }
+    value
+}
+
+fn retained_serve_continuation_prefix(line: &AutoflowServeViewLine) -> String {
+    let mut value = retained_serve_rail_prefix(line.indent);
+    match line.kind {
+        AutoflowServeViewLineKind::TreeItem | AutoflowServeViewLineKind::TreeNote => {
+            let _ = palette::write_colored(&mut value, "│  ", BRAND);
+        }
+        AutoflowServeViewLineKind::Event => value.push_str("  "),
+    }
+    value
+}
+
+fn retained_serve_rail_prefix(indent: usize) -> String {
+    let mut value = String::new();
+    for _ in 0..indent {
+        let _ = palette::write_colored(&mut value, "│  ", BRAND);
+    }
+    value
 }
 
 fn resolve_live_claim_run(
@@ -2562,36 +3220,52 @@ fn load_live_run_lines(
     lines
 }
 
+fn serve_event_line(status: UiStatus, text: impl Into<String>) -> AutoflowServeViewLine {
+    AutoflowServeViewLine {
+        status,
+        text: text.into(),
+        continuation: false,
+        indent: 0,
+        kind: AutoflowServeViewLineKind::Event,
+    }
+}
+
+fn serve_note_line(status: UiStatus, text: impl Into<String>) -> AutoflowServeViewLine {
+    AutoflowServeViewLine {
+        status,
+        text: text.into(),
+        continuation: true,
+        indent: 0,
+        kind: AutoflowServeViewLineKind::TreeNote,
+    }
+}
+
 fn live_run_event_lines(
     event: &TranscriptEvent,
     view_mode: LiveViewMode,
 ) -> Vec<AutoflowServeViewLine> {
     match event {
-        TranscriptEvent::TurnStart { turn_idx } => vec![AutoflowServeViewLine {
-            status: UiStatus::Working,
-            text: format!("turn {turn_idx}  ·  assistant turn started"),
-            continuation: false,
-        }],
+        TranscriptEvent::TurnStart { turn_idx } => {
+            vec![serve_event_line(
+                UiStatus::Working,
+                format!("turn {turn_idx}  ·  assistant turn started"),
+            )]
+        }
         TranscriptEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
             match view_mode {
-                LiveViewMode::Focused => vec![AutoflowServeViewLine {
-                    status: UiStatus::Active,
-                    text: format!("assistant  ·  {}", truncate_single_line(content, 96)),
-                    continuation: false,
-                }],
+                LiveViewMode::Focused => vec![serve_event_line(
+                    UiStatus::Active,
+                    format!("assistant  ·  {}", truncate_single_line(content, 96)),
+                )],
                 LiveViewMode::Compact | LiveViewMode::Full => {
                     let prefs = retained_serve_ui_prefs();
                     let highlighted = render_assistant_content(content.trim(), &prefs).rendered;
                     let mut out = Vec::new();
                     for (index, line) in highlighted.lines().enumerate() {
-                        out.push(AutoflowServeViewLine {
-                            status: UiStatus::Active,
-                            text: if index == 0 {
-                                format!("assistant output  ·  {line}")
-                            } else {
-                                line.to_string()
-                            },
-                            continuation: index > 0,
+                        out.push(if index == 0 {
+                            serve_event_line(UiStatus::Active, format!("assistant output  ·  {line}"))
+                        } else {
+                            serve_note_line(UiStatus::Active, line.to_string())
                         });
                     }
                     out
@@ -2599,32 +3273,56 @@ fn live_run_event_lines(
             }
         }
         TranscriptEvent::ToolCall { tool, input, .. } => match view_mode {
-            LiveViewMode::Focused | LiveViewMode::Compact => vec![AutoflowServeViewLine {
-                status: UiStatus::Working,
-                text: format!(
+            LiveViewMode::Focused => vec![serve_event_line(
+                UiStatus::Working,
+                format!(
                     "{}  ·  {}",
                     tool,
                     crate::output::workflow_printer::tool_summary(tool, input)
                 ),
-                continuation: false,
-            }],
-            LiveViewMode::Full => {
+            )],
+            LiveViewMode::Compact => {
                 let prefs = retained_serve_ui_prefs();
-                let mut out = vec![AutoflowServeViewLine {
-                    status: UiStatus::Working,
-                    text: format!(
+                let mut out = vec![serve_event_line(
+                    UiStatus::Working,
+                    format!(
                         "{}  ·  {}",
                         tool,
                         crate::output::workflow_printer::tool_summary(tool, input)
                     ),
-                    continuation: false,
-                }];
+                )];
                 if let Some(rendered) = render_tool_input(tool, input, &prefs) {
-                    out.extend(rendered.lines().map(|line| AutoflowServeViewLine {
-                        status: UiStatus::Working,
-                        text: line.to_string(),
-                        continuation: true,
-                    }));
+                    let lines = rendered.lines().collect::<Vec<_>>();
+                    out.extend(
+                        lines.iter()
+                            .take(4)
+                            .map(|line| serve_note_line(UiStatus::Working, (*line).to_string())),
+                    );
+                    if lines.len() > 4 {
+                        out.push(serve_note_line(
+                            UiStatus::Working,
+                            format!("… +{} more line(s)", lines.len() - 4),
+                        ));
+                    }
+                }
+                out
+            }
+            LiveViewMode::Full => {
+                let prefs = retained_serve_ui_prefs();
+                let mut out = vec![serve_event_line(
+                    UiStatus::Working,
+                    format!(
+                        "{}  ·  {}",
+                        tool,
+                        crate::output::workflow_printer::tool_summary(tool, input)
+                    ),
+                )];
+                if let Some(rendered) = render_tool_input(tool, input, &prefs) {
+                    out.extend(
+                        rendered
+                            .lines()
+                            .map(|line| serve_note_line(UiStatus::Working, line.to_string())),
+                    );
                 }
                 out
             }
@@ -2644,9 +3342,9 @@ fn live_run_event_lines(
             let raw = error.as_deref().unwrap_or(output.as_str());
             let payload = render_payload(raw, &prefs);
             match view_mode {
-                LiveViewMode::Focused => vec![AutoflowServeViewLine {
+                LiveViewMode::Focused => vec![serve_event_line(
                     status,
-                    text: format!(
+                    format!(
                         "{}  ·  {}{}",
                         if error.is_some() {
                             "tool error"
@@ -2660,12 +3358,11 @@ fn live_run_event_lines(
                             String::new()
                         }
                     ),
-                    continuation: false,
-                }],
+                )],
                 LiveViewMode::Compact => {
-                    let mut out = vec![AutoflowServeViewLine {
+                    let mut out = vec![serve_event_line(
                         status,
-                        text: format!(
+                        format!(
                             "{}  ·  {}{}",
                             if error.is_some() {
                                 "tool error"
@@ -2679,23 +3376,18 @@ fn live_run_event_lines(
                                 String::new()
                             }
                         ),
-                        continuation: false,
-                    }];
+                    )];
                     out.extend(
                         render_payload_preview_lines(&payload, 5)
                             .into_iter()
-                            .map(|line| AutoflowServeViewLine {
-                                status,
-                                text: line,
-                                continuation: true,
-                            }),
+                            .map(|line| serve_note_line(status, line)),
                     );
                     out
                 }
                 LiveViewMode::Full => {
-                    let mut out = vec![AutoflowServeViewLine {
+                    let mut out = vec![serve_event_line(
                         status,
-                        text: format!(
+                        format!(
                             "{}  ·  {}{}",
                             if error.is_some() {
                                 "tool error"
@@ -2709,13 +3401,13 @@ fn live_run_event_lines(
                                 String::new()
                             }
                         ),
-                        continuation: false,
-                    }];
-                    out.extend(payload.rendered.lines().map(|line| AutoflowServeViewLine {
-                        status,
-                        text: line.to_string(),
-                        continuation: true,
-                    }));
+                    )];
+                    out.extend(
+                        payload
+                            .rendered
+                            .lines()
+                            .map(|line| serve_note_line(status, line.to_string())),
+                    );
                     out
                 }
             }
@@ -2723,55 +3415,49 @@ fn live_run_event_lines(
         TranscriptEvent::FileEdit { path, kind, diff } => {
             let prefs = retained_serve_ui_prefs();
             match view_mode {
-                LiveViewMode::Focused => vec![AutoflowServeViewLine {
-                    status: UiStatus::Complete,
-                    text: format!(
+                LiveViewMode::Focused => vec![serve_event_line(
+                    UiStatus::Complete,
+                    format!(
                         "file edit  ·  {} {}",
                         format!("{kind:?}").to_lowercase(),
                         path
                     ),
-                    continuation: false,
-                }],
+                )],
                 LiveViewMode::Compact => {
                     let payload = render_payload(diff, &prefs);
-                    let mut out = vec![AutoflowServeViewLine {
-                        status: UiStatus::Complete,
-                        text: format!(
+                    let mut out = vec![serve_event_line(
+                        UiStatus::Complete,
+                        format!(
                             "file edit  ·  {} {}  ·  {}",
                             format!("{kind:?}").to_lowercase(),
                             path,
                             payload.headline
                         ),
-                        continuation: false,
-                    }];
+                    )];
                     out.extend(
                         render_payload_preview_lines(&payload, 8)
                             .into_iter()
-                            .map(|line| AutoflowServeViewLine {
-                                status: UiStatus::Complete,
-                                text: line,
-                                continuation: true,
-                            }),
+                            .map(|line| serve_note_line(UiStatus::Complete, line)),
                     );
                     out
                 }
                 LiveViewMode::Full => {
                     let payload = render_payload(diff, &prefs);
-                    let mut out = vec![AutoflowServeViewLine {
-                        status: UiStatus::Complete,
-                        text: format!(
+                    let mut out = vec![serve_event_line(
+                        UiStatus::Complete,
+                        format!(
                             "file edit  ·  {} {}  ·  {}",
                             format!("{kind:?}").to_lowercase(),
                             path,
                             payload.headline
                         ),
-                        continuation: false,
-                    }];
-                    out.extend(payload.rendered.lines().map(|line| AutoflowServeViewLine {
-                        status: UiStatus::Complete,
-                        text: line.to_string(),
-                        continuation: true,
-                    }));
+                    )];
+                    out.extend(
+                        payload
+                            .rendered
+                            .lines()
+                            .map(|line| serve_note_line(UiStatus::Complete, line.to_string())),
+                    );
                     out
                 }
             }
@@ -2786,13 +3472,12 @@ fn live_run_event_lines(
             if !view_mode.shows_full_payloads() {
                 return Vec::new();
             }
-            vec![AutoflowServeViewLine {
-                status: UiStatus::Active,
-                text: format!(
+            vec![serve_event_line(
+                UiStatus::Active,
+                format!(
                     "usage  ·  {provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
                 ),
-                continuation: false,
-            }]
+            )]
         }
         TranscriptEvent::TurnEnd {
             turn_idx,
@@ -2802,15 +3487,14 @@ fn live_run_event_lines(
             if !view_mode.shows_full_payloads() {
                 return Vec::new();
             }
-            vec![AutoflowServeViewLine {
-                status: UiStatus::Complete,
-                text: format!(
+            vec![serve_event_line(
+                UiStatus::Complete,
+                format!(
                     "turn complete  ·  turn {turn_idx}  ·  in {} out {}",
                     tokens_in.unwrap_or(0),
                     tokens_out.unwrap_or(0)
                 ),
-                continuation: false,
-            }]
+            )]
         }
         TranscriptEvent::RunComplete {
             status,
@@ -2818,14 +3502,14 @@ fn live_run_event_lines(
             duration_ms,
             error,
             ..
-        } => vec![AutoflowServeViewLine {
-            status: match status {
+        } => vec![serve_event_line(
+            match status {
                 rupu_transcript::RunStatus::Ok => UiStatus::Complete,
                 rupu_transcript::RunStatus::Error | rupu_transcript::RunStatus::Aborted => {
                     UiStatus::Failed
                 }
             },
-            text: {
+            {
                 let mut text = format!(
                     "run complete  ·  status {}  ·  {}ms  ·  {} tokens",
                     format!("{status:?}").to_lowercase(),
@@ -2838,8 +3522,7 @@ fn live_run_event_lines(
                 }
                 text
             },
-            continuation: false,
-        }],
+        )],
         _ => Vec::new(),
     }
 }
@@ -3453,7 +4136,7 @@ mod serve_heartbeat_tests {
             kind: "autoflow_monitor",
             version: 1,
             workers: Vec::new(),
-            claims: vec![running],
+            claims: vec![running, blocked],
             activity: vec![
                 AutoflowMonitorActivityRow {
                     at: "2026-05-14T05:00:00Z".into(),
@@ -3588,7 +4271,7 @@ mod serve_heartbeat_tests {
     fn retained_serve_focused_mode_omits_claims_section() {
         let tmp = tempdir().unwrap();
         let run_store = RunStore::new(tmp.path().join("runs"));
-        let mut viewport = ViewportState::default();
+        let mut ui_state = AutoflowServeUiState::default();
         let rows = build_retained_serve_rows_for_size(
             &sample_monitor_report(),
             &run_store,
@@ -3597,22 +4280,27 @@ mod serve_heartbeat_tests {
             Some("team-mini-01"),
             std::time::Duration::from_secs(10),
             crate::cmd::ui::LiveViewMode::Focused,
-            &mut viewport,
+            &mut ui_state,
             &ServeProgressSnapshot::default(),
             80,
             24,
         );
         assert!(rows
             .iter()
-            .any(|row| row.contains("active") && row.contains("storefront-feature-delivery")));
-        assert!(!rows.iter().any(|row| row.contains("claims")));
+            .any(|row| row.contains("issues")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("selected") || row.contains("issue 1/")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("storefront-feature-delivery")));
     }
 
     #[test]
-    fn retained_serve_full_mode_includes_claims_section() {
+    fn retained_serve_full_mode_shows_operator_console_layout() {
         let tmp = tempdir().unwrap();
         let run_store = RunStore::new(tmp.path().join("runs"));
-        let mut viewport = ViewportState::default();
+        let mut ui_state = AutoflowServeUiState::default();
         let rows = build_retained_serve_rows_for_size(
             &sample_monitor_report(),
             &run_store,
@@ -3621,15 +4309,16 @@ mod serve_heartbeat_tests {
             Some("team-mini-01"),
             std::time::Duration::from_secs(10),
             crate::cmd::ui::LiveViewMode::Full,
-            &mut viewport,
+            &mut ui_state,
             &ServeProgressSnapshot::default(),
-            80,
+            150,
             24,
         );
-        assert!(rows.iter().any(|row| row.contains("claims")));
         assert!(rows
             .iter()
             .any(|row| row.contains("storefront-feature-delivery")));
+        assert!(rows.iter().any(|row| row.contains("following hottest")));
+        assert!(rows.iter().any(|row| row.contains("issues")));
     }
 
     #[test]
@@ -3701,12 +4390,25 @@ mod serve_heartbeat_tests {
                 status: UiStatus::Active,
                 text: format!("event line {index:03}"),
                 continuation: false,
+                indent: 0,
+                kind: AutoflowServeViewLineKind::Event,
             })
             .collect::<Vec<_>>();
         let rendered = render_retained_serve_event_rows(&lines, 72);
         assert!(rendered.iter().any(|row| row.contains("event line 000")));
         assert!(rendered.iter().any(|row| row.contains("event line 039")));
         assert!(rendered.len() >= 40);
+    }
+
+    #[test]
+    fn retained_serve_issue_selection_moves_off_hottest() {
+        let mut ui_state = AutoflowServeUiState::default();
+        let report = sample_monitor_report();
+        let entries = build_serve_issue_entries(&report.claims, &[]);
+        assert_eq!(ui_state.sync_selection(&entries), Some(0));
+        ui_state.move_selection(&entries, 1);
+        assert!(!ui_state.follow_hottest);
+        assert_eq!(ui_state.sync_selection(&entries), Some(1));
     }
 }
 
