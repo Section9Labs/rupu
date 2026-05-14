@@ -103,6 +103,14 @@ struct WorkflowViewLine {
     text: String,
     continuation: bool,
     indent: usize,
+    kind: WorkflowViewLineKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowViewLineKind {
+    Event,
+    TreeItem,
+    TreeNote,
 }
 
 struct WorkflowInteractiveState {
@@ -136,6 +144,7 @@ impl WorkflowInteractiveState {
             text: text.into(),
             continuation: false,
             indent: 0,
+            kind: WorkflowViewLineKind::Event,
         });
     }
 
@@ -143,12 +152,23 @@ impl WorkflowInteractiveState {
         self.lines.push(line);
     }
 
-    fn push_nested_line(&mut self, status: UiStatus, indent: usize, text: impl Into<String>) {
+    fn push_tree_item(&mut self, status: UiStatus, indent: usize, text: impl Into<String>) {
         self.lines.push(WorkflowViewLine {
             status,
             text: text.into(),
             continuation: false,
             indent,
+            kind: WorkflowViewLineKind::TreeItem,
+        });
+    }
+
+    fn push_tree_note(&mut self, status: UiStatus, indent: usize, text: impl Into<String>) {
+        self.lines.push(WorkflowViewLine {
+            status,
+            text: text.into(),
+            continuation: false,
+            indent,
+            kind: WorkflowViewLineKind::TreeNote,
         });
     }
 }
@@ -967,7 +987,11 @@ fn append_fanout_item_lines(
                 _ => None,
             },
         );
-        state.push_nested_line(status, 1, format!("{headline}  ·  {detail}"));
+        state.push_tree_item(
+            status,
+            0,
+            retained_tree_item_text(status, &headline, &detail),
+        );
         if view_mode == LiveViewMode::Full {
             for event in &events {
                 for line in workflow_transcript_event_lines(event, LiveViewMode::Full, prefs) {
@@ -979,17 +1003,28 @@ fn append_fanout_item_lines(
             }
         } else if !item.success {
             let reason = summary.error.as_deref().unwrap_or("item failed");
-            state.push_nested_line(
+            state.push_tree_note(
                 UiStatus::Failed,
-                2,
-                format!("error  {}", truncate_single_line(reason, 88)),
+                1,
+                retained_tree_note_text(
+                    UiStatus::Failed,
+                    &format!("error  {}", truncate_single_line(reason, 88)),
+                ),
             );
         } else if view_mode == LiveViewMode::Focused {
             if let Some(note) = compact_child_note(&summary) {
-                state.push_nested_line(UiStatus::Active, 2, note);
+                state.push_tree_note(
+                    UiStatus::Active,
+                    1,
+                    retained_tree_note_text(UiStatus::Active, &note),
+                );
             }
         } else if let Some(note) = compact_child_note(&summary) {
-            state.push_nested_line(UiStatus::Active, 2, note);
+            state.push_tree_note(
+                UiStatus::Active,
+                1,
+                retained_tree_note_text(UiStatus::Active, &note),
+            );
         }
     }
 }
@@ -1021,6 +1056,7 @@ fn workflow_transcript_event_lines(
             ),
             continuation: false,
             indent: 0,
+            kind: WorkflowViewLineKind::Event,
         }],
         TxEvent::TurnStart { turn_idx } => vec![WorkflowViewLine {
             status: UiStatus::Working,
@@ -1031,6 +1067,7 @@ fn workflow_transcript_event_lines(
             ),
             continuation: false,
             indent: 0,
+            kind: WorkflowViewLineKind::Event,
         }],
         TxEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
@@ -1044,6 +1081,7 @@ fn workflow_transcript_event_lines(
                     ),
                     continuation: false,
                     indent: 0,
+                    kind: WorkflowViewLineKind::Event,
                 });
             }
             if !content.trim().is_empty() {
@@ -1057,9 +1095,10 @@ fn workflow_transcript_event_lines(
                         ),
                         continuation: false,
                         indent: 0,
+                        kind: WorkflowViewLineKind::Event,
                     }),
                     LiveViewMode::Full => {
-                        let highlighted = crate::cmd::ui::highlight_markdown(content.trim(), prefs);
+                        let highlighted = render_payload(content.trim(), prefs).rendered;
                         let mut lines = highlighted.split('\n');
                         if let Some(first) = lines.next() {
                             out.push(WorkflowViewLine {
@@ -1071,6 +1110,7 @@ fn workflow_transcript_event_lines(
                                 ),
                                 continuation: false,
                                 indent: 0,
+                                kind: WorkflowViewLineKind::Event,
                             });
                             for line in lines {
                                 out.push(WorkflowViewLine {
@@ -1078,6 +1118,7 @@ fn workflow_transcript_event_lines(
                                     text: line.to_string(),
                                     continuation: true,
                                     indent: 0,
+                                    kind: WorkflowViewLineKind::Event,
                                 });
                             }
                         }
@@ -1096,6 +1137,7 @@ fn workflow_transcript_event_lines(
                 ),
                 continuation: false,
                 indent: 0,
+                kind: WorkflowViewLineKind::Event,
             }],
             LiveViewMode::Full => {
                 let mut out = vec![WorkflowViewLine {
@@ -1107,6 +1149,7 @@ fn workflow_transcript_event_lines(
                     ),
                     continuation: false,
                     indent: 0,
+                    kind: WorkflowViewLineKind::Event,
                 }];
                 if let Some(rendered) = render_tool_input(tool, input, prefs) {
                     out.extend(rendered.lines().map(|line| WorkflowViewLine {
@@ -1114,6 +1157,7 @@ fn workflow_transcript_event_lines(
                         text: line.to_string(),
                         continuation: true,
                         indent: 1,
+                        kind: WorkflowViewLineKind::Event,
                     }));
                 }
                 out
@@ -1147,6 +1191,7 @@ fn workflow_transcript_event_lines(
                         text: retained_workflow_event_line(status, label, &detail),
                         continuation: false,
                         indent: 0,
+                        kind: WorkflowViewLineKind::Event,
                     }]
                 }
                 LiveViewMode::Full => {
@@ -1161,6 +1206,7 @@ fn workflow_transcript_event_lines(
                         ),
                         continuation: false,
                         indent: 0,
+                        kind: WorkflowViewLineKind::Event,
                     }];
                     out.extend(retained_payload_lines(&payload, status, 1));
                     out
@@ -1176,6 +1222,7 @@ fn workflow_transcript_event_lines(
             ),
             continuation: false,
             indent: 0,
+            kind: WorkflowViewLineKind::Event,
         }],
         TxEvent::CommandRun {
             argv,
@@ -1204,6 +1251,7 @@ fn workflow_transcript_event_lines(
             ),
             continuation: false,
             indent: 0,
+            kind: WorkflowViewLineKind::Event,
         }],
         TxEvent::ActionEmitted {
             kind,
@@ -1229,6 +1277,7 @@ fn workflow_transcript_event_lines(
                 text: retained_workflow_event_line_raw(status, "action", &detail),
                 continuation: false,
                 indent: 0,
+                kind: WorkflowViewLineKind::Event,
             }]
         }
         TxEvent::GateRequested {
@@ -1249,6 +1298,7 @@ fn workflow_transcript_event_lines(
                 text: retained_workflow_event_line_raw(UiStatus::Awaiting, "approval gate", &detail),
                 continuation: false,
                 indent: 0,
+                kind: WorkflowViewLineKind::Event,
             }]
         }
         TxEvent::TurnEnd {
@@ -1268,6 +1318,7 @@ fn workflow_transcript_event_lines(
             ),
             continuation: false,
             indent: 0,
+            kind: WorkflowViewLineKind::Event,
         }],
         TxEvent::Usage {
             provider,
@@ -1286,6 +1337,7 @@ fn workflow_transcript_event_lines(
             ),
             continuation: false,
             indent: 0,
+            kind: WorkflowViewLineKind::Event,
         }],
         TxEvent::RunComplete {
             status,
@@ -1315,6 +1367,7 @@ fn workflow_transcript_event_lines(
                 text: retained_workflow_event_line_raw(ui_status, "run complete", &detail),
                 continuation: false,
                 indent: 0,
+                kind: WorkflowViewLineKind::Event,
             }]
         }
     }
@@ -1392,9 +1445,10 @@ fn retained_dispatch_outcome_lines(
     );
     let mut out = vec![WorkflowViewLine {
         status,
-        text: format!("{headline}  ·  {detail}"),
+        text: retained_tree_item_text(status, headline, &detail),
         continuation: false,
-        indent: 1,
+        indent: 0,
+        kind: WorkflowViewLineKind::TreeItem,
     }];
     for event in &events {
         for line in workflow_transcript_event_lines(event, LiveViewMode::Full, prefs) {
@@ -1407,9 +1461,13 @@ fn retained_dispatch_outcome_lines(
     if !success && events.is_empty() {
         out.push(WorkflowViewLine {
             status: UiStatus::Failed,
-            text: truncate_single_line(dispatch_error.unwrap_or("dispatch failed"), 96),
+            text: retained_tree_note_text(
+                UiStatus::Failed,
+                &truncate_single_line(dispatch_error.unwrap_or("dispatch failed"), 96),
+            ),
             continuation: false,
-            indent: 2,
+            indent: 1,
+            kind: WorkflowViewLineKind::TreeNote,
         });
     }
     out
@@ -1422,6 +1480,22 @@ fn workflow_payload_summary(payload: &RenderedPayload, duration_ms: u64) -> Stri
     } else {
         detail
     }
+}
+
+fn retained_tree_item_text(status: UiStatus, label: &str, detail: &str) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, status.color());
+    if !detail.trim().is_empty() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+        let _ = palette::write_colored(&mut buf, detail, DIM);
+    }
+    buf
+}
+
+fn retained_tree_note_text(status: UiStatus, message: &str) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, message, status.color());
+    buf
 }
 
 fn retained_payload_lines(
@@ -1437,6 +1511,7 @@ fn retained_payload_lines(
             text: line.to_string(),
             continuation: true,
             indent,
+            kind: WorkflowViewLineKind::Event,
         })
         .collect()
 }
@@ -1784,20 +1859,7 @@ fn render_workflow_event_rows(
 ) -> Vec<String> {
     let mut rendered = Vec::new();
     for line in &state.lines {
-        let indent_prefix = "  ".repeat(line.indent);
-        let prefix = if line.continuation {
-            format!("{indent_prefix}  ")
-        } else {
-            let mut value = String::new();
-            value.push_str(&indent_prefix);
-            let _ = palette::write_bold_colored(
-                &mut value,
-                &line.status.glyph().to_string(),
-                line.status.color(),
-            );
-            value.push(' ');
-            value
-        };
+        let prefix = retained_workflow_line_prefix(line);
         let content_width = width.saturating_sub(visible_len(&prefix)).max(1);
         for (idx, segment) in wrap_with_ansi(&line.text, content_width)
             .into_iter()
@@ -1806,11 +1868,61 @@ fn render_workflow_event_rows(
             if idx == 0 && !line.continuation {
                 rendered.push(format!("{prefix}{segment}"));
             } else {
-                rendered.push(format!("  {segment}"));
+                rendered.push(format!(
+                    "{}{}",
+                    retained_workflow_continuation_prefix(line),
+                    segment
+                ));
             }
         }
     }
     state.viewport.apply(rendered, max_rows).rows
+}
+
+fn retained_workflow_line_prefix(line: &WorkflowViewLine) -> String {
+    let mut value = workflow_rail_prefix(line.indent);
+    match line.kind {
+        WorkflowViewLineKind::Event => {
+            let _ = palette::write_bold_colored(
+                &mut value,
+                &line.status.glyph().to_string(),
+                line.status.color(),
+            );
+            value.push(' ');
+        }
+        WorkflowViewLineKind::TreeItem => {
+            let _ = palette::write_colored(&mut value, "├─ ", BRAND);
+            let _ = palette::write_bold_colored(
+                &mut value,
+                &line.status.glyph().to_string(),
+                line.status.color(),
+            );
+            value.push(' ');
+        }
+        WorkflowViewLineKind::TreeNote => {
+            let _ = palette::write_colored(&mut value, "│  ", BRAND);
+        }
+    }
+    value
+}
+
+fn retained_workflow_continuation_prefix(line: &WorkflowViewLine) -> String {
+    let mut value = workflow_rail_prefix(line.indent);
+    match line.kind {
+        WorkflowViewLineKind::TreeItem | WorkflowViewLineKind::TreeNote => {
+            let _ = palette::write_colored(&mut value, "│  ", BRAND);
+        }
+        WorkflowViewLineKind::Event => value.push_str("  "),
+    }
+    value
+}
+
+fn workflow_rail_prefix(indent: usize) -> String {
+    let mut value = String::new();
+    for _ in 0..indent {
+        let _ = palette::write_colored(&mut value, "│  ", BRAND);
+    }
+    value
 }
 
 fn render_workflow_screen_rows(rows: &[String]) -> io::Result<()> {
@@ -3237,7 +3349,7 @@ mod tests {
         );
         let mut state = WorkflowInteractiveState::new(0);
         for index in 0..800 {
-            state.push_nested_line(UiStatus::Active, 0, format!("workflow line {index:03}"));
+            state.push_line(UiStatus::Active, format!("workflow line {index:03}"));
         }
         state.viewport.jump_top();
         let rows = build_workflow_screen_rows_for_size(
@@ -3352,10 +3464,7 @@ mod tests {
         assert!(lines[0]
             .text
             .contains(".git/logs/refs/heads/storefront/issue-19"));
-        assert!(lines
-            .iter()
-            .skip(1)
-            .any(|line| line.text.contains("\"path\"")));
+        assert!(lines.iter().skip(1).any(|line| line.text.contains("path:")));
     }
 
     #[test]
@@ -3433,6 +3542,8 @@ mod tests {
             .iter()
             .any(|line| line.text.contains("assistant output")));
         assert!(state.lines.iter().any(|line| line.indent >= 2));
+        let rendered = render_workflow_event_rows(&mut state, 120, 20);
+        assert!(rendered.iter().any(|row| row.contains("├─")));
     }
 
     #[test]

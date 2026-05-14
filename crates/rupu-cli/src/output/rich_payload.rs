@@ -10,6 +10,7 @@ pub enum PayloadKind {
     Jsonl { records: usize },
     Yaml,
     Diff,
+    Shell,
     Markdown,
     Plain,
 }
@@ -65,6 +66,14 @@ pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
         };
     }
 
+    if looks_like_shell(raw) {
+        return RenderedPayload {
+            kind: PayloadKind::Shell,
+            headline: "shell payload".into(),
+            rendered: highlight_shell(raw.trim_end(), prefs),
+        };
+    }
+
     if looks_like_markdown(raw) {
         return RenderedPayload {
             kind: PayloadKind::Markdown,
@@ -92,6 +101,72 @@ pub fn render_tool_input(tool: &str, input: &serde_json::Value, prefs: &UiPrefs)
             .get("command")
             .and_then(|value| value.as_str())
             .map(|command| highlight_shell(command.trim_end(), prefs)),
+        "read_file" | "write_file" | "edit_file" => render_labeled_fields(
+            &[("path", input.get("path").and_then(|value| value.as_str()))],
+            prefs,
+        ),
+        "glob" => render_labeled_fields(
+            &[(
+                "pattern",
+                input.get("pattern").and_then(|value| value.as_str()),
+            )],
+            prefs,
+        ),
+        "grep" => render_labeled_fields(
+            &[
+                (
+                    "pattern",
+                    input.get("pattern").and_then(|value| value.as_str()),
+                ),
+                ("path", input.get("path").and_then(|value| value.as_str())),
+            ],
+            prefs,
+        ),
+        "dispatch_agent" => render_labeled_fields(
+            &[
+                ("agent", input.get("agent").and_then(|value| value.as_str())),
+                (
+                    "prompt",
+                    input.get("prompt").and_then(|value| value.as_str()),
+                ),
+            ],
+            prefs,
+        ),
+        "dispatch_agents_parallel" => {
+            if let Some(agents) = input.get("agents").and_then(|value| value.as_array()) {
+                let listed = agents
+                    .iter()
+                    .map(|agent| {
+                        if let Some(id) = agent.get("id").and_then(|value| value.as_str()) {
+                            if let Some(name) = agent.get("agent").and_then(|value| value.as_str())
+                            {
+                                format!("- {id}: {name}")
+                            } else {
+                                format!("- {id}")
+                            }
+                        } else {
+                            serde_json::to_string(agent).unwrap_or_default()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut text = String::new();
+                if let Some(limit) = input.get("max_parallel").and_then(|value| value.as_u64()) {
+                    text.push_str(&format!("max_parallel: {limit}\n"));
+                }
+                text.push_str("agents:\n");
+                for line in listed.lines() {
+                    text.push_str("  ");
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                Some(highlight_yaml(text.trim_end(), prefs))
+            } else {
+                serde_json::to_string_pretty(input)
+                    .ok()
+                    .map(|pretty| highlight_json(&pretty, prefs))
+            }
+        }
         _ => serde_json::to_string_pretty(input)
             .ok()
             .map(|pretty| highlight_json(&pretty, prefs)),
@@ -132,10 +207,47 @@ fn looks_like_markdown(raw: &str) -> bool {
         || trimmed.contains("\n* ")
 }
 
+fn looks_like_shell(raw: &str) -> bool {
+    let trimmed = raw.trim_start();
+    trimmed.starts_with("#!/bin/")
+        || trimmed.starts_with("$ ")
+        || trimmed.contains("\n$ ")
+        || trimmed.starts_with("git ")
+        || trimmed.starts_with("cargo ")
+        || trimmed.starts_with("npm ")
+        || trimmed.starts_with("pnpm ")
+}
+
 fn looks_like_diff(raw: &str) -> bool {
     let trimmed = raw.trim_start();
     trimmed.starts_with("diff --git ")
         || (trimmed.contains("\n@@ ") && trimmed.contains("\n--- ") && trimmed.contains("\n+++ "))
+}
+
+fn render_labeled_fields(fields: &[(&str, Option<&str>)], prefs: &UiPrefs) -> Option<String> {
+    let mut text = String::new();
+    let mut wrote = false;
+    for (label, value) in fields {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if value.contains('\n') {
+            text.push_str(label);
+            text.push_str(": |\n");
+            for line in value.lines() {
+                text.push_str("  ");
+                text.push_str(line);
+                text.push('\n');
+            }
+        } else {
+            text.push_str(label);
+            text.push_str(": ");
+            text.push_str(value);
+            text.push('\n');
+        }
+        wrote = true;
+    }
+    wrote.then(|| highlight_yaml(text.trim_end(), prefs))
 }
 
 #[cfg(test)]
