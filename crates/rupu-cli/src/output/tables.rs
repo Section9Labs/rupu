@@ -287,7 +287,7 @@ fn format_seconds(s: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::ui::{ColorMode, PagerMode};
+    use crate::cmd::ui::{ColorMode, LiveViewMode, PagerMode};
 
     // Construct UiPrefs directly rather than going through `resolve`
     // so concurrent tests in this binary that flip NO_COLOR don't
@@ -300,6 +300,7 @@ mod tests {
             theme: "base16-ocean.dark".into(),
             palette_theme: "rupu-dark".into(),
             palette: palette::UiPaletteTheme::default(),
+            live_view: LiveViewMode::Focused,
             pager: PagerMode::Never,
         }
     }
@@ -310,6 +311,7 @@ mod tests {
             theme: "base16-ocean.dark".into(),
             palette_theme: "rupu-dark".into(),
             palette: palette::UiPaletteTheme::default(),
+            live_view: LiveViewMode::Focused,
             pager: PagerMode::Never,
         }
     }

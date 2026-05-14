@@ -196,7 +196,7 @@ pub fn prefs_for_diag(no_color: bool) -> UiPrefs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::ui::{ColorMode, PagerMode};
+    use crate::cmd::ui::{ColorMode, LiveViewMode, PagerMode};
 
     fn no_color() -> UiPrefs {
         UiPrefs {
@@ -204,6 +204,7 @@ mod tests {
             theme: "base16-ocean.dark".into(),
             palette_theme: "rupu-dark".into(),
             palette: crate::output::palette::UiPaletteTheme::default(),
+            live_view: LiveViewMode::Focused,
             pager: PagerMode::Never,
         }
     }

@@ -22,6 +22,8 @@
 use super::{
     palette::Status as UiStatus, printer::LineStreamPrinter, SpinnerHandle, TranscriptTailer,
 };
+use crate::cmd::transcript::truncate_single_line;
+use crate::cmd::ui::LiveViewMode;
 use rupu_orchestrator::{FindingRecord, ItemResultRecord, RunRecord, StepKind, StepResultRecord};
 use rupu_transcript::Event as TxEvent;
 use serde_json::Value as JsonValue;
@@ -119,6 +121,8 @@ pub struct AttachOpts {
     pub skip_count: usize,
     /// Optional sideband hook for selected live transcript events.
     pub live_event_hook: Option<LiveWorkflowEventHook>,
+    /// Control live output density for workflow body rendering.
+    pub view_mode: LiveViewMode,
 }
 
 /// Drive `printer` from a live or recently-finished workflow run.
@@ -185,6 +189,9 @@ pub fn attach_and_print_with(
     if !opts.skip_header {
         printer.workflow_header(workflow_name, run_id, started_at);
     }
+    if let Some(record) = load_run_record(&run_json) {
+        render_workflow_intro(printer, &record, opts.view_mode);
+    }
 
     // Workflow-level liveness ticker. `step_results.jsonl` is appended
     // at step COMPLETION, so the per-step `start_ticker` inside
@@ -199,7 +206,7 @@ pub fn attach_and_print_with(
     // close still tears it down, but the next iteration's re-arm
     // brings it back before the next sleep so the bottom row is
     // never empty during an in-flight workflow.
-    printer.start_ticker("running…");
+    printer.start_ticker(workflow_ticker_message(workflow_name, None));
 
     let mut seen_step_results: usize = opts.skip_count;
     let mut steps: Vec<StepState> = Vec::new();
@@ -224,6 +231,7 @@ pub fn attach_and_print_with(
             &mut steps,
             printer,
             &mut step_count,
+            opts.view_mode,
         );
 
         for step in &mut steps {
@@ -235,6 +243,7 @@ pub fn attach_and_print_with(
                     printer,
                     &mut total_tokens,
                     opts.live_event_hook.as_ref(),
+                    opts.view_mode,
                 );
             }
         }
@@ -252,11 +261,11 @@ pub fn attach_and_print_with(
         // in place when already running, so this is cheap; it's
         // load-bearing only when a step's `step_done` just tore the
         // ticker down (which happens inside `process_event` above).
-        printer.start_ticker("running…");
+        printer.start_ticker(workflow_ticker_message(workflow_name, Some(&record)));
 
         match record.status {
             rupu_orchestrator::RunStatus::AwaitingApproval => {
-                flush_all_tailers(&mut steps, printer, &mut total_tokens);
+                flush_all_tailers(&mut steps, printer, &mut total_tokens, opts.view_mode);
 
                 let step_id = record
                     .awaiting_step_id
@@ -330,8 +339,9 @@ pub fn attach_and_print_with(
                     &mut steps,
                     printer,
                     &mut step_count,
+                    opts.view_mode,
                 );
-                flush_all_tailers(&mut steps, printer, &mut total_tokens);
+                flush_all_tailers(&mut steps, printer, &mut total_tokens, opts.view_mode);
 
                 let duration_ms = record
                     .finished_at
@@ -344,7 +354,7 @@ pub fn attach_and_print_with(
             }
             rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
                 std::thread::sleep(Duration::from_millis(DRAIN_EXTRA_MS));
-                flush_all_tailers(&mut steps, printer, &mut total_tokens);
+                flush_all_tailers(&mut steps, printer, &mut total_tokens, opts.view_mode);
 
                 let err = record.error_message.as_deref().unwrap_or("unknown error");
                 printer.stop_ticker();
@@ -445,6 +455,7 @@ fn drain_step_results(
     steps: &mut Vec<StepState>,
     printer: &mut LineStreamPrinter,
     step_count: &mut usize,
+    view_mode: LiveViewMode,
 ) {
     let Ok(bytes) = std::fs::read(log) else {
         return;
@@ -471,7 +482,7 @@ fn drain_step_results(
 
         match rec.kind {
             StepKind::ForEach | StepKind::Parallel | StepKind::Panel => {
-                render_fanout_step(&rec, printer);
+                render_fanout_step(&rec, printer, view_mode);
             }
             StepKind::Linear => {
                 // Linear step — open a tailer if we have a transcript.
@@ -514,7 +525,11 @@ fn drain_step_results(
 /// panelist. By the time the parent record reaches us, all child
 /// transcripts are complete on disk — so we replay each one fully
 /// rather than tailing live.
-fn render_fanout_step(rec: &StepResultRecord, printer: &mut LineStreamPrinter) {
+fn render_fanout_step(
+    rec: &StepResultRecord,
+    printer: &mut LineStreamPrinter,
+    view_mode: LiveViewMode,
+) {
     // Parent header — emit the same `╭─ … ────  (kind · count)` shape
     // the linear-step header uses, with kind-specific meta. Reuse
     // `panel_start` for panels (it already wires the ticker copy);
@@ -529,7 +544,7 @@ fn render_fanout_step(rec: &StepResultRecord, printer: &mut LineStreamPrinter) {
     // Child frames at indent+1.
     printer.push_indent();
     for item in &rec.items {
-        render_child_item(rec, item, printer);
+        render_child_item(rec, item, printer, view_mode);
     }
     printer.pop_indent();
     parent_spinner.stop();
@@ -568,6 +583,7 @@ fn render_child_item(
     parent: &StepResultRecord,
     item: &ItemResultRecord,
     printer: &mut LineStreamPrinter,
+    view_mode: LiveViewMode,
 ) {
     // Read the full transcript (file is complete by the time we
     // see it). Empty/missing transcripts produce a header+immediate
@@ -630,7 +646,7 @@ fn render_child_item(
     for ev in events {
         match ev {
             TxEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-                printer.assistant_chunk(&content);
+                render_assistant_output(printer, &content, view_mode);
             }
             TxEvent::ToolCall { tool, input, .. } => {
                 let summary = summarize_tool_input(&tool, &input);
@@ -717,6 +733,7 @@ fn process_event(
     printer: &mut LineStreamPrinter,
     total_tokens: &mut u64,
     live_event_hook: Option<&LiveWorkflowEventHook>,
+    view_mode: LiveViewMode,
 ) {
     match ev {
         TxEvent::RunStart {
@@ -730,7 +747,7 @@ fn process_event(
             step.model = Some(model);
         }
         TxEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-            printer.assistant_chunk(&content);
+            render_assistant_output(printer, &content, view_mode);
         }
         TxEvent::ToolCall {
             call_id,
@@ -770,10 +787,10 @@ fn process_event(
         } => {
             match step.dispatches.remove(&call_id) {
                 Some(InFlightDispatch::Single { agent }) => {
-                    render_dispatch_child(&agent, &output, printer);
+                    render_dispatch_child(&agent, &output, printer, view_mode);
                 }
                 Some(InFlightDispatch::Parallel) => {
-                    render_dispatch_children(&output, printer);
+                    render_dispatch_children(&output, printer, view_mode);
                 }
                 None => {}
             }
@@ -843,13 +860,18 @@ fn is_promoted_live_tool(tool: &str) -> bool {
 /// `transcript_path`, `tokens_used`, and `duration_ms` from it; if any
 /// are missing or the file isn't on disk yet we degrade to a
 /// header+immediate footer so the parent's stream stays coherent.
-fn render_dispatch_child(agent_name: &str, output: &str, printer: &mut LineStreamPrinter) {
+fn render_dispatch_child(
+    agent_name: &str,
+    output: &str,
+    printer: &mut LineStreamPrinter,
+    view_mode: LiveViewMode,
+) {
     let parsed: serde_json::Value = match serde_json::from_str(output) {
         Ok(v) => v,
         Err(_) => return,
     };
     printer.push_indent();
-    render_one_child(agent_name, &parsed, printer);
+    render_one_child(agent_name, &parsed, printer, view_mode);
     printer.pop_indent();
 }
 
@@ -861,7 +883,11 @@ fn render_dispatch_child(agent_name: &str, output: &str, printer: &mut LineStrea
 /// default `Map` is BTreeMap-backed, so iteration order is alphabetical
 /// — the same order the parent agent saw when it parsed the result, so
 /// the rendering matches what the model is reasoning about.
-fn render_dispatch_children(output: &str, printer: &mut LineStreamPrinter) {
+fn render_dispatch_children(
+    output: &str,
+    printer: &mut LineStreamPrinter,
+    view_mode: LiveViewMode,
+) {
     let parsed: serde_json::Value = match serde_json::from_str(output) {
         Ok(v) => v,
         Err(_) => return,
@@ -874,7 +900,7 @@ fn render_dispatch_children(output: &str, printer: &mut LineStreamPrinter) {
     }
     printer.push_indent();
     for (id, outcome) in results.iter() {
-        render_one_child(id, outcome, printer);
+        render_one_child(id, outcome, printer, view_mode);
     }
     printer.pop_indent();
 }
@@ -882,7 +908,12 @@ fn render_dispatch_children(output: &str, printer: &mut LineStreamPrinter) {
 /// Render one child callout: open frame, replay the persisted
 /// transcript inline, close frame. Shared between the single-dispatch
 /// and parallel-dispatch renderers.
-fn render_one_child(headline: &str, outcome: &serde_json::Value, printer: &mut LineStreamPrinter) {
+fn render_one_child(
+    headline: &str,
+    outcome: &serde_json::Value,
+    printer: &mut LineStreamPrinter,
+    view_mode: LiveViewMode,
+) {
     let transcript_path = outcome["transcript_path"]
         .as_str()
         .map(PathBuf::from)
@@ -918,7 +949,7 @@ fn render_one_child(headline: &str, outcome: &serde_json::Value, printer: &mut L
     for ev in events {
         match ev {
             TxEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-                printer.assistant_chunk(&content);
+                render_assistant_output(printer, &content, view_mode);
             }
             TxEvent::ToolCall { tool, input, .. } => {
                 let summary = summarize_tool_input(&tool, &input);
@@ -940,14 +971,98 @@ fn flush_all_tailers(
     steps: &mut [StepState],
     printer: &mut LineStreamPrinter,
     total_tokens: &mut u64,
+    view_mode: LiveViewMode,
 ) {
     for step in steps.iter_mut() {
         let events = step.tailer.drain();
         for ev in events {
-            process_event(ev, step, printer, total_tokens, None);
+            process_event(ev, step, printer, total_tokens, None, view_mode);
         }
         if let Some(spinner) = step.spinner.take() {
             spinner.stop();
+        }
+    }
+}
+
+fn render_assistant_output(
+    printer: &mut LineStreamPrinter,
+    content: &str,
+    view_mode: LiveViewMode,
+) {
+    match view_mode {
+        LiveViewMode::Full => printer.assistant_chunk(content),
+        LiveViewMode::Focused => printer.sideband_event(
+            UiStatus::Active,
+            "assistant output",
+            Some(&truncate_single_line(content, 96)),
+        ),
+    }
+}
+
+fn render_workflow_intro(
+    printer: &mut LineStreamPrinter,
+    record: &RunRecord,
+    view_mode: LiveViewMode,
+) {
+    if view_mode != LiveViewMode::Focused {
+        return;
+    }
+    printer.sideband_event(
+        workflow_run_status(record.status.as_str()),
+        "status",
+        Some(record.status.as_str()),
+    );
+    if let Some(issue_ref) = record.issue_ref.as_deref() {
+        printer.sideband_event(
+            UiStatus::Active,
+            "issue",
+            Some(&truncate_single_line(issue_ref, 96)),
+        );
+    }
+    let workspace = format!(
+        "{}  ·  {}",
+        record.workspace_id,
+        truncate_single_line(&record.workspace_path.display().to_string(), 72)
+    );
+    printer.sideband_event(UiStatus::Active, "workspace", Some(&workspace));
+    let mut route = Vec::new();
+    if let Some(backend) = record.backend_id.as_deref() {
+        route.push(format!("backend {backend}"));
+    }
+    if let Some(worker) = record.worker_id.as_deref() {
+        route.push(format!("worker {worker}"));
+    }
+    if !route.is_empty() {
+        printer.sideband_event(UiStatus::Active, "route", Some(&route.join("  ·  ")));
+    }
+}
+
+fn workflow_run_status(status: &str) -> UiStatus {
+    match status {
+        "completed" => UiStatus::Complete,
+        "failed" | "rejected" => UiStatus::Failed,
+        "awaiting_approval" => UiStatus::Awaiting,
+        "running" => UiStatus::Working,
+        _ => UiStatus::Active,
+    }
+}
+
+fn workflow_ticker_message(workflow_name: &str, record: Option<&RunRecord>) -> String {
+    let Some(record) = record else {
+        return format!("workflow {workflow_name}  ·  starting");
+    };
+    if let Some(step_id) = record.active_step_id.as_deref() {
+        return format!("workflow {workflow_name}  ·  {step_id}");
+    }
+    match record.status {
+        rupu_orchestrator::RunStatus::Pending => format!("workflow {workflow_name}  ·  pending"),
+        rupu_orchestrator::RunStatus::Running => format!("workflow {workflow_name}  ·  running"),
+        rupu_orchestrator::RunStatus::Completed => format!("workflow {workflow_name}  ·  complete"),
+        rupu_orchestrator::RunStatus::Failed => format!("workflow {workflow_name}  ·  failed"),
+        rupu_orchestrator::RunStatus::Rejected => format!("workflow {workflow_name}  ·  rejected"),
+        rupu_orchestrator::RunStatus::AwaitingApproval => {
+            let step = record.awaiting_step_id.as_deref().unwrap_or("approval");
+            format!("workflow {workflow_name}  ·  awaiting {step}")
         }
     }
 }
@@ -1237,6 +1352,7 @@ mod tests {
             &mut printer,
             &mut total_tokens,
             Some(&hook),
+            LiveViewMode::Focused,
         );
         process_event(
             TxEvent::ToolResult {
@@ -1249,6 +1365,7 @@ mod tests {
             &mut printer,
             &mut total_tokens,
             Some(&hook),
+            LiveViewMode::Focused,
         );
 
         assert_eq!(
