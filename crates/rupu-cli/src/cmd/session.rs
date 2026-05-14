@@ -1851,7 +1851,7 @@ fn transcript_event_lines(
                         continuation: false,
                     }),
                     LiveViewMode::Full => {
-                        let highlighted = crate::cmd::ui::highlight_markdown(content.trim(), prefs);
+                        let highlighted = render_payload(content.trim(), prefs).rendered;
                         let mut lines = highlighted.split('\n');
                         if let Some(first) = lines.next() {
                             out.push(SessionViewLine {
@@ -3836,9 +3836,6 @@ mod tests {
         assert!(lines[0]
             .text
             .contains(".git/logs/refs/heads/storefront/issue-19"));
-        assert!(lines
-            .iter()
-            .skip(1)
-            .any(|line| line.text.contains("\"path\"")));
+        assert!(lines.iter().skip(1).any(|line| line.text.contains("path:")));
     }
 }
