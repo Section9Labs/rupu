@@ -47,7 +47,7 @@ impl ViewportState {
     }
 
     pub fn jump_top(&mut self) {
-        self.scroll_from_bottom = self.total_rows;
+        self.scroll_from_bottom = usize::MAX;
     }
 
     pub fn jump_bottom(&mut self) {
@@ -86,5 +86,19 @@ mod tests {
         viewport.scroll_up(1);
         let window = viewport.apply(rows, 2);
         assert_eq!(window.rows, vec!["row2".to_string(), "row3".to_string()]);
+    }
+
+    #[test]
+    fn viewport_jump_top_before_first_apply_reaches_oldest_rows() {
+        let mut viewport = ViewportState::default();
+        let rows = vec![
+            "row1".to_string(),
+            "row2".to_string(),
+            "row3".to_string(),
+            "row4".to_string(),
+        ];
+        viewport.jump_top();
+        let window = viewport.apply(rows, 2);
+        assert_eq!(window.rows, vec!["row1".to_string(), "row2".to_string()]);
     }
 }

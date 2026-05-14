@@ -141,10 +141,6 @@ impl WorkflowInteractiveState {
 
     fn push_view_line(&mut self, line: WorkflowViewLine) {
         self.lines.push(line);
-        if self.lines.len() > 500 {
-            let keep_from = self.lines.len().saturating_sub(500);
-            self.lines.drain(0..keep_from);
-        }
     }
 
     fn push_nested_line(&mut self, status: UiStatus, indent: usize, text: impl Into<String>) {
@@ -154,10 +150,6 @@ impl WorkflowInteractiveState {
             continuation: false,
             indent,
         });
-        if self.lines.len() > 500 {
-            let keep_from = self.lines.len().saturating_sub(500);
-            self.lines.drain(0..keep_from);
-        }
     }
 }
 
@@ -3197,6 +3189,35 @@ mod tests {
         );
         assert!(rows.len() <= 14);
         assert!(rows.iter().all(|row| visible_len(row) <= 52));
+    }
+
+    #[test]
+    fn retained_workflow_viewport_can_reach_oldest_rows() {
+        let mut record = sample_run_record();
+        record.active_step_id = Some("implement".into());
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let mut state = WorkflowInteractiveState::new(0);
+        for index in 0..800 {
+            state.push_nested_line(UiStatus::Active, 0, format!("workflow line {index:03}"));
+        }
+        state.viewport.jump_top();
+        let rows = build_workflow_screen_rows_for_size(
+            "demo",
+            &record,
+            &mut state,
+            LiveViewMode::Focused,
+            &prefs,
+            72,
+            16,
+        );
+        assert!(rows.iter().any(|row| row.contains("workflow line 000")));
+        assert!(!rows.iter().any(|row| row.contains("workflow line 799")));
     }
 
     #[test]

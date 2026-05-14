@@ -1242,19 +1242,11 @@ impl SessionInteractiveState {
             text: text.into(),
             continuation: false,
         });
-        if self.lines.len() > 400 {
-            let keep_from = self.lines.len().saturating_sub(400);
-            self.lines.drain(0..keep_from);
-        }
     }
 
     fn push_transcript_event(&mut self, event: &TranscriptEvent, prefs: &UiPrefs) {
         for line in transcript_event_lines(event, self.view_mode, prefs) {
             self.lines.push(line);
-            if self.lines.len() > 400 {
-                let keep_from = self.lines.len().saturating_sub(400);
-                self.lines.drain(0..keep_from);
-            }
         }
     }
 }
@@ -3653,6 +3645,33 @@ mod tests {
         let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 48, 14);
         assert!(rows.len() <= 14);
         assert!(rows.iter().all(|row| visible_len(row) <= 48));
+    }
+
+    #[test]
+    fn retained_session_viewport_can_reach_oldest_rows() {
+        let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Focused,
+        );
+        for index in 0..700 {
+            state.push_line(
+                crate::output::palette::Status::Active,
+                format!("history line {index:03}"),
+            );
+        }
+        state.viewport.jump_top();
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 72, 16);
+        assert!(rows.iter().any(|row| row.contains("history line 000")));
+        assert!(!rows.iter().any(|row| row.contains("history line 699")));
     }
 
     #[test]
