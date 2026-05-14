@@ -5,7 +5,7 @@ use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref as canonical_repo_issue_ref;
 use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::transcript::truncate_single_line;
-use crate::cmd::ui::UiPrefs;
+use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::cmd::workflow::{
     locate_workflow_in, run_with_explicit_context, ExecutionWorkerContext,
     ExplicitWorkflowRunContext, RunEnvelopeTemplate,
@@ -13,6 +13,7 @@ use crate::cmd::workflow::{
 use crate::output::palette::{self, Status as UiStatus, BRAND, DIM};
 use crate::output::printer::{format_duration, visible_len, wrap_with_ansi};
 use crate::output::report::{self as output_report, CollectionOutput, DetailOutput};
+use crate::output::viewport::ViewportState;
 use crate::output::workflow_printer::{
     LiveWorkflowEvent, LiveWorkflowEventHook, LiveWorkflowRender,
 };
@@ -23,8 +24,9 @@ use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
 use comfy_table::Cell;
 use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
-use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 use jsonschema::JSONSchema;
 use rupu_auth::{CredentialResolver, KeychainResolver};
@@ -1029,6 +1031,21 @@ struct AutoflowServeViewLine {
 
 struct AutoflowServeScreenGuard;
 
+struct AutoflowServeRawModeGuard;
+
+impl AutoflowServeRawModeGuard {
+    fn enter() -> anyhow::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AutoflowServeRawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
 impl AutoflowServeScreenGuard {
     fn enter() -> anyhow::Result<Self> {
         execute!(std::io::stdout(), EnterAlternateScreen, Hide)?;
@@ -1743,7 +1760,7 @@ async fn serve_retained(
     repo_filter: Option<&str>,
     worker_filter: Option<&str>,
     idle_sleep: std::time::Duration,
-    view_mode: crate::cmd::ui::LiveViewMode,
+    view_mode: LiveViewMode,
     resolver: Arc<dyn CredentialResolver>,
 ) -> anyhow::Result<()> {
     let progress = Arc::new(Mutex::new(ServeProgressSnapshot::default()));
@@ -1784,10 +1801,13 @@ async fn serve_retained(
     });
 
     let exit = {
+        let _raw_mode = AutoflowServeRawModeGuard::enter()?;
         let _screen = AutoflowServeScreenGuard::enter()?;
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(250));
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_rows: Vec<String> = Vec::new();
+        let mut live_view_mode = view_mode;
+        let mut viewport = ViewportState::default();
 
         loop {
             tokio::select! {
@@ -1808,12 +1828,34 @@ async fn serve_retained(
                         repo_filter,
                         worker_filter,
                         idle_sleep,
-                        view_mode,
+                        live_view_mode,
+                        &mut viewport,
                         &snapshot,
                     )?;
                     if rows != last_rows {
                         render_retained_serve_rows(&rows)?;
                         last_rows = rows;
+                    }
+                    while event::poll(std::time::Duration::from_millis(0))? {
+                        match event::read()? {
+                            CrosstermEvent::Resize(_, _) => {}
+                            CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                                match (key.code, key.modifiers) {
+                                    (KeyCode::Char('f'), _) => {
+                                        live_view_mode = live_view_mode.toggled();
+                                        last_rows.clear();
+                                    }
+                                    (KeyCode::Up, _) | (KeyCode::Char('k'), _) => viewport.scroll_up(1),
+                                    (KeyCode::Down, _) | (KeyCode::Char('j'), _) => viewport.scroll_down(1),
+                                    (KeyCode::PageUp, _) => viewport.page_up(),
+                                    (KeyCode::PageDown, _) => viewport.page_down(),
+                                    (KeyCode::Char('g'), KeyModifiers::NONE) => viewport.jump_top(),
+                                    (KeyCode::Char('G'), _) | (KeyCode::End, _) => viewport.jump_bottom(),
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -1850,7 +1892,8 @@ fn build_retained_serve_rows(
     repo_filter: Option<&str>,
     worker_filter: Option<&str>,
     idle_sleep: std::time::Duration,
-    view_mode: crate::cmd::ui::LiveViewMode,
+    view_mode: LiveViewMode,
+    viewport: &mut ViewportState,
     snapshot: &ServeProgressSnapshot,
 ) -> anyhow::Result<Vec<String>> {
     let monitor = build_monitor_report(repo_filter, worker_filter)?;
@@ -1866,6 +1909,7 @@ fn build_retained_serve_rows(
         worker_filter,
         idle_sleep,
         view_mode,
+        viewport,
         snapshot,
         width.max(50) as usize,
         height.max(14) as usize,
@@ -1879,7 +1923,8 @@ fn build_retained_serve_rows_for_size(
     repo_filter: Option<&str>,
     worker_filter: Option<&str>,
     idle_sleep: std::time::Duration,
-    view_mode: crate::cmd::ui::LiveViewMode,
+    view_mode: LiveViewMode,
+    viewport: &mut ViewportState,
     snapshot: &ServeProgressSnapshot,
     width: usize,
     height: usize,
@@ -1911,12 +1956,14 @@ fn build_retained_serve_rows_for_size(
         ),
     ];
 
+    let mut body_rows = Vec::new();
+
     let primary = build_serve_issue_entries(&monitor.claims, &[])
         .into_iter()
         .find_map(|entry| entry.claim.cloned());
 
     if let Some(claim) = primary.as_ref() {
-        rows.push(format!(
+        body_rows.push(format!(
             "{}",
             retained_serve_kv_row(
                 "active",
@@ -1938,7 +1985,7 @@ fn build_retained_serve_rows_for_size(
         if claim.pr != "-" {
             route.push(format!("pr {}", short_url_like(&claim.pr, 22)));
         }
-        rows.push(retained_serve_kv_row(
+        body_rows.push(retained_serve_kv_row(
             "route",
             &route.join("  ·  "),
             width,
@@ -1948,7 +1995,7 @@ fn build_retained_serve_rows_for_size(
         if let Some((record, summary, live_lines)) =
             resolve_live_claim_run(run_store, pricing, claim)
         {
-            rows.push(retained_serve_kv_row(
+            body_rows.push(retained_serve_kv_row(
                 "run",
                 &format!(
                     "{}  ·  {}  ·  {}",
@@ -1967,7 +2014,7 @@ fn build_retained_serve_rows_for_size(
                 .as_deref()
                 .or(record.awaiting_step_id.as_deref())
                 .unwrap_or("-");
-            rows.push(retained_serve_kv_row(
+            body_rows.push(retained_serve_kv_row(
                 "step",
                 &format!(
                     "{}  ·  {}/{} complete",
@@ -1980,7 +2027,7 @@ fn build_retained_serve_rows_for_size(
             ));
 
             if let Some(usage) = &summary.usage {
-                rows.push(retained_serve_kv_row(
+                body_rows.push(retained_serve_kv_row(
                     "usage",
                     &format!(
                         "in {}  ·  out {}  ·  total {}{}",
@@ -1997,17 +2044,14 @@ fn build_retained_serve_rows_for_size(
                 ));
             }
 
-            rows.push(String::new());
-            rows.extend(render_retained_serve_event_rows(
+            body_rows.push(String::new());
+            body_rows.extend(render_retained_serve_event_rows(
                 &live_lines,
                 width,
-                match view_mode {
-                    crate::cmd::ui::LiveViewMode::Focused => 6,
-                    crate::cmd::ui::LiveViewMode::Full => 10,
-                },
+                usize::MAX,
             ));
         } else if claim.summary != "-" {
-            rows.push(retained_serve_kv_row(
+            body_rows.push(retained_serve_kv_row(
                 "summary",
                 &claim.summary,
                 width,
@@ -2015,7 +2059,7 @@ fn build_retained_serve_rows_for_size(
             ));
         }
     } else {
-        rows.push(retained_serve_kv_row(
+        body_rows.push(retained_serve_kv_row(
             "active",
             "no active issues",
             width,
@@ -2023,12 +2067,12 @@ fn build_retained_serve_rows_for_size(
         ));
     }
 
-    if view_mode == crate::cmd::ui::LiveViewMode::Full && !monitor.claims.is_empty() {
-        rows.push(String::new());
-        rows.push(retained_serve_section_title("claims", width));
+    if view_mode == LiveViewMode::Full && !monitor.claims.is_empty() {
+        body_rows.push(String::new());
+        body_rows.push(retained_serve_section_title("claims", width));
         for claim in monitor.claims.iter().take(6) {
             let status = claim_status_ui(&claim.status);
-            rows.push(retained_serve_activity_line(
+            body_rows.push(retained_serve_activity_line(
                 status,
                 &display_issue_headline(claim),
                 &format!(
@@ -2041,30 +2085,30 @@ fn build_retained_serve_rows_for_size(
         }
     }
 
-    rows.push(String::new());
-    rows.push(retained_serve_section_title("recent", width));
+    body_rows.push(String::new());
+    body_rows.push(retained_serve_section_title("recent", width));
     let recent_limit = match view_mode {
-        crate::cmd::ui::LiveViewMode::Focused => 4,
-        crate::cmd::ui::LiveViewMode::Full => 8,
+        LiveViewMode::Focused => 4,
+        LiveViewMode::Full => 8,
     };
     for activity in monitor.activity.iter().take(recent_limit) {
         let (status, label) = activity_status_and_label(&activity.event);
-        rows.push(retained_serve_activity_line(
+        body_rows.push(retained_serve_activity_line(
             status,
             &activity.issue,
             &format!("{label}  ·  {}", truncate_text(&activity.workflow, 24)),
             width,
         ));
         if activity.detail != "-" {
-            rows.push(retained_serve_detail_line(
+            body_rows.push(retained_serve_detail_line(
                 &truncate_text(&activity.detail, width.saturating_sub(2)),
                 width,
             ));
         }
     }
 
-    rows.push(String::new());
-    rows.push(retained_serve_kv_row(
+    body_rows.push(String::new());
+    body_rows.push(retained_serve_kv_row(
         "queue",
         &format!(
             "queued {}  ·  due {}  ·  processed {}",
@@ -2074,8 +2118,58 @@ fn build_retained_serve_rows_for_size(
         UiStatus::Active,
     ));
 
+    let footer_reserved = 2usize;
+    let available_body_rows = height
+        .saturating_sub(rows.len())
+        .saturating_sub(footer_reserved)
+        .max(1);
+    let body = viewport.apply(body_rows, available_body_rows).rows;
+    rows.extend(body);
+    while rows.len() < height.saturating_sub(footer_reserved) {
+        rows.push(String::new());
+    }
+
+    rows.push(retained_serve_controls_line(width));
+    rows.push(retained_serve_status_line(
+        view_mode, viewport, snapshot, width,
+    ));
     rows.truncate(height);
     rows
+}
+
+fn retained_serve_controls_line(width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        "  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  Ctrl-C quit",
+        DIM,
+    );
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn retained_serve_status_line(
+    view_mode: LiveViewMode,
+    viewport: &ViewportState,
+    snapshot: &ServeProgressSnapshot,
+    width: usize,
+) -> String {
+    retained_serve_kv_row(
+        "view",
+        &format!(
+            "{}  ·  {}  ·  cycles {}  ·  {}",
+            view_mode.as_str(),
+            viewport.status_text(),
+            snapshot.cycles,
+            if snapshot.cycle_running {
+                "reconciling"
+            } else {
+                "watching"
+            }
+        ),
+        width,
+        UiStatus::Active,
+    )
 }
 
 fn render_retained_serve_rows(rows: &[String]) -> anyhow::Result<()> {
@@ -3135,6 +3229,7 @@ mod serve_heartbeat_tests {
     fn retained_serve_focused_mode_omits_claims_section() {
         let tmp = tempdir().unwrap();
         let run_store = RunStore::new(tmp.path().join("runs"));
+        let mut viewport = ViewportState::default();
         let rows = build_retained_serve_rows_for_size(
             &sample_monitor_report(),
             &run_store,
@@ -3143,6 +3238,7 @@ mod serve_heartbeat_tests {
             Some("team-mini-01"),
             std::time::Duration::from_secs(10),
             crate::cmd::ui::LiveViewMode::Focused,
+            &mut viewport,
             &ServeProgressSnapshot::default(),
             80,
             24,
@@ -3157,6 +3253,7 @@ mod serve_heartbeat_tests {
     fn retained_serve_full_mode_includes_claims_section() {
         let tmp = tempdir().unwrap();
         let run_store = RunStore::new(tmp.path().join("runs"));
+        let mut viewport = ViewportState::default();
         let rows = build_retained_serve_rows_for_size(
             &sample_monitor_report(),
             &run_store,
@@ -3165,6 +3262,7 @@ mod serve_heartbeat_tests {
             Some("team-mini-01"),
             std::time::Duration::from_secs(10),
             crate::cmd::ui::LiveViewMode::Full,
+            &mut viewport,
             &ServeProgressSnapshot::default(),
             80,
             24,

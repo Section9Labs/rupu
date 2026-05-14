@@ -14,6 +14,7 @@ pub mod rich_payload;
 pub mod spinner;
 pub mod tables;
 pub mod theme;
+pub mod viewport;
 pub mod workflow_printer;
 pub mod yaml_snippet;
 

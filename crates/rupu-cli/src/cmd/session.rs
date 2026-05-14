@@ -13,6 +13,7 @@ use crate::output::palette::{self, BRAND, DIM};
 use crate::output::printer::{visible_len, wrap_with_ansi};
 use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::output::rich_payload::{render_payload, render_tool_input, RenderedPayload};
+use crate::output::viewport::ViewportState;
 use crate::paths;
 use crate::standalone_run_metadata::{
     metadata_path_for_run, write_metadata, StandaloneRunMetadata,
@@ -1212,17 +1213,25 @@ struct SessionInteractiveState {
     transcript_path: PathBuf,
     tailer: crate::output::TranscriptTailer,
     lines: Vec<SessionViewLine>,
+    view_mode: LiveViewMode,
+    viewport: ViewportState,
     compose: Option<String>,
 }
 
 impl SessionInteractiveState {
-    fn new(transcript_path: PathBuf, followed_run_id: Option<String>) -> Self {
+    fn new(
+        transcript_path: PathBuf,
+        followed_run_id: Option<String>,
+        view_mode: LiveViewMode,
+    ) -> Self {
         let tailer = crate::output::TranscriptTailer::new(transcript_path.clone());
         Self {
             followed_run_id,
             transcript_path,
             tailer,
             lines: Vec::new(),
+            view_mode,
+            viewport: ViewportState::default(),
             compose: None,
         }
     }
@@ -1239,13 +1248,8 @@ impl SessionInteractiveState {
         }
     }
 
-    fn push_transcript_event(
-        &mut self,
-        event: &TranscriptEvent,
-        view_mode: LiveViewMode,
-        prefs: &UiPrefs,
-    ) {
-        for line in transcript_event_lines(event, view_mode, prefs) {
+    fn push_transcript_event(&mut self, event: &TranscriptEvent, prefs: &UiPrefs) {
+        for line in transcript_event_lines(event, self.view_mode, prefs) {
             self.lines.push(line);
             if self.lines.len() > 400 {
                 let keep_from = self.lines.len().saturating_sub(400);
@@ -1275,7 +1279,6 @@ fn attach_blocking_interactive(
     session_id: &str,
     prefs: UiPrefs,
 ) -> anyhow::Result<()> {
-    let view_mode = prefs.live_view;
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session attach")?;
     if reconcile_stale_session(&mut session) {
@@ -1294,7 +1297,8 @@ fn attach_blocking_interactive(
     let outcome = {
         let _raw_mode = RawModeGuard::new(true)?;
         let _screen = SessionScreenGuard::enter()?;
-        let mut state = SessionInteractiveState::new(transcript_path, followed_run_id);
+        let mut state =
+            SessionInteractiveState::new(transcript_path, followed_run_id, prefs.live_view);
         let mut last_rows: Vec<String> = Vec::new();
         if let Some(run_id) = state.followed_run_id.as_deref() {
             state.push_line(
@@ -1305,7 +1309,7 @@ fn attach_blocking_interactive(
 
         loop {
             for event in state.tailer.drain() {
-                state.push_transcript_event(&event, view_mode, &prefs);
+                state.push_transcript_event(&event, &prefs);
             }
 
             let (mut session, scope) = read_session(global, session_id)?;
@@ -1324,7 +1328,7 @@ fn attach_blocking_interactive(
                 .or_else(|| session.last_transcript_path.clone());
             if desired_run_id != state.followed_run_id {
                 for event in state.tailer.drain() {
-                    state.push_transcript_event(&event, view_mode, &prefs);
+                    state.push_transcript_event(&event, &prefs);
                 }
                 if let Some(next_path) = desired_transcript_path {
                     state.transcript_path = next_path.clone();
@@ -1339,7 +1343,7 @@ fn attach_blocking_interactive(
                 }
             }
 
-            let rows = build_session_screen_rows(&session, &state, &prefs);
+            let rows = build_session_screen_rows(&session, &mut state, &prefs);
             if rows != last_rows {
                 render_session_screen_rows(&rows)?;
                 last_rows = rows;
@@ -1348,7 +1352,9 @@ fn attach_blocking_interactive(
             if event::poll(std::time::Duration::from_millis(100))? {
                 match event::read()? {
                     CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                        match handle_session_live_keypress(global, &session, &mut state, key)? {
+                        match handle_session_live_keypress(
+                            global, &session, &mut state, &prefs, key,
+                        )? {
                             AttachControl::Continue => {}
                             AttachControl::Exit(AttachExit::Detach) => {
                                 break AttachExit::Detach;
@@ -1392,6 +1398,7 @@ fn handle_session_live_keypress(
     global: &Path,
     session: &SessionRecord,
     state: &mut SessionInteractiveState,
+    prefs: &UiPrefs,
     key: KeyEvent,
 ) -> anyhow::Result<AttachControl> {
     if let Some(buffer) = state.compose.as_mut() {
@@ -1422,6 +1429,35 @@ fn handle_session_live_keypress(
     }
 
     match (key.code, key.modifiers) {
+        (KeyCode::Char('f'), _) => {
+            state.view_mode = state.view_mode.toggled();
+            rebuild_session_transcript_lines(state, prefs);
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+            state.viewport.scroll_up(1);
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+            state.viewport.scroll_down(1);
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::PageUp, _) => {
+            state.viewport.page_up();
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::PageDown, _) => {
+            state.viewport.page_down();
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            state.viewport.jump_top();
+            Ok(AttachControl::Continue)
+        }
+        (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
+            state.viewport.jump_bottom();
+            Ok(AttachControl::Continue)
+        }
         (KeyCode::Char('d'), _) | (KeyCode::Char(']'), KeyModifiers::CONTROL) => {
             Ok(AttachControl::Exit(AttachExit::Detach))
         }
@@ -1497,6 +1533,22 @@ fn handle_session_live_keypress(
     }
 }
 
+fn rebuild_session_transcript_lines(state: &mut SessionInteractiveState, prefs: &UiPrefs) {
+    let transcript_path = state.transcript_path.clone();
+    let followed_run_id = state.followed_run_id.clone();
+    state.lines.clear();
+    if let Some(run_id) = followed_run_id.as_deref() {
+        state.push_line(
+            crate::output::palette::Status::Working,
+            format!("attached to {}", compact_session_run_id(run_id)),
+        );
+    }
+    state.tailer = crate::output::TranscriptTailer::new(transcript_path);
+    for event in state.tailer.drain() {
+        state.push_transcript_event(&event, prefs);
+    }
+}
+
 fn handle_session_live_input(
     global: &Path,
     session: &SessionRecord,
@@ -1562,7 +1614,7 @@ fn execute_session_live_command(
 
 fn build_session_screen_rows(
     session: &SessionRecord,
-    state: &SessionInteractiveState,
+    state: &mut SessionInteractiveState,
     prefs: &UiPrefs,
 ) -> Vec<String> {
     let (width, height) = terminal::size().unwrap_or((100, 30));
@@ -1573,12 +1625,12 @@ fn build_session_screen_rows(
 
 fn build_session_screen_rows_for_size(
     session: &SessionRecord,
-    state: &SessionInteractiveState,
-    prefs: &UiPrefs,
+    state: &mut SessionInteractiveState,
+    _prefs: &UiPrefs,
     width: usize,
     height: usize,
 ) -> Vec<String> {
-    let view_mode = prefs.live_view;
+    let view_mode = state.view_mode;
     let mut rows = vec![
         render_session_header_line(session, view_mode, width),
         String::new(),
@@ -1624,7 +1676,7 @@ fn build_session_screen_rows_for_size(
         .saturating_sub(rows.len())
         .saturating_sub(footer_reserved)
         .max(1);
-    let event_rows = render_session_event_rows(&state.lines, width, available_event_rows);
+    let event_rows = render_session_event_rows(state, width, available_event_rows);
     rows.extend(event_rows);
     while rows.len() < height.saturating_sub(footer_reserved) {
         rows.push(String::new());
@@ -1671,7 +1723,7 @@ fn render_session_controls_line(width: usize) -> String {
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
     let _ = palette::write_colored(
         &mut buf,
-        "  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help",
+        "  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help",
         DIM,
     );
     truncate_ansi_line(&buf, width)
@@ -1695,8 +1747,9 @@ fn render_session_prompt_line(
         retained_session_kv_row(
             "view",
             &format!(
-                "{}  ·  runs {}  ·  current {}",
-                session.status.as_str(),
+                "{}  ·  {}  ·  runs {}  ·  current {}",
+                state.view_mode.as_str(),
+                state.viewport.status_text(),
                 session.runs.len(),
                 session
                     .active_run_id
@@ -1712,12 +1765,12 @@ fn render_session_prompt_line(
 }
 
 fn render_session_event_rows(
-    lines: &[SessionViewLine],
+    state: &mut SessionInteractiveState,
     width: usize,
     max_rows: usize,
 ) -> Vec<String> {
     let mut rendered = Vec::new();
-    for line in lines {
+    for line in &state.lines {
         let prefix = if line.continuation {
             "  ".to_string()
         } else {
@@ -1741,11 +1794,7 @@ fn render_session_event_rows(
             rendered.push(text);
         }
     }
-    if rendered.len() > max_rows {
-        rendered.split_off(rendered.len() - max_rows)
-    } else {
-        rendered
-    }
+    state.viewport.apply(rendered, max_rows).rows
 }
 
 fn transcript_event_lines(
@@ -3595,12 +3644,13 @@ mod tests {
         let mut state = SessionInteractiveState::new(
             PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
             Some("run_live123".into()),
+            LiveViewMode::Focused,
         );
         state.push_line(
             crate::output::palette::Status::Active,
             "assistant output  ·  this is a deliberately long line that should wrap cleanly inside the retained session screen without spilling past the requested width",
         );
-        let rows = build_session_screen_rows_for_size(&session, &state, &prefs, 48, 14);
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 48, 14);
         assert!(rows.len() <= 14);
         assert!(rows.iter().all(|row| visible_len(row) <= 48));
     }

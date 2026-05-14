@@ -27,6 +27,7 @@ use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::output::palette::{self, BRAND, DIM};
 use crate::output::printer::{visible_len, wrap_with_ansi};
 use crate::output::rich_payload::{render_payload, render_tool_input, RenderedPayload};
+use crate::output::viewport::ViewportState;
 use crate::paths;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
@@ -112,6 +113,7 @@ struct WorkflowInteractiveState {
     lines: Vec<WorkflowViewLine>,
     total_tokens: u64,
     dispatches: BTreeMap<String, InFlightDispatch>,
+    viewport: ViewportState,
 }
 
 impl WorkflowInteractiveState {
@@ -124,6 +126,7 @@ impl WorkflowInteractiveState {
             lines: Vec::new(),
             total_tokens: 0,
             dispatches: BTreeMap::new(),
+            viewport: ViewportState::default(),
         }
     }
 
@@ -521,6 +524,7 @@ pub fn attach_and_render_interactive_with(
                 Some(opts.view_mode),
             )
         });
+        let mut view_mode = opts.view_mode;
         let mut state = WorkflowInteractiveState::new(opts.skip_count);
         let mut last_rows: Vec<String> = Vec::new();
 
@@ -530,12 +534,12 @@ pub fn attach_and_render_interactive_with(
                 continue;
             };
 
-            drain_step_results_interactive(&step_results_log, &mut state, opts.view_mode, &prefs);
-            follow_active_transcript(&record, &mut state, opts.view_mode, &prefs);
-            drain_workflow_transcript_events(&mut state, opts.view_mode, &prefs);
+            drain_step_results_interactive(&step_results_log, &mut state, view_mode, &prefs);
+            follow_active_transcript(&record, &mut state, view_mode, &prefs);
+            drain_workflow_transcript_events(&mut state, view_mode, &prefs);
 
             let rows =
-                build_workflow_screen_rows(workflow_name, &record, &state, opts.view_mode, &prefs);
+                build_workflow_screen_rows(workflow_name, &record, &mut state, view_mode, &prefs);
             if rows != last_rows {
                 render_workflow_screen_rows(&rows)?;
                 last_rows = rows;
@@ -547,6 +551,23 @@ pub fn attach_and_render_interactive_with(
                         match event::read()? {
                             CrosstermEvent::Resize(_, _) => {}
                             CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                                if let Some(action) =
+                                    handle_workflow_navigation_keypress(&record, &mut state, key)
+                                {
+                                    if matches!(action, WorkflowNavAction::ToggleView) {
+                                        let viewport = state.viewport.clone();
+                                        view_mode = view_mode.toggled();
+                                        state = rebuild_workflow_interactive_state(
+                                            &record,
+                                            &step_results_log,
+                                            opts.skip_count,
+                                            view_mode,
+                                            &prefs,
+                                        );
+                                        state.viewport = viewport;
+                                    }
+                                    continue;
+                                }
                                 match handle_workflow_approval_keypress(
                                     run_id,
                                     &record,
@@ -573,16 +594,16 @@ pub fn attach_and_render_interactive_with(
                     drain_step_results_interactive(
                         &step_results_log,
                         &mut state,
-                        opts.view_mode,
+                        view_mode,
                         &prefs,
                     );
-                    drain_workflow_transcript_events(&mut state, opts.view_mode, &prefs);
+                    drain_workflow_transcript_events(&mut state, view_mode, &prefs);
 
                     let final_rows = build_workflow_screen_rows(
                         workflow_name,
                         &record,
-                        &state,
-                        opts.view_mode,
+                        &mut state,
+                        view_mode,
                         &prefs,
                     );
                     if final_rows != last_rows {
@@ -595,7 +616,22 @@ pub fn attach_and_render_interactive_with(
                         match event::read()? {
                             CrosstermEvent::Resize(_, _) => {}
                             CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                                handle_running_workflow_keypress(&record, &mut state, key);
+                                if let Some(action) =
+                                    handle_workflow_navigation_keypress(&record, &mut state, key)
+                                {
+                                    if matches!(action, WorkflowNavAction::ToggleView) {
+                                        let viewport = state.viewport.clone();
+                                        view_mode = view_mode.toggled();
+                                        state = rebuild_workflow_interactive_state(
+                                            &record,
+                                            &step_results_log,
+                                            opts.skip_count,
+                                            view_mode,
+                                            &prefs,
+                                        );
+                                        state.viewport = viewport;
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -639,6 +675,20 @@ pub fn attach_and_render_interactive_with(
     }
 
     Ok(final_outcome)
+}
+
+fn rebuild_workflow_interactive_state(
+    record: &RunRecord,
+    step_results_log: &Path,
+    skip_count: usize,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) -> WorkflowInteractiveState {
+    let mut state = WorkflowInteractiveState::new(skip_count);
+    drain_step_results_interactive(step_results_log, &mut state, view_mode, prefs);
+    follow_active_transcript(record, &mut state, view_mode, prefs);
+    drain_workflow_transcript_events(&mut state, view_mode, prefs);
+    state
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -1376,24 +1426,62 @@ fn retained_payload_lines(
         .collect()
 }
 
-fn handle_running_workflow_keypress(
+enum WorkflowNavAction {
+    Handled,
+    ToggleView,
+}
+
+fn handle_workflow_navigation_keypress(
     record: &RunRecord,
     state: &mut WorkflowInteractiveState,
     key: crossterm::event::KeyEvent,
-) {
+) -> Option<WorkflowNavAction> {
     match (key.code, key.modifiers) {
-        (KeyCode::Char('?'), _) => state.push_line(
-            UiStatus::Active,
-            "help  ·  resize reflows automatically  ·  approval keys appear when needed",
-        ),
-        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => state.push_line(
-            UiStatus::Awaiting,
-            format!(
-                "workflow stays attached until completion  ·  current step {}",
-                record.active_step_id.as_deref().unwrap_or("pending")
-            ),
-        ),
-        _ => {}
+        (KeyCode::Char('f'), _) => Some(WorkflowNavAction::ToggleView),
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+            state.viewport.scroll_up(1);
+            Some(WorkflowNavAction::Handled)
+        }
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+            state.viewport.scroll_down(1);
+            Some(WorkflowNavAction::Handled)
+        }
+        (KeyCode::PageUp, _) => {
+            state.viewport.page_up();
+            Some(WorkflowNavAction::Handled)
+        }
+        (KeyCode::PageDown, _) => {
+            state.viewport.page_down();
+            Some(WorkflowNavAction::Handled)
+        }
+        (KeyCode::Char('g'), KeyModifiers::NONE) => {
+            state.viewport.jump_top();
+            Some(WorkflowNavAction::Handled)
+        }
+        (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
+            state.viewport.jump_bottom();
+            Some(WorkflowNavAction::Handled)
+        }
+        (KeyCode::Char('?'), _) => {
+            state.push_line(
+                UiStatus::Active,
+                "help  ·  f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail",
+            );
+            Some(WorkflowNavAction::Handled)
+        }
+        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL)
+            if record.status != rupu_orchestrator::RunStatus::AwaitingApproval =>
+        {
+            state.push_line(
+                UiStatus::Awaiting,
+                format!(
+                    "workflow stays attached until completion  ·  current step {}",
+                    record.active_step_id.as_deref().unwrap_or("pending")
+                ),
+            );
+            Some(WorkflowNavAction::Handled)
+        }
+        _ => None,
     }
 }
 
@@ -1516,7 +1604,7 @@ fn append_findings_lines(
 fn build_workflow_screen_rows(
     workflow_name: &str,
     record: &RunRecord,
-    state: &WorkflowInteractiveState,
+    state: &mut WorkflowInteractiveState,
     view_mode: LiveViewMode,
     prefs: &UiPrefs,
 ) -> Vec<String> {
@@ -1537,7 +1625,7 @@ fn build_workflow_screen_rows(
 fn build_workflow_screen_rows_for_size(
     workflow_name: &str,
     record: &RunRecord,
-    state: &WorkflowInteractiveState,
+    state: &mut WorkflowInteractiveState,
     view_mode: LiveViewMode,
     _prefs: &UiPrefs,
     width: usize,
@@ -1606,14 +1694,14 @@ fn build_workflow_screen_rows_for_size(
         .saturating_sub(rows.len())
         .saturating_sub(footer_reserved)
         .max(1);
-    let event_rows = render_workflow_event_rows(&state.lines, width, available_event_rows);
+    let event_rows = render_workflow_event_rows(state, width, available_event_rows);
     rows.extend(event_rows);
     while rows.len() < height.saturating_sub(footer_reserved) {
         rows.push(String::new());
     }
 
     rows.push(render_workflow_controls_line(record.status, width));
-    rows.push(render_workflow_status_line(record, view_mode, width));
+    rows.push(render_workflow_status_line(record, state, view_mode, width));
     rows.truncate(height);
     rows
 }
@@ -1621,9 +1709,9 @@ fn build_workflow_screen_rows_for_size(
 fn render_workflow_controls_line(status: rupu_orchestrator::RunStatus, width: usize) -> String {
     let line = match status {
         rupu_orchestrator::RunStatus::AwaitingApproval => {
-            "a approve  ·  r reject  ·  v findings  ·  q detach"
+            "f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  a approve  ·  r reject  ·  v findings  ·  q detach"
         }
-        _ => "resize reflows automatically  ·  ? help",
+        _ => "f toggle  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  resize reflows automatically  ·  ? help",
     };
     let mut buf = String::new();
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
@@ -1633,16 +1721,15 @@ fn render_workflow_controls_line(status: rupu_orchestrator::RunStatus, width: us
 
 fn render_workflow_status_line(
     record: &RunRecord,
+    state: &WorkflowInteractiveState,
     view_mode: LiveViewMode,
     width: usize,
 ) -> String {
-    let current = record
-        .active_step_id
-        .as_deref()
-        .unwrap_or(record.status.as_str());
     let text = match record.status {
         rupu_orchestrator::RunStatus::AwaitingApproval => format!(
-            "awaiting  {}  ·  {}",
+            "view {}  ·  {}  ·  awaiting {}  ·  {}",
+            view_mode.as_str(),
+            state.viewport.status_text(),
             record.awaiting_step_id.as_deref().unwrap_or("approval"),
             truncate_single_line(
                 record
@@ -1653,22 +1740,26 @@ fn render_workflow_status_line(
             )
         ),
         _ => format!(
-            "view  {}  ·  status {}  ·  current {}",
+            "view {}  ·  {}  ·  status {}  ·  current {}",
             view_mode.as_str(),
+            state.viewport.status_text(),
             record.status.as_str(),
-            current
+            record
+                .active_step_id
+                .as_deref()
+                .unwrap_or(record.status.as_str())
         ),
     };
     retained_workflow_kv_row("view", &text, width, workflow_status_ui(record))
 }
 
 fn render_workflow_event_rows(
-    lines: &[WorkflowViewLine],
+    state: &mut WorkflowInteractiveState,
     width: usize,
     max_rows: usize,
 ) -> Vec<String> {
     let mut rendered = Vec::new();
-    for line in lines {
+    for line in &state.lines {
         let indent_prefix = "  ".repeat(line.indent);
         let prefix = if line.continuation {
             format!("{indent_prefix}  ")
@@ -1695,11 +1786,7 @@ fn render_workflow_event_rows(
             }
         }
     }
-    if rendered.len() > max_rows {
-        rendered.split_off(rendered.len() - max_rows)
-    } else {
-        rendered
-    }
+    state.viewport.apply(rendered, max_rows).rows
 }
 
 fn render_workflow_screen_rows(rows: &[String]) -> io::Result<()> {
@@ -3102,7 +3189,7 @@ mod tests {
         let rows = build_workflow_screen_rows_for_size(
             "demo",
             &record,
-            &state,
+            &mut state,
             LiveViewMode::Focused,
             &prefs,
             52,

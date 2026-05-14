@@ -99,6 +99,13 @@ impl LiveViewMode {
             Self::Full => "full",
         }
     }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Focused => Self::Full,
+            Self::Full => Self::Focused,
+        }
+    }
 }
 
 impl Default for LiveViewMode {
