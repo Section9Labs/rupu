@@ -788,6 +788,8 @@ impl Render for WorkspaceWindow {
         let weak2 = weak.clone();
         // Pre-cloned for the launcher overlay branch below.
         let weak_launcher = weak.clone();
+        // Pre-cloned for the context menu dismiss callback.
+        let weak_context_dismiss = weak.clone();
         let on_approve: ApproveCallback =
             Arc::new(move |step_id: String, window: &mut Window, cx: &mut App| {
                 let _ = window;
@@ -1018,7 +1020,28 @@ impl Render for WorkspaceWindow {
             let _ = weak_launcher;
             main_layout.into_any_element()
         };
-        body
+
+        // Context menu overlay — paints on top of everything (including the
+        // launcher sheet) when state.is_some(). Built as `deferred(...)` inside
+        // the widget so paint order is correct.
+        let on_dismiss: crate::widget::DismissCb = Arc::new(move |_w, cx| {
+            let weak = weak_context_dismiss.clone();
+            cx.defer(move |cx| {
+                let _ = weak.update(cx, |this, cx| this.handle_dismiss_context_menu(cx));
+            });
+        });
+
+        let body_with_context: AnyElement = if let Some(menu_state) = self.context_menu.as_ref() {
+            div()
+                .relative()
+                .size_full()
+                .child(body)
+                .child(crate::widget::context_menu::render(menu_state, on_dismiss))
+                .into_any_element()
+        } else {
+            body
+        };
+        body_with_context
     }
 }
 
