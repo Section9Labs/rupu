@@ -151,7 +151,7 @@ async fn workflow_show_prints_yaml_body() {
 }
 
 #[tokio::test]
-async fn workflow_show_supports_focused_compact_and_full_views() {
+async fn workflow_show_defaults_to_full_and_supports_focused_compact_views() {
     let _guard = ENV_LOCK.lock().await;
 
     let tmp = assert_fs::TempDir::new().unwrap();
@@ -176,8 +176,30 @@ async fn workflow_show_supports_focused_compact_and_full_views() {
         .assert()
         .success()
         .stdout(predicates::str::contains("workflow show"))
+        .stdout(predicates::str::contains("·  full"))
+        .stdout(predicates::str::contains("steps  ·  declared steps"))
+        .stdout(predicates::str::contains("yaml  ·  raw definition"))
+        .stdout(predicates::str::contains("schema: review_report"));
+
+    AssertCommand::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args([
+            "workflow",
+            "show",
+            "review-def",
+            "--view",
+            "focused",
+            "--no-color",
+            "--no-pager",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("·  focused"))
         .stdout(predicates::str::contains("graph  ·  workflow structure"))
         .stdout(predicates::str::contains("for_each · runtime fan-out"))
+        .stdout(predicates::str::contains("inputs  ·  declared inputs").not())
         .stdout(predicates::str::contains("raw definition").not());
 
     AssertCommand::cargo_bin("rupu")
@@ -197,27 +219,10 @@ async fn workflow_show_supports_focused_compact_and_full_views() {
         .success()
         .stdout(predicates::str::contains("·  compact"))
         .stdout(predicates::str::contains("inputs  ·  declared inputs"))
-        .stdout(predicates::str::contains("output  ·  report"))
+        .stdout(predicates::str::contains("outputs  ·  declared outputs"))
+        .stdout(predicates::str::contains("NAME"))
+        .stdout(predicates::str::contains("DETAIL"))
         .stdout(predicates::str::contains("raw definition").not());
-
-    AssertCommand::cargo_bin("rupu")
-        .unwrap()
-        .env("RUPU_HOME", global.path())
-        .current_dir(tmp.path())
-        .args([
-            "workflow",
-            "show",
-            "review-def",
-            "--view",
-            "full",
-            "--no-color",
-            "--no-pager",
-        ])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("·  full"))
-        .stdout(predicates::str::contains("yaml  ·  raw definition"))
-        .stdout(predicates::str::contains("schema: review_report"));
 }
 
 #[tokio::test]
@@ -468,7 +473,9 @@ async fn workflow_show_run_supports_pretty_and_json_output() {
         .stdout(predicates::str::contains("hello-wf"))
         .stdout(predicates::str::contains("workspace"))
         .stdout(predicates::str::contains("assistant output"))
-        .stdout(predicates::str::contains("usage"));
+        .stdout(predicates::str::contains("usage"))
+        .stdout(predicates::str::contains("PROVIDER"))
+        .stdout(predicates::str::contains("OUTPUT"));
 
     AssertCommand::cargo_bin("rupu")
         .unwrap()
@@ -546,6 +553,9 @@ async fn workflow_show_run_full_renders_fanout_timeline() {
         .stdout(predicates::str::contains("for_each"))
         .stdout(predicates::str::contains("iter[1]"))
         .stdout(predicates::str::contains("iter[2]"))
+        .stdout(predicates::str::contains("inputs  ·  runtime inputs"))
+        .stdout(predicates::str::contains("KEY"))
+        .stdout(predicates::str::contains("VALUE"))
         .stdout(predicates::str::contains("assistant output"))
         .stdout(predicates::str::contains("step output"));
 

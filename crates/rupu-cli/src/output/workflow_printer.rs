@@ -2206,19 +2206,46 @@ fn build_workflow_snapshot_rows_for_size(
             UiStatus::Failed,
         ));
     }
-    for (key, value) in &record.inputs {
-        rows.push(retained_workflow_kv_row(
-            &format!("input {key}"),
-            value,
+    if matches!(view_mode, LiveViewMode::Compact | LiveViewMode::Full) && !record.inputs.is_empty() {
+        rows.push(String::new());
+        rows.push(render_workflow_snapshot_section_header(
+            "inputs",
+            "runtime inputs",
             width,
-            UiStatus::Active,
         ));
+        rows.extend(render_workflow_snapshot_inputs_table(record, width));
     }
     rows.push(String::new());
     rows.extend(render_all_workflow_event_rows(state, width));
     rows.push(String::new());
     rows.push(render_workflow_snapshot_status_line(record, state, view_mode, width));
     rows
+}
+
+fn render_workflow_snapshot_section_header(label: &str, detail: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, BRAND);
+    if !detail.is_empty() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+        let _ = palette::write_colored(&mut buf, detail, DIM);
+    }
+    truncate_workflow_ansi_line(&buf, width)
+}
+
+fn render_workflow_snapshot_inputs_table(record: &RunRecord, width: usize) -> Vec<String> {
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["KEY", "VALUE"]);
+    for (key, value) in &record.inputs {
+        table.add_row(vec![
+            comfy_table::Cell::new(key),
+            comfy_table::Cell::new(truncate_single_line(value, 72)),
+        ]);
+    }
+    table
+        .to_string()
+        .lines()
+        .map(|line| truncate_workflow_ansi_line(line, width))
+        .collect()
 }
 
 fn render_workflow_controls_line(status: rupu_orchestrator::RunStatus, width: usize) -> String {
