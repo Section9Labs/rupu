@@ -323,6 +323,90 @@ impl WorkspaceWindow {
         self.open_launcher(path, cx);
     }
 
+    /// Open a context menu at `position` with workflow-row actions.
+    pub fn open_workflow_context_menu(
+        &mut self,
+        path: PathBuf,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let weak_run: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let path_for_run = path.clone();
+        let run_item = crate::widget::ContextMenuItem {
+            label: "Run\u{2026}".into(),
+            on_select: Arc::new(move |_w, cx| {
+                let weak = weak_run.clone();
+                let path = path_for_run.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.handle_workflow_right_clicked(path, cx);
+                    });
+                });
+            }),
+        };
+        let weak_reveal: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let path_for_reveal = path.clone();
+        let reveal_item = crate::widget::ContextMenuItem {
+            label: "Reveal in Finder".into(),
+            on_select: Arc::new(move |_w, cx| {
+                let weak = weak_reveal.clone();
+                let path = path_for_reveal.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.handle_workflow_reveal(path, cx);
+                    });
+                });
+            }),
+        };
+        self.context_menu = Some(crate::widget::ContextMenuState {
+            position,
+            items: vec![run_item, reveal_item],
+        });
+        cx.notify();
+    }
+
+    /// Open a context menu at `position` with agent-row actions.
+    pub fn open_agent_context_menu(
+        &mut self,
+        path: PathBuf,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let weak_open: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let path_for_open = path.clone();
+        let open_item = crate::widget::ContextMenuItem {
+            label: "Open in Editor".into(),
+            on_select: Arc::new(move |_w, cx| {
+                let weak = weak_open.clone();
+                let path = path_for_open.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.handle_agent_clicked(path, cx);
+                    });
+                });
+            }),
+        };
+        let weak_reveal: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let path_for_reveal = path.clone();
+        let reveal_item = crate::widget::ContextMenuItem {
+            label: "Reveal in Finder".into(),
+            on_select: Arc::new(move |_w, cx| {
+                let weak = weak_reveal.clone();
+                let path = path_for_reveal.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.handle_agent_reveal(path, cx);
+                    });
+                });
+            }),
+        };
+        self.context_menu = Some(crate::widget::ContextMenuState {
+            position,
+            items: vec![open_item, reveal_item],
+        });
+        cx.notify();
+    }
+
     /// Toggle a sidebar section's collapsed state and persist.
     pub fn handle_section_toggle(&mut self, section: &'static str, cx: &mut Context<Self>) {
         self.workspace
@@ -367,6 +451,24 @@ impl WorkspaceWindow {
                 .spawn()
             {
                 tracing::warn!(?path, %e, "reveal agent in Finder");
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tracing::info!(?path, "reveal: no-op on non-macOS");
+        }
+    }
+
+    /// Reveal a workflow's YAML file in Finder.
+    pub fn handle_workflow_reveal(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(e) = std::process::Command::new("open")
+                .args(["-R"])
+                .arg(&path)
+                .spawn()
+            {
+                tracing::warn!(?path, %e, "reveal workflow in Finder");
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -783,12 +885,12 @@ impl Render for WorkspaceWindow {
                                     .update(cx, |this, cx| this.handle_workflow_clicked(path, cx));
                             });
                         });
-                        let on_workflow_right_click: WorkflowClickCb =
-                            Arc::new(move |path, _w, cx| {
+                        let on_workflow_right_click: sidebar::RightClickCb =
+                            Arc::new(move |path, position, _w, cx| {
                                 let weak_sidebar_right = weak_sidebar_right.clone();
                                 cx.defer(move |cx| {
                                     let _ = weak_sidebar_right.update(cx, |this, cx| {
-                                        this.handle_workflow_right_clicked(path, cx)
+                                        this.open_workflow_context_menu(path, position, cx)
                                     });
                                 });
                             });
@@ -810,12 +912,12 @@ impl Render for WorkspaceWindow {
                                     });
                                 });
                             });
-                        let on_agent_right_click: sidebar::AgentClickCb =
-                            Arc::new(move |path, _w, cx| {
+                        let on_agent_right_click: sidebar::RightClickCb =
+                            Arc::new(move |path, position, _w, cx| {
                                 let weak = weak_agent_reveal.clone();
                                 cx.defer(move |cx| {
                                     let _ = weak.update(cx, |this, cx| {
-                                        this.handle_agent_reveal(path, cx)
+                                        this.open_agent_context_menu(path, position, cx)
                                     });
                                 });
                             });
