@@ -15,7 +15,6 @@ use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
 use crate::output::palette::Status as UiStatus;
 use crate::output::report::{self, CollectionOutput, DetailOutput, EventOutput};
-use crate::output::LineStreamPrinter;
 use crate::paths;
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
@@ -146,6 +145,19 @@ pub enum Action {
         /// Full run id (`run_<ULID>`) as printed by
         /// `rupu workflow run`.
         run_id: String,
+        /// Live view density for the retained snapshot.
+        #[arg(long)]
+        view: Option<LiveViewMode>,
+        /// Disable colored output (also honored: `NO_COLOR` env,
+        /// `[ui].color = \"never\"` in config).
+        #[arg(long)]
+        no_color: bool,
+        /// Force pager. Default: page when stdout is a tty.
+        #[arg(long, conflicts_with = "no_pager")]
+        pager: bool,
+        /// Disable pager.
+        #[arg(long, conflicts_with = "pager")]
+        no_pager: bool,
     },
     /// Approve a paused run and resume execution from the awaited
     /// step. The run must be in `awaiting_approval` status.
@@ -226,7 +238,22 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             )
             .await
         }
-        Action::ShowRun { run_id } => show_run(&run_id, global_format).await,
+        Action::ShowRun {
+            run_id,
+            view,
+            no_color,
+            pager,
+            no_pager,
+        } => {
+            let pager_flag = if pager {
+                Some(true)
+            } else if no_pager {
+                Some(false)
+            } else {
+                None
+            };
+            show_run(&run_id, view, no_color, pager_flag, global_format).await
+        }
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
         Action::Cancel { run_id } => cancel(&run_id).await,
@@ -417,6 +444,10 @@ struct WorkflowShowRunReport {
 }
 
 struct WorkflowShowRunOutput {
+    prefs: crate::cmd::ui::UiPrefs,
+    view_mode: LiveViewMode,
+    record: rupu_orchestrator::RunRecord,
+    step_results_log: PathBuf,
     report: WorkflowShowRunReport,
 }
 
@@ -524,143 +555,103 @@ impl EventOutput for WorkflowShowRunOutput {
     }
 
     fn render_pretty(&self) -> anyhow::Result<()> {
-        let item = &self.report.item;
-        render_pretty_workflow_run(item)
+        render_pretty_workflow_run(
+            &self.record,
+            &self.step_results_log,
+            &self.report.item.usage_rows,
+            self.report.item.usage_totals.as_ref(),
+            &self.prefs,
+            self.view_mode,
+        )
     }
 }
 
-fn render_pretty_workflow_run(item: &WorkflowShowRunItem) -> anyhow::Result<()> {
-    let mut printer = LineStreamPrinter::new();
-    let started_at = chrono::DateTime::parse_from_str(&item.started_at, "%Y-%m-%d %H:%M:%S UTC")
-        .map(|value| value.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|_| chrono::Utc::now());
-
-    printer.workflow_header(&item.workflow, &item.run_id, started_at);
-    printer.sideband_event(
-        workflow_run_status(item.status.as_str()),
-        "status",
-        Some(&item.status),
+fn render_pretty_workflow_run(
+    record: &rupu_orchestrator::RunRecord,
+    step_results_log: &Path,
+    usage_rows: &[WorkflowShowRunUsageRow],
+    usage_totals: Option<&WorkflowShowRunUsageTotals>,
+    prefs: &crate::cmd::ui::UiPrefs,
+    view_mode: LiveViewMode,
+) -> anyhow::Result<()> {
+    let width = crossterm::terminal::size()
+        .map(|(value, _)| value.max(40) as usize)
+        .unwrap_or(100);
+    let mut body = crate::output::workflow_printer::render_workflow_snapshot_body(
+        &record.workflow_name,
+        record,
+        step_results_log,
+        view_mode,
+        prefs,
+        width,
     );
-
-    let workspace = format!("{}  ·  {}", item.workspace_id, item.workspace_path);
-    printer.sideband_event(UiStatus::Active, "workspace", Some(&workspace));
-    printer.sideband_event(UiStatus::Active, "started", Some(&item.started_at));
-
-    if let Some(finished_at) = item.finished_at.as_deref() {
-        printer.sideband_event(UiStatus::Complete, "finished", Some(finished_at));
+    let usage_block = render_workflow_usage_block(usage_rows, usage_totals);
+    if !usage_block.is_empty() {
+        body.push_str("\n\n");
+        body.push_str(&usage_block);
     }
-    if let Some(error) = item.error.as_deref() {
-        printer.sideband_event(UiStatus::Failed, "error", Some(error));
-    }
-    if let Some(step) = item.awaiting_step.as_deref() {
-        let mut detail = step.to_string();
-        if let Some(since) = item.awaiting_since.as_deref() {
-            detail.push_str(&format!("  ·  since {since}"));
-        }
-        if let Some(expires) = item.expires_at.as_deref() {
-            detail.push_str(&format!("  ·  expires {expires}"));
-        }
-        printer.sideband_event(UiStatus::Awaiting, "awaiting", Some(&detail));
+    body.push('\n');
+    crate::cmd::ui::paginate(&body, prefs)
+}
+
+fn render_workflow_usage_block(
+    usage_rows: &[WorkflowShowRunUsageRow],
+    usage_totals: Option<&WorkflowShowRunUsageTotals>,
+) -> String {
+    if usage_rows.is_empty() {
+        return String::new();
     }
 
-    for (key, value) in &item.inputs {
-        let detail = format!("{key} = {}", truncate_pretty(value, 72));
-        printer.sideband_event(UiStatus::Active, "input", Some(&detail));
-    }
-
-    if !item.steps.is_empty() {
-        printer.phase_separator();
-        for step in &item.steps {
-            let detail = format!(
-                "{}  ·  {}",
-                step.status,
-                truncate_pretty(&step.transcript_path, 72)
-            );
-            printer.sideband_event(
-                workflow_step_status(step.status.as_str()),
-                &format!("step {}", step.step_id),
-                Some(&detail),
-            );
-            for child in &step.items {
-                let sub_detail = format!(
-                    "{}  ·  {}",
-                    child.status,
-                    truncate_pretty(&child.transcript_path, 68)
-                );
-                printer.sideband_event(
-                    workflow_step_status(child.status.as_str()),
-                    &format!("item {}", child.label),
-                    Some(&sub_detail),
-                );
-            }
-        }
-    }
-
-    if !item.usage_rows.is_empty() {
-        printer.phase_separator();
-        for row in &item.usage_rows {
-            let detail = format!(
-                "{} · {} · {}  ·  in {} out {} cached {}{}",
+    let mut lines = Vec::new();
+    lines.push(styled_usage_line(
+        UiStatus::Active,
+        "usage",
+        "provider  ·  model  ·  agent  ·  in/out/cached  ·  cost",
+    ));
+    for row in usage_rows {
+        let cost = row
+            .cost_usd
+            .map(|value| format!("  ·  ${value:.4}"))
+            .unwrap_or_default();
+        lines.push(styled_usage_line(
+            UiStatus::Active,
+            "├─",
+            &format!(
+                "{}  ·  {}  ·  {}  ·  in {} out {} cached {}{}",
                 row.provider,
                 row.model,
                 row.agent,
                 row.input_tokens,
                 row.output_tokens,
                 row.cached_tokens,
-                row.cost_usd
-                    .map(|value| format!("  ·  ${value:.4}"))
-                    .unwrap_or_default()
-            );
-            printer.sideband_event(UiStatus::Active, "usage", Some(&detail));
-        }
-        if let Some(totals) = &item.usage_totals {
-            let detail = format!(
+                cost
+            ),
+        ));
+    }
+    if let Some(totals) = usage_totals {
+        let cost = totals
+            .cost_usd
+            .map(|value| format!("  ·  ${value:.4}"))
+            .unwrap_or_default();
+        lines.push(styled_usage_line(
+            UiStatus::Complete,
+            "└─ total",
+            &format!(
                 "in {} out {} cached {}{}",
-                totals.input_tokens,
-                totals.output_tokens,
-                totals.cached_tokens,
-                totals
-                    .cost_usd
-                    .map(|value| format!("  ·  ${value:.4}"))
-                    .unwrap_or_default()
-            );
-            printer.sideband_event(UiStatus::Complete, "usage total", Some(&detail));
-        }
+                totals.input_tokens, totals.output_tokens, totals.cached_tokens, cost
+            ),
+        ));
     }
-
-    Ok(())
+    lines.join("\n")
 }
 
-fn workflow_run_status(status: &str) -> UiStatus {
-    match status {
-        "completed" => UiStatus::Complete,
-        "failed" | "rejected" => UiStatus::Failed,
-        "awaiting_approval" => UiStatus::Awaiting,
-        "running" => UiStatus::Working,
-        _ => UiStatus::Active,
-    }
-}
-
-fn workflow_step_status(status: &str) -> UiStatus {
-    match status {
-        "ok" | "completed" => UiStatus::Complete,
-        "fail" | "failed" => UiStatus::Failed,
-        "skipped" => UiStatus::Skipped,
-        _ => UiStatus::Active,
-    }
-}
-
-fn truncate_pretty(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        value.to_string()
-    } else {
-        let mut out = value
-            .chars()
-            .take(max.saturating_sub(1))
-            .collect::<String>();
-        out.push('…');
-        out
-    }
+fn styled_usage_line(status: UiStatus, label: &str, detail: &str) -> String {
+    let mut buf = String::new();
+    let _ = crate::output::palette::write_bold_colored(&mut buf, label, status.color());
+    let _ = crate::output::palette::write_colored(&mut buf, "  ", crate::output::palette::DIM);
+    let _ =
+        crate::output::palette::write_colored(&mut buf, detail, crate::output::palette::DIM);
+    buf
 }
 
 async fn list(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
@@ -837,7 +828,8 @@ async fn runs(
     global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
-    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let runs_dir = global.join("runs");
+    let store = rupu_orchestrator::RunStore::new(runs_dir.clone());
     let mut all = store
         .list()
         .map_err(|e| anyhow::anyhow!("run-store list failed: {e}"))?;
@@ -994,13 +986,20 @@ fn layered_config_workflow(
         .unwrap_or_default()
 }
 
-async fn show_run(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn show_run(
+    run_id: &str,
+    view: Option<LiveViewMode>,
+    no_color: bool,
+    pager_flag: Option<bool>,
+    global_format: Option<OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let cfg = layered_config_workflow(&global, project_root.as_deref());
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, None);
-    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
+    let runs_dir = global.join("runs");
+    let store = rupu_orchestrator::RunStore::new(runs_dir.clone());
     let record = store.load(run_id).map_err(|e| {
         anyhow::anyhow!(
             "run not found: {e}\n  hint: list runs with `rupu workflow runs` \
@@ -1062,7 +1061,12 @@ async fn show_run(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::
                 .collect(),
         })
         .collect();
+    let view_mode = prefs.live_view;
     let output = WorkflowShowRunOutput {
+        prefs,
+        view_mode,
+        record: record.clone(),
+        step_results_log: runs_dir.join(run_id).join("step_results.jsonl"),
         report: WorkflowShowRunReport {
             kind: "workflow_show_run",
             version: 1,
@@ -1094,7 +1098,6 @@ async fn show_run(run_id: &str, global_format: Option<OutputFormat>) -> anyhow::
             },
         },
     };
-    let _ = prefs;
     report::emit_event(global_format, &output)
 }
 

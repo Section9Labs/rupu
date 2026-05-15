@@ -371,7 +371,8 @@ async fn workflow_show_run_supports_pretty_and_json_output() {
         .success()
         .stdout(predicates::str::contains("hello-wf"))
         .stdout(predicates::str::contains("workspace"))
-        .stdout(predicates::str::contains("step a"));
+        .stdout(predicates::str::contains("assistant output"))
+        .stdout(predicates::str::contains("usage"));
 
     AssertCommand::cargo_bin("rupu")
         .unwrap()
@@ -384,6 +385,73 @@ async fn workflow_show_run_supports_pretty_and_json_output() {
         .stdout(predicates::str::contains(format!(
             "\"run_id\": \"{run_id}\""
         )));
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    std::env::remove_var("RUPU_HOME");
+}
+
+#[tokio::test]
+async fn workflow_show_run_full_renders_fanout_timeline() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/echo.md")
+        .write_str("---\nname: echo\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\nyou echo.")
+        .unwrap();
+    global.child("workflows").create_dir_all().unwrap();
+    global
+        .child("workflows/fanout-wf.yaml")
+        .write_str(FANOUT_WORKFLOW_YAML)
+        .unwrap();
+
+    let project = assert_fs::TempDir::new().unwrap();
+
+    std::env::set_var("RUPU_HOME", global.path());
+    std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", MOCK_SCRIPT);
+    std::env::set_current_dir(project.path()).unwrap();
+
+    let exit = rupu_cli::run(vec![
+        "rupu".into(),
+        "workflow".into(),
+        "run".into(),
+        "fanout-wf".into(),
+        "--mode".into(),
+        "bypass".into(),
+        "--input".into(),
+        "files=[\"a.rs\",\"b.py\"]".into(),
+    ])
+    .await;
+    assert_eq!(exit, std::process::ExitCode::from(0));
+
+    let run_store = rupu_orchestrator::RunStore::new(global.path().join("runs"));
+    let runs = run_store.list().unwrap();
+    assert_eq!(runs.len(), 1);
+    let run_id = runs[0].id.clone();
+
+    AssertCommand::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(project.path())
+        .args([
+            "--format",
+            "pretty",
+            "workflow",
+            "show-run",
+            &run_id,
+            "--view",
+            "full",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("for_each"))
+        .stdout(predicates::str::contains("iter[1]"))
+        .stdout(predicates::str::contains("iter[2]"))
+        .stdout(predicates::str::contains("assistant output"))
+        .stdout(predicates::str::contains("step output"));
 
     std::env::set_current_dir(tmp.path()).unwrap();
     std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
