@@ -406,7 +406,8 @@ automation.
 
 `rupu session show` now uses the same retained static-snapshot model for human terminal output.
 The default table/human surface respects `--view focused|compact|full` plus `--no-color`, `--pager`,
-and `--no-pager`, while `--format json` remains unchanged for automation.
+and `--no-pager`. `full` expands the retained transcript content inline under each recent run,
+while `--format json` remains unchanged for automation.
 
 Built-in parity names currently include:
 

@@ -229,8 +229,10 @@ rupu session show ses_01J... --view full --pager
 `rupu session show` now renders a retained static session snapshot instead of the older flat
 key/value dump. The human terminal surface keeps the session route/workspace/usage summary and a
 recent-runs timeline on screen together. Use `--view focused|compact|full` to control how much run
-detail is shown, and use `--no-color`, `--pager`, or `--no-pager` to override the configured UI
-preferences for a single invocation. Structured `json` output is unchanged.
+detail is shown: `focused` keeps run summaries only, `compact` adds run metadata, and `full`
+expands the retained transcript content inline under each recent run. Use `--no-color`, `--pager`,
+or `--no-pager` to override the configured UI preferences for a single invocation. Structured
+`json` output is unchanged.
 
 ### Inspect workflow run history
 

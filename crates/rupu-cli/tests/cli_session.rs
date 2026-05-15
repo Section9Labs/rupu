@@ -6,6 +6,7 @@
 use assert_cmd::Command;
 use chrono::Utc;
 use predicates::prelude::*;
+use rupu_transcript::{Event, JsonlWriter, RunMode, RunStatus};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -89,14 +90,18 @@ fn write_session(
     } else {
         transcripts_dir.join("run_prev123.jsonl")
     };
-    std::fs::write(&prev_transcript_path, "{}\n").unwrap();
+    write_transcript_file(
+        &prev_transcript_path,
+        "run_prev123",
+        "repo summary SENTINELBODY",
+    );
     let live_transcript_path = if archived {
         archived_transcripts_dir.join("run_live123.jsonl")
     } else {
         transcripts_dir.join("run_live123.jsonl")
     };
     if status == "running" {
-        std::fs::write(&live_transcript_path, "{}\n").unwrap();
+        write_transcript_file(&live_transcript_path, "run_live123", "live summary");
     }
     let active_run_id = if status == "running" {
         Some("run_live123".to_string())
@@ -145,7 +150,7 @@ fn write_session(
         runs: vec![TestRun {
             run_id: "run_prev123".into(),
             prompt: "Summarize the issue.".into(),
-            transcript_path: "/tmp/repo/.rupu/transcripts/run_prev123.jsonl".into(),
+            transcript_path: prev_transcript_path.display().to_string(),
             started_at: now.clone(),
             completed_at: Some(now),
             status: Some("ok".into()),
@@ -161,6 +166,38 @@ fn write_session(
         serde_json::to_vec_pretty(&payload).unwrap(),
     )
     .unwrap();
+}
+
+fn write_transcript_file(path: &std::path::Path, run_id: &str, assistant_content: &str) {
+    let mut writer = JsonlWriter::create(path).unwrap();
+    writer
+        .write(&Event::RunStart {
+            run_id: run_id.to_string(),
+            workspace_id: "ws_test".into(),
+            agent: "issue-reader".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            started_at: Utc::now(),
+            mode: RunMode::Bypass,
+        })
+        .unwrap();
+    writer.write(&Event::TurnStart { turn_idx: 0 }).unwrap();
+    writer
+        .write(&Event::AssistantMessage {
+            content: assistant_content.to_string(),
+            thinking: None,
+        })
+        .unwrap();
+    writer
+        .write(&Event::RunComplete {
+            run_id: run_id.to_string(),
+            status: RunStatus::Ok,
+            total_tokens: 123,
+            duration_ms: 1234,
+            error: None,
+        })
+        .unwrap();
+    writer.flush().unwrap();
 }
 
 fn rewrite_session_updated_at(
@@ -232,7 +269,7 @@ async fn session_show_supports_focused_compact_and_full_views() {
         .success()
         .stdout(predicate::str::contains("session show"))
         .stdout(predicate::str::contains("runs  ·  recent turns"))
-        .stdout(predicate::str::contains("transcript /tmp/repo/.rupu/transcripts/run_prev123.jsonl").not());
+        .stdout(predicate::str::contains("SENTINELBODY").not());
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -242,7 +279,8 @@ async fn session_show_supports_focused_compact_and_full_views() {
         .assert()
         .success()
         .stdout(predicate::str::contains("·  compact"))
-        .stdout(predicate::str::contains("transcript /tmp/repo/.rupu/transcripts/run_prev123.jsonl"));
+        .stdout(predicate::str::contains("transcript "))
+        .stdout(predicate::str::contains("SENTINELBODY").not());
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -253,7 +291,9 @@ async fn session_show_supports_focused_compact_and_full_views() {
         .success()
         .stdout(predicate::str::contains("·  full"))
         .stdout(predicate::str::contains("completed "))
-        .stdout(predicate::str::contains("1234ms"));
+        .stdout(predicate::str::contains("1234ms"))
+        .stdout(predicate::str::contains("assistant output"))
+        .stdout(predicate::str::contains("SENTINELBODY"));
 }
 
 #[tokio::test]
