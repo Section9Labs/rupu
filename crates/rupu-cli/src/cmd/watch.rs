@@ -1,7 +1,14 @@
-use crate::output::workflow_printer::attach_and_print;
+use crate::cmd::transcript::truncate_single_line;
+use crate::cmd::ui::{LiveViewMode, UiPrefs};
+use crate::output::palette::Status as UiStatus;
+use crate::output::rich_payload::render_payload;
+use crate::output::workflow_printer::{
+    attach_and_print_with, attach_and_render_interactive_with, tool_summary, AttachOpts,
+};
 use crate::output::LineStreamPrinter;
 use crate::paths;
 use clap::Args;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -17,6 +24,10 @@ pub struct WatchArgs {
     /// Replay pace in events per second (only with --replay).
     #[arg(long, default_value_t = 10.0)]
     pub pace: f32,
+
+    /// Live view density for retained watch screens.
+    #[arg(long)]
+    pub view: Option<LiveViewMode>,
 
     /// Follow a live run (tail mode). Re-scans the transcript dir
     /// every 250ms until the run reaches a terminal state.
@@ -55,6 +66,8 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
         }
     };
 
+    let prefs = resolve_watch_prefs(args.view);
+    let view_mode = prefs.live_view;
     let transcript_dir = record.transcript_dir.clone();
     let workflow_name = record.workflow_name.clone();
     let run_id = args.run_id.clone();
@@ -67,22 +80,41 @@ fn handle_inner(args: WatchArgs) -> ExitCode {
             &runs_dir,
             &transcript_dir,
             args.pace,
+            view_mode,
+            &prefs,
         );
         match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => crate::output::diag::fail(e),
         }
     } else {
-        // Live watch (same logic as workflow attach_and_print).
-        let mut printer = LineStreamPrinter::new();
-        match attach_and_print(
-            &workflow_name,
-            &run_id,
-            &runs_dir,
-            &transcript_dir,
-            &mut printer,
-            &store,
-        ) {
+        // Live watch uses the retained interactive workflow view when
+        // attached to a tty; pipes/non-tty keep the line-stream path.
+        let attach_opts = AttachOpts {
+            view_mode,
+            ..AttachOpts::default()
+        };
+        let outcome = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            attach_and_render_interactive_with(
+                &workflow_name,
+                &run_id,
+                &runs_dir,
+                &store,
+                attach_opts,
+            )
+        } else {
+            let mut printer = LineStreamPrinter::new();
+            attach_and_print_with(
+                &workflow_name,
+                &run_id,
+                &runs_dir,
+                &transcript_dir,
+                &mut printer,
+                &store,
+                attach_opts,
+            )
+        };
+        match outcome {
             Ok(crate::output::workflow_printer::AttachOutcome::Approved { awaited_step_id }) => {
                 // We persisted the approval, but `rupu watch` doesn't have
                 // the workflow YAML / factory needed to spin a resume run
@@ -109,6 +141,8 @@ fn replay_with_printer(
     runs_dir: &std::path::Path,
     _transcript_dir: &std::path::Path,
     pace: f32,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
 ) -> std::io::Result<()> {
     let run_dir = runs_dir.join(run_id);
     let step_results_log = run_dir.join("step_results.jsonl");
@@ -156,11 +190,41 @@ fn replay_with_printer(
                 rupu_transcript::Event::AssistantMessage { content, .. }
                     if !content.trim().is_empty() =>
                 {
-                    printer.assistant_chunk(&content);
+                    render_replay_assistant_output(&mut printer, &content, view_mode);
                 }
                 rupu_transcript::Event::ToolCall { tool, input, .. } => {
-                    let summary = crate::output::workflow_printer::tool_summary(&tool, &input);
+                    let summary = tool_summary(&tool, &input);
                     printer.tool_call(&tool, &summary);
+                }
+                rupu_transcript::Event::ToolResult {
+                    output,
+                    error,
+                    duration_ms,
+                    ..
+                } => {
+                    let status = if error.is_some() {
+                        UiStatus::Failed
+                    } else {
+                        UiStatus::Complete
+                    };
+                    let label = if error.is_some() { "tool error" } else { "tool result" };
+                    let raw = error.as_deref().unwrap_or(output.as_str());
+                    let rendered = render_payload(raw, prefs);
+                    let mut detail = rendered.headline.clone();
+                    if duration_ms > 0 {
+                        detail.push_str(&format!("  ·  {duration_ms}ms"));
+                    }
+                    printer.sideband_event(status, label, Some(&detail));
+                }
+                rupu_transcript::Event::FileEdit { path, kind, diff } => {
+                    let rendered = render_payload(&diff, prefs);
+                    let detail = format!(
+                        "{} {}  ·  {}",
+                        format!("{kind:?}").to_lowercase(),
+                        path,
+                        rendered.headline
+                    );
+                    printer.sideband_event(UiStatus::Complete, "file edit", Some(&detail));
                 }
                 rupu_transcript::Event::RunComplete {
                     status,
@@ -226,4 +290,40 @@ fn load_run_started_at(run_json: &std::path::Path) -> Option<chrono::DateTime<ch
 fn load_run_json_value(run_json: &std::path::Path) -> Option<serde_json::Value> {
     let bytes = std::fs::read(run_json).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn resolve_watch_prefs(view: Option<LiveViewMode>) -> UiPrefs {
+    let global = paths::global_dir().ok();
+    let project_root = std::env::current_dir()
+        .ok()
+        .and_then(|pwd| paths::project_root_for(&pwd).ok().flatten());
+    let cfg = global
+        .as_deref()
+        .map(|global| {
+            rupu_config::layer_files(
+                Some(&global.join("config.toml")),
+                project_root
+                    .as_deref()
+                    .map(|root| root.join(".rupu/config.toml"))
+                    .as_deref(),
+            )
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    UiPrefs::resolve(&cfg.ui, false, None, None, view)
+}
+
+fn render_replay_assistant_output(
+    printer: &mut LineStreamPrinter,
+    content: &str,
+    view_mode: LiveViewMode,
+) {
+    match view_mode {
+        LiveViewMode::Focused => printer.sideband_event(
+            UiStatus::Active,
+            "assistant output",
+            Some(&truncate_single_line(content, 96)),
+        ),
+        LiveViewMode::Compact | LiveViewMode::Full => printer.assistant_chunk(content),
+    }
 }
