@@ -759,7 +759,9 @@ impl CollectionOutput for AutoflowClaimsOutput {
 }
 
 struct AutoflowMonitorOutput {
+    prefs: UiPrefs,
     report: AutoflowMonitorReport,
+    view_mode: LiveViewMode,
 }
 
 impl CollectionOutput for AutoflowMonitorOutput {
@@ -783,6 +785,9 @@ impl CollectionOutput for AutoflowMonitorOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
+        if std::io::stdout().is_terminal() {
+            return render_monitor_snapshot_view(&self.report, self.view_mode, &self.prefs);
+        }
         render_monitor_snapshot(&self.report, false)
     }
 }
@@ -4467,7 +4472,11 @@ async fn monitor(
 
     if !watch {
         let report = build_monitor_report(repo_filter.as_deref(), worker)?;
-        let output = AutoflowMonitorOutput { report };
+        let output = AutoflowMonitorOutput {
+            prefs: retained_serve_ui_prefs(),
+            report,
+            view_mode: live_view_mode,
+        };
         return output_report::emit_collection(global_format, &output);
     }
 
@@ -5013,6 +5022,49 @@ fn render_history_snapshot(
     );
     let rendered = rows.join("\n") + "\n";
     crate::cmd::ui::paginate(&rendered, prefs)
+}
+
+fn render_monitor_snapshot_view(
+    report: &AutoflowMonitorReport,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let run_store = RunStore::new(global.join("runs"));
+    let pricing = autoflow_pricing_config();
+    let (width, _) = crossterm::terminal::size().unwrap_or((120, 40));
+    let rows = build_monitor_snapshot_rows_for_size(
+        report,
+        &run_store,
+        &pricing,
+        view_mode,
+        width.max(80) as usize,
+    );
+    let rendered = rows.join("\n") + "\n";
+    crate::cmd::ui::paginate(&rendered, prefs)
+}
+
+fn build_monitor_snapshot_rows_for_size(
+    report: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> Vec<String> {
+    let mut ui_state = AutoflowServeUiState::default();
+    build_retained_monitor_rows_for_size(
+        report,
+        run_store,
+        pricing,
+        None,
+        None,
+        std::time::Duration::from_secs(0),
+        view_mode,
+        &mut ui_state,
+        0,
+        width,
+        4096,
+    )
 }
 
 fn build_history_snapshot_rows_for_size(
@@ -5579,6 +5631,22 @@ mod serve_heartbeat_tests {
         assert!(rows.iter().any(|row| row.contains("issues")));
         assert!(rows.iter().any(|row| row.contains("selected")));
         assert!(rows.iter().any(|row| row.contains("refreshes 3")));
+    }
+
+    #[test]
+    fn monitor_snapshot_rows_show_operator_console_layout() {
+        let tmp = tempdir().unwrap();
+        let run_store = RunStore::new(tmp.path().join("runs"));
+        let rows = build_monitor_snapshot_rows_for_size(
+            &sample_monitor_report(),
+            &run_store,
+            &autoflow_pricing_config(),
+            crate::cmd::ui::LiveViewMode::Focused,
+            150,
+        );
+        assert!(rows.iter().any(|row| row.contains("autoflow monitor")));
+        assert!(rows.iter().any(|row| row.contains("issues")));
+        assert!(rows.iter().any(|row| row.contains("selected")));
     }
 
     #[test]
