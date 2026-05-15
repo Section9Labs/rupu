@@ -133,7 +133,7 @@ pub enum Action {
         /// Refresh interval for `--watch`, for example `2s`.
         #[arg(long, default_value = "2s")]
         interval: String,
-        /// Live operator view mode (`focused`, `compact`, or `full`) for `--watch`.
+        /// Human/operator view mode (`focused`, `compact`, or `full`).
         #[arg(long, value_enum)]
         view: Option<crate::cmd::ui::LiveViewMode>,
     },
@@ -162,7 +162,7 @@ pub enum Action {
         /// Refresh interval for `--watch`, for example `2s`.
         #[arg(long, default_value = "2s")]
         interval: String,
-        /// Live operator view mode (`focused`, `compact`, or `full`) for `--watch`.
+        /// Human/operator view mode (`focused`, `compact`, or `full`).
         #[arg(long, value_enum)]
         view: Option<crate::cmd::ui::LiveViewMode>,
     },
@@ -788,7 +788,10 @@ impl CollectionOutput for AutoflowMonitorOutput {
 }
 
 struct AutoflowHistoryOutput {
+    prefs: UiPrefs,
     report: AutoflowHistoryReport,
+    monitor: AutoflowMonitorReport,
+    view_mode: LiveViewMode,
 }
 
 impl CollectionOutput for AutoflowHistoryOutput {
@@ -815,6 +818,9 @@ impl CollectionOutput for AutoflowHistoryOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
+        if std::io::stdout().is_terminal() {
+            return render_history_snapshot(&self.report, &self.monitor, self.view_mode, &self.prefs);
+        }
         render_history_table(&self.report)
     }
 }
@@ -2957,6 +2963,29 @@ fn retained_history_header_line(
     truncate_retained_ansi_line(&buf, width)
 }
 
+fn retained_history_snapshot_header_line(
+    report: &AutoflowHistoryReport,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "autoflow history", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        &format!(
+            "  ·  rows {}  ·  events {}  ·  cycles {}  ·  {}",
+            report.rows.len(),
+            report.total_events,
+            report.total_cycles,
+            view_mode.as_str(),
+        ),
+        DIM,
+    );
+    truncate_retained_ansi_line(&buf, width)
+}
+
 fn render_history_issue_list_row(
     entry: &HistoryIssueEntry,
     selected: bool,
@@ -4577,7 +4606,13 @@ async fn history(
 
     if !watch {
         let report = build_history_report(&query)?;
-        let output = AutoflowHistoryOutput { report };
+        let monitor = build_monitor_report(query.repo_filter, query.worker_filter)?;
+        let output = AutoflowHistoryOutput {
+            prefs: retained_serve_ui_prefs(),
+            report,
+            monitor,
+            view_mode: live_view_mode,
+        };
         return output_report::emit_collection(global_format, &output);
     }
 
@@ -4956,6 +4991,125 @@ fn render_history_watch_frame(report: &AutoflowHistoryReport) -> anyhow::Result<
     );
     println!();
     render_history_table(report)
+}
+
+fn render_history_snapshot(
+    report: &AutoflowHistoryReport,
+    monitor: &AutoflowMonitorReport,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let run_store = RunStore::new(global.join("runs"));
+    let pricing = autoflow_pricing_config();
+    let (width, _) = crossterm::terminal::size().unwrap_or((120, 40));
+    let rows = build_history_snapshot_rows_for_size(
+        report,
+        monitor,
+        &run_store,
+        &pricing,
+        view_mode,
+        width.max(80) as usize,
+    );
+    let rendered = rows.join("\n") + "\n";
+    crate::cmd::ui::paginate(&rendered, prefs)
+}
+
+fn build_history_snapshot_rows_for_size(
+    report: &AutoflowHistoryReport,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> Vec<String> {
+    let entries = build_history_issue_entries(report, monitor);
+    let mut ui_state = AutoflowServeUiState::default();
+    let selected_index = ui_state.sync_history_selection(&entries);
+
+    let mut rows = vec![
+        retained_history_snapshot_header_line(report, view_mode, width),
+        retained_serve_kv_row(
+            "history",
+            &format!(
+                "issues {}  ·  rows {}  ·  events {}  ·  cycles {}",
+                entries.len(),
+                report.rows.len(),
+                report.total_events,
+                report.total_cycles,
+            ),
+            width,
+            UiStatus::Active,
+        ),
+        retained_serve_kv_row(
+            "context",
+            &format!(
+                "active {}  ·  claims {}  ·  queued wakes {}  ·  due wakes {}  ·  workers {}",
+                monitor
+                    .claims
+                    .iter()
+                    .filter(|claim| matches!(claim.status.as_str(), "running" | "claimed"))
+                    .count(),
+                monitor.claims.len(),
+                monitor.wakes.queued,
+                monitor.wakes.due,
+                monitor.workers.len(),
+            ),
+            width,
+            UiStatus::Active,
+        ),
+        String::new(),
+    ];
+
+    let body_rows = if width >= 132 {
+        let left_width = (width / 3).clamp(34, 50);
+        let left_rows = build_history_issue_list_rows(
+            &entries,
+            selected_index,
+            monitor,
+            run_store,
+            pricing,
+            &mut ui_state,
+            left_width,
+            entries.len().saturating_add(3).max(6),
+        );
+        let right_width = width.saturating_sub(left_width + 2).max(40);
+        let right_rows = build_selected_history_rows(
+            &entries,
+            selected_index,
+            report,
+            monitor,
+            run_store,
+            pricing,
+            view_mode,
+            &mut ui_state,
+            right_width,
+            4096,
+        );
+        merge_retained_columns(
+            &left_rows,
+            &right_rows,
+            left_width,
+            right_width,
+            2,
+            left_rows.len().max(right_rows.len()),
+        )
+    } else {
+        build_retained_history_stacked_rows(
+            &entries,
+            selected_index,
+            report,
+            monitor,
+            run_store,
+            pricing,
+            view_mode,
+            &mut ui_state,
+            width,
+            4096,
+        )
+    };
+    rows.extend(body_rows);
+    rows
 }
 
 fn render_monitor_snapshot(report: &AutoflowMonitorReport, watch_mode: bool) -> anyhow::Result<()> {
@@ -5452,6 +5606,24 @@ mod serve_heartbeat_tests {
             3,
             150,
             24,
+        );
+        assert!(rows.iter().any(|row| row.contains("autoflow history")));
+        assert!(rows.iter().any(|row| row.contains("issues")));
+        assert!(rows.iter().any(|row| row.contains("selected")));
+        assert!(rows.iter().any(|row| row.contains("history timeline")));
+    }
+
+    #[test]
+    fn history_snapshot_rows_show_operator_console_layout() {
+        let tmp = tempdir().unwrap();
+        let run_store = RunStore::new(tmp.path().join("runs"));
+        let rows = build_history_snapshot_rows_for_size(
+            &sample_history_report(),
+            &sample_monitor_report(),
+            &run_store,
+            &autoflow_pricing_config(),
+            crate::cmd::ui::LiveViewMode::Focused,
+            150,
         );
         assert!(rows.iter().any(|row| row.contains("autoflow history")));
         assert!(rows.iter().any(|row| row.contains("issues")));
