@@ -218,6 +218,20 @@ the same transcript timeline structure, and use `--no-color`, `--pager`, or `--n
 override the configured UI preferences for a single invocation. Structured `json` and `jsonl`
 output are unchanged.
 
+### Inspect a session snapshot
+
+```sh
+rupu session show ses_01J...
+rupu session show ses_01J... --view compact
+rupu session show ses_01J... --view full --pager
+```
+
+`rupu session show` now renders a retained static session snapshot instead of the older flat
+key/value dump. The human terminal surface keeps the session route/workspace/usage summary and a
+recent-runs timeline on screen together. Use `--view focused|compact|full` to control how much run
+detail is shown, and use `--no-color`, `--pager`, or `--no-pager` to override the configured UI
+preferences for a single invocation. Structured `json` output is unchanged.
+
 ### Inspect workflow run history
 
 ```sh
