@@ -34,15 +34,21 @@ pub type SectionToggleCb = Arc<dyn Fn(&'static str, &mut Window, &mut App) + Sen
 /// path, the current GPUI window handle, and the app context.
 pub type AgentClickCb = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync + 'static>;
 
+/// Callback type for sidebar right-clicks. Receives the asset path,
+/// the mouse-down position in window coords (for the context-menu anchor),
+/// the GPUI window handle, and the app context.
+pub type RightClickCb =
+    Arc<dyn Fn(PathBuf, gpui::Point<gpui::Pixels>, &mut Window, &mut App) + Send + Sync + 'static>;
+
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     workspace: &Workspace,
     active_runs: &ActiveRunMap,
     focused_workflow: Option<&PathBuf>,
     on_workflow_click: WorkflowClickCb,
-    on_workflow_right_click: WorkflowClickCb,
+    on_workflow_right_click: RightClickCb,
     on_agent_click: AgentClickCb,
-    on_agent_right_click: AgentClickCb,
+    on_agent_right_click: RightClickCb,
     on_section_toggle: SectionToggleCb,
 ) -> impl IntoElement {
     let collapsed = &workspace.manifest.ui.sidebar_collapsed_sections;
@@ -98,9 +104,9 @@ fn render_section(
     active_runs: &ActiveRunMap,
     focused_workflow: Option<&PathBuf>,
     on_workflow_click: WorkflowClickCb,
-    on_workflow_right_click: WorkflowClickCb,
+    on_workflow_right_click: RightClickCb,
     on_agent_click: AgentClickCb,
-    on_agent_right_click: AgentClickCb,
+    on_agent_right_click: RightClickCb,
     on_section_toggle: SectionToggleCb,
 ) -> impl IntoElement {
     // Header: clickable row with caret + uppercase label + count badge.
@@ -209,7 +215,9 @@ fn render_section(
                             move |_, w, cx| cb_click(path.clone(), w, cx)
                         })
                         .on_mouse_down(MouseButton::Right, {
-                            move |_, w, cx| cb_right(path_right.clone(), w, cx)
+                            move |ev: &gpui::MouseDownEvent, w, cx| {
+                                cb_right(path_right.clone(), ev.position, w, cx)
+                            }
                         });
                 }
                 "agents" => {
@@ -223,7 +231,9 @@ fn render_section(
                             move |_, w, cx| cb_click(path.clone(), w, cx)
                         })
                         .on_mouse_down(MouseButton::Right, {
-                            move |_, w, cx| cb_right(path_right.clone(), w, cx)
+                            move |ev: &gpui::MouseDownEvent, w, cx| {
+                                cb_right(path_right.clone(), ev.position, w, cx)
+                            }
                         });
                 }
                 _ => {} // runs / repos / issues — wired in D-3 / D-9

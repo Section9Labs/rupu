@@ -4,7 +4,7 @@ pub mod sidebar;
 pub mod titlebar;
 
 use crate::executor::AppExecutor;
-use crate::menu::app_menu::{ApproveFocused, LaunchSelected, RejectFocused, ToggleSidebar};
+use crate::menu::app_menu::{ApproveFocused, DismissContextMenu, LaunchSelected, RejectFocused, ToggleSidebar};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
@@ -37,6 +37,9 @@ pub struct WorkspaceWindow {
     /// The workflow row most recently focused in the sidebar.
     /// ⌘R uses this. `None` means no row has focus.
     pub focused_workflow: Option<PathBuf>,
+    /// `Some` while a right-click context menu is open. Cleared by item
+    /// selection, click-outside, or Esc.
+    pub context_menu: Option<crate::widget::ContextMenuState>,
 }
 
 impl WorkspaceWindow {
@@ -71,6 +74,7 @@ impl WorkspaceWindow {
                     transcript_lines: Vec::new(),
                     launcher: None,
                     focused_workflow: None,
+                    context_menu: None,
                 })
             })
             .expect("open workspace window");
@@ -114,6 +118,12 @@ impl WorkspaceWindow {
                     if let Some(path) = this.focused_workflow.clone() {
                         this.open_launcher(path, cx);
                     }
+                });
+            });
+            let weak_dctx = entity.downgrade();
+            cx.on_action(move |_: &DismissContextMenu, cx| {
+                let _ = weak_dctx.update(cx, |this, cx| {
+                    this.handle_dismiss_context_menu(cx);
                 });
             });
         }
@@ -319,6 +329,90 @@ impl WorkspaceWindow {
         self.open_launcher(path, cx);
     }
 
+    /// Open a context menu at `position` with workflow-row actions.
+    pub fn open_workflow_context_menu(
+        &mut self,
+        path: PathBuf,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let weak_run: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let path_for_run = path.clone();
+        let run_item = crate::widget::ContextMenuItem {
+            label: "Run\u{2026}".into(),
+            on_select: Arc::new(move |_w, cx| {
+                let weak = weak_run.clone();
+                let path = path_for_run.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.handle_workflow_right_clicked(path, cx);
+                    });
+                });
+            }),
+        };
+        let weak_reveal: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let path_for_reveal = path.clone();
+        let reveal_item = crate::widget::ContextMenuItem {
+            label: "Reveal in Finder".into(),
+            on_select: Arc::new(move |_w, cx| {
+                let weak = weak_reveal.clone();
+                let path = path_for_reveal.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.handle_workflow_reveal(path, cx);
+                    });
+                });
+            }),
+        };
+        self.context_menu = Some(crate::widget::ContextMenuState {
+            position,
+            items: vec![run_item, reveal_item],
+        });
+        cx.notify();
+    }
+
+    /// Open a context menu at `position` with agent-row actions.
+    pub fn open_agent_context_menu(
+        &mut self,
+        path: PathBuf,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let weak_open: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let path_for_open = path.clone();
+        let open_item = crate::widget::ContextMenuItem {
+            label: "Open in Editor".into(),
+            on_select: Arc::new(move |_w, cx| {
+                let weak = weak_open.clone();
+                let path = path_for_open.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.handle_agent_clicked(path, cx);
+                    });
+                });
+            }),
+        };
+        let weak_reveal: WeakEntity<WorkspaceWindow> = cx.weak_entity();
+        let path_for_reveal = path.clone();
+        let reveal_item = crate::widget::ContextMenuItem {
+            label: "Reveal in Finder".into(),
+            on_select: Arc::new(move |_w, cx| {
+                let weak = weak_reveal.clone();
+                let path = path_for_reveal.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.handle_agent_reveal(path, cx);
+                    });
+                });
+            }),
+        };
+        self.context_menu = Some(crate::widget::ContextMenuState {
+            position,
+            items: vec![open_item, reveal_item],
+        });
+        cx.notify();
+    }
+
     /// Toggle a sidebar section's collapsed state and persist.
     pub fn handle_section_toggle(&mut self, section: &'static str, cx: &mut Context<Self>) {
         self.workspace
@@ -329,6 +423,14 @@ impl WorkspaceWindow {
             tracing::warn!(%e, "persist sidebar collapse state");
         }
         cx.notify();
+    }
+
+    /// Close the context menu. Idempotent — safe to call when no menu is open.
+    pub fn handle_dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+        }
     }
 
     /// Open an agent's `.md` source file in the user's default app.
@@ -355,6 +457,24 @@ impl WorkspaceWindow {
                 .spawn()
             {
                 tracing::warn!(?path, %e, "reveal agent in Finder");
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            tracing::info!(?path, "reveal: no-op on non-macOS");
+        }
+    }
+
+    /// Reveal a workflow's YAML file in Finder.
+    pub fn handle_workflow_reveal(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Err(e) = std::process::Command::new("open")
+                .args(["-R"])
+                .arg(&path)
+                .spawn()
+            {
+                tracing::warn!(?path, %e, "reveal workflow in Finder");
             }
         }
         #[cfg(not(target_os = "macos"))]
@@ -674,6 +794,8 @@ impl Render for WorkspaceWindow {
         let weak2 = weak.clone();
         // Pre-cloned for the launcher overlay branch below.
         let weak_launcher = weak.clone();
+        // Pre-cloned for the context menu dismiss callback.
+        let weak_context_dismiss = weak.clone();
         let on_approve: ApproveCallback =
             Arc::new(move |step_id: String, window: &mut Window, cx: &mut App| {
                 let _ = window;
@@ -771,12 +893,12 @@ impl Render for WorkspaceWindow {
                                     .update(cx, |this, cx| this.handle_workflow_clicked(path, cx));
                             });
                         });
-                        let on_workflow_right_click: WorkflowClickCb =
-                            Arc::new(move |path, _w, cx| {
+                        let on_workflow_right_click: sidebar::RightClickCb =
+                            Arc::new(move |path, position, _w, cx| {
                                 let weak_sidebar_right = weak_sidebar_right.clone();
                                 cx.defer(move |cx| {
                                     let _ = weak_sidebar_right.update(cx, |this, cx| {
-                                        this.handle_workflow_right_clicked(path, cx)
+                                        this.open_workflow_context_menu(path, position, cx)
                                     });
                                 });
                             });
@@ -798,12 +920,12 @@ impl Render for WorkspaceWindow {
                                     });
                                 });
                             });
-                        let on_agent_right_click: sidebar::AgentClickCb =
-                            Arc::new(move |path, _w, cx| {
+                        let on_agent_right_click: sidebar::RightClickCb =
+                            Arc::new(move |path, position, _w, cx| {
                                 let weak = weak_agent_reveal.clone();
                                 cx.defer(move |cx| {
                                     let _ = weak.update(cx, |this, cx| {
-                                        this.handle_agent_reveal(path, cx)
+                                        this.open_agent_context_menu(path, position, cx)
                                     });
                                 });
                             });
@@ -904,7 +1026,28 @@ impl Render for WorkspaceWindow {
             let _ = weak_launcher;
             main_layout.into_any_element()
         };
-        body
+
+        // Context menu overlay — paints on top of everything (including the
+        // launcher sheet) when state.is_some(). Built as `deferred(...)` inside
+        // the widget so paint order is correct.
+        let on_dismiss: crate::widget::DismissCb = Arc::new(move |_w, cx| {
+            let weak = weak_context_dismiss.clone();
+            cx.defer(move |cx| {
+                let _ = weak.update(cx, |this, cx| this.handle_dismiss_context_menu(cx));
+            });
+        });
+
+        let body_with_context: AnyElement = if let Some(menu_state) = self.context_menu.as_ref() {
+            div()
+                .relative()
+                .size_full()
+                .child(body)
+                .child(crate::widget::context_menu::render(menu_state, on_dismiss))
+                .into_any_element()
+        } else {
+            body
+        };
+        body_with_context
     }
 }
 
