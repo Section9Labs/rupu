@@ -385,6 +385,7 @@ Mode semantics:
 - `rupu autoflow serve` uses the same modes inside an operator-console layout: issue list on one side, selected issue detail/timeline on the other when the terminal is wide enough
 - `rupu autoflow monitor --watch` now uses the same operator-console layout in a read-only mode
 - `rupu autoflow history --watch` now uses the same retained operator-console layout, but with history rows as the selected issue timeline
+- `rupu autoflow history` in a terminal now renders the same issue-list + selected-issue snapshot instead of the old flat history table
 
 The first commands wired to this are:
 
