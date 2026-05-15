@@ -216,6 +216,47 @@ async fn session_show_supports_json_output() {
 }
 
 #[tokio::test]
+async fn session_show_supports_focused_compact_and_full_views() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_show_view01", "idle", None, false);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["session", "show", "ses_show_view01"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session show"))
+        .stdout(predicate::str::contains("runs  ·  recent turns"))
+        .stdout(predicate::str::contains("transcript /tmp/repo/.rupu/transcripts/run_prev123.jsonl").not());
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["session", "show", "ses_show_view01", "--view", "compact"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("·  compact"))
+        .stdout(predicate::str::contains("transcript /tmp/repo/.rupu/transcripts/run_prev123.jsonl"));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", &home)
+        .current_dir(tmp.path())
+        .args(["session", "show", "ses_show_view01", "--view", "full"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("·  full"))
+        .stdout(predicate::str::contains("completed "))
+        .stdout(predicate::str::contains("1234ms"));
+}
+
+#[tokio::test]
 async fn session_list_reconciles_stale_running_workers() {
     let _guard = ENV_LOCK.lock().await;
 

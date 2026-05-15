@@ -393,6 +393,7 @@ The first commands wired to this are:
 
 - `rupu run`
 - `rupu transcript show`
+- `rupu session show`
 - `rupu session attach`
 - `rupu workflow run`
 - `rupu watch`
@@ -402,6 +403,10 @@ The first commands wired to this are:
 human `pretty` surface respects the configured theme, `--view focused|compact|full`, and optional
 `--no-color`, `--pager`, and `--no-pager` overrides while keeping `json` and `jsonl` unchanged for
 automation.
+
+`rupu session show` now uses the same retained static-snapshot model for human terminal output.
+The default table/human surface respects `--view focused|compact|full` plus `--no-color`, `--pager`,
+and `--no-pager`, while `--format json` remains unchanged for automation.
 
 Built-in parity names currently include:
 

@@ -65,6 +65,14 @@ pub enum Action {
     Show {
         #[arg(add = ArgValueCompleter::new(session_ids))]
         session_id: String,
+        #[arg(long, value_enum)]
+        view: Option<LiveViewMode>,
+        #[arg(long)]
+        no_color: bool,
+        #[arg(long, conflicts_with = "no_pager")]
+        pager: bool,
+        #[arg(long, conflicts_with = "pager")]
+        no_pager: bool,
     },
     /// Archive an inactive session and its owned transcripts.
     Archive {
@@ -425,6 +433,10 @@ struct SessionShowReport {
 }
 
 struct SessionShowOutput {
+    prefs: UiPrefs,
+    scope: SessionScope,
+    session: SessionRecord,
+    view_mode: LiveViewMode,
     report: SessionShowReport,
 }
 
@@ -528,53 +540,272 @@ impl DetailOutput for SessionShowOutput {
     }
 
     fn render_human(&self) -> anyhow::Result<()> {
-        let item = &self.report.item;
-        println!("session: {}", item.session_id);
-        println!("agent: {}", item.agent);
-        println!("scope: {}", item.scope);
-        println!("status: {}", item.status);
-        println!("provider: {}", item.provider);
-        println!("model: {}", item.model);
-        println!("permission mode: {}", item.permission_mode);
-        if let Some(target) = item.target.as_deref() {
-            println!("target: {target}");
-        }
-        if let Some(repo_ref) = item.repo_ref.as_deref() {
-            println!("repo: {repo_ref}");
-        }
-        if let Some(issue_ref) = item.issue_ref.as_deref() {
-            println!("issue: {issue_ref}");
-        }
-        println!("workspace: {}", item.workspace_path);
-        println!("transcripts: {}", item.transcripts_dir);
-        println!(
-            "active run: {}",
-            item.active_run_id.as_deref().unwrap_or("—")
+        let width = terminal::size()
+            .map(|(value, _)| value.max(40) as usize)
+            .unwrap_or(100);
+        let body =
+            render_session_show_snapshot(&self.session, self.scope, self.view_mode, width);
+        crate::cmd::ui::paginate(&body, &self.prefs)
+    }
+}
+
+fn render_session_show_snapshot(
+    session: &SessionRecord,
+    scope: SessionScope,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let mut rows = vec![
+        render_session_show_header_line(session, view_mode, width),
+        String::new(),
+        retained_session_kv_row("scope", scope.as_str(), width, crate::output::palette::Status::Active),
+        retained_session_kv_row(
+            "status",
+            &session_status_detail(session),
+            width,
+            session.status.ui_status(),
+        ),
+    ];
+    if let Some(route) = session_route_detail(session) {
+        rows.push(retained_session_kv_row(
+            "route",
+            &route,
+            width,
+            crate::output::palette::Status::Active,
+        ));
+    }
+    rows.push(retained_session_kv_row(
+        "workspace",
+        &session_workspace_detail(session),
+        width,
+        crate::output::palette::Status::Active,
+    ));
+    rows.push(retained_session_kv_row(
+        "transcript",
+        &truncate_single_line(&session.transcripts_dir.display().to_string(), 96),
+        width,
+        crate::output::palette::Status::Active,
+    ));
+    rows.push(retained_session_kv_row(
+        "usage",
+        &session_usage_detail(session),
+        width,
+        crate::output::palette::Status::Active,
+    ));
+    rows.push(retained_session_kv_row(
+        "created",
+        &session.created_at.to_rfc3339(),
+        width,
+        crate::output::palette::Status::Active,
+    ));
+    rows.push(retained_session_kv_row(
+        "updated",
+        &session.updated_at.to_rfc3339(),
+        width,
+        crate::output::palette::Status::Active,
+    ));
+    if let Some(error) = session
+        .last_error
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        rows.push(retained_session_kv_row(
+            "last error",
+            error,
+            width,
+            crate::output::palette::Status::Failed,
+        ));
+    }
+    rows.push(String::new());
+    rows.extend(render_session_show_run_rows(session, view_mode, width));
+    rows.push(String::new());
+    rows.push(render_session_show_footer_line(session, view_mode, width));
+    rows.join("\n") + "\n"
+}
+
+fn render_session_show_header_line(
+    session: &SessionRecord,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let agent = truncate_single_line(&session.agent_name, 24);
+    let sid = truncate_single_line(&session.session_id, 24);
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "session show", BRAND);
+    buf.push_str("  ");
+    let _ = palette::write_bold_colored(&mut buf, &agent, BRAND);
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, &sid, DIM);
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, view_mode.as_str(), DIM);
+    truncate_ansi_line(&buf, width)
+}
+
+fn render_session_show_footer_line(
+    session: &SessionRecord,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    retained_session_kv_row(
+        "view",
+        &format!(
+            "{}  ·  runs {}  ·  current {}",
+            view_mode.as_str(),
+            session.runs.len(),
+            session
+                .active_run_id
+                .as_deref()
+                .or(session.last_run_id.as_deref())
+                .map(compact_session_run_id)
+                .unwrap_or_else(|| "none".into())
+        ),
+        width,
+        session.status.ui_status(),
+    )
+}
+
+fn render_session_show_run_rows(
+    session: &SessionRecord,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> Vec<String> {
+    if session.runs.is_empty() {
+        return vec![render_session_show_section_header("runs", "no runs yet", width)];
+    }
+
+    let mut rows = vec![render_session_show_section_header("runs", "recent turns", width)];
+    for run in session.runs.iter().rev().take(10) {
+        let status = run
+            .status
+            .map(|value| format!("{:?}", value).to_lowercase())
+            .unwrap_or_else(|| "running".into());
+        let prompt = truncate_single_line(&run.prompt, 96);
+        let detail = format!(
+            "{}  ·  {}  ·  {}",
+            compact_session_run_id(&run.run_id),
+            status,
+            prompt
         );
-        println!("last run: {}", item.last_run_id.as_deref().unwrap_or("—"));
-        println!(
-            "usage: turns {}  ·  in {}  ·  out {}",
-            item.total_turns, item.total_tokens_in, item.total_tokens_out
-        );
-        println!("created: {}", item.created_at);
-        println!("updated: {}", item.updated_at);
-        if let Some(error) = item.last_error.as_deref() {
-            println!("last error: {error}");
-        }
-        if !item.runs.is_empty() {
-            println!("runs:");
-            for run in item.runs.iter().rev().take(10) {
-                let status = run.status.as_deref().unwrap_or("running");
-                println!(
-                    "- {}  ·  {}  ·  {}",
-                    run.run_id,
-                    status,
-                    truncate_single_line(&run.prompt, 72)
+        rows.extend(render_session_show_event_lines(
+            session_run_status_ui(run.status),
+            "run",
+            &detail,
+            width,
+            "",
+        ));
+
+        match view_mode {
+            LiveViewMode::Focused => {}
+            LiveViewMode::Compact => {
+                let preview = format!(
+                    "transcript {}  ·  in {} out {}",
+                    truncate_single_line(&run.transcript_path.display().to_string(), 60),
+                    run.total_tokens_in,
+                    run.total_tokens_out
                 );
-                println!("  transcript: {}", run.transcript_path);
+                rows.extend(render_session_show_event_lines(
+                    crate::output::palette::Status::Active,
+                    "",
+                    &preview,
+                    width,
+                    "│  ",
+                ));
+            }
+            LiveViewMode::Full => {
+                let timing = format!(
+                    "started {}{}",
+                    run.started_at.to_rfc3339(),
+                    run.completed_at
+                        .map(|value| format!("  ·  completed {}", value.to_rfc3339()))
+                        .unwrap_or_default()
+                );
+                rows.extend(render_session_show_event_lines(
+                    crate::output::palette::Status::Active,
+                    "",
+                    &timing,
+                    width,
+                    "│  ",
+                ));
+                let usage = format!(
+                    "transcript {}  ·  in {} out {}  ·  {}ms",
+                    truncate_single_line(&run.transcript_path.display().to_string(), 60),
+                    run.total_tokens_in,
+                    run.total_tokens_out,
+                    run.duration_ms
+                );
+                rows.extend(render_session_show_event_lines(
+                    crate::output::palette::Status::Active,
+                    "",
+                    &usage,
+                    width,
+                    "│  ",
+                ));
+                if let Some(error) = run.error.as_deref().filter(|value| !value.trim().is_empty()) {
+                    rows.extend(render_session_show_event_lines(
+                        crate::output::palette::Status::Failed,
+                        "",
+                        &truncate_single_line(error, 88),
+                        width,
+                        "│  ",
+                    ));
+                }
             }
         }
-        Ok(())
+    }
+    rows
+}
+
+fn render_session_show_section_header(label: &str, detail: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, BRAND);
+    if !detail.is_empty() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+        let _ = palette::write_colored(&mut buf, detail, DIM);
+    }
+    truncate_ansi_line(&buf, width)
+}
+
+fn render_session_show_event_lines(
+    status: crate::output::palette::Status,
+    label: &str,
+    detail: &str,
+    width: usize,
+    prefix: &str,
+) -> Vec<String> {
+    let raw = if label.is_empty() {
+        detail.to_string()
+    } else {
+        retained_session_event_line(status, label, detail)
+    };
+    let available = width.saturating_sub(prefix.len()).max(12);
+    let wrapped = wrap_with_ansi(&raw, available);
+    if wrapped.is_empty() {
+        return vec![prefix.to_string()];
+    }
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let row_prefix = if idx == 0 {
+                prefix.to_string()
+            } else if prefix.is_empty() {
+                "│  ".to_string()
+            } else {
+                prefix.to_string()
+            };
+            truncate_ansi_line(&format!("{row_prefix}{line}"), width)
+        })
+        .collect()
+}
+
+fn session_run_status_ui(status: Option<RunStatus>) -> crate::output::palette::Status {
+    match status {
+        Some(RunStatus::Ok) => crate::output::palette::Status::Complete,
+        Some(RunStatus::Error) => crate::output::palette::Status::Failed,
+        Some(RunStatus::Aborted) => crate::output::palette::Status::Awaiting,
+        None => crate::output::palette::Status::Working,
     }
 }
 
@@ -619,7 +850,22 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
     let result = match action {
         Action::Start(args) => start(args).await,
         Action::List(args) => list(args, global_format).await,
-        Action::Show { session_id } => show(&session_id, global_format).await,
+        Action::Show {
+            session_id,
+            view,
+            no_color,
+            pager,
+            no_pager,
+        } => {
+            let pager_flag = if pager {
+                Some(true)
+            } else if no_pager {
+                Some(false)
+            } else {
+                None
+            };
+            show(&session_id, view, no_color, pager_flag, global_format).await
+        }
         Action::Archive { session_id } => archive(&session_id).await,
         Action::Restore { session_id } => restore(&session_id).await,
         Action::Delete(args) => delete(args).await,
@@ -702,13 +948,34 @@ async fn list(args: ListArgs, global_format: Option<OutputFormat>) -> anyhow::Re
     report::emit_collection(global_format, &output)
 }
 
-async fn show(session_id: &str, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn show(
+    session_id: &str,
+    view: Option<LiveViewMode>,
+    no_color: bool,
+    pager_flag: Option<bool>,
+    global_format: Option<OutputFormat>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, session_id)?;
     if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
         write_session(&global, scope, &session)?;
     }
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let cfg = rupu_config::layer_files(
+        Some(&global.join("config.toml")),
+        project_root
+            .as_deref()
+            .map(|root| root.join(".rupu/config.toml"))
+            .as_deref(),
+    )?;
+    let prefs = UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
+    let view_mode = prefs.live_view;
     let output = SessionShowOutput {
+        prefs,
+        scope,
+        session: session.clone(),
+        view_mode,
         report: SessionShowReport {
             kind: "session_show",
             version: 1,
