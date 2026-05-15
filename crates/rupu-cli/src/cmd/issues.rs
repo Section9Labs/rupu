@@ -7,7 +7,9 @@
 //! and parses common SSH / HTTPS / shorthand forms into a `RepoRef`.
 
 use crate::cmd::completers::workflow_names;
+use crate::cmd::ui::UiPrefs;
 use crate::output::formats::OutputFormat;
+use crate::output::palette::{self, BRAND, DIM};
 use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::paths;
 use clap::{Args as ClapArgs, Subcommand};
@@ -66,6 +68,13 @@ pub struct ShowArgs {
     /// `<owner>/<repo>` portion if cwd has a detectable remote —
     /// `#42` or `42` alone resolves against that.
     pub r#ref: String,
+    /// Disable colored output.
+    #[arg(long)]
+    pub no_color: bool,
+    #[arg(long, conflicts_with = "no_pager")]
+    pub pager: bool,
+    #[arg(long, conflicts_with = "pager")]
+    pub no_pager: bool,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -154,6 +163,7 @@ struct IssueShowItem {
     state: String,
     author: String,
     labels: Vec<String>,
+    label_colors: std::collections::BTreeMap<String, String>,
     created_at: String,
     updated_at: String,
     body: String,
@@ -167,6 +177,7 @@ struct IssueShowReport {
 }
 
 struct IssueShowOutput {
+    prefs: UiPrefs,
     report: IssueShowReport,
 }
 
@@ -227,28 +238,11 @@ impl DetailOutput for IssueShowOutput {
     }
 
     fn render_human(&self) -> anyhow::Result<()> {
-        let item = &self.report.item;
-        println!("Issue   : #{} on {}", item.number, item.project);
-        println!("Title   : {}", item.title);
-        println!("State   : {}", item.state);
-        println!("Author  : {}", item.author);
-        println!(
-            "Labels  : {}",
-            if item.labels.is_empty() {
-                "-".into()
-            } else {
-                item.labels.join(", ")
-            }
-        );
-        println!("Created : {}", item.created_at);
-        println!("Updated : {}", item.updated_at);
-        println!();
-        if item.body.trim().is_empty() {
-            println!("(no body)");
-        } else {
-            println!("{}", item.body.trim_end());
-        }
-        Ok(())
+        let width = crossterm::terminal::size()
+            .map(|(value, _)| value.max(40) as usize)
+            .unwrap_or(100);
+        let body = render_issue_show_snapshot(&self.report.item, &self.prefs, width);
+        crate::cmd::ui::paginate(&body, &self.prefs)
     }
 }
 
@@ -353,7 +347,7 @@ fn layered_config(
 }
 
 async fn show(args: ShowArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let (registry, _global, _project_root) = build_registry().await?;
+    let (registry, global, project_root) = build_registry().await?;
     let issue_ref = resolve_issue_ref(&args.r#ref)?;
     let conn = registry.issues(issue_ref.tracker).ok_or_else(|| {
         anyhow::anyhow!(
@@ -363,6 +357,15 @@ async fn show(args: ShowArgs, global_format: Option<OutputFormat>) -> anyhow::Re
         )
     })?;
     let issue = conn.get_issue(&issue_ref).await?;
+    let cfg = layered_config(&global, project_root.as_deref());
+    let pager_flag = if args.pager {
+        Some(true)
+    } else if args.no_pager {
+        Some(false)
+    } else {
+        None
+    };
+    let prefs = UiPrefs::resolve(&cfg.ui, args.no_color, None, pager_flag, None);
     let state = match issue.state {
         IssueState::Open => "open",
         IssueState::Closed => "closed",
@@ -382,12 +385,96 @@ async fn show(args: ShowArgs, global_format: Option<OutputFormat>) -> anyhow::Re
             state: state.into(),
             author: issue.author.clone(),
             labels: issue.labels.clone(),
+            label_colors: issue.label_colors.clone(),
             created_at: issue.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
             updated_at: issue.updated_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
             body: issue.body,
         },
     };
-    report::emit_detail(global_format, &IssueShowOutput { report })
+    report::emit_detail(global_format, &IssueShowOutput { prefs, report })
+}
+
+fn render_issue_show_snapshot(item: &IssueShowItem, prefs: &UiPrefs, width: usize) -> String {
+    let mut rows = vec![
+        render_issue_show_header_line(item, width),
+        String::new(),
+        render_issue_show_kv_row("state", &item.state, width),
+        render_issue_show_kv_row("author", &item.author, width),
+        render_issue_show_kv_row("project", &item.project, width),
+        render_issue_show_kv_row("ref", &item.issue_ref, width),
+    ];
+    let labels = if item.labels.is_empty() {
+        "—".to_string()
+    } else {
+        crate::output::tables::label_chips_with_colors(
+            &item.labels,
+            &item.label_colors,
+            prefs,
+        )
+    };
+    rows.push(render_issue_show_kv_row_raw("labels", &labels, width));
+    rows.push(render_issue_show_kv_row("created", &item.created_at, width));
+    rows.push(render_issue_show_kv_row("updated", &item.updated_at, width));
+    rows.push(String::new());
+    rows.push(render_issue_show_section_header("body", width));
+    if item.body.trim().is_empty() {
+        rows.push(render_issue_show_kv_row("body", "(no body)", width));
+    } else {
+        let rendered = crate::cmd::ui::highlight_markdown(item.body.trim_end(), prefs);
+        for line in rendered.lines() {
+            rows.push(truncate_ansi_value(line, width));
+        }
+    }
+    rows.join("\n") + "\n"
+}
+
+fn render_issue_show_header_line(item: &IssueShowItem, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "issues show", BRAND);
+    let _ = palette::write_colored(&mut buf, "  ", DIM);
+    let _ = palette::write_bold_colored(&mut buf, &format!("#{}", item.number), BRAND);
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, &truncate(&item.project, 28), DIM);
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, &truncate(&item.title, 48), DIM);
+    truncate_ansi_value(&buf, width)
+}
+
+fn render_issue_show_section_header(label: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, BRAND);
+    truncate_ansi_value(&buf, width)
+}
+
+fn render_issue_show_kv_row(label: &str, value: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, &format!("{label:<10}"), BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        &truncate(value, width.saturating_sub(11)),
+        DIM,
+    );
+    truncate_ansi_value(&buf, width)
+}
+
+fn render_issue_show_kv_row_raw(label: &str, value: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, &format!("{label:<10}"), BRAND);
+    buf.push_str(value);
+    truncate_ansi_value(&buf, width)
+}
+
+fn truncate_ansi_value(value: &str, width: usize) -> String {
+    if crate::output::printer::visible_len(value) <= width {
+        value.to_string()
+    } else {
+        crate::output::printer::wrap_with_ansi(value, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
 }
 
 async fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -789,5 +876,71 @@ mod tests {
         let out = truncate("0123456789abcdef", 8);
         assert_eq!(out.chars().count(), 8);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn issue_show_snapshot_renders_metadata_and_body() {
+        let prefs = crate::cmd::ui::UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            true,
+            None,
+            Some(false),
+            None,
+        );
+        let item = IssueShowItem {
+            issue_ref: "github:Section9Labs/rupu/issues/42".into(),
+            tracker: "github".into(),
+            project: "Section9Labs/rupu".into(),
+            number: 42,
+            title: "Fix retained issue snapshot".into(),
+            state: "open".into(),
+            author: "matt".into(),
+            labels: vec!["bug".into(), "ui".into()],
+            label_colors: std::collections::BTreeMap::from([
+                ("bug".into(), "ff0000".into()),
+                ("ui".into(), "00ff00".into()),
+            ]),
+            created_at: "2026-05-15 12:00:00 UTC".into(),
+            updated_at: "2026-05-15 12:30:00 UTC".into(),
+            body: "## Summary\n\n- line one\n- line two".into(),
+        };
+
+        let rendered = render_issue_show_snapshot(&item, &prefs, 100);
+        assert!(rendered.contains("issues show"));
+        assert!(rendered.contains("#42"));
+        assert!(rendered.contains("state"));
+        assert!(rendered.contains("author"));
+        assert!(rendered.contains("[bug]"));
+        assert!(rendered.contains("## Summary"));
+        assert!(rendered.contains("- line one"));
+    }
+
+    #[test]
+    fn issue_show_snapshot_handles_empty_body() {
+        let prefs = crate::cmd::ui::UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            true,
+            None,
+            Some(false),
+            None,
+        );
+        let item = IssueShowItem {
+            issue_ref: "github:Section9Labs/rupu/issues/7".into(),
+            tracker: "github".into(),
+            project: "Section9Labs/rupu".into(),
+            number: 7,
+            title: "Empty body".into(),
+            state: "closed".into(),
+            author: "matt".into(),
+            labels: Vec::new(),
+            label_colors: std::collections::BTreeMap::new(),
+            created_at: "2026-05-15 12:00:00 UTC".into(),
+            updated_at: "2026-05-15 12:30:00 UTC".into(),
+            body: "".into(),
+        };
+
+        let rendered = render_issue_show_snapshot(&item, &prefs, 80);
+        assert!(rendered.contains("body"));
+        assert!(rendered.contains("(no body)"));
     }
 }

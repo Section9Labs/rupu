@@ -234,6 +234,19 @@ expands the retained transcript content inline under each recent run. Use `--no-
 or `--no-pager` to override the configured UI preferences for a single invocation. Structured
 `json` output is unchanged.
 
+### Inspect an issue snapshot
+
+```sh
+rupu issues show github:your-org/your-repo/issues/42
+rupu issues show github:your-org/your-repo/issues/42 --no-color
+rupu issues show github:your-org/your-repo/issues/42 --pager
+```
+
+`rupu issues show` now renders a retained static issue snapshot instead of the older flat
+key/value dump. The human terminal surface keeps issue metadata and the highlighted body together
+on one screen. Use `--no-color`, `--pager`, or `--no-pager` to override the configured UI
+preferences for a single invocation. Structured `json` output is unchanged.
+
 ### Inspect workflow run history
 
 ```sh
@@ -410,6 +423,7 @@ Event/timeline views use a separate contract:
 
 Snapshot views with a custom structured surface:
 
+- `rupu issues show` (`table` and `json`)
 - `rupu autoflow monitor` (`table` and `json`)
 
 Persistent agent sessions:
