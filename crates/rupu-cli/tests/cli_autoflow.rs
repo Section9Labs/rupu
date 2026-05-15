@@ -533,6 +533,19 @@ fn autoflow_monitor_shows_workers_claims_and_recent_activity() {
 }
 
 #[test]
+fn autoflow_monitor_help_includes_live_view_flag() {
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .args(["autoflow", "monitor", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--view"))
+        .stdout(predicate::str::contains("focused"))
+        .stdout(predicate::str::contains("compact"))
+        .stdout(predicate::str::contains("full"));
+}
+
+#[test]
 fn autoflow_monitor_supports_structured_json_output() {
     let _guard = ENV_LOCK.blocking_lock();
 

@@ -119,7 +119,7 @@ pub enum Action {
     },
     /// Inspect queued and recently processed wakes.
     Wakes(RepoFilterArgs),
-    /// Show a live operator view across workers, claims, wakes, and recent activity.
+    /// Show a read-only operator view across workers, claims, wakes, and recent activity.
     Monitor {
         /// Limit results to one repo target, for example `github:owner/repo`.
         #[arg(long)]
@@ -127,12 +127,15 @@ pub enum Action {
         /// Limit results to one worker id or display name.
         #[arg(long)]
         worker: Option<String>,
-        /// Refresh the table view until interrupted.
+        /// Refresh the operator view until interrupted.
         #[arg(long)]
         watch: bool,
         /// Refresh interval for `--watch`, for example `2s`.
         #[arg(long, default_value = "2s")]
         interval: String,
+        /// Live operator view mode (`focused`, `compact`, or `full`) for `--watch`.
+        #[arg(long, value_enum)]
+        view: Option<crate::cmd::ui::LiveViewMode>,
     },
     /// Show durable autoflow cycle and event history.
     History {
@@ -1349,12 +1352,14 @@ async fn handle_with_resolver(
             worker,
             watch,
             interval,
+            view,
         } => {
             monitor(
                 repo.as_deref(),
                 worker.as_deref(),
                 watch,
                 &interval,
+                view,
                 global_format,
             )
             .await
@@ -2326,7 +2331,119 @@ fn build_retained_serve_rows_for_size(
     rows
 }
 
+fn build_retained_monitor_rows_for_size(
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+    refresh: std::time::Duration,
+    view_mode: LiveViewMode,
+    ui_state: &mut AutoflowServeUiState,
+    refresh_count: usize,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let entries = build_serve_issue_entries(&monitor.claims, &[]);
+    let selected_index = ui_state.sync_selection(&entries);
+    let active = monitor
+        .claims
+        .iter()
+        .filter(|claim| matches!(claim.status.as_str(), "running" | "claimed"))
+        .count();
+    let blocked = monitor
+        .claims
+        .iter()
+        .filter(|claim| matches!(claim.status.as_str(), "await_human" | "await_external" | "retry_backoff" | "blocked"))
+        .count();
+    let complete = monitor
+        .claims
+        .iter()
+        .filter(|claim| claim.status == "complete")
+        .count();
+    let mut rows = vec![
+        retained_monitor_header_line(repo_filter, worker_filter, refresh, view_mode, width),
+        retained_serve_kv_row(
+            "monitor",
+            &format!(
+                "refreshes {}  ·  active {}  ·  claims {}  ·  blocked {}  ·  complete {}  ·  workers {}",
+                refresh_count,
+                active,
+                monitor.claims.len(),
+                blocked,
+                complete,
+                monitor.workers.len(),
+            ),
+            width,
+            UiStatus::Active,
+        ),
+        retained_serve_kv_row(
+            "queue",
+            &format!(
+                "due {}  ·  queued {}  ·  processed {}  ·  activity {}",
+                monitor.wakes.due,
+                monitor.wakes.queued,
+                monitor.wakes.processed_recent,
+                monitor.activity.len()
+            ),
+            width,
+            UiStatus::Active,
+        ),
+        String::new(),
+    ];
+
+    let footer_reserved = 2usize;
+    let available_body_rows = height
+        .saturating_sub(rows.len())
+        .saturating_sub(footer_reserved)
+        .max(4);
+    let body_rows = if width >= 132 {
+        build_retained_serve_two_pane_rows(
+            &entries,
+            selected_index,
+            monitor,
+            run_store,
+            pricing,
+            view_mode,
+            ui_state,
+            width,
+            available_body_rows,
+        )
+    } else {
+        build_retained_serve_stacked_rows(
+            &entries,
+            selected_index,
+            monitor,
+            run_store,
+            pricing,
+            view_mode,
+            ui_state,
+            width,
+            available_body_rows,
+        )
+    };
+    rows.extend(body_rows);
+    while rows.len() < height.saturating_sub(footer_reserved) {
+        rows.push(String::new());
+    }
+    rows.push(retained_monitor_controls_line(width));
+    rows.push(retained_monitor_status_line(view_mode, ui_state, refresh_count, width));
+    rows.truncate(height);
+    rows
+}
+
 fn retained_serve_controls_line(width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        "  Tab focus  ·  Enter pin  ·  Space hottest  ·  f cycle view  ·  ↑/↓ or j/k  ·  PgUp/PgDn  ·  g/G  ·  Ctrl-C quit",
+        DIM,
+    );
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn retained_monitor_controls_line(width: usize) -> String {
     let mut buf = String::new();
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
     let _ = palette::write_colored(
@@ -2367,6 +2484,31 @@ fn retained_serve_status_line(
     )
 }
 
+fn retained_monitor_status_line(
+    view_mode: LiveViewMode,
+    ui_state: &AutoflowServeUiState,
+    refresh_count: usize,
+    width: usize,
+) -> String {
+    retained_serve_kv_row(
+        "view",
+        &format!(
+            "{}  ·  focus {}  ·  {}  ·  {}  ·  refreshes {}",
+            view_mode.as_str(),
+            ui_state.focus_label(),
+            if ui_state.follow_hottest {
+                "following hottest"
+            } else {
+                "pinned selection"
+            },
+            ui_state.detail_viewport.status_text(),
+            refresh_count,
+        ),
+        width,
+        UiStatus::Active,
+    )
+}
+
 fn render_retained_serve_rows(rows: &[String]) -> anyhow::Result<()> {
     let mut stdout = std::io::stdout();
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
@@ -2395,6 +2537,31 @@ fn retained_serve_header_line(
             repo_filter.unwrap_or("(all)"),
             worker_filter.unwrap_or("(auto)"),
             idle_sleep.as_secs_f32(),
+            view_mode.as_str(),
+        ),
+        DIM,
+    );
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn retained_monitor_header_line(
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+    refresh: std::time::Duration,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "autoflow monitor", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        &format!(
+            "  ·  repo {}  ·  worker {}  ·  refresh {}s  ·  {}",
+            repo_filter.unwrap_or("(all)"),
+            worker_filter.unwrap_or("(all)"),
+            refresh.as_secs_f32(),
             view_mode.as_str(),
         ),
         DIM,
@@ -3590,6 +3757,7 @@ async fn monitor(
     worker: Option<&str>,
     watch: bool,
     interval: &str,
+    view: Option<crate::cmd::ui::LiveViewMode>,
     global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
     let format =
@@ -3602,11 +3770,18 @@ async fn monitor(
         .to_std()
         .map_err(|_| anyhow!("monitor interval must be non-negative"))?;
     let repo_filter = normalize_repo_filter(repo)?;
+    let live_view_mode = autoflow_ui_config()
+        .map(|cfg| UiPrefs::resolve(&cfg.ui, false, None, None, view).live_view)
+        .unwrap_or(view.unwrap_or(LiveViewMode::Focused));
 
     if !watch {
         let report = build_monitor_report(repo_filter.as_deref(), worker)?;
         let output = AutoflowMonitorOutput { report };
         return output_report::emit_collection(global_format, &output);
+    }
+
+    if std::io::stdout().is_terminal() {
+        return monitor_retained(repo_filter.as_deref(), worker, refresh, live_view_mode).await;
     }
 
     loop {
@@ -3618,6 +3793,98 @@ async fn monitor(
             _ = tokio::time::sleep(refresh) => {}
         }
     }
+    Ok(())
+}
+
+async fn monitor_retained(
+    repo_filter: Option<&str>,
+    worker_filter: Option<&str>,
+    refresh: std::time::Duration,
+    view_mode: LiveViewMode,
+) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let run_store = RunStore::new(global.join("runs"));
+    let pricing = autoflow_pricing_config();
+    let mut refresh_count = 0usize;
+    let _raw_mode = AutoflowServeRawModeGuard::enter()?;
+    let _screen = AutoflowServeScreenGuard::enter()?;
+    let mut heartbeat = tokio::time::interval(refresh);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_rows: Vec<String> = Vec::new();
+    let mut live_view_mode = view_mode;
+    let mut ui_state = AutoflowServeUiState::default();
+
+    loop {
+        let report = build_monitor_report(repo_filter, worker_filter)?;
+        let (width, height) = crossterm::terminal::size().unwrap_or((100, 30));
+        let rows = build_retained_monitor_rows_for_size(
+            &report,
+            &run_store,
+            &pricing,
+            repo_filter,
+            worker_filter,
+            refresh,
+            live_view_mode,
+            &mut ui_state,
+            refresh_count,
+            width.max(50) as usize,
+            height.max(14) as usize,
+        );
+        if rows != last_rows {
+            render_retained_serve_rows(&rows)?;
+            last_rows = rows;
+        }
+        refresh_count = refresh_count.saturating_add(1);
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = heartbeat.tick() => {}
+        }
+
+        while event::poll(std::time::Duration::from_millis(0))? {
+            match event::read()? {
+                CrosstermEvent::Resize(_, _) => {}
+                CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('f'), _) => {
+                            live_view_mode = live_view_mode.toggled();
+                            last_rows.clear();
+                        }
+                        (KeyCode::Tab, _) => ui_state.switch_focus(),
+                        (KeyCode::Enter, _) => {
+                            let entries = build_serve_issue_entries(&report.claims, &[]);
+                            ui_state.toggle_follow(&entries);
+                        }
+                        (KeyCode::Char(' '), _) => {
+                            let entries = build_serve_issue_entries(&report.claims, &[]);
+                            ui_state.follow_hottest(&entries);
+                        }
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _)
+                            if ui_state.focus == AutoflowServeFocus::Issues =>
+                        {
+                            let entries = build_serve_issue_entries(&report.claims, &[]);
+                            ui_state.move_selection(&entries, -1);
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _)
+                            if ui_state.focus == AutoflowServeFocus::Issues =>
+                        {
+                            let entries = build_serve_issue_entries(&report.claims, &[]);
+                            ui_state.move_selection(&entries, 1);
+                        }
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => ui_state.detail_viewport.scroll_up(1),
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => ui_state.detail_viewport.scroll_down(1),
+                        (KeyCode::PageUp, _) => ui_state.detail_viewport.page_up(),
+                        (KeyCode::PageDown, _) => ui_state.detail_viewport.page_down(),
+                        (KeyCode::Char('g'), KeyModifiers::NONE) => ui_state.detail_viewport.jump_top(),
+                        (KeyCode::Char('G'), _) | (KeyCode::End, _) => ui_state.detail_viewport.jump_bottom(),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    println!("autoflow monitor stopped after {refresh_count} refresh(es)");
     Ok(())
 }
 
@@ -4319,6 +4586,30 @@ mod serve_heartbeat_tests {
             .any(|row| row.contains("storefront-feature-delivery")));
         assert!(rows.iter().any(|row| row.contains("following hottest")));
         assert!(rows.iter().any(|row| row.contains("issues")));
+    }
+
+    #[test]
+    fn retained_monitor_full_mode_shows_operator_console_layout() {
+        let tmp = tempdir().unwrap();
+        let run_store = RunStore::new(tmp.path().join("runs"));
+        let mut ui_state = AutoflowServeUiState::default();
+        let rows = build_retained_monitor_rows_for_size(
+            &sample_monitor_report(),
+            &run_store,
+            &autoflow_pricing_config(),
+            Some("github:Section9Labs/rupu"),
+            Some("team-mini-01"),
+            std::time::Duration::from_secs(2),
+            crate::cmd::ui::LiveViewMode::Full,
+            &mut ui_state,
+            3,
+            150,
+            24,
+        );
+        assert!(rows.iter().any(|row| row.contains("autoflow monitor")));
+        assert!(rows.iter().any(|row| row.contains("issues")));
+        assert!(rows.iter().any(|row| row.contains("selected")));
+        assert!(rows.iter().any(|row| row.contains("refreshes 3")));
     }
 
     #[test]
