@@ -258,7 +258,8 @@ rupu workflow show-run run_01J... --view compact
 `rupu workflow show-run` now uses the same retained workflow timeline language as the live
 workflow runner, so completed runs render as a static graph/timeline snapshot instead of the old
 flat sideband summary. Use `--view focused|compact|full` to control payload density while keeping
-the same workflow structure on screen.
+the same workflow structure on screen. In `compact` and `full`, runtime inputs and usage now render
+as compact tables instead of dense inline rows.
 
 ### Inspect a workflow definition
 
@@ -271,8 +272,9 @@ rupu workflow show review-changed-files --view full --pager
 `rupu workflow show` now renders a retained static workflow-definition snapshot instead of only
 printing highlighted YAML. The human terminal surface keeps workflow summary metadata together with
 a graph-style step preview. Use `--view focused|compact|full` to control how much definition
-detail is shown: `focused` keeps the summary plus graph, `compact` adds declared inputs/outputs
-and step details, and `full` adds the raw highlighted YAML below the definition snapshot.
+detail is shown. When `--view` is omitted, `workflow show` defaults to `full`. `focused` keeps the
+summary plus graph, `compact` adds declared inputs/outputs and step details in table form, and
+`full` adds the raw highlighted YAML below the definition snapshot.
 
 ### Approve or reject a paused workflow
 
