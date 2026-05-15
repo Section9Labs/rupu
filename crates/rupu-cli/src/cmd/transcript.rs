@@ -16,7 +16,9 @@ use crate::cmd::completers::{standalone_transcript_run_ids, transcript_run_ids};
 use crate::cmd::retention::parse_retention_duration;
 use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
+use crate::output::palette;
 use crate::output::palette::Status;
+use crate::output::printer::{visible_len, wrap_with_ansi};
 use crate::output::report::{self, CollectionOutput, EventOutput};
 use crate::output::workflow_printer::tool_summary;
 use crate::output::LineStreamPrinter;
@@ -54,6 +56,12 @@ pub enum Action {
         run_id: String,
         #[arg(long, value_enum)]
         view: Option<LiveViewMode>,
+        #[arg(long)]
+        no_color: bool,
+        #[arg(long, conflicts_with = "no_pager")]
+        pager: bool,
+        #[arg(long, conflicts_with = "pager")]
+        no_pager: bool,
     },
     /// Archive a standalone transcript and its metadata.
     Archive {
@@ -91,7 +99,22 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             all,
             archived,
         } => list(no_color, all, archived, global_format).await,
-        Action::Show { run_id, view } => show(&run_id, view, global_format).await,
+        Action::Show {
+            run_id,
+            view,
+            no_color,
+            pager,
+            no_pager,
+        } => {
+            let pager_flag = if pager {
+                Some(true)
+            } else if no_pager {
+                Some(false)
+            } else {
+                None
+            };
+            show(&run_id, view, no_color, pager_flag, global_format).await
+        }
         Action::Archive { run_id } => archive(&run_id).await,
         Action::Delete(args) => delete(args).await,
         Action::Prune(args) => prune(args, global_format).await,
@@ -232,6 +255,7 @@ struct TranscriptShowReport {
 }
 
 struct TranscriptShowOutput {
+    prefs: crate::cmd::ui::UiPrefs,
     report: TranscriptShowReport,
     events: Vec<TranscriptEvent>,
     view_mode: LiveViewMode,
@@ -354,33 +378,657 @@ impl EventOutput for TranscriptShowOutput {
     }
 
     fn render_pretty(&self) -> anyhow::Result<()> {
-        render_pretty_transcript(&self.events, self.view_mode)
+        render_pretty_transcript(&self.events, &self.prefs, self.view_mode)
     }
 }
 
 fn render_pretty_transcript(
     events: &[TranscriptEvent],
+    prefs: &crate::cmd::ui::UiPrefs,
     view_mode: LiveViewMode,
 ) -> anyhow::Result<()> {
-    let mut printer = LineStreamPrinter::new();
-    let mut saw_header = false;
+    let width = crossterm::terminal::size()
+        .map(|(value, _)| value.max(40) as usize)
+        .unwrap_or(100);
+    let body = render_transcript_snapshot_body(events, prefs, view_mode, width);
+    crate::cmd::ui::paginate(&body, prefs)
+}
 
-    for event in events {
-        render_pretty_transcript_event(
-            &mut printer,
-            event,
-            &mut saw_header,
-            view_mode,
-            TranscriptPrettyContext::Standalone,
-        );
+#[derive(Debug, Clone)]
+struct TranscriptSnapshotMeta {
+    run_id: Option<String>,
+    agent: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    workspace_id: Option<String>,
+    mode: Option<String>,
+    started_at: Option<String>,
+    final_status: Option<String>,
+    duration_ms: Option<u64>,
+    total_tokens: Option<u64>,
+    error: Option<String>,
+    turn_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptViewLine {
+    status: Status,
+    text: String,
+    continuation: bool,
+    indent: usize,
+}
+
+fn render_transcript_snapshot_body(
+    events: &[TranscriptEvent],
+    prefs: &crate::cmd::ui::UiPrefs,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let meta = extract_transcript_snapshot_meta(events);
+    let mut rows = Vec::new();
+    rows.push(render_transcript_header_line(&meta, view_mode, width));
+    rows.push(String::new());
+    if let Some(status) = meta.final_status.as_deref() {
+        rows.push(render_transcript_kv_row("status", status, width, transcript_status_ui(status)));
     }
+    if let Some(agent) = meta.agent.as_deref() {
+        let mut detail = agent.to_string();
+        if let Some(provider) = meta.provider.as_deref() {
+            detail.push_str("  ·  ");
+            detail.push_str(provider);
+        }
+        if let Some(model) = meta.model.as_deref() {
+            detail.push_str("  ·  ");
+            detail.push_str(model);
+        }
+        rows.push(render_transcript_kv_row("agent", &detail, width, Status::Active));
+    }
+    if let Some(workspace_id) = meta.workspace_id.as_deref() {
+        rows.push(render_transcript_kv_row("workspace", workspace_id, width, Status::Active));
+    }
+    if let Some(started_at) = meta.started_at.as_deref() {
+        rows.push(render_transcript_kv_row("started", started_at, width, Status::Active));
+    }
+    if let Some(mode) = meta.mode.as_deref() {
+        rows.push(render_transcript_kv_row("mode", mode, width, Status::Active));
+    }
+    if let Some(error) = meta.error.as_deref() {
+        rows.push(render_transcript_kv_row("error", error, width, Status::Failed));
+    }
+    rows.push(String::new());
+    rows.extend(render_transcript_event_rows(events, prefs, view_mode, width));
+    rows.push(String::new());
+    rows.push(render_transcript_footer_line(&meta, view_mode, width));
+    rows.join("\n") + "\n"
+}
 
-    if !saw_header {
-        for event in events {
-            println!("{}", serde_json::to_string_pretty(event)?);
+fn extract_transcript_snapshot_meta(events: &[TranscriptEvent]) -> TranscriptSnapshotMeta {
+    let mut meta = TranscriptSnapshotMeta {
+        run_id: None,
+        agent: None,
+        provider: None,
+        model: None,
+        workspace_id: None,
+        mode: None,
+        started_at: None,
+        final_status: None,
+        duration_ms: None,
+        total_tokens: None,
+        error: None,
+        turn_count: 0,
+    };
+    for event in events {
+        match event {
+            TranscriptEvent::RunStart {
+                run_id,
+                workspace_id,
+                agent,
+                provider,
+                model,
+                started_at,
+                mode,
+            } => {
+                meta.run_id = Some(run_id.clone());
+                meta.workspace_id = Some(workspace_id.clone());
+                meta.agent = Some(agent.clone());
+                meta.provider = Some(provider.clone());
+                meta.model = Some(model.clone());
+                meta.started_at = Some(started_at.format("%Y-%m-%d %H:%M:%S UTC").to_string());
+                meta.mode = Some(format!("{mode:?}").to_lowercase());
+            }
+            TranscriptEvent::TurnStart { .. } => {
+                meta.turn_count += 1;
+            }
+            TranscriptEvent::RunComplete {
+                status,
+                total_tokens,
+                duration_ms,
+                error,
+                ..
+            } => {
+                meta.final_status = Some(format!("{status:?}").to_lowercase());
+                meta.total_tokens = Some(*total_tokens);
+                meta.duration_ms = Some(*duration_ms);
+                meta.error = error.clone();
+            }
+            _ => {}
         }
     }
-    Ok(())
+    meta
+}
+
+fn render_transcript_header_line(
+    meta: &TranscriptSnapshotMeta,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", palette::BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "transcript show", palette::BRAND);
+    if let Some(agent) = meta.agent.as_deref() {
+        let _ = palette::write_colored(&mut buf, "  ", palette::DIM);
+        let _ = palette::write_bold_colored(&mut buf, &truncate_single_line(agent, 24), palette::BRAND);
+    }
+    if let Some(run_id) = meta.run_id.as_deref() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", palette::DIM);
+        let _ = palette::write_colored(&mut buf, &compact_run_id(run_id), palette::DIM);
+    }
+    let _ = palette::write_colored(&mut buf, "  ·  ", palette::DIM);
+    let _ = palette::write_colored(&mut buf, view_mode.as_str(), palette::DIM);
+    truncate_transcript_ansi_line(&buf, width)
+}
+
+fn render_transcript_kv_row(label: &str, value: &str, width: usize, status: Status) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, &format!("{label:<10}"), status.color());
+    let _ = palette::write_colored(
+        &mut buf,
+        &truncate_single_line(value, width.saturating_sub(11)),
+        palette::DIM,
+    );
+    truncate_transcript_ansi_line(&buf, width)
+}
+
+fn render_transcript_footer_line(
+    meta: &TranscriptSnapshotMeta,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let mut detail = format!("view {}  ·  static snapshot", view_mode.as_str());
+    if meta.turn_count > 0 {
+        detail.push_str(&format!("  ·  turns {}", meta.turn_count));
+    }
+    if let Some(total_tokens) = meta.total_tokens {
+        detail.push_str(&format!("  ·  total tokens {total_tokens}"));
+    }
+    if let Some(duration_ms) = meta.duration_ms {
+        detail.push_str(&format!("  ·  {}ms", duration_ms));
+    }
+    render_transcript_kv_row(
+        "view",
+        &detail,
+        width,
+        meta.final_status
+            .as_deref()
+            .map(transcript_status_ui)
+            .unwrap_or(Status::Active),
+    )
+}
+
+fn render_transcript_event_rows(
+    events: &[TranscriptEvent],
+    prefs: &crate::cmd::ui::UiPrefs,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> Vec<String> {
+    let mut view_lines = Vec::new();
+    for event in events {
+        view_lines.extend(transcript_event_lines(event, prefs, view_mode));
+    }
+    render_transcript_view_lines(&view_lines, width)
+}
+
+fn transcript_event_lines(
+    event: &TranscriptEvent,
+    prefs: &crate::cmd::ui::UiPrefs,
+    view_mode: LiveViewMode,
+) -> Vec<TranscriptViewLine> {
+    match event {
+        TranscriptEvent::RunStart {
+            run_id,
+            workspace_id,
+            mode,
+            started_at,
+            ..
+        } => vec![transcript_event_line(
+            Status::Active,
+            0,
+            false,
+            transcript_event_text(
+                Status::Active,
+                "run started",
+                &format!(
+                    "{}  ·  workspace {}  ·  mode {}  ·  {}",
+                    compact_run_id(run_id),
+                    workspace_id,
+                    format!("{mode:?}").to_lowercase(),
+                    started_at.format("%Y-%m-%d %H:%M:%S UTC")
+                ),
+            ),
+        )],
+        TranscriptEvent::TurnStart { turn_idx } => vec![transcript_event_line(
+            Status::Working,
+            0,
+            false,
+            transcript_event_text(
+                Status::Working,
+                &format!("turn {turn_idx}"),
+                "assistant turn started",
+            ),
+        )],
+        TranscriptEvent::AssistantMessage { content, thinking } => {
+            let mut out = Vec::new();
+            if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
+                out.push(transcript_event_line(
+                    Status::Active,
+                    0,
+                    false,
+                    transcript_event_text(
+                        Status::Active,
+                        "thinking",
+                        &truncate_single_line(thinking, 96),
+                    ),
+                ));
+            }
+            if !content.trim().is_empty() {
+                match view_mode {
+                    LiveViewMode::Focused => out.push(transcript_event_line(
+                        Status::Active,
+                        0,
+                        false,
+                        transcript_event_text(
+                            Status::Active,
+                            "assistant output",
+                            &truncate_single_line(content, 96),
+                        ),
+                    )),
+                    LiveViewMode::Compact | LiveViewMode::Full => {
+                        let rendered = crate::output::rich_payload::render_assistant_content(
+                            content.trim(),
+                            prefs,
+                        );
+                        out.extend(render_payload_body_lines(
+                            Status::Active,
+                            "assistant output",
+                            &rendered.rendered,
+                            0,
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        TranscriptEvent::ToolCall { tool, input, .. } => {
+            let mut out = vec![transcript_event_line(
+                Status::Working,
+                0,
+                false,
+                transcript_event_text(Status::Working, &format!("tool {tool}"), &tool_summary(tool, input)),
+            )];
+            if view_mode == LiveViewMode::Full {
+                if let Some(rendered) = crate::output::rich_payload::render_tool_input(tool, input, prefs) {
+                    out.extend(render_payload_body_lines(Status::Working, "", &rendered, 1));
+                }
+            }
+            out
+        }
+        TranscriptEvent::ToolResult {
+            output,
+            error,
+            duration_ms,
+            ..
+        } => {
+            let status = if error.is_some() {
+                Status::Failed
+            } else {
+                Status::Complete
+            };
+            let label = if error.is_some() {
+                "tool error"
+            } else {
+                "tool result"
+            };
+            let payload = crate::output::rich_payload::render_payload(
+                error.as_deref().unwrap_or(output.as_str()),
+                prefs,
+            );
+            let mut detail = truncate_single_line(&payload.headline, 84);
+            if *duration_ms > 0 {
+                detail.push_str(&format!("  ·  {}ms", duration_ms));
+            }
+            let mut out = vec![transcript_event_line(
+                status,
+                0,
+                false,
+                transcript_event_text(status, label, &detail),
+            )];
+            match view_mode {
+                LiveViewMode::Focused => {}
+                LiveViewMode::Compact => {
+                    out.extend(
+                        crate::output::rich_payload::render_payload_preview_lines(&payload, 5)
+                            .into_iter()
+                            .map(|line| transcript_event_line(status, 1, true, line)),
+                    );
+                }
+                LiveViewMode::Full => {
+                    out.extend(render_payload_body_lines(status, "", &payload.rendered, 1));
+                }
+            }
+            out
+        }
+        TranscriptEvent::FileEdit { path, kind, diff } => {
+            let payload = crate::output::rich_payload::render_payload(diff, prefs);
+            let detail = format!(
+                "{} {}  ·  {}",
+                format!("{kind:?}").to_lowercase(),
+                path,
+                payload.headline
+            );
+            let mut out = vec![transcript_event_line(
+                Status::Complete,
+                0,
+                false,
+                transcript_event_text(Status::Complete, "file edit", &detail),
+            )];
+            match view_mode {
+                LiveViewMode::Focused => {}
+                LiveViewMode::Compact => {
+                    out.extend(
+                        crate::output::rich_payload::render_payload_preview_lines(&payload, 8)
+                            .into_iter()
+                            .map(|line| transcript_event_line(Status::Complete, 1, true, line)),
+                    );
+                }
+                LiveViewMode::Full => {
+                    out.extend(render_payload_body_lines(
+                        Status::Complete,
+                        "",
+                        &payload.rendered,
+                        1,
+                    ));
+                }
+            }
+            out
+        }
+        TranscriptEvent::CommandRun {
+            argv,
+            cwd,
+            exit_code,
+            ..
+        } => {
+            let status = if *exit_code == 0 {
+                Status::Complete
+            } else {
+                Status::Failed
+            };
+            vec![transcript_event_line(
+                status,
+                0,
+                false,
+                transcript_event_text(
+                    status,
+                    "command",
+                    &format!(
+                        "{}  ·  cwd {}  ·  exit {}",
+                        truncate_single_line(&argv.join(" "), 64),
+                        truncate_single_line(cwd, 24),
+                        exit_code
+                    ),
+                ),
+            )]
+        }
+        TranscriptEvent::ActionEmitted {
+            kind,
+            allowed,
+            applied,
+            reason,
+            ..
+        } => {
+            let status = if *applied {
+                Status::Complete
+            } else if *allowed {
+                Status::Awaiting
+            } else {
+                Status::Failed
+            };
+            let mut detail = format!("{kind}  ·  allowed={allowed} applied={applied}");
+            if let Some(reason) = reason.as_deref().filter(|value| !value.trim().is_empty()) {
+                detail.push_str("  ·  ");
+                detail.push_str(&truncate_single_line(reason, 64));
+            }
+            vec![transcript_event_line(
+                status,
+                0,
+                false,
+                transcript_event_text(status, "action", &detail),
+            )]
+        }
+        TranscriptEvent::GateRequested {
+            gate_id,
+            prompt,
+            decision,
+            decided_by,
+        } => {
+            let mut detail = format!("{gate_id}  ·  {}", truncate_single_line(prompt, 72));
+            if let Some(decision) = decision.as_deref() {
+                detail.push_str(&format!("  ·  decision {decision}"));
+            }
+            if let Some(decided_by) = decided_by.as_deref() {
+                detail.push_str(&format!("  ·  by {decided_by}"));
+            }
+            vec![transcript_event_line(
+                Status::Awaiting,
+                0,
+                false,
+                transcript_event_text(Status::Awaiting, "approval gate", &detail),
+            )]
+        }
+        TranscriptEvent::TurnEnd {
+            turn_idx,
+            tokens_in,
+            tokens_out,
+        } => vec![transcript_event_line(
+            Status::Complete,
+            0,
+            false,
+            transcript_event_text(
+                Status::Complete,
+                "turn complete",
+                &format!(
+                    "turn {turn_idx}  ·  in {} out {}",
+                    tokens_in.unwrap_or(0),
+                    tokens_out.unwrap_or(0)
+                ),
+            ),
+        )],
+        TranscriptEvent::Usage {
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        } => vec![transcript_event_line(
+            Status::Active,
+            0,
+            false,
+            transcript_event_text(
+                Status::Active,
+                "usage",
+                &format!(
+                    "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+                ),
+            ),
+        )],
+        TranscriptEvent::RunComplete {
+            status,
+            total_tokens,
+            duration_ms,
+            error,
+            ..
+        } => {
+            let ui_status = match status {
+                RunStatus::Ok => Status::Complete,
+                RunStatus::Error | RunStatus::Aborted => Status::Failed,
+            };
+            let mut detail = format!(
+                "status {}  ·  {}ms  ·  {} tokens",
+                format!("{status:?}").to_lowercase(),
+                duration_ms,
+                total_tokens
+            );
+            if let Some(error) = error.as_deref().filter(|value| !value.trim().is_empty()) {
+                detail.push_str("  ·  ");
+                detail.push_str(&truncate_single_line(error, 72));
+            }
+            vec![transcript_event_line(
+                ui_status,
+                0,
+                false,
+                transcript_event_text(ui_status, "run complete", &detail),
+            )]
+        }
+    }
+}
+
+fn transcript_event_line(
+    status: Status,
+    indent: usize,
+    continuation: bool,
+    text: String,
+) -> TranscriptViewLine {
+    TranscriptViewLine {
+        status,
+        text,
+        continuation,
+        indent,
+    }
+}
+
+fn transcript_event_text(status: Status, label: &str, detail: &str) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, status.color());
+    if !detail.is_empty() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", palette::DIM);
+        let _ = palette::write_colored(&mut buf, detail, palette::DIM);
+    }
+    buf
+}
+
+fn render_payload_body_lines(
+    status: Status,
+    label: &str,
+    rendered: &str,
+    indent: usize,
+) -> Vec<TranscriptViewLine> {
+    let mut out = Vec::new();
+    let mut lines = rendered.lines();
+    if let Some(first) = lines.next() {
+        if label.is_empty() {
+            out.push(transcript_event_line(status, indent, true, first.to_string()));
+        } else {
+            out.push(transcript_event_line(
+                status,
+                indent,
+                false,
+                transcript_event_text_raw(status, label, first),
+            ));
+        }
+        for line in lines {
+            out.push(transcript_event_line(status, indent, true, line.to_string()));
+        }
+    }
+    out
+}
+
+fn transcript_event_text_raw(status: Status, label: &str, detail: &str) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, status.color());
+    if !detail.is_empty() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", palette::DIM);
+        buf.push_str(detail);
+    }
+    buf
+}
+
+fn render_transcript_view_lines(lines: &[TranscriptViewLine], width: usize) -> Vec<String> {
+    let mut rendered = Vec::new();
+    for line in lines {
+        let prefix = transcript_line_prefix(line);
+        let content_width = width.saturating_sub(visible_len(&prefix)).max(1);
+        for (idx, segment) in wrap_with_ansi(&line.text, content_width)
+            .into_iter()
+            .enumerate()
+        {
+            if idx == 0 && !line.continuation {
+                rendered.push(format!("{prefix}{segment}"));
+            } else {
+                rendered.push(format!(
+                    "{}{}",
+                    transcript_continuation_prefix(line),
+                    segment
+                ));
+            }
+        }
+    }
+    rendered
+}
+
+fn transcript_line_prefix(line: &TranscriptViewLine) -> String {
+    let mut value = transcript_indent_prefix(line.indent);
+    let _ = palette::write_bold_colored(
+        &mut value,
+        &line.status.glyph().to_string(),
+        line.status.color(),
+    );
+    value.push(' ');
+    value
+}
+
+fn transcript_continuation_prefix(line: &TranscriptViewLine) -> String {
+    let mut value = transcript_indent_prefix(line.indent);
+    let _ = palette::write_colored(&mut value, "│  ", palette::BRAND);
+    value
+}
+
+fn transcript_indent_prefix(indent: usize) -> String {
+    let mut value = String::new();
+    for _ in 0..indent {
+        let _ = palette::write_colored(&mut value, "│  ", palette::BRAND);
+    }
+    value
+}
+
+fn truncate_transcript_ansi_line(value: &str, width: usize) -> String {
+    if visible_len(value) <= width {
+        value.to_string()
+    } else {
+        wrap_with_ansi(value, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+}
+
+fn transcript_status_ui(status: &str) -> Status {
+    match status {
+        "ok" | "completed" => Status::Complete,
+        "error" | "aborted" | "failed" | "rejected" => Status::Failed,
+        "awaiting_approval" => Status::Awaiting,
+        "running" => Status::Working,
+        _ => Status::Active,
+    }
 }
 
 pub(crate) fn render_pretty_transcript_event(
@@ -785,6 +1433,8 @@ async fn list(
 async fn show(
     run_id: &str,
     view: Option<LiveViewMode>,
+    no_color: bool,
+    pager_flag: Option<bool>,
     global_format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let path = locate_transcript(run_id)?.transcript_path;
@@ -798,7 +1448,7 @@ async fn show(
             .map(|root| root.join(".rupu/config.toml"))
             .as_deref(),
     )?;
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, false, None, None, view);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, pager_flag, view);
     let mut events = Vec::new();
     let mut raw_events = Vec::new();
     for event in JsonlReader::iter(&path)? {
@@ -806,9 +1456,11 @@ async fn show(
         raw_events.push(event.clone());
         events.push(serde_json::to_value(event)?);
     }
+    let view_mode = prefs.live_view;
     let output = TranscriptShowOutput {
+        prefs,
         events: raw_events,
-        view_mode: prefs.live_view,
+        view_mode,
         report: TranscriptShowReport {
             kind: "transcript_show",
             version: 1,
