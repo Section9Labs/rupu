@@ -204,6 +204,20 @@ When attached to a terminal, `rupu watch` now uses the same retained workflow sc
 `rupu workflow run`, including resize-safe reflow and `--view focused|compact|full`. Replay mode
 keeps the existing line-stream contract, but `--view` still controls assistant/tool density there.
 
+### Inspect a transcript snapshot
+
+```sh
+rupu transcript show run_01J...
+rupu transcript show run_01J... --view compact
+rupu transcript show run_01J... --view full --pager
+```
+
+`rupu transcript show` now renders a retained static transcript snapshot instead of the older
+pretty line-stream dump. Use `--view focused|compact|full` to control payload density while keeping
+the same transcript timeline structure, and use `--no-color`, `--pager`, or `--no-pager` to
+override the configured UI preferences for a single invocation. Structured `json` and `jsonl`
+output are unchanged.
+
 ### Inspect workflow run history
 
 ```sh
@@ -371,11 +385,11 @@ Detail views that support `--format json`:
 Event/timeline views use a separate contract:
 
 - `rupu transcript show`
-  - `pretty` (default human timeline)
+  - `pretty` (default retained transcript snapshot)
   - `json`
   - `jsonl`
 - `rupu workflow show-run`
-  - `pretty` (default human timeline)
+  - `pretty` (default retained workflow snapshot)
   - `json`
 
 Snapshot views with a custom structured surface:
