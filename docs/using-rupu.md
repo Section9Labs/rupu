@@ -260,6 +260,20 @@ workflow runner, so completed runs render as a static graph/timeline snapshot in
 flat sideband summary. Use `--view focused|compact|full` to control payload density while keeping
 the same workflow structure on screen.
 
+### Inspect a workflow definition
+
+```sh
+rupu workflow show review-changed-files
+rupu workflow show review-changed-files --view compact
+rupu workflow show review-changed-files --view full --pager
+```
+
+`rupu workflow show` now renders a retained static workflow-definition snapshot instead of only
+printing highlighted YAML. The human terminal surface keeps workflow summary metadata together with
+a graph-style step preview. Use `--view focused|compact|full` to control how much definition
+detail is shown: `focused` keeps the summary plus graph, `compact` adds declared inputs/outputs
+and step details, and `full` adds the raw highlighted YAML below the definition snapshot.
+
 ### Approve or reject a paused workflow
 
 ```sh
@@ -423,6 +437,7 @@ Event/timeline views use a separate contract:
 
 Snapshot views with a custom structured surface:
 
+- `rupu workflow show` (`table` and `json`)
 - `rupu issues show` (`table` and `json`)
 - `rupu autoflow monitor` (`table` and `json`)
 

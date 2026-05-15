@@ -339,6 +339,7 @@ Event/timeline views use a separate contract:
 
 Snapshot views with a custom structured surface:
 
+- `rupu workflow show` (`table` and `json`)
 - `rupu issues show` (`table` and `json`)
 - `rupu workflow show-run` (`pretty`/`table` and `json`)
 - `rupu autoflow monitor` (`table` and `json`)
@@ -414,6 +415,12 @@ while `--format json` remains unchanged for automation.
 The default table/human surface keeps issue metadata and the highlighted body together on one
 screen. Use `--no-color`, `--pager`, or `--no-pager` to override the configured UI preferences
 for a single invocation, while `--format json` remains unchanged for automation.
+
+`rupu workflow show` now uses a retained static definition snapshot for human terminal output.
+The default table/human surface keeps workflow summary metadata together with a graph-style step
+preview. Use `--view focused|compact|full` to control how much definition detail is shown:
+`focused` keeps the summary plus graph, `compact` adds declared inputs/outputs and step details,
+and `full` adds the raw highlighted YAML below the definition snapshot.
 
 Built-in parity names currently include:
 
