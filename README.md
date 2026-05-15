@@ -383,6 +383,7 @@ Mode semantics:
 - `compact` — same timeline structure, full assistant messages, trimmed tool payload previews
 - `full` — same timeline structure, full assistant/tool payload bodies with highlighting
 - `rupu autoflow serve` uses the same modes inside an operator-console layout: issue list on one side, selected issue detail/timeline on the other when the terminal is wide enough
+- `rupu autoflow monitor --watch` now uses the same operator-console layout in a read-only mode
 
 The first commands wired to this are:
 
