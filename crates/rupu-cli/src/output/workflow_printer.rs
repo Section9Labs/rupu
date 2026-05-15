@@ -2087,6 +2087,140 @@ fn build_workflow_screen_rows_for_size(
     rows
 }
 
+pub(crate) fn render_workflow_snapshot_body(
+    workflow_name: &str,
+    record: &RunRecord,
+    step_results_log: &Path,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+    width: usize,
+) -> String {
+    let mut state = rebuild_workflow_interactive_state(record, step_results_log, 0, view_mode, prefs);
+    build_workflow_snapshot_rows_for_size(workflow_name, record, &mut state, view_mode, width)
+        .join("\n")
+}
+
+fn build_workflow_snapshot_rows_for_size(
+    workflow_name: &str,
+    record: &RunRecord,
+    state: &mut WorkflowInteractiveState,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> Vec<String> {
+    let mut rows = vec![
+        render_workflow_header_line(workflow_name, record, view_mode, width),
+        String::new(),
+        retained_workflow_kv_row(
+            "status",
+            record.status.as_str(),
+            width,
+            workflow_status_ui(record),
+        ),
+        retained_workflow_kv_row(
+            "started",
+            &record.started_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            width,
+            UiStatus::Active,
+        ),
+    ];
+    if let Some(finished_at) = record.finished_at {
+        rows.push(retained_workflow_kv_row(
+            "finished",
+            &finished_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            width,
+            UiStatus::Complete,
+        ));
+    }
+    if let Some(issue_ref) = record.issue_ref.as_deref() {
+        rows.push(retained_workflow_kv_row(
+            "issue",
+            issue_ref,
+            width,
+            UiStatus::Active,
+        ));
+    }
+    rows.push(retained_workflow_kv_row(
+        "workspace",
+        &format!(
+            "{}  ·  {}",
+            record.workspace_id,
+            record.workspace_path.display()
+        ),
+        width,
+        UiStatus::Active,
+    ));
+    let mut route = Vec::new();
+    if let Some(backend) = record.backend_id.as_deref() {
+        route.push(format!("backend {backend}"));
+    }
+    if let Some(worker) = record.worker_id.as_deref() {
+        route.push(format!("worker {worker}"));
+    }
+    if !route.is_empty() {
+        rows.push(retained_workflow_kv_row(
+            "route",
+            &route.join("  ·  "),
+            width,
+            UiStatus::Active,
+        ));
+    }
+    if let Some(step_id) = record.active_step_id.as_deref() {
+        let detail = if let Some(agent) = record.active_step_agent.as_deref() {
+            format!("{step_id}  ·  {agent}")
+        } else {
+            step_id.to_string()
+        };
+        rows.push(retained_workflow_kv_row(
+            "step",
+            &detail,
+            width,
+            UiStatus::Working,
+        ));
+    }
+    if let Some(step_id) = record.awaiting_step_id.as_deref() {
+        let mut detail = step_id.to_string();
+        if let Some(since) = record.awaiting_since {
+            detail.push_str(&format!(
+                "  ·  since {}",
+                since.format("%Y-%m-%d %H:%M:%S UTC")
+            ));
+        }
+        if let Some(expires) = record.expires_at {
+            detail.push_str(&format!(
+                "  ·  expires {}",
+                expires.format("%Y-%m-%d %H:%M:%S UTC")
+            ));
+        }
+        rows.push(retained_workflow_kv_row(
+            "awaiting",
+            &detail,
+            width,
+            UiStatus::Awaiting,
+        ));
+    }
+    if let Some(error) = record.error_message.as_deref() {
+        rows.push(retained_workflow_kv_row(
+            "error",
+            error,
+            width,
+            UiStatus::Failed,
+        ));
+    }
+    for (key, value) in &record.inputs {
+        rows.push(retained_workflow_kv_row(
+            &format!("input {key}"),
+            value,
+            width,
+            UiStatus::Active,
+        ));
+    }
+    rows.push(String::new());
+    rows.extend(render_all_workflow_event_rows(state, width));
+    rows.push(String::new());
+    rows.push(render_workflow_snapshot_status_line(record, state, view_mode, width));
+    rows
+}
+
 fn render_workflow_controls_line(status: rupu_orchestrator::RunStatus, width: usize) -> String {
     let line = match status {
         rupu_orchestrator::RunStatus::AwaitingApproval => {
@@ -2134,11 +2268,45 @@ fn render_workflow_status_line(
     retained_workflow_kv_row("view", &text, width, workflow_status_ui(record))
 }
 
+fn render_workflow_snapshot_status_line(
+    record: &RunRecord,
+    state: &WorkflowInteractiveState,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let text = match record.status {
+        rupu_orchestrator::RunStatus::AwaitingApproval => format!(
+            "view {}  ·  static snapshot  ·  awaiting {}  ·  {}",
+            view_mode.as_str(),
+            record.awaiting_step_id.as_deref().unwrap_or("approval"),
+            truncate_single_line(
+                record
+                    .approval_prompt
+                    .as_deref()
+                    .unwrap_or("Approve this step?"),
+                56
+            )
+        ),
+        _ => format!(
+            "view {}  ·  static snapshot  ·  status {}  ·  total tokens {}",
+            view_mode.as_str(),
+            record.status.as_str(),
+            state.total_tokens
+        ),
+    };
+    retained_workflow_kv_row("view", &text, width, workflow_status_ui(record))
+}
+
 fn render_workflow_event_rows(
     state: &mut WorkflowInteractiveState,
     width: usize,
     max_rows: usize,
 ) -> Vec<String> {
+    let rendered = render_all_workflow_event_rows(state, width);
+    state.viewport.apply(rendered, max_rows).rows
+}
+
+fn render_all_workflow_event_rows(state: &WorkflowInteractiveState, width: usize) -> Vec<String> {
     let mut rendered = Vec::new();
     for line in &state.lines {
         let prefix = retained_workflow_line_prefix(line);
@@ -2158,7 +2326,7 @@ fn render_workflow_event_rows(
             }
         }
     }
-    state.viewport.apply(rendered, max_rows).rows
+    rendered
 }
 
 fn retained_workflow_line_prefix(line: &WorkflowViewLine) -> String {
