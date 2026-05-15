@@ -39,6 +39,32 @@ steps:
     prompt: "review {{ item }}"
 "#;
 
+const WORKFLOW_SHOW_YAML: &str = r#"name: review-def
+description: Review repository changes before shipping.
+inputs:
+  files:
+    type: string
+    required: true
+    description: Files to inspect
+contracts:
+  outputs:
+    report:
+      from_step: summarize
+      format: json
+      schema: review_report
+steps:
+  - id: fanout
+    agent: reviewer
+    actions: []
+    for_each: "{{ inputs.files }}"
+    max_parallel: 2
+    prompt: "review {{ item }}"
+  - id: summarize
+    agent: writer
+    actions: []
+    prompt: "summarize findings"
+"#;
+
 fn init_git_checkout(path: &std::path::Path, origin_url: &str) {
     let status = Command::new("git")
         .arg("init")
@@ -122,6 +148,76 @@ async fn workflow_show_prints_yaml_body() {
         format!("{:?}", std::process::ExitCode::from(0)),
         "workflow show should exit 0 when workflow exists"
     );
+}
+
+#[tokio::test]
+async fn workflow_show_supports_focused_compact_and_full_views() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let global = tmp.child(".rupu");
+    global.child("workflows").create_dir_all().unwrap();
+    global
+        .child("workflows/review-def.yaml")
+        .write_str(WORKFLOW_SHOW_YAML)
+        .unwrap();
+
+    AssertCommand::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args([
+            "workflow",
+            "show",
+            "review-def",
+            "--no-color",
+            "--no-pager",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("workflow show"))
+        .stdout(predicates::str::contains("graph  ·  workflow structure"))
+        .stdout(predicates::str::contains("for_each · runtime fan-out"))
+        .stdout(predicates::str::contains("raw definition").not());
+
+    AssertCommand::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args([
+            "workflow",
+            "show",
+            "review-def",
+            "--view",
+            "compact",
+            "--no-color",
+            "--no-pager",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("·  compact"))
+        .stdout(predicates::str::contains("inputs  ·  declared inputs"))
+        .stdout(predicates::str::contains("output  ·  report"))
+        .stdout(predicates::str::contains("raw definition").not());
+
+    AssertCommand::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args([
+            "workflow",
+            "show",
+            "review-def",
+            "--view",
+            "full",
+            "--no-color",
+            "--no-pager",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("·  full"))
+        .stdout(predicates::str::contains("yaml  ·  raw definition"))
+        .stdout(predicates::str::contains("schema: review_report"));
 }
 
 #[tokio::test]

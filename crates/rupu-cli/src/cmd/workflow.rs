@@ -2,7 +2,8 @@
 //!
 //! Lists workflows from `<global>/workflows/*.yaml` and (if any)
 //! `<project>/.rupu/workflows/*.yaml`; project entries shadow global by
-//! filename. `show` prints the YAML body. `run` parses the workflow,
+//! filename. `show` renders a retained definition snapshot for human
+//! output (or structured JSON for automation). `run` parses the workflow,
 //! builds a [`StepFactory`] that wires real providers via
 //! [`rupu_runtime::provider_factory::build_for_provider`], and dispatches
 //! [`rupu_orchestrator::run_workflow`].
@@ -13,11 +14,13 @@
 use crate::cmd::completers::workflow_names;
 use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
-use crate::output::palette::Status as UiStatus;
+use crate::output::palette::{self, BRAND, DIM, Status as UiStatus};
 use crate::output::report::{self, CollectionOutput, DetailOutput, EventOutput};
+use crate::output::printer::{visible_len, wrap_with_ansi};
 use crate::paths;
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
+use rupu_app_canvas::{render_rows as render_graph_rows, GraphCell, NodeStatus};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts};
 use rupu_orchestrator::{DefaultStepFactory, RunWorkflowError};
 use rupu_runtime::{
@@ -62,11 +65,14 @@ use ulid::Ulid;
 pub enum Action {
     /// List all workflows (global + project).
     List,
-    /// Print a workflow's YAML body.
+    /// Inspect a workflow definition.
     Show {
         /// Workflow name (filename stem under `workflows/`).
         #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
+        /// Human snapshot density (`focused` | `compact` | `full`).
+        #[arg(long, value_enum)]
+        view: Option<LiveViewMode>,
         /// Disable colored output (also honored: `NO_COLOR` env var).
         #[arg(long)]
         no_color: bool,
@@ -197,6 +203,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::List => list(global_format).await,
         Action::Show {
             name,
+            view,
             no_color,
             theme,
             pager,
@@ -209,7 +216,15 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             } else {
                 None
             };
-            show(&name, no_color, theme.as_deref(), pager_flag, global_format).await
+            show(
+                &name,
+                view,
+                no_color,
+                theme.as_deref(),
+                pager_flag,
+                global_format,
+            )
+            .await
         }
         Action::Edit {
             name,
@@ -380,6 +395,7 @@ struct WorkflowShowReport {
 
 struct WorkflowShowOutput {
     prefs: crate::cmd::ui::UiPrefs,
+    view_mode: LiveViewMode,
     report: WorkflowShowReport,
 }
 
@@ -533,7 +549,15 @@ impl DetailOutput for WorkflowShowOutput {
     }
 
     fn render_human(&self) -> anyhow::Result<()> {
-        let rendered = crate::cmd::ui::highlight_yaml(&self.report.item.body, &self.prefs);
+        let width = crossterm::terminal::size()
+            .map(|(value, _)| value.max(40) as usize)
+            .unwrap_or(100);
+        let rendered = render_workflow_show_snapshot(
+            &self.report.item,
+            self.view_mode,
+            &self.prefs,
+            width,
+        );
         crate::cmd::ui::paginate(&rendered, &self.prefs)
     }
 }
@@ -701,6 +725,7 @@ fn push_yaml_names(dir: &Path, scope: &str, into: &mut BTreeMap<String, String>)
 
 async fn show(
     name: &str,
+    view: Option<LiveViewMode>,
     no_color: bool,
     theme: Option<&str>,
     pager_flag: Option<bool>,
@@ -717,9 +742,11 @@ async fn show(
     let cfg =
         rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).unwrap_or_default();
 
-    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag, None);
+    let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, theme, pager_flag, view);
+    let view_mode = prefs.live_view;
     let output = WorkflowShowOutput {
         prefs,
+        view_mode,
         report: WorkflowShowReport {
             kind: "workflow_show",
             version: 1,
@@ -731,6 +758,498 @@ async fn show(
         },
     };
     report::emit_detail(global_format, &output)
+}
+
+fn render_workflow_show_snapshot(
+    item: &WorkflowShowItem,
+    view_mode: LiveViewMode,
+    prefs: &crate::cmd::ui::UiPrefs,
+    width: usize,
+) -> String {
+    let mut rows = vec![render_workflow_show_header_line(item, view_mode, width), String::new()];
+
+    match Workflow::parse(&item.body) {
+        Ok(workflow) => {
+            rows.extend(render_workflow_show_summary_rows(&workflow, item, width));
+            rows.push(String::new());
+            rows.push(render_workflow_show_section_header("graph", "workflow structure", width));
+            rows.extend(render_workflow_show_graph(&workflow, width));
+
+            if matches!(view_mode, LiveViewMode::Compact | LiveViewMode::Full) {
+                let input_rows = render_workflow_show_inputs(&workflow, width);
+                if !input_rows.is_empty() {
+                    rows.push(String::new());
+                    rows.extend(input_rows);
+                }
+                let output_rows = render_workflow_show_outputs(&workflow, width);
+                if !output_rows.is_empty() {
+                    rows.push(String::new());
+                    rows.extend(output_rows);
+                }
+                let detail_rows = render_workflow_show_step_details(&workflow, width);
+                if !detail_rows.is_empty() {
+                    rows.push(String::new());
+                    rows.extend(detail_rows);
+                }
+            }
+
+            if view_mode == LiveViewMode::Full {
+                rows.push(String::new());
+                rows.push(render_workflow_show_section_header("yaml", "raw definition", width));
+                rows.extend(
+                    crate::cmd::ui::highlight_yaml(&item.body, prefs)
+                        .lines()
+                        .map(|line| line.to_string()),
+                );
+            }
+        }
+        Err(err) => {
+            rows.push(render_workflow_show_kv_row(
+                "path",
+                &item.path,
+                width,
+                UiStatus::Active,
+            ));
+            rows.push(render_workflow_show_kv_row(
+                "parse",
+                &err.to_string(),
+                width,
+                UiStatus::Failed,
+            ));
+            rows.push(String::new());
+            rows.push(render_workflow_show_section_header("yaml", "raw definition", width));
+            rows.extend(
+                crate::cmd::ui::highlight_yaml(&item.body, prefs)
+                    .lines()
+                    .map(|line| line.to_string()),
+            );
+        }
+    }
+
+    rows.join("\n") + "\n"
+}
+
+fn render_workflow_show_header_line(
+    item: &WorkflowShowItem,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "workflow show", BRAND);
+    let _ = palette::write_colored(&mut buf, "  ", DIM);
+    let _ = palette::write_bold_colored(
+        &mut buf,
+        &crate::cmd::transcript::truncate_single_line(&item.name, 28),
+        BRAND,
+    );
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, view_mode.as_str(), DIM);
+    truncate_workflow_show_ansi_line(&buf, width)
+}
+
+fn render_workflow_show_summary_rows(
+    workflow: &Workflow,
+    item: &WorkflowShowItem,
+    width: usize,
+) -> Vec<String> {
+    let mut rows = vec![
+        render_workflow_show_kv_row("path", &item.path, width, UiStatus::Active),
+        render_workflow_show_kv_row("trigger", &workflow_trigger_summary(&workflow.trigger), width, UiStatus::Active),
+        render_workflow_show_kv_row(
+            "steps",
+            &format!(
+                "{}  ·  agents {}  ·  inputs {}  ·  outputs {}",
+                workflow.steps.len(),
+                collect_workflow_agents(workflow).len(),
+                workflow.inputs.len(),
+                workflow.contracts.outputs.len()
+            ),
+            width,
+            UiStatus::Active,
+        ),
+    ];
+
+    if let Some(description) = workflow
+        .description
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        rows.push(render_workflow_show_kv_row(
+            "description",
+            description.trim(),
+            width,
+            UiStatus::Active,
+        ));
+    }
+
+    rows.push(render_workflow_show_kv_row(
+        "agents",
+        &collect_workflow_agents(workflow).into_iter().collect::<Vec<_>>().join(", "),
+        width,
+        UiStatus::Active,
+    ));
+
+    if let Some(autoflow) = workflow.autoflow.as_ref().filter(|value| value.enabled) {
+        rows.push(render_workflow_show_kv_row(
+            "autoflow",
+            &workflow_autoflow_summary(autoflow),
+            width,
+            UiStatus::Active,
+        ));
+    }
+
+    if workflow.notify_issue {
+        rows.push(render_workflow_show_kv_row(
+            "notify",
+            "issue comments enabled",
+            width,
+            UiStatus::Awaiting,
+        ));
+    }
+
+    rows
+}
+
+fn render_workflow_show_inputs(workflow: &Workflow, width: usize) -> Vec<String> {
+    if workflow.inputs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rows = vec![render_workflow_show_section_header("inputs", "declared inputs", width)];
+    for (name, input) in &workflow.inputs {
+        let mut detail = format!(
+            "{}  ·  {}{}",
+            name,
+            workflow_input_type_name(input.ty),
+            if input.required { "  ·  required" } else { "" }
+        );
+        if let Some(default) = &input.default {
+            detail.push_str("  ·  default ");
+            detail.push_str(&yaml_scalar_inline(default));
+        }
+        if !input.allowed.is_empty() {
+            detail.push_str("  ·  enum ");
+            detail.push_str(&input.allowed.join(", "));
+        }
+        rows.push(render_workflow_show_event_line(UiStatus::Active, "input", &detail, width));
+        if let Some(description) = input.description.as_deref().filter(|value| !value.trim().is_empty()) {
+            rows.push(render_workflow_show_event_line(
+                UiStatus::Waiting,
+                "",
+                description.trim(),
+                width,
+            ));
+        }
+    }
+    rows
+}
+
+fn render_workflow_show_outputs(workflow: &Workflow, width: usize) -> Vec<String> {
+    if workflow.contracts.outputs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut rows = vec![render_workflow_show_section_header("outputs", "declared outputs", width)];
+    for (name, output) in &workflow.contracts.outputs {
+        rows.push(render_workflow_show_event_line(
+            UiStatus::Active,
+            "output",
+            &format!(
+                "{}  ·  from {}  ·  {}  ·  schema {}",
+                name,
+                output.from_step,
+                workflow_contract_format_name(output.format),
+                output.schema
+            ),
+            width,
+        ));
+    }
+    rows
+}
+
+fn render_workflow_show_step_details(workflow: &Workflow, width: usize) -> Vec<String> {
+    let mut rows = vec![render_workflow_show_section_header("steps", "declared steps", width)];
+    for step in &workflow.steps {
+        rows.push(render_workflow_show_event_line(
+            UiStatus::Waiting,
+            "step",
+            &workflow_step_summary(step),
+            width,
+        ));
+
+        if let Some(sub_steps) = &step.parallel {
+            for sub in sub_steps {
+                rows.push(render_workflow_show_event_line(
+                    UiStatus::Waiting,
+                    "├─",
+                    &format!("{}  ·  agent {}", sub.id, sub.agent),
+                    width,
+                ));
+            }
+        }
+
+        if let Some(panel) = &step.panel {
+            rows.push(render_workflow_show_event_line(
+                UiStatus::Waiting,
+                "├─",
+                &format!("panelists  {}", panel.panelists.join(", ")),
+                width,
+            ));
+            if let Some(gate) = panel.gate.as_ref() {
+                rows.push(render_workflow_show_event_line(
+                    UiStatus::Awaiting,
+                    "└─",
+                    &format!(
+                        "gate  until {}  ·  fix_with {}  ·  max_iterations {}",
+                        gate.until_no_findings_at_severity_or_above.as_str(),
+                        gate.fix_with,
+                        gate.max_iterations
+                    ),
+                    width,
+                ));
+            }
+        }
+    }
+    rows
+}
+
+fn render_workflow_show_graph(workflow: &Workflow, width: usize) -> Vec<String> {
+    render_graph_rows(workflow, |_| NodeStatus::Waiting)
+        .into_iter()
+        .map(|row| render_workflow_show_graph_row(&row, width))
+        .collect()
+}
+
+fn render_workflow_show_graph_row(row: &rupu_app_canvas::GraphRow, width: usize) -> String {
+    let mut buf = String::new();
+    for cell in &row.cells {
+        match cell {
+            GraphCell::Pipe(status) => {
+                let _ = palette::write_colored(&mut buf, "│", node_status_color(*status));
+            }
+            GraphCell::Branch(glyph, status) => {
+                let _ = palette::write_colored(&mut buf, glyph.as_str(), node_status_color(*status));
+            }
+            GraphCell::Bullet(status) => {
+                let _ = palette::write_bold_colored(
+                    &mut buf,
+                    &status.glyph().to_string(),
+                    node_status_color(*status),
+                );
+            }
+            GraphCell::Space(count) => {
+                buf.push_str(&" ".repeat((*count).into()));
+            }
+            GraphCell::Label(label) => {
+                let _ = palette::write_bold_colored(&mut buf, label, BRAND);
+            }
+            GraphCell::Meta(meta) => {
+                let _ = palette::write_colored(&mut buf, meta, DIM);
+            }
+        }
+    }
+    truncate_workflow_show_ansi_line(&buf, width)
+}
+
+fn render_workflow_show_section_header(label: &str, detail: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, BRAND);
+    if !detail.is_empty() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+        let _ = palette::write_colored(&mut buf, detail, DIM);
+    }
+    truncate_workflow_show_ansi_line(&buf, width)
+}
+
+fn render_workflow_show_kv_row(
+    label: &str,
+    value: &str,
+    width: usize,
+    status: UiStatus,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, &format!("{label:<10}"), status.color());
+    let _ = palette::write_colored(
+        &mut buf,
+        &crate::cmd::transcript::truncate_single_line(value, width.saturating_sub(11)),
+        DIM,
+    );
+    truncate_workflow_show_ansi_line(&buf, width)
+}
+
+fn render_workflow_show_event_line(
+    status: UiStatus,
+    label: &str,
+    detail: &str,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    if !label.is_empty() {
+        let _ = palette::write_bold_colored(&mut buf, label, status.color());
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    }
+    let _ = palette::write_colored(&mut buf, detail, DIM);
+    truncate_workflow_show_ansi_line(&buf, width)
+}
+
+fn workflow_trigger_summary(trigger: &rupu_orchestrator::Trigger) -> String {
+    match trigger.on {
+        rupu_orchestrator::TriggerKind::Manual => "manual".into(),
+        rupu_orchestrator::TriggerKind::Cron => match trigger.cron.as_deref() {
+            Some(cron) => format!("cron  ·  {cron}"),
+            None => "cron".into(),
+        },
+        rupu_orchestrator::TriggerKind::Event => {
+            let mut parts = vec!["event".to_string()];
+            if let Some(event) = trigger.event.as_deref() {
+                parts.push(event.to_string());
+            }
+            if let Some(filter) = trigger.filter.as_deref().filter(|value| !value.trim().is_empty())
+            {
+                parts.push(format!("filter {}", crate::cmd::transcript::truncate_single_line(filter, 40)));
+            }
+            parts.join("  ·  ")
+        }
+    }
+}
+
+fn workflow_autoflow_summary(autoflow: &rupu_orchestrator::Autoflow) -> String {
+    let mut parts = vec![
+        format!("{:?}", autoflow.entity).to_ascii_lowercase(),
+        format!("priority {}", autoflow.priority),
+    ];
+    if let Some(source) = autoflow.source.as_deref() {
+        parts.push(source.to_string());
+    }
+    if let Some(ttl) = autoflow.claim.as_ref().and_then(|claim| claim.ttl.as_deref()) {
+        parts.push(format!("ttl {ttl}"));
+    }
+    parts.join("  ·  ")
+}
+
+fn collect_workflow_agents(workflow: &Workflow) -> std::collections::BTreeSet<String> {
+    let mut agents = std::collections::BTreeSet::new();
+    for step in &workflow.steps {
+        if let Some(agent) = step.agent.as_deref().filter(|value| !value.is_empty()) {
+            agents.insert(agent.to_string());
+        }
+        if let Some(subs) = &step.parallel {
+            for sub in subs {
+                if !sub.agent.is_empty() {
+                    agents.insert(sub.agent.clone());
+                }
+            }
+        }
+        if let Some(panel) = &step.panel {
+            for panelist in &panel.panelists {
+                if !panelist.is_empty() {
+                    agents.insert(panelist.clone());
+                }
+            }
+            if let Some(gate) = &panel.gate {
+                if !gate.fix_with.is_empty() {
+                    agents.insert(gate.fix_with.clone());
+                }
+            }
+        }
+    }
+    agents
+}
+
+fn workflow_step_summary(step: &rupu_orchestrator::Step) -> String {
+    if let Some(sub_steps) = &step.parallel {
+        let mut detail = format!("{}  ·  parallel  ·  {} sub-steps", step.id, sub_steps.len());
+        if let Some(max_parallel) = step.max_parallel {
+            detail.push_str(&format!("  ·  max_parallel {max_parallel}"));
+        }
+        return detail;
+    }
+    if let Some(panel) = &step.panel {
+        let mut detail = format!("{}  ·  panel  ·  {} panelists", step.id, panel.panelists.len());
+        if let Some(max_parallel) = panel.max_parallel {
+            detail.push_str(&format!("  ·  max_parallel {max_parallel}"));
+        }
+        return detail;
+    }
+    if let Some(for_each) = step.for_each.as_deref() {
+        let mut detail = format!(
+            "{}  ·  for_each  ·  agent {}  ·  {}",
+            step.id,
+            step.agent.as_deref().unwrap_or(""),
+            crate::cmd::transcript::truncate_single_line(for_each, 36)
+        );
+        if let Some(max_parallel) = step.max_parallel {
+            detail.push_str(&format!("  ·  max_parallel {max_parallel}"));
+        }
+        return detail;
+    }
+
+    let mut detail = format!(
+        "{}  ·  linear  ·  agent {}",
+        step.id,
+        step.agent.as_deref().unwrap_or("")
+    );
+    if !step.actions.is_empty() {
+        detail.push_str(&format!("  ·  actions {}", step.actions.join(", ")));
+    }
+    if step.approval.as_ref().is_some_and(|approval| approval.required) {
+        detail.push_str("  ·  approval");
+    }
+    if step.contract.is_some() {
+        detail.push_str("  ·  contract");
+    }
+    detail
+}
+
+fn yaml_scalar_inline(value: &serde_yaml::Value) -> String {
+    serde_yaml::to_string(value)
+        .unwrap_or_else(|_| format!("{value:?}"))
+        .replace('\n', " ")
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_string()
+}
+
+fn workflow_contract_format_name(format: rupu_orchestrator::ContractFormat) -> &'static str {
+    match format {
+        rupu_orchestrator::ContractFormat::Json => "json",
+        rupu_orchestrator::ContractFormat::Yaml => "yaml",
+    }
+}
+
+fn workflow_input_type_name(ty: rupu_orchestrator::InputType) -> &'static str {
+    match ty {
+        rupu_orchestrator::InputType::String => "string",
+        rupu_orchestrator::InputType::Int => "int",
+        rupu_orchestrator::InputType::Bool => "bool",
+    }
+}
+
+fn node_status_color(status: NodeStatus) -> owo_colors::Rgb {
+    match status {
+        NodeStatus::Waiting => DIM,
+        NodeStatus::Active | NodeStatus::Working => crate::output::palette::RUNNING,
+        NodeStatus::Complete => crate::output::palette::COMPLETE,
+        NodeStatus::Failed => crate::output::palette::FAILED,
+        NodeStatus::SoftFailed => crate::output::palette::SOFT_FAILED,
+        NodeStatus::Awaiting => crate::output::palette::AWAITING,
+        NodeStatus::Retrying => crate::output::palette::RETRYING,
+        NodeStatus::Skipped => crate::output::palette::SKIPPED,
+    }
+}
+
+fn truncate_workflow_show_ansi_line(value: &str, width: usize) -> String {
+    if visible_len(value) <= width {
+        value.to_string()
+    } else {
+        wrap_with_ansi(value, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
 }
 
 async fn edit(
