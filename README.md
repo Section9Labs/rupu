@@ -334,11 +334,12 @@ Event/timeline views use a separate contract:
   - `json`
   - `jsonl`
 - `rupu workflow show-run`
-  - `pretty` (default human timeline)
+  - `pretty` (default retained workflow snapshot)
   - `json`
 
 Snapshot views with a custom structured surface:
 
+- `rupu workflow show-run` (`pretty`/`table` and `json`)
 - `rupu autoflow monitor` (`table` and `json`)
 
 UI theming is split into two layers:

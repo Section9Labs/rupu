@@ -205,7 +205,13 @@ rupu watch run_01J... --replay --pace=20
 ```sh
 rupu workflow runs
 rupu workflow show-run run_01J...
+rupu workflow show-run run_01J... --view compact
 ```
+
+`rupu workflow show-run` now uses the same retained workflow timeline language as the live
+workflow runner, so completed runs render as a static graph/timeline snapshot instead of the old
+flat sideband summary. Use `--view focused|compact|full` to control payload density while keeping
+the same workflow structure on screen.
 
 ### Approve or reject a paused workflow
 
@@ -496,6 +502,7 @@ Notes:
   - `rupu transcript show`
   - `rupu session attach`
   - `rupu workflow run`
+  - `rupu workflow show-run`
   - `rupu autoflow serve`
 - `focused` keeps the graph/timeline and semantic summaries only.
 - `compact` keeps the same timeline, shows assistant bodies, and trims tool payloads to previews.
