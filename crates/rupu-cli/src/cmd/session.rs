@@ -44,7 +44,7 @@ use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, ToolContext};
-use rupu_transcript::{Event as TranscriptEvent, RunStatus};
+use rupu_transcript::{Event as TranscriptEvent, JsonlReader, RunStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -543,8 +543,13 @@ impl DetailOutput for SessionShowOutput {
         let width = terminal::size()
             .map(|(value, _)| value.max(40) as usize)
             .unwrap_or(100);
-        let body =
-            render_session_show_snapshot(&self.session, self.scope, self.view_mode, width);
+        let body = render_session_show_snapshot(
+            &self.session,
+            self.scope,
+            self.view_mode,
+            &self.prefs,
+            width,
+        );
         crate::cmd::ui::paginate(&body, &self.prefs)
     }
 }
@@ -553,6 +558,7 @@ fn render_session_show_snapshot(
     session: &SessionRecord,
     scope: SessionScope,
     view_mode: LiveViewMode,
+    prefs: &UiPrefs,
     width: usize,
 ) -> String {
     let mut rows = vec![
@@ -617,7 +623,7 @@ fn render_session_show_snapshot(
         ));
     }
     rows.push(String::new());
-    rows.extend(render_session_show_run_rows(session, view_mode, width));
+    rows.extend(render_session_show_run_rows(session, view_mode, prefs, width));
     rows.push(String::new());
     rows.push(render_session_show_footer_line(session, view_mode, width));
     rows.join("\n") + "\n"
@@ -669,6 +675,7 @@ fn render_session_show_footer_line(
 fn render_session_show_run_rows(
     session: &SessionRecord,
     view_mode: LiveViewMode,
+    prefs: &UiPrefs,
     width: usize,
 ) -> Vec<String> {
     if session.runs.is_empty() {
@@ -751,10 +758,103 @@ fn render_session_show_run_rows(
                         "│  ",
                     ));
                 }
+                rows.extend(render_session_show_transcript_rows(run, prefs, width));
             }
         }
     }
     rows
+}
+
+fn render_session_show_transcript_rows(
+    run: &SessionRunRecord,
+    prefs: &UiPrefs,
+    width: usize,
+) -> Vec<String> {
+    let mut rows = Vec::new();
+    let iter = match JsonlReader::iter(&run.transcript_path) {
+        Ok(iter) => iter,
+        Err(err) => {
+            rows.extend(render_session_show_event_lines(
+                crate::output::palette::Status::Failed,
+                "",
+                &format!(
+                    "transcript unavailable  ·  {}",
+                    truncate_single_line(&err.to_string(), 88)
+                ),
+                width,
+                "│  ",
+            ));
+            return rows;
+        }
+    };
+
+    for event in iter {
+        match event {
+            Ok(event) => rows.extend(render_session_show_transcript_event_rows(
+                &transcript_event_lines(&event, LiveViewMode::Full, prefs),
+                width,
+            )),
+            Err(err) => rows.extend(render_session_show_event_lines(
+                crate::output::palette::Status::Failed,
+                "",
+                &format!(
+                    "transcript parse error  ·  {}",
+                    truncate_single_line(&err.to_string(), 88)
+                ),
+                width,
+                "│  ",
+            )),
+        }
+    }
+
+    rows
+}
+
+fn render_session_show_transcript_event_rows(
+    lines: &[SessionViewLine],
+    width: usize,
+) -> Vec<String> {
+    let mut rendered = Vec::new();
+    for line in lines {
+        let prefix = if line.continuation {
+            {
+                let mut value = String::new();
+                let _ = palette::write_colored(&mut value, "│", DIM);
+                value.push_str("    ");
+                value
+            }
+        } else {
+            let mut value = String::new();
+            let _ = palette::write_colored(&mut value, "│", DIM);
+            value.push_str("  ");
+            let _ = palette::write_bold_colored(
+                &mut value,
+                &line.status.glyph().to_string(),
+                line.status.color(),
+            );
+            value.push(' ');
+            value
+        };
+        let content_width = width.saturating_sub(visible_len(&prefix)).max(1);
+        let wrapped = wrap_with_ansi(&line.text, content_width);
+        for (idx, segment) in wrapped.into_iter().enumerate() {
+            let text = if idx == 0 {
+                format!("{prefix}{segment}")
+            } else if line.continuation {
+                let mut continuation = String::new();
+                let _ = palette::write_colored(&mut continuation, "│", DIM);
+                continuation.push_str("    ");
+                format!("{continuation}{segment}")
+            } else {
+                let mut continuation = String::new();
+                let _ = palette::write_colored(&mut continuation, "│", DIM);
+                continuation.push_str("    ");
+                format!("{continuation}{segment}")
+            };
+            rendered.push(truncate_ansi_line(&text, width));
+        }
+    }
+    rendered
 }
 
 fn render_session_show_section_header(label: &str, detail: &str, width: usize) -> String {
