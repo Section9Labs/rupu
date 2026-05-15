@@ -395,6 +395,7 @@ The first commands wired to this are:
 - `rupu transcript show`
 - `rupu session attach`
 - `rupu workflow run`
+- `rupu watch`
 - `rupu autoflow serve`
 
 Built-in parity names currently include:

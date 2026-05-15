@@ -200,6 +200,10 @@ Replay a finished run:
 rupu watch run_01J... --replay --pace=20
 ```
 
+When attached to a terminal, `rupu watch` now uses the same retained workflow screen as
+`rupu workflow run`, including resize-safe reflow and `--view focused|compact|full`. Replay mode
+keeps the existing line-stream contract, but `--view` still controls assistant/tool density there.
+
 ### Inspect workflow run history
 
 ```sh
@@ -503,6 +507,7 @@ Notes:
   - `rupu session attach`
   - `rupu workflow run`
   - `rupu workflow show-run`
+  - `rupu watch`
   - `rupu autoflow serve`
 - `focused` keeps the graph/timeline and semantic summaries only.
 - `compact` keeps the same timeline, shows assistant bodies, and trims tool payloads to previews.
