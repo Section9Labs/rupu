@@ -339,6 +339,7 @@ Event/timeline views use a separate contract:
 
 Snapshot views with a custom structured surface:
 
+- `rupu issues show` (`table` and `json`)
 - `rupu workflow show-run` (`pretty`/`table` and `json`)
 - `rupu autoflow monitor` (`table` and `json`)
 
@@ -408,6 +409,11 @@ automation.
 The default table/human surface respects `--view focused|compact|full` plus `--no-color`, `--pager`,
 and `--no-pager`. `full` expands the retained transcript content inline under each recent run,
 while `--format json` remains unchanged for automation.
+
+`rupu issues show` now uses the same retained static-snapshot model for human terminal output.
+The default table/human surface keeps issue metadata and the highlighted body together on one
+screen. Use `--no-color`, `--pager`, or `--no-pager` to override the configured UI preferences
+for a single invocation, while `--format json` remains unchanged for automation.
 
 Built-in parity names currently include:
 
