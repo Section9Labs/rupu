@@ -156,12 +156,15 @@ pub enum Action {
         /// Maximum number of history rows to show.
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Refresh the table view until interrupted.
+        /// Refresh the operator view until interrupted.
         #[arg(long)]
         watch: bool,
         /// Refresh interval for `--watch`, for example `2s`.
         #[arg(long, default_value = "2s")]
         interval: String,
+        /// Live operator view mode (`focused`, `compact`, or `full`) for `--watch`.
+        #[arg(long, value_enum)]
+        view: Option<crate::cmd::ui::LiveViewMode>,
     },
     /// Explain the current autonomous state for one issue.
     Explain {
@@ -1108,6 +1111,48 @@ impl AutoflowServeUiState {
         self.sync_selection(entries);
     }
 
+    fn sync_history_selection(&mut self, entries: &[HistoryIssueEntry]) -> Option<usize> {
+        if entries.is_empty() {
+            self.selected_issue_ref = None;
+            self.issue_scroll = 0;
+            return None;
+        }
+        let needs_reset = self
+            .selected_issue_ref
+            .as_ref()
+            .is_none_or(|selected| !entries.iter().any(|entry| &entry.issue_ref == selected));
+        if self.follow_hottest || needs_reset {
+            self.selected_issue_ref = Some(entries[0].issue_ref.clone());
+        }
+        entries
+            .iter()
+            .position(|entry| self.selected_issue_ref.as_deref() == Some(entry.issue_ref.as_str()))
+    }
+
+    fn move_history_selection(&mut self, entries: &[HistoryIssueEntry], delta: isize) {
+        let Some(current) = self.sync_history_selection(entries) else {
+            return;
+        };
+        let limit = entries.len().saturating_sub(1) as isize;
+        let next = (current as isize + delta).clamp(0, limit) as usize;
+        self.follow_hottest = false;
+        self.selected_issue_ref = Some(entries[next].issue_ref.clone());
+    }
+
+    fn toggle_follow_history(&mut self, entries: &[HistoryIssueEntry]) {
+        self.follow_hottest = !self.follow_hottest;
+        if self.follow_hottest {
+            self.issue_scroll = 0;
+            self.sync_history_selection(entries);
+        }
+    }
+
+    fn follow_hottest_history(&mut self, entries: &[HistoryIssueEntry]) {
+        self.follow_hottest = true;
+        self.issue_scroll = 0;
+        self.sync_history_selection(entries);
+    }
+
     fn switch_focus(&mut self) {
         self.focus = match self.focus {
             AutoflowServeFocus::Issues => AutoflowServeFocus::Detail,
@@ -1373,6 +1418,7 @@ async fn handle_with_resolver(
             limit,
             watch,
             interval,
+            view,
         } => {
             let query = AutoflowHistoryQuery {
                 issue_filter: r#ref.as_deref(),
@@ -1382,7 +1428,7 @@ async fn handle_with_resolver(
                 event_filter: event.as_deref(),
                 limit,
             };
-            history(query, watch, &interval, global_format).await
+            history(query, watch, &interval, view, global_format).await
         }
         Action::Explain { r#ref, repo } => explain(&r#ref, repo.as_deref(), global_format).await,
         Action::Doctor(args) => doctor(args.repo.as_deref(), global_format).await,
@@ -2430,6 +2476,622 @@ fn build_retained_monitor_rows_for_size(
     rows.push(retained_monitor_status_line(view_mode, ui_state, refresh_count, width));
     rows.truncate(height);
     rows
+}
+
+fn build_retained_history_rows_for_size(
+    report: &AutoflowHistoryReport,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    query: &AutoflowHistoryQuery<'_>,
+    refresh: std::time::Duration,
+    view_mode: LiveViewMode,
+    ui_state: &mut AutoflowServeUiState,
+    refresh_count: usize,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let entries = build_history_issue_entries(report, monitor);
+    let selected_index = ui_state.sync_history_selection(&entries);
+    let active = monitor
+        .claims
+        .iter()
+        .filter(|claim| matches!(claim.status.as_str(), "running" | "claimed"))
+        .count();
+    let mut rows = vec![
+        retained_history_header_line(query, refresh, view_mode, width),
+        retained_serve_kv_row(
+            "history",
+            &format!(
+                "refreshes {}  ·  issues {}  ·  rows {}  ·  events {}  ·  cycles {}",
+                refresh_count,
+                entries.len(),
+                report.rows.len(),
+                report.total_events,
+                report.total_cycles,
+            ),
+            width,
+            UiStatus::Active,
+        ),
+        retained_serve_kv_row(
+            "context",
+            &format!(
+                "active {}  ·  claims {}  ·  queued wakes {}  ·  due wakes {}  ·  workers {}",
+                active,
+                monitor.claims.len(),
+                monitor.wakes.queued,
+                monitor.wakes.due,
+                monitor.workers.len(),
+            ),
+            width,
+            UiStatus::Active,
+        ),
+        String::new(),
+    ];
+
+    let footer_reserved = 2usize;
+    let available_body_rows = height
+        .saturating_sub(rows.len())
+        .saturating_sub(footer_reserved)
+        .max(4);
+    let body_rows = if width >= 132 {
+        build_retained_history_two_pane_rows(
+            &entries,
+            selected_index,
+            report,
+            monitor,
+            run_store,
+            pricing,
+            view_mode,
+            ui_state,
+            width,
+            available_body_rows,
+        )
+    } else {
+        build_retained_history_stacked_rows(
+            &entries,
+            selected_index,
+            report,
+            monitor,
+            run_store,
+            pricing,
+            view_mode,
+            ui_state,
+            width,
+            available_body_rows,
+        )
+    };
+    rows.extend(body_rows);
+    while rows.len() < height.saturating_sub(footer_reserved) {
+        rows.push(String::new());
+    }
+    rows.push(retained_history_controls_line(width));
+    rows.push(retained_history_status_line(view_mode, ui_state, refresh_count, width));
+    rows.truncate(height);
+    rows
+}
+
+fn build_history_issue_entries(
+    report: &AutoflowHistoryReport,
+    monitor: &AutoflowMonitorReport,
+) -> Vec<HistoryIssueEntry> {
+    let mut entries: Vec<HistoryIssueEntry> = Vec::new();
+    let mut seen = BTreeMap::<String, usize>::new();
+    for row in &report.rows {
+        let issue_ref = row.issue.clone();
+        if let Some(index) = seen.get(&issue_ref).copied() {
+            entries[index].row_count += 1;
+            continue;
+        }
+        let claim_index = monitor.claims.iter().position(|claim| {
+            claim.issue == issue_ref
+                || claim.issue_display.as_deref() == Some(issue_ref.as_str())
+        });
+        entries.push(HistoryIssueEntry {
+            issue_ref: issue_ref.clone(),
+            issue_display: issue_ref.clone(),
+            repo: row.repo.clone(),
+            source: row.source.clone(),
+            workflow: row.workflow.clone(),
+            latest_at: row.at.clone(),
+            latest_event: row.event.clone(),
+            latest_worker: row.worker.clone(),
+            latest_run: row.run.clone(),
+            row_count: 1,
+            claim_index,
+        });
+        seen.insert(issue_ref, entries.len() - 1);
+    }
+    entries
+}
+
+fn build_retained_history_two_pane_rows(
+    entries: &[HistoryIssueEntry],
+    selected_index: Option<usize>,
+    report: &AutoflowHistoryReport,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    view_mode: LiveViewMode,
+    ui_state: &mut AutoflowServeUiState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let gap = 2usize;
+    let left_width = (width / 3).clamp(34, 50);
+    let right_width = width.saturating_sub(left_width + gap).max(40);
+    let left_rows = build_history_issue_list_rows(
+        entries,
+        selected_index,
+        monitor,
+        run_store,
+        pricing,
+        ui_state,
+        left_width,
+        height,
+    );
+    let right_rows = build_selected_history_rows(
+        entries,
+        selected_index,
+        report,
+        monitor,
+        run_store,
+        pricing,
+        view_mode,
+        ui_state,
+        right_width,
+        height,
+    );
+    merge_retained_columns(&left_rows, &right_rows, left_width, right_width, gap, height)
+}
+
+fn build_retained_history_stacked_rows(
+    entries: &[HistoryIssueEntry],
+    selected_index: Option<usize>,
+    report: &AutoflowHistoryReport,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    view_mode: LiveViewMode,
+    ui_state: &mut AutoflowServeUiState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let issue_height = height
+        .min(entries.len().saturating_add(3))
+        .clamp(4, height.saturating_sub(4).max(4));
+    let mut rows = build_history_issue_list_rows(
+        entries,
+        selected_index,
+        monitor,
+        run_store,
+        pricing,
+        ui_state,
+        width,
+        issue_height,
+    );
+    if rows.len() < issue_height {
+        rows.resize(issue_height, String::new());
+    }
+    let detail_height = height.saturating_sub(rows.len() + 1).max(1);
+    rows.push(String::new());
+    rows.extend(build_selected_history_rows(
+        entries,
+        selected_index,
+        report,
+        monitor,
+        run_store,
+        pricing,
+        view_mode,
+        ui_state,
+        width,
+        detail_height,
+    ));
+    rows.truncate(height);
+    rows
+}
+
+fn build_history_issue_list_rows(
+    entries: &[HistoryIssueEntry],
+    selected_index: Option<usize>,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    ui_state: &mut AutoflowServeUiState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let mut rows = vec![retained_serve_focus_section_title(
+        "issues",
+        ui_state.focus == AutoflowServeFocus::Issues,
+        Some(if ui_state.follow_hottest {
+            "following newest"
+        } else {
+            "pinned"
+        }),
+        width,
+    )];
+    if entries.is_empty() {
+        rows.push(retained_serve_kv_row(
+            "items",
+            "no visible issue history",
+            width,
+            UiStatus::Skipped,
+        ));
+        return rows;
+    }
+    let visible_slots = height.saturating_sub(rows.len()).max(1);
+    let selected_index = selected_index.unwrap_or(0);
+    if selected_index < ui_state.issue_scroll {
+        ui_state.issue_scroll = selected_index;
+    } else {
+        let end = ui_state.issue_scroll.saturating_add(visible_slots);
+        if selected_index >= end {
+            ui_state.issue_scroll = selected_index.saturating_sub(visible_slots.saturating_sub(1));
+        }
+    }
+    let start = ui_state.issue_scroll.min(entries.len().saturating_sub(1));
+    let end = (start + visible_slots).min(entries.len());
+    for (offset, entry) in entries[start..end].iter().enumerate() {
+        let idx = start + offset;
+        rows.push(render_history_issue_list_row(
+            entry,
+            idx == selected_index,
+            monitor,
+            run_store,
+            pricing,
+            width,
+        ));
+    }
+    rows
+}
+
+fn build_selected_history_rows(
+    entries: &[HistoryIssueEntry],
+    selected_index: Option<usize>,
+    report: &AutoflowHistoryReport,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    view_mode: LiveViewMode,
+    ui_state: &mut AutoflowServeUiState,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let mut pinned = vec![retained_serve_focus_section_title(
+        "selected",
+        ui_state.focus == AutoflowServeFocus::Detail,
+        selected_index
+            .map(|idx| format!("issue {}/{}", idx + 1, entries.len()))
+            .as_deref(),
+        width,
+    )];
+
+    let Some(selected_index) = selected_index else {
+        pinned.push(retained_serve_kv_row(
+            "detail",
+            "no issue selected",
+            width,
+            UiStatus::Skipped,
+        ));
+        return pinned;
+    };
+    let entry = &entries[selected_index];
+    let claim = entry
+        .claim_index
+        .and_then(|index| monitor.claims.get(index));
+    let issue_status = claim
+        .map(|claim| claim_status_ui(&claim.status))
+        .unwrap_or_else(|| history_row_status(&entry.latest_event));
+    pinned.push(retained_serve_kv_row(
+        "issue",
+        &format!(
+            "{}  ·  {}",
+            entry.issue_display,
+            truncate_single_line(&entry.workflow, 28)
+        ),
+        width,
+        issue_status,
+    ));
+
+    let mut route = vec![format!("repo {}", short_locator(&entry.repo, 28))];
+    if entry.source != "-" {
+        route.push(format!("source {}", truncate_text(&entry.source, 24)));
+    }
+    if let Some(claim) = claim {
+        if claim.branch != "-" {
+            route.push(format!("branch {}", truncate_text(&claim.branch, 22)));
+        }
+        if claim.pr != "-" {
+            route.push(format!("pr {}", short_url_like(&claim.pr, 22)));
+        }
+    }
+    pinned.push(retained_serve_kv_row(
+        "route",
+        &route.join("  ·  "),
+        width,
+        UiStatus::Active,
+    ));
+
+    pinned.push(retained_serve_kv_row(
+        "latest",
+        &format!(
+            "{}  ·  {}  ·  worker {}{}",
+            short_timestamp(&entry.latest_at),
+            entry.latest_event,
+            entry.latest_worker,
+            if entry.latest_run != "-" {
+                format!("  ·  run {}", short_run_id(&entry.latest_run))
+            } else {
+                String::new()
+            }
+        ),
+        width,
+        history_row_status(&entry.latest_event),
+    ));
+
+    let mut scrollable = Vec::new();
+    if let Some(claim) = claim {
+        if let Some((record, summary, live_lines)) =
+            resolve_live_claim_run(run_store, pricing, claim, view_mode)
+        {
+            if let Some(usage) = &summary.usage {
+                pinned.push(retained_serve_kv_row(
+                    "usage",
+                    &format!(
+                        "in {}  ·  out {}  ·  total {}{}",
+                        format_count(usage.input_tokens),
+                        format_count(usage.output_tokens),
+                        format_count(usage.total_tokens),
+                        usage
+                            .cost_usd
+                            .map(|cost| format!("  ·  ${cost:.2}"))
+                            .unwrap_or_default()
+                    ),
+                    width,
+                    UiStatus::Active,
+                ));
+            }
+            if let Some(diff) = &summary.diff {
+                pinned.push(retained_serve_kv_row(
+                    "changes",
+                    &format!(
+                        "{} file(s)  ·  +{}/-{}",
+                        diff.files_changed,
+                        format_compact_count(diff.insertions),
+                        format_compact_count(diff.deletions)
+                    ),
+                    width,
+                    UiStatus::Complete,
+                ));
+            }
+            pinned.push(String::new());
+            pinned.push(retained_serve_section_title("workflow canvas", width));
+            scrollable.extend(build_issue_canvas_rows(claim, &record, &summary, &live_lines, width));
+            scrollable.push(String::new());
+        }
+    }
+
+    scrollable.push(retained_serve_section_title("history timeline", width));
+    scrollable.extend(build_history_issue_timeline_rows(
+        &entry.issue_ref,
+        report,
+        view_mode,
+        width,
+    ));
+
+    let body_slots = height.saturating_sub(pinned.len()).max(1);
+    let window = ui_state.detail_viewport.apply(scrollable, body_slots);
+    pinned.extend(window.rows);
+    pinned.truncate(height);
+    pinned
+}
+
+fn retained_history_controls_line(width: usize) -> String {
+    retained_monitor_controls_line(width)
+}
+
+fn retained_history_status_line(
+    view_mode: LiveViewMode,
+    ui_state: &AutoflowServeUiState,
+    refresh_count: usize,
+    width: usize,
+) -> String {
+    retained_serve_kv_row(
+        "view",
+        &format!(
+            "{}  ·  focus {}  ·  {}  ·  {}  ·  refreshes {}",
+            view_mode.as_str(),
+            ui_state.focus_label(),
+            if ui_state.follow_hottest {
+                "following newest"
+            } else {
+                "pinned selection"
+            },
+            ui_state.detail_viewport.status_text(),
+            refresh_count,
+        ),
+        width,
+        UiStatus::Active,
+    )
+}
+
+fn retained_history_header_line(
+    query: &AutoflowHistoryQuery<'_>,
+    refresh: std::time::Duration,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let mut filters = Vec::new();
+    if let Some(repo) = query.repo_filter {
+        filters.push(format!("repo {repo}"));
+    }
+    if let Some(source) = query.source_filter {
+        filters.push(format!("source {source}"));
+    }
+    if let Some(worker) = query.worker_filter {
+        filters.push(format!("worker {worker}"));
+    }
+    if let Some(event) = query.event_filter {
+        filters.push(format!("event {event}"));
+    }
+    if let Some(issue) = query.issue_filter {
+        filters.push(format!("issue {issue}"));
+    }
+    filters.push(format!("limit {}", query.limit));
+
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "autoflow history", BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        &format!(
+            "  ·  {}  ·  refresh {}s  ·  {}",
+            filters.join("  ·  "),
+            refresh.as_secs_f32(),
+            view_mode.as_str(),
+        ),
+        DIM,
+    );
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn render_history_issue_list_row(
+    entry: &HistoryIssueEntry,
+    selected: bool,
+    monitor: &AutoflowMonitorReport,
+    run_store: &RunStore,
+    pricing: &rupu_config::PricingConfig,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    let selected_color = if selected { BRAND } else { DIM };
+    let _ = palette::write_bold_colored(&mut buf, if selected { "▸" } else { " " }, selected_color);
+    buf.push(' ');
+    let status = entry
+        .claim_index
+        .and_then(|index| monitor.claims.get(index))
+        .map(|claim| claim_status_ui(&claim.status))
+        .unwrap_or_else(|| history_row_status(&entry.latest_event));
+    let _ = palette::write_bold_colored(&mut buf, &status.glyph().to_string(), status.color());
+    buf.push(' ');
+    let _ = palette::write_bold_colored(
+        &mut buf,
+        &truncate_single_line(&entry.issue_display, 28),
+        if selected { BRAND } else { status.color() },
+    );
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(
+        &mut buf,
+        &truncate_single_line(&entry.workflow, 22),
+        BRAND,
+    );
+    let chip = entry
+        .claim_index
+        .and_then(|index| monitor.claims.get(index))
+        .and_then(|claim| issue_stage_chip(claim, run_store, pricing))
+        .unwrap_or_else(|| {
+            format!(
+                "{}  ·  {} row(s)",
+                truncate_text(&entry.latest_event, 18),
+                entry.row_count
+            )
+        });
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, &truncate_single_line(&chip, 36), DIM);
+    truncate_retained_ansi_line(&buf, width)
+}
+
+fn build_history_issue_timeline_rows(
+    issue_ref: &str,
+    report: &AutoflowHistoryReport,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> Vec<String> {
+    let lines = build_history_issue_timeline_lines(issue_ref, report, view_mode);
+    render_retained_serve_event_rows(&lines, width)
+}
+
+fn build_history_issue_timeline_lines(
+    issue_ref: &str,
+    report: &AutoflowHistoryReport,
+    view_mode: LiveViewMode,
+) -> Vec<AutoflowServeViewLine> {
+    let prefs = retained_serve_ui_prefs();
+    let mut out = Vec::new();
+    let mut current_run: Option<String> = None;
+    for row in report.rows.iter().filter(|row| row.issue == issue_ref) {
+        let status = history_row_status(&row.event);
+        let run_group = (row.run != "-").then(|| row.run.clone());
+        if run_group != current_run {
+            if let Some(run_id) = run_group.as_deref() {
+                out.push(AutoflowServeViewLine {
+                    status: UiStatus::Active,
+                    text: retained_workflow_step_line(
+                        &format!("run {}", short_run_id(run_id)),
+                        &truncate_single_line(&row.workflow, 40),
+                    ),
+                    continuation: false,
+                    indent: 0,
+                    kind: AutoflowServeViewLineKind::TreeItem,
+                });
+            }
+            current_run = run_group.clone();
+        }
+        let (_, label) = activity_status_and_label(&row.event);
+        out.push(AutoflowServeViewLine {
+            status,
+            text: format!(
+                "{}  ·  {}  ·  worker {}",
+                short_timestamp(&row.at),
+                label,
+                truncate_text(&row.worker, 24)
+            ),
+            continuation: false,
+            indent: usize::from(run_group.is_some()),
+            kind: AutoflowServeViewLineKind::TreeItem,
+        });
+        match view_mode {
+            LiveViewMode::Focused => {}
+            LiveViewMode::Compact => {
+                if row.detail != "-" {
+                    let payload = render_payload(&row.detail, &prefs);
+                    out.extend(
+                        render_payload_preview_lines(&payload, 4)
+                            .into_iter()
+                            .map(|line| AutoflowServeViewLine {
+                                status,
+                                text: line,
+                                continuation: true,
+                                indent: usize::from(run_group.is_some()),
+                                kind: AutoflowServeViewLineKind::TreeNote,
+                            }),
+                    );
+                }
+            }
+            LiveViewMode::Full => {
+                if row.detail != "-" {
+                    let payload = render_payload(&row.detail, &prefs);
+                    out.extend(payload.rendered.lines().map(|line| AutoflowServeViewLine {
+                        status,
+                        text: line.to_string(),
+                        continuation: true,
+                        indent: usize::from(run_group.is_some()),
+                        kind: AutoflowServeViewLineKind::TreeNote,
+                    }));
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(serve_event_line(UiStatus::Skipped, "no visible history"));
+    }
+    out
+}
+
+fn history_row_status(event: &str) -> UiStatus {
+    activity_status_and_label(event).0
 }
 
 fn retained_serve_controls_line(width: usize) -> String {
@@ -3892,6 +4554,7 @@ async fn history(
     query: AutoflowHistoryQuery<'_>,
     watch: bool,
     interval: &str,
+    view: Option<crate::cmd::ui::LiveViewMode>,
     global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
     let format =
@@ -3908,11 +4571,18 @@ async fn history(
         repo_filter: repo_filter.as_deref(),
         ..query
     };
+    let live_view_mode = autoflow_ui_config()
+        .map(|cfg| UiPrefs::resolve(&cfg.ui, false, None, None, view).live_view)
+        .unwrap_or(view.unwrap_or(LiveViewMode::Focused));
 
     if !watch {
         let report = build_history_report(&query)?;
         let output = AutoflowHistoryOutput { report };
         return output_report::emit_collection(global_format, &output);
+    }
+
+    if std::io::stdout().is_terminal() {
+        return history_retained(query, refresh, live_view_mode).await;
     }
 
     loop {
@@ -3924,6 +4594,98 @@ async fn history(
             _ = tokio::time::sleep(refresh) => {}
         }
     }
+    Ok(())
+}
+
+async fn history_retained(
+    query: AutoflowHistoryQuery<'_>,
+    refresh: std::time::Duration,
+    view_mode: LiveViewMode,
+) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let run_store = RunStore::new(global.join("runs"));
+    let pricing = autoflow_pricing_config();
+    let mut refresh_count = 0usize;
+    let _raw_mode = AutoflowServeRawModeGuard::enter()?;
+    let _screen = AutoflowServeScreenGuard::enter()?;
+    let mut heartbeat = tokio::time::interval(refresh);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_rows: Vec<String> = Vec::new();
+    let mut live_view_mode = view_mode;
+    let mut ui_state = AutoflowServeUiState::default();
+
+    loop {
+        let report = build_history_report(&query)?;
+        let monitor = build_monitor_report(query.repo_filter, query.worker_filter)?;
+        let (width, height) = crossterm::terminal::size().unwrap_or((100, 30));
+        let rows = build_retained_history_rows_for_size(
+            &report,
+            &monitor,
+            &run_store,
+            &pricing,
+            &query,
+            refresh,
+            live_view_mode,
+            &mut ui_state,
+            refresh_count,
+            width.max(50) as usize,
+            height.max(14) as usize,
+        );
+        if rows != last_rows {
+            render_retained_serve_rows(&rows)?;
+            last_rows = rows;
+        }
+        refresh_count = refresh_count.saturating_add(1);
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = heartbeat.tick() => {}
+        }
+
+        while event::poll(std::time::Duration::from_millis(0))? {
+            match event::read()? {
+                CrosstermEvent::Resize(_, _) => {}
+                CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Char('f'), _) => {
+                            live_view_mode = live_view_mode.toggled();
+                            last_rows.clear();
+                        }
+                        (KeyCode::Tab, _) => ui_state.switch_focus(),
+                        (KeyCode::Enter, _) => {
+                            let entries = build_history_issue_entries(&report, &monitor);
+                            ui_state.toggle_follow_history(&entries);
+                        }
+                        (KeyCode::Char(' '), _) => {
+                            let entries = build_history_issue_entries(&report, &monitor);
+                            ui_state.follow_hottest_history(&entries);
+                        }
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _)
+                            if ui_state.focus == AutoflowServeFocus::Issues =>
+                        {
+                            let entries = build_history_issue_entries(&report, &monitor);
+                            ui_state.move_history_selection(&entries, -1);
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _)
+                            if ui_state.focus == AutoflowServeFocus::Issues =>
+                        {
+                            let entries = build_history_issue_entries(&report, &monitor);
+                            ui_state.move_history_selection(&entries, 1);
+                        }
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => ui_state.detail_viewport.scroll_up(1),
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => ui_state.detail_viewport.scroll_down(1),
+                        (KeyCode::PageUp, _) => ui_state.detail_viewport.page_up(),
+                        (KeyCode::PageDown, _) => ui_state.detail_viewport.page_down(),
+                        (KeyCode::Char('g'), KeyModifiers::NONE) => ui_state.detail_viewport.jump_top(),
+                        (KeyCode::Char('G'), _) | (KeyCode::End, _) => ui_state.detail_viewport.jump_bottom(),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    println!("autoflow history stopped after {refresh_count} refresh(es)");
     Ok(())
 }
 
@@ -4432,6 +5194,59 @@ mod serve_heartbeat_tests {
         }
     }
 
+    fn sample_history_report() -> AutoflowHistoryReport {
+        AutoflowHistoryReport {
+            kind: "autoflow_history",
+            version: 1,
+            total_cycles: 4,
+            total_events: 6,
+            rows: vec![
+                AutoflowHistoryRow {
+                    at: "2026-05-14T05:03:00Z".into(),
+                    cycle_id: "cycle-3".into(),
+                    mode: "serve".into(),
+                    worker: "team-mini-01".into(),
+                    event: "run_launched".into(),
+                    issue: "github:Section9Labs/rupu/issues/7".into(),
+                    source: "github:Section9Labs/rupu".into(),
+                    workflow: "storefront-feature-delivery".into(),
+                    repo: "github:Section9Labs/rupu".into(),
+                    run: "run_01ABCDEF".into(),
+                    wake: "wake-1".into(),
+                    detail: "launched implementation run".into(),
+                },
+                AutoflowHistoryRow {
+                    at: "2026-05-14T05:02:00Z".into(),
+                    cycle_id: "cycle-2".into(),
+                    mode: "serve".into(),
+                    worker: "team-mini-01".into(),
+                    event: "issue_commented".into(),
+                    issue: "github:Section9Labs/rupu/issues/7".into(),
+                    source: "github:Section9Labs/rupu".into(),
+                    workflow: "storefront-feature-delivery".into(),
+                    repo: "github:Section9Labs/rupu".into(),
+                    run: "run_01ABCDEF".into(),
+                    wake: "-".into(),
+                    detail: "commented with plan".into(),
+                },
+                AutoflowHistoryRow {
+                    at: "2026-05-14T05:01:00Z".into(),
+                    cycle_id: "cycle-1".into(),
+                    mode: "serve".into(),
+                    worker: "team-mini-01".into(),
+                    event: "awaiting_human".into(),
+                    issue: "github:Section9Labs/rupu/issues/8".into(),
+                    source: "github:Section9Labs/rupu".into(),
+                    workflow: "verify-followup".into(),
+                    repo: "github:Section9Labs/rupu".into(),
+                    run: "-".into(),
+                    wake: "-".into(),
+                    detail: "approval required".into(),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn heartbeat_ignores_complete_claims() {
         assert!(!claim_is_live_for_heartbeat(&claim_with_status("complete")));
@@ -4613,6 +5428,38 @@ mod serve_heartbeat_tests {
     }
 
     #[test]
+    fn retained_history_full_mode_shows_operator_console_layout() {
+        let tmp = tempdir().unwrap();
+        let run_store = RunStore::new(tmp.path().join("runs"));
+        let mut ui_state = AutoflowServeUiState::default();
+        let query = AutoflowHistoryQuery {
+            issue_filter: None,
+            repo_filter: Some("github:Section9Labs/rupu"),
+            source_filter: None,
+            worker_filter: None,
+            event_filter: None,
+            limit: 50,
+        };
+        let rows = build_retained_history_rows_for_size(
+            &sample_history_report(),
+            &sample_monitor_report(),
+            &run_store,
+            &autoflow_pricing_config(),
+            &query,
+            std::time::Duration::from_secs(2),
+            crate::cmd::ui::LiveViewMode::Full,
+            &mut ui_state,
+            3,
+            150,
+            24,
+        );
+        assert!(rows.iter().any(|row| row.contains("autoflow history")));
+        assert!(rows.iter().any(|row| row.contains("issues")));
+        assert!(rows.iter().any(|row| row.contains("selected")));
+        assert!(rows.iter().any(|row| row.contains("history timeline")));
+    }
+
+    #[test]
     fn live_run_event_lines_focused_summarize_read_file_tool_call() {
         let lines = live_run_event_lines(
             &TranscriptEvent::ToolCall {
@@ -4757,6 +5604,21 @@ struct ServeIssueEntry<'a> {
     issue_ref: String,
     claim: Option<&'a AutoflowClaimRow>,
     events: Vec<&'a AutoflowCycleEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct HistoryIssueEntry {
+    issue_ref: String,
+    issue_display: String,
+    repo: String,
+    source: String,
+    workflow: String,
+    latest_at: String,
+    latest_event: String,
+    latest_worker: String,
+    latest_run: String,
+    row_count: usize,
+    claim_index: Option<usize>,
 }
 
 fn render_cycle_operator_layout(
