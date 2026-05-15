@@ -71,8 +71,8 @@ pub enum Action {
         #[arg(add = ArgValueCompleter::new(workflow_names))]
         name: String,
         /// Human snapshot density (`focused` | `compact` | `full`).
-        #[arg(long, value_enum)]
-        view: Option<LiveViewMode>,
+        #[arg(long, value_enum, default_value_t = LiveViewMode::Full)]
+        view: LiveViewMode,
         /// Disable colored output (also honored: `NO_COLOR` env var).
         #[arg(long)]
         no_color: bool,
@@ -218,7 +218,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             };
             show(
                 &name,
-                view,
+                Some(view),
                 no_color,
                 theme.as_deref(),
                 pager_flag,
@@ -626,46 +626,41 @@ fn render_workflow_usage_block(
         return String::new();
     }
 
-    let mut lines = Vec::new();
-    lines.push(styled_usage_line(
-        UiStatus::Active,
-        "usage",
-        "provider  ·  model  ·  agent  ·  in/out/cached  ·  cost",
-    ));
+    let mut lines = vec![styled_usage_line(UiStatus::Active, "usage", "provider/model/agent usage")];
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["PROVIDER", "MODEL", "AGENT", "INPUT", "OUTPUT", "CACHED", "COST"]);
     for row in usage_rows {
-        let cost = row
-            .cost_usd
-            .map(|value| format!("  ·  ${value:.4}"))
-            .unwrap_or_default();
-        lines.push(styled_usage_line(
-            UiStatus::Active,
-            "├─",
-            &format!(
-                "{}  ·  {}  ·  {}  ·  in {} out {} cached {}{}",
-                row.provider,
-                row.model,
-                row.agent,
-                row.input_tokens,
-                row.output_tokens,
-                row.cached_tokens,
-                cost
+        table.add_row(vec![
+            comfy_table::Cell::new(&row.provider),
+            comfy_table::Cell::new(&row.model),
+            comfy_table::Cell::new(&row.agent),
+            comfy_table::Cell::new(row.input_tokens),
+            comfy_table::Cell::new(row.output_tokens),
+            comfy_table::Cell::new(row.cached_tokens),
+            comfy_table::Cell::new(
+                row.cost_usd
+                    .map(|value| format!("${value:.4}"))
+                    .unwrap_or_else(|| "—".into()),
             ),
-        ));
+        ]);
     }
     if let Some(totals) = usage_totals {
-        let cost = totals
-            .cost_usd
-            .map(|value| format!("  ·  ${value:.4}"))
-            .unwrap_or_default();
-        lines.push(styled_usage_line(
-            UiStatus::Complete,
-            "└─ total",
-            &format!(
-                "in {} out {} cached {}{}",
-                totals.input_tokens, totals.output_tokens, totals.cached_tokens, cost
+        table.add_row(vec![
+            comfy_table::Cell::new("total"),
+            comfy_table::Cell::new("—"),
+            comfy_table::Cell::new("—"),
+            comfy_table::Cell::new(totals.input_tokens),
+            comfy_table::Cell::new(totals.output_tokens),
+            comfy_table::Cell::new(totals.cached_tokens),
+            comfy_table::Cell::new(
+                totals
+                    .cost_usd
+                    .map(|value| format!("${value:.4}"))
+                    .unwrap_or_else(|| "—".into()),
             ),
-        ));
+        ]);
     }
+    lines.extend(table.to_string().lines().map(|line| line.to_string()));
     lines.join("\n")
 }
 
@@ -918,31 +913,40 @@ fn render_workflow_show_inputs(workflow: &Workflow, width: usize) -> Vec<String>
     }
 
     let mut rows = vec![render_workflow_show_section_header("inputs", "declared inputs", width)];
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["NAME", "TYPE", "REQUIRED", "DEFAULT", "ENUM", "DESCRIPTION"]);
     for (name, input) in &workflow.inputs {
-        let mut detail = format!(
-            "{}  ·  {}{}",
-            name,
-            workflow_input_type_name(input.ty),
-            if input.required { "  ·  required" } else { "" }
-        );
-        if let Some(default) = &input.default {
-            detail.push_str("  ·  default ");
-            detail.push_str(&yaml_scalar_inline(default));
-        }
-        if !input.allowed.is_empty() {
-            detail.push_str("  ·  enum ");
-            detail.push_str(&input.allowed.join(", "));
-        }
-        rows.push(render_workflow_show_event_line(UiStatus::Active, "input", &detail, width));
-        if let Some(description) = input.description.as_deref().filter(|value| !value.trim().is_empty()) {
-            rows.push(render_workflow_show_event_line(
-                UiStatus::Waiting,
-                "",
-                description.trim(),
-                width,
-            ));
-        }
+        table.add_row(vec![
+            comfy_table::Cell::new(name),
+            comfy_table::Cell::new(workflow_input_type_name(input.ty)),
+            comfy_table::Cell::new(if input.required { "yes" } else { "no" }),
+            comfy_table::Cell::new(
+                input.default
+                    .as_ref()
+                    .map(yaml_scalar_inline)
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            comfy_table::Cell::new(if input.allowed.is_empty() {
+                "—".to_string()
+            } else {
+                crate::cmd::transcript::truncate_single_line(&input.allowed.join(", "), 40)
+            }),
+            comfy_table::Cell::new(
+                input
+                    .description
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| crate::cmd::transcript::truncate_single_line(value.trim(), 48))
+                    .unwrap_or_else(|| "—".into()),
+            ),
+        ]);
     }
+    rows.extend(
+        table
+            .to_string()
+            .lines()
+            .map(|line| truncate_workflow_show_ansi_line(line, width)),
+    );
     rows
 }
 
@@ -952,66 +956,58 @@ fn render_workflow_show_outputs(workflow: &Workflow, width: usize) -> Vec<String
     }
 
     let mut rows = vec![render_workflow_show_section_header("outputs", "declared outputs", width)];
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["NAME", "FROM STEP", "FORMAT", "SCHEMA"]);
     for (name, output) in &workflow.contracts.outputs {
-        rows.push(render_workflow_show_event_line(
-            UiStatus::Active,
-            "output",
-            &format!(
-                "{}  ·  from {}  ·  {}  ·  schema {}",
-                name,
-                output.from_step,
-                workflow_contract_format_name(output.format),
-                output.schema
-            ),
-            width,
-        ));
+        table.add_row(vec![
+            comfy_table::Cell::new(name),
+            comfy_table::Cell::new(&output.from_step),
+            comfy_table::Cell::new(workflow_contract_format_name(output.format)),
+            comfy_table::Cell::new(&output.schema),
+        ]);
     }
+    rows.extend(
+        table
+            .to_string()
+            .lines()
+            .map(|line| truncate_workflow_show_ansi_line(line, width)),
+    );
     rows
 }
 
 fn render_workflow_show_step_details(workflow: &Workflow, width: usize) -> Vec<String> {
     let mut rows = vec![render_workflow_show_section_header("steps", "declared steps", width)];
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["ID", "KIND", "PRIMARY", "DETAIL"]);
     for step in &workflow.steps {
-        rows.push(render_workflow_show_event_line(
-            UiStatus::Waiting,
-            "step",
-            &workflow_step_summary(step),
-            width,
-        ));
+        let (kind, primary, detail) = workflow_step_table_summary(step);
+        table.add_row(vec![
+            comfy_table::Cell::new(&step.id),
+            comfy_table::Cell::new(kind),
+            comfy_table::Cell::new(primary),
+            comfy_table::Cell::new(detail),
+        ]);
 
         if let Some(sub_steps) = &step.parallel {
             for sub in sub_steps {
-                rows.push(render_workflow_show_event_line(
-                    UiStatus::Waiting,
-                    "├─",
-                    &format!("{}  ·  agent {}", sub.id, sub.agent),
-                    width,
-                ));
-            }
-        }
-
-        if let Some(panel) = &step.panel {
-            rows.push(render_workflow_show_event_line(
-                UiStatus::Waiting,
-                "├─",
-                &format!("panelists  {}", panel.panelists.join(", ")),
-                width,
-            ));
-            if let Some(gate) = panel.gate.as_ref() {
-                rows.push(render_workflow_show_event_line(
-                    UiStatus::Awaiting,
-                    "└─",
-                    &format!(
-                        "gate  until {}  ·  fix_with {}  ·  max_iterations {}",
-                        gate.until_no_findings_at_severity_or_above.as_str(),
-                        gate.fix_with,
-                        gate.max_iterations
-                    ),
-                    width,
-                ));
+                table.add_row(vec![
+                    comfy_table::Cell::new(format!("  ├─ {}", sub.id)),
+                    comfy_table::Cell::new("substep"),
+                    comfy_table::Cell::new(&sub.agent),
+                    comfy_table::Cell::new(crate::cmd::transcript::truncate_single_line(
+                        &sub.prompt,
+                        48,
+                    )),
+                ]);
             }
         }
     }
+    rows.extend(
+        table
+            .to_string()
+            .lines()
+            .map(|line| truncate_workflow_show_ansi_line(line, width)),
+    );
     rows
 }
 
@@ -1079,21 +1075,6 @@ fn render_workflow_show_kv_row(
     truncate_workflow_show_ansi_line(&buf, width)
 }
 
-fn render_workflow_show_event_line(
-    status: UiStatus,
-    label: &str,
-    detail: &str,
-    width: usize,
-) -> String {
-    let mut buf = String::new();
-    if !label.is_empty() {
-        let _ = palette::write_bold_colored(&mut buf, label, status.color());
-        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
-    }
-    let _ = palette::write_colored(&mut buf, detail, DIM);
-    truncate_workflow_show_ansi_line(&buf, width)
-}
-
 fn workflow_trigger_summary(trigger: &rupu_orchestrator::Trigger) -> String {
     match trigger.on {
         rupu_orchestrator::TriggerKind::Manual => "manual".into(),
@@ -1158,49 +1139,66 @@ fn collect_workflow_agents(workflow: &Workflow) -> std::collections::BTreeSet<St
     agents
 }
 
-fn workflow_step_summary(step: &rupu_orchestrator::Step) -> String {
+fn workflow_step_table_summary(step: &rupu_orchestrator::Step) -> (&'static str, String, String) {
     if let Some(sub_steps) = &step.parallel {
-        let mut detail = format!("{}  ·  parallel  ·  {} sub-steps", step.id, sub_steps.len());
+        let primary = format!("{} sub-steps", sub_steps.len());
+        let mut detail = String::new();
         if let Some(max_parallel) = step.max_parallel {
-            detail.push_str(&format!("  ·  max_parallel {max_parallel}"));
+            detail.push_str(&format!("max_parallel {max_parallel}"));
         }
-        return detail;
+        return ("parallel", primary, if detail.is_empty() { "—".into() } else { detail });
     }
     if let Some(panel) = &step.panel {
-        let mut detail = format!("{}  ·  panel  ·  {} panelists", step.id, panel.panelists.len());
+        let primary = format!("{} panelists", panel.panelists.len());
+        let mut parts =
+            vec![crate::cmd::transcript::truncate_single_line(&panel.panelists.join(", "), 40)];
         if let Some(max_parallel) = panel.max_parallel {
-            detail.push_str(&format!("  ·  max_parallel {max_parallel}"));
+            parts.push(format!("max_parallel {max_parallel}"));
         }
-        return detail;
+        if let Some(gate) = &panel.gate {
+            parts.push(format!(
+                "gate {} → {} ({} iters)",
+                gate.until_no_findings_at_severity_or_above.as_str(),
+                gate.fix_with,
+                gate.max_iterations
+            ));
+        }
+        return ("panel", primary, parts.join("  ·  "));
     }
     if let Some(for_each) = step.for_each.as_deref() {
-        let mut detail = format!(
-            "{}  ·  for_each  ·  agent {}  ·  {}",
-            step.id,
-            step.agent.as_deref().unwrap_or(""),
-            crate::cmd::transcript::truncate_single_line(for_each, 36)
-        );
+        let primary = step.agent.clone().unwrap_or_default();
+        let mut parts = vec![crate::cmd::transcript::truncate_single_line(for_each, 32)];
         if let Some(max_parallel) = step.max_parallel {
-            detail.push_str(&format!("  ·  max_parallel {max_parallel}"));
+            parts.push(format!("max_parallel {max_parallel}"));
         }
-        return detail;
+        if step.approval.as_ref().is_some_and(|approval| approval.required) {
+            parts.push("approval".into());
+        }
+        return ("for_each", primary, parts.join("  ·  "));
     }
 
-    let mut detail = format!(
-        "{}  ·  linear  ·  agent {}",
-        step.id,
-        step.agent.as_deref().unwrap_or("")
-    );
+    let primary = step.agent.clone().unwrap_or_default();
+    let mut parts = Vec::new();
     if !step.actions.is_empty() {
-        detail.push_str(&format!("  ·  actions {}", step.actions.join(", ")));
+        parts.push(format!("actions {}", step.actions.join(", ")));
+    }
+    if let Some(when) = step.when.as_deref().filter(|value| !value.trim().is_empty()) {
+        parts.push(format!(
+            "when {}",
+            crate::cmd::transcript::truncate_single_line(when, 28)
+        ));
     }
     if step.approval.as_ref().is_some_and(|approval| approval.required) {
-        detail.push_str("  ·  approval");
+        parts.push("approval".into());
     }
-    if step.contract.is_some() {
-        detail.push_str("  ·  contract");
+    if let Some(contract) = &step.contract {
+        parts.push(format!(
+            "emits {} ({})",
+            contract.emits,
+            workflow_contract_format_name(contract.format)
+        ));
     }
-    detail
+    ("linear", primary, if parts.is_empty() { "—".into() } else { parts.join("  ·  ") })
 }
 
 fn yaml_scalar_inline(value: &serde_yaml::Value) -> String {
