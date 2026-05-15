@@ -37,6 +37,9 @@ pub struct WorkspaceWindow {
     /// The workflow row most recently focused in the sidebar.
     /// ⌘R uses this. `None` means no row has focus.
     pub focused_workflow: Option<PathBuf>,
+    /// `Some` while a right-click context menu is open. Cleared by item
+    /// selection, click-outside, or Esc.
+    pub context_menu: Option<crate::widget::ContextMenuState>,
 }
 
 impl WorkspaceWindow {
@@ -71,6 +74,7 @@ impl WorkspaceWindow {
                     transcript_lines: Vec::new(),
                     launcher: None,
                     focused_workflow: None,
+                    context_menu: None,
                 })
             })
             .expect("open workspace window");
@@ -329,6 +333,14 @@ impl WorkspaceWindow {
             tracing::warn!(%e, "persist sidebar collapse state");
         }
         cx.notify();
+    }
+
+    /// Close the context menu. Idempotent — safe to call when no menu is open.
+    pub fn handle_dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+        }
     }
 
     /// Open an agent's `.md` source file in the user's default app.
