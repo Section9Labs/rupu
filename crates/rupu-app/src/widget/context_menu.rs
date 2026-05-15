@@ -129,4 +129,27 @@ mod tests {
         assert_eq!(cloned.items[0].label.as_ref(), "Run");
         assert_eq!(cloned.position.x, px(10.0));
     }
+
+    #[test]
+    fn context_menu_state_with_two_items() {
+        let mut item_a_count = 0;
+        let mut item_b_count = 0;
+        let _ = (&mut item_a_count, &mut item_b_count);
+        let state = ContextMenuState {
+            position: Point::new(px(50.0), px(60.0)),
+            items: vec![
+                ContextMenuItem {
+                    label: "Run\u{2026}".into(),
+                    on_select: Arc::new(|_w, _cx| {}),
+                },
+                ContextMenuItem {
+                    label: "Reveal in Finder".into(),
+                    on_select: Arc::new(|_w, _cx| {}),
+                },
+            ],
+        };
+        assert_eq!(state.items.len(), 2);
+        assert_eq!(state.items[0].label.as_ref(), "Run\u{2026}");
+        assert_eq!(state.items[1].label.as_ref(), "Reveal in Finder");
+    }
 }
