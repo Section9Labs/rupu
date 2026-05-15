@@ -546,6 +546,19 @@ fn autoflow_monitor_help_includes_live_view_flag() {
 }
 
 #[test]
+fn autoflow_history_help_includes_live_view_flag() {
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .args(["autoflow", "history", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--view"))
+        .stdout(predicate::str::contains("focused"))
+        .stdout(predicate::str::contains("compact"))
+        .stdout(predicate::str::contains("full"));
+}
+
+#[test]
 fn autoflow_monitor_supports_structured_json_output() {
     let _guard = ENV_LOCK.blocking_lock();
 
