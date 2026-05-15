@@ -4,7 +4,7 @@ pub mod sidebar;
 pub mod titlebar;
 
 use crate::executor::AppExecutor;
-use crate::menu::app_menu::{ApproveFocused, LaunchSelected, RejectFocused, ToggleSidebar};
+use crate::menu::app_menu::{ApproveFocused, DismissContextMenu, LaunchSelected, RejectFocused, ToggleSidebar};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
@@ -118,6 +118,12 @@ impl WorkspaceWindow {
                     if let Some(path) = this.focused_workflow.clone() {
                         this.open_launcher(path, cx);
                     }
+                });
+            });
+            let weak_dctx = entity.downgrade();
+            cx.on_action(move |_: &DismissContextMenu, cx| {
+                let _ = weak_dctx.update(cx, |this, cx| {
+                    this.handle_dismiss_context_menu(cx);
                 });
             });
         }
