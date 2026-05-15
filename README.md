@@ -330,7 +330,7 @@ Detail views that support `--format json` include:
 Event/timeline views use a separate contract:
 
 - `rupu transcript show`
-  - `pretty` (default human timeline)
+  - `pretty` (default retained transcript snapshot)
   - `json`
   - `jsonl`
 - `rupu workflow show-run`
@@ -397,6 +397,11 @@ The first commands wired to this are:
 - `rupu workflow run`
 - `rupu watch`
 - `rupu autoflow serve`
+
+`rupu transcript show` now uses the same retained static-snapshot model as the live views. The
+human `pretty` surface respects the configured theme, `--view focused|compact|full`, and optional
+`--no-color`, `--pager`, and `--no-pager` overrides while keeping `json` and `jsonl` unchanged for
+automation.
 
 Built-in parity names currently include:
 

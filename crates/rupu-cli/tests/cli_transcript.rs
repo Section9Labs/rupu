@@ -281,7 +281,7 @@ async fn show_pretty_supports_focused_and_full_view_modes() {
         &transcripts_dir,
         "run_view123",
         "view-agent",
-        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega OMEGA-SENTINEL",
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega\nOMEGA-SENTINEL",
     );
 
     Command::cargo_bin("rupu")
@@ -305,11 +305,30 @@ async fn show_pretty_supports_focused_and_full_view_modes() {
             "show",
             "run_view123",
             "--view",
+            "compact",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("OMEGA-SENTI"))
+        .stdout(predicate::str::contains("NEL"));
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", global.path())
+        .current_dir(tmp.path())
+        .args([
+            "--format",
+            "pretty",
+            "transcript",
+            "show",
+            "run_view123",
+            "--view",
             "full",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("OMEGA-SENTINEL"));
+        .stdout(predicate::str::contains("OMEGA-SENTI"))
+        .stdout(predicate::str::contains("NEL"));
 }
 
 #[tokio::test]
