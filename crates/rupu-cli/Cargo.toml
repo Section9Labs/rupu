@@ -49,6 +49,7 @@ rupu-mcp = { path = "../rupu-mcp" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-transcript = { path = "../rupu-transcript" }
 rupu-webhook = { path = "../rupu-webhook" }
+rupu-app-canvas = { path = "../rupu-app-canvas" }
 comfy-table.workspace = true
 indicatif.workspace = true
 owo-colors.workspace = true
