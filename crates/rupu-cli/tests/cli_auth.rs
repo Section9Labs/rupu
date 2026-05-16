@@ -11,6 +11,8 @@
 //! chmod-600 JSON file inside the tempdir.
 
 use tokio::sync::Mutex;
+use assert_cmd::Command;
+use predicates::prelude::*;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -149,4 +151,70 @@ async fn login_then_logout_round_trip() {
         format!("{:?}", std::process::ExitCode::from(0)),
         "second login should exit 0"
     );
+}
+
+#[tokio::test]
+async fn auth_backend_snapshot_defaults_to_full() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    force_json_backend(&tmp);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .arg("auth")
+        .arg("backend")
+        .arg("--no-color")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("auth backend"))
+        .stdout(predicate::str::contains("·  full"))
+        .stdout(predicate::str::contains("state  ·  resolved backend"))
+        .stdout(predicate::str::contains("paths  ·  storage files"))
+        .stdout(predicate::str::contains("commands  ·  switch or override"));
+}
+
+#[tokio::test]
+async fn auth_backend_focused_hides_detail_sections() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    force_json_backend(&tmp);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .arg("auth")
+        .arg("backend")
+        .arg("--view")
+        .arg("focused")
+        .arg("--no-color")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("·  focused"))
+        .stdout(predicate::str::contains("state  ·  resolved backend"))
+        .stdout(predicate::str::contains("paths  ·  storage files").not())
+        .stdout(predicate::str::contains("commands  ·  switch or override").not());
+}
+
+#[tokio::test]
+async fn auth_backend_use_file_renders_requested_backend_snapshot() {
+    let _guard = ENV_LOCK.lock().await;
+
+    let tmp = assert_fs::TempDir::new().unwrap();
+    force_json_backend(&tmp);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .arg("auth")
+        .arg("backend")
+        .arg("--use")
+        .arg("file")
+        .arg("--no-color")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("requested"))
+        .stdout(predicate::str::contains("rupu auth login --provider <name>"));
 }

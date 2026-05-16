@@ -339,6 +339,7 @@ Event/timeline views use a separate contract:
 
 Snapshot views with a custom structured surface:
 
+- `rupu auth backend` (`table` and `json`)
 - `rupu workflow show` (`table` and `json`)
 - `rupu issues show` (`table` and `json`)
 - `rupu workflow show-run` (`pretty`/`table` and `json`)
