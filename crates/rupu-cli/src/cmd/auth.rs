@@ -1,8 +1,11 @@
 //! `rupu auth login | logout | status`.
 
+use crate::cmd::ui::{self, LiveViewMode, UiPrefs};
 use crate::output::formats::OutputFormat;
+use crate::output::palette::{self, BRAND, DIM};
 use crate::output::report::{self, CollectionOutput, DetailOutput};
 use clap::Subcommand;
+use comfy_table::Cell;
 use rupu_auth::ProviderId;
 use serde::Serialize;
 use std::process::ExitCode;
@@ -50,6 +53,18 @@ pub enum Action {
         /// (env-var, cache, or default probe).
         #[arg(long, value_name = "KIND")]
         r#use: Option<String>,
+        /// Human snapshot density (`focused` | `compact` | `full`).
+        #[arg(long, value_enum, default_value_t = LiveViewMode::Full)]
+        view: LiveViewMode,
+        /// Disable colored output.
+        #[arg(long)]
+        no_color: bool,
+        /// Force pager. Default: page when stdout is a tty.
+        #[arg(long, conflicts_with = "no_pager")]
+        pager: bool,
+        /// Disable pager.
+        #[arg(long, conflicts_with = "pager")]
+        no_pager: bool,
     },
 }
 
@@ -91,7 +106,22 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             .await
         }
         Action::Status => status(global_format).await,
-        Action::Backend { r#use } => backend(r#use.as_deref(), global_format).await,
+        Action::Backend {
+            r#use,
+            view,
+            no_color,
+            pager,
+            no_pager,
+        } => {
+            let pager_flag = if pager {
+                Some(true)
+            } else if no_pager {
+                Some(false)
+            } else {
+                None
+            };
+            backend(r#use.as_deref(), no_color, pager_flag, view, global_format).await
+        }
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -293,6 +323,7 @@ struct AuthBackendReport {
 }
 
 struct AuthBackendOutput {
+    prefs: UiPrefs,
     report: AuthBackendReport,
 }
 
@@ -308,21 +339,26 @@ impl DetailOutput for AuthBackendOutput {
     }
 
     fn render_human(&self) -> anyhow::Result<()> {
-        let item = &self.report.item;
-        println!("Active backend : {}", item.active_backend);
-        println!("Cache file     : {}", item.cache_path);
-        println!();
-        println!("To switch persistently:");
-        println!("  rupu auth backend --use file       # store in ~/.rupu/auth.json (chmod 600)");
-        println!("  rupu auth backend --use keychain   # store in OS keychain");
-        println!();
-        println!("To override per-shell session:");
-        println!("  export RUPU_AUTH_BACKEND=file      # or `keychain`");
-        Ok(())
+        let width = crossterm::terminal::size()
+            .map(|(value, _)| value.max(40) as usize)
+            .unwrap_or(100);
+        let body = render_auth_backend_snapshot(
+            &self.report.item,
+            self.prefs.live_view,
+            &self.prefs,
+            width,
+        );
+        ui::paginate(&body, &self.prefs)
     }
 }
 
-async fn backend(r#use: Option<&str>, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
+async fn backend(
+    r#use: Option<&str>,
+    no_color: bool,
+    pager_flag: Option<bool>,
+    view: LiveViewMode,
+    global_format: Option<OutputFormat>,
+) -> anyhow::Result<()> {
     // Persist the user's choice via a tiny shell-rc-friendly env-export
     // hint rather than writing to the cache directly: the env var
     // lives at the session boundary, and any in-process change here
@@ -332,6 +368,7 @@ async fn backend(r#use: Option<&str>, global_format: Option<OutputFormat>) -> an
     let cache_path = global.join("cache/auth-backend.json");
     let cache = rupu_auth::ProbeCache::new(cache_path.clone());
     let auth_path = global.join("auth.json");
+    let prefs = auth_ui_prefs(no_color, pager_flag, view)?;
 
     if let Some(target) = r#use {
         let target_norm = target.trim().to_ascii_lowercase();
@@ -362,24 +399,21 @@ async fn backend(r#use: Option<&str>, global_format: Option<OutputFormat>) -> an
                     env_override: None,
                 },
             };
-            return report::emit_detail(global_format, &AuthBackendOutput { report });
+            return report::emit_detail(global_format, &AuthBackendOutput { prefs, report });
         }
-        println!(
-            "rupu: persisted backend choice = {env_value} (cache: {})",
-            cache_path.display()
-        );
-        println!();
-        println!("To override per-shell session (e.g. while debugging):");
-        println!("  export RUPU_AUTH_BACKEND={env_value}");
-        if matches!(choice, rupu_auth::BackendChoice::JsonFile) {
-            println!();
-            println!("Credentials will be stored at:");
-            println!("  {}", auth_path.display());
-            println!("  (chmod 600 enforced on every write)");
-            println!();
-            println!("Re-run `rupu auth login --provider <name>` to populate the file.");
-        }
-        return Ok(());
+        let report = AuthBackendReport {
+            kind: "auth_backend",
+            version: 1,
+            item: AuthBackendItem {
+                requested_backend: Some(env_value.to_string()),
+                active_backend: format!("cached: {env_value}"),
+                cache_path: cache_path.display().to_string(),
+                auth_path: auth_path.display().to_string(),
+                cache_choice: Some(env_value.to_string()),
+                env_override: None,
+            },
+        };
+        return report::emit_detail(global_format, &AuthBackendOutput { prefs, report });
     }
 
     // Show current state.
@@ -406,7 +440,248 @@ async fn backend(r#use: Option<&str>, global_format: Option<OutputFormat>) -> an
             env_override,
         },
     };
-    report::emit_detail(global_format, &AuthBackendOutput { report })
+    report::emit_detail(global_format, &AuthBackendOutput { prefs, report })
+}
+
+fn auth_ui_prefs(
+    no_color: bool,
+    pager_flag: Option<bool>,
+    view: LiveViewMode,
+) -> anyhow::Result<UiPrefs> {
+    let global = crate::paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = crate::paths::project_root_for(&pwd)?;
+    let global_cfg = global.join("config.toml");
+    let project_cfg = project_root.as_ref().map(|path| path.join(".rupu/config.toml"));
+    let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref())?;
+    Ok(UiPrefs::resolve(
+        &cfg.ui,
+        no_color,
+        None,
+        pager_flag,
+        Some(view),
+    ))
+}
+
+fn render_auth_backend_snapshot(
+    item: &AuthBackendItem,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+    width: usize,
+) -> String {
+    let mut rows = vec![render_auth_backend_header_line(item, view_mode, width), String::new()];
+    rows.extend(render_auth_backend_state_rows(item, width));
+
+    if matches!(view_mode, LiveViewMode::Compact | LiveViewMode::Full) {
+        rows.push(String::new());
+        rows.extend(render_auth_backend_path_rows(item, width));
+    }
+
+    if view_mode == LiveViewMode::Full {
+        rows.push(String::new());
+        rows.extend(render_auth_backend_command_rows(item, prefs, width));
+        if let Some(note_rows) = render_auth_backend_note_rows(item, width) {
+            rows.push(String::new());
+            rows.extend(note_rows);
+        }
+    }
+
+    rows.join("\n") + "\n"
+}
+
+fn render_auth_backend_header_line(
+    item: &AuthBackendItem,
+    view_mode: LiveViewMode,
+    width: usize,
+) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_colored(&mut buf, "▶", BRAND);
+    buf.push(' ');
+    let _ = palette::write_bold_colored(&mut buf, "auth backend", BRAND);
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_bold_colored(&mut buf, effective_backend_kind(item), BRAND);
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, view_mode.as_str(), DIM);
+    truncate_auth_backend_ansi_line(&buf, width)
+}
+
+fn render_auth_backend_state_rows(item: &AuthBackendItem, width: usize) -> Vec<String> {
+    let mut rows = vec![render_auth_backend_section_header(
+        "state",
+        "resolved backend",
+        width,
+    )];
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["KEY", "VALUE"]);
+    if let Some(requested) = item.requested_backend.as_deref() {
+        table.add_row(vec![Cell::new("requested"), Cell::new(requested)]);
+    }
+    table.add_row(vec![
+        Cell::new("active"),
+        Cell::new(effective_backend_kind(item)),
+    ]);
+    table.add_row(vec![
+        Cell::new("source"),
+        Cell::new(backend_resolution_source(item)),
+    ]);
+    table.add_row(vec![
+        Cell::new("cache"),
+        Cell::new(item.cache_choice.as_deref().unwrap_or("none")),
+    ]);
+    table.add_row(vec![
+        Cell::new("override"),
+        Cell::new(item.env_override.as_deref().unwrap_or("none")),
+    ]);
+    table.add_row(vec![
+        Cell::new("detail"),
+        Cell::new(crate::cmd::transcript::truncate_single_line(
+            &item.active_backend,
+            72,
+        )),
+    ]);
+    rows.extend(
+        table
+            .to_string()
+            .lines()
+            .map(|line| truncate_auth_backend_ansi_line(line, width)),
+    );
+    rows
+}
+
+fn render_auth_backend_path_rows(item: &AuthBackendItem, width: usize) -> Vec<String> {
+    let mut rows = vec![render_auth_backend_section_header(
+        "paths",
+        "storage files",
+        width,
+    )];
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["NAME", "PATH"]);
+    table.add_row(vec![Cell::new("cache"), Cell::new(&item.cache_path)]);
+    table.add_row(vec![Cell::new("auth"), Cell::new(&item.auth_path)]);
+    rows.extend(
+        table
+            .to_string()
+            .lines()
+            .map(|line| truncate_auth_backend_ansi_line(line, width)),
+    );
+    rows
+}
+
+fn render_auth_backend_command_rows(
+    item: &AuthBackendItem,
+    _prefs: &UiPrefs,
+    width: usize,
+) -> Vec<String> {
+    let mut rows = vec![render_auth_backend_section_header(
+        "commands",
+        "switch or override",
+        width,
+    )];
+    let mut table = crate::output::tables::new_table();
+    table.set_header(vec!["MODE", "COMMAND", "EFFECT"]);
+    table.add_row(vec![
+        Cell::new("persist"),
+        Cell::new("rupu auth backend --use file"),
+        Cell::new("store credentials in ~/.rupu/auth.json"),
+    ]);
+    table.add_row(vec![
+        Cell::new("persist"),
+        Cell::new("rupu auth backend --use keychain"),
+        Cell::new("store credentials in the OS keychain"),
+    ]);
+    table.add_row(vec![
+        Cell::new("shell"),
+        Cell::new("export RUPU_AUTH_BACKEND=file"),
+        Cell::new("override the backend for the current shell"),
+    ]);
+    table.add_row(vec![
+        Cell::new("shell"),
+        Cell::new("export RUPU_AUTH_BACKEND=keychain"),
+        Cell::new("override the backend for the current shell"),
+    ]);
+    if item.requested_backend.as_deref() == Some("file") {
+        table.add_row(vec![
+            Cell::new("next"),
+            Cell::new("rupu auth login --provider <name>"),
+            Cell::new("populate the local auth file with credentials"),
+        ]);
+    }
+    rows.extend(
+        table
+            .to_string()
+            .lines()
+            .map(|line| truncate_auth_backend_ansi_line(line, width)),
+    );
+    rows
+}
+
+fn render_auth_backend_note_rows(item: &AuthBackendItem, width: usize) -> Option<Vec<String>> {
+    let effective = effective_backend_kind(item);
+    let detail = if effective == "file" {
+        "JSON-file credentials are written with chmod 600 on every update."
+    } else {
+        "Keychain mode relies on the platform credential store and avoids a local auth.json file."
+    };
+    Some(vec![
+        render_auth_backend_section_header("notes", "backend behavior", width),
+        render_auth_backend_kv_row("note", detail, width),
+    ])
+}
+
+fn render_auth_backend_section_header(label: &str, detail: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, label, BRAND);
+    if !detail.is_empty() {
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+        let _ = palette::write_colored(&mut buf, detail, DIM);
+    }
+    truncate_auth_backend_ansi_line(&buf, width)
+}
+
+fn render_auth_backend_kv_row(label: &str, value: &str, width: usize) -> String {
+    let mut buf = String::new();
+    let _ = palette::write_bold_colored(&mut buf, &format!("{label:<10}"), BRAND);
+    let _ = palette::write_colored(
+        &mut buf,
+        &crate::cmd::transcript::truncate_single_line(value, width.saturating_sub(11)),
+        DIM,
+    );
+    truncate_auth_backend_ansi_line(&buf, width)
+}
+
+fn effective_backend_kind(item: &AuthBackendItem) -> &'static str {
+    let candidate = item
+        .env_override
+        .as_deref()
+        .or(item.requested_backend.as_deref())
+        .or(item.cache_choice.as_deref())
+        .unwrap_or(&item.active_backend);
+    if candidate.to_ascii_lowercase().contains("key") {
+        "keychain"
+    } else {
+        "file"
+    }
+}
+
+fn backend_resolution_source(item: &AuthBackendItem) -> &'static str {
+    if item.env_override.is_some() {
+        "env override"
+    } else if item.cache_choice.is_some() {
+        "probe cache"
+    } else {
+        "default"
+    }
+}
+
+fn truncate_auth_backend_ansi_line(value: &str, width: usize) -> String {
+    if crate::output::printer::visible_len(value) <= width {
+        value.to_string()
+    } else {
+        crate::output::printer::wrap_with_ansi(value, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
