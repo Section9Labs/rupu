@@ -221,6 +221,7 @@ enum AttachExit {
     Quit,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AttachCommand {
     Help,
     Status,
@@ -231,6 +232,14 @@ enum AttachCommand {
     History,
     Transcript,
     Runs,
+    Routed(RoutedAttachCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedAttachCommand {
+    root: String,
+    args: Vec<String>,
+    display: String,
 }
 
 enum SessionInput {
@@ -564,7 +573,12 @@ fn render_session_show_snapshot(
     let mut rows = vec![
         render_session_show_header_line(session, view_mode, width),
         String::new(),
-        retained_session_kv_row("scope", scope.as_str(), width, crate::output::palette::Status::Active),
+        retained_session_kv_row(
+            "scope",
+            scope.as_str(),
+            width,
+            crate::output::palette::Status::Active,
+        ),
         retained_session_kv_row(
             "status",
             &session_status_detail(session),
@@ -623,7 +637,9 @@ fn render_session_show_snapshot(
         ));
     }
     rows.push(String::new());
-    rows.extend(render_session_show_run_rows(session, view_mode, prefs, width));
+    rows.extend(render_session_show_run_rows(
+        session, view_mode, prefs, width,
+    ));
     rows.push(String::new());
     rows.push(render_session_show_footer_line(session, view_mode, width));
     rows.join("\n") + "\n"
@@ -679,10 +695,18 @@ fn render_session_show_run_rows(
     width: usize,
 ) -> Vec<String> {
     if session.runs.is_empty() {
-        return vec![render_session_show_section_header("runs", "no runs yet", width)];
+        return vec![render_session_show_section_header(
+            "runs",
+            "no runs yet",
+            width,
+        )];
     }
 
-    let mut rows = vec![render_session_show_section_header("runs", "recent turns", width)];
+    let mut rows = vec![render_session_show_section_header(
+        "runs",
+        "recent turns",
+        width,
+    )];
     for run in session.runs.iter().rev().take(10) {
         let status = run
             .status
@@ -749,7 +773,11 @@ fn render_session_show_run_rows(
                     width,
                     "│  ",
                 ));
-                if let Some(error) = run.error.as_deref().filter(|value| !value.trim().is_empty()) {
+                if let Some(error) = run
+                    .error
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
                     rows.extend(render_session_show_event_lines(
                         crate::output::palette::Status::Failed,
                         "",
@@ -1585,7 +1613,8 @@ struct SessionInteractiveState {
     lines: Vec<SessionViewLine>,
     view_mode: LiveViewMode,
     viewport: ViewportState,
-    compose: Option<String>,
+    prompt_active: bool,
+    input_buffer: String,
 }
 
 impl SessionInteractiveState {
@@ -1602,7 +1631,8 @@ impl SessionInteractiveState {
             lines: Vec::new(),
             view_mode,
             viewport: ViewportState::default(),
-            compose: None,
+            prompt_active: false,
+            input_buffer: String::new(),
         }
     }
 
@@ -1763,34 +1793,52 @@ fn handle_session_live_keypress(
     prefs: &UiPrefs,
     key: KeyEvent,
 ) -> anyhow::Result<AttachControl> {
-    if let Some(buffer) = state.compose.as_mut() {
+    if state.prompt_active {
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                state.compose = None;
-                state.push_line(crate::output::palette::Status::Skipped, "prompt cancelled");
-                return Ok(AttachControl::Continue);
-            }
             (KeyCode::Enter, _) => {
-                let input = buffer.trim().to_string();
-                state.compose = None;
+                let input = state.input_buffer.trim().to_string();
+                state.prompt_active = false;
+                state.input_buffer.clear();
                 if input.is_empty() {
                     return Ok(AttachControl::Continue);
                 }
-                return handle_session_live_input(global, session, state, input);
+                return handle_session_live_input(global, session, state, prefs, input);
             }
             (KeyCode::Backspace, _) => {
-                buffer.pop();
+                state.input_buffer.pop();
+                if state.input_buffer.is_empty() {
+                    state.prompt_active = false;
+                }
+                return Ok(AttachControl::Continue);
+            }
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+                state.input_buffer.clear();
+                state.prompt_active = false;
+                return Ok(AttachControl::Continue);
+            }
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+                trim_last_prompt_word(&mut state.input_buffer);
+                if state.input_buffer.is_empty() {
+                    state.prompt_active = false;
+                }
                 return Ok(AttachControl::Continue);
             }
             (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                buffer.push(ch);
+                state.input_buffer.push(ch);
                 return Ok(AttachControl::Continue);
             }
-            _ => return Ok(AttachControl::Continue),
+            _ => {}
         }
     }
 
     match (key.code, key.modifiers) {
+        (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT)
+            if should_begin_session_prompt(ch, session.status) =>
+        {
+            state.prompt_active = true;
+            state.input_buffer.push(ch);
+            Ok(AttachControl::Continue)
+        }
         (KeyCode::Char('f'), _) => {
             state.view_mode = state.view_mode.toggled();
             rebuild_session_transcript_lines(state, prefs);
@@ -1845,20 +1893,6 @@ fn handle_session_live_keypress(
             Ok(AttachControl::Continue)
         }
         (KeyCode::Char('p'), _) | (KeyCode::Enter, _) => {
-            if session.status == SessionStatus::Running {
-                state.push_line(
-                    crate::output::palette::Status::Awaiting,
-                    format!(
-                        "session busy  ·  {}",
-                        session
-                            .active_run_id
-                            .as_deref()
-                            .map(compact_session_run_id)
-                            .unwrap_or_else(|| "turn still running".into())
-                    ),
-                );
-                return Ok(AttachControl::Continue);
-            }
             if session.status == SessionStatus::Stopped {
                 state.push_line(
                     crate::output::palette::Status::Failed,
@@ -1866,7 +1900,7 @@ fn handle_session_live_keypress(
                 );
                 return Ok(AttachControl::Continue);
             }
-            state.compose = Some(String::new());
+            state.prompt_active = true;
             Ok(AttachControl::Continue)
         }
         (KeyCode::Esc, _) => {
@@ -1881,14 +1915,6 @@ fn handle_session_live_keypress(
                 );
                 return Ok(AttachControl::Continue);
             }
-            if session.status == SessionStatus::Stopped {
-                state.push_line(
-                    crate::output::palette::Status::Failed,
-                    "session stopped  ·  use `rupu session start` to create a new one",
-                );
-                return Ok(AttachControl::Continue);
-            }
-            state.compose = Some(String::new());
             Ok(AttachControl::Continue)
         }
         _ => Ok(AttachControl::Continue),
@@ -1915,10 +1941,11 @@ fn handle_session_live_input(
     global: &Path,
     session: &SessionRecord,
     state: &mut SessionInteractiveState,
+    prefs: &UiPrefs,
     input: String,
 ) -> anyhow::Result<AttachControl> {
     if let Some(command) = parse_attach_command(&input) {
-        return execute_session_live_command(global, session, state, command);
+        return execute_session_live_command(global, session, state, prefs, command);
     }
     if input.starts_with('/') && !input.starts_with("//") {
         state.push_line(
@@ -1932,13 +1959,21 @@ fn handle_session_live_input(
     } else {
         input.clone()
     };
+    state.push_line(
+        crate::output::palette::Status::Active,
+        retained_session_event_line(
+            crate::output::palette::Status::Active,
+            "you",
+            &truncate_single_line(prompt.as_str(), 96),
+        ),
+    );
     let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
     state.push_line(
         crate::output::palette::Status::Working,
-        format!(
-            "queued prompt  ·  {}  ·  {}",
-            compact_session_run_id(&run_id),
-            truncate_single_line(prompt.as_str(), 72)
+        retained_session_event_line(
+            crate::output::palette::Status::Working,
+            "queued",
+            &compact_session_run_id(&run_id),
         ),
     );
     Ok(AttachControl::Continue)
@@ -1948,6 +1983,7 @@ fn execute_session_live_command(
     global: &Path,
     session: &SessionRecord,
     state: &mut SessionInteractiveState,
+    prefs: &UiPrefs,
     command: AttachCommand,
 ) -> anyhow::Result<AttachControl> {
     match command {
@@ -1970,6 +2006,9 @@ fn execute_session_live_command(
         }
         AttachCommand::Detach => return Ok(AttachControl::Exit(AttachExit::Detach)),
         AttachCommand::Quit => return Ok(AttachControl::Exit(AttachExit::Quit)),
+        AttachCommand::Routed(ref routed) => {
+            execute_routed_session_command(global, session, state, prefs, routed)?
+        }
     }
     Ok(AttachControl::Continue)
 }
@@ -1996,41 +2035,8 @@ fn build_session_screen_rows_for_size(
     let mut rows = vec![
         render_session_header_line(session, view_mode, width),
         String::new(),
-        retained_session_kv_row(
-            "status",
-            &session_status_detail(session),
-            width,
-            session.status.ui_status(),
-        ),
+        render_session_summary_line(session, state, width),
     ];
-    if let Some(route) = session_route_detail(session) {
-        rows.push(retained_session_kv_row(
-            "route",
-            &route,
-            width,
-            crate::output::palette::Status::Active,
-        ));
-    }
-    rows.push(retained_session_kv_row(
-        "workspace",
-        &session_workspace_detail(session),
-        width,
-        crate::output::palette::Status::Active,
-    ));
-    rows.push(retained_session_kv_row(
-        "usage",
-        &session_usage_detail(session),
-        width,
-        crate::output::palette::Status::Active,
-    ));
-    if let Some(prompt) = session_recent_prompt(session) {
-        rows.push(retained_session_kv_row(
-            "prompt",
-            &prompt,
-            width,
-            crate::output::palette::Status::Active,
-        ));
-    }
     rows.push(String::new());
 
     let footer_reserved = 2usize;
@@ -2085,7 +2091,7 @@ fn render_session_controls_line(width: usize) -> String {
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
     let _ = palette::write_colored(
         &mut buf,
-        "  f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  d detach  ·  q quit  ·  ? help",
+        "  type or /command  ·  Enter send  ·  Ctrl-U clear  ·  Ctrl-W word  ·  Esc cancel turn  ·  f cycle view  ·  ↑/↓ scroll  ·  d detach  ·  q quit  ·  ? help",
         DIM,
     );
     truncate_ansi_line(&buf, width)
@@ -2096,33 +2102,103 @@ fn render_session_prompt_line(
     state: &SessionInteractiveState,
     width: usize,
 ) -> String {
-    if let Some(buffer) = state.compose.as_deref() {
-        let mut buf = String::new();
-        let _ = palette::write_bold_colored(&mut buf, "prompt", BRAND);
+    let mut buf = String::new();
+    let prompt_status = session.status.ui_status();
+    let _ = palette::write_bold_colored(
+        &mut buf,
+        &session_prompt_glyph(session.status).to_string(),
+        prompt_status.color(),
+    );
+    buf.push(' ');
+    let _ = palette::write_bold_colored(
+        &mut buf,
+        &truncate_single_line(&session.agent_name, 20),
+        BRAND,
+    );
+    let _ = palette::write_colored(&mut buf, " > ", DIM);
+    if state.input_buffer.is_empty() {
         let _ = palette::write_colored(
             &mut buf,
-            &format!("  {}> {}", session.session_id, buffer),
+            &format!(
+                "{}  ·  {}",
+                state.viewport.status_text(),
+                state.view_mode.as_str()
+            ),
             DIM,
         );
-        truncate_ansi_line(&buf, width)
     } else {
-        retained_session_kv_row(
-            "view",
-            &format!(
-                "{}  ·  {}  ·  runs {}  ·  current {}",
-                state.view_mode.as_str(),
-                state.viewport.status_text(),
-                session.runs.len(),
-                session
-                    .active_run_id
-                    .as_deref()
-                    .or(session.last_run_id.as_deref())
-                    .map(compact_session_run_id)
-                    .unwrap_or_else(|| "none".into())
-            ),
-            width,
-            session.status.ui_status(),
-        )
+        let _ = palette::write_colored(&mut buf, &state.input_buffer, DIM);
+    }
+    truncate_ansi_line(&buf, width)
+}
+
+fn render_session_summary_line(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+    width: usize,
+) -> String {
+    let mut parts = vec![format!(
+        "{}  ·  turns {}  ·  {}",
+        session.status.as_str(),
+        session.total_turns,
+        session_usage_detail(session)
+    )];
+    if let Some(route) = session_route_detail(session) {
+        parts.push(route);
+    }
+    parts.push(format!(
+        "current {}",
+        session
+            .active_run_id
+            .as_deref()
+            .or(session.last_run_id.as_deref())
+            .map(compact_session_run_id)
+            .unwrap_or_else(|| "none".into())
+    ));
+    parts.push(state.view_mode.as_str().to_string());
+    retained_session_kv_row(
+        "session",
+        &parts.join("  ·  "),
+        width,
+        session.status.ui_status(),
+    )
+}
+
+fn session_prompt_glyph(status: SessionStatus) -> char {
+    match status {
+        SessionStatus::Running => {
+            const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
+            let tick = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| (duration.as_millis() / 160) as usize)
+                .unwrap_or(0);
+            FRAMES[tick % FRAMES.len()]
+        }
+        SessionStatus::Idle => '●',
+        SessionStatus::Failed => '✗',
+        SessionStatus::Stopped => '⏸',
+    }
+}
+
+fn should_begin_session_prompt(ch: char, status: SessionStatus) -> bool {
+    if matches!(status, SessionStatus::Running | SessionStatus::Stopped) {
+        return false;
+    }
+    if ch == '/' {
+        return true;
+    }
+    !matches!(
+        ch,
+        '?' | 'f' | 'j' | 'k' | 'g' | 'G' | 'd' | 'q' | 'x' | 's'
+    )
+}
+
+fn trim_last_prompt_word(buffer: &mut String) {
+    while buffer.chars().last().is_some_and(|ch| ch.is_whitespace()) {
+        buffer.pop();
+    }
+    while buffer.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+        buffer.pop();
     }
 }
 
@@ -2157,6 +2233,133 @@ fn render_session_event_rows(
         }
     }
     state.viewport.apply(rendered, max_rows).rows
+}
+
+fn execute_routed_session_command(
+    _global: &Path,
+    session: &SessionRecord,
+    state: &mut SessionInteractiveState,
+    prefs: &UiPrefs,
+    command: &RoutedAttachCommand,
+) -> anyhow::Result<()> {
+    let mut argv = vec![command.root.clone()];
+    argv.extend(command.args.clone());
+    resolve_inline_session_aliases(session, state, &mut argv);
+    if command_supports_view(&argv) && !argv.iter().any(|value| value == "--view") {
+        argv.push("--view".into());
+        argv.push(state.view_mode.as_str().into());
+    }
+    if !argv.iter().any(|value| value == "--no-pager") {
+        argv.push("--no-pager".into());
+    }
+    if !prefs.use_color() && !argv.iter().any(|value| value == "--no-color") {
+        argv.push("--no-color".into());
+    }
+
+    state.push_line(
+        crate::output::palette::Status::Active,
+        retained_session_event_line(
+            crate::output::palette::Status::Active,
+            "command",
+            &format!("/{}", command.display),
+        ),
+    );
+
+    let output = Command::new(std::env::current_exe()?)
+        .args(&argv)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("run inline session command")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = if output.status.success() {
+        crate::output::palette::Status::Complete
+    } else {
+        crate::output::palette::Status::Failed
+    };
+
+    for line in stdout.lines() {
+        state.lines.push(SessionViewLine {
+            status,
+            text: line.to_string(),
+            continuation: true,
+        });
+    }
+    for line in stderr.lines() {
+        state.lines.push(SessionViewLine {
+            status: crate::output::palette::Status::Failed,
+            text: line.to_string(),
+            continuation: true,
+        });
+    }
+    if stdout.is_empty() && stderr.is_empty() {
+        state.push_line(status, "command completed");
+    }
+    Ok(())
+}
+
+fn resolve_inline_session_aliases(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+    argv: &mut Vec<String>,
+) {
+    if argv.is_empty() {
+        return;
+    }
+    match argv[0].as_str() {
+        "session" if argv.get(1).is_some_and(|value| value == "show") => {
+            if argv.get(2).is_none() || argv.get(2).is_some_and(|value| value == "current") {
+                argv.insert(2, session.session_id.clone());
+            }
+        }
+        "transcript" if argv.get(1).is_some_and(|value| value == "show") => {
+            if let Some(run_id) = inline_session_run_alias(session, state, argv.get(2)) {
+                if argv.get(2).is_some() {
+                    argv[2] = run_id;
+                } else {
+                    argv.push(run_id);
+                }
+            }
+        }
+        "workflow" if argv.get(1).is_some_and(|value| value == "show-run") => {
+            if let Some(run_id) = inline_session_run_alias(session, state, argv.get(2)) {
+                if argv.get(2).is_some() {
+                    argv[2] = run_id;
+                } else {
+                    argv.push(run_id);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn inline_session_run_alias(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+    value: Option<&String>,
+) -> Option<String> {
+    let run_id = session
+        .active_run_id
+        .as_ref()
+        .or(state.followed_run_id.as_ref())
+        .or(session.last_run_id.as_ref())?;
+    match value.map(|value| value.as_str()) {
+        None | Some("current") | Some("last") => Some(run_id.clone()),
+        Some(_) => None,
+    }
+}
+
+fn command_supports_view(argv: &[String]) -> bool {
+    matches!(
+        argv,
+        [root, sub, ..]
+            if (root == "session" && sub == "show")
+                || (root == "transcript" && sub == "show")
+                || (root == "workflow" && (sub == "show" || sub == "show-run"))
+    )
 }
 
 fn transcript_event_lines(
@@ -2225,7 +2428,7 @@ fn transcript_event_lines(
                         status: Status::Active,
                         text: retained_session_event_line(
                             Status::Active,
-                            "assistant output",
+                            "assistant",
                             &truncate_single_line(content, 96),
                         ),
                         continuation: false,
@@ -2238,7 +2441,7 @@ fn transcript_event_lines(
                                 status: Status::Active,
                                 text: retained_session_event_line_raw(
                                     Status::Active,
-                                    "assistant output",
+                                    "assistant",
                                     first,
                                 ),
                                 continuation: false,
@@ -2655,11 +2858,11 @@ fn transcript_tool_summary(tool: &str, input: &serde_json::Value) -> String {
 fn append_session_help_lines(state: &mut SessionInteractiveState) {
     state.push_line(
         crate::output::palette::Status::Active,
-        "help  ·  f cycle view  ·  ↑/↓ scroll  ·  PgUp/PgDn page  ·  g top  ·  G tail  ·  p prompt  ·  Esc prompt/cancel turn  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit",
+        "help  ·  type or /command  ·  Enter send  ·  Ctrl-U clear  ·  Ctrl-W word  ·  Esc cancel turn  ·  f cycle view  ·  ↑/↓ scroll  ·  d detach  ·  q quit",
     );
     state.push_line(
         crate::output::palette::Status::Active,
-        "commands  ·  /help /status /history /runs /transcript /cancel /stop /detach /quit",
+        "commands  ·  /help /status /history /runs /transcript /cancel /stop /detach /quit /workflow ... /session ... /issues ...",
     );
 }
 
@@ -2986,7 +3189,80 @@ fn parse_attach_command(input: &str) -> Option<AttachCommand> {
         "history" => Some(AttachCommand::History),
         "transcript" => Some(AttachCommand::Transcript),
         "runs" => Some(AttachCommand::Runs),
-        _ => None,
+        _ => parse_routed_attach_command(command).map(AttachCommand::Routed),
+    }
+}
+
+fn parse_routed_attach_command(command: &str) -> Option<RoutedAttachCommand> {
+    let argv = tokenize_attach_command(command)?;
+    let (root, args) = argv.split_first()?;
+    if !matches!(
+        root.as_str(),
+        "workflow" | "session" | "transcript" | "issues"
+    ) {
+        return None;
+    }
+    if !inline_command_is_allowed(root, args) {
+        return None;
+    }
+    Some(RoutedAttachCommand {
+        root: root.clone(),
+        args: args.to_vec(),
+        display: command.to_string(),
+    })
+}
+
+fn tokenize_attach_command(command: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (Some(_), c) => current.push(c),
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn inline_command_is_allowed(root: &str, args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(|value| value.as_str()) else {
+        return false;
+    };
+    match root {
+        "session" => matches!(subcommand, "show" | "list"),
+        "transcript" => matches!(subcommand, "show" | "list"),
+        "workflow" => matches!(subcommand, "show" | "show-run" | "runs" | "list"),
+        "issues" => matches!(subcommand, "show" | "list"),
+        _ => false,
     }
 }
 
@@ -3013,6 +3289,13 @@ fn execute_attach_command(
         }
         AttachCommand::Detach => return Ok(AttachControl::Exit(AttachExit::Detach)),
         AttachCommand::Quit => return Ok(AttachControl::Exit(AttachExit::Quit)),
+        AttachCommand::Routed(_) => {
+            printer.sideband_event(
+                crate::output::palette::Status::Awaiting,
+                "namespace commands",
+                Some("inline /workflow /session /transcript /issues are available in retained session attach only"),
+            );
+        }
     }
     Ok(AttachControl::Continue)
 }
@@ -3021,7 +3304,7 @@ fn render_attach_help_hint(printer: &mut crate::output::LineStreamPrinter) {
     printer.sideband_event(
         crate::output::palette::Status::Active,
         "controls",
-        Some("p/Esc prompt  ·  Esc/x cancel turn  ·  d detach  ·  q quit  ·  ? help"),
+        Some("type or /command  ·  Enter send  ·  Esc/x cancel turn  ·  d detach  ·  q quit  ·  ? help"),
     );
 }
 
@@ -3029,12 +3312,12 @@ fn render_attach_help(printer: &mut crate::output::LineStreamPrinter) {
     printer.sideband_event(
         crate::output::palette::Status::Active,
         "keys",
-        Some("p prompt  ·  Esc prompt/cancel turn  ·  Esc cancel prompt  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit"),
+        Some("type or /command  ·  Enter send  ·  Ctrl-U clear  ·  Ctrl-W delete word  ·  Esc cancel turn  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit"),
     );
     printer.sideband_event(
         crate::output::palette::Status::Active,
         "commands",
-        Some("/help /status /history /runs /transcript /cancel /stop"),
+        Some("/help /status /history /runs /transcript /cancel /stop /workflow ... /session ... /issues ..."),
     );
 }
 
@@ -4012,6 +4295,14 @@ mod tests {
         ));
         assert!(parse_attach_command("plain prompt").is_none());
         assert!(parse_attach_command("/unknown").is_none());
+        match parse_attach_command("/workflow show-run current --view full") {
+            Some(AttachCommand::Routed(cmd)) => {
+                assert_eq!(cmd.root, "workflow");
+                assert_eq!(cmd.args[0], "show-run");
+                assert_eq!(cmd.args[1], "current");
+            }
+            other => panic!("unexpected routed command: {other:?}"),
+        }
     }
 
     #[test]
@@ -4107,6 +4398,19 @@ mod tests {
     }
 
     #[test]
+    fn retained_session_prompt_line_uses_agent_name() {
+        let session = test_session_record();
+        let state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        let line = render_session_prompt_line(&session, &state, 120);
+        assert!(line.contains("issue-reader >"));
+        assert!(!line.contains("ses_test123>"));
+    }
+
+    #[test]
     fn retained_session_viewport_can_reach_oldest_rows() {
         let session = test_session_record();
         let prefs = UiPrefs::resolve(
@@ -4157,8 +4461,8 @@ mod tests {
         let full = transcript_event_lines(&event, LiveViewMode::Full, &full_prefs);
         assert_eq!(focused.len(), 1);
         assert!(!full.is_empty());
-        assert!(focused[0].text.contains("assistant output"));
-        assert!(full[0].text.contains("assistant output"));
+        assert!(focused[0].text.contains("assistant"));
+        assert!(full[0].text.contains("assistant"));
         assert!(full.len() >= focused.len());
     }
 
@@ -4177,7 +4481,7 @@ mod tests {
         );
         let compact = transcript_event_lines(&event, LiveViewMode::Compact, &prefs);
         assert!(!compact.is_empty());
-        assert!(compact[0].text.contains("assistant output"));
+        assert!(compact[0].text.contains("assistant"));
         assert!(compact.len() > 1);
     }
 

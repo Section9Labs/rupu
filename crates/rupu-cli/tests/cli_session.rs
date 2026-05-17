@@ -292,7 +292,7 @@ async fn session_show_supports_focused_compact_and_full_views() {
         .stdout(predicate::str::contains("·  full"))
         .stdout(predicate::str::contains("completed "))
         .stdout(predicate::str::contains("1234ms"))
-        .stdout(predicate::str::contains("assistant output"))
+        .stdout(predicate::str::contains("assistant"))
         .stdout(predicate::str::contains("SENTINELBODY"));
 }
 
