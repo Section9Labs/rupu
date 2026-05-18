@@ -13,26 +13,46 @@ pub struct WindowedRows {
     pub scroll_from_bottom: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowBounds {
+    pub start: usize,
+    pub end: usize,
+    pub total_rows: usize,
+    pub max_offset: usize,
+    pub scroll_from_bottom: usize,
+}
+
 impl ViewportState {
-    pub fn apply(&mut self, rows: Vec<String>, max_rows: usize) -> WindowedRows {
+    pub fn window(&mut self, total_rows: usize, max_rows: usize) -> WindowBounds {
         let max_rows = max_rows.max(1);
         let previous_total_rows = self.total_rows;
-        if self.scroll_from_bottom > 0 && rows.len() > previous_total_rows {
+        if self.scroll_from_bottom > 0 && total_rows > previous_total_rows {
             self.scroll_from_bottom = self
                 .scroll_from_bottom
-                .saturating_add(rows.len() - previous_total_rows);
+                .saturating_add(total_rows - previous_total_rows);
         }
-        self.total_rows = rows.len();
+        self.total_rows = total_rows;
         self.page_rows = max_rows;
-        let max_offset = rows.len().saturating_sub(max_rows);
+        let max_offset = total_rows.saturating_sub(max_rows);
         self.scroll_from_bottom = self.scroll_from_bottom.min(max_offset);
-        let end = rows.len().saturating_sub(self.scroll_from_bottom);
+        let end = total_rows.saturating_sub(self.scroll_from_bottom);
         let start = end.saturating_sub(max_rows);
-        WindowedRows {
-            rows: rows[start..end].to_vec(),
-            total_rows: rows.len(),
+        WindowBounds {
+            start,
+            end,
+            total_rows,
             max_offset,
             scroll_from_bottom: self.scroll_from_bottom,
+        }
+    }
+
+    pub fn apply(&mut self, rows: Vec<String>, max_rows: usize) -> WindowedRows {
+        let bounds = self.window(rows.len(), max_rows);
+        WindowedRows {
+            rows: rows[bounds.start..bounds.end].to_vec(),
+            total_rows: bounds.total_rows,
+            max_offset: bounds.max_offset,
+            scroll_from_bottom: bounds.scroll_from_bottom,
         }
     }
 

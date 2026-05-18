@@ -1694,11 +1694,20 @@ struct SessionLiveUsage {
     cached_tokens: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CachedSessionRows {
+    width: usize,
+    view_mode: LiveViewMode,
+    next_is_nested: bool,
+    rows: Vec<String>,
+}
+
 struct SessionInteractiveState {
     followed_run_id: Option<String>,
     transcript_path: PathBuf,
     tailer: crate::output::TranscriptTailer,
     entries: Vec<SessionEntry>,
+    entry_row_cache: Vec<Option<CachedSessionRows>>,
     view_mode: LiveViewMode,
     viewport: ViewportState,
     prompt_active: bool,
@@ -1722,6 +1731,7 @@ impl SessionInteractiveState {
             transcript_path,
             tailer,
             entries: Vec::new(),
+            entry_row_cache: Vec::new(),
             view_mode,
             viewport: ViewportState::default(),
             prompt_active: false,
@@ -1735,11 +1745,26 @@ impl SessionInteractiveState {
     }
 
     fn push_line(&mut self, status: crate::output::palette::Status, text: impl Into<String>) {
-        self.entries.push(SessionEntry::Notice(SessionViewLine {
+        self.push_entry(SessionEntry::Notice(SessionViewLine {
             status,
             text: text.into(),
             continuation: false,
         }));
+    }
+
+    fn push_entry(&mut self, entry: SessionEntry) -> usize {
+        if !self.entries.is_empty() {
+            self.invalidate_entry(self.entries.len() - 1);
+        }
+        self.entries.push(entry);
+        self.entry_row_cache.push(None);
+        self.entries.len() - 1
+    }
+
+    fn invalidate_entry(&mut self, index: usize) {
+        if let Some(slot) = self.entry_row_cache.get_mut(index) {
+            *slot = None;
+        }
     }
 
     fn push_transcript_event(&mut self, event: &TranscriptEvent) {
@@ -1754,16 +1779,16 @@ impl SessionInteractiveState {
                 self.activity = SessionActivity::Thinking;
                 self.current_run_started_at = Some(*started_at);
                 self.live_usage = SessionLiveUsage::default();
-                self.entries.push(SessionEntry::RunStart {
+                self.push_entry(SessionEntry::RunStart {
                     run_id: run_id.clone(),
                     workspace_id: workspace_id.clone(),
                     mode: *mode,
                     started_at: *started_at,
-                })
+                });
             }
             TranscriptEvent::TurnStart { .. } => {
                 self.activity = SessionActivity::Thinking;
-                self.entries.push(SessionEntry::TurnStart)
+                self.push_entry(SessionEntry::TurnStart);
             }
             TranscriptEvent::AssistantDelta { content } => {
                 self.push_assistant_delta(content);
@@ -1773,7 +1798,7 @@ impl SessionInteractiveState {
             }
             TranscriptEvent::ToolCall { tool, input, .. } => {
                 self.activity = SessionActivity::Tool { tool: tool.clone() };
-                self.entries.push(SessionEntry::ToolCall {
+                self.push_entry(SessionEntry::ToolCall {
                     tool: tool.clone(),
                     input: input.clone(),
                 });
@@ -1785,15 +1810,15 @@ impl SessionInteractiveState {
                 ..
             } => {
                 self.activity = SessionActivity::Thinking;
-                self.entries.push(SessionEntry::ToolResult {
+                self.push_entry(SessionEntry::ToolResult {
                     output: output.clone(),
                     error: error.clone(),
                     duration_ms: *duration_ms,
-                })
+                });
             }
             TranscriptEvent::FileEdit { path, kind, diff } => {
                 self.activity = SessionActivity::Thinking;
-                self.entries.push(SessionEntry::FileEdit {
+                self.push_entry(SessionEntry::FileEdit {
                     path: path.clone(),
                     kind: *kind,
                     diff: diff.clone(),
@@ -1806,11 +1831,11 @@ impl SessionInteractiveState {
                 ..
             } => {
                 self.activity = SessionActivity::Thinking;
-                self.entries.push(SessionEntry::CommandRun {
+                self.push_entry(SessionEntry::CommandRun {
                     argv: argv.clone(),
                     cwd: cwd.clone(),
                     exit_code: *exit_code,
-                })
+                });
             }
             TranscriptEvent::ActionEmitted {
                 kind,
@@ -1820,12 +1845,12 @@ impl SessionInteractiveState {
                 ..
             } => {
                 self.activity = SessionActivity::Thinking;
-                self.entries.push(SessionEntry::ActionEmitted {
+                self.push_entry(SessionEntry::ActionEmitted {
                     kind: kind.clone(),
                     allowed: *allowed,
                     applied: *applied,
                     reason: reason.clone(),
-                })
+                });
             }
             TranscriptEvent::GateRequested {
                 gate_id,
@@ -1834,16 +1859,16 @@ impl SessionInteractiveState {
                 decided_by,
             } => {
                 self.activity = SessionActivity::Thinking;
-                self.entries.push(SessionEntry::GateRequested {
+                self.push_entry(SessionEntry::GateRequested {
                     gate_id: gate_id.clone(),
                     prompt: prompt.clone(),
                     decision: decision.clone(),
                     decided_by: decided_by.clone(),
-                })
+                });
             }
             TranscriptEvent::TurnEnd { .. } => {
                 self.activity = SessionActivity::Thinking;
-                self.entries.push(SessionEntry::TurnEnd)
+                self.push_entry(SessionEntry::TurnEnd);
             }
             TranscriptEvent::Usage {
                 provider,
@@ -1857,13 +1882,13 @@ impl SessionInteractiveState {
                 self.live_usage.input_tokens += *input_tokens as u64;
                 self.live_usage.output_tokens += *output_tokens as u64;
                 self.live_usage.cached_tokens += *cached_tokens as u64;
-                self.entries.push(SessionEntry::Usage {
+                self.push_entry(SessionEntry::Usage {
                     provider: provider.clone(),
                     model: model.clone(),
                     input_tokens: *input_tokens,
                     output_tokens: *output_tokens,
                     cached_tokens: *cached_tokens,
-                })
+                });
             }
             TranscriptEvent::RunComplete {
                 status,
@@ -1874,22 +1899,21 @@ impl SessionInteractiveState {
             } => {
                 self.activity = SessionActivity::Idle;
                 self.current_run_started_at = None;
-                self.entries.push(SessionEntry::RunComplete {
+                self.push_entry(SessionEntry::RunComplete {
                     status: *status,
                     total_tokens: *total_tokens,
                     duration_ms: *duration_ms,
                     error: error.clone(),
-                })
+                });
             }
         }
     }
 
     fn push_user_prompt(&mut self, content: impl Into<String>, queued: bool) -> usize {
-        self.entries.push(SessionEntry::UserPrompt {
+        self.push_entry(SessionEntry::UserPrompt {
             content: content.into(),
             queued,
-        });
-        self.entries.len() - 1
+        })
     }
 
     fn push_assistant_delta(&mut self, chunk: &str) {
@@ -1897,62 +1921,95 @@ impl SessionInteractiveState {
             return;
         }
         self.activity = SessionActivity::Typing;
-        match self.entries.last_mut() {
-            Some(SessionEntry::Assistant {
-                content, streaming, ..
-            }) => {
+        let last_index = self.entries.len().checked_sub(1);
+        match last_index.and_then(|index| self.entries.get_mut(index).map(|entry| (index, entry))) {
+            Some((
+                index,
+                SessionEntry::Assistant {
+                    content, streaming, ..
+                },
+            )) => {
                 content.push_str(chunk);
                 *streaming = true;
+                self.invalidate_entry(index);
             }
-            _ => self.entries.push(SessionEntry::Assistant {
-                content: chunk.to_string(),
-                thinking: None,
-                streaming: true,
-            }),
+            _ => {
+                self.push_entry(SessionEntry::Assistant {
+                    content: chunk.to_string(),
+                    thinking: None,
+                    streaming: true,
+                });
+            }
         }
     }
 
     fn push_assistant_message(&mut self, content: &str, thinking: Option<String>) {
         self.activity = SessionActivity::Thinking;
         if content.trim().is_empty() && thinking.is_none() {
-            if let Some(SessionEntry::Assistant { streaming, .. }) =
-                self.last_mergeable_assistant_mut()
-            {
-                *streaming = false;
+            let last_index = self.last_mergeable_assistant_index();
+            if let Some(index) = last_index {
+                if let Some(SessionEntry::Assistant { streaming, .. }) = self.entries.get_mut(index)
+                {
+                    *streaming = false;
+                }
+                self.invalidate_entry(index);
             }
             return;
         }
-        match self.last_mergeable_assistant_mut() {
-            Some(SessionEntry::Assistant {
-                content: existing,
-                thinking: existing_thinking,
-                streaming,
-            }) if *streaming || existing.trim() == content.trim() => {
-                *existing = content.to_string();
-                *existing_thinking = thinking;
-                *streaming = false;
+        match self.last_mergeable_assistant_index() {
+            Some(index) => match self.entries.get_mut(index) {
+                Some(entry @ SessionEntry::Assistant { .. }) => {
+                    let mut merged = false;
+                    if let SessionEntry::Assistant {
+                        content: existing,
+                        thinking: existing_thinking,
+                        streaming,
+                    } = entry
+                    {
+                        if *streaming || existing.trim() == content.trim() {
+                            *existing = content.to_string();
+                            *existing_thinking = thinking.clone();
+                            *streaming = false;
+                            merged = true;
+                        }
+                    }
+                    if merged {
+                        self.invalidate_entry(index);
+                    } else {
+                        self.push_entry(SessionEntry::Assistant {
+                            content: content.to_string(),
+                            thinking,
+                            streaming: false,
+                        });
+                    }
+                }
+                _ => {
+                    self.push_entry(SessionEntry::Assistant {
+                        content: content.to_string(),
+                        thinking,
+                        streaming: false,
+                    });
+                }
+            },
+            None => {
+                self.push_entry(SessionEntry::Assistant {
+                    content: content.to_string(),
+                    thinking,
+                    streaming: false,
+                });
             }
-            _ => self.entries.push(SessionEntry::Assistant {
-                content: content.to_string(),
-                thinking,
-                streaming: false,
-            }),
         }
     }
 
-    fn last_mergeable_assistant_mut(&mut self) -> Option<&mut SessionEntry> {
-        let mut candidate = None;
+    fn last_mergeable_assistant_index(&self) -> Option<usize> {
         for idx in (0..self.entries.len()).rev() {
             match self.entries.get(idx) {
                 Some(SessionEntry::Usage { .. }) => continue,
-                Some(SessionEntry::Assistant { .. }) => {
-                    candidate = Some(idx);
-                    break;
-                }
+                Some(SessionEntry::Assistant { .. }) => return Some(idx),
                 _ => break,
             }
         }
-        candidate.and_then(|idx| self.entries.get_mut(idx))
+        None
     }
 
     fn enqueue_prompt(&mut self, entry_index: usize, prompt: String) -> usize {
@@ -1985,7 +2042,45 @@ impl SessionInteractiveState {
     fn mark_user_prompt_sent(&mut self, entry_index: usize) {
         if let Some(SessionEntry::UserPrompt { queued, .. }) = self.entries.get_mut(entry_index) {
             *queued = false;
+            self.invalidate_entry(entry_index);
         }
+    }
+
+    fn render_cached_entry_rows(
+        &mut self,
+        index: usize,
+        next_is_nested: bool,
+        prefs: &UiPrefs,
+        width: usize,
+    ) -> &[String] {
+        let cache_valid = self
+            .entry_row_cache
+            .get(index)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|cached| {
+                cached.width == width
+                    && cached.view_mode == self.view_mode
+                    && cached.next_is_nested == next_is_nested
+            });
+        if !cache_valid {
+            let rows = render_session_entry_rows(
+                &self.entries[index],
+                next_is_nested,
+                self.view_mode,
+                prefs,
+                width,
+            );
+            self.entry_row_cache[index] = Some(CachedSessionRows {
+                width,
+                view_mode: self.view_mode,
+                next_is_nested,
+                rows,
+            });
+        }
+        &self.entry_row_cache[index]
+            .as_ref()
+            .expect("cache populated")
+            .rows
     }
 }
 
@@ -2540,20 +2635,47 @@ fn render_session_event_rows(
     width: usize,
     max_rows: usize,
 ) -> Vec<String> {
-    let mut rendered = Vec::new();
-    for (index, entry) in state.entries.iter().enumerate() {
-        rendered.extend(render_session_entry_rows(
-            entry,
-            state.entries.get(index + 1),
-            state.view_mode,
-            prefs,
-            width,
-        ));
+    let mut entry_counts = Vec::with_capacity(state.entries.len());
+    let mut total_rows = 0usize;
+    for index in 0..state.entries.len() {
+        let next_is_nested = session_entry_is_nested(state.entries.get(index + 1));
+        let count = state
+            .render_cached_entry_rows(index, next_is_nested, prefs, width)
+            .len();
+        entry_counts.push(count);
+        total_rows += count;
     }
-    rendered.extend(render_synthetic_session_activity_rows(
-        session, state, width,
-    ));
-    state.viewport.apply(rendered, max_rows).rows
+
+    let synthetic_rows = render_synthetic_session_activity_rows(session, state, width);
+    total_rows += synthetic_rows.len();
+    let bounds = state.viewport.window(total_rows, max_rows);
+
+    let mut rows = Vec::with_capacity(max_rows.min(total_rows));
+    let mut cursor = 0usize;
+    for (index, count) in entry_counts.into_iter().enumerate() {
+        let next_cursor = cursor + count;
+        if next_cursor <= bounds.start {
+            cursor = next_cursor;
+            continue;
+        }
+        if cursor >= bounds.end {
+            break;
+        }
+        let next_is_nested = session_entry_is_nested(state.entries.get(index + 1));
+        let rendered = state.render_cached_entry_rows(index, next_is_nested, prefs, width);
+        let slice_start = bounds.start.saturating_sub(cursor).min(rendered.len());
+        let slice_end = bounds.end.saturating_sub(cursor).min(rendered.len());
+        rows.extend(rendered[slice_start..slice_end].iter().cloned());
+        cursor = next_cursor;
+    }
+
+    if cursor < bounds.end && !synthetic_rows.is_empty() {
+        let slice_start = bounds.start.saturating_sub(cursor).min(synthetic_rows.len());
+        let slice_end = bounds.end.saturating_sub(cursor).min(synthetic_rows.len());
+        rows.extend(synthetic_rows[slice_start..slice_end].iter().cloned());
+    }
+
+    rows
 }
 
 fn render_synthetic_session_activity_rows(
@@ -2579,7 +2701,7 @@ fn render_synthetic_session_activity_rows(
 
 fn render_session_entry_rows(
     entry: &SessionEntry,
-    next: Option<&SessionEntry>,
+    next_is_nested: bool,
     view_mode: LiveViewMode,
     prefs: &UiPrefs,
     width: usize,
@@ -2655,7 +2777,7 @@ fn render_session_entry_rows(
         }
         SessionEntry::ToolCall { tool, input } => {
             let mut rows = render_nested_event_rows(
-                next,
+                next_is_nested,
                 Status::Working,
                 retained_session_event_line(
                     Status::Working,
@@ -2669,7 +2791,7 @@ fn render_session_entry_rows(
                 LiveViewMode::Compact => {
                     if let Some(rendered) = render_tool_input(tool, input, prefs) {
                         rows.extend(render_nested_body_lines(
-                            next,
+                            next_is_nested,
                             &preview_rendered_lines(&rendered, 5),
                             width,
                         ));
@@ -2678,7 +2800,7 @@ fn render_session_entry_rows(
                 LiveViewMode::Full => {
                     if let Some(rendered) = render_tool_input(tool, input, prefs) {
                         rows.extend(render_nested_body_lines(
-                            next,
+                            next_is_nested,
                             &rendered.lines().map(str::to_string).collect::<Vec<_>>(),
                             width,
                         ));
@@ -2705,7 +2827,7 @@ fn render_session_entry_rows(
             let raw = error.as_deref().unwrap_or(output.as_str());
             let payload = render_payload(raw, prefs);
             let mut rows = render_nested_event_rows(
-                next,
+                next_is_nested,
                 status,
                 retained_session_event_line(
                     status,
@@ -2719,7 +2841,7 @@ fn render_session_entry_rows(
                 LiveViewMode::Compact => {
                     if error.is_some() {
                         rows.extend(render_nested_body_lines(
-                            next,
+                            next_is_nested,
                             &render_payload_preview_lines(&payload, 3),
                             width,
                         ));
@@ -2727,7 +2849,7 @@ fn render_session_entry_rows(
                 }
                 LiveViewMode::Full => {
                     rows.extend(render_nested_body_lines(
-                        next,
+                        next_is_nested,
                         &session_rich_payload_lines(&payload),
                         width,
                     ));
@@ -2738,7 +2860,7 @@ fn render_session_entry_rows(
         SessionEntry::FileEdit { path, kind, diff } => {
             let payload = render_payload(diff, prefs);
             let mut rows = render_nested_event_rows(
-                next,
+                next_is_nested,
                 Status::Complete,
                 retained_session_event_line(
                     Status::Complete,
@@ -2755,12 +2877,12 @@ fn render_session_entry_rows(
             match view_mode {
                 LiveViewMode::Focused => {}
                 LiveViewMode::Compact => rows.extend(render_nested_body_lines(
-                    next,
+                    next_is_nested,
                     &render_payload_preview_lines(&payload, 8),
                     width,
                 )),
                 LiveViewMode::Full => rows.extend(render_nested_body_lines(
-                    next,
+                    next_is_nested,
                     &session_rich_payload_lines(&payload),
                     width,
                 )),
@@ -2772,7 +2894,7 @@ fn render_session_entry_rows(
             cwd,
             exit_code,
         } => render_nested_event_rows(
-            next,
+            next_is_nested,
             if *exit_code == 0 {
                 Status::Complete
             } else {
@@ -2813,7 +2935,7 @@ fn render_session_entry_rows(
                 detail.push_str(&truncate_single_line(reason, 64));
             }
             render_nested_event_rows(
-                next,
+                next_is_nested,
                 status,
                 retained_session_event_line_raw(status, "action", &detail),
                 width,
@@ -2836,7 +2958,7 @@ fn render_session_entry_rows(
                 detail.push_str(&format!("  ·  by {decided_by}"));
             }
             render_nested_event_rows(
-                next,
+                next_is_nested,
                 Status::Awaiting,
                 retained_session_event_line_raw(Status::Awaiting, "approval gate", &detail),
                 width,
@@ -2968,12 +3090,12 @@ fn render_indented_body_lines(lines: &[String], width: usize, prefix: &str) -> V
 }
 
 fn render_nested_event_rows(
-    next: Option<&SessionEntry>,
+    next_is_nested: bool,
     status: crate::output::palette::Status,
     text: String,
     width: usize,
 ) -> Vec<String> {
-    let (first_prefix, continuation_prefix) = nested_prefixes(next);
+    let (first_prefix, continuation_prefix) = nested_prefixes(next_is_nested);
     let mut prefix = String::new();
     prefix.push_str(&first_prefix);
     let _ = palette::write_bold_colored(&mut prefix, &status.glyph().to_string(), status.color());
@@ -2982,16 +3104,16 @@ fn render_nested_event_rows(
 }
 
 fn render_nested_body_lines(
-    next: Option<&SessionEntry>,
+    next_is_nested: bool,
     lines: &[String],
     width: usize,
 ) -> Vec<String> {
-    let (_, continuation_prefix) = nested_prefixes(next);
+    let (_, continuation_prefix) = nested_prefixes(next_is_nested);
     render_indented_body_lines(lines, width, &continuation_prefix)
 }
 
-fn nested_prefixes(next: Option<&SessionEntry>) -> (String, String) {
-    if session_entry_is_nested(next) {
+fn nested_prefixes(next_is_nested: bool) -> (String, String) {
+    if next_is_nested {
         ("  ├─ ".to_string(), "  │  ".to_string())
     } else {
         ("  └─ ".to_string(), "     ".to_string())
@@ -5391,6 +5513,45 @@ mod tests {
         let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 72, 16);
         assert!(rows.iter().any(|row| row.contains("history line 000")));
         assert!(!rows.iter().any(|row| row.contains("history line 699")));
+    }
+
+    #[test]
+    fn retained_session_viewport_keeps_oldest_rows_visible_when_history_grows() {
+        let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Focused,
+        );
+        for index in 0..120 {
+            state.push_line(
+                crate::output::palette::Status::Active,
+                format!("history line {index:03}"),
+            );
+        }
+        state.viewport.jump_top();
+
+        let initial_rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 72, 16);
+        assert!(initial_rows.iter().any(|row| row.contains("history line 000")));
+        assert!(!initial_rows.iter().any(|row| row.contains("history line 119")));
+
+        for index in 120..240 {
+            state.push_line(
+                crate::output::palette::Status::Active,
+                format!("history line {index:03}"),
+            );
+        }
+
+        let grown_rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 72, 16);
+        assert!(grown_rows.iter().any(|row| row.contains("history line 000")));
+        assert!(!grown_rows.iter().any(|row| row.contains("history line 239")));
     }
 
     #[test]
