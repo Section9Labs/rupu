@@ -1,11 +1,11 @@
 use crate::cmd::completers::{active_session_ids, archived_session_ids, session_ids};
 use crate::cmd::retention::parse_retention_duration;
 use crate::cmd::run::{
-    canonicalize_if_exists, resolve_clone_dest, standalone_issue_ref, standalone_repo_ref,
-    standalone_workspace_strategy, ReadonlyDecider,
+    ReadonlyDecider, canonicalize_if_exists, resolve_clone_dest, standalone_issue_ref,
+    standalone_repo_ref, standalone_workspace_strategy,
 };
 use crate::cmd::transcript::{
-    render_pretty_transcript_event, truncate_single_line, TranscriptPrettyContext,
+    TranscriptPrettyContext, render_pretty_transcript_event, truncate_single_line,
 };
 use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::output::formats::OutputFormat;
@@ -13,13 +13,13 @@ use crate::output::palette::{self, BRAND, DIM};
 use crate::output::printer::{visible_len, wrap_with_ansi};
 use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::output::rich_payload::{
-    render_assistant_content, render_payload, render_payload_preview_lines, render_tool_input,
-    RenderedPayload,
+    RenderedPayload, render_assistant_content, render_payload, render_payload_preview_lines,
+    render_tool_input,
 };
 use crate::output::viewport::ViewportState;
 use crate::paths;
 use crate::standalone_run_metadata::{
-    metadata_path_for_run, write_metadata, StandaloneRunMetadata,
+    StandaloneRunMetadata, metadata_path_for_run, write_metadata,
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -36,13 +36,13 @@ use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternate
 use crossterm::{execute, queue};
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_agent::{load_agent, parse_mode, resolve_mode};
+use rupu_providers::AuthMode;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::types::{
     ContextManagement, Message, OutputFormat as ProviderOutputFormat, Speed,
 };
-use rupu_providers::AuthMode;
-use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
+use rupu_runtime::provider_factory;
 use rupu_tools::{PermissionMode, ToolContext};
 use rupu_transcript::{Event as TranscriptEvent, FileEditKind, JsonlReader, RunMode, RunStatus};
 use serde::{Deserialize, Serialize};
@@ -1176,7 +1176,9 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let global_mode = cfg.permission_mode.as_deref().and_then(parse_mode);
     let mode = resolve_mode(cli_mode, agent_mode, None, global_mode);
     if matches!(mode, PermissionMode::Ask) {
-        anyhow::bail!("sessions require a non-interactive permission mode; use `--mode bypass` or `--mode readonly`");
+        anyhow::bail!(
+            "sessions require a non-interactive permission mode; use `--mode bypass` or `--mode readonly`"
+        );
     }
 
     let resolver = rupu_auth::KeychainResolver::new();
@@ -1842,12 +1844,14 @@ impl SessionInteractiveState {
 
     fn push_assistant_message(&mut self, content: &str, thinking: Option<String>) {
         if content.trim().is_empty() && thinking.is_none() {
-            if let Some(SessionEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
+            if let Some(SessionEntry::Assistant { streaming, .. }) =
+                self.last_mergeable_assistant_mut()
+            {
                 *streaming = false;
             }
             return;
         }
-        match self.entries.last_mut() {
+        match self.last_mergeable_assistant_mut() {
             Some(SessionEntry::Assistant {
                 content: existing,
                 thinking: existing_thinking,
@@ -1863,6 +1867,21 @@ impl SessionInteractiveState {
                 streaming: false,
             }),
         }
+    }
+
+    fn last_mergeable_assistant_mut(&mut self) -> Option<&mut SessionEntry> {
+        let mut candidate = None;
+        for idx in (0..self.entries.len()).rev() {
+            match self.entries.get(idx) {
+                Some(SessionEntry::Usage { .. }) => continue,
+                Some(SessionEntry::Assistant { .. }) => {
+                    candidate = Some(idx);
+                    break;
+                }
+                _ => break,
+            }
+        }
+        candidate.and_then(|idx| self.entries.get_mut(idx))
     }
 }
 
@@ -1907,12 +1926,6 @@ fn attach_blocking_interactive(
         let mut state =
             SessionInteractiveState::new(transcript_path, followed_run_id, prefs.live_view);
         let mut last_rows: Vec<String> = Vec::new();
-        if let Some(run_id) = state.followed_run_id.as_deref() {
-            state.push_line(
-                crate::output::palette::Status::Working,
-                format!("attached to {}", compact_session_run_id(run_id)),
-            );
-        }
 
         loop {
             for event in state.tailer.drain() {
@@ -1941,12 +1954,6 @@ fn attach_blocking_interactive(
                     state.transcript_path = next_path.clone();
                     state.followed_run_id = desired_run_id.clone();
                     state.tailer = crate::output::TranscriptTailer::new(next_path);
-                    if let Some(run_id) = desired_run_id.as_deref() {
-                        state.push_line(
-                            crate::output::palette::Status::Working,
-                            format!("following {}", compact_session_run_id(run_id)),
-                        );
-                    }
                 }
             }
 
@@ -2445,7 +2452,12 @@ fn render_session_entry_rows(
             if !content.trim().is_empty() {
                 let payload = render_assistant_content(content.trim(), prefs);
                 let body_lines = match view_mode {
-                    LiveViewMode::Focused => render_payload_preview_lines(&payload, 6),
+                    LiveViewMode::Focused => {
+                        vec![truncate_single_line(
+                            content.trim(),
+                            width.saturating_sub(4).max(24),
+                        )]
+                    }
                     LiveViewMode::Compact | LiveViewMode::Full => payload
                         .rendered
                         .lines()
@@ -2710,7 +2722,7 @@ fn render_session_entry_rows(
                 RunStatus::Error | RunStatus::Aborted => Status::Failed,
             };
             let mut detail = format!(
-                "run complete  ·  status {}  ·  {}ms  ·  {} tokens",
+                "status {}  ·  {}ms  ·  {} tokens",
                 format!("{status:?}").to_lowercase(),
                 duration_ms,
                 total_tokens
@@ -3663,7 +3675,7 @@ fn handle_attach_keypress(
             }
             match prompt_for_session_input(printer, &session.session_id)? {
                 SessionInput::Submit(input) => {
-                    return handle_session_input(global, session, printer, input)
+                    return handle_session_input(global, session, printer, input);
                 }
                 SessionInput::Cancelled => {
                     printer.sideband_event(
@@ -3856,11 +3868,7 @@ fn tokenize_attach_command(command: &str) -> Option<Vec<String>> {
     if !current.is_empty() {
         out.push(current);
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn inline_command_is_allowed(root: &str, args: &[String]) -> bool {
@@ -5234,12 +5242,19 @@ mod tests {
         state.push_transcript_event(&TranscriptEvent::AssistantDelta {
             content: " world".into(),
         });
+        state.push_transcript_event(&TranscriptEvent::Usage {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            input_tokens: 10,
+            output_tokens: 4,
+            cached_tokens: 0,
+        });
         state.push_transcript_event(&TranscriptEvent::AssistantMessage {
             content: "Hello world".into(),
             thinking: None,
         });
 
-        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries.len(), 2);
         match &state.entries[0] {
             SessionEntry::Assistant {
                 content, streaming, ..
@@ -5330,9 +5345,11 @@ mod tests {
         );
         let lines = transcript_event_lines(&event, LiveViewMode::Focused, &prefs);
         assert_eq!(lines.len(), 1);
-        assert!(lines[0]
-            .text
-            .contains(".git/logs/refs/heads/storefront/issue-19"));
+        assert!(
+            lines[0]
+                .text
+                .contains(".git/logs/refs/heads/storefront/issue-19")
+        );
         assert!(!lines[0].text.contains("{\"path\""));
     }
 
@@ -5352,9 +5369,11 @@ mod tests {
         );
         let lines = transcript_event_lines(&event, LiveViewMode::Full, &prefs);
         assert!(lines.len() > 1);
-        assert!(lines[0]
-            .text
-            .contains(".git/logs/refs/heads/storefront/issue-19"));
+        assert!(
+            lines[0]
+                .text
+                .contains(".git/logs/refs/heads/storefront/issue-19")
+        );
         assert!(lines.iter().skip(1).any(|line| line.text.contains("path:")));
     }
 }

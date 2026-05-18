@@ -1,7 +1,7 @@
 use crate::cmd::transcript::truncate_single_line;
 use crate::cmd::ui::{
-    highlight_diff, highlight_json, highlight_markdown, highlight_shell, highlight_toml,
-    highlight_yaml, UiPrefs,
+    UiPrefs, highlight_diff, highlight_json, highlight_markdown, highlight_shell, highlight_toml,
+    highlight_yaml,
 };
 use crate::output::palette::{self, DIM};
 
@@ -154,20 +154,6 @@ pub fn render_assistant_content(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
             rendered: highlight_json(&pretty, prefs),
         };
     }
-    if let Some(pretty) = try_pretty_yaml(trimmed) {
-        return RenderedPayload {
-            kind: PayloadKind::Yaml,
-            headline: "yaml payload".into(),
-            rendered: highlight_yaml(&pretty, prefs),
-        };
-    }
-    if let Some(pretty) = try_pretty_toml(trimmed) {
-        return RenderedPayload {
-            kind: PayloadKind::Toml,
-            headline: "toml payload".into(),
-            rendered: highlight_toml(&pretty, prefs),
-        };
-    }
     if looks_like_diff(trimmed) {
         return RenderedPayload {
             kind: PayloadKind::Diff,
@@ -263,11 +249,7 @@ fn try_pretty_jsonl(raw: &str) -> Option<Vec<String>> {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         rows.push(serde_json::to_string_pretty(&value).ok()?);
     }
-    if rows.len() > 1 {
-        Some(rows)
-    } else {
-        None
-    }
+    if rows.len() > 1 { Some(rows) } else { None }
 }
 
 fn try_pretty_yaml(raw: &str) -> Option<String> {
@@ -446,5 +428,15 @@ mod tests {
         let payload = render_assistant_content("# Title\n- item\n", &prefs());
         assert_eq!(payload.kind, PayloadKind::Markdown);
         assert_eq!(payload.headline, "assistant output");
+    }
+
+    #[test]
+    fn render_assistant_content_does_not_treat_chat_text_as_yaml() {
+        let payload = render_assistant_content(
+            "Hi! How can I help today?\n- Coding question\n- Debug a bug\n",
+            &prefs(),
+        );
+        assert_eq!(payload.kind, PayloadKind::Markdown);
+        assert!(!payload.rendered.contains("|-"));
     }
 }
