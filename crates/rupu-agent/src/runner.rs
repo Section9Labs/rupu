@@ -285,20 +285,33 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             }
         } else {
             let suppress = opts.suppress_stream_stdout;
+            let mut stream_transcript_error: Option<rupu_transcript::WriteError> = None;
             let mut on_event = |ev: StreamEvent| {
-                if suppress {
-                    return;
-                }
                 if let StreamEvent::TextDelta(chunk) = ev {
-                    use std::io::Write;
-                    print!("{chunk}");
-                    let _ = std::io::stdout().flush();
+                    if !chunk.is_empty() && stream_transcript_error.is_none() {
+                        if let Err(err) = writer
+                            .write(&Event::AssistantDelta {
+                                content: chunk.clone(),
+                            })
+                            .and_then(|_| writer.flush())
+                        {
+                            stream_transcript_error = Some(err);
+                        }
+                    }
+                    if !suppress {
+                        use std::io::Write;
+                        print!("{chunk}");
+                        let _ = std::io::stdout().flush();
+                    }
                 }
             };
             match opts.provider.stream(&req, &mut on_event).await {
                 Ok(r) => {
                     if !suppress {
                         println!();
+                    }
+                    if let Some(err) = stream_transcript_error {
+                        return Err(RunError::Transcript(err));
                     }
                     r
                 }

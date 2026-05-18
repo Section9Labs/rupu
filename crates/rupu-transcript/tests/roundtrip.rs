@@ -30,6 +30,9 @@ fn roundtrip_turn_start() {
 
 #[test]
 fn roundtrip_assistant_message() {
+    assert_roundtrip(&Event::AssistantDelta {
+        content: "Looking".into(),
+    });
     assert_roundtrip(&Event::AssistantMessage {
         content: "Looking at the failing test now.".into(),
         thinking: None,

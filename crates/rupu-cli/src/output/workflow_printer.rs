@@ -1218,6 +1218,7 @@ fn workflow_transcript_event_lines(
                 kind: WorkflowViewLineKind::Event,
             }]
         }
+        TxEvent::AssistantDelta { .. } => Vec::new(),
         TxEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
             if view_mode.shows_full_payloads() {

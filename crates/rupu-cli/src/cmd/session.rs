@@ -44,7 +44,7 @@ use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, ToolContext};
-use rupu_transcript::{Event as TranscriptEvent, JsonlReader, RunStatus};
+use rupu_transcript::{Event as TranscriptEvent, FileEditKind, JsonlReader, RunMode, RunStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -1599,18 +1599,83 @@ fn attach_blocking(
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct SessionViewLine {
     status: crate::output::palette::Status,
     text: String,
     continuation: bool,
 }
 
+#[derive(Debug, Clone)]
+enum SessionEntry {
+    Notice(SessionViewLine),
+    UserPrompt {
+        content: String,
+    },
+    Assistant {
+        content: String,
+        thinking: Option<String>,
+        streaming: bool,
+    },
+    ToolCall {
+        tool: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        output: String,
+        error: Option<String>,
+        duration_ms: u64,
+    },
+    FileEdit {
+        path: String,
+        kind: FileEditKind,
+        diff: String,
+    },
+    CommandRun {
+        argv: Vec<String>,
+        cwd: String,
+        exit_code: i32,
+    },
+    ActionEmitted {
+        kind: String,
+        allowed: bool,
+        applied: bool,
+        reason: Option<String>,
+    },
+    GateRequested {
+        gate_id: String,
+        prompt: String,
+        decision: Option<String>,
+        decided_by: Option<String>,
+    },
+    RunStart {
+        run_id: String,
+        workspace_id: String,
+        mode: RunMode,
+        started_at: DateTime<Utc>,
+    },
+    TurnStart,
+    TurnEnd,
+    Usage {
+        provider: String,
+        model: String,
+        input_tokens: u32,
+        output_tokens: u32,
+        cached_tokens: u32,
+    },
+    RunComplete {
+        status: RunStatus,
+        total_tokens: u64,
+        duration_ms: u64,
+        error: Option<String>,
+    },
+}
+
 struct SessionInteractiveState {
     followed_run_id: Option<String>,
     transcript_path: PathBuf,
     tailer: crate::output::TranscriptTailer,
-    lines: Vec<SessionViewLine>,
+    entries: Vec<SessionEntry>,
     view_mode: LiveViewMode,
     viewport: ViewportState,
     prompt_active: bool,
@@ -1628,7 +1693,7 @@ impl SessionInteractiveState {
             followed_run_id,
             transcript_path,
             tailer,
-            lines: Vec::new(),
+            entries: Vec::new(),
             view_mode,
             viewport: ViewportState::default(),
             prompt_active: false,
@@ -1637,16 +1702,166 @@ impl SessionInteractiveState {
     }
 
     fn push_line(&mut self, status: crate::output::palette::Status, text: impl Into<String>) {
-        self.lines.push(SessionViewLine {
+        self.entries.push(SessionEntry::Notice(SessionViewLine {
             status,
             text: text.into(),
             continuation: false,
+        }));
+    }
+
+    fn push_transcript_event(&mut self, event: &TranscriptEvent) {
+        match event {
+            TranscriptEvent::RunStart {
+                run_id,
+                workspace_id,
+                mode,
+                started_at,
+                ..
+            } => self.entries.push(SessionEntry::RunStart {
+                run_id: run_id.clone(),
+                workspace_id: workspace_id.clone(),
+                mode: *mode,
+                started_at: *started_at,
+            }),
+            TranscriptEvent::TurnStart { .. } => self.entries.push(SessionEntry::TurnStart),
+            TranscriptEvent::AssistantDelta { content } => {
+                self.push_assistant_delta(content);
+            }
+            TranscriptEvent::AssistantMessage { content, thinking } => {
+                self.push_assistant_message(content, thinking.clone());
+            }
+            TranscriptEvent::ToolCall { tool, input, .. } => {
+                self.entries.push(SessionEntry::ToolCall {
+                    tool: tool.clone(),
+                    input: input.clone(),
+                });
+            }
+            TranscriptEvent::ToolResult {
+                output,
+                error,
+                duration_ms,
+                ..
+            } => self.entries.push(SessionEntry::ToolResult {
+                output: output.clone(),
+                error: error.clone(),
+                duration_ms: *duration_ms,
+            }),
+            TranscriptEvent::FileEdit { path, kind, diff } => {
+                self.entries.push(SessionEntry::FileEdit {
+                    path: path.clone(),
+                    kind: *kind,
+                    diff: diff.clone(),
+                });
+            }
+            TranscriptEvent::CommandRun {
+                argv,
+                cwd,
+                exit_code,
+                ..
+            } => self.entries.push(SessionEntry::CommandRun {
+                argv: argv.clone(),
+                cwd: cwd.clone(),
+                exit_code: *exit_code,
+            }),
+            TranscriptEvent::ActionEmitted {
+                kind,
+                allowed,
+                applied,
+                reason,
+                ..
+            } => self.entries.push(SessionEntry::ActionEmitted {
+                kind: kind.clone(),
+                allowed: *allowed,
+                applied: *applied,
+                reason: reason.clone(),
+            }),
+            TranscriptEvent::GateRequested {
+                gate_id,
+                prompt,
+                decision,
+                decided_by,
+            } => self.entries.push(SessionEntry::GateRequested {
+                gate_id: gate_id.clone(),
+                prompt: prompt.clone(),
+                decision: decision.clone(),
+                decided_by: decided_by.clone(),
+            }),
+            TranscriptEvent::TurnEnd { .. } => self.entries.push(SessionEntry::TurnEnd),
+            TranscriptEvent::Usage {
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            } => self.entries.push(SessionEntry::Usage {
+                provider: provider.clone(),
+                model: model.clone(),
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
+                cached_tokens: *cached_tokens,
+            }),
+            TranscriptEvent::RunComplete {
+                status,
+                total_tokens,
+                duration_ms,
+                error,
+                ..
+            } => self.entries.push(SessionEntry::RunComplete {
+                status: *status,
+                total_tokens: *total_tokens,
+                duration_ms: *duration_ms,
+                error: error.clone(),
+            }),
+        }
+    }
+
+    fn push_user_prompt(&mut self, content: impl Into<String>) {
+        self.entries.push(SessionEntry::UserPrompt {
+            content: content.into(),
         });
     }
 
-    fn push_transcript_event(&mut self, event: &TranscriptEvent, prefs: &UiPrefs) {
-        for line in transcript_event_lines(event, self.view_mode, prefs) {
-            self.lines.push(line);
+    fn push_assistant_delta(&mut self, chunk: &str) {
+        if chunk.is_empty() {
+            return;
+        }
+        match self.entries.last_mut() {
+            Some(SessionEntry::Assistant {
+                content, streaming, ..
+            }) => {
+                content.push_str(chunk);
+                *streaming = true;
+            }
+            _ => self.entries.push(SessionEntry::Assistant {
+                content: chunk.to_string(),
+                thinking: None,
+                streaming: true,
+            }),
+        }
+    }
+
+    fn push_assistant_message(&mut self, content: &str, thinking: Option<String>) {
+        if content.trim().is_empty() && thinking.is_none() {
+            if let Some(SessionEntry::Assistant { streaming, .. }) = self.entries.last_mut() {
+                *streaming = false;
+            }
+            return;
+        }
+        match self.entries.last_mut() {
+            Some(SessionEntry::Assistant {
+                content: existing,
+                thinking: existing_thinking,
+                streaming,
+            }) if *streaming || existing.trim() == content.trim() => {
+                *existing = content.to_string();
+                *existing_thinking = thinking;
+                *streaming = false;
+            }
+            _ => self.entries.push(SessionEntry::Assistant {
+                content: content.to_string(),
+                thinking,
+                streaming: false,
+            }),
         }
     }
 }
@@ -1701,7 +1916,7 @@ fn attach_blocking_interactive(
 
         loop {
             for event in state.tailer.drain() {
-                state.push_transcript_event(&event, &prefs);
+                state.push_transcript_event(&event);
             }
 
             let (mut session, scope) = read_session(global, session_id)?;
@@ -1720,7 +1935,7 @@ fn attach_blocking_interactive(
                 .or_else(|| session.last_transcript_path.clone());
             if desired_run_id != state.followed_run_id {
                 for event in state.tailer.drain() {
-                    state.push_transcript_event(&event, &prefs);
+                    state.push_transcript_event(&event);
                 }
                 if let Some(next_path) = desired_transcript_path {
                     state.transcript_path = next_path.clone();
@@ -1804,7 +2019,7 @@ fn handle_session_live_keypress(
                 }
                 return handle_session_live_input(global, session, state, prefs, input);
             }
-            (KeyCode::Backspace, _) => {
+            (KeyCode::Backspace, _) | (KeyCode::Delete, _) => {
                 state.input_buffer.pop();
                 if state.input_buffer.is_empty() {
                     state.prompt_active = false;
@@ -1839,16 +2054,16 @@ fn handle_session_live_keypress(
             state.input_buffer.push(ch);
             Ok(AttachControl::Continue)
         }
-        (KeyCode::Char('f'), _) => {
+        (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
             state.view_mode = state.view_mode.toggled();
             rebuild_session_transcript_lines(state, prefs);
             Ok(AttachControl::Continue)
         }
-        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+        (KeyCode::Up, _) => {
             state.viewport.scroll_up(1);
             Ok(AttachControl::Continue)
         }
-        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+        (KeyCode::Down, _) => {
             state.viewport.scroll_down(1);
             Ok(AttachControl::Continue)
         }
@@ -1860,39 +2075,24 @@ fn handle_session_live_keypress(
             state.viewport.page_down();
             Ok(AttachControl::Continue)
         }
-        (KeyCode::Char('g'), KeyModifiers::NONE) => {
+        (KeyCode::Home, _) => {
             state.viewport.jump_top();
             Ok(AttachControl::Continue)
         }
-        (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
+        (KeyCode::End, _) => {
             state.viewport.jump_bottom();
             Ok(AttachControl::Continue)
         }
-        (KeyCode::Char('d'), _) | (KeyCode::Char(']'), KeyModifiers::CONTROL) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL)
+        | (KeyCode::Char(']'), KeyModifiers::CONTROL) => {
             Ok(AttachControl::Exit(AttachExit::Detach))
         }
-        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            Ok(AttachControl::Exit(AttachExit::Quit))
-        }
-        (KeyCode::Char('?'), _) => {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => Ok(AttachControl::Exit(AttachExit::Quit)),
+        (KeyCode::F(1), _) => {
             append_session_help_lines(state);
             Ok(AttachControl::Continue)
         }
-        (KeyCode::Char('x'), _) => {
-            let detail = cancel_active_turn_in_place(global, &session.session_id)?
-                .unwrap_or_else(|| "no active turn".into());
-            state.push_line(
-                crate::output::palette::Status::Awaiting,
-                format!("cancel requested  ·  {detail}"),
-            );
-            Ok(AttachControl::Continue)
-        }
-        (KeyCode::Char('s'), _) => {
-            stop_session_in_place(global, &session.session_id)?;
-            state.push_line(crate::output::palette::Status::Failed, "session stopped");
-            Ok(AttachControl::Continue)
-        }
-        (KeyCode::Char('p'), _) | (KeyCode::Enter, _) => {
+        (KeyCode::Enter, _) => {
             if session.status == SessionStatus::Stopped {
                 state.push_line(
                     crate::output::palette::Status::Failed,
@@ -1910,7 +2110,7 @@ fn handle_session_live_keypress(
                 state.push_line(
                     crate::output::palette::Status::Awaiting,
                     format!(
-                        "cancel requested  ·  {detail}  ·  press p once the session is idle to send the next prompt"
+                        "cancel requested  ·  {detail}  ·  press Enter once the session is idle to send the next prompt"
                     ),
                 );
                 return Ok(AttachControl::Continue);
@@ -1921,21 +2121,7 @@ fn handle_session_live_keypress(
     }
 }
 
-fn rebuild_session_transcript_lines(state: &mut SessionInteractiveState, prefs: &UiPrefs) {
-    let transcript_path = state.transcript_path.clone();
-    let followed_run_id = state.followed_run_id.clone();
-    state.lines.clear();
-    if let Some(run_id) = followed_run_id.as_deref() {
-        state.push_line(
-            crate::output::palette::Status::Working,
-            format!("attached to {}", compact_session_run_id(run_id)),
-        );
-    }
-    state.tailer = crate::output::TranscriptTailer::new(transcript_path);
-    for event in state.tailer.drain() {
-        state.push_transcript_event(&event, prefs);
-    }
-}
+fn rebuild_session_transcript_lines(_state: &mut SessionInteractiveState, _prefs: &UiPrefs) {}
 
 fn handle_session_live_input(
     global: &Path,
@@ -1959,14 +2145,7 @@ fn handle_session_live_input(
     } else {
         input.clone()
     };
-    state.push_line(
-        crate::output::palette::Status::Active,
-        retained_session_event_line(
-            crate::output::palette::Status::Active,
-            "you",
-            &truncate_single_line(prompt.as_str(), 96),
-        ),
-    );
+    state.push_user_prompt(prompt.clone());
     let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
     state.push_line(
         crate::output::palette::Status::Working,
@@ -2044,7 +2223,7 @@ fn build_session_screen_rows_for_size(
         .saturating_sub(rows.len())
         .saturating_sub(footer_reserved)
         .max(1);
-    let event_rows = render_session_event_rows(state, width, available_event_rows);
+    let event_rows = render_session_event_rows(state, _prefs, width, available_event_rows);
     rows.extend(event_rows);
     while rows.len() < height.saturating_sub(footer_reserved) {
         rows.push(String::new());
@@ -2091,7 +2270,7 @@ fn render_session_controls_line(width: usize) -> String {
     let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
     let _ = palette::write_colored(
         &mut buf,
-        "  type or /command  ·  Enter send  ·  Ctrl-U clear  ·  Ctrl-W word  ·  Esc cancel turn  ·  f cycle view  ·  ↑/↓ scroll  ·  d detach  ·  q quit  ·  ? help",
+        "  type or /command  ·  Enter send  ·  Ctrl-U clear  ·  Ctrl-W word  ·  Esc cancel turn  ·  Ctrl-F cycle view  ·  ↑/↓ scroll  ·  Ctrl-D detach  ·  Ctrl-C quit  ·  F1 help",
         DIM,
     );
     truncate_ansi_line(&buf, width)
@@ -2184,13 +2363,7 @@ fn should_begin_session_prompt(ch: char, status: SessionStatus) -> bool {
     if matches!(status, SessionStatus::Running | SessionStatus::Stopped) {
         return false;
     }
-    if ch == '/' {
-        return true;
-    }
-    !matches!(
-        ch,
-        '?' | 'f' | 'j' | 'k' | 'g' | 'G' | 'd' | 'q' | 'x' | 's'
-    )
+    !ch.is_control()
 }
 
 fn trim_last_prompt_word(buffer: &mut String) {
@@ -2204,35 +2377,483 @@ fn trim_last_prompt_word(buffer: &mut String) {
 
 fn render_session_event_rows(
     state: &mut SessionInteractiveState,
+    prefs: &UiPrefs,
     width: usize,
     max_rows: usize,
 ) -> Vec<String> {
     let mut rendered = Vec::new();
-    for line in &state.lines {
-        let prefix = if line.continuation {
-            "  ".to_string()
-        } else {
-            let mut value = String::new();
-            let _ = palette::write_bold_colored(
-                &mut value,
-                &line.status.glyph().to_string(),
-                line.status.color(),
-            );
-            value.push(' ');
-            value
-        };
-        let content_width = width.saturating_sub(2).max(1);
-        let wrapped = wrap_with_ansi(&line.text, content_width);
-        for (idx, segment) in wrapped.into_iter().enumerate() {
-            let text = if idx == 0 && !line.continuation {
-                format!("{prefix}{segment}")
-            } else {
-                format!("  {segment}")
-            };
-            rendered.push(text);
-        }
+    for (index, entry) in state.entries.iter().enumerate() {
+        rendered.extend(render_session_entry_rows(
+            entry,
+            state.entries.get(index + 1),
+            state.view_mode,
+            prefs,
+            width,
+        ));
     }
     state.viewport.apply(rendered, max_rows).rows
+}
+
+fn render_session_entry_rows(
+    entry: &SessionEntry,
+    next: Option<&SessionEntry>,
+    view_mode: LiveViewMode,
+    prefs: &UiPrefs,
+    width: usize,
+) -> Vec<String> {
+    use crate::output::palette::Status;
+
+    match entry {
+        SessionEntry::Notice(line) => render_notice_rows(line, width),
+        SessionEntry::UserPrompt { content } => {
+            let mut rows = render_role_header("you", BRAND, None, width);
+            rows.extend(render_indented_body_lines(
+                &content.lines().map(str::to_string).collect::<Vec<_>>(),
+                width,
+                "  ",
+            ));
+            rows
+        }
+        SessionEntry::Assistant {
+            content,
+            thinking,
+            streaming,
+        } => {
+            let mut rows = render_role_header(
+                "assistant",
+                if *streaming {
+                    Status::Working.color()
+                } else {
+                    Status::Active.color()
+                },
+                if *streaming { Some("typing") } else { None },
+                width,
+            );
+            if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
+                if view_mode == LiveViewMode::Full {
+                    rows.extend(render_indented_body_lines(
+                        &[retained_session_event_line(
+                            Status::Active,
+                            "thinking",
+                            &truncate_single_line(thinking, 96),
+                        )],
+                        width,
+                        "  ",
+                    ));
+                }
+            }
+            if !content.trim().is_empty() {
+                let payload = render_assistant_content(content.trim(), prefs);
+                let body_lines = match view_mode {
+                    LiveViewMode::Focused => render_payload_preview_lines(&payload, 6),
+                    LiveViewMode::Compact | LiveViewMode::Full => payload
+                        .rendered
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                };
+                rows.extend(render_indented_body_lines(&body_lines, width, "  "));
+            }
+            rows
+        }
+        SessionEntry::ToolCall { tool, input } => {
+            let mut rows = render_nested_event_rows(
+                next,
+                Status::Working,
+                retained_session_event_line(
+                    Status::Working,
+                    &format!("tool {tool}"),
+                    &transcript_tool_summary(tool, input),
+                ),
+                width,
+            );
+            match view_mode {
+                LiveViewMode::Focused => {}
+                LiveViewMode::Compact => {
+                    if let Some(rendered) = render_tool_input(tool, input, prefs) {
+                        rows.extend(render_nested_body_lines(
+                            next,
+                            &preview_rendered_lines(&rendered, 5),
+                            width,
+                        ));
+                    }
+                }
+                LiveViewMode::Full => {
+                    if let Some(rendered) = render_tool_input(tool, input, prefs) {
+                        rows.extend(render_nested_body_lines(
+                            next,
+                            &rendered.lines().map(str::to_string).collect::<Vec<_>>(),
+                            width,
+                        ));
+                    }
+                }
+            }
+            rows
+        }
+        SessionEntry::ToolResult {
+            output,
+            error,
+            duration_ms,
+        } => {
+            let status = if error.is_some() {
+                Status::Failed
+            } else {
+                Status::Complete
+            };
+            let label = if error.is_some() {
+                "tool error"
+            } else {
+                "tool result"
+            };
+            let raw = error.as_deref().unwrap_or(output.as_str());
+            let payload = render_payload(raw, prefs);
+            let mut rows = render_nested_event_rows(
+                next,
+                status,
+                retained_session_event_line(
+                    status,
+                    label,
+                    &session_payload_summary(&payload, *duration_ms),
+                ),
+                width,
+            );
+            match view_mode {
+                LiveViewMode::Focused => {}
+                LiveViewMode::Compact => {
+                    if error.is_some() {
+                        rows.extend(render_nested_body_lines(
+                            next,
+                            &render_payload_preview_lines(&payload, 3),
+                            width,
+                        ));
+                    }
+                }
+                LiveViewMode::Full => {
+                    rows.extend(render_nested_body_lines(
+                        next,
+                        &session_rich_payload_lines(&payload),
+                        width,
+                    ));
+                }
+            }
+            rows
+        }
+        SessionEntry::FileEdit { path, kind, diff } => {
+            let payload = render_payload(diff, prefs);
+            let mut rows = render_nested_event_rows(
+                next,
+                Status::Complete,
+                retained_session_event_line(
+                    Status::Complete,
+                    "file edit",
+                    &format!(
+                        "{} {}  ·  {}",
+                        format!("{kind:?}").to_lowercase(),
+                        path,
+                        payload.headline
+                    ),
+                ),
+                width,
+            );
+            match view_mode {
+                LiveViewMode::Focused => {}
+                LiveViewMode::Compact => rows.extend(render_nested_body_lines(
+                    next,
+                    &render_payload_preview_lines(&payload, 8),
+                    width,
+                )),
+                LiveViewMode::Full => rows.extend(render_nested_body_lines(
+                    next,
+                    &session_rich_payload_lines(&payload),
+                    width,
+                )),
+            }
+            rows
+        }
+        SessionEntry::CommandRun {
+            argv,
+            cwd,
+            exit_code,
+        } => render_nested_event_rows(
+            next,
+            if *exit_code == 0 {
+                Status::Complete
+            } else {
+                Status::Failed
+            },
+            retained_session_event_line(
+                if *exit_code == 0 {
+                    Status::Complete
+                } else {
+                    Status::Failed
+                },
+                "command",
+                &format!(
+                    "{}  ·  cwd {}  ·  exit {}",
+                    truncate_single_line(&argv.join(" "), 64),
+                    truncate_single_line(cwd, 24),
+                    exit_code
+                ),
+            ),
+            width,
+        ),
+        SessionEntry::ActionEmitted {
+            kind,
+            allowed,
+            applied,
+            reason,
+        } => {
+            let status = if *applied {
+                Status::Complete
+            } else if *allowed {
+                Status::Awaiting
+            } else {
+                Status::Failed
+            };
+            let mut detail = format!("action  ·  {kind}  ·  allowed={allowed} applied={applied}");
+            if let Some(reason) = reason.as_deref().filter(|value| !value.trim().is_empty()) {
+                detail.push_str("  ·  ");
+                detail.push_str(&truncate_single_line(reason, 64));
+            }
+            render_nested_event_rows(
+                next,
+                status,
+                retained_session_event_line_raw(status, "action", &detail),
+                width,
+            )
+        }
+        SessionEntry::GateRequested {
+            gate_id,
+            prompt,
+            decision,
+            decided_by,
+        } => {
+            let mut detail = format!(
+                "approval gate  ·  {gate_id}  ·  {}",
+                truncate_single_line(prompt, 72)
+            );
+            if let Some(decision) = decision.as_deref() {
+                detail.push_str(&format!("  ·  decision {decision}"));
+            }
+            if let Some(decided_by) = decided_by.as_deref() {
+                detail.push_str(&format!("  ·  by {decided_by}"));
+            }
+            render_nested_event_rows(
+                next,
+                Status::Awaiting,
+                retained_session_event_line_raw(Status::Awaiting, "approval gate", &detail),
+                width,
+            )
+        }
+        SessionEntry::RunStart {
+            run_id,
+            workspace_id,
+            mode,
+            started_at,
+        } => {
+            if view_mode != LiveViewMode::Full {
+                return Vec::new();
+            }
+            render_notice_rows(
+                &SessionViewLine {
+                    status: Status::Active,
+                    text: retained_session_event_line(
+                        Status::Active,
+                        "run started",
+                        &format!(
+                            "{}  ·  workspace {}  ·  mode {}  ·  {}",
+                            compact_session_run_id(run_id),
+                            workspace_id,
+                            format!("{mode:?}").to_lowercase(),
+                            started_at.format("%Y-%m-%d %H:%M:%S UTC")
+                        ),
+                    ),
+                    continuation: false,
+                },
+                width,
+            )
+        }
+        SessionEntry::TurnStart | SessionEntry::TurnEnd => Vec::new(),
+        SessionEntry::Usage {
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
+        } => {
+            if view_mode != LiveViewMode::Full {
+                return Vec::new();
+            }
+            render_notice_rows(
+                &SessionViewLine {
+                    status: Status::Active,
+                    text: retained_session_event_line_raw(
+                        Status::Active,
+                        "usage",
+                        &format!(
+                            "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"
+                        ),
+                    ),
+                    continuation: false,
+                },
+                width,
+            )
+        }
+        SessionEntry::RunComplete {
+            status,
+            total_tokens,
+            duration_ms,
+            error,
+        } => {
+            let status_color = match status {
+                RunStatus::Ok => Status::Complete,
+                RunStatus::Error | RunStatus::Aborted => Status::Failed,
+            };
+            let mut detail = format!(
+                "run complete  ·  status {}  ·  {}ms  ·  {} tokens",
+                format!("{status:?}").to_lowercase(),
+                duration_ms,
+                total_tokens
+            );
+            if let Some(error) = error.as_deref().filter(|value| !value.trim().is_empty()) {
+                detail.push_str("  ·  ");
+                detail.push_str(&truncate_single_line(error, 72));
+            }
+            render_notice_rows(
+                &SessionViewLine {
+                    status: status_color,
+                    text: retained_session_event_line_raw(status_color, "run complete", &detail),
+                    continuation: false,
+                },
+                width,
+            )
+        }
+    }
+}
+
+fn render_role_header(
+    label: &str,
+    color: owo_colors::Rgb,
+    detail: Option<&str>,
+    width: usize,
+) -> Vec<String> {
+    let mut header = String::new();
+    let _ = palette::write_bold_colored(&mut header, label, color);
+    if let Some(detail) = detail {
+        let _ = palette::write_colored(&mut header, "  ·  ", DIM);
+        let _ = palette::write_colored(&mut header, detail, DIM);
+    }
+    vec![truncate_ansi_line(&header, width)]
+}
+
+fn render_notice_rows(line: &SessionViewLine, width: usize) -> Vec<String> {
+    let prefix = if line.continuation {
+        "  ".to_string()
+    } else {
+        let mut value = String::new();
+        let _ = palette::write_bold_colored(
+            &mut value,
+            &line.status.glyph().to_string(),
+            line.status.color(),
+        );
+        value.push(' ');
+        value
+    };
+    wrap_prefixed_lines(&line.text, &prefix, "  ", width)
+}
+
+fn render_indented_body_lines(lines: &[String], width: usize, prefix: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in lines {
+        rows.extend(wrap_prefixed_lines(line, prefix, prefix, width));
+    }
+    rows
+}
+
+fn render_nested_event_rows(
+    next: Option<&SessionEntry>,
+    status: crate::output::palette::Status,
+    text: String,
+    width: usize,
+) -> Vec<String> {
+    let (first_prefix, continuation_prefix) = nested_prefixes(next);
+    let mut prefix = String::new();
+    prefix.push_str(&first_prefix);
+    let _ = palette::write_bold_colored(&mut prefix, &status.glyph().to_string(), status.color());
+    prefix.push(' ');
+    wrap_prefixed_lines(&text, &prefix, &continuation_prefix, width)
+}
+
+fn render_nested_body_lines(
+    next: Option<&SessionEntry>,
+    lines: &[String],
+    width: usize,
+) -> Vec<String> {
+    let (_, continuation_prefix) = nested_prefixes(next);
+    render_indented_body_lines(lines, width, &continuation_prefix)
+}
+
+fn nested_prefixes(next: Option<&SessionEntry>) -> (String, String) {
+    if session_entry_is_nested(next) {
+        ("  ├─ ".to_string(), "  │  ".to_string())
+    } else {
+        ("  └─ ".to_string(), "     ".to_string())
+    }
+}
+
+fn session_entry_is_nested(entry: Option<&SessionEntry>) -> bool {
+    matches!(
+        entry,
+        Some(
+            SessionEntry::ToolCall { .. }
+                | SessionEntry::ToolResult { .. }
+                | SessionEntry::FileEdit { .. }
+                | SessionEntry::CommandRun { .. }
+                | SessionEntry::ActionEmitted { .. }
+                | SessionEntry::GateRequested { .. }
+        )
+    )
+}
+
+fn wrap_prefixed_lines(
+    text: &str,
+    first_prefix: &str,
+    continuation_prefix: &str,
+    width: usize,
+) -> Vec<String> {
+    let content_width = width.saturating_sub(visible_len(first_prefix)).max(1);
+    let wrapped = wrap_with_ansi(text, content_width);
+    let mut rows = Vec::new();
+    for (idx, segment) in wrapped.into_iter().enumerate() {
+        rows.push(format!(
+            "{}{}",
+            if idx == 0 {
+                first_prefix
+            } else {
+                continuation_prefix
+            },
+            segment
+        ));
+    }
+    rows
+}
+
+fn preview_rendered_lines(rendered: &str, max_lines: usize) -> Vec<String> {
+    let max_lines = max_lines.max(1);
+    let all_lines = rendered.lines().map(str::to_string).collect::<Vec<_>>();
+    if all_lines.is_empty() {
+        return Vec::new();
+    }
+    let total = all_lines.len();
+    let shown = total.min(max_lines);
+    let mut out = all_lines.into_iter().take(shown).collect::<Vec<_>>();
+    if total > shown {
+        let hidden = total - shown;
+        let mut trailer = String::new();
+        let _ = palette::write_colored(&mut trailer, &format!("… +{hidden} more line(s)"), DIM);
+        out.push(trailer);
+    }
+    out
 }
 
 fn execute_routed_session_command(
@@ -2281,18 +2902,18 @@ fn execute_routed_session_command(
     };
 
     for line in stdout.lines() {
-        state.lines.push(SessionViewLine {
+        state.entries.push(SessionEntry::Notice(SessionViewLine {
             status,
             text: line.to_string(),
             continuation: true,
-        });
+        }));
     }
     for line in stderr.lines() {
-        state.lines.push(SessionViewLine {
+        state.entries.push(SessionEntry::Notice(SessionViewLine {
             status: crate::output::palette::Status::Failed,
             text: line.to_string(),
             continuation: true,
-        });
+        }));
     }
     if stdout.is_empty() && stderr.is_empty() {
         state.push_line(status, "command completed");
@@ -2395,6 +3016,7 @@ fn transcript_event_lines(
                 continuation: false,
             }]
         }
+        TranscriptEvent::AssistantDelta { .. } => Vec::new(),
         TranscriptEvent::TurnStart { turn_idx } => {
             if view_mode == LiveViewMode::Compact {
                 return Vec::new();
@@ -2460,7 +3082,7 @@ fn transcript_event_lines(
             out
         }
         TranscriptEvent::ToolCall { tool, input, .. } => match view_mode {
-            LiveViewMode::Focused | LiveViewMode::Compact => vec![SessionViewLine {
+            LiveViewMode::Focused => vec![SessionViewLine {
                 status: Status::Working,
                 text: retained_session_event_line(
                     Status::Working,
@@ -2469,6 +3091,27 @@ fn transcript_event_lines(
                 ),
                 continuation: false,
             }],
+            LiveViewMode::Compact => {
+                let mut out = vec![SessionViewLine {
+                    status: Status::Working,
+                    text: retained_session_event_line(
+                        Status::Working,
+                        &format!("tool {tool}"),
+                        &transcript_tool_summary(tool, input),
+                    ),
+                    continuation: false,
+                }];
+                if let Some(rendered) = render_tool_input(tool, input, prefs) {
+                    for line in preview_rendered_lines(&rendered, 5) {
+                        out.push(SessionViewLine {
+                            status: Status::Working,
+                            text: line,
+                            continuation: true,
+                        });
+                    }
+                }
+                out
+            }
             LiveViewMode::Full => {
                 let mut out = vec![SessionViewLine {
                     status: Status::Working,
@@ -2527,12 +3170,14 @@ fn transcript_event_lines(
                         ),
                         continuation: false,
                     }];
-                    for line in render_payload_preview_lines(&payload, 5) {
-                        out.push(SessionViewLine {
-                            status,
-                            text: line,
-                            continuation: true,
-                        });
+                    if error.is_some() {
+                        for line in render_payload_preview_lines(&payload, 3) {
+                            out.push(SessionViewLine {
+                                status,
+                                text: line,
+                                continuation: true,
+                            });
+                        }
                     }
                     out
                 }
@@ -2858,7 +3503,7 @@ fn transcript_tool_summary(tool: &str, input: &serde_json::Value) -> String {
 fn append_session_help_lines(state: &mut SessionInteractiveState) {
     state.push_line(
         crate::output::palette::Status::Active,
-        "help  ·  type or /command  ·  Enter send  ·  Ctrl-U clear  ·  Ctrl-W word  ·  Esc cancel turn  ·  f cycle view  ·  ↑/↓ scroll  ·  d detach  ·  q quit",
+        "help  ·  type or /command  ·  Enter send  ·  Ctrl-U clear  ·  Ctrl-W word  ·  Esc cancel turn  ·  Ctrl-F cycle view  ·  ↑/↓ scroll  ·  Ctrl-D detach  ·  Ctrl-C quit  ·  F1 help",
     );
     state.push_line(
         crate::output::palette::Status::Active,
@@ -2971,63 +3616,28 @@ fn handle_attach_keypress(
         return Ok(AttachControl::Continue);
     }
     match (key.code, key.modifiers) {
-        (KeyCode::Char('d'), _) | (KeyCode::Char(']'), KeyModifiers::CONTROL) => {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL)
+        | (KeyCode::Char(']'), KeyModifiers::CONTROL) => {
             Ok(AttachControl::Exit(AttachExit::Detach))
         }
-        (KeyCode::Char('q'), _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-            Ok(AttachControl::Exit(AttachExit::Quit))
-        }
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => Ok(AttachControl::Exit(AttachExit::Quit)),
         (KeyCode::Esc, _) => {
             if session.status == SessionStatus::Running {
                 cancel_active_turn(global, &session.session_id, printer)?;
                 printer.sideband_event(
                     crate::output::palette::Status::Awaiting,
                     "cancel requested",
-                    Some("press p once the session is idle to send the next prompt"),
+                    Some("press Enter once the session is idle to send the next prompt"),
                 );
                 return Ok(AttachControl::Continue);
-            }
-            if session.status == SessionStatus::Stopped {
-                printer.sideband_event(
-                    crate::output::palette::Status::Failed,
-                    "session stopped",
-                    Some("use `rupu session start` to create a new one"),
-                );
-                return Ok(AttachControl::Continue);
-            }
-            match prompt_for_session_input(printer, &session.session_id)? {
-                SessionInput::Submit(input) => {
-                    return handle_session_input(global, session, printer, input)
-                }
-                SessionInput::Cancelled => {
-                    printer.sideband_event(
-                        crate::output::palette::Status::Skipped,
-                        "prompt cancelled",
-                        None,
-                    );
-                }
-                SessionInput::Empty => {}
             }
             Ok(AttachControl::Continue)
         }
-        (KeyCode::Char('?'), _) => {
+        (KeyCode::F(1), _) => {
             render_attach_help(printer);
             Ok(AttachControl::Continue)
         }
-        (KeyCode::Char('x'), _) => {
-            cancel_active_turn(global, &session.session_id, printer)?;
-            Ok(AttachControl::Continue)
-        }
-        (KeyCode::Char('s'), _) => {
-            stop_session_in_place(global, &session.session_id)?;
-            printer.sideband_event(
-                crate::output::palette::Status::Failed,
-                "session stopped",
-                Some(&session.session_id),
-            );
-            Ok(AttachControl::Continue)
-        }
-        (KeyCode::Char('p'), _) | (KeyCode::Enter, _) => {
+        (KeyCode::Enter, _) => {
             if session.status == SessionStatus::Running {
                 printer.sideband_event(
                     crate::output::palette::Status::Awaiting,
@@ -3304,7 +3914,7 @@ fn render_attach_help_hint(printer: &mut crate::output::LineStreamPrinter) {
     printer.sideband_event(
         crate::output::palette::Status::Active,
         "controls",
-        Some("type or /command  ·  Enter send  ·  Esc/x cancel turn  ·  d detach  ·  q quit  ·  ? help"),
+        Some("Enter prompt  ·  Esc cancel turn  ·  Ctrl-D detach  ·  Ctrl-C quit  ·  F1 help"),
     );
 }
 
@@ -3312,7 +3922,7 @@ fn render_attach_help(printer: &mut crate::output::LineStreamPrinter) {
     printer.sideband_event(
         crate::output::palette::Status::Active,
         "keys",
-        Some("type or /command  ·  Enter send  ·  Ctrl-U clear  ·  Ctrl-W delete word  ·  Esc cancel turn  ·  x cancel turn  ·  s stop session  ·  d detach  ·  q quit"),
+        Some("Enter prompt  ·  Ctrl-U clear  ·  Ctrl-W delete word  ·  Esc cancel turn  ·  Ctrl-D detach  ·  Ctrl-C quit  ·  F1 help"),
     );
     printer.sideband_event(
         crate::output::palette::Status::Active,
@@ -4411,6 +5021,40 @@ mod tests {
     }
 
     #[test]
+    fn plain_letter_keys_start_prompt_instead_of_triggering_actions() {
+        let session = SessionRecord {
+            status: SessionStatus::Idle,
+            ..test_session_record()
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+
+        let control = handle_session_live_keypress(
+            Path::new("/tmp/repo"),
+            &session,
+            &mut state,
+            &prefs,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        )
+        .expect("keypress handled");
+
+        assert!(matches!(control, AttachControl::Continue));
+        assert!(state.prompt_active);
+        assert_eq!(state.input_buffer, "s");
+        assert!(state.entries.is_empty());
+    }
+
+    #[test]
     fn retained_session_viewport_can_reach_oldest_rows() {
         let session = test_session_record();
         let prefs = UiPrefs::resolve(
@@ -4435,6 +5079,47 @@ mod tests {
         let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 72, 16);
         assert!(rows.iter().any(|row| row.contains("history line 000")));
         assert!(!rows.iter().any(|row| row.contains("history line 699")));
+    }
+
+    #[test]
+    fn retained_session_rows_group_assistant_text_and_hide_success_tool_output_in_compact() {
+        let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.push_user_prompt("summarize the issue");
+        state.push_transcript_event(&TranscriptEvent::AssistantDelta {
+            content: "Reading the repo".into(),
+        });
+        state.push_transcript_event(&TranscriptEvent::ToolCall {
+            call_id: "call_123".into(),
+            tool: "bash".into(),
+            input: serde_json::json!({ "command": "rg session crates/" }),
+        });
+        state.push_transcript_event(&TranscriptEvent::ToolResult {
+            call_id: "call_123".into(),
+            output: "line1\nline2\nline3\n".into(),
+            error: None,
+            duration_ms: 8,
+        });
+
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 96, 20);
+        assert!(rows.iter().any(|row| row.contains("you")));
+        assert!(rows.iter().any(|row| row.contains("assistant")));
+        assert!(rows.iter().any(|row| row.contains("Reading the repo")));
+        assert!(rows.iter().any(|row| row.contains("tool bash")));
+        assert!(rows.iter().any(|row| row.contains("command: |")));
+        assert!(rows.iter().any(|row| row.contains("tool result")));
+        assert!(!rows.iter().any(|row| row.contains("line1")));
     }
 
     #[test]
@@ -4530,9 +5215,40 @@ mod tests {
             Some(LiveViewMode::Compact),
         );
         let compact = transcript_event_lines(&event, LiveViewMode::Compact, &prefs);
-        assert!(compact.len() > 1);
+        assert_eq!(compact.len(), 1);
         assert!(compact[0].text.contains("tool result"));
-        assert!(compact.iter().any(|line| line.text.contains("line1")));
+        assert!(!compact.iter().any(|line| line.text.contains("line1")));
+    }
+
+    #[test]
+    fn assistant_delta_merges_into_single_streaming_assistant_entry() {
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+
+        state.push_transcript_event(&TranscriptEvent::AssistantDelta {
+            content: "Hello".into(),
+        });
+        state.push_transcript_event(&TranscriptEvent::AssistantDelta {
+            content: " world".into(),
+        });
+        state.push_transcript_event(&TranscriptEvent::AssistantMessage {
+            content: "Hello world".into(),
+            thinking: None,
+        });
+
+        assert_eq!(state.entries.len(), 1);
+        match &state.entries[0] {
+            SessionEntry::Assistant {
+                content, streaming, ..
+            } => {
+                assert_eq!(content, "Hello world");
+                assert!(!streaming);
+            }
+            other => panic!("expected assistant entry, got {other:?}"),
+        }
     }
 
     fn test_session_record() -> SessionRecord {
