@@ -18,8 +18,8 @@ use crate::output::rich_payload::{
     render_assistant_content, render_payload, render_payload_preview_lines, render_tool_input,
     RenderedPayload,
 };
-use crate::output::TranscriptHistoryPager;
 use crate::output::viewport::ViewportState;
+use crate::output::TranscriptHistoryPager;
 use crate::paths;
 use crate::standalone_run_metadata::{
     metadata_path_for_run, write_metadata, StandaloneRunMetadata,
@@ -39,11 +39,11 @@ use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternate
 use crossterm::{execute, queue};
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_agent::{load_agent, parse_mode, resolve_mode};
+use rupu_config::PricingConfig;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::types::{
     ContextManagement, Message, OutputFormat as ProviderOutputFormat, Speed,
 };
-use rupu_config::PricingConfig;
 use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
@@ -106,6 +106,8 @@ pub enum Action {
         #[arg(add = ArgValueCompleter::new(active_session_ids))]
         session_id: String,
     },
+    #[command(name = "_worker", hide = true)]
+    RunWorker(RunWorkerArgs),
     #[command(name = "_run-turn", hide = true)]
     RunTurn(RunTurnArgs),
 }
@@ -183,6 +185,12 @@ pub struct RunTurnArgs {
     pub run_id: String,
     #[arg(long)]
     pub prompt: String,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub struct RunWorkerArgs {
+    #[arg(long)]
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +297,20 @@ struct SessionRunRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionTurnRequest {
+    version: u32,
+    request_id: String,
+    run_id: String,
+    prompt: String,
+    transcript_path: PathBuf,
+    enqueued_at: DateTime<Utc>,
+}
+
+impl SessionTurnRequest {
+    const VERSION: u32 = 1;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionRecord {
     version: u32,
     session_id: String,
@@ -343,6 +365,8 @@ struct SessionRecord {
     active_transcript_path: Option<PathBuf>,
     #[serde(default)]
     active_pid: Option<u32>,
+    #[serde(default)]
+    worker_pid: Option<u32>,
     #[serde(default)]
     last_run_id: Option<String>,
     #[serde(default)]
@@ -1005,6 +1029,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::Send(args) => send(args).await,
         Action::Attach { session_id, view } => attach(&session_id, view).await,
         Action::Stop { session_id } => stop(&session_id).await,
+        Action::RunWorker(args) => run_worker(args).await,
         Action::RunTurn(args) => run_turn(args).await,
     };
     match result {
@@ -1025,6 +1050,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Send(_) => ("session send", report::TABLE_ONLY),
         Action::Attach { .. } => ("session attach", report::TABLE_ONLY),
         Action::Stop { .. } => ("session stop", report::TABLE_ONLY),
+        Action::RunWorker(_) => ("session _worker", report::TABLE_ONLY),
         Action::RunTurn(_) => ("session _run-turn", report::TABLE_ONLY),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
@@ -1314,6 +1340,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         active_run_id: None,
         active_transcript_path: None,
         active_pid: None,
+        worker_pid: None,
         last_run_id: None,
         last_transcript_path: None,
         last_error: None,
@@ -1337,7 +1364,6 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     if session.status == SessionStatus::Stopped {
         anyhow::bail!("session {} is stopped", session.session_id);
     }
-    ensure_session_available(&session)?;
     launch_turn(
         &global,
         &session.session_id,
@@ -1368,27 +1394,38 @@ async fn launch_turn(
 }
 
 fn launch_turn_detached(global: &Path, session_id: &str, prompt: String) -> anyhow::Result<String> {
+    enqueue_turn_request(global, session_id, prompt)
+}
+
+fn enqueue_turn_request(global: &Path, session_id: &str, prompt: String) -> anyhow::Result<String> {
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session send")?;
     if reconcile_stale_session(&mut session) {
         write_session(global, scope, &session)?;
     }
-    ensure_session_available(&session)?;
+    if session.status == SessionStatus::Stopped {
+        anyhow::bail!("session {} is stopped", session.session_id);
+    }
+
+    let worker_pid = ensure_session_worker(global, &mut session, scope)?;
 
     let run_id = format!("run_{}", Ulid::new());
     let transcript_path = session.transcripts_dir.join(format!("{run_id}.jsonl"));
-    let started_at = Utc::now();
-    session.status = SessionStatus::Running;
-    session.updated_at = started_at;
-    session.active_run_id = Some(run_id.clone());
-    session.active_transcript_path = Some(transcript_path.clone());
-    session.active_pid = None;
+    let request_id = Ulid::new().to_string();
+    let enqueued_at = Utc::now();
+    if session.status != SessionStatus::Running {
+        session.status = SessionStatus::Running;
+        session.active_run_id = Some(run_id.clone());
+        session.active_transcript_path = Some(transcript_path.clone());
+        session.active_pid = Some(worker_pid);
+    }
+    session.updated_at = enqueued_at;
     session.last_error = None;
     session.runs.push(SessionRunRecord {
         run_id: run_id.clone(),
         prompt: prompt.clone(),
         transcript_path: transcript_path.clone(),
-        started_at,
+        started_at: enqueued_at,
         completed_at: None,
         status: None,
         total_tokens_in: 0,
@@ -1399,32 +1436,57 @@ fn launch_turn_detached(global: &Path, session_id: &str, prompt: String) -> anyh
     });
     write_session(global, scope, &session)?;
 
+    enqueue_session_turn_request(
+        global,
+        scope,
+        &session.session_id,
+        SessionTurnRequest {
+            version: SessionTurnRequest::VERSION,
+            request_id,
+            run_id: run_id.clone(),
+            prompt,
+            transcript_path,
+            enqueued_at,
+        },
+    )?;
+    Ok(run_id)
+}
+
+fn ensure_session_worker(
+    global: &Path,
+    session: &mut SessionRecord,
+    scope: SessionScope,
+) -> anyhow::Result<u32> {
+    if let Some(pid) = session.worker_pid.filter(|pid| pid_is_running(*pid)) {
+        return Ok(pid);
+    }
+    session.worker_pid = None;
+    if session.status != SessionStatus::Running {
+        session.active_pid = None;
+    }
+    write_session(global, scope, session)?;
+
     let exe = std::env::current_exe()?;
     let child = Command::new(exe)
         .arg("session")
-        .arg("_run-turn")
+        .arg("_worker")
         .arg("--session-id")
-        .arg(session_id)
-        .arg("--run-id")
-        .arg(&run_id)
-        .arg("--prompt")
-        .arg(&prompt)
+        .arg(&session.session_id)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .with_context(|| format!("spawn session worker for {session_id}"))?;
+        .with_context(|| format!("spawn warm session worker for {}", session.session_id))?;
 
     let pid = child.id();
-    let (mut session, scope) = read_session(global, session_id)?;
-    if let Some(run) = session.runs.iter_mut().find(|run| run.run_id == run_id) {
-        run.pid = Some(pid);
-    }
-    session.active_pid = Some(pid);
+    session.worker_pid = Some(pid);
     session.updated_at = Utc::now();
-    write_session(global, scope, &session)?;
+    if session.status == SessionStatus::Running {
+        session.active_pid = Some(pid);
+    }
+    write_session(global, scope, session)?;
     drop(child);
-    Ok(run_id)
+    Ok(pid)
 }
 
 async fn attach(session_id: &str, view: Option<LiveViewMode>) -> anyhow::Result<()> {
@@ -1617,6 +1679,7 @@ enum SessionEntry {
     Notice(SessionViewLine),
     UserPrompt {
         content: String,
+        run_id: Option<String>,
         queued: bool,
     },
     Assistant {
@@ -1815,8 +1878,10 @@ impl SessionInteractiveState {
         self.transcript_path = transcript_path.clone();
         let mut pager = TranscriptHistoryPager::new(&transcript_path);
         let preload = pager.load_previous(preload_events);
-        self.tailer =
-            crate::output::TranscriptTailer::with_offset(transcript_path.clone(), pager.end_offset());
+        self.tailer = crate::output::TranscriptTailer::with_offset(
+            transcript_path.clone(),
+            pager.end_offset(),
+        );
         self.history_segments.push(SessionHistorySegment {
             start_entry: self.entries.len(),
             pager,
@@ -1849,7 +1914,10 @@ impl SessionInteractiveState {
     }
 
     fn maybe_load_older_history(&mut self) {
-        if !self.viewport.is_near_top(SESSION_HISTORY_BACKFILL_MARGIN_ROWS) {
+        if !self
+            .viewport
+            .is_near_top(SESSION_HISTORY_BACKFILL_MARGIN_ROWS)
+        {
             return;
         }
         self.load_older_history_batch(SESSION_HISTORY_BACKFILL_EVENTS);
@@ -2024,9 +2092,15 @@ impl SessionInteractiveState {
         }
     }
 
-    fn push_user_prompt(&mut self, content: impl Into<String>, queued: bool) -> usize {
+    fn push_user_prompt(
+        &mut self,
+        content: impl Into<String>,
+        run_id: Option<String>,
+        queued: bool,
+    ) -> usize {
         self.push_entry(SessionEntry::UserPrompt {
             content: content.into(),
+            run_id,
             queued,
         })
     }
@@ -2127,16 +2201,8 @@ impl SessionInteractiveState {
         None
     }
 
-    fn enqueue_prompt(&mut self, entry_index: usize, prompt: String) -> usize {
-        self.queued_prompts.push_back((entry_index, prompt));
-        self.queued_prompts.len()
-    }
-
-    fn dequeue_prompt(&mut self) -> Option<(usize, String)> {
-        self.queued_prompts.pop_front()
-    }
-
-    fn queued_prompt_count(&self) -> usize {
+    fn enqueue_prompt(&mut self, entry_index: usize, run_id: String) -> usize {
+        self.queued_prompts.push_back((entry_index, run_id));
         self.queued_prompts.len()
     }
 
@@ -2159,6 +2225,25 @@ impl SessionInteractiveState {
             *queued = false;
             self.invalidate_entry(entry_index);
         }
+    }
+
+    fn reconcile_queued_prompts(&mut self, session: &SessionRecord) {
+        let mut remaining = VecDeque::new();
+        while let Some((entry_index, run_id)) = self.queued_prompts.pop_front() {
+            let started_or_finished = session.active_run_id.as_deref() == Some(run_id.as_str())
+                || session.last_run_id.as_deref() == Some(run_id.as_str())
+                || session
+                    .runs
+                    .iter()
+                    .find(|run| run.run_id == run_id)
+                    .is_some_and(|run| run.status.is_some() || run.completed_at.is_some());
+            if started_or_finished {
+                self.mark_user_prompt_sent(entry_index);
+            } else {
+                remaining.push_back((entry_index, run_id));
+            }
+        }
+        self.queued_prompts = remaining;
     }
 
     fn render_cached_entry_rows(
@@ -2303,19 +2388,7 @@ fn attach_blocking_interactive(
             }
             state.sync_runtime_status(session.status);
 
-            if session.status != SessionStatus::Running {
-                if let Some((entry_index, prompt)) = state.dequeue_prompt() {
-                    let _run_id = launch_turn_detached(global, &session.session_id, prompt)?;
-                    state.mark_user_prompt_sent(entry_index);
-                    let (mut refreshed, scope) = read_session(global, session_id)?;
-                    ensure_active_scope(scope, "session attach")?;
-                    if reconcile_stale_session(&mut refreshed) {
-                        write_session(global, scope, &refreshed)?;
-                    }
-                    session = refreshed;
-                    state.sync_runtime_status(session.status);
-                }
-            }
+            state.reconcile_queued_prompts(&session);
 
             let desired_run_id = session
                 .active_run_id
@@ -2330,7 +2403,11 @@ fn attach_blocking_interactive(
                     state.push_transcript_event(&event);
                 }
                 if let Some(next_path) = desired_transcript_path {
-                    state.follow_transcript(next_path, desired_run_id.clone(), INITIAL_SESSION_HISTORY_EVENTS);
+                    state.follow_transcript(
+                        next_path,
+                        desired_run_id.clone(),
+                        INITIAL_SESSION_HISTORY_EVENTS,
+                    );
                 }
             }
 
@@ -2532,21 +2609,19 @@ fn handle_session_live_input(
     } else {
         input.clone()
     };
-    let entry_index =
-        state.push_user_prompt(prompt.clone(), session.status == SessionStatus::Running);
-    if session.status == SessionStatus::Running {
-        let _position = state.enqueue_prompt(entry_index, prompt);
-        return Ok(AttachControl::Continue);
+    let queued = session.status == SessionStatus::Running;
+    let entry_index = state.push_user_prompt(prompt.clone(), None, queued);
+    let run_id = launch_turn_detached(global, &session.session_id, prompt)?;
+    if let Some(SessionEntry::UserPrompt {
+        run_id: entry_run_id,
+        ..
+    }) = state.entries.get_mut(entry_index)
+    {
+        *entry_run_id = Some(run_id.clone());
     }
-    let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
-    state.push_line(
-        crate::output::palette::Status::Working,
-        retained_session_event_line(
-            crate::output::palette::Status::Working,
-            "queued",
-            &compact_session_run_id(&run_id),
-        ),
-    );
+    if queued {
+        let _position = state.enqueue_prompt(entry_index, run_id);
+    }
     Ok(AttachControl::Continue)
 }
 
@@ -2602,7 +2677,10 @@ fn build_session_screen_rows_for_size(
     width: usize,
     height: usize,
 ) -> Vec<String> {
-    let mut rows = vec![render_session_header_line(session, state, width), String::new()];
+    let mut rows = vec![
+        render_session_header_line(session, state, width),
+        String::new(),
+    ];
 
     let footer_reserved = 1usize;
     let available_event_rows = height
@@ -2648,7 +2726,10 @@ fn render_session_header_line(
         BRAND,
     );
 
-    let mut parts = vec![session.status.as_str().to_string(), truncate_single_line(&session.model, 24)];
+    let mut parts = vec![
+        session.status.as_str().to_string(),
+        truncate_single_line(&session.model, 24),
+    ];
     if let Some(effort) = session_effort_detail(session) {
         parts.push(effort);
     }
@@ -2656,8 +2737,9 @@ fn render_session_header_line(
     if let Some(cost) = session_total_cost_detail(session, state) {
         parts.push(cost);
     }
-    if state.queued_prompt_count() > 0 {
-        parts.push(format!("queued {}", state.queued_prompt_count()));
+    let queued_runs = session_pending_run_count(session);
+    if queued_runs > 0 {
+        parts.push(format!("queued {queued_runs}"));
     }
     let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
     let _ = palette::write_colored(&mut buf, &parts.join("  ·  "), DIM);
@@ -2684,12 +2766,9 @@ fn render_session_prompt_line(
     );
     let _ = palette::write_colored(&mut buf, " > ", DIM);
     if state.input_buffer.is_empty() {
-        if state.queued_prompt_count() > 0 {
-            let _ = palette::write_colored(
-                &mut buf,
-                &format!("queued {}", state.queued_prompt_count()),
-                DIM,
-            );
+        let queued_runs = session_pending_run_count(session);
+        if queued_runs > 0 {
+            let _ = palette::write_colored(&mut buf, &format!("queued {queued_runs}"), DIM);
         }
     } else {
         let _ = palette::write_colored(&mut buf, &state.input_buffer, DIM);
@@ -2835,7 +2914,10 @@ fn render_session_event_rows(
     }
 
     if cursor < bounds.end && !synthetic_rows.is_empty() {
-        let slice_start = bounds.start.saturating_sub(cursor).min(synthetic_rows.len());
+        let slice_start = bounds
+            .start
+            .saturating_sub(cursor)
+            .min(synthetic_rows.len());
         let slice_end = bounds.end.saturating_sub(cursor).min(synthetic_rows.len());
         rows.extend(synthetic_rows[slice_start..slice_end].iter().cloned());
     }
@@ -2875,7 +2957,9 @@ fn render_session_entry_rows(
 
     match entry {
         SessionEntry::Notice(line) => render_notice_rows(line, width),
-        SessionEntry::UserPrompt { content, queued } => {
+        SessionEntry::UserPrompt {
+            content, queued, ..
+        } => {
             let normalized = sanitize_terminal_text(content);
             let mut rows = render_role_header(
                 "you",
@@ -3268,11 +3352,7 @@ fn render_nested_event_rows(
     wrap_prefixed_lines(&text, &prefix, &continuation_prefix, width)
 }
 
-fn render_nested_body_lines(
-    next_is_nested: bool,
-    lines: &[String],
-    width: usize,
-) -> Vec<String> {
+fn render_nested_body_lines(next_is_nested: bool, lines: &[String], width: usize) -> Vec<String> {
     let (_, continuation_prefix) = nested_prefixes(next_is_nested);
     render_indented_body_lines(lines, width, &continuation_prefix)
 }
@@ -4610,12 +4690,9 @@ fn session_session_totals_detail(session: &SessionRecord) -> String {
 }
 
 fn session_effort_detail(session: &SessionRecord) -> Option<String> {
-    session.effort.map(|effort| {
-        format!(
-            "effort {}",
-            format!("{effort:?}").to_ascii_lowercase()
-        )
-    })
+    session
+        .effort
+        .map(|effort| format!("effort {}", format!("{effort:?}").to_ascii_lowercase()))
 }
 
 fn session_total_cost_detail(
@@ -4651,6 +4728,17 @@ fn session_recent_prompt(session: &SessionRecord) -> Option<String> {
         .runs
         .last()
         .map(|run| truncate_single_line(&run.prompt, 96))
+}
+
+fn session_pending_run_count(session: &SessionRecord) -> usize {
+    session
+        .runs
+        .iter()
+        .filter(|run| {
+            run.completed_at.is_none()
+                && session.active_run_id.as_deref() != Some(run.run_id.as_str())
+        })
+        .count()
 }
 
 fn compact_session_run_id(run_id: &str) -> String {
@@ -4831,7 +4919,11 @@ fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> 
     if reconcile_stale_session(&mut session) {
         write_session(&global, scope, &session)?;
     }
-    if let Some(pid) = session.active_pid.filter(|pid| pid_is_running(*pid)) {
+    if let Some(pid) = session
+        .active_pid
+        .or(session.worker_pid)
+        .filter(|pid| pid_is_running(*pid))
+    {
         let _ = terminate_pid(pid);
     }
     session.status = SessionStatus::Stopped;
@@ -4848,6 +4940,7 @@ fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> 
     session.active_run_id = None;
     session.active_transcript_path = None;
     session.active_pid = None;
+    session.worker_pid = None;
     if let Some(run) = session
         .runs
         .last_mut()
@@ -4858,6 +4951,7 @@ fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> 
         run.error = Some("stopped by operator".into());
     }
     write_session(&global, scope, &session)?;
+    clear_session_turn_queue(global, scope, session_id)?;
     Ok(())
 }
 
@@ -4891,7 +4985,11 @@ fn cancel_active_turn_in_place(global: &Path, session_id: &str) -> anyhow::Resul
     let Some(run_id) = session.active_run_id.clone() else {
         return Ok(None);
     };
-    if let Some(pid) = session.active_pid.filter(|pid| pid_is_running(*pid)) {
+    if let Some(pid) = session
+        .active_pid
+        .or(session.worker_pid)
+        .filter(|pid| pid_is_running(*pid))
+    {
         let _ = terminate_pid(pid);
     }
     session.status = SessionStatus::Idle;
@@ -4902,13 +5000,123 @@ fn cancel_active_turn_in_place(global: &Path, session_id: &str) -> anyhow::Resul
     session.active_run_id = None;
     session.active_transcript_path = None;
     session.active_pid = None;
+    session.worker_pid = None;
     if let Some(run) = session.runs.iter_mut().find(|run| run.run_id == run_id) {
         run.completed_at = Some(Utc::now());
         run.status = Some(RunStatus::Aborted);
         run.error = Some("turn cancelled by operator".into());
     }
     write_session(global, scope, &session)?;
+    if session_has_pending_turn_requests(global, scope, session_id)? {
+        let (mut refreshed, scope) = read_session(global, session_id)?;
+        refreshed.status = SessionStatus::Idle;
+        let _ = ensure_session_worker(global, &mut refreshed, scope)?;
+    }
     Ok(Some(run_id))
+}
+
+async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
+    crate::logging::init_to_file();
+
+    let global = paths::global_dir()?;
+    let worker_pid = std::process::id();
+
+    {
+        let (mut session, scope) = read_session(&global, &args.session_id)?;
+        ensure_active_scope(scope, "session _worker")?;
+        if let Some(existing_pid) = session.worker_pid {
+            if existing_pid != worker_pid && pid_is_running(existing_pid) {
+                return Ok(());
+            }
+        }
+        session.worker_pid = Some(worker_pid);
+        session.updated_at = Utc::now();
+        write_session(&global, scope, &session)?;
+    }
+
+    loop {
+        let (mut session, scope) = match read_session(&global, &args.session_id) {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        ensure_active_scope(scope, "session _worker")?;
+        if reconcile_stale_session(&mut session) {
+            write_session(&global, scope, &session)?;
+        }
+        if session.worker_pid != Some(worker_pid) {
+            break;
+        }
+
+        if let Some((request, claimed_path)) =
+            claim_next_session_turn_request(&global, scope, &args.session_id)?
+        {
+            let transcript_path = request.transcript_path.clone();
+            session.status = SessionStatus::Running;
+            session.updated_at = Utc::now();
+            session.active_run_id = Some(request.run_id.clone());
+            session.active_transcript_path = Some(transcript_path.clone());
+            session.active_pid = Some(worker_pid);
+            session.last_error = None;
+            if let Some(run) = session
+                .runs
+                .iter_mut()
+                .find(|run| run.run_id == request.run_id)
+            {
+                run.pid = Some(worker_pid);
+                run.transcript_path = transcript_path.clone();
+            }
+            write_session(&global, scope, &session)?;
+
+            let result = run_turn(RunTurnArgs {
+                session_id: args.session_id.clone(),
+                run_id: request.run_id.clone(),
+                prompt: request.prompt.clone(),
+            })
+            .await;
+            let _ = fs::remove_file(&claimed_path);
+
+            if let Err(err) = result {
+                let (mut failed, scope) = read_session(&global, &args.session_id)?;
+                ensure_active_scope(scope, "session _worker")?;
+                if failed.worker_pid == Some(worker_pid) {
+                    failed.status = SessionStatus::Failed;
+                    failed.updated_at = Utc::now();
+                    failed.active_run_id = None;
+                    failed.active_transcript_path = None;
+                    failed.active_pid = None;
+                    failed.last_run_id = Some(request.run_id.clone());
+                    failed.last_transcript_path = Some(transcript_path.clone());
+                    failed.last_error = Some(err.to_string());
+                    if let Some(run) = failed
+                        .runs
+                        .iter_mut()
+                        .find(|run| run.run_id == request.run_id)
+                    {
+                        run.completed_at.get_or_insert(Utc::now());
+                        run.status.get_or_insert(RunStatus::Error);
+                        run.error.get_or_insert_with(|| err.to_string());
+                        run.transcript_path = transcript_path.clone();
+                    }
+                    write_session(&global, scope, &failed)?;
+                }
+            }
+            continue;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    if let Ok((mut session, scope)) = read_session(&global, &args.session_id) {
+        if session.worker_pid == Some(worker_pid) {
+            session.worker_pid = None;
+            if session.active_pid == Some(worker_pid) {
+                session.active_pid = None;
+            }
+            session.updated_at = Utc::now();
+            let _ = write_session(&global, scope, &session);
+        }
+    }
+    Ok(())
 }
 
 async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
@@ -5116,21 +5324,6 @@ fn duration_ms_from_transcript(path: &Path) -> anyhow::Result<u64> {
     Ok(0)
 }
 
-fn ensure_session_available(session: &SessionRecord) -> anyhow::Result<()> {
-    if session.status == SessionStatus::Running {
-        if let Some(pid) = session.active_pid {
-            if pid_is_running(pid) {
-                anyhow::bail!(
-                    "session {} is already running {}",
-                    session.session_id,
-                    session.active_run_id.as_deref().unwrap_or("a turn")
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 fn ensure_active_scope(scope: SessionScope, command: &str) -> anyhow::Result<()> {
     if scope == SessionScope::Archived {
         anyhow::bail!("{command} does not support archived sessions; restore the session first");
@@ -5139,24 +5332,38 @@ fn ensure_active_scope(scope: SessionScope, command: &str) -> anyhow::Result<()>
 }
 
 fn ensure_session_not_running(session: &SessionRecord, action: &str) -> anyhow::Result<()> {
-    if session.status == SessionStatus::Running && session.active_pid.is_some_and(pid_is_running) {
+    if session
+        .active_pid
+        .or(session.worker_pid)
+        .is_some_and(pid_is_running)
+    {
         anyhow::bail!(
-            "cannot {action} session {} while {} is still running",
+            "cannot {action} session {} while the worker is still running",
             session.session_id,
-            session.active_run_id.as_deref().unwrap_or("a turn")
         );
     }
     Ok(())
 }
 
 fn reconcile_stale_session(session: &mut SessionRecord) -> bool {
+    let worker_alive = session.worker_pid.is_some_and(pid_is_running);
+    let active_alive = session.active_pid.is_some_and(pid_is_running);
     if session.status != SessionStatus::Running {
-        return false;
+        let mut changed = false;
+        if session.worker_pid.is_some() && !worker_alive {
+            session.worker_pid = None;
+            changed = true;
+        }
+        if session.active_pid.is_some() && !active_alive {
+            session.active_pid = None;
+            changed = true;
+        }
+        if changed {
+            session.updated_at = Utc::now();
+        }
+        return changed;
     }
-    let Some(pid) = session.active_pid else {
-        return false;
-    };
-    if pid_is_running(pid) {
+    if active_alive || worker_alive {
         return false;
     }
     session.status = SessionStatus::Failed;
@@ -5173,6 +5380,7 @@ fn reconcile_stale_session(session: &mut SessionRecord) -> bool {
     session.active_run_id = None;
     session.active_transcript_path = None;
     session.active_pid = None;
+    session.worker_pid = None;
     if let Some(run) = session
         .runs
         .last_mut()
@@ -5196,6 +5404,90 @@ fn session_dir(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf 
 
 fn session_record_path(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
     session_dir(global, scope, session_id).join("session.json")
+}
+
+fn session_turn_queue_dir(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
+    session_dir(global, scope, session_id).join("queue")
+}
+
+fn session_turn_request_path(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+    request_id: &str,
+) -> PathBuf {
+    session_turn_queue_dir(global, scope, session_id).join(format!("{request_id}.json"))
+}
+
+fn enqueue_session_turn_request(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+    request: SessionTurnRequest,
+) -> anyhow::Result<()> {
+    let dir = session_turn_queue_dir(global, scope, session_id);
+    fs::create_dir_all(&dir)?;
+    let path = session_turn_request_path(global, scope, session_id, &request.request_id);
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(&request)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn claim_next_session_turn_request(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+) -> anyhow::Result<Option<(SessionTurnRequest, PathBuf)>> {
+    let dir = session_turn_queue_dir(global, scope, session_id);
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let mut paths = fs::read_dir(&dir)?
+        .filter_map(|entry| entry.ok().map(|item| item.path()))
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let claimed = path.with_extension("processing");
+        if fs::rename(&path, &claimed).is_err() {
+            continue;
+        }
+        let bytes = fs::read(&claimed)
+            .with_context(|| format!("read session turn request {}", claimed.display()))?;
+        let request: SessionTurnRequest = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse session turn request {}", claimed.display()))?;
+        return Ok(Some((request, claimed)));
+    }
+    Ok(None)
+}
+
+fn clear_session_turn_queue(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let dir = session_turn_queue_dir(global, scope, session_id);
+    if dir.is_dir() {
+        fs::remove_dir_all(&dir)
+            .with_context(|| format!("remove session queue {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+fn session_has_pending_turn_requests(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let dir = session_turn_queue_dir(global, scope, session_id);
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    Ok(fs::read_dir(&dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json")))
 }
 
 fn write_session(
@@ -5410,10 +5702,7 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    fn write_session_transcript(
-        path: &Path,
-        assistant_lines: impl IntoIterator<Item = String>,
-    ) {
+    fn write_session_transcript(path: &Path, assistant_lines: impl IntoIterator<Item = String>) {
         let mut lines = Vec::new();
         lines.push(
             serde_json::to_string(&TranscriptEvent::RunStart {
@@ -5648,10 +5937,14 @@ mod tests {
 
     #[test]
     fn handle_session_live_input_queues_prompt_while_running() {
+        let global = tempfile::tempdir().expect("tmpdir");
         let session = SessionRecord {
             status: SessionStatus::Running,
+            active_pid: Some(std::process::id()),
+            worker_pid: Some(std::process::id()),
             ..test_session_record()
         };
+        write_session(global.path(), SessionScope::Active, &session).expect("write session");
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),
             false,
@@ -5666,7 +5959,7 @@ mod tests {
         );
 
         let control = handle_session_live_input(
-            Path::new("/tmp/repo"),
+            global.path(),
             &session,
             &mut state,
             &prefs,
@@ -5675,11 +5968,82 @@ mod tests {
         .expect("input handled");
 
         assert!(matches!(control, AttachControl::Continue));
-        assert_eq!(state.queued_prompt_count(), 1);
+        assert_eq!(state.queued_prompts.len(), 1);
+        assert!(session_has_pending_turn_requests(
+            global.path(),
+            SessionScope::Active,
+            &session.session_id
+        )
+        .expect("queue status"));
         assert!(matches!(
             state.entries.first(),
-            Some(SessionEntry::UserPrompt { content, queued: true }) if content == "summarize the repo"
+            Some(SessionEntry::UserPrompt { content, queued: true, .. }) if content == "summarize the repo"
         ));
+    }
+
+    #[test]
+    fn claim_next_session_turn_request_returns_oldest_request_first() {
+        let global = tempfile::tempdir().expect("tmpdir");
+        let session = test_session_record();
+        write_session(global.path(), SessionScope::Active, &session).expect("write session");
+        enqueue_session_turn_request(
+            global.path(),
+            SessionScope::Active,
+            &session.session_id,
+            SessionTurnRequest {
+                version: SessionTurnRequest::VERSION,
+                request_id: "01KTEST0000000000000000001".into(),
+                run_id: "run_oldest".into(),
+                prompt: "first".into(),
+                transcript_path: session.transcripts_dir.join("run_oldest.jsonl"),
+                enqueued_at: Utc::now(),
+            },
+        )
+        .expect("enqueue oldest");
+        enqueue_session_turn_request(
+            global.path(),
+            SessionScope::Active,
+            &session.session_id,
+            SessionTurnRequest {
+                version: SessionTurnRequest::VERSION,
+                request_id: "01KTEST0000000000000000002".into(),
+                run_id: "run_newest".into(),
+                prompt: "second".into(),
+                transcript_path: session.transcripts_dir.join("run_newest.jsonl"),
+                enqueued_at: Utc::now(),
+            },
+        )
+        .expect("enqueue newest");
+
+        let (request, claimed_path) = claim_next_session_turn_request(
+            global.path(),
+            SessionScope::Active,
+            &session.session_id,
+        )
+        .expect("claim request")
+        .expect("request present");
+
+        assert_eq!(request.run_id, "run_oldest");
+        assert_eq!(request.prompt, "first");
+        assert!(claimed_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext == "processing"));
+    }
+
+    #[test]
+    fn reconcile_stale_session_clears_dead_idle_worker() {
+        let mut session = SessionRecord {
+            status: SessionStatus::Idle,
+            worker_pid: Some(u32::MAX),
+            active_pid: None,
+            ..test_session_record()
+        };
+
+        assert!(reconcile_stale_session(&mut session));
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!(session.worker_pid, None);
+        assert_eq!(session.active_pid, None);
     }
 
     #[test]
@@ -5735,13 +6099,19 @@ mod tests {
         assert!(state.entries.len() < 221);
 
         let tail_rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 84, 16);
-        assert!(tail_rows.iter().any(|row| row.contains("assistant line 219")));
-        assert!(!tail_rows.iter().any(|row| row.contains("assistant line 000")));
+        assert!(tail_rows
+            .iter()
+            .any(|row| row.contains("assistant line 219")));
+        assert!(!tail_rows
+            .iter()
+            .any(|row| row.contains("assistant line 000")));
 
         state.load_all_older_history();
         state.viewport.jump_top();
         let top_rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 84, 16);
-        assert!(top_rows.iter().any(|row| row.contains("assistant line 000")));
+        assert!(top_rows
+            .iter()
+            .any(|row| row.contains("assistant line 000")));
     }
 
     #[test]
@@ -5768,8 +6138,12 @@ mod tests {
         state.viewport.jump_top();
 
         let initial_rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 72, 16);
-        assert!(initial_rows.iter().any(|row| row.contains("history line 000")));
-        assert!(!initial_rows.iter().any(|row| row.contains("history line 119")));
+        assert!(initial_rows
+            .iter()
+            .any(|row| row.contains("history line 000")));
+        assert!(!initial_rows
+            .iter()
+            .any(|row| row.contains("history line 119")));
 
         for index in 120..240 {
             state.push_line(
@@ -5779,8 +6153,12 @@ mod tests {
         }
 
         let grown_rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 72, 16);
-        assert!(grown_rows.iter().any(|row| row.contains("history line 000")));
-        assert!(!grown_rows.iter().any(|row| row.contains("history line 239")));
+        assert!(grown_rows
+            .iter()
+            .any(|row| row.contains("history line 000")));
+        assert!(!grown_rows
+            .iter()
+            .any(|row| row.contains("history line 239")));
     }
 
     #[test]
@@ -5798,7 +6176,7 @@ mod tests {
             Some("run_live123".into()),
             LiveViewMode::Compact,
         );
-        state.push_user_prompt("summarize the issue", false);
+        state.push_user_prompt("summarize the issue", None, false);
         state.push_transcript_event(&TranscriptEvent::AssistantDelta {
             content: "Reading the repo".into(),
         });
@@ -6162,6 +6540,7 @@ mod tests {
                 "/tmp/repo/.rupu/transcripts/run_live123.jsonl",
             )),
             active_pid: Some(1234),
+            worker_pid: Some(1234),
             last_run_id: Some("run_prev123".into()),
             last_transcript_path: Some(PathBuf::from(
                 "/tmp/repo/.rupu/transcripts/run_prev123.jsonl",
