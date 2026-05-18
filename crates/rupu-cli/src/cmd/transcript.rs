@@ -627,6 +627,7 @@ fn transcript_event_lines(
                 "assistant turn started",
             ),
         )],
+        TranscriptEvent::AssistantDelta { .. } => Vec::new(),
         TranscriptEvent::AssistantMessage { content, thinking } => {
             let mut out = Vec::new();
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -1067,6 +1068,7 @@ pub(crate) fn render_pretty_transcript_event(
                 Some("assistant turn started"),
             );
         }
+        TranscriptEvent::AssistantDelta { .. } => {}
         TranscriptEvent::AssistantMessage { content, thinking } => {
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
                 let detail = truncate_single_line(thinking, 96);

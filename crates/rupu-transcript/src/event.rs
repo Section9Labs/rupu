@@ -22,6 +22,9 @@ pub enum Event {
     TurnStart {
         turn_idx: u32,
     },
+    AssistantDelta {
+        content: String,
+    },
     AssistantMessage {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none", default)]

@@ -4114,6 +4114,7 @@ fn live_run_event_lines(
                 format!("turn {turn_idx}  ·  assistant turn started"),
             )]
         }
+        TranscriptEvent::AssistantDelta { .. } => Vec::new(),
         TranscriptEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
             match view_mode {
                 LiveViewMode::Focused => vec![serve_event_line(
