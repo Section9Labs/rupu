@@ -1615,6 +1615,7 @@ enum SessionEntry {
     Notice(SessionViewLine),
     UserPrompt {
         content: String,
+        queued: bool,
     },
     Assistant {
         content: String,
@@ -1692,7 +1693,7 @@ struct SessionInteractiveState {
     viewport: ViewportState,
     prompt_active: bool,
     input_buffer: String,
-    queued_prompts: VecDeque<String>,
+    queued_prompts: VecDeque<(usize, String)>,
     activity: SessionActivity,
 }
 
@@ -1857,10 +1858,12 @@ impl SessionInteractiveState {
         }
     }
 
-    fn push_user_prompt(&mut self, content: impl Into<String>) {
+    fn push_user_prompt(&mut self, content: impl Into<String>, queued: bool) -> usize {
         self.entries.push(SessionEntry::UserPrompt {
             content: content.into(),
+            queued,
         });
+        self.entries.len() - 1
     }
 
     fn push_assistant_delta(&mut self, chunk: &str) {
@@ -1926,12 +1929,12 @@ impl SessionInteractiveState {
         candidate.and_then(|idx| self.entries.get_mut(idx))
     }
 
-    fn enqueue_prompt(&mut self, prompt: String) -> usize {
-        self.queued_prompts.push_back(prompt);
+    fn enqueue_prompt(&mut self, entry_index: usize, prompt: String) -> usize {
+        self.queued_prompts.push_back((entry_index, prompt));
         self.queued_prompts.len()
     }
 
-    fn dequeue_prompt(&mut self) -> Option<String> {
+    fn dequeue_prompt(&mut self) -> Option<(usize, String)> {
         self.queued_prompts.pop_front()
     }
 
@@ -1951,6 +1954,12 @@ impl SessionInteractiveState {
 
     fn has_dynamic_render_state(&self, status: SessionStatus) -> bool {
         status == SessionStatus::Running || self.prompt_active || !self.input_buffer.is_empty()
+    }
+
+    fn mark_user_prompt_sent(&mut self, entry_index: usize) {
+        if let Some(SessionEntry::UserPrompt { queued, .. }) = self.entries.get_mut(entry_index) {
+            *queued = false;
+        }
     }
 }
 
@@ -2009,16 +2018,9 @@ fn attach_blocking_interactive(
             state.sync_runtime_status(session.status);
 
             if session.status != SessionStatus::Running {
-                if let Some(prompt) = state.dequeue_prompt() {
-                    let run_id = launch_turn_detached(global, &session.session_id, prompt)?;
-                    state.push_line(
-                        crate::output::palette::Status::Working,
-                        retained_session_event_line(
-                            crate::output::palette::Status::Working,
-                            "queued prompt",
-                            &format!("sent  ·  {}", compact_session_run_id(&run_id)),
-                        ),
-                    );
+                if let Some((entry_index, prompt)) = state.dequeue_prompt() {
+                    let _run_id = launch_turn_detached(global, &session.session_id, prompt)?;
+                    state.mark_user_prompt_sent(entry_index);
                     let (mut refreshed, scope) = read_session(global, session_id)?;
                     ensure_active_scope(scope, "session attach")?;
                     if reconcile_stale_session(&mut refreshed) {
@@ -2243,17 +2245,10 @@ fn handle_session_live_input(
     } else {
         input.clone()
     };
-    state.push_user_prompt(prompt.clone());
+    let entry_index =
+        state.push_user_prompt(prompt.clone(), session.status == SessionStatus::Running);
     if session.status == SessionStatus::Running {
-        let position = state.enqueue_prompt(prompt);
-        state.push_line(
-            crate::output::palette::Status::Awaiting,
-            retained_session_event_line(
-                crate::output::palette::Status::Awaiting,
-                "queued prompt",
-                &format!("position {position}  ·  Esc cancel turn or wait for completion"),
-            ),
-        );
+        let _position = state.enqueue_prompt(entry_index, prompt);
         return Ok(AttachControl::Continue);
     }
     let run_id = launch_turn_detached(global, &session.session_id, prompt.clone())?;
@@ -2564,9 +2559,14 @@ fn render_session_entry_rows(
 
     match entry {
         SessionEntry::Notice(line) => render_notice_rows(line, width),
-        SessionEntry::UserPrompt { content } => {
+        SessionEntry::UserPrompt { content, queued } => {
             let normalized = sanitize_terminal_text(content);
-            let mut rows = render_role_header("you", BRAND, None, width);
+            let mut rows = render_role_header(
+                "you",
+                BRAND,
+                if *queued { Some("queued") } else { None },
+                width,
+            );
             rows.extend(render_indented_body_lines(
                 &normalized
                     .split('\n')
@@ -2608,12 +2608,7 @@ fn render_session_entry_rows(
             if !content.trim().is_empty() {
                 let payload = render_assistant_content(content.trim(), prefs);
                 let body_lines = match view_mode {
-                    LiveViewMode::Focused => {
-                        vec![truncate_single_line(
-                            content.trim(),
-                            width.saturating_sub(4).max(24),
-                        )]
-                    }
+                    LiveViewMode::Focused => preview_rendered_lines(&payload.rendered, 4),
                     LiveViewMode::Compact | LiveViewMode::Full => payload
                         .rendered
                         .lines()
@@ -5284,12 +5279,8 @@ mod tests {
         assert_eq!(state.queued_prompt_count(), 1);
         assert!(matches!(
             state.entries.first(),
-            Some(SessionEntry::UserPrompt { content }) if content == "summarize the repo"
+            Some(SessionEntry::UserPrompt { content, queued: true }) if content == "summarize the repo"
         ));
-        assert!(state.entries.iter().any(|entry| matches!(
-            entry,
-            SessionEntry::Notice(line) if line.text.contains("queued prompt")
-        )));
     }
 
     #[test]
@@ -5334,7 +5325,7 @@ mod tests {
             Some("run_live123".into()),
             LiveViewMode::Compact,
         );
-        state.push_user_prompt("summarize the issue");
+        state.push_user_prompt("summarize the issue", false);
         state.push_transcript_event(&TranscriptEvent::AssistantDelta {
             content: "Reading the repo".into(),
         });
