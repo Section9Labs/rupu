@@ -42,6 +42,7 @@ fn opts(
         dispatchable_agents: None,
         step_id: String::new(),
         on_tool_call: None,
+        on_stream_event: None,
     }
 }
 

@@ -31,6 +31,7 @@ const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 /// active node. Called from the agent's tokio task — must be
 /// non-blocking.
 pub type OnToolCallCallback = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+pub type OnStreamEventCallback = std::sync::Arc<dyn Fn(StreamEvent) + Send + Sync>;
 
 fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> &str {
     if input.len() <= max_bytes {
@@ -183,6 +184,10 @@ pub struct AgentRunOpts {
     pub step_id: String,
     /// Optional callback invoked before each tool dispatch.
     pub on_tool_call: Option<OnToolCallCallback>,
+    /// Optional callback invoked for live stream events while the
+    /// provider is generating. Used by session attach to surface
+    /// real-time usage/progress without changing transcript schema.
+    pub on_stream_event: Option<OnStreamEventCallback>,
 }
 
 /// Outcome of a finished run.
@@ -311,22 +316,29 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             let suppress = opts.suppress_stream_stdout;
             let mut stream_transcript_error: Option<rupu_transcript::WriteError> = None;
             let mut on_event = |ev: StreamEvent| {
-                if let StreamEvent::TextDelta(chunk) = ev {
-                    if !chunk.is_empty() && stream_transcript_error.is_none() {
-                        if let Err(err) = writer
-                            .write(&Event::AssistantDelta {
-                                content: chunk.clone(),
-                            })
-                            .and_then(|_| writer.flush())
-                        {
-                            stream_transcript_error = Some(err);
+                if let Some(cb) = opts.on_stream_event.as_ref() {
+                    cb(ev.clone());
+                }
+                match ev {
+                    StreamEvent::TextDelta(chunk) => {
+                        if !chunk.is_empty() && stream_transcript_error.is_none() {
+                            if let Err(err) = writer
+                                .write(&Event::AssistantDelta {
+                                    content: chunk.clone(),
+                                })
+                                .and_then(|_| writer.flush())
+                            {
+                                stream_transcript_error = Some(err);
+                            }
+                        }
+                        if !suppress {
+                            use std::io::Write;
+                            print!("{chunk}");
+                            let _ = std::io::stdout().flush();
                         }
                     }
-                    if !suppress {
-                        use std::io::Write;
-                        print!("{chunk}");
-                        let _ = std::io::stdout().flush();
-                    }
+                    StreamEvent::UsageSnapshot(_) => {}
+                    StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => {}
                 }
             };
             match opts.provider.stream(&req, &mut on_event).await {

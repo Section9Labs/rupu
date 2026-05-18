@@ -204,6 +204,7 @@ impl StepFactory for ParallelFactory {
             dispatchable_agents: Some(vec!["security-reviewer".into(), "perf-reviewer".into()]),
             step_id: String::new(),
             on_tool_call: None,
+            on_stream_event: None,
         }
     }
 }

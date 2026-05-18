@@ -179,6 +179,7 @@ impl LlmProvider for BrokerClient {
                             usage.input_tokens = data["input_tokens"].as_u64().unwrap_or(0) as u32;
                             usage.output_tokens =
                                 data["output_tokens"].as_u64().unwrap_or(0) as u32;
+                            on_event(StreamEvent::UsageSnapshot(usage.clone()));
                         }
                         _ => {}
                     }

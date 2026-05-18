@@ -80,6 +80,7 @@ impl StepFactory for FakeFactory {
             dispatchable_agents: None,
             step_id: step_id.to_string(),
             on_tool_call,
+            on_stream_event: None,
         }
     }
 }
@@ -445,6 +446,7 @@ impl StepFactory for FailingFactory {
             dispatchable_agents: None,
             step_id: step_id.to_string(),
             on_tool_call,
+            on_stream_event: None,
         }
     }
 }
@@ -1181,6 +1183,7 @@ impl StepFactory for PanelFactory {
             dispatchable_agents: None,
             step_id: step_id.to_string(),
             on_tool_call,
+            on_stream_event: None,
         }
     }
 }
@@ -1420,6 +1423,7 @@ impl StepFactory for LoopingPanelFactory {
             dispatchable_agents: None,
             step_id: step_id.to_string(),
             on_tool_call,
+            on_stream_event: None,
         }
     }
 }

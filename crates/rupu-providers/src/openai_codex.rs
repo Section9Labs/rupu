@@ -406,6 +406,11 @@ impl OpenAiCodexClient {
                     if let Some(usage) = resp.get("usage") {
                         acc.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0) as u32;
                         acc.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0) as u32;
+                        on_event(StreamEvent::UsageSnapshot(Usage {
+                            input_tokens: acc.input_tokens,
+                            output_tokens: acc.output_tokens,
+                            cached_tokens: 0,
+                        }));
                     }
                     // Extract stop reason
                     let status = resp["status"].as_str().unwrap_or("completed");
@@ -1325,7 +1330,10 @@ mod tests {
         assert_eq!(response.id, "resp_1");
         assert_eq!(response.text(), Some("Hello world!"));
         assert_eq!(response.usage.input_tokens, 10);
-        assert_eq!(events.len(), 2); // two TextDelta events
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().any(
+            |event| event.contains("UsageSnapshot(Usage { input_tokens: 10, output_tokens: 5")
+        ));
     }
 
     #[test]

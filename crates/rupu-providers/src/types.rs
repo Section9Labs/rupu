@@ -214,6 +214,8 @@ impl LlmResponse {
 pub enum StreamEvent {
     /// A chunk of text content.
     TextDelta(String),
+    /// Current provider-reported usage snapshot while streaming.
+    UsageSnapshot(Usage),
     /// A tool use block is starting.
     ToolUseStart { id: String, name: String },
     /// A chunk of tool input JSON.
