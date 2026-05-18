@@ -18,6 +18,7 @@ use crate::output::rich_payload::{
     render_assistant_content, render_payload, render_payload_preview_lines, render_tool_input,
     RenderedPayload,
 };
+use crate::output::TranscriptHistoryPager;
 use crate::output::viewport::ViewportState;
 use crate::paths;
 use crate::standalone_run_metadata::{
@@ -1702,12 +1703,23 @@ struct CachedSessionRows {
     rows: Vec<String>,
 }
 
+#[derive(Debug)]
+struct SessionHistorySegment {
+    start_entry: usize,
+    pager: TranscriptHistoryPager,
+}
+
+const INITIAL_SESSION_HISTORY_EVENTS: usize = 120;
+const SESSION_HISTORY_BACKFILL_EVENTS: usize = 160;
+const SESSION_HISTORY_BACKFILL_MARGIN_ROWS: usize = 24;
+
 struct SessionInteractiveState {
     followed_run_id: Option<String>,
     transcript_path: PathBuf,
     tailer: crate::output::TranscriptTailer,
     entries: Vec<SessionEntry>,
     entry_row_cache: Vec<Option<CachedSessionRows>>,
+    history_segments: Vec<SessionHistorySegment>,
     view_mode: LiveViewMode,
     viewport: ViewportState,
     prompt_active: bool,
@@ -1720,18 +1732,14 @@ struct SessionInteractiveState {
 }
 
 impl SessionInteractiveState {
-    fn new(
-        transcript_path: PathBuf,
-        followed_run_id: Option<String>,
-        view_mode: LiveViewMode,
-    ) -> Self {
-        let tailer = crate::output::TranscriptTailer::new(transcript_path.clone());
+    fn empty_history_builder(view_mode: LiveViewMode) -> Self {
         Self {
-            followed_run_id,
-            transcript_path,
-            tailer,
+            followed_run_id: None,
+            transcript_path: PathBuf::new(),
+            tailer: crate::output::TranscriptTailer::with_offset(PathBuf::new(), 0),
             entries: Vec::new(),
             entry_row_cache: Vec::new(),
+            history_segments: Vec::new(),
             view_mode,
             viewport: ViewportState::default(),
             prompt_active: false,
@@ -1742,6 +1750,36 @@ impl SessionInteractiveState {
             live_usage: SessionLiveUsage::default(),
             pricing: PricingConfig::default(),
         }
+    }
+
+    fn new(
+        transcript_path: PathBuf,
+        followed_run_id: Option<String>,
+        view_mode: LiveViewMode,
+    ) -> Self {
+        let mut state = Self {
+            followed_run_id,
+            transcript_path: transcript_path.clone(),
+            tailer: crate::output::TranscriptTailer::with_offset(transcript_path.clone(), 0),
+            entries: Vec::new(),
+            entry_row_cache: Vec::new(),
+            history_segments: Vec::new(),
+            view_mode,
+            viewport: ViewportState::default(),
+            prompt_active: false,
+            input_buffer: String::new(),
+            queued_prompts: VecDeque::new(),
+            activity: SessionActivity::Idle,
+            current_run_started_at: None,
+            live_usage: SessionLiveUsage::default(),
+            pricing: PricingConfig::default(),
+        };
+        state.follow_transcript(
+            transcript_path,
+            state.followed_run_id.clone(),
+            INITIAL_SESSION_HISTORY_EVENTS,
+        );
+        state
     }
 
     fn push_line(&mut self, status: crate::output::palette::Status, text: impl Into<String>) {
@@ -1765,6 +1803,83 @@ impl SessionInteractiveState {
         if let Some(slot) = self.entry_row_cache.get_mut(index) {
             *slot = None;
         }
+    }
+
+    fn follow_transcript(
+        &mut self,
+        transcript_path: PathBuf,
+        followed_run_id: Option<String>,
+        preload_events: usize,
+    ) {
+        self.followed_run_id = followed_run_id;
+        self.transcript_path = transcript_path.clone();
+        let mut pager = TranscriptHistoryPager::new(&transcript_path);
+        let preload = pager.load_previous(preload_events);
+        self.tailer =
+            crate::output::TranscriptTailer::with_offset(transcript_path.clone(), pager.end_offset());
+        self.history_segments.push(SessionHistorySegment {
+            start_entry: self.entries.len(),
+            pager,
+        });
+        for event in &preload {
+            self.push_transcript_event(event);
+        }
+        let (started_at, live_usage) = rebuild_live_usage_from_transcript(&transcript_path);
+        self.current_run_started_at = started_at;
+        self.live_usage = live_usage;
+        self.activity = SessionActivity::Idle;
+    }
+
+    fn insert_entries(&mut self, at: usize, new_entries: Vec<SessionEntry>) {
+        if new_entries.is_empty() {
+            return;
+        }
+        let inserted = new_entries.len();
+        if at > 0 {
+            self.invalidate_entry(at - 1);
+        }
+        let none_cache = std::iter::repeat_with(|| None).take(inserted);
+        self.entries.splice(at..at, new_entries);
+        self.entry_row_cache.splice(at..at, none_cache);
+        for segment in &mut self.history_segments {
+            if segment.start_entry > at {
+                segment.start_entry += inserted;
+            }
+        }
+    }
+
+    fn maybe_load_older_history(&mut self) {
+        if !self.viewport.is_near_top(SESSION_HISTORY_BACKFILL_MARGIN_ROWS) {
+            return;
+        }
+        self.load_older_history_batch(SESSION_HISTORY_BACKFILL_EVENTS);
+    }
+
+    fn load_all_older_history(&mut self) {
+        while self.load_older_history_batch(SESSION_HISTORY_BACKFILL_EVENTS) {}
+    }
+
+    fn load_older_history_batch(&mut self, batch_events: usize) -> bool {
+        let Some(segment_index) = self
+            .history_segments
+            .iter()
+            .position(|segment| !segment.pager.exhausted())
+        else {
+            return false;
+        };
+
+        let insert_at = self.history_segments[segment_index].start_entry;
+        let events = {
+            let segment = &mut self.history_segments[segment_index];
+            segment.pager.load_previous(batch_events)
+        };
+        if events.is_empty() {
+            return false;
+        }
+
+        let entries = build_session_history_entries(self.view_mode, &events);
+        self.insert_entries(insert_at, entries);
+        true
     }
 
     fn push_transcript_event(&mut self, event: &TranscriptEvent) {
@@ -2084,6 +2199,54 @@ impl SessionInteractiveState {
     }
 }
 
+fn build_session_history_entries(
+    view_mode: LiveViewMode,
+    events: &[TranscriptEvent],
+) -> Vec<SessionEntry> {
+    let mut builder = SessionInteractiveState::empty_history_builder(view_mode);
+    for event in events {
+        builder.push_transcript_event(event);
+    }
+    builder.entries
+}
+
+fn rebuild_live_usage_from_transcript(path: &Path) -> (Option<DateTime<Utc>>, SessionLiveUsage) {
+    let mut started_at = None;
+    let mut usage = SessionLiveUsage::default();
+    let Ok(iter) = JsonlReader::iter(path) else {
+        return (None, usage);
+    };
+    for event in iter.flatten() {
+        match event {
+            TranscriptEvent::RunStart {
+                provider,
+                model,
+                started_at: run_started_at,
+                ..
+            } => {
+                started_at = Some(run_started_at);
+                usage.provider = Some(provider);
+                usage.model = Some(model);
+            }
+            TranscriptEvent::Usage {
+                provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+            } => {
+                usage.provider = Some(provider);
+                usage.model = Some(model);
+                usage.input_tokens += input_tokens as u64;
+                usage.output_tokens += output_tokens as u64;
+                usage.cached_tokens += cached_tokens as u64;
+            }
+            _ => {}
+        }
+    }
+    (started_at, usage)
+}
+
 struct SessionScreenGuard;
 
 impl SessionScreenGuard {
@@ -2167,9 +2330,7 @@ fn attach_blocking_interactive(
                     state.push_transcript_event(&event);
                 }
                 if let Some(next_path) = desired_transcript_path {
-                    state.transcript_path = next_path.clone();
-                    state.followed_run_id = desired_run_id.clone();
-                    state.tailer = crate::output::TranscriptTailer::new(next_path);
+                    state.follow_transcript(next_path, desired_run_id.clone(), INITIAL_SESSION_HISTORY_EVENTS);
                 }
             }
 
@@ -2284,6 +2445,7 @@ fn handle_session_live_keypress(
         }
         (KeyCode::Up, _) => {
             state.viewport.scroll_up(1);
+            state.maybe_load_older_history();
             Ok(AttachControl::Continue)
         }
         (KeyCode::Down, _) => {
@@ -2292,6 +2454,7 @@ fn handle_session_live_keypress(
         }
         (KeyCode::PageUp, _) => {
             state.viewport.page_up();
+            state.maybe_load_older_history();
             Ok(AttachControl::Continue)
         }
         (KeyCode::PageDown, _) => {
@@ -2299,6 +2462,7 @@ fn handle_session_live_keypress(
             Ok(AttachControl::Continue)
         }
         (KeyCode::Home, _) => {
+            state.load_all_older_history();
             state.viewport.jump_top();
             Ok(AttachControl::Continue)
         }
@@ -2635,6 +2799,7 @@ fn render_session_event_rows(
     width: usize,
     max_rows: usize,
 ) -> Vec<String> {
+    state.maybe_load_older_history();
     let mut entry_counts = Vec::with_capacity(state.entries.len());
     let mut total_rows = 0usize;
     for index in 0..state.entries.len() {
@@ -5245,6 +5410,35 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    fn write_session_transcript(
+        path: &Path,
+        assistant_lines: impl IntoIterator<Item = String>,
+    ) {
+        let mut lines = Vec::new();
+        lines.push(
+            serde_json::to_string(&TranscriptEvent::RunStart {
+                run_id: "run_live123".into(),
+                workspace_id: "ws_live123".into(),
+                agent: "issue-reader".into(),
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+                started_at: Utc::now(),
+                mode: RunMode::Bypass,
+            })
+            .unwrap(),
+        );
+        for content in assistant_lines {
+            lines.push(
+                serde_json::to_string(&TranscriptEvent::AssistantMessage {
+                    content,
+                    thinking: None,
+                })
+                .unwrap(),
+            );
+        }
+        std::fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
     #[test]
     fn parse_attach_command_handles_known_commands() {
         assert!(matches!(
@@ -5513,6 +5707,41 @@ mod tests {
         let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 72, 16);
         assert!(rows.iter().any(|row| row.contains("history line 000")));
         assert!(!rows.iter().any(|row| row.contains("history line 699")));
+    }
+
+    #[test]
+    fn retained_session_attach_bootstraps_from_recent_tail_then_backfills_on_jump_top() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_path = dir.path().join("run_live123.jsonl");
+        write_session_transcript(
+            &transcript_path,
+            (0..220).map(|index| format!("assistant line {index:03}")),
+        );
+
+        let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let mut state = SessionInteractiveState::new(
+            transcript_path,
+            Some("run_live123".into()),
+            LiveViewMode::Focused,
+        );
+
+        assert!(state.entries.len() < 221);
+
+        let tail_rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 84, 16);
+        assert!(tail_rows.iter().any(|row| row.contains("assistant line 219")));
+        assert!(!tail_rows.iter().any(|row| row.contains("assistant line 000")));
+
+        state.load_all_older_history();
+        state.viewport.jump_top();
+        let top_rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 84, 16);
+        assert!(top_rows.iter().any(|row| row.contains("assistant line 000")));
     }
 
     #[test]
