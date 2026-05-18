@@ -16,7 +16,7 @@
 //! print stream — pipes and CI runners get clean output.
 
 use super::palette::{
-    self, Status, AWAITING, BRAND, BRAND_300, COMPLETE, DIM, FAILED, RUNNING, SEPARATOR, TOOL_ARROW,
+    self, AWAITING, BRAND, BRAND_300, COMPLETE, DIM, FAILED, RUNNING, SEPARATOR, Status, TOOL_ARROW,
 };
 use super::spinner::{Spinner, SpinnerHandle};
 use crate::cmd::ui::UiPrefs;
@@ -1185,6 +1185,33 @@ pub(crate) fn visible_len(s: &str) -> usize {
     n
 }
 
+/// Normalize raw terminal content before syntax highlighting or layout.
+///
+/// - `\r\n` and bare `\r` become `\n`
+/// - tabs expand to four spaces
+/// - raw ESC bytes are escaped so user/tool output cannot inject terminal control
+/// - other control chars are rendered visibly via `escape_default`
+pub(crate) fn sanitize_terminal_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    let _ = chars.next();
+                }
+                out.push('\n');
+            }
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
+            '\x1b' => out.push_str("\\x1b"),
+            other if other.is_control() => out.extend(other.escape_default()),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Wrap a possibly-ANSI-colored string into pieces of at most
 /// `width` *visible* characters, preserving in-place SGR (color)
 /// state across the cuts.
@@ -1257,6 +1284,19 @@ pub(crate) fn wrap_with_ansi(line: &str, width: usize) -> Vec<String> {
         pieces.push(String::new());
     }
     pieces
+}
+
+/// Wrap a possibly-ANSI-colored multi-line block, preserving explicit
+/// line breaks and blank lines.
+pub(crate) fn wrap_block_with_ansi(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        out.extend(wrap_with_ansi(line, width));
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -1580,6 +1620,19 @@ mod tests {
         assert_eq!(visible_len(&pieces[0]), 4);
         assert_eq!(visible_len(&pieces[1]), 4);
         assert_eq!(visible_len(&pieces[2]), 2);
+    }
+
+    #[test]
+    fn sanitize_terminal_text_normalizes_newlines_and_controls() {
+        let text = "one\r\ntwo\tthree\rfour\x1b[31m\x08";
+        let sanitized = sanitize_terminal_text(text);
+        assert_eq!(sanitized, "one\ntwo    three\nfour\\x1b[31m\\u{8}");
+    }
+
+    #[test]
+    fn wrap_block_with_ansi_preserves_blank_lines() {
+        let pieces = wrap_block_with_ansi("alpha\n\nbeta", 10);
+        assert_eq!(pieces, vec!["alpha", "", "beta"]);
     }
 
     fn make_finding(severity: &str, title: &str, body: &str, source: &str) -> FindingRecord {

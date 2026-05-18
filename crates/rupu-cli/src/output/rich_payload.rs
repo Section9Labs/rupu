@@ -4,6 +4,7 @@ use crate::cmd::ui::{
     highlight_yaml,
 };
 use crate::output::palette::{self, DIM};
+use crate::output::printer::sanitize_terminal_text;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadKind {
@@ -48,7 +49,8 @@ pub fn render_payload_preview_lines(payload: &RenderedPayload, max_lines: usize)
 }
 
 pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
-    if raw.trim().is_empty() {
+    let normalized = sanitize_terminal_text(raw);
+    if normalized.trim().is_empty() {
         return RenderedPayload {
             kind: PayloadKind::Empty,
             headline: "empty payload".into(),
@@ -56,7 +58,7 @@ pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
         };
     }
 
-    if let Some(records) = try_pretty_jsonl(raw) {
+    if let Some(records) = try_pretty_jsonl(&normalized) {
         let rendered = highlight_json(&records.join("\n\n"), prefs);
         return RenderedPayload {
             kind: PayloadKind::Jsonl {
@@ -67,7 +69,7 @@ pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
         };
     }
 
-    if let Some(pretty) = try_pretty_json(raw) {
+    if let Some(pretty) = try_pretty_json(&normalized) {
         return RenderedPayload {
             kind: PayloadKind::Json,
             headline: "json payload".into(),
@@ -75,7 +77,7 @@ pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
         };
     }
 
-    if let Some(pretty) = try_pretty_yaml(raw) {
+    if let Some(pretty) = try_pretty_yaml(&normalized) {
         return RenderedPayload {
             kind: PayloadKind::Yaml,
             headline: "yaml payload".into(),
@@ -83,7 +85,7 @@ pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
         };
     }
 
-    if let Some(pretty) = try_pretty_toml(raw) {
+    if let Some(pretty) = try_pretty_toml(&normalized) {
         return RenderedPayload {
             kind: PayloadKind::Toml,
             headline: "toml payload".into(),
@@ -91,45 +93,46 @@ pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
         };
     }
 
-    if looks_like_diff(raw) {
+    if looks_like_diff(&normalized) {
         return RenderedPayload {
             kind: PayloadKind::Diff,
             headline: "diff payload".into(),
-            rendered: highlight_diff(raw.trim_end(), prefs),
+            rendered: highlight_diff(normalized.trim_end(), prefs),
         };
     }
 
-    if looks_like_shell(raw) {
+    if looks_like_shell(&normalized) {
         return RenderedPayload {
             kind: PayloadKind::Shell,
             headline: "shell payload".into(),
-            rendered: highlight_shell(raw.trim_end(), prefs),
+            rendered: highlight_shell(normalized.trim_end(), prefs),
         };
     }
 
-    if looks_like_markdown(raw) {
+    if looks_like_markdown(&normalized) {
         return RenderedPayload {
             kind: PayloadKind::Markdown,
             headline: "markdown payload".into(),
-            rendered: highlight_markdown(raw.trim_end(), prefs),
+            rendered: highlight_markdown(normalized.trim_end(), prefs),
         };
     }
 
-    let line_count = raw.lines().count();
+    let line_count = normalized.lines().count();
     let headline = if line_count > 1 {
         format!("{line_count} lines")
     } else {
-        truncate_single_line(raw.trim(), 90)
+        truncate_single_line(normalized.trim(), 90)
     };
     RenderedPayload {
         kind: PayloadKind::Plain,
         headline,
-        rendered: raw.trim_end().to_string(),
+        rendered: normalized.trim_end().to_string(),
     }
 }
 
 pub fn render_assistant_content(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
-    let trimmed = raw.trim();
+    let normalized = sanitize_terminal_text(raw);
+    let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return RenderedPayload {
             kind: PayloadKind::Empty,
@@ -254,7 +257,21 @@ fn try_pretty_jsonl(raw: &str) -> Option<Vec<String>> {
 
 fn try_pretty_yaml(raw: &str) -> Option<String> {
     let value: serde_yaml::Value = serde_yaml::from_str(raw.trim()).ok()?;
+    if !structured_yaml(&value) {
+        return None;
+    }
     serde_yaml::to_string(&value).ok()
+}
+
+fn structured_yaml(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_) => true,
+        serde_yaml::Value::Tagged(tagged) => structured_yaml(&tagged.value),
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Number(_)
+        | serde_yaml::Value::String(_) => false,
+    }
 }
 
 fn try_pretty_toml(raw: &str) -> Option<String> {
@@ -294,7 +311,11 @@ fn render_labeled_fields(fields: &[(&str, Option<&str>)], prefs: &UiPrefs) -> Op
     let mut text = String::new();
     let mut wrote = false;
     for (label, value) in fields {
-        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        let Some(value) = value
+            .map(sanitize_terminal_text)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        else {
             continue;
         };
         if value.contains('\n') {
@@ -308,7 +329,7 @@ fn render_labeled_fields(fields: &[(&str, Option<&str>)], prefs: &UiPrefs) -> Op
         } else {
             text.push_str(label);
             text.push_str(": ");
-            text.push_str(value);
+            text.push_str(&value);
             text.push('\n');
         }
         wrote = true;
@@ -317,10 +338,13 @@ fn render_labeled_fields(fields: &[(&str, Option<&str>)], prefs: &UiPrefs) -> Op
 }
 
 fn render_bash_input(input: &serde_json::Value, prefs: &UiPrefs) -> Option<String> {
-    let command = input.get("command").and_then(|value| value.as_str())?;
+    let command = sanitize_terminal_text(input.get("command").and_then(|value| value.as_str())?);
     let cwd = input.get("cwd").and_then(|value| value.as_str());
     let mut text = String::new();
-    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+    if let Some(cwd) = cwd
+        .map(sanitize_terminal_text)
+        .filter(|value| !value.trim().is_empty())
+    {
         text.push_str("cwd: ");
         text.push_str(cwd.trim());
         text.push('\n');
@@ -348,19 +372,19 @@ fn render_grep_input(input: &serde_json::Value, prefs: &UiPrefs) -> Option<Strin
     let mut wrote = false;
     if let Some(pattern) = input.get("pattern").and_then(|value| value.as_str()) {
         text.push_str("pattern: ");
-        text.push_str(pattern.trim());
+        text.push_str(sanitize_terminal_text(pattern).trim());
         text.push('\n');
         wrote = true;
     }
     if let Some(path) = input.get("path").and_then(|value| value.as_str()) {
         text.push_str("path: ");
-        text.push_str(path.trim());
+        text.push_str(sanitize_terminal_text(path).trim());
         text.push('\n');
         wrote = true;
     }
     if let Some(glob) = input.get("glob").and_then(|value| value.as_str()) {
         text.push_str("glob: ");
-        text.push_str(glob.trim());
+        text.push_str(sanitize_terminal_text(glob).trim());
         text.push('\n');
         wrote = true;
     }
@@ -438,5 +462,12 @@ mod tests {
         );
         assert_eq!(payload.kind, PayloadKind::Markdown);
         assert!(!payload.rendered.contains("|-"));
+    }
+
+    #[test]
+    fn render_payload_sanitizes_terminal_control_characters() {
+        let payload = render_payload("alpha\r\nbeta\tgamma\x1b[31m", &prefs());
+        assert_eq!(payload.kind, PayloadKind::Plain);
+        assert!(payload.rendered.contains("alpha\nbeta    gamma\\x1b[31m"));
     }
 }

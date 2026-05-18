@@ -10,7 +10,9 @@ use crate::cmd::transcript::{
 use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::output::formats::OutputFormat;
 use crate::output::palette::{self, BRAND, DIM};
-use crate::output::printer::{visible_len, wrap_with_ansi};
+use crate::output::printer::{
+    sanitize_terminal_text, visible_len, wrap_block_with_ansi, wrap_with_ansi,
+};
 use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::output::rich_payload::{
     RenderedPayload, render_assistant_content, render_payload, render_payload_preview_lines,
@@ -864,7 +866,7 @@ fn render_session_show_transcript_event_rows(
             value
         };
         let content_width = width.saturating_sub(visible_len(&prefix)).max(1);
-        let wrapped = wrap_with_ansi(&line.text, content_width);
+        let wrapped = wrap_block_with_ansi(&line.text, content_width);
         for (idx, segment) in wrapped.into_iter().enumerate() {
             let text = if idx == 0 {
                 format!("{prefix}{segment}")
@@ -907,8 +909,8 @@ fn render_session_show_event_lines(
     } else {
         retained_session_event_line(status, label, detail)
     };
-    let available = width.saturating_sub(prefix.len()).max(12);
-    let wrapped = wrap_with_ansi(&raw, available);
+    let available = width.saturating_sub(visible_len(prefix)).max(12);
+    let wrapped = wrap_block_with_ansi(&raw, available);
     if wrapped.is_empty() {
         return vec![prefix.to_string()];
     }
@@ -2563,9 +2565,13 @@ fn render_session_entry_rows(
     match entry {
         SessionEntry::Notice(line) => render_notice_rows(line, width),
         SessionEntry::UserPrompt { content } => {
+            let normalized = sanitize_terminal_text(content);
             let mut rows = render_role_header("you", BRAND, None, width);
             rows.extend(render_indented_body_lines(
-                &content.lines().map(str::to_string).collect::<Vec<_>>(),
+                &normalized
+                    .split('\n')
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
                 width,
                 "  ",
             ));
@@ -2984,7 +2990,7 @@ fn wrap_prefixed_lines(
     width: usize,
 ) -> Vec<String> {
     let content_width = width.saturating_sub(visible_len(first_prefix)).max(1);
-    let wrapped = wrap_with_ansi(text, content_width);
+    let wrapped = wrap_block_with_ansi(text, content_width);
     let mut rows = Vec::new();
     for (idx, segment) in wrapped.into_iter().enumerate() {
         rows.push(format!(
@@ -5352,6 +5358,34 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("command: |")));
         assert!(rows.iter().any(|row| row.contains("tool result")));
         assert!(!rows.iter().any(|row| row.contains("line1")));
+    }
+
+    #[test]
+    fn retained_session_rows_wrap_multiline_assistant_output_with_indentation() {
+        let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.push_transcript_event(&TranscriptEvent::AssistantMessage {
+            content: "line one with a tab\tvalue\n\nline three after a blank line".into(),
+            thinking: None,
+        });
+
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 36, 18);
+        assert!(rows.iter().any(|row| row.contains("assistant")));
+        assert!(rows.iter().any(|row| row.contains("line one with")));
+        assert!(rows.iter().any(|row| row.contains("tab    value")));
+        assert!(rows.iter().any(|row| row.trim().is_empty() || row == "  "));
+        assert!(rows.iter().all(|row| visible_len(row) <= 36));
     }
 
     #[test]
