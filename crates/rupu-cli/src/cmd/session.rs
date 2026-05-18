@@ -42,6 +42,7 @@ use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::types::{
     ContextManagement, Message, OutputFormat as ProviderOutputFormat, Speed,
 };
+use rupu_config::PricingConfig;
 use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
@@ -1451,7 +1452,7 @@ fn attach_blocking(
     let view_mode = prefs.live_view;
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if interactive {
-        return attach_blocking_interactive(global, session_id, prefs);
+        return attach_blocking_interactive(global, session_id, prefs, cfg.pricing);
     }
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session attach")?;
@@ -1706,6 +1707,7 @@ struct SessionInteractiveState {
     activity: SessionActivity,
     current_run_started_at: Option<DateTime<Utc>>,
     live_usage: SessionLiveUsage,
+    pricing: PricingConfig,
 }
 
 impl SessionInteractiveState {
@@ -1728,6 +1730,7 @@ impl SessionInteractiveState {
             activity: SessionActivity::Idle,
             current_run_started_at: None,
             live_usage: SessionLiveUsage::default(),
+            pricing: PricingConfig::default(),
         }
     }
 
@@ -2005,6 +2008,7 @@ fn attach_blocking_interactive(
     global: &Path,
     session_id: &str,
     prefs: UiPrefs,
+    pricing: PricingConfig,
 ) -> anyhow::Result<()> {
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session attach")?;
@@ -2026,6 +2030,7 @@ fn attach_blocking_interactive(
         let _screen = SessionScreenGuard::enter()?;
         let mut state =
             SessionInteractiveState::new(transcript_path, followed_run_id, prefs.live_view);
+        state.pricing = pricing;
         let mut last_rows: Vec<String> = Vec::new();
 
         loop {
@@ -2338,15 +2343,9 @@ fn build_session_screen_rows_for_size(
     width: usize,
     height: usize,
 ) -> Vec<String> {
-    let view_mode = state.view_mode;
-    let mut rows = vec![
-        render_session_header_line(session, view_mode, width),
-        String::new(),
-        render_session_summary_line(session, state, width),
-    ];
-    rows.push(String::new());
+    let mut rows = vec![render_session_header_line(session, state, width), String::new()];
 
-    let footer_reserved = 2usize;
+    let footer_reserved = 1usize;
     let available_event_rows = height
         .saturating_sub(rows.len())
         .saturating_sub(footer_reserved)
@@ -2357,7 +2356,6 @@ fn build_session_screen_rows_for_size(
         rows.push(String::new());
     }
 
-    rows.push(render_session_controls_line(width));
     rows.push(render_session_prompt_line(session, state, width));
     rows.truncate(height);
     rows
@@ -2375,32 +2373,39 @@ fn render_session_screen_rows(rows: &[String]) -> anyhow::Result<()> {
 
 fn render_session_header_line(
     session: &SessionRecord,
-    view_mode: LiveViewMode,
+    state: &SessionInteractiveState,
     width: usize,
 ) -> String {
-    let agent = truncate_single_line(&session.agent_name, 24);
-    let sid = truncate_single_line(&session.session_id, 24);
     let mut buf = String::new();
-    let _ = palette::write_colored(&mut buf, "▶", BRAND);
-    buf.push(' ');
-    let _ = palette::write_bold_colored(&mut buf, "session attach", BRAND);
-    buf.push_str("  ");
-    let _ = palette::write_bold_colored(&mut buf, &agent, BRAND);
-    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
-    let _ = palette::write_colored(&mut buf, &sid, DIM);
-    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
-    let _ = palette::write_colored(&mut buf, view_mode.as_str(), DIM);
-    truncate_ansi_line(&buf, width)
-}
-
-fn render_session_controls_line(width: usize) -> String {
-    let mut buf = String::new();
-    let _ = palette::write_bold_colored(&mut buf, "controls", BRAND);
-    let _ = palette::write_colored(
+    let _ = palette::write_bold_colored(
         &mut buf,
-        "  type or /command  ·  Enter send or queue  ·  Ctrl-U clear  ·  Ctrl-W word  ·  Esc cancel turn  ·  Ctrl-F cycle view  ·  ↑/↓ scroll  ·  Ctrl-D detach  ·  Ctrl-C quit  ·  F1 help",
-        DIM,
+        &session_prompt_glyph(session.status).to_string(),
+        session.status.ui_status().color(),
     );
+    buf.push(' ');
+    let _ = palette::write_bold_colored(
+        &mut buf,
+        &truncate_single_line(&session.agent_name, 20),
+        BRAND,
+    );
+
+    let mut parts = vec![
+        session_activity_detail(session, state),
+        truncate_single_line(&session.model, 24),
+    ];
+    if let Some(effort) = session_effort_detail(session) {
+        parts.push(effort);
+    }
+    parts.push(session_session_totals_detail(session));
+    if let Some(cost) = session_total_cost_detail(session, state) {
+        parts.push(cost);
+    }
+    if state.queued_prompt_count() > 0 {
+        parts.push(format!("queued {}", state.queued_prompt_count()));
+    }
+    parts.push(state.view_mode.as_str().to_string());
+    let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+    let _ = palette::write_colored(&mut buf, &parts.join("  ·  "), DIM);
     truncate_ansi_line(&buf, width)
 }
 
@@ -2424,67 +2429,24 @@ fn render_session_prompt_line(
     );
     let _ = palette::write_colored(&mut buf, " > ", DIM);
     if state.input_buffer.is_empty() {
-        let queue_detail = if state.queued_prompt_count() > 0 {
-            format!("queued {}  ·  ", state.queued_prompt_count())
+        let placeholder = if session.status == SessionStatus::Running {
+            session_live_status_detail(session, state)
         } else {
-            String::new()
+            let mut parts = Vec::new();
+            if state.queued_prompt_count() > 0 {
+                parts.push(format!("queued {}", state.queued_prompt_count()));
+            }
+            if !state.viewport.at_tail() {
+                parts.push(state.viewport.status_text());
+            }
+            parts.push("F1 help".to_string());
+            parts.join("  ·  ")
         };
-        let status_detail = if session.status == SessionStatus::Running {
-            format!(
-                "{}{}  ·  {}",
-                queue_detail,
-                session_live_status_detail(session, state),
-                state.view_mode.as_str()
-            )
-        } else {
-            format!(
-                "{}{}  ·  {}",
-                queue_detail,
-                state.viewport.status_text(),
-                state.view_mode.as_str()
-            )
-        };
-        let _ = palette::write_colored(&mut buf, &status_detail, DIM);
+        let _ = palette::write_colored(&mut buf, &placeholder, DIM);
     } else {
         let _ = palette::write_colored(&mut buf, &state.input_buffer, DIM);
     }
     truncate_ansi_line(&buf, width)
-}
-
-fn render_session_summary_line(
-    session: &SessionRecord,
-    state: &SessionInteractiveState,
-    width: usize,
-) -> String {
-    let mut parts = vec![format!(
-        "{}  ·  {}  ·  turns {}  ·  {}",
-        session.status.as_str(),
-        session_activity_detail(session, state),
-        session.total_turns,
-        session_runtime_usage_detail(session, state)
-    )];
-    if state.queued_prompt_count() > 0 {
-        parts.push(format!("queued {}", state.queued_prompt_count()));
-    }
-    if let Some(route) = session_route_detail(session) {
-        parts.push(route);
-    }
-    parts.push(format!(
-        "current {}",
-        session
-            .active_run_id
-            .as_deref()
-            .or(session.last_run_id.as_deref())
-            .map(compact_session_run_id)
-            .unwrap_or_else(|| "none".into())
-    ));
-    parts.push(state.view_mode.as_str().to_string());
-    retained_session_kv_row(
-        "session",
-        &parts.join("  ·  "),
-        width,
-        session.status.ui_status(),
-    )
 }
 
 fn session_prompt_glyph(status: SessionStatus) -> char {
@@ -4391,27 +4353,49 @@ fn session_usage_detail(session: &SessionRecord) -> String {
     )
 }
 
-fn session_runtime_usage_detail(
+fn session_session_totals_detail(session: &SessionRecord) -> String {
+    format!(
+        "total in {} out {}",
+        format_token_count(session.total_tokens_in),
+        format_token_count(session.total_tokens_out)
+    )
+}
+
+fn session_effort_detail(session: &SessionRecord) -> Option<String> {
+    session.effort.map(|effort| {
+        format!(
+            "effort {}",
+            format!("{effort:?}").to_ascii_lowercase()
+        )
+    })
+}
+
+fn session_total_cost_detail(
     session: &SessionRecord,
     state: &SessionInteractiveState,
-) -> String {
-    if session.status != SessionStatus::Running {
-        return session_usage_detail(session);
+) -> Option<String> {
+    let pricing = crate::pricing::lookup(
+        &state.pricing,
+        &session.provider_name,
+        &session.model,
+        &session.agent_name,
+    )?;
+    Some(format!(
+        "~${:.4}",
+        pricing.cost_usd(session.total_tokens_in, session.total_tokens_out, 0)
+    ))
+}
+
+fn format_token_count(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
     }
-    let provider = state
-        .live_usage
-        .provider
-        .as_deref()
-        .unwrap_or(&session.provider_name);
-    let model = state.live_usage.model.as_deref().unwrap_or(&session.model);
-    format!(
-        "{}  ·  {}  ·  in {} out {} cached {}",
-        truncate_single_line(provider, 14),
-        truncate_single_line(model, 24),
-        state.live_usage.input_tokens,
-        state.live_usage.output_tokens,
-        state.live_usage.cached_tokens
-    )
+    out.chars().rev().collect()
 }
 
 fn session_recent_prompt(session: &SessionRecord) -> Option<String> {
@@ -5543,9 +5527,12 @@ mod tests {
     }
 
     #[test]
-    fn retained_session_summary_shows_live_elapsed_and_tokens_while_running() {
+    fn retained_session_header_shows_model_effort_totals_and_cost() {
         let session = SessionRecord {
             status: SessionStatus::Running,
+            provider_name: "openai".into(),
+            model: "gpt-5".into(),
+            effort: Some(ThinkingLevel::High),
             ..test_session_record()
         };
         let mut state = SessionInteractiveState::new(
@@ -5553,20 +5540,15 @@ mod tests {
             Some("run_live123".into()),
             LiveViewMode::Compact,
         );
-        state.current_run_started_at = Some(Utc::now());
-        state.live_usage.provider = Some("openai".into());
-        state.live_usage.model = Some("gpt-5".into());
-        state.live_usage.input_tokens = 42;
-        state.live_usage.output_tokens = 7;
-        state.live_usage.cached_tokens = 3;
+        state.pricing = PricingConfig::default();
         state.activity = SessionActivity::Thinking;
 
-        let summary = render_session_summary_line(&session, &state, 160);
-        assert!(summary.contains("thinking"));
-        assert!(summary.contains("00:00:"));
-        assert!(summary.contains("openai"));
-        assert!(summary.contains("gpt-5"));
-        assert!(summary.contains("in 42 out 7 cached 3"));
+        let header = render_session_header_line(&session, &state, 160);
+        assert!(header.contains("issue-reader"));
+        assert!(header.contains("gpt-5"));
+        assert!(header.contains("effort high"));
+        assert!(header.contains("total in 120 out 45"));
+        assert!(header.contains("~$"));
     }
 
     #[test]
