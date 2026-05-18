@@ -1,11 +1,11 @@
 use crate::cmd::completers::{active_session_ids, archived_session_ids, session_ids};
 use crate::cmd::retention::parse_retention_duration;
 use crate::cmd::run::{
-    ReadonlyDecider, canonicalize_if_exists, resolve_clone_dest, standalone_issue_ref,
-    standalone_repo_ref, standalone_workspace_strategy,
+    canonicalize_if_exists, resolve_clone_dest, standalone_issue_ref, standalone_repo_ref,
+    standalone_workspace_strategy, ReadonlyDecider,
 };
 use crate::cmd::transcript::{
-    TranscriptPrettyContext, render_pretty_transcript_event, truncate_single_line,
+    render_pretty_transcript_event, truncate_single_line, TranscriptPrettyContext,
 };
 use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::output::formats::OutputFormat;
@@ -15,13 +15,13 @@ use crate::output::printer::{
 };
 use crate::output::report::{self, CollectionOutput, DetailOutput};
 use crate::output::rich_payload::{
-    RenderedPayload, render_assistant_content, render_payload, render_payload_preview_lines,
-    render_tool_input,
+    render_assistant_content, render_payload, render_payload_preview_lines, render_tool_input,
+    RenderedPayload,
 };
 use crate::output::viewport::ViewportState;
 use crate::paths;
 use crate::standalone_run_metadata::{
-    StandaloneRunMetadata, metadata_path_for_run, write_metadata,
+    metadata_path_for_run, write_metadata, StandaloneRunMetadata,
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -38,13 +38,13 @@ use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternate
 use crossterm::{execute, queue};
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_agent::{load_agent, parse_mode, resolve_mode};
-use rupu_providers::AuthMode;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::types::{
     ContextManagement, Message, OutputFormat as ProviderOutputFormat, Speed,
 };
-use rupu_runtime::WorkerKind;
+use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory;
+use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, ToolContext};
 use rupu_transcript::{Event as TranscriptEvent, FileEditKind, JsonlReader, RunMode, RunStatus};
 use serde::{Deserialize, Serialize};
@@ -1684,6 +1684,15 @@ enum SessionActivity {
     Tool { tool: String },
 }
 
+#[derive(Debug, Clone, Default)]
+struct SessionLiveUsage {
+    provider: Option<String>,
+    model: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+}
+
 struct SessionInteractiveState {
     followed_run_id: Option<String>,
     transcript_path: PathBuf,
@@ -1695,6 +1704,8 @@ struct SessionInteractiveState {
     input_buffer: String,
     queued_prompts: VecDeque<(usize, String)>,
     activity: SessionActivity,
+    current_run_started_at: Option<DateTime<Utc>>,
+    live_usage: SessionLiveUsage,
 }
 
 impl SessionInteractiveState {
@@ -1715,6 +1726,8 @@ impl SessionInteractiveState {
             input_buffer: String::new(),
             queued_prompts: VecDeque::new(),
             activity: SessionActivity::Idle,
+            current_run_started_at: None,
+            live_usage: SessionLiveUsage::default(),
         }
     }
 
@@ -1736,6 +1749,8 @@ impl SessionInteractiveState {
                 ..
             } => {
                 self.activity = SessionActivity::Thinking;
+                self.current_run_started_at = Some(*started_at);
+                self.live_usage = SessionLiveUsage::default();
                 self.entries.push(SessionEntry::RunStart {
                     run_id: run_id.clone(),
                     workspace_id: workspace_id.clone(),
@@ -1833,13 +1848,20 @@ impl SessionInteractiveState {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
-            } => self.entries.push(SessionEntry::Usage {
-                provider: provider.clone(),
-                model: model.clone(),
-                input_tokens: *input_tokens,
-                output_tokens: *output_tokens,
-                cached_tokens: *cached_tokens,
-            }),
+            } => {
+                self.live_usage.provider = Some(provider.clone());
+                self.live_usage.model = Some(model.clone());
+                self.live_usage.input_tokens += *input_tokens as u64;
+                self.live_usage.output_tokens += *output_tokens as u64;
+                self.live_usage.cached_tokens += *cached_tokens as u64;
+                self.entries.push(SessionEntry::Usage {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    input_tokens: *input_tokens,
+                    output_tokens: *output_tokens,
+                    cached_tokens: *cached_tokens,
+                })
+            }
             TranscriptEvent::RunComplete {
                 status,
                 total_tokens,
@@ -1848,6 +1870,7 @@ impl SessionInteractiveState {
                 ..
             } => {
                 self.activity = SessionActivity::Idle;
+                self.current_run_started_at = None;
                 self.entries.push(SessionEntry::RunComplete {
                     status: *status,
                     total_tokens: *total_tokens,
@@ -2406,16 +2429,22 @@ fn render_session_prompt_line(
         } else {
             String::new()
         };
-        let _ = palette::write_colored(
-            &mut buf,
-            &format!(
+        let status_detail = if session.status == SessionStatus::Running {
+            format!(
+                "{}{}  ·  {}",
+                queue_detail,
+                session_live_status_detail(session, state),
+                state.view_mode.as_str()
+            )
+        } else {
+            format!(
                 "{}{}  ·  {}",
                 queue_detail,
                 state.viewport.status_text(),
                 state.view_mode.as_str()
-            ),
-            DIM,
-        );
+            )
+        };
+        let _ = palette::write_colored(&mut buf, &status_detail, DIM);
     } else {
         let _ = palette::write_colored(&mut buf, &state.input_buffer, DIM);
     }
@@ -2432,7 +2461,7 @@ fn render_session_summary_line(
         session.status.as_str(),
         session_activity_detail(session, state),
         session.total_turns,
-        session_usage_detail(session)
+        session_runtime_usage_detail(session, state)
     )];
     if state.queued_prompt_count() > 0 {
         parts.push(format!("queued {}", state.queued_prompt_count()));
@@ -2460,18 +2489,89 @@ fn render_session_summary_line(
 
 fn session_prompt_glyph(status: SessionStatus) -> char {
     match status {
-        SessionStatus::Running => {
-            const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
-            let tick = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| (duration.as_millis() / 160) as usize)
-                .unwrap_or(0);
-            FRAMES[tick % FRAMES.len()]
-        }
+        SessionStatus::Running => session_live_frame(),
         SessionStatus::Idle => '●',
         SessionStatus::Failed => '✗',
         SessionStatus::Stopped => '⏸',
     }
+}
+
+fn session_live_frame() -> char {
+    const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 160) as usize)
+        .unwrap_or(0);
+    FRAMES[tick % FRAMES.len()]
+}
+
+fn session_live_elapsed(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+) -> Option<String> {
+    let started_at = state.current_run_started_at.or_else(|| {
+        let active_run_id = session.active_run_id.as_deref()?;
+        session
+            .runs
+            .iter()
+            .rev()
+            .find(|run| run.run_id == active_run_id)
+            .map(|run| run.started_at)
+    })?;
+    let seconds = (Utc::now() - started_at).num_seconds().max(0) as u64;
+    Some(format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    ))
+}
+
+fn session_live_status_detail(session: &SessionRecord, state: &SessionInteractiveState) -> String {
+    let label = match &state.activity {
+        SessionActivity::Idle | SessionActivity::Thinking => "thinking".to_string(),
+        SessionActivity::Typing => "typing".to_string(),
+        SessionActivity::Tool { tool } => {
+            format!("tool {}", truncate_single_line(tool, 18))
+        }
+    };
+    session_live_status_detail_parts(Some(session), state, &label, true)
+}
+
+fn session_live_activity_detail(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+    label: &str,
+) -> String {
+    session_live_status_detail_parts(Some(session), state, label, false)
+}
+
+fn session_live_status_detail_parts(
+    session: Option<&SessionRecord>,
+    state: &SessionInteractiveState,
+    label: &str,
+    include_usage: bool,
+) -> String {
+    let mut detail = format!("{label} {}", session_live_frame());
+    if let Some(elapsed) = session.and_then(|session| session_live_elapsed(session, state)) {
+        detail.push_str("  ·  ");
+        detail.push_str(&elapsed);
+    }
+    let usage = &state.live_usage;
+    if include_usage
+        && (usage.input_tokens > 0 || usage.output_tokens > 0 || usage.cached_tokens > 0)
+    {
+        detail.push_str("  ·  ");
+        detail.push_str(&format!(
+            "in {} out {} cached {}",
+            usage.input_tokens, usage.output_tokens, usage.cached_tokens
+        ));
+    }
+    detail
+}
+
+fn session_live_typing_detail() -> String {
+    format!("typing {}", session_live_frame())
 }
 
 fn should_begin_session_prompt(ch: char, status: SessionStatus) -> bool {
@@ -2486,12 +2586,18 @@ fn session_activity_detail(session: &SessionRecord, state: &SessionInteractiveSt
         (_, SessionStatus::Stopped) => "stopped".into(),
         (_, SessionStatus::Failed) => "failed".into(),
         (_, SessionStatus::Idle) => "idle".into(),
-        (SessionActivity::Typing, SessionStatus::Running) => "typing".into(),
-        (SessionActivity::Tool { tool }, SessionStatus::Running) => {
-            format!("tool {}", truncate_single_line(tool, 18))
+        (SessionActivity::Typing, SessionStatus::Running) => {
+            session_live_activity_detail(session, state, "typing")
         }
+        (SessionActivity::Tool { tool }, SessionStatus::Running) => session_live_activity_detail(
+            session,
+            state,
+            &format!("tool {}", truncate_single_line(tool, 18)),
+        ),
         (SessionActivity::Thinking, SessionStatus::Running)
-        | (SessionActivity::Idle, SessionStatus::Running) => "thinking".into(),
+        | (SessionActivity::Idle, SessionStatus::Running) => {
+            session_live_activity_detail(session, state, "thinking")
+        }
     }
 }
 
@@ -2539,7 +2645,7 @@ fn render_synthetic_session_activity_rows(
         SessionActivity::Thinking => render_role_header(
             "assistant",
             crate::output::palette::Status::Working.color(),
-            Some("thinking"),
+            Some(&session_live_status_detail(session, state)),
             width,
         ),
         SessionActivity::Idle | SessionActivity::Typing | SessionActivity::Tool { .. } => {
@@ -2582,6 +2688,11 @@ fn render_session_entry_rows(
             thinking,
             streaming,
         } => {
+            let streaming_detail = if *streaming {
+                Some(session_live_typing_detail())
+            } else {
+                None
+            };
             let mut rows = render_role_header(
                 "assistant",
                 if *streaming {
@@ -2589,7 +2700,7 @@ fn render_session_entry_rows(
                 } else {
                     Status::Active.color()
                 },
-                if *streaming { Some("typing") } else { None },
+                streaming_detail.as_deref(),
                 width,
             );
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
@@ -4019,7 +4130,11 @@ fn tokenize_attach_command(command: &str) -> Option<Vec<String>> {
     if !current.is_empty() {
         out.push(current);
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn inline_command_is_allowed(root: &str, args: &[String]) -> bool {
@@ -4273,6 +4388,29 @@ fn session_usage_detail(session: &SessionRecord) -> String {
         truncate_single_line(&session.model, 24),
         session.total_tokens_in,
         session.total_tokens_out
+    )
+}
+
+fn session_runtime_usage_detail(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+) -> String {
+    if session.status != SessionStatus::Running {
+        return session_usage_detail(session);
+    }
+    let provider = state
+        .live_usage
+        .provider
+        .as_deref()
+        .unwrap_or(&session.provider_name);
+    let model = state.live_usage.model.as_deref().unwrap_or(&session.model);
+    format!(
+        "{}  ·  {}  ·  in {} out {} cached {}",
+        truncate_single_line(provider, 14),
+        truncate_single_line(model, 24),
+        state.live_usage.input_tokens,
+        state.live_usage.output_tokens,
+        state.live_usage.cached_tokens
     )
 }
 
@@ -5405,6 +5543,64 @@ mod tests {
     }
 
     #[test]
+    fn retained_session_summary_shows_live_elapsed_and_tokens_while_running() {
+        let session = SessionRecord {
+            status: SessionStatus::Running,
+            ..test_session_record()
+        };
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.current_run_started_at = Some(Utc::now());
+        state.live_usage.provider = Some("openai".into());
+        state.live_usage.model = Some("gpt-5".into());
+        state.live_usage.input_tokens = 42;
+        state.live_usage.output_tokens = 7;
+        state.live_usage.cached_tokens = 3;
+        state.activity = SessionActivity::Thinking;
+
+        let summary = render_session_summary_line(&session, &state, 160);
+        assert!(summary.contains("thinking"));
+        assert!(summary.contains("00:00:"));
+        assert!(summary.contains("openai"));
+        assert!(summary.contains("gpt-5"));
+        assert!(summary.contains("in 42 out 7 cached 3"));
+    }
+
+    #[test]
+    fn retained_session_rows_show_live_thinking_tokens_in_assistant_row() {
+        let session = SessionRecord {
+            status: SessionStatus::Running,
+            ..test_session_record()
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.current_run_started_at = Some(Utc::now());
+        state.live_usage.input_tokens = 12;
+        state.live_usage.output_tokens = 5;
+        state.live_usage.cached_tokens = 2;
+        state.activity = SessionActivity::Thinking;
+
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 120, 16);
+        assert!(rows.iter().any(|row| row.contains("assistant")));
+        assert!(rows.iter().any(|row| row.contains("thinking")));
+        assert!(rows.iter().any(|row| row.contains("00:00:")));
+        assert!(rows.iter().any(|row| row.contains("in 12 out 5 cached 2")));
+    }
+
+    #[test]
     fn transcript_event_lines_full_keeps_more_assistant_text_than_focused() {
         let event = TranscriptEvent::AssistantMessage {
             content: "This is a longer assistant response that should stay fuller in full mode while focused mode truncates it.".into(),
@@ -5619,11 +5815,9 @@ mod tests {
         );
         let lines = transcript_event_lines(&event, LiveViewMode::Focused, &prefs);
         assert_eq!(lines.len(), 1);
-        assert!(
-            lines[0]
-                .text
-                .contains(".git/logs/refs/heads/storefront/issue-19")
-        );
+        assert!(lines[0]
+            .text
+            .contains(".git/logs/refs/heads/storefront/issue-19"));
         assert!(!lines[0].text.contains("{\"path\""));
     }
 
@@ -5643,11 +5837,9 @@ mod tests {
         );
         let lines = transcript_event_lines(&event, LiveViewMode::Full, &prefs);
         assert!(lines.len() > 1);
-        assert!(
-            lines[0]
-                .text
-                .contains(".git/logs/refs/heads/storefront/issue-19")
-        );
+        assert!(lines[0]
+            .text
+            .contains(".git/logs/refs/heads/storefront/issue-19"));
         assert!(lines.iter().skip(1).any(|line| line.text.contains("path:")));
     }
 }
