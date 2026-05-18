@@ -18,6 +18,6 @@ pub mod viewport;
 pub mod workflow_printer;
 pub mod yaml_snippet;
 
-pub use jsonl_reader::TranscriptTailer;
+pub use jsonl_reader::{TranscriptHistoryPager, TranscriptTailer};
 pub use printer::LineStreamPrinter;
 pub use spinner::SpinnerHandle;

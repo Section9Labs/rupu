@@ -84,6 +84,19 @@ impl ViewportState {
         self.scroll_from_bottom == 0
     }
 
+    pub fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    pub fn page_rows(&self) -> usize {
+        self.page_rows.max(1)
+    }
+
+    pub fn is_near_top(&self, margin_rows: usize) -> bool {
+        let max_offset = self.total_rows.saturating_sub(self.page_rows());
+        self.scroll_from_bottom >= max_offset.saturating_sub(margin_rows)
+    }
+
     pub fn status_text(&self) -> String {
         if self.at_tail() {
             "live tail".into()
