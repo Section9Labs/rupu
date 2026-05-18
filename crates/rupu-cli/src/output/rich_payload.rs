@@ -6,6 +6,31 @@ use crate::cmd::ui::{
 use crate::output::palette::{self, DIM};
 use crate::output::printer::sanitize_terminal_text;
 
+const MAX_RENDER_PAYLOAD_BYTES: usize = 256 * 1024;
+
+fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> (&str, bool) {
+    if input.len() <= max_bytes {
+        return (input, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&input[..end], true)
+}
+
+fn normalize_payload_source(raw: &str) -> String {
+    let (prefix, truncated) = truncate_utf8_bytes(raw, MAX_RENDER_PAYLOAD_BYTES);
+    let mut normalized = sanitize_terminal_text(prefix);
+    if truncated {
+        normalized.push_str(&format!(
+            "\n… [payload truncated for display; {} more bytes omitted]",
+            raw.len().saturating_sub(prefix.len())
+        ));
+    }
+    normalized
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadKind {
     Empty,
@@ -49,7 +74,7 @@ pub fn render_payload_preview_lines(payload: &RenderedPayload, max_lines: usize)
 }
 
 pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
-    let normalized = sanitize_terminal_text(raw);
+    let normalized = normalize_payload_source(raw);
     if normalized.trim().is_empty() {
         return RenderedPayload {
             kind: PayloadKind::Empty,
@@ -131,7 +156,7 @@ pub fn render_payload(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
 }
 
 pub fn render_assistant_content(raw: &str, prefs: &UiPrefs) -> RenderedPayload {
-    let normalized = sanitize_terminal_text(raw);
+    let normalized = normalize_payload_source(raw);
     let trimmed = normalized.trim();
     if trimmed.is_empty() {
         return RenderedPayload {
@@ -469,5 +494,13 @@ mod tests {
         let payload = render_payload("alpha\r\nbeta\tgamma\x1b[31m", &prefs());
         assert_eq!(payload.kind, PayloadKind::Plain);
         assert!(payload.rendered.contains("alpha\nbeta    gamma\\x1b[31m"));
+    }
+
+    #[test]
+    fn render_payload_truncates_huge_plain_text_for_display() {
+        let raw = "x".repeat(MAX_RENDER_PAYLOAD_BYTES + 128);
+        let payload = render_payload(&raw, &prefs());
+        assert!(payload.rendered.contains("[payload truncated for display;"));
+        assert!(payload.rendered.len() < raw.len());
     }
 }
