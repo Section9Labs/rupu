@@ -32,6 +32,14 @@ fn desanitize_openai_tool_name(name: &str) -> String {
     name.replace(TOOL_NAME_DOT_ESCAPE, ".")
 }
 
+fn normalize_function_call_output(content: &str) -> String {
+    if content.is_empty() {
+        "[tool completed with no textual output]".to_string()
+    } else {
+        content.to_string()
+    }
+}
+
 /// OpenAI Codex client using the Responses API.
 /// Translates LlmRequest/LlmResponse to/from OpenAI's Responses API format.
 pub struct OpenAiCodexClient {
@@ -251,7 +259,7 @@ impl OpenAiCodexClient {
                         input.push(serde_json::json!({
                             "type": "function_call_output",
                             "call_id": normalize_tool_call_id(tool_use_id),
-                            "output": content,
+                            "output": normalize_function_call_output(content),
                         }));
                     }
                 }
@@ -1486,6 +1494,41 @@ mod tests {
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["call_id"], "call_abc");
         assert_eq!(input[0]["output"], "file contents");
+    }
+
+    #[test]
+    fn test_empty_tool_result_conversion_uses_non_empty_placeholder() {
+        let creds = AuthCredentials::ApiKey {
+            key: "sk-test".into(),
+        };
+        let mut client = OpenAiCodexClient::new(creds, None).unwrap();
+        client.api_url = "http://test".into();
+
+        let request = LlmRequest {
+            model: "gpt-4.1".into(),
+            system: None,
+            messages: vec![Message::tool_result("call_empty", "", false)],
+            max_tokens: 1024,
+            tools: vec![],
+            cell_id: None,
+            trace_id: None,
+            thinking: None,
+            context_window: None,
+            task_type: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+        };
+
+        let body = client.build_request_body(&request, false);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_empty");
+        assert_eq!(
+            input[0]["output"],
+            "[tool completed with no textual output]"
+        );
     }
 
     #[test]

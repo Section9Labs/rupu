@@ -23,12 +23,36 @@ use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
 
+const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
+
 /// Callback invoked by `run_agent` immediately before each tool
 /// dispatch. The runner translates this into `Event::StepWorking
 /// { note: Some(tool_name) }` so the Graph view can pulse the
 /// active node. Called from the agent's tokio task — must be
 /// non-blocking.
 pub type OnToolCallCallback = std::sync::Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> &str {
+    if input.len() <= max_bytes {
+        return input;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    &input[..end]
+}
+
+fn clamp_tool_result_text(input: &str) -> String {
+    if input.len() <= MAX_TOOL_RESULT_BYTES {
+        return input.to_string();
+    }
+    let prefix = truncate_utf8_bytes(input, MAX_TOOL_RESULT_BYTES);
+    format!(
+        "{prefix}\n… [truncated {} bytes]",
+        input.len().saturating_sub(prefix.len())
+    )
+}
 
 /// Errors that can occur during an agent run.
 #[derive(Debug, Error)]
@@ -426,9 +450,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             let started_tool = Instant::now();
             match tool.invoke(input.clone(), &opts.tool_context).await {
                 Ok(out) => {
+                    let clamped_stdout = clamp_tool_result_text(&out.stdout);
                     writer.write(&Event::ToolResult {
                         call_id: call_id.clone(),
-                        output: out.stdout.clone(),
+                        output: clamped_stdout.clone(),
                         error: out.error.clone(),
                         duration_ms: started_tool.elapsed().as_millis() as u64,
                     })?;
@@ -458,7 +483,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             }
                         }
                     }
-                    tool_results.push((call_id, out.stdout, out.error));
+                    tool_results.push((call_id, clamped_stdout, out.error));
                 }
                 Err(e) => {
                     let msg = format!("{e}");
@@ -491,13 +516,14 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             let mut blocks: Vec<ContentBlock> = Vec::new();
             for (call_id, output, error) in tool_results {
                 let is_error = error.is_some();
+                let content = if let Some(e) = error {
+                    clamp_tool_result_text(&format!("error: {e}\n{output}"))
+                } else {
+                    output
+                };
                 blocks.push(ContentBlock::ToolResult {
                     tool_use_id: call_id,
-                    content: if let Some(e) = error {
-                        format!("error: {e}\n{output}")
-                    } else {
-                        output
-                    },
+                    content,
                     is_error,
                 });
             }
@@ -723,6 +749,19 @@ mod allowlist_tests {
         let list = vec!["bash".into(), "read".into()];
         assert!(!mcp_tool_name_matches_allowlist("scm.repos.get", &list));
         assert!(!mcp_tool_name_matches_allowlist("issues.list", &list));
+    }
+}
+
+#[cfg(test)]
+mod tool_result_clamp_tests {
+    use super::{clamp_tool_result_text, MAX_TOOL_RESULT_BYTES};
+
+    #[test]
+    fn clamp_tool_result_text_truncates_large_payloads() {
+        let raw = "a".repeat(MAX_TOOL_RESULT_BYTES + 64);
+        let clamped = clamp_tool_result_text(&raw);
+        assert!(clamped.len() < raw.len());
+        assert!(clamped.contains("[truncated "));
     }
 }
 

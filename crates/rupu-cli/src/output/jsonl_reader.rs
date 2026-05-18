@@ -5,6 +5,7 @@
 //! and watch commands to tail live transcript files.
 
 use rupu_transcript::Event;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Incremental byte-offset reader for a single JSONL transcript file.
@@ -26,14 +27,25 @@ impl TranscriptTailer {
     /// events in order. Incomplete trailing lines (write in progress) are
     /// silently deferred to the next call.
     pub fn drain(&mut self) -> Vec<Event> {
-        let Ok(bytes) = std::fs::read(&self.path) else {
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
             return Vec::new();
         };
-        let from = self.offset as usize;
-        if bytes.len() <= from {
+        let Ok(metadata) = file.metadata() else {
+            return Vec::new();
+        };
+        if metadata.len() < self.offset {
+            self.offset = 0;
+        }
+        if metadata.len() <= self.offset {
             return Vec::new();
         }
-        let new_bytes = &bytes[from..];
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut new_bytes = Vec::new();
+        if file.read_to_end(&mut new_bytes).is_err() {
+            return Vec::new();
+        }
         let mut consumed = 0usize;
         let mut events = Vec::new();
         for line in new_bytes.split_inclusive(|&b| b == b'\n') {

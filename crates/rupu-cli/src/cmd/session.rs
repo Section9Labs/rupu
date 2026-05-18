@@ -2389,10 +2389,7 @@ fn render_session_header_line(
         BRAND,
     );
 
-    let mut parts = vec![
-        session_activity_detail(session, state),
-        truncate_single_line(&session.model, 24),
-    ];
+    let mut parts = vec![session.status.as_str().to_string(), truncate_single_line(&session.model, 24)];
     if let Some(effort) = session_effort_detail(session) {
         parts.push(effort);
     }
@@ -2403,7 +2400,6 @@ fn render_session_header_line(
     if state.queued_prompt_count() > 0 {
         parts.push(format!("queued {}", state.queued_prompt_count()));
     }
-    parts.push(state.view_mode.as_str().to_string());
     let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
     let _ = palette::write_colored(&mut buf, &parts.join("  ·  "), DIM);
     truncate_ansi_line(&buf, width)
@@ -2429,20 +2425,13 @@ fn render_session_prompt_line(
     );
     let _ = palette::write_colored(&mut buf, " > ", DIM);
     if state.input_buffer.is_empty() {
-        let placeholder = if session.status == SessionStatus::Running {
-            session_live_status_detail(session, state)
-        } else {
-            let mut parts = Vec::new();
-            if state.queued_prompt_count() > 0 {
-                parts.push(format!("queued {}", state.queued_prompt_count()));
-            }
-            if !state.viewport.at_tail() {
-                parts.push(state.viewport.status_text());
-            }
-            parts.push("F1 help".to_string());
-            parts.join("  ·  ")
-        };
-        let _ = palette::write_colored(&mut buf, &placeholder, DIM);
+        if state.queued_prompt_count() > 0 {
+            let _ = palette::write_colored(
+                &mut buf,
+                &format!("queued {}", state.queued_prompt_count()),
+                DIM,
+            );
+        }
     } else {
         let _ = palette::write_colored(&mut buf, &state.input_buffer, DIM);
     }
@@ -2500,14 +2489,6 @@ fn session_live_status_detail(session: &SessionRecord, state: &SessionInteractiv
     session_live_status_detail_parts(Some(session), state, &label, true)
 }
 
-fn session_live_activity_detail(
-    session: &SessionRecord,
-    state: &SessionInteractiveState,
-    label: &str,
-) -> String {
-    session_live_status_detail_parts(Some(session), state, label, false)
-}
-
 fn session_live_status_detail_parts(
     session: Option<&SessionRecord>,
     state: &SessionInteractiveState,
@@ -2541,26 +2522,6 @@ fn should_begin_session_prompt(ch: char, status: SessionStatus) -> bool {
         return false;
     }
     !ch.is_control()
-}
-
-fn session_activity_detail(session: &SessionRecord, state: &SessionInteractiveState) -> String {
-    match (&state.activity, session.status) {
-        (_, SessionStatus::Stopped) => "stopped".into(),
-        (_, SessionStatus::Failed) => "failed".into(),
-        (_, SessionStatus::Idle) => "idle".into(),
-        (SessionActivity::Typing, SessionStatus::Running) => {
-            session_live_activity_detail(session, state, "typing")
-        }
-        (SessionActivity::Tool { tool }, SessionStatus::Running) => session_live_activity_detail(
-            session,
-            state,
-            &format!("tool {}", truncate_single_line(tool, 18)),
-        ),
-        (SessionActivity::Thinking, SessionStatus::Running)
-        | (SessionActivity::Idle, SessionStatus::Running) => {
-            session_live_activity_detail(session, state, "thinking")
-        }
-    }
 }
 
 fn trim_last_prompt_word(buffer: &mut String) {
@@ -2917,7 +2878,7 @@ fn render_session_entry_rows(
             output_tokens,
             cached_tokens,
         } => {
-            if view_mode != LiveViewMode::Full {
+            if view_mode == LiveViewMode::Focused {
                 return Vec::new();
             }
             render_notice_rows(
@@ -5579,6 +5540,61 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("assistant")));
         assert!(rows.iter().any(|row| row.contains("thinking")));
         assert!(rows.iter().any(|row| row.contains("00:00:")));
+        assert!(rows.iter().any(|row| row.contains("in 12 out 5 cached 2")));
+    }
+
+    #[test]
+    fn retained_session_prompt_line_omits_live_status_counters() {
+        let session = SessionRecord {
+            status: SessionStatus::Running,
+            model: "gpt-5".into(),
+            ..test_session_record()
+        };
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.live_usage.input_tokens = 12;
+        state.live_usage.output_tokens = 5;
+        state.live_usage.cached_tokens = 2;
+        state.activity = SessionActivity::Thinking;
+
+        let line = render_session_prompt_line(&session, &state, 160);
+        assert!(line.contains("issue-reader >"));
+        assert!(!line.contains("thinking"));
+        assert!(!line.contains("in 12"));
+        assert!(!line.contains("cached 2"));
+    }
+
+    #[test]
+    fn retained_session_compact_rows_include_usage_events() {
+        let session = SessionRecord {
+            status: SessionStatus::Idle,
+            ..test_session_record()
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.push_transcript_event(&TranscriptEvent::Usage {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            input_tokens: 12,
+            output_tokens: 5,
+            cached_tokens: 2,
+        });
+
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 120, 12);
+        assert!(rows.iter().any(|row| row.contains("usage")));
         assert!(rows.iter().any(|row| row.contains("in 12 out 5 cached 2")));
     }
 
