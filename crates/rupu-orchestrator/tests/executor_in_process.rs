@@ -69,6 +69,7 @@ impl StepFactory for FakeFactory {
             dispatchable_agents: None,
             step_id: step_id.to_string(),
             on_tool_call,
+            on_stream_event: None,
         }
     }
 }

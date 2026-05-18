@@ -175,6 +175,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             dispatchable_agents: spec.dispatchable_agents.clone(),
             step_id: String::new(),
             on_tool_call: None,
+            on_stream_event: None,
         };
 
         let started = std::time::Instant::now();

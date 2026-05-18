@@ -1233,6 +1233,11 @@ impl AnthropicClient {
                             .and_then(|v| v.as_u64())
                             .map(|n| n as u32)
                             .unwrap_or(0);
+                        on_event(StreamEvent::UsageSnapshot(Usage {
+                            input_tokens: acc.input_tokens,
+                            output_tokens: acc.output_tokens,
+                            cached_tokens: acc.cached_tokens,
+                        }));
                     }
                 }
             }
@@ -1326,6 +1331,11 @@ impl AnthropicClient {
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as u32;
+                    on_event(StreamEvent::UsageSnapshot(Usage {
+                        input_tokens: acc.input_tokens,
+                        output_tokens: acc.output_tokens,
+                        cached_tokens: acc.cached_tokens,
+                    }));
                 }
             }
             "message_stop" | "ping" => {}

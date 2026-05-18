@@ -757,6 +757,11 @@ fn process_gemini_sse(
         if let Some(output) = meta.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
             acc.output_tokens = output as u32;
         }
+        on_event(StreamEvent::UsageSnapshot(Usage {
+            input_tokens: acc.input_tokens,
+            output_tokens: acc.output_tokens,
+            cached_tokens: 0,
+        }));
     }
 
     Ok(())
@@ -1152,7 +1157,10 @@ mod tests {
         assert_eq!(response.text(), Some("Hello world!"));
         assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
         assert_eq!(response.usage.input_tokens, 10);
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().any(
+            |event| event.contains("UsageSnapshot(Usage { input_tokens: 10, output_tokens: 5")
+        ));
     }
 
     #[test]

@@ -189,6 +189,7 @@ impl StepFactory for DispatchFactory {
             dispatchable_agents: Some(vec!["security-reviewer".into()]),
             step_id: String::new(),
             on_tool_call: None,
+            on_stream_event: None,
         }
     }
 }
@@ -340,6 +341,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 dispatchable_agents: Some(vec!["security-reviewer".into()]),
                 step_id: String::new(),
                 on_tool_call: None,
+                on_stream_event: None,
             }
         }
     }

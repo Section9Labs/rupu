@@ -196,6 +196,7 @@ impl StepFactory for DefaultStepFactory {
             dispatchable_agents: spec.dispatchable_agents,
             step_id: step_id.to_string(),
             on_tool_call,
+            on_stream_event: None,
         }
     }
 }

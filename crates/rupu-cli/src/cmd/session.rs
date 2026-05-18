@@ -42,7 +42,7 @@ use rupu_agent::{load_agent, parse_mode, resolve_mode};
 use rupu_config::PricingConfig;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::types::{
-    ContextManagement, Message, OutputFormat as ProviderOutputFormat, Speed,
+    ContextManagement, Message, OutputFormat as ProviderOutputFormat, Speed, StreamEvent,
 };
 use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory;
@@ -55,7 +55,8 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -1418,6 +1419,7 @@ fn enqueue_turn_request(global: &Path, session_id: &str, prompt: String) -> anyh
         session.active_run_id = Some(run_id.clone());
         session.active_transcript_path = Some(transcript_path.clone());
         session.active_pid = Some(worker_pid);
+        clear_session_live_usage(global, scope, &session.session_id)?;
     }
     session.updated_at = enqueued_at;
     session.last_error = None;
@@ -1749,13 +1751,109 @@ enum SessionActivity {
     Tool { tool: String },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionLiveUsage {
+    #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
     input_tokens: u64,
+    #[serde(default)]
     output_tokens: u64,
+    #[serde(default)]
     cached_tokens: u64,
+    #[serde(default)]
+    output_tokens_estimated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionLiveUsageRecord {
+    version: u32,
+    session_id: String,
+    run_id: String,
+    updated_at: DateTime<Utc>,
+    usage: SessionLiveUsage,
+}
+
+impl SessionLiveUsageRecord {
+    const VERSION: u32 = 1;
+}
+
+#[derive(Debug, Clone)]
+struct SessionLiveUsageWriterState {
+    usage: SessionLiveUsage,
+    streamed_chars: usize,
+    last_persisted: SessionLiveUsage,
+    last_written_at: Option<Instant>,
+}
+
+impl SessionLiveUsageWriterState {
+    fn new(provider: &str, model: &str) -> Self {
+        let usage = SessionLiveUsage {
+            provider: Some(provider.to_string()),
+            model: Some(model.to_string()),
+            ..SessionLiveUsage::default()
+        };
+        Self {
+            last_persisted: usage.clone(),
+            usage,
+            streamed_chars: 0,
+            last_written_at: None,
+        }
+    }
+
+    fn apply_event(&mut self, event: &StreamEvent) -> bool {
+        match event {
+            StreamEvent::TextDelta(chunk) => {
+                if chunk.is_empty() {
+                    return false;
+                }
+                self.streamed_chars += chunk.chars().count();
+                if self.usage.output_tokens_estimated || self.usage.output_tokens == 0 {
+                    let next = estimate_stream_output_tokens(self.streamed_chars);
+                    if next == self.usage.output_tokens && self.usage.output_tokens_estimated {
+                        return false;
+                    }
+                    self.usage.output_tokens = next;
+                    self.usage.output_tokens_estimated = true;
+                    return true;
+                }
+                false
+            }
+            StreamEvent::UsageSnapshot(usage) => {
+                let next = SessionLiveUsage {
+                    provider: self.usage.provider.clone(),
+                    model: self.usage.model.clone(),
+                    input_tokens: usage.input_tokens as u64,
+                    output_tokens: usage.output_tokens as u64,
+                    cached_tokens: usage.cached_tokens as u64,
+                    output_tokens_estimated: false,
+                };
+                if self.usage == next {
+                    return false;
+                }
+                self.usage = next;
+                true
+            }
+            StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => false,
+        }
+    }
+
+    fn should_flush(&self, force: bool) -> bool {
+        if self.usage == self.last_persisted {
+            return false;
+        }
+        force
+            || self
+                .last_written_at
+                .is_none_or(|timestamp| timestamp.elapsed() >= Duration::from_millis(80))
+    }
+
+    fn mark_persisted(&mut self) {
+        self.last_persisted = self.usage.clone();
+        self.last_written_at = Some(Instant::now());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2216,6 +2314,28 @@ impl SessionInteractiveState {
         }
     }
 
+    fn sync_live_usage_from_record(
+        &mut self,
+        session: &SessionRecord,
+        live_usage: Option<&SessionLiveUsageRecord>,
+    ) {
+        if session.status != SessionStatus::Running {
+            self.live_usage = SessionLiveUsage::default();
+            return;
+        }
+        if let Some(record) = live_usage
+            .filter(|record| session.active_run_id.as_deref() == Some(record.run_id.as_str()))
+        {
+            self.live_usage = record.usage.clone();
+            return;
+        }
+        self.live_usage = SessionLiveUsage {
+            provider: Some(session.provider_name.clone()),
+            model: Some(session.model.clone()),
+            ..SessionLiveUsage::default()
+        };
+    }
+
     fn has_dynamic_render_state(&self, status: SessionStatus) -> bool {
         status == SessionStatus::Running || self.prompt_active || !self.input_buffer.is_empty()
     }
@@ -2248,27 +2368,38 @@ impl SessionInteractiveState {
 
     fn render_cached_entry_rows(
         &mut self,
+        session: &SessionRecord,
         index: usize,
         next_is_nested: bool,
         prefs: &UiPrefs,
         width: usize,
     ) -> &[String] {
+        let dynamic_entry = matches!(
+            self.entries.get(index),
+            Some(SessionEntry::Assistant {
+                streaming: true,
+                ..
+            })
+        );
         let cache_valid = self
             .entry_row_cache
             .get(index)
             .and_then(|slot| slot.as_ref())
             .is_some_and(|cached| {
-                cached.width == width
+                !dynamic_entry
+                    && cached.width == width
                     && cached.view_mode == self.view_mode
                     && cached.next_is_nested == next_is_nested
             });
         if !cache_valid {
+            let dynamic_detail = dynamic_entry.then(|| session_live_typing_detail(session, self));
             let rows = render_session_entry_rows(
                 &self.entries[index],
                 next_is_nested,
                 self.view_mode,
                 prefs,
                 width,
+                dynamic_detail.as_deref(),
             );
             self.entry_row_cache[index] = Some(CachedSessionRows {
                 width,
@@ -2387,6 +2518,8 @@ fn attach_blocking_interactive(
                 write_session(global, scope, &session)?;
             }
             state.sync_runtime_status(session.status);
+            let live_usage = read_session_live_usage(global, scope, session_id)?;
+            state.sync_live_usage_from_record(&session, live_usage.as_ref());
 
             state.reconcile_queued_prompts(&session);
 
@@ -2839,20 +2972,59 @@ fn session_live_status_detail_parts(
         detail.push_str(&elapsed);
     }
     let usage = &state.live_usage;
-    if include_usage
-        && (usage.input_tokens > 0 || usage.output_tokens > 0 || usage.cached_tokens > 0)
-    {
+    if include_usage {
+        let output_count = if usage.output_tokens_estimated {
+            format!("~{}", usage.output_tokens)
+        } else {
+            usage.output_tokens.to_string()
+        };
         detail.push_str("  ·  ");
         detail.push_str(&format!(
-            "in {} out {} cached {}",
-            usage.input_tokens, usage.output_tokens, usage.cached_tokens
+            "{} {}  {} {}  {} {}",
+            session_upload_indicator(),
+            usage.input_tokens,
+            session_download_indicator(),
+            output_count,
+            session_cache_indicator(),
+            usage.cached_tokens
         ));
     }
     detail
 }
 
-fn session_live_typing_detail() -> String {
-    format!("typing {}", session_live_frame())
+fn session_live_typing_detail(session: &SessionRecord, state: &SessionInteractiveState) -> String {
+    session_live_status_detail_parts(Some(session), state, "typing", true)
+}
+
+fn session_upload_indicator() -> &'static str {
+    const FRAMES: [&str; 4] = ["⇡◔", "⇡◑", "⇡◕", "⇡◗"];
+    session_activity_frame(&FRAMES)
+}
+
+fn session_download_indicator() -> &'static str {
+    const FRAMES: [&str; 4] = ["⇣◔", "⇣◑", "⇣◕", "⇣◗"];
+    session_activity_frame(&FRAMES)
+}
+
+fn session_cache_indicator() -> &'static str {
+    const FRAMES: [&str; 4] = ["⟳◔", "⟳◑", "⟳◕", "⟳◗"];
+    session_activity_frame(&FRAMES)
+}
+
+fn session_activity_frame<const N: usize>(frames: &[&'static str; N]) -> &'static str {
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 120) as usize)
+        .unwrap_or(0);
+    frames[tick % N]
+}
+
+fn estimate_stream_output_tokens(streamed_chars: usize) -> u64 {
+    if streamed_chars == 0 {
+        0
+    } else {
+        ((streamed_chars as u64) + 3) / 4
+    }
 }
 
 fn should_begin_session_prompt(ch: char, status: SessionStatus) -> bool {
@@ -2884,7 +3056,7 @@ fn render_session_event_rows(
     for index in 0..state.entries.len() {
         let next_is_nested = session_entry_is_nested(state.entries.get(index + 1));
         let count = state
-            .render_cached_entry_rows(index, next_is_nested, prefs, width)
+            .render_cached_entry_rows(session, index, next_is_nested, prefs, width)
             .len();
         entry_counts.push(count);
         total_rows += count;
@@ -2906,7 +3078,7 @@ fn render_session_event_rows(
             break;
         }
         let next_is_nested = session_entry_is_nested(state.entries.get(index + 1));
-        let rendered = state.render_cached_entry_rows(index, next_is_nested, prefs, width);
+        let rendered = state.render_cached_entry_rows(session, index, next_is_nested, prefs, width);
         let slice_start = bounds.start.saturating_sub(cursor).min(rendered.len());
         let slice_end = bounds.end.saturating_sub(cursor).min(rendered.len());
         rows.extend(rendered[slice_start..slice_end].iter().cloned());
@@ -2952,6 +3124,7 @@ fn render_session_entry_rows(
     view_mode: LiveViewMode,
     prefs: &UiPrefs,
     width: usize,
+    live_detail: Option<&str>,
 ) -> Vec<String> {
     use crate::output::palette::Status;
 
@@ -2982,11 +3155,7 @@ fn render_session_entry_rows(
             thinking,
             streaming,
         } => {
-            let streaming_detail = if *streaming {
-                Some(session_live_typing_detail())
-            } else {
-                None
-            };
+            let streaming_detail = if *streaming { live_detail } else { None };
             let mut rows = render_role_header(
                 "assistant",
                 if *streaming {
@@ -4951,6 +5120,7 @@ fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> 
         run.error = Some("stopped by operator".into());
     }
     write_session(&global, scope, &session)?;
+    clear_session_live_usage(global, scope, session_id)?;
     clear_session_turn_queue(global, scope, session_id)?;
     Ok(())
 }
@@ -5007,6 +5177,7 @@ fn cancel_active_turn_in_place(global: &Path, session_id: &str) -> anyhow::Resul
         run.error = Some("turn cancelled by operator".into());
     }
     write_session(global, scope, &session)?;
+    clear_session_live_usage(global, scope, session_id)?;
     if session_has_pending_turn_requests(global, scope, session_id)? {
         let (mut refreshed, scope) = read_session(global, session_id)?;
         refreshed.status = SessionStatus::Idle;
@@ -5066,6 +5237,7 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
                 run.transcript_path = transcript_path.clone();
             }
             write_session(&global, scope, &session)?;
+            clear_session_live_usage(&global, scope, &args.session_id)?;
 
             let result = run_turn(RunTurnArgs {
                 session_id: args.session_id.clone(),
@@ -5099,6 +5271,7 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
                     }
                     write_session(&global, scope, &failed)?;
                 }
+                let _ = clear_session_live_usage(&global, scope, &args.session_id);
             }
             continue;
         }
@@ -5115,6 +5288,7 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
             session.updated_at = Utc::now();
             let _ = write_session(&global, scope, &session);
         }
+        let _ = clear_session_live_usage(&global, scope, &args.session_id);
     }
     Ok(())
 }
@@ -5194,6 +5368,34 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         "readonly" => Arc::new(ReadonlyDecider),
         _ => Arc::new(BypassDecider),
     };
+    let live_usage_state = Arc::new(Mutex::new(SessionLiveUsageWriterState::new(
+        &session.provider_name,
+        &session.model,
+    )));
+    let live_usage_global = global.clone();
+    let live_usage_session_id = args.session_id.clone();
+    let live_usage_run_id = args.run_id.clone();
+    let live_usage_state_cb = Arc::clone(&live_usage_state);
+    let on_stream_event = Arc::new(move |event: StreamEvent| {
+        let force = matches!(event, StreamEvent::UsageSnapshot(_));
+        let Ok(mut state) = live_usage_state_cb.lock() else {
+            return;
+        };
+        if !state.apply_event(&event) || !state.should_flush(force) {
+            return;
+        }
+        if persist_session_live_usage_snapshot(
+            &live_usage_global,
+            scope,
+            &live_usage_session_id,
+            &live_usage_run_id,
+            &state.usage,
+        )
+        .is_ok()
+        {
+            state.mark_persisted();
+        }
+    });
 
     let opts = AgentRunOpts {
         agent_name: session.agent_name.clone(),
@@ -5227,9 +5429,11 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         dispatchable_agents: session.dispatchable_agents.clone(),
         step_id: String::new(),
         on_tool_call: None,
+        on_stream_event: Some(on_stream_event),
     };
 
     let outcome = rupu_agent::run_agent(opts).await;
+    clear_session_live_usage(&global, scope, &args.session_id)?;
 
     session = read_session(&global, &args.session_id)?.0;
     session.updated_at = Utc::now();
@@ -5406,6 +5610,10 @@ fn session_record_path(global: &Path, scope: SessionScope, session_id: &str) -> 
     session_dir(global, scope, session_id).join("session.json")
 }
 
+fn session_live_usage_path(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
+    session_dir(global, scope, session_id).join("live-usage.json")
+}
+
 fn session_turn_queue_dir(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
     session_dir(global, scope, session_id).join("queue")
 }
@@ -5431,6 +5639,70 @@ fn enqueue_session_turn_request(
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(&request)?)?;
     fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn write_session_live_usage(
+    global: &Path,
+    scope: SessionScope,
+    record: &SessionLiveUsageRecord,
+) -> anyhow::Result<()> {
+    let dir = session_dir(global, scope, &record.session_id);
+    fs::create_dir_all(&dir)?;
+    let path = session_live_usage_path(global, scope, &record.session_id);
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(record)?)?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn read_session_live_usage(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+) -> anyhow::Result<Option<SessionLiveUsageRecord>> {
+    let path = session_live_usage_path(global, scope, session_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)?;
+    Ok(Some(serde_json::from_slice(&bytes)?))
+}
+
+fn clear_session_live_usage(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let path = session_live_usage_path(global, scope, session_id);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn persist_session_live_usage_snapshot(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+    run_id: &str,
+    usage: &SessionLiveUsage,
+) -> anyhow::Result<()> {
+    if let Some(active_run_id) = read_session(global, session_id)?
+        .0
+        .active_run_id
+        .filter(|active_run_id| active_run_id == run_id)
+    {
+        let record = SessionLiveUsageRecord {
+            version: SessionLiveUsageRecord::VERSION,
+            session_id: session_id.to_string(),
+            run_id: active_run_id,
+            updated_at: Utc::now(),
+            usage: usage.clone(),
+        };
+        write_session_live_usage(global, scope, &record)?;
+    }
     Ok(())
 }
 
@@ -6308,7 +6580,12 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("assistant")));
         assert!(rows.iter().any(|row| row.contains("thinking")));
         assert!(rows.iter().any(|row| row.contains("00:00:")));
-        assert!(rows.iter().any(|row| row.contains("in 12 out 5 cached 2")));
+        assert!(rows.iter().any(|row| row.contains("⇡")));
+        assert!(rows.iter().any(|row| row.contains("⇣")));
+        assert!(rows.iter().any(|row| row.contains("⟳")));
+        assert!(rows.iter().any(|row| row.contains("12")));
+        assert!(rows.iter().any(|row| row.contains("5")));
+        assert!(rows.iter().any(|row| row.contains("2")));
     }
 
     #[test]
@@ -6331,8 +6608,29 @@ mod tests {
         let line = render_session_prompt_line(&session, &state, 160);
         assert!(line.contains("issue-reader >"));
         assert!(!line.contains("thinking"));
-        assert!(!line.contains("in 12"));
-        assert!(!line.contains("cached 2"));
+        assert!(!line.contains("⇡"));
+        assert!(!line.contains("⇣"));
+        assert!(!line.contains("⟳"));
+    }
+
+    #[test]
+    fn session_live_usage_writer_estimates_output_until_provider_snapshot() {
+        let mut writer = SessionLiveUsageWriterState::new("openai", "gpt-5");
+        assert!(writer.apply_event(&StreamEvent::TextDelta("hello there".into())));
+        assert!(writer.usage.output_tokens > 0);
+        assert!(writer.usage.output_tokens_estimated);
+
+        assert!(
+            writer.apply_event(&StreamEvent::UsageSnapshot(rupu_providers::types::Usage {
+                input_tokens: 123,
+                output_tokens: 7,
+                cached_tokens: 9,
+            },))
+        );
+        assert_eq!(writer.usage.input_tokens, 123);
+        assert_eq!(writer.usage.output_tokens, 7);
+        assert_eq!(writer.usage.cached_tokens, 9);
+        assert!(!writer.usage.output_tokens_estimated);
     }
 
     #[test]

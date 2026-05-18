@@ -664,6 +664,11 @@ fn process_completion_sse(
         if let Some(output) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
             acc.output_tokens = output as u32;
         }
+        on_event(StreamEvent::UsageSnapshot(Usage {
+            input_tokens: acc.input_tokens,
+            output_tokens: acc.output_tokens,
+            cached_tokens: 0,
+        }));
     }
 
     Ok(())
