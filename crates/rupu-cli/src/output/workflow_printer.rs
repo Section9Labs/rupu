@@ -116,6 +116,12 @@ enum WorkflowViewLineKind {
     TreeNote,
 }
 
+#[derive(Debug, Clone)]
+struct CachedWorkflowRows {
+    width: usize,
+    rows: Vec<String>,
+}
+
 struct WorkflowInteractiveState {
     seen_step_results: usize,
     step_results: BTreeMap<String, StepResultRecord>,
@@ -124,6 +130,7 @@ struct WorkflowInteractiveState {
     tailer: Option<TranscriptTailer>,
     active_transcript_indent: usize,
     lines: Vec<WorkflowViewLine>,
+    line_row_cache: Vec<Option<CachedWorkflowRows>>,
     total_tokens: u64,
     dispatches: BTreeMap<String, InFlightDispatch>,
     viewport: ViewportState,
@@ -139,6 +146,7 @@ impl WorkflowInteractiveState {
             tailer: None,
             active_transcript_indent: 0,
             lines: Vec::new(),
+            line_row_cache: Vec::new(),
             total_tokens: 0,
             dispatches: BTreeMap::new(),
             viewport: ViewportState::default(),
@@ -157,10 +165,11 @@ impl WorkflowInteractiveState {
 
     fn push_view_line(&mut self, line: WorkflowViewLine) {
         self.lines.push(line);
+        self.line_row_cache.push(None);
     }
 
     fn push_tree_item(&mut self, status: UiStatus, indent: usize, text: impl Into<String>) {
-        self.lines.push(WorkflowViewLine {
+        self.push_view_line(WorkflowViewLine {
             status,
             text: text.into(),
             continuation: false,
@@ -170,13 +179,29 @@ impl WorkflowInteractiveState {
     }
 
     fn push_tree_note(&mut self, status: UiStatus, indent: usize, text: impl Into<String>) {
-        self.lines.push(WorkflowViewLine {
+        self.push_view_line(WorkflowViewLine {
             status,
             text: text.into(),
             continuation: false,
             indent,
             kind: WorkflowViewLineKind::TreeNote,
         });
+    }
+
+    fn render_cached_line_rows(&mut self, index: usize, width: usize) -> &[String] {
+        let cache_valid = self
+            .line_row_cache
+            .get(index)
+            .and_then(|slot| slot.as_ref())
+            .is_some_and(|cached| cached.width == width);
+        if !cache_valid {
+            let rows = render_workflow_view_line_rows(&self.lines[index], width);
+            self.line_row_cache[index] = Some(CachedWorkflowRows { width, rows });
+        }
+        &self.line_row_cache[index]
+            .as_ref()
+            .expect("workflow row cache populated")
+            .rows
     }
 }
 
@@ -2330,28 +2355,59 @@ fn render_workflow_event_rows(
     width: usize,
     max_rows: usize,
 ) -> Vec<String> {
-    let rendered = render_all_workflow_event_rows(state, width);
-    state.viewport.apply(rendered, max_rows).rows
+    let mut line_counts = Vec::with_capacity(state.lines.len());
+    let mut total_rows = 0usize;
+    for index in 0..state.lines.len() {
+        let count = state.render_cached_line_rows(index, width).len();
+        line_counts.push(count);
+        total_rows += count;
+    }
+
+    let bounds = state.viewport.window(total_rows, max_rows);
+    let mut rows = Vec::with_capacity(max_rows.min(total_rows));
+    let mut cursor = 0usize;
+    for (index, count) in line_counts.into_iter().enumerate() {
+        let next_cursor = cursor + count;
+        if next_cursor <= bounds.start {
+            cursor = next_cursor;
+            continue;
+        }
+        if cursor >= bounds.end {
+            break;
+        }
+        let rendered = state.render_cached_line_rows(index, width);
+        let slice_start = bounds.start.saturating_sub(cursor).min(rendered.len());
+        let slice_end = bounds.end.saturating_sub(cursor).min(rendered.len());
+        rows.extend(rendered[slice_start..slice_end].iter().cloned());
+        cursor = next_cursor;
+    }
+    rows
 }
 
 fn render_all_workflow_event_rows(state: &WorkflowInteractiveState, width: usize) -> Vec<String> {
     let mut rendered = Vec::new();
     for line in &state.lines {
-        let prefix = retained_workflow_line_prefix(line);
-        let content_width = width.saturating_sub(visible_len(&prefix)).max(1);
-        for (idx, segment) in wrap_with_ansi(&line.text, content_width)
-            .into_iter()
-            .enumerate()
-        {
-            if idx == 0 && !line.continuation {
-                rendered.push(format!("{prefix}{segment}"));
-            } else {
-                rendered.push(format!(
-                    "{}{}",
-                    retained_workflow_continuation_prefix(line),
-                    segment
-                ));
-            }
+        rendered.extend(render_workflow_view_line_rows(line, width));
+    }
+    rendered
+}
+
+fn render_workflow_view_line_rows(line: &WorkflowViewLine, width: usize) -> Vec<String> {
+    let prefix = retained_workflow_line_prefix(line);
+    let content_width = width.saturating_sub(visible_len(&prefix)).max(1);
+    let mut rendered = Vec::new();
+    for (idx, segment) in wrap_with_ansi(&line.text, content_width)
+        .into_iter()
+        .enumerate()
+    {
+        if idx == 0 && !line.continuation {
+            rendered.push(format!("{prefix}{segment}"));
+        } else {
+            rendered.push(format!(
+                "{}{}",
+                retained_workflow_continuation_prefix(line),
+                segment
+            ));
         }
     }
     rendered
@@ -3864,6 +3920,52 @@ mod tests {
         );
         assert!(rows.iter().any(|row| row.contains("workflow line 000")));
         assert!(!rows.iter().any(|row| row.contains("workflow line 799")));
+    }
+
+    #[test]
+    fn retained_workflow_viewport_keeps_oldest_rows_visible_when_history_grows() {
+        let mut record = sample_run_record();
+        record.active_step_id = Some("implement".into());
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Focused),
+        );
+        let mut state = WorkflowInteractiveState::new(0);
+        for index in 0..160 {
+            state.push_line(UiStatus::Active, format!("workflow line {index:03}"));
+        }
+        state.viewport.jump_top();
+
+        let initial_rows = build_workflow_screen_rows_for_size(
+            "demo",
+            &record,
+            &mut state,
+            LiveViewMode::Focused,
+            &prefs,
+            72,
+            16,
+        );
+        assert!(initial_rows.iter().any(|row| row.contains("workflow line 000")));
+        assert!(!initial_rows.iter().any(|row| row.contains("workflow line 159")));
+
+        for index in 160..320 {
+            state.push_line(UiStatus::Active, format!("workflow line {index:03}"));
+        }
+
+        let grown_rows = build_workflow_screen_rows_for_size(
+            "demo",
+            &record,
+            &mut state,
+            LiveViewMode::Focused,
+            &prefs,
+            72,
+            16,
+        );
+        assert!(grown_rows.iter().any(|row| row.contains("workflow line 000")));
+        assert!(!grown_rows.iter().any(|row| row.contains("workflow line 319")));
     }
 
     #[test]

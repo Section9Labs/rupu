@@ -2841,7 +2841,7 @@ fn build_selected_history_rows(
         history_row_status(&entry.latest_event),
     ));
 
-    let mut scrollable = Vec::new();
+    let mut scrollable_blocks: Vec<Vec<String>> = Vec::new();
     if let Some(claim) = claim {
         if let Some((record, summary, live_lines)) =
             resolve_live_claim_run(run_store, pricing, claim, view_mode)
@@ -2878,22 +2878,28 @@ fn build_selected_history_rows(
             }
             pinned.push(String::new());
             pinned.push(retained_serve_section_title("workflow canvas", width));
-            scrollable.extend(build_issue_canvas_rows(claim, &record, &summary, &live_lines, width));
-            scrollable.push(String::new());
+            let mut canvas_block =
+                build_issue_canvas_rows(claim, &record, &summary, &live_lines, width);
+            canvas_block.push(String::new());
+            scrollable_blocks.push(canvas_block);
         }
     }
 
-    scrollable.push(retained_serve_section_title("history timeline", width));
-    scrollable.extend(build_history_issue_timeline_rows(
+    let mut history_block = vec![retained_serve_section_title("history timeline", width)];
+    history_block.extend(build_history_issue_timeline_rows(
         &entry.issue_ref,
         report,
         view_mode,
         width,
     ));
+    scrollable_blocks.push(history_block);
 
     let body_slots = height.saturating_sub(pinned.len()).max(1);
-    let window = ui_state.detail_viewport.apply(scrollable, body_slots);
-    pinned.extend(window.rows);
+    pinned.extend(window_string_blocks(
+        &mut ui_state.detail_viewport,
+        &scrollable_blocks,
+        body_slots,
+    ));
     pinned.truncate(height);
     pinned
 }
@@ -3544,7 +3550,7 @@ fn build_selected_issue_rows(
         UiStatus::Active,
     ));
 
-    let mut scrollable = Vec::new();
+    let mut scrollable_blocks: Vec<Vec<String>> = Vec::new();
     if let Some((record, summary, live_lines)) = resolve_live_claim_run(run_store, pricing, claim, view_mode) {
         pinned.push(retained_serve_kv_row(
             "run",
@@ -3612,7 +3618,7 @@ fn build_selected_issue_rows(
         }
         pinned.push(String::new());
         pinned.push(retained_serve_section_title("timeline", width));
-        scrollable.extend(build_issue_canvas_rows(
+        scrollable_blocks.push(build_issue_canvas_rows(
             claim,
             &record,
             &summary,
@@ -3647,24 +3653,25 @@ fn build_selected_issue_rows(
         })
         .collect::<Vec<_>>();
     if !issue_recent.is_empty() {
-        if !scrollable.is_empty() {
-            scrollable.push(String::new());
-        }
-        scrollable.push(retained_serve_section_title("recent issue activity", width));
+        let mut recent_block = vec![retained_serve_section_title("recent issue activity", width)];
         for activity in issue_recent {
             let (status, label) = activity_status_and_label(&activity.event);
-            scrollable.push(retained_serve_activity_line(
+            recent_block.push(retained_serve_activity_line(
                 status,
                 &short_timestamp(&activity.at),
                 &format!("{label}  ·  {}", truncate_text(&activity.detail, 64)),
                 width,
             ));
         }
+        scrollable_blocks.push(recent_block);
     }
 
     let body_slots = height.saturating_sub(pinned.len()).max(1);
-    let window = ui_state.detail_viewport.apply(scrollable, body_slots);
-    pinned.extend(window.rows);
+    pinned.extend(window_string_blocks(
+        &mut ui_state.detail_viewport,
+        &scrollable_blocks,
+        body_slots,
+    ));
     pinned.truncate(height);
     pinned
 }
@@ -3680,6 +3687,32 @@ fn build_issue_canvas_rows(
         &build_issue_canvas_lines(claim, record, summary, live_lines),
         width,
     )
+}
+
+fn window_string_blocks(
+    viewport: &mut ViewportState,
+    blocks: &[Vec<String>],
+    max_rows: usize,
+) -> Vec<String> {
+    let total_rows = blocks.iter().map(Vec::len).sum();
+    let bounds = viewport.window(total_rows, max_rows);
+    let mut rows = Vec::with_capacity(max_rows.min(total_rows));
+    let mut cursor = 0usize;
+    for block in blocks {
+        let next_cursor = cursor + block.len();
+        if next_cursor <= bounds.start {
+            cursor = next_cursor;
+            continue;
+        }
+        if cursor >= bounds.end {
+            break;
+        }
+        let slice_start = bounds.start.saturating_sub(cursor).min(block.len());
+        let slice_end = bounds.end.saturating_sub(cursor).min(block.len());
+        rows.extend(block[slice_start..slice_end].iter().cloned());
+        cursor = next_cursor;
+    }
+    rows
 }
 
 fn build_issue_canvas_lines(
@@ -5777,6 +5810,28 @@ mod serve_heartbeat_tests {
         assert!(rendered.iter().any(|row| row.contains("event line 000")));
         assert!(rendered.iter().any(|row| row.contains("event line 039")));
         assert!(rendered.len() >= 40);
+    }
+
+    #[test]
+    fn window_string_blocks_keeps_oldest_rows_visible_when_history_grows() {
+        let mut viewport = ViewportState::default();
+        let initial = vec![
+            (0..6).map(|index| format!("a line {index:03}")).collect::<Vec<_>>(),
+            (0..6).map(|index| format!("b line {index:03}")).collect::<Vec<_>>(),
+        ];
+        viewport.jump_top();
+        let first = window_string_blocks(&mut viewport, &initial, 4);
+        assert!(first.iter().any(|row| row.contains("a line 000")));
+        assert!(!first.iter().any(|row| row.contains("b line 005")));
+
+        let grown = vec![
+            initial[0].clone(),
+            initial[1].clone(),
+            (0..6).map(|index| format!("c line {index:03}")).collect::<Vec<_>>(),
+        ];
+        let second = window_string_blocks(&mut viewport, &grown, 4);
+        assert!(second.iter().any(|row| row.contains("a line 000")));
+        assert!(!second.iter().any(|row| row.contains("c line 005")));
     }
 
     #[test]
