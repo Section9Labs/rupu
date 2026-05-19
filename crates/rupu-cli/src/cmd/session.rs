@@ -2831,6 +2831,18 @@ fn build_session_screen_rows_for_size(
     rows
 }
 
+/// Time-phase for the painted prompt caret. Toggles every ~530ms (matches
+/// macOS NSTextView cadence). Source of liveness for the redraw loop: when
+/// the phase flips, the prompt row text differs from `last_rows` and the
+/// caller re-renders.
+fn session_caret_visible() -> bool {
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 530) as u64)
+        .unwrap_or(0);
+    tick % 2 == 0
+}
+
 fn render_session_screen_rows(rows: &[String]) -> anyhow::Result<()> {
     let mut stdout = io::stdout();
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
@@ -2898,13 +2910,23 @@ fn render_session_prompt_line(
         BRAND,
     );
     let _ = palette::write_colored(&mut buf, " > ", DIM);
+    if !state.input_buffer.is_empty() {
+        let _ = palette::write_colored(&mut buf, &state.input_buffer, DIM);
+    }
+    // Painted caret right after the input position. Half-block glyph in the
+    // brand color, toggled every ~530ms by `session_caret_visible()`. The
+    // attach loop redraws when row text changes, so the phase flip drives
+    // the visible blink.
+    if session_caret_visible() {
+        let _ = palette::write_bold_colored(&mut buf, "▏", BRAND);
+    } else {
+        buf.push(' ');
+    }
     if state.input_buffer.is_empty() {
         let queued_runs = session_pending_run_count(session);
         if queued_runs > 0 {
-            let _ = palette::write_colored(&mut buf, &format!("queued {queued_runs}"), DIM);
+            let _ = palette::write_colored(&mut buf, &format!(" queued {queued_runs}"), DIM);
         }
-    } else {
-        let _ = palette::write_colored(&mut buf, &state.input_buffer, DIM);
     }
     truncate_ansi_line(&buf, width)
 }
@@ -2979,15 +3001,12 @@ fn session_live_status_detail_parts(
             usage.output_tokens.to_string()
         };
         detail.push_str("  ·  ");
-        detail.push_str(&format!(
-            "{} {}  {} {}  {} {}",
-            session_upload_indicator(),
-            usage.input_tokens,
-            session_download_indicator(),
-            output_count,
-            session_cache_indicator(),
-            usage.cached_tokens
-        ));
+        let _ = palette::write_colored(&mut detail, session_upload_indicator(), BRAND);
+        detail.push_str(&format!(" {}  ", usage.input_tokens));
+        let _ = palette::write_colored(&mut detail, session_download_indicator(), BRAND);
+        detail.push_str(&format!(" {output_count}  "));
+        let _ = palette::write_colored(&mut detail, session_cache_indicator(), BRAND);
+        detail.push_str(&format!(" {}", usage.cached_tokens));
     }
     detail
 }
@@ -2997,26 +3016,15 @@ fn session_live_typing_detail(session: &SessionRecord, state: &SessionInteractiv
 }
 
 fn session_upload_indicator() -> &'static str {
-    const FRAMES: [&str; 4] = ["⇡◔", "⇡◑", "⇡◕", "⇡◗"];
-    session_activity_frame(&FRAMES)
+    "⇡"
 }
 
 fn session_download_indicator() -> &'static str {
-    const FRAMES: [&str; 4] = ["⇣◔", "⇣◑", "⇣◕", "⇣◗"];
-    session_activity_frame(&FRAMES)
+    "⇣"
 }
 
 fn session_cache_indicator() -> &'static str {
-    const FRAMES: [&str; 4] = ["⟳◔", "⟳◑", "⟳◕", "⟳◗"];
-    session_activity_frame(&FRAMES)
-}
-
-fn session_activity_frame<const N: usize>(frames: &[&'static str; N]) -> &'static str {
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| (duration.as_millis() / 120) as usize)
-        .unwrap_or(0);
-    frames[tick % N]
+    "⟳"
 }
 
 fn estimate_stream_output_tokens(streamed_chars: usize) -> u64 {
