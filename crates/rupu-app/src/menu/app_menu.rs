@@ -19,6 +19,7 @@ actions!(
         LaunchSelected,
         ToggleSidebar,
         AboutRupu,
+        DismissContextMenu,
     ]
 );
 
@@ -53,6 +54,7 @@ pub fn install(cx: &mut App) {
         KeyBinding::new("r", RejectFocused, None),
         KeyBinding::new("cmd-r", LaunchSelected, None),
         KeyBinding::new("cmd-\\", ToggleSidebar, None),
+        KeyBinding::new("escape", DismissContextMenu, None),
         // TextInput shortcuts — scoped to focused text inputs only.
         KeyBinding::new(
             "backspace",
