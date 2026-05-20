@@ -708,6 +708,7 @@ mod on_tool_call_tests {
             dispatchable_agents: None,
             step_id: "s1".into(),
             on_tool_call: Some(cb),
+            on_stream_event: None,
         };
 
         run_agent(opts).await.expect("agent run succeeds");
