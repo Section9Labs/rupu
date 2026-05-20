@@ -290,6 +290,8 @@ struct SessionRunRecord {
     #[serde(default)]
     total_tokens_out: u64,
     #[serde(default)]
+    total_tokens_cached: u64,
+    #[serde(default)]
     duration_ms: u64,
     #[serde(default)]
     pid: Option<u32>,
@@ -380,6 +382,8 @@ struct SessionRecord {
     total_tokens_in: u64,
     #[serde(default)]
     total_tokens_out: u64,
+    #[serde(default)]
+    total_tokens_cached: u64,
     #[serde(default)]
     message_history: Vec<Message>,
     #[serde(default)]
@@ -1348,6 +1352,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         total_turns: 0,
         total_tokens_in: 0,
         total_tokens_out: 0,
+        total_tokens_cached: 0,
         message_history: Vec::new(),
         runs: Vec::new(),
     };
@@ -1432,6 +1437,7 @@ fn enqueue_turn_request(global: &Path, session_id: &str, prompt: String) -> anyh
         status: None,
         total_tokens_in: 0,
         total_tokens_out: 0,
+        total_tokens_cached: 0,
         duration_ms: 0,
         pid: None,
         error: None,
@@ -1737,7 +1743,9 @@ enum SessionEntry {
     },
     RunComplete {
         status: RunStatus,
-        total_tokens: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
         duration_ms: u64,
         error: Option<String>,
     },
@@ -1888,7 +1896,17 @@ struct SessionInteractiveState {
     queued_prompts: VecDeque<(usize, String)>,
     activity: SessionActivity,
     current_run_started_at: Option<DateTime<Utc>>,
+    /// Authoritative accumulator. Driven only by transcript `Event::Usage`
+    /// entries via `push_transcript_event`. Reset on `RunStart`. Must not
+    /// be touched by the on-disk live-usage sync, or the next Event::Usage
+    /// double-counts on top of the streaming estimate.
     live_usage: SessionLiveUsage,
+    /// Streaming overlay for the in-flight turn — read from the on-disk
+    /// `live-usage.json` file (the worker's per-chunk estimate / partial
+    /// snapshot). Combined additively with `live_usage` for display, then
+    /// cleared when the turn's `Event::Usage` lands so we don't keep it
+    /// stacking against the now-authoritative accumulator value.
+    streaming_overlay: SessionLiveUsage,
     pricing: PricingConfig,
 }
 
@@ -1909,6 +1927,7 @@ impl SessionInteractiveState {
             activity: SessionActivity::Idle,
             current_run_started_at: None,
             live_usage: SessionLiveUsage::default(),
+            streaming_overlay: SessionLiveUsage::default(),
             pricing: PricingConfig::default(),
         }
     }
@@ -1933,6 +1952,7 @@ impl SessionInteractiveState {
             activity: SessionActivity::Idle,
             current_run_started_at: None,
             live_usage: SessionLiveUsage::default(),
+            streaming_overlay: SessionLiveUsage::default(),
             pricing: PricingConfig::default(),
         };
         state.follow_transcript(
@@ -2060,6 +2080,7 @@ impl SessionInteractiveState {
                 self.activity = SessionActivity::Thinking;
                 self.current_run_started_at = Some(*started_at);
                 self.live_usage = SessionLiveUsage::default();
+                self.streaming_overlay = SessionLiveUsage::default();
                 self.push_entry(SessionEntry::RunStart {
                     run_id: run_id.clone(),
                     workspace_id: workspace_id.clone(),
@@ -2163,6 +2184,11 @@ impl SessionInteractiveState {
                 self.live_usage.input_tokens += *input_tokens as u64;
                 self.live_usage.output_tokens += *output_tokens as u64;
                 self.live_usage.cached_tokens += *cached_tokens as u64;
+                // Authoritative per-turn usage just landed. The on-disk
+                // streaming estimate for THIS turn is now redundant —
+                // zero the overlay so we don't keep displaying it on top
+                // of the value it was estimating.
+                self.streaming_overlay = SessionLiveUsage::default();
                 self.push_entry(SessionEntry::Usage {
                     provider: provider.clone(),
                     model: model.clone(),
@@ -2173,16 +2199,21 @@ impl SessionInteractiveState {
             }
             TranscriptEvent::RunComplete {
                 status,
-                total_tokens,
                 duration_ms,
                 error,
                 ..
             } => {
                 self.activity = SessionActivity::Idle;
                 self.current_run_started_at = None;
+                // Snapshot the live usage triple at completion — gives us
+                // authoritative in/out/cached for this run without relying
+                // on the legacy `total_tokens` rollup field.
+                let usage = self.live_usage.clone();
                 self.push_entry(SessionEntry::RunComplete {
                     status: *status,
-                    total_tokens: *total_tokens,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cached_tokens: usage.cached_tokens,
                     duration_ms: *duration_ms,
                     error: error.clone(),
                 });
@@ -2319,21 +2350,61 @@ impl SessionInteractiveState {
         session: &SessionRecord,
         live_usage: Option<&SessionLiveUsageRecord>,
     ) {
+        // The on-disk live-usage file holds the WORKER's per-turn
+        // estimate / partial snapshot for the in-flight turn. Funnel it
+        // into `streaming_overlay` only — never touch `live_usage`,
+        // which is the authoritative accumulator driven by transcript
+        // `Event::Usage` entries. See [streaming_overlay] field docs.
         if session.status != SessionStatus::Running {
-            self.live_usage = SessionLiveUsage::default();
+            self.streaming_overlay = SessionLiveUsage::default();
             return;
         }
         if let Some(record) = live_usage
             .filter(|record| session.active_run_id.as_deref() == Some(record.run_id.as_str()))
         {
-            self.live_usage = record.usage.clone();
+            self.streaming_overlay = record.usage.clone();
+            // Provider/model on the accumulator are unset until the first
+            // transcript Event::Usage; hydrate from the on-disk record so
+            // the UI knows them during streaming.
+            if self.live_usage.provider.is_none() {
+                self.live_usage.provider = record.usage.provider.clone();
+            }
+            if self.live_usage.model.is_none() {
+                self.live_usage.model = record.usage.model.clone();
+            }
             return;
         }
-        self.live_usage = SessionLiveUsage {
-            provider: Some(session.provider_name.clone()),
-            model: Some(session.model.clone()),
-            ..SessionLiveUsage::default()
-        };
+        self.streaming_overlay = SessionLiveUsage::default();
+        if self.live_usage.provider.is_none() {
+            self.live_usage.provider = Some(session.provider_name.clone());
+        }
+        if self.live_usage.model.is_none() {
+            self.live_usage.model = Some(session.model.clone());
+        }
+    }
+
+    /// Combined view of `live_usage + streaming_overlay`. Use this for
+    /// any user-facing token display during an active turn.
+    fn display_usage(&self) -> SessionLiveUsage {
+        SessionLiveUsage {
+            provider: self
+                .live_usage
+                .provider
+                .clone()
+                .or_else(|| self.streaming_overlay.provider.clone()),
+            model: self
+                .live_usage
+                .model
+                .clone()
+                .or_else(|| self.streaming_overlay.model.clone()),
+            input_tokens: self.live_usage.input_tokens + self.streaming_overlay.input_tokens,
+            output_tokens: self.live_usage.output_tokens + self.streaming_overlay.output_tokens,
+            cached_tokens: self.live_usage.cached_tokens + self.streaming_overlay.cached_tokens,
+            // If the overlay is non-zero, the output_tokens are an estimate
+            // for the in-flight turn; mark the combined value accordingly.
+            output_tokens_estimated: self.streaming_overlay.output_tokens > 0
+                && self.streaming_overlay.output_tokens_estimated,
+        }
     }
 
     fn has_dynamic_render_state(&self, status: SessionStatus) -> bool {
@@ -2867,7 +2938,7 @@ fn render_session_header_line(
     buf.push(' ');
     let _ = palette::write_bold_colored(
         &mut buf,
-        &truncate_single_line(&session.agent_name, 20),
+        &truncate_single_line(&session_header_label(session), 32),
         BRAND,
     );
 
@@ -2993,20 +3064,20 @@ fn session_live_status_detail_parts(
         detail.push_str("  ·  ");
         detail.push_str(&elapsed);
     }
-    let usage = &state.live_usage;
+    let usage = state.display_usage();
     if include_usage {
         let output_count = if usage.output_tokens_estimated {
-            format!("~{}", usage.output_tokens)
+            format!("~{}", format_token_count(usage.output_tokens))
         } else {
-            usage.output_tokens.to_string()
+            format_token_count(usage.output_tokens)
         };
         detail.push_str("  ·  ");
         let _ = palette::write_colored(&mut detail, session_upload_indicator(), BRAND);
-        detail.push_str(&format!(" {}  ", usage.input_tokens));
+        detail.push_str(&format!(" {}  ", format_token_count(usage.input_tokens)));
         let _ = palette::write_colored(&mut detail, session_download_indicator(), BRAND);
         detail.push_str(&format!(" {output_count}  "));
         let _ = palette::write_colored(&mut detail, session_cache_indicator(), BRAND);
-        detail.push_str(&format!(" {}", usage.cached_tokens));
+        detail.push_str(&format!(" {}", format_token_count(usage.cached_tokens)));
     }
     detail
 }
@@ -3446,7 +3517,9 @@ fn render_session_entry_rows(
         }
         SessionEntry::RunComplete {
             status,
-            total_tokens,
+            input_tokens,
+            output_tokens,
+            cached_tokens,
             duration_ms,
             error,
         } => {
@@ -3455,11 +3528,16 @@ fn render_session_entry_rows(
                 RunStatus::Error | RunStatus::Aborted => Status::Failed,
             };
             let mut detail = format!(
-                "status {}  ·  {}ms  ·  {} tokens",
+                "status {}  ·  {}ms  ·  ",
                 format!("{status:?}").to_lowercase(),
-                duration_ms,
-                total_tokens
+                duration_ms
             );
+            let _ = palette::write_colored(&mut detail, session_upload_indicator(), BRAND);
+            detail.push_str(&format!(" {}  ", format_token_count(*input_tokens)));
+            let _ = palette::write_colored(&mut detail, session_download_indicator(), BRAND);
+            detail.push_str(&format!(" {}  ", format_token_count(*output_tokens)));
+            let _ = palette::write_colored(&mut detail, session_cache_indicator(), BRAND);
+            detail.push_str(&format!(" {}", format_token_count(*cached_tokens)));
             if let Some(error) = error.as_deref().filter(|value| !value.trim().is_empty()) {
                 detail.push_str("  ·  ");
                 detail.push_str(&truncate_single_line(error, 72));
@@ -4858,12 +4936,39 @@ fn session_usage_detail(session: &SessionRecord) -> String {
     )
 }
 
+/// Workspace-scoped label for the session header. Prefers the user-meaningful
+/// repo reference (e.g. `Section9Labs/rupu`) when the session is bound to one,
+/// falling back to the workspace directory's basename for local sessions.
+fn session_header_label(session: &SessionRecord) -> String {
+    if let Some(ref_str) = session.repo_ref.as_deref() {
+        let stripped = ref_str
+            .strip_prefix("github:")
+            .or_else(|| ref_str.strip_prefix("gitlab:"))
+            .unwrap_or(ref_str);
+        return stripped.to_string();
+    }
+    session
+        .workspace_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| session.workspace_id.clone())
+}
+
 fn session_session_totals_detail(session: &SessionRecord) -> String {
-    format!(
-        "total in {} out {}",
-        format_token_count(session.total_tokens_in),
-        format_token_count(session.total_tokens_out)
-    )
+    let mut detail = String::new();
+    let _ = palette::write_colored(&mut detail, session_upload_indicator(), BRAND);
+    detail.push_str(&format!(" {}  ", format_token_count(session.total_tokens_in)));
+    let _ = palette::write_colored(&mut detail, session_download_indicator(), BRAND);
+    detail.push_str(&format!(" {}  ", format_token_count(session.total_tokens_out)));
+    let _ = palette::write_colored(&mut detail, session_cache_indicator(), BRAND);
+    detail.push_str(&format!(" {}", format_token_count(session.total_tokens_cached)));
+    let grand_total = session
+        .total_tokens_in
+        .saturating_add(session.total_tokens_out)
+        .saturating_add(session.total_tokens_cached);
+    detail.push_str(&format!("  ·  total {}", format_token_count(grand_total)));
+    detail
 }
 
 fn session_effort_detail(session: &SessionRecord) -> Option<String> {
@@ -5441,6 +5546,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     };
 
     let outcome = rupu_agent::run_agent(opts).await;
+    // Snapshot live cached_tokens before clearing — UsageSnapshot events
+    // populated it during streaming, but RunResult (from rupu-agent) only
+    // carries in/out. Keep cached as an additive grand-total dimension.
+    let cached_tokens = read_session_live_usage(&global, scope, &args.session_id)?
+        .map(|record| record.usage.cached_tokens)
+        .unwrap_or(0);
     clear_session_live_usage(&global, scope, &args.session_id)?;
 
     session = read_session(&global, &args.session_id)?.0;
@@ -5467,6 +5578,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 run_status = Some(result.status);
                 run.total_tokens_in = result.total_tokens_in;
                 run.total_tokens_out = result.total_tokens_out;
+                run.total_tokens_cached = cached_tokens;
                 run.duration_ms = duration_ms_from_transcript(&transcript_path).unwrap_or(0);
                 duration_ms = run.duration_ms;
             }
@@ -5490,6 +5602,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             session.total_turns += result.turns;
             session.total_tokens_in += result.total_tokens_in;
             session.total_tokens_out += result.total_tokens_out;
+            session.total_tokens_cached += cached_tokens;
             session.message_history = result.final_messages;
             session.last_error = if result.status == RunStatus::Ok {
                 None
@@ -6553,10 +6666,20 @@ mod tests {
         state.activity = SessionActivity::Thinking;
 
         let header = render_session_header_line(&session, &state, 160);
-        assert!(header.contains("issue-reader"));
+        // Header shows the workspace label (repo_ref stripped of platform prefix),
+        // not the agent name — the agent appears on the prompt row instead.
+        assert!(header.contains("Section9Labs/rupu"));
+        assert!(!header.contains("issue-reader"));
         assert!(header.contains("gpt-5"));
         assert!(header.contains("effort high"));
-        assert!(header.contains("total in 120 out 45"));
+        assert!(header.contains("⇡"));
+        assert!(header.contains(" 120"));
+        assert!(header.contains("⇣"));
+        assert!(header.contains(" 45"));
+        assert!(header.contains("⟳"));
+        assert!(header.contains(" 18"));
+        // grand total = 120 + 45 + 18 = 183
+        assert!(header.contains("total 183"));
         assert!(header.contains("~$"));
     }
 
@@ -6855,6 +6978,7 @@ mod tests {
             total_turns: 3,
             total_tokens_in: 120,
             total_tokens_out: 45,
+            total_tokens_cached: 18,
             message_history: Vec::new(),
             runs: vec![SessionRunRecord {
                 run_id: "run_prev123".into(),
@@ -6865,6 +6989,7 @@ mod tests {
                 status: Some(RunStatus::Ok),
                 total_tokens_in: 100,
                 total_tokens_out: 40,
+                total_tokens_cached: 15,
                 duration_ms: 1234,
                 pid: None,
                 error: None,

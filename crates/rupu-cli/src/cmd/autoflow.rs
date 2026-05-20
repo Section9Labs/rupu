@@ -201,6 +201,19 @@ pub enum Action {
     Claims(RepoFilterArgs),
     /// Force-release one claim.
     Release { r#ref: String },
+    /// Scaffold a new autoflow-enabled workflow YAML, then open it for
+    /// editing. Same template as `workflow create` plus an `autoflow:`
+    /// block pre-filled with reasonable defaults.
+    Create {
+        /// Workflow name (no `.yaml` extension).
+        name: Option<String>,
+        /// Target scope (`global` or `project`). Prompts when omitted.
+        #[arg(long, value_parser = ["global", "project"])]
+        scope: Option<String>,
+        /// Override the editor (e.g. `--editor "code --wait"`).
+        #[arg(long)]
+        editor: Option<String>,
+    },
 }
 
 #[derive(ClapArgs, Debug, Clone, Default)]
@@ -1456,6 +1469,11 @@ async fn handle_with_resolver(
         Action::Status(args) => status(args.repo.as_deref(), global_format).await,
         Action::Claims(args) => claims(args.repo.as_deref(), global_format).await,
         Action::Release { r#ref } => release(&r#ref).await,
+        Action::Create {
+            name,
+            scope,
+            editor,
+        } => create(name, scope, editor.as_deref()).await,
     }
 }
 
@@ -1492,6 +1510,7 @@ pub fn ensure_output_format(
         Action::Status(_) => ("autoflow status", output_report::TABLE_JSON_CSV),
         Action::Claims(_) => ("autoflow claims", output_report::TABLE_JSON_CSV),
         Action::Release { .. } => ("autoflow release", output_report::TABLE_ONLY),
+        Action::Create { .. } => ("autoflow create", output_report::TABLE_ONLY),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
@@ -8613,6 +8632,102 @@ async fn claims(
         },
     };
     output_report::emit_collection(global_format, &output)
+}
+
+/// Workflow YAML pre-populated with an `autoflow:` block. The
+/// selector mirrors the `autoflow` label convention used by the
+/// sample workflows so a freshly-created file is reconciler-visible
+/// the moment the user finishes editing.
+const AUTOFLOW_TEMPLATE: &str = r#"name: {{name}}
+description: # one-line summary of what this autoflow does
+
+# Autoflow turns this workflow into a reconciler-driven loop:
+# the autoflow worker picks issues matching `selector` and runs
+# the steps below on a cadence triggered by `wake_on`.
+autoflow:
+  enabled: true
+  entity: issue
+  priority: 50
+  selector:
+    states: ["open"]
+    labels_all: ["autoflow"]
+    limit: 100
+  wake_on:
+    cron: "*/5 * * * *"
+  workspace:
+    strategy: cached_clone
+
+# Optional inputs become `{{ inputs.<key> }}` in step prompts.
+# Autoflows additionally expose `{{ issue.* }}` for the bound issue.
+# inputs:
+#   topic:
+#     type: string
+#     required: false
+
+steps:
+  - id: triage
+    agent: # agent name from `rupu agent list`
+    actions: []
+    prompt: |
+      Issue {{ issue.ref }}: {{ issue.title }}
+
+      {{ issue.body }}
+
+      Take one bounded action. Comment on the issue when done.
+"#;
+
+async fn create(
+    name: Option<String>,
+    scope: Option<String>,
+    editor_override: Option<&str>,
+) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+
+    let scope = match scope {
+        Some(s) => s,
+        None => crate::cmd::create_common::prompt_scope("autoflow", project_root.as_deref())?,
+    };
+    let name = match name {
+        Some(n) => {
+            crate::cmd::create_common::validate_name(n.trim())?;
+            n.trim().to_string()
+        }
+        None => crate::cmd::create_common::prompt_name("autoflow")?,
+    };
+
+    let dir = crate::cmd::create_common::target_dir(
+        &scope,
+        &global,
+        project_root.as_deref(),
+        "workflows",
+    )?;
+    let target = dir.join(format!("{name}.yaml"));
+    let yml_sibling = dir.join(format!("{name}.yml"));
+    if target.exists() || yml_sibling.exists() {
+        let existing = if target.exists() { &target } else { &yml_sibling };
+        anyhow::bail!(
+            "workflow `{name}` already exists at {} — use `rupu workflow edit {name}` to modify",
+            existing.display()
+        );
+    }
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&target, AUTOFLOW_TEMPLATE.replace("{{name}}", &name))?;
+    println!("created {} ({scope})", target.display());
+
+    crate::cmd::editor::open_for_edit(editor_override, &target)?;
+
+    match Workflow::parse_file(&target) {
+        Ok(_) => {
+            println!("✓ {name}: autoflow YAML parses cleanly");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("⚠ {name}: failed to re-parse after save:\n  {e}");
+            Ok(())
+        }
+    }
 }
 
 async fn release(r#ref: &str) -> anyhow::Result<()> {
