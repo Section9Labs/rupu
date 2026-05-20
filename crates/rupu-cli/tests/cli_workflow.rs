@@ -166,13 +166,7 @@ async fn workflow_show_defaults_to_full_and_supports_focused_compact_views() {
         .unwrap()
         .env("RUPU_HOME", global.path())
         .current_dir(tmp.path())
-        .args([
-            "workflow",
-            "show",
-            "review-def",
-            "--no-color",
-            "--no-pager",
-        ])
+        .args(["workflow", "show", "review-def", "--no-color", "--no-pager"])
         .assert()
         .success()
         .stdout(predicates::str::contains("workflow show"))
@@ -540,13 +534,7 @@ async fn workflow_show_run_full_renders_fanout_timeline() {
         .env("RUPU_HOME", global.path())
         .current_dir(project.path())
         .args([
-            "--format",
-            "pretty",
-            "workflow",
-            "show-run",
-            &run_id,
-            "--view",
-            "full",
+            "--format", "pretty", "workflow", "show-run", &run_id, "--view", "full",
         ])
         .assert()
         .success()

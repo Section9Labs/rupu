@@ -452,7 +452,9 @@ fn auth_ui_prefs(
     let pwd = std::env::current_dir()?;
     let project_root = crate::paths::project_root_for(&pwd)?;
     let global_cfg = global.join("config.toml");
-    let project_cfg = project_root.as_ref().map(|path| path.join(".rupu/config.toml"));
+    let project_cfg = project_root
+        .as_ref()
+        .map(|path| path.join(".rupu/config.toml"));
     let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref())?;
     Ok(UiPrefs::resolve(
         &cfg.ui,
@@ -469,7 +471,10 @@ fn render_auth_backend_snapshot(
     prefs: &UiPrefs,
     width: usize,
 ) -> String {
-    let mut rows = vec![render_auth_backend_header_line(item, view_mode, width), String::new()];
+    let mut rows = vec![
+        render_auth_backend_header_line(item, view_mode, width),
+        String::new(),
+    ];
     rows.extend(render_auth_backend_state_rows(item, width));
 
     if matches!(view_mode, LiveViewMode::Compact | LiveViewMode::Full) {

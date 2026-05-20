@@ -207,7 +207,11 @@ fn replay_with_printer(
                     } else {
                         UiStatus::Complete
                     };
-                    let label = if error.is_some() { "tool error" } else { "tool result" };
+                    let label = if error.is_some() {
+                        "tool error"
+                    } else {
+                        "tool result"
+                    };
                     let raw = error.as_deref().unwrap_or(output.as_str());
                     let rendered = render_payload(raw, prefs);
                     let mut detail = rendered.headline.clone();

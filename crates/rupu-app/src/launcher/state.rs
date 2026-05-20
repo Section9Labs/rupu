@@ -136,7 +136,7 @@ fn yaml_value_to_string(v: &serde_yaml::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rupu_orchestrator::{InputDef, InputType, Trigger, WorkflowDefaults, Contracts};
+    use rupu_orchestrator::{Contracts, InputDef, InputType, Trigger, WorkflowDefaults};
 
     fn workflow_with_input(name: &str, ty: InputType, required: bool) -> Workflow {
         let mut inputs = BTreeMap::new();
@@ -170,7 +170,10 @@ mod tests {
         let wf = workflow_with_input("repo", InputType::String, true);
         let mut state = LauncherState::new("/tmp/wf.yml".into(), wf);
         // Required input is missing → validation should fail.
-        assert!(state.validation.is_some(), "expected validation error on init");
+        assert!(
+            state.validation.is_some(),
+            "expected validation error on init"
+        );
         state.set_input("repo", "github:foo/bar");
         state.revalidate();
         assert!(

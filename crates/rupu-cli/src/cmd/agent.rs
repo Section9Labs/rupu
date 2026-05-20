@@ -340,12 +340,8 @@ async fn create(
         None => crate::cmd::create_common::prompt_name("agent")?,
     };
 
-    let dir = crate::cmd::create_common::target_dir(
-        &scope,
-        &global,
-        project_root.as_deref(),
-        "agents",
-    )?;
+    let dir =
+        crate::cmd::create_common::target_dir(&scope, &global, project_root.as_deref(), "agents")?;
     let target = dir.join(format!("{name}.md"));
     if target.exists() {
         anyhow::bail!(

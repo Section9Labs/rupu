@@ -4,7 +4,9 @@ pub mod sidebar;
 pub mod titlebar;
 
 use crate::executor::AppExecutor;
-use crate::menu::app_menu::{ApproveFocused, DismissContextMenu, LaunchSelected, RejectFocused, ToggleSidebar};
+use crate::menu::app_menu::{
+    ApproveFocused, DismissContextMenu, LaunchSelected, RejectFocused, ToggleSidebar,
+};
 use crate::palette;
 use crate::view::transcript_tail::{TranscriptLine, TranscriptTail};
 use crate::view::{ApproveCallback, RejectCallback};
@@ -415,10 +417,7 @@ impl WorkspaceWindow {
 
     /// Toggle a sidebar section's collapsed state and persist.
     pub fn handle_section_toggle(&mut self, section: &'static str, cx: &mut Context<Self>) {
-        self.workspace
-            .manifest
-            .ui
-            .toggle_section_collapsed(section);
+        self.workspace.manifest.ui.toggle_section_collapsed(section);
         if let Err(e) = crate::workspace::storage::save(&self.workspace.manifest) {
             tracing::warn!(%e, "persist sidebar collapse state");
         }
@@ -530,20 +529,23 @@ impl WorkspaceWindow {
             });
             // Subscribe to ContentChanged → mirror into LauncherState.inputs.
             let weak: WeakEntity<WorkspaceWindow> = cx.weak_entity();
-            cx.subscribe(&entity, move |_, _entity, ev: &crate::widget::ContentChanged, cx| {
-                let name = name_owned.clone();
-                let new_value = ev.content.to_string();
-                let weak = weak.clone();
-                cx.defer(move |cx| {
-                    let _ = weak.update(cx, |this, cx| {
-                        if let Some(s) = this.launcher.as_mut() {
-                            s.set_input(&name, new_value);
-                            s.revalidate();
-                            cx.notify();
-                        }
+            cx.subscribe(
+                &entity,
+                move |_, _entity, ev: &crate::widget::ContentChanged, cx| {
+                    let name = name_owned.clone();
+                    let new_value = ev.content.to_string();
+                    let weak = weak.clone();
+                    cx.defer(move |cx| {
+                        let _ = weak.update(cx, |this, cx| {
+                            if let Some(s) = this.launcher.as_mut() {
+                                s.set_input(&name, new_value);
+                                s.revalidate();
+                                cx.notify();
+                            }
+                        });
                     });
-                });
-            })
+                },
+            )
             .detach();
             state.text_inputs.insert(name.clone(), entity);
         }
@@ -915,9 +917,8 @@ impl Render for WorkspaceWindow {
                             Arc::new(move |path, _w, cx| {
                                 let weak = weak_agent_click.clone();
                                 cx.defer(move |cx| {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        this.handle_agent_clicked(path, cx)
-                                    });
+                                    let _ = weak
+                                        .update(cx, |this, cx| this.handle_agent_clicked(path, cx));
                                 });
                             });
                         let on_agent_right_click: sidebar::RightClickCb =

@@ -406,11 +406,7 @@ fn render_issue_show_snapshot(item: &IssueShowItem, prefs: &UiPrefs, width: usiz
     let labels = if item.labels.is_empty() {
         "—".to_string()
     } else {
-        crate::output::tables::label_chips_with_colors(
-            &item.labels,
-            &item.label_colors,
-            prefs,
-        )
+        crate::output::tables::label_chips_with_colors(&item.labels, &item.label_colors, prefs)
     };
     rows.push(render_issue_show_kv_row_raw("labels", &labels, width));
     rows.push(render_issue_show_kv_row("created", &item.created_at, width));
@@ -451,11 +447,7 @@ fn render_issue_show_section_header(label: &str, width: usize) -> String {
 fn render_issue_show_kv_row(label: &str, value: &str, width: usize) -> String {
     let mut buf = String::new();
     let _ = palette::write_bold_colored(&mut buf, &format!("{label:<10}"), BRAND);
-    let _ = palette::write_colored(
-        &mut buf,
-        &truncate(value, width.saturating_sub(11)),
-        DIM,
-    );
+    let _ = palette::write_colored(&mut buf, &truncate(value, width.saturating_sub(11)), DIM);
     truncate_ansi_value(&buf, width)
 }
 

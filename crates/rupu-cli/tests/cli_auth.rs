@@ -10,9 +10,9 @@
 //! cache and skips the probe, routing all credential operations to the
 //! chmod-600 JSON file inside the tempdir.
 
-use tokio::sync::Mutex;
 use assert_cmd::Command;
 use predicates::prelude::*;
+use tokio::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -216,5 +216,7 @@ async fn auth_backend_use_file_renders_requested_backend_snapshot() {
         .assert()
         .success()
         .stdout(predicate::str::contains("requested"))
-        .stdout(predicate::str::contains("rupu auth login --provider <name>"));
+        .stdout(predicate::str::contains(
+            "rupu auth login --provider <name>",
+        ));
 }

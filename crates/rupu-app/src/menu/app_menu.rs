@@ -67,11 +67,7 @@ pub fn install(cx: &mut App) {
             Some("TextInput"),
         ),
         KeyBinding::new("left", crate::widget::text_input::Left, Some("TextInput")),
-        KeyBinding::new(
-            "right",
-            crate::widget::text_input::Right,
-            Some("TextInput"),
-        ),
+        KeyBinding::new("right", crate::widget::text_input::Right, Some("TextInput")),
         KeyBinding::new(
             "shift-left",
             crate::widget::text_input::SelectLeft,
@@ -94,11 +90,7 @@ pub fn install(cx: &mut App) {
             crate::widget::text_input::ShowCharacterPalette,
             Some("TextInput"),
         ),
-        KeyBinding::new(
-            "cmd-v",
-            crate::widget::text_input::Paste,
-            Some("TextInput"),
-        ),
+        KeyBinding::new("cmd-v", crate::widget::text_input::Paste, Some("TextInput")),
         KeyBinding::new("cmd-c", crate::widget::text_input::Copy, Some("TextInput")),
         KeyBinding::new("cmd-x", crate::widget::text_input::Cut, Some("TextInput")),
     ]);

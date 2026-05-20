@@ -36,8 +36,8 @@ use rupu_auth::{CredentialResolver, KeychainResolver};
 use rupu_config::{AutoflowCheckout, Config, PollSourceEntry};
 use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
-    AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepKind,
-    StepResultRecord, Workflow, WorkflowOutputContract,
+    AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepKind, StepResultRecord,
+    Workflow, WorkflowOutputContract,
 };
 use rupu_runtime::{
     AutoflowCycleEvent, AutoflowCycleRecord, AutoflowHistoryEventRecord, AutoflowHistoryStore,
@@ -837,7 +837,12 @@ impl CollectionOutput for AutoflowHistoryOutput {
 
     fn render_table(&self) -> anyhow::Result<()> {
         if std::io::stdout().is_terminal() {
-            return render_history_snapshot(&self.report, &self.monitor, self.view_mode, &self.prefs);
+            return render_history_snapshot(
+                &self.report,
+                &self.monitor,
+                self.view_mode,
+                &self.prefs,
+            );
         }
         render_history_table(&self.report)
     }
@@ -2320,7 +2325,12 @@ fn build_retained_serve_rows_for_size(
     let blocked = monitor
         .claims
         .iter()
-        .filter(|claim| matches!(claim.status.as_str(), "await_human" | "await_external" | "retry_backoff" | "blocked"))
+        .filter(|claim| {
+            matches!(
+                claim.status.as_str(),
+                "await_human" | "await_external" | "retry_backoff" | "blocked"
+            )
+        })
         .count();
     let failed = monitor
         .claims
@@ -2402,7 +2412,9 @@ fn build_retained_serve_rows_for_size(
         rows.push(String::new());
     }
     rows.push(retained_serve_controls_line(width));
-    rows.push(retained_serve_status_line(view_mode, ui_state, snapshot, width));
+    rows.push(retained_serve_status_line(
+        view_mode, ui_state, snapshot, width,
+    ));
     rows.truncate(height);
     rows
 }
@@ -2430,7 +2442,12 @@ fn build_retained_monitor_rows_for_size(
     let blocked = monitor
         .claims
         .iter()
-        .filter(|claim| matches!(claim.status.as_str(), "await_human" | "await_external" | "retry_backoff" | "blocked"))
+        .filter(|claim| {
+            matches!(
+                claim.status.as_str(),
+                "await_human" | "await_external" | "retry_backoff" | "blocked"
+            )
+        })
         .count();
     let complete = monitor
         .claims
@@ -2503,7 +2520,12 @@ fn build_retained_monitor_rows_for_size(
         rows.push(String::new());
     }
     rows.push(retained_monitor_controls_line(width));
-    rows.push(retained_monitor_status_line(view_mode, ui_state, refresh_count, width));
+    rows.push(retained_monitor_status_line(
+        view_mode,
+        ui_state,
+        refresh_count,
+        width,
+    ));
     rows.truncate(height);
     rows
 }
@@ -2596,7 +2618,12 @@ fn build_retained_history_rows_for_size(
         rows.push(String::new());
     }
     rows.push(retained_history_controls_line(width));
-    rows.push(retained_history_status_line(view_mode, ui_state, refresh_count, width));
+    rows.push(retained_history_status_line(
+        view_mode,
+        ui_state,
+        refresh_count,
+        width,
+    ));
     rows.truncate(height);
     rows
 }
@@ -2614,8 +2641,7 @@ fn build_history_issue_entries(
             continue;
         }
         let claim_index = monitor.claims.iter().position(|claim| {
-            claim.issue == issue_ref
-                || claim.issue_display.as_deref() == Some(issue_ref.as_str())
+            claim.issue == issue_ref || claim.issue_display.as_deref() == Some(issue_ref.as_str())
         });
         entries.push(HistoryIssueEntry {
             issue_ref: issue_ref.clone(),
@@ -2672,7 +2698,14 @@ fn build_retained_history_two_pane_rows(
         right_width,
         height,
     );
-    merge_retained_columns(&left_rows, &right_rows, left_width, right_width, gap, height)
+    merge_retained_columns(
+        &left_rows,
+        &right_rows,
+        left_width,
+        right_width,
+        gap,
+        height,
+    )
 }
 
 fn build_retained_history_stacked_rows(
@@ -3041,11 +3074,7 @@ fn render_history_issue_list_row(
         if selected { BRAND } else { status.color() },
     );
     let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
-    let _ = palette::write_colored(
-        &mut buf,
-        &truncate_single_line(&entry.workflow, 22),
-        BRAND,
-    );
+    let _ = palette::write_colored(&mut buf, &truncate_single_line(&entry.workflow, 22), BRAND);
     let chip = entry
         .claim_index
         .and_then(|index| monitor.claims.get(index))
@@ -3356,7 +3385,14 @@ fn build_retained_serve_two_pane_rows(
         right_width,
         height,
     );
-    merge_retained_columns(&left_rows, &right_rows, left_width, right_width, gap, height)
+    merge_retained_columns(
+        &left_rows,
+        &right_rows,
+        left_width,
+        right_width,
+        gap,
+        height,
+    )
 }
 
 fn build_retained_serve_stacked_rows(
@@ -3469,7 +3505,8 @@ fn render_issue_list_row(
     match entry.claim {
         Some(claim) => {
             let status = claim_status_ui(&claim.status);
-            let _ = palette::write_bold_colored(&mut buf, &status.glyph().to_string(), status.color());
+            let _ =
+                palette::write_bold_colored(&mut buf, &status.glyph().to_string(), status.color());
             buf.push(' ');
             let _ = palette::write_bold_colored(
                 &mut buf,
@@ -3477,17 +3514,15 @@ fn render_issue_list_row(
                 if selected { BRAND } else { status.color() },
             );
             let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
-            let _ = palette::write_colored(
-                &mut buf,
-                &truncate_single_line(&claim.workflow, 22),
-                BRAND,
-            );
+            let _ =
+                palette::write_colored(&mut buf, &truncate_single_line(&claim.workflow, 22), BRAND);
             if let Some(chip) = issue_stage_chip(claim, run_store, pricing) {
                 let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
                 let _ = palette::write_colored(&mut buf, &truncate_single_line(&chip, 36), DIM);
             } else if claim.status != "-" {
                 let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
-                let _ = palette::write_colored(&mut buf, &truncate_single_line(&claim.status, 18), DIM);
+                let _ =
+                    palette::write_colored(&mut buf, &truncate_single_line(&claim.status, 18), DIM);
             }
         }
         None => {
@@ -3570,7 +3605,9 @@ fn build_selected_issue_rows(
     ));
 
     let mut scrollable_blocks: Vec<Vec<String>> = Vec::new();
-    if let Some((record, summary, live_lines)) = resolve_live_claim_run(run_store, pricing, claim, view_mode) {
+    if let Some((record, summary, live_lines)) =
+        resolve_live_claim_run(run_store, pricing, claim, view_mode)
+    {
         pinned.push(retained_serve_kv_row(
             "run",
             &format!(
@@ -3833,7 +3870,8 @@ fn load_workflow_outline(record: &rupu_orchestrator::RunRecord) -> Vec<WorkflowS
     let Ok(global) = paths::global_dir() else {
         return Vec::new();
     };
-    let Ok(path) = locate_workflow_in(&global, Some(&record.workspace_path), &record.workflow_name) else {
+    let Ok(path) = locate_workflow_in(&global, Some(&record.workspace_path), &record.workflow_name)
+    else {
         return Vec::new();
     };
     let Ok(workflow) = Workflow::parse_file(&path) else {
@@ -3880,7 +3918,9 @@ fn issue_stage_chip(
         .take(3)
         .map(|step| step.step_id.clone())
         .collect::<Vec<_>>();
-    if claim.status != "complete" && claim.next != "-" && !parts.iter().any(|part| part == &claim.next)
+    if claim.status != "complete"
+        && claim.next != "-"
+        && !parts.iter().any(|part| part == &claim.next)
     {
         parts.push(format!("[{}]", truncate_text(&claim.next, 18)));
     }
@@ -3925,8 +3965,14 @@ fn merge_retained_columns(
     let spacer = " ".repeat(gap);
     let count = left_rows.len().max(right_rows.len()).min(height);
     for idx in 0..count {
-        let left = fit_retained_ansi_line(left_rows.get(idx).map(String::as_str).unwrap_or(""), left_width);
-        let right = fit_retained_ansi_line(right_rows.get(idx).map(String::as_str).unwrap_or(""), right_width);
+        let left = fit_retained_ansi_line(
+            left_rows.get(idx).map(String::as_str).unwrap_or(""),
+            left_width,
+        );
+        let right = fit_retained_ansi_line(
+            right_rows.get(idx).map(String::as_str).unwrap_or(""),
+            right_width,
+        );
         rows.push(format!("{left}{spacer}{right}"));
     }
     rows
@@ -4179,7 +4225,10 @@ fn live_run_event_lines(
                     let mut out = Vec::new();
                     for (index, line) in highlighted.lines().enumerate() {
                         out.push(if index == 0 {
-                            serve_event_line(UiStatus::Active, format!("assistant output  ·  {line}"))
+                            serve_event_line(
+                                UiStatus::Active,
+                                format!("assistant output  ·  {line}"),
+                            )
                         } else {
                             serve_note_line(UiStatus::Active, line.to_string())
                         });
@@ -4210,7 +4259,8 @@ fn live_run_event_lines(
                 if let Some(rendered) = render_tool_input(tool, input, &prefs) {
                     let lines = rendered.lines().collect::<Vec<_>>();
                     out.extend(
-                        lines.iter()
+                        lines
+                            .iter()
                             .take(4)
                             .map(|line| serve_note_line(UiStatus::Working, (*line).to_string())),
                     );
@@ -4624,12 +4674,20 @@ async fn monitor_retained(
                             let entries = build_serve_issue_entries(&report.claims, &[]);
                             ui_state.move_selection(&entries, 1);
                         }
-                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => ui_state.detail_viewport.scroll_up(1),
-                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => ui_state.detail_viewport.scroll_down(1),
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                            ui_state.detail_viewport.scroll_up(1)
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                            ui_state.detail_viewport.scroll_down(1)
+                        }
                         (KeyCode::PageUp, _) => ui_state.detail_viewport.page_up(),
                         (KeyCode::PageDown, _) => ui_state.detail_viewport.page_down(),
-                        (KeyCode::Char('g'), KeyModifiers::NONE) => ui_state.detail_viewport.jump_top(),
-                        (KeyCode::Char('G'), _) | (KeyCode::End, _) => ui_state.detail_viewport.jump_bottom(),
+                        (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                            ui_state.detail_viewport.jump_top()
+                        }
+                        (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
+                            ui_state.detail_viewport.jump_bottom()
+                        }
                         _ => {}
                     }
                 }
@@ -4769,12 +4827,20 @@ async fn history_retained(
                             let entries = build_history_issue_entries(&report, &monitor);
                             ui_state.move_history_selection(&entries, 1);
                         }
-                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => ui_state.detail_viewport.scroll_up(1),
-                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => ui_state.detail_viewport.scroll_down(1),
+                        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
+                            ui_state.detail_viewport.scroll_up(1)
+                        }
+                        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
+                            ui_state.detail_viewport.scroll_down(1)
+                        }
                         (KeyCode::PageUp, _) => ui_state.detail_viewport.page_up(),
                         (KeyCode::PageDown, _) => ui_state.detail_viewport.page_down(),
-                        (KeyCode::Char('g'), KeyModifiers::NONE) => ui_state.detail_viewport.jump_top(),
-                        (KeyCode::Char('G'), _) | (KeyCode::End, _) => ui_state.detail_viewport.jump_bottom(),
+                        (KeyCode::Char('g'), KeyModifiers::NONE) => {
+                            ui_state.detail_viewport.jump_top()
+                        }
+                        (KeyCode::Char('G'), _) | (KeyCode::End, _) => {
+                            ui_state.detail_viewport.jump_bottom()
+                        }
                         _ => {}
                     }
                 }
@@ -5626,9 +5692,7 @@ mod serve_heartbeat_tests {
             80,
             24,
         );
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("issues")));
+        assert!(rows.iter().any(|row| row.contains("issues")));
         assert!(rows
             .iter()
             .any(|row| row.contains("selected") || row.contains("issue 1/")));
@@ -5835,8 +5899,12 @@ mod serve_heartbeat_tests {
     fn window_string_blocks_keeps_oldest_rows_visible_when_history_grows() {
         let mut viewport = ViewportState::default();
         let initial = vec![
-            (0..6).map(|index| format!("a line {index:03}")).collect::<Vec<_>>(),
-            (0..6).map(|index| format!("b line {index:03}")).collect::<Vec<_>>(),
+            (0..6)
+                .map(|index| format!("a line {index:03}"))
+                .collect::<Vec<_>>(),
+            (0..6)
+                .map(|index| format!("b line {index:03}"))
+                .collect::<Vec<_>>(),
         ];
         viewport.jump_top();
         let first = window_string_blocks(&mut viewport, &initial, 4);
@@ -5846,7 +5914,9 @@ mod serve_heartbeat_tests {
         let grown = vec![
             initial[0].clone(),
             initial[1].clone(),
-            (0..6).map(|index| format!("c line {index:03}")).collect::<Vec<_>>(),
+            (0..6)
+                .map(|index| format!("c line {index:03}"))
+                .collect::<Vec<_>>(),
         ];
         let second = window_string_blocks(&mut viewport, &grown, 4);
         assert!(second.iter().any(|row| row.contains("a line 000")));
@@ -8706,7 +8776,11 @@ async fn create(
     let target = dir.join(format!("{name}.yaml"));
     let yml_sibling = dir.join(format!("{name}.yml"));
     if target.exists() || yml_sibling.exists() {
-        let existing = if target.exists() { &target } else { &yml_sibling };
+        let existing = if target.exists() {
+            &target
+        } else {
+            &yml_sibling
+        };
         anyhow::bail!(
             "workflow `{name}` already exists at {} — use `rupu workflow edit {name}` to modify",
             existing.display()
