@@ -3186,8 +3186,12 @@ fn render_synthetic_session_activity_rows(
     }
     match &state.activity {
         SessionActivity::Thinking => render_role_header(
-            "assistant",
+            "agent",
             crate::output::palette::Status::Working.color(),
+            Some((
+                crate::output::palette::Status::Working.glyph(),
+                crate::output::palette::Status::Working.color(),
+            )),
             Some(&session_live_status_detail(session, state)),
             width,
         ),
@@ -3216,16 +3220,17 @@ fn render_session_entry_rows(
             let mut rows = render_role_header(
                 "you",
                 BRAND,
+                Some(('▸', BRAND)),
                 if *queued { Some("queued") } else { None },
                 width,
             );
-            rows.extend(render_indented_body_lines(
+            rows.extend(render_role_body(
                 &normalized
                     .split('\n')
                     .map(str::to_string)
                     .collect::<Vec<_>>(),
+                BRAND,
                 width,
-                "  ",
             ));
             rows
         }
@@ -3235,26 +3240,33 @@ fn render_session_entry_rows(
             streaming,
         } => {
             let streaming_detail = if *streaming { live_detail } else { None };
+            let role_color = if *streaming {
+                Status::Working.color()
+            } else {
+                Status::Active.color()
+            };
+            let role_glyph = if *streaming {
+                Status::Working.glyph()
+            } else {
+                Status::Active.glyph()
+            };
             let mut rows = render_role_header(
-                "assistant",
-                if *streaming {
-                    Status::Working.color()
-                } else {
-                    Status::Active.color()
-                },
+                "agent",
+                role_color,
+                Some((role_glyph, role_color)),
                 streaming_detail.as_deref(),
                 width,
             );
             if let Some(thinking) = thinking.as_deref().filter(|value| !value.trim().is_empty()) {
                 if view_mode == LiveViewMode::Full {
-                    rows.extend(render_indented_body_lines(
+                    rows.extend(render_role_body(
                         &[retained_session_event_line(
                             Status::Active,
                             "thinking",
                             &truncate_single_line(thinking, 96),
                         )],
+                        role_color,
                         width,
-                        "  ",
                     ));
                 }
             }
@@ -3268,7 +3280,7 @@ fn render_session_entry_rows(
                         .map(str::to_string)
                         .collect::<Vec<_>>(),
                 };
-                rows.extend(render_indented_body_lines(&body_lines, width, "  "));
+                rows.extend(render_role_body(&body_lines, role_color, width));
             }
             rows
         }
@@ -3557,16 +3569,33 @@ fn render_session_entry_rows(
 fn render_role_header(
     label: &str,
     color: owo_colors::Rgb,
+    glyph: Option<(char, owo_colors::Rgb)>,
     detail: Option<&str>,
     width: usize,
 ) -> Vec<String> {
     let mut header = String::new();
+    if let Some((ch, glyph_color)) = glyph {
+        let _ = palette::write_bold_colored(&mut header, &ch.to_string(), glyph_color);
+        header.push(' ');
+        header.push(' ');
+    }
     let _ = palette::write_bold_colored(&mut header, label, color);
     if let Some(detail) = detail {
         let _ = palette::write_colored(&mut header, "  ·  ", DIM);
         let _ = palette::write_colored(&mut header, detail, DIM);
     }
     vec![truncate_ansi_line(&header, width)]
+}
+
+fn render_role_body(lines: &[String], color: owo_colors::Rgb, width: usize) -> Vec<String> {
+    let mut prefix = String::new();
+    let _ = palette::write_colored(&mut prefix, "│", color);
+    prefix.push(' ');
+    let mut rows = Vec::new();
+    for line in lines {
+        rows.extend(wrap_prefixed_lines(line, &prefix, &prefix, width));
+    }
+    rows
 }
 
 fn render_notice_rows(line: &SessionViewLine, width: usize) -> Vec<String> {
@@ -6256,7 +6285,10 @@ mod tests {
             LiveViewMode::Compact,
         );
         let line = render_session_prompt_line(&session, &state, 120);
-        assert!(line.contains("issue-reader >"));
+        // Agent name and prompt arrow are emitted with separate ANSI
+        // color escapes between them, so check each segment on its own.
+        assert!(line.contains("issue-reader"));
+        assert!(line.contains(" > "));
         assert!(!line.contains("ses_test123>"));
     }
 
@@ -6587,7 +6619,7 @@ mod tests {
 
         let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 96, 20);
         assert!(rows.iter().any(|row| row.contains("you")));
-        assert!(rows.iter().any(|row| row.contains("assistant")));
+        assert!(rows.iter().any(|row| row.contains("agent")));
         assert!(rows.iter().any(|row| row.contains("Reading the repo")));
         assert!(rows.iter().any(|row| row.contains("tool bash")));
         assert!(rows.iter().any(|row| row.contains("command: |")));
@@ -6616,7 +6648,7 @@ mod tests {
         });
 
         let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 36, 18);
-        assert!(rows.iter().any(|row| row.contains("assistant")));
+        assert!(rows.iter().any(|row| row.contains("agent")));
         assert!(rows.iter().any(|row| row.contains("line one with")));
         assert!(rows.iter().any(|row| row.contains("tab    value")));
         assert!(rows.iter().any(|row| row.trim().is_empty() || row == "  "));
@@ -6644,7 +6676,7 @@ mod tests {
         state.push_transcript_event(&TranscriptEvent::TurnStart { turn_idx: 0 });
 
         let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 96, 16);
-        assert!(rows.iter().any(|row| row.contains("assistant")));
+        assert!(rows.iter().any(|row| row.contains("agent")));
         assert!(rows.iter().any(|row| row.contains("thinking")));
     }
 
@@ -6708,7 +6740,7 @@ mod tests {
         state.activity = SessionActivity::Thinking;
 
         let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 120, 16);
-        assert!(rows.iter().any(|row| row.contains("assistant")));
+        assert!(rows.iter().any(|row| row.contains("agent")));
         assert!(rows.iter().any(|row| row.contains("thinking")));
         assert!(rows.iter().any(|row| row.contains("00:00:")));
         assert!(rows.iter().any(|row| row.contains("⇡")));
@@ -6737,7 +6769,8 @@ mod tests {
         state.activity = SessionActivity::Thinking;
 
         let line = render_session_prompt_line(&session, &state, 160);
-        assert!(line.contains("issue-reader >"));
+        assert!(line.contains("issue-reader"));
+        assert!(line.contains(" > "));
         assert!(!line.contains("thinking"));
         assert!(!line.contains("⇡"));
         assert!(!line.contains("⇣"));
@@ -6929,6 +6962,88 @@ mod tests {
             }
             other => panic!("expected assistant entry, got {other:?}"),
         }
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for inner in chars.by_ref() {
+                    if inner == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn retained_session_agent_block_renders_glyph_and_rail() {
+        let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.push_user_prompt("hello there", None, false);
+        state.push_transcript_event(&TranscriptEvent::AssistantMessage {
+            content: "hi from the agent".into(),
+            thinking: None,
+        });
+
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 96, 20);
+        let plain: Vec<String> = rows.iter().map(|row| strip_ansi(row)).collect();
+
+        // Role header has the new label and the Active status glyph.
+        assert!(plain.iter().any(|row| row.starts_with("●  agent")));
+        // Agent body rows wear the colored rail.
+        assert!(plain.iter().any(|row| row.starts_with("│ hi from the agent")));
+        // User prompt has the brand glyph and matching rail.
+        assert!(plain.iter().any(|row| row.starts_with("▸  you")));
+        assert!(plain.iter().any(|row| row.starts_with("│ hello there")));
+        // Old label and old indent are gone.
+        assert!(!plain.iter().any(|row| row.starts_with("assistant")));
+        assert!(!plain
+            .iter()
+            .any(|row| row.starts_with("  hi from the agent")));
+    }
+
+    #[test]
+    fn retained_session_streaming_agent_block_uses_working_glyph() {
+        let session = test_session_record();
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        state.push_transcript_event(&TranscriptEvent::AssistantDelta {
+            content: "streaming chunk".into(),
+        });
+
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 96, 20);
+        let plain: Vec<String> = rows.iter().map(|row| strip_ansi(row)).collect();
+
+        // While streaming, the agent header carries the Working glyph (◐).
+        assert!(plain.iter().any(|row| row.starts_with("◐  agent")));
+        assert!(plain.iter().any(|row| row.starts_with("│ streaming chunk")));
     }
 
     fn test_session_record() -> SessionRecord {
