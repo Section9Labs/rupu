@@ -151,16 +151,12 @@ fn render_inputs_form(state: &LauncherState, on_input_change: InputChangeCb) -> 
                 def.required,
                 on_input_change.clone(),
             ),
-            rupu_orchestrator::InputType::String => render_text_row(
-                name,
-                state.text_inputs.get(name).cloned(),
-                def.required,
-            ),
-            rupu_orchestrator::InputType::Int => render_number_row(
-                name,
-                state.text_inputs.get(name).cloned(),
-                def.required,
-            ),
+            rupu_orchestrator::InputType::String => {
+                render_text_row(name, state.text_inputs.get(name).cloned(), def.required)
+            }
+            rupu_orchestrator::InputType::Int => {
+                render_number_row(name, state.text_inputs.get(name).cloned(), def.required)
+            }
             rupu_orchestrator::InputType::Bool => {
                 render_checkbox_row(name, &current, def.required, on_input_change.clone())
             }
@@ -332,11 +328,7 @@ fn render_footer(
         .gap(px(8.0))
         .items_center()
         .child(render_mode_picker(state.mode, on_mode_change))
-        .child(render_target_picker(
-            state,
-            on_target_change,
-            on_pick_dir,
-        ))
+        .child(render_target_picker(state, on_target_change, on_pick_dir))
         .child(div().flex_grow())
         .child(render_run_button(can_run, on_run))
         .into_any_element()

@@ -2121,7 +2121,8 @@ pub(crate) fn render_workflow_snapshot_body(
     prefs: &UiPrefs,
     width: usize,
 ) -> String {
-    let mut state = rebuild_workflow_interactive_state(record, step_results_log, 0, view_mode, prefs);
+    let mut state =
+        rebuild_workflow_interactive_state(record, step_results_log, 0, view_mode, prefs);
     build_workflow_snapshot_rows_for_size(workflow_name, record, &mut state, view_mode, width)
         .join("\n")
 }
@@ -2144,7 +2145,10 @@ fn build_workflow_snapshot_rows_for_size(
         ),
         retained_workflow_kv_row(
             "started",
-            &record.started_at.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+            &record
+                .started_at
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string(),
             width,
             UiStatus::Active,
         ),
@@ -2232,7 +2236,8 @@ fn build_workflow_snapshot_rows_for_size(
             UiStatus::Failed,
         ));
     }
-    if matches!(view_mode, LiveViewMode::Compact | LiveViewMode::Full) && !record.inputs.is_empty() {
+    if matches!(view_mode, LiveViewMode::Compact | LiveViewMode::Full) && !record.inputs.is_empty()
+    {
         rows.push(String::new());
         rows.push(render_workflow_snapshot_section_header(
             "inputs",
@@ -2244,7 +2249,9 @@ fn build_workflow_snapshot_rows_for_size(
     rows.push(String::new());
     rows.extend(render_all_workflow_event_rows(state, width));
     rows.push(String::new());
-    rows.push(render_workflow_snapshot_status_line(record, state, view_mode, width));
+    rows.push(render_workflow_snapshot_status_line(
+        record, state, view_mode, width,
+    ));
     rows
 }
 
@@ -3948,8 +3955,12 @@ mod tests {
             72,
             16,
         );
-        assert!(initial_rows.iter().any(|row| row.contains("workflow line 000")));
-        assert!(!initial_rows.iter().any(|row| row.contains("workflow line 159")));
+        assert!(initial_rows
+            .iter()
+            .any(|row| row.contains("workflow line 000")));
+        assert!(!initial_rows
+            .iter()
+            .any(|row| row.contains("workflow line 159")));
 
         for index in 160..320 {
             state.push_line(UiStatus::Active, format!("workflow line {index:03}"));
@@ -3964,8 +3975,12 @@ mod tests {
             72,
             16,
         );
-        assert!(grown_rows.iter().any(|row| row.contains("workflow line 000")));
-        assert!(!grown_rows.iter().any(|row| row.contains("workflow line 319")));
+        assert!(grown_rows
+            .iter()
+            .any(|row| row.contains("workflow line 000")));
+        assert!(!grown_rows
+            .iter()
+            .any(|row| row.contains("workflow line 319")));
     }
 
     #[test]

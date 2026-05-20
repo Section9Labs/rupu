@@ -1,7 +1,7 @@
 use crate::cmd::transcript::truncate_single_line;
 use crate::cmd::ui::{
-    UiPrefs, highlight_diff, highlight_json, highlight_markdown, highlight_shell, highlight_toml,
-    highlight_yaml,
+    highlight_diff, highlight_json, highlight_markdown, highlight_shell, highlight_toml,
+    highlight_yaml, UiPrefs,
 };
 use crate::output::palette::{self, DIM};
 use crate::output::printer::sanitize_terminal_text;
@@ -277,7 +277,11 @@ fn try_pretty_jsonl(raw: &str) -> Option<Vec<String>> {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         rows.push(serde_json::to_string_pretty(&value).ok()?);
     }
-    if rows.len() > 1 { Some(rows) } else { None }
+    if rows.len() > 1 {
+        Some(rows)
+    } else {
+        None
+    }
 }
 
 fn try_pretty_yaml(raw: &str) -> Option<String> {

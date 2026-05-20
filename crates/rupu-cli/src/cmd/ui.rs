@@ -878,6 +878,9 @@ mod tests {
 
     #[test]
     fn parse_live_view_supports_compact() {
-        assert_eq!(parse_live_view(Some("compact")), Some(LiveViewMode::Compact));
+        assert_eq!(
+            parse_live_view(Some("compact")),
+            Some(LiveViewMode::Compact)
+        );
     }
 }

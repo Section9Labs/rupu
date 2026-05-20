@@ -16,7 +16,7 @@
 //! print stream — pipes and CI runners get clean output.
 
 use super::palette::{
-    self, AWAITING, BRAND, BRAND_300, COMPLETE, DIM, FAILED, RUNNING, SEPARATOR, Status, TOOL_ARROW,
+    self, Status, AWAITING, BRAND, BRAND_300, COMPLETE, DIM, FAILED, RUNNING, SEPARATOR, TOOL_ARROW,
 };
 use super::spinner::{Spinner, SpinnerHandle};
 use crate::cmd::ui::UiPrefs;

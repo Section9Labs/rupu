@@ -429,7 +429,12 @@ fn render_transcript_snapshot_body(
     rows.push(render_transcript_header_line(&meta, view_mode, width));
     rows.push(String::new());
     if let Some(status) = meta.final_status.as_deref() {
-        rows.push(render_transcript_kv_row("status", status, width, transcript_status_ui(status)));
+        rows.push(render_transcript_kv_row(
+            "status",
+            status,
+            width,
+            transcript_status_ui(status),
+        ));
     }
     if let Some(agent) = meta.agent.as_deref() {
         let mut detail = agent.to_string();
@@ -441,22 +446,49 @@ fn render_transcript_snapshot_body(
             detail.push_str("  ·  ");
             detail.push_str(model);
         }
-        rows.push(render_transcript_kv_row("agent", &detail, width, Status::Active));
+        rows.push(render_transcript_kv_row(
+            "agent",
+            &detail,
+            width,
+            Status::Active,
+        ));
     }
     if let Some(workspace_id) = meta.workspace_id.as_deref() {
-        rows.push(render_transcript_kv_row("workspace", workspace_id, width, Status::Active));
+        rows.push(render_transcript_kv_row(
+            "workspace",
+            workspace_id,
+            width,
+            Status::Active,
+        ));
     }
     if let Some(started_at) = meta.started_at.as_deref() {
-        rows.push(render_transcript_kv_row("started", started_at, width, Status::Active));
+        rows.push(render_transcript_kv_row(
+            "started",
+            started_at,
+            width,
+            Status::Active,
+        ));
     }
     if let Some(mode) = meta.mode.as_deref() {
-        rows.push(render_transcript_kv_row("mode", mode, width, Status::Active));
+        rows.push(render_transcript_kv_row(
+            "mode",
+            mode,
+            width,
+            Status::Active,
+        ));
     }
     if let Some(error) = meta.error.as_deref() {
-        rows.push(render_transcript_kv_row("error", error, width, Status::Failed));
+        rows.push(render_transcript_kv_row(
+            "error",
+            error,
+            width,
+            Status::Failed,
+        ));
     }
     rows.push(String::new());
-    rows.extend(render_transcript_event_rows(events, prefs, view_mode, width));
+    rows.extend(render_transcript_event_rows(
+        events, prefs, view_mode, width,
+    ));
     rows.push(String::new());
     rows.push(render_transcript_footer_line(&meta, view_mode, width));
     rows.join("\n") + "\n"
@@ -528,7 +560,8 @@ fn render_transcript_header_line(
     let _ = palette::write_bold_colored(&mut buf, "transcript show", palette::BRAND);
     if let Some(agent) = meta.agent.as_deref() {
         let _ = palette::write_colored(&mut buf, "  ", palette::DIM);
-        let _ = palette::write_bold_colored(&mut buf, &truncate_single_line(agent, 24), palette::BRAND);
+        let _ =
+            palette::write_bold_colored(&mut buf, &truncate_single_line(agent, 24), palette::BRAND);
     }
     if let Some(run_id) = meta.run_id.as_deref() {
         let _ = palette::write_colored(&mut buf, "  ·  ", palette::DIM);
@@ -937,7 +970,12 @@ fn render_payload_body_lines(
     let mut lines = rendered.lines();
     if let Some(first) = lines.next() {
         if label.is_empty() {
-            out.push(transcript_event_line(status, indent, true, first.to_string()));
+            out.push(transcript_event_line(
+                status,
+                indent,
+                true,
+                first.to_string(),
+            ));
         } else {
             out.push(transcript_event_line(
                 status,
@@ -947,7 +985,12 @@ fn render_payload_body_lines(
             ));
         }
         for line in lines {
-            out.push(transcript_event_line(status, indent, true, line.to_string()));
+            out.push(transcript_event_line(
+                status,
+                indent,
+                true,
+                line.to_string(),
+            ));
         }
     }
     out

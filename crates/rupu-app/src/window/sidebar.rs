@@ -174,8 +174,8 @@ fn render_section(
                 });
 
             let path = asset.path.clone();
-            let is_selected = name == "workflows"
-                && focused_workflow.map(|p| p == &asset.path).unwrap_or(false);
+            let is_selected =
+                name == "workflows" && focused_workflow.map(|p| p == &asset.path).unwrap_or(false);
             let row_bg = if is_selected {
                 palette::BG_ROW_SELECTED
             } else {

@@ -14,9 +14,9 @@
 use crate::cmd::completers::workflow_names;
 use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
-use crate::output::palette::{self, BRAND, DIM, Status as UiStatus};
-use crate::output::report::{self, CollectionOutput, DetailOutput, EventOutput};
+use crate::output::palette::{self, Status as UiStatus, BRAND, DIM};
 use crate::output::printer::{visible_len, wrap_with_ansi};
+use crate::output::report::{self, CollectionOutput, DetailOutput, EventOutput};
 use crate::paths;
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
@@ -570,12 +570,8 @@ impl DetailOutput for WorkflowShowOutput {
         let width = crossterm::terminal::size()
             .map(|(value, _)| value.max(40) as usize)
             .unwrap_or(100);
-        let rendered = render_workflow_show_snapshot(
-            &self.report.item,
-            self.view_mode,
-            &self.prefs,
-            width,
-        );
+        let rendered =
+            render_workflow_show_snapshot(&self.report.item, self.view_mode, &self.prefs, width);
         crate::cmd::ui::paginate(&rendered, &self.prefs)
     }
 }
@@ -644,9 +640,15 @@ fn render_workflow_usage_block(
         return String::new();
     }
 
-    let mut lines = vec![styled_usage_line(UiStatus::Active, "usage", "provider/model/agent usage")];
+    let mut lines = vec![styled_usage_line(
+        UiStatus::Active,
+        "usage",
+        "provider/model/agent usage",
+    )];
     let mut table = crate::output::tables::new_table();
-    table.set_header(vec!["PROVIDER", "MODEL", "AGENT", "INPUT", "OUTPUT", "CACHED", "COST"]);
+    table.set_header(vec![
+        "PROVIDER", "MODEL", "AGENT", "INPUT", "OUTPUT", "CACHED", "COST",
+    ]);
     for row in usage_rows {
         table.add_row(vec![
             comfy_table::Cell::new(&row.provider),
@@ -686,8 +688,7 @@ fn styled_usage_line(status: UiStatus, label: &str, detail: &str) -> String {
     let mut buf = String::new();
     let _ = crate::output::palette::write_bold_colored(&mut buf, label, status.color());
     let _ = crate::output::palette::write_colored(&mut buf, "  ", crate::output::palette::DIM);
-    let _ =
-        crate::output::palette::write_colored(&mut buf, detail, crate::output::palette::DIM);
+    let _ = crate::output::palette::write_colored(&mut buf, detail, crate::output::palette::DIM);
     buf
 }
 
@@ -779,13 +780,20 @@ fn render_workflow_show_snapshot(
     prefs: &crate::cmd::ui::UiPrefs,
     width: usize,
 ) -> String {
-    let mut rows = vec![render_workflow_show_header_line(item, view_mode, width), String::new()];
+    let mut rows = vec![
+        render_workflow_show_header_line(item, view_mode, width),
+        String::new(),
+    ];
 
     match Workflow::parse(&item.body) {
         Ok(workflow) => {
             rows.extend(render_workflow_show_summary_rows(&workflow, item, width));
             rows.push(String::new());
-            rows.push(render_workflow_show_section_header("graph", "workflow structure", width));
+            rows.push(render_workflow_show_section_header(
+                "graph",
+                "workflow structure",
+                width,
+            ));
             rows.extend(render_workflow_show_graph(&workflow, width));
 
             if matches!(view_mode, LiveViewMode::Compact | LiveViewMode::Full) {
@@ -808,7 +816,11 @@ fn render_workflow_show_snapshot(
 
             if view_mode == LiveViewMode::Full {
                 rows.push(String::new());
-                rows.push(render_workflow_show_section_header("yaml", "raw definition", width));
+                rows.push(render_workflow_show_section_header(
+                    "yaml",
+                    "raw definition",
+                    width,
+                ));
                 rows.extend(
                     crate::cmd::ui::highlight_yaml(&item.body, prefs)
                         .lines()
@@ -830,7 +842,11 @@ fn render_workflow_show_snapshot(
                 UiStatus::Failed,
             ));
             rows.push(String::new());
-            rows.push(render_workflow_show_section_header("yaml", "raw definition", width));
+            rows.push(render_workflow_show_section_header(
+                "yaml",
+                "raw definition",
+                width,
+            ));
             rows.extend(
                 crate::cmd::ui::highlight_yaml(&item.body, prefs)
                     .lines()
@@ -869,7 +885,12 @@ fn render_workflow_show_summary_rows(
 ) -> Vec<String> {
     let mut rows = vec![
         render_workflow_show_kv_row("path", &item.path, width, UiStatus::Active),
-        render_workflow_show_kv_row("trigger", &workflow_trigger_summary(&workflow.trigger), width, UiStatus::Active),
+        render_workflow_show_kv_row(
+            "trigger",
+            &workflow_trigger_summary(&workflow.trigger),
+            width,
+            UiStatus::Active,
+        ),
         render_workflow_show_kv_row(
             "steps",
             &format!(
@@ -899,7 +920,10 @@ fn render_workflow_show_summary_rows(
 
     rows.push(render_workflow_show_kv_row(
         "agents",
-        &collect_workflow_agents(workflow).into_iter().collect::<Vec<_>>().join(", "),
+        &collect_workflow_agents(workflow)
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", "),
         width,
         UiStatus::Active,
     ));
@@ -930,16 +954,28 @@ fn render_workflow_show_inputs(workflow: &Workflow, width: usize) -> Vec<String>
         return Vec::new();
     }
 
-    let mut rows = vec![render_workflow_show_section_header("inputs", "declared inputs", width)];
+    let mut rows = vec![render_workflow_show_section_header(
+        "inputs",
+        "declared inputs",
+        width,
+    )];
     let mut table = crate::output::tables::new_table();
-    table.set_header(vec!["NAME", "TYPE", "REQUIRED", "DEFAULT", "ENUM", "DESCRIPTION"]);
+    table.set_header(vec![
+        "NAME",
+        "TYPE",
+        "REQUIRED",
+        "DEFAULT",
+        "ENUM",
+        "DESCRIPTION",
+    ]);
     for (name, input) in &workflow.inputs {
         table.add_row(vec![
             comfy_table::Cell::new(name),
             comfy_table::Cell::new(workflow_input_type_name(input.ty)),
             comfy_table::Cell::new(if input.required { "yes" } else { "no" }),
             comfy_table::Cell::new(
-                input.default
+                input
+                    .default
                     .as_ref()
                     .map(yaml_scalar_inline)
                     .unwrap_or_else(|| "—".into()),
@@ -973,7 +1009,11 @@ fn render_workflow_show_outputs(workflow: &Workflow, width: usize) -> Vec<String
         return Vec::new();
     }
 
-    let mut rows = vec![render_workflow_show_section_header("outputs", "declared outputs", width)];
+    let mut rows = vec![render_workflow_show_section_header(
+        "outputs",
+        "declared outputs",
+        width,
+    )];
     let mut table = crate::output::tables::new_table();
     table.set_header(vec!["NAME", "FROM STEP", "FORMAT", "SCHEMA"]);
     for (name, output) in &workflow.contracts.outputs {
@@ -994,7 +1034,11 @@ fn render_workflow_show_outputs(workflow: &Workflow, width: usize) -> Vec<String
 }
 
 fn render_workflow_show_step_details(workflow: &Workflow, width: usize) -> Vec<String> {
-    let mut rows = vec![render_workflow_show_section_header("steps", "declared steps", width)];
+    let mut rows = vec![render_workflow_show_section_header(
+        "steps",
+        "declared steps",
+        width,
+    )];
     let mut table = crate::output::tables::new_table();
     table.set_header(vec!["ID", "KIND", "PRIMARY", "DETAIL"]);
     for step in &workflow.steps {
@@ -1044,7 +1088,8 @@ fn render_workflow_show_graph_row(row: &rupu_app_canvas::GraphRow, width: usize)
                 let _ = palette::write_colored(&mut buf, "│", node_status_color(*status));
             }
             GraphCell::Branch(glyph, status) => {
-                let _ = palette::write_colored(&mut buf, glyph.as_str(), node_status_color(*status));
+                let _ =
+                    palette::write_colored(&mut buf, glyph.as_str(), node_status_color(*status));
             }
             GraphCell::Bullet(status) => {
                 let _ = palette::write_bold_colored(
@@ -1077,12 +1122,7 @@ fn render_workflow_show_section_header(label: &str, detail: &str, width: usize) 
     truncate_workflow_show_ansi_line(&buf, width)
 }
 
-fn render_workflow_show_kv_row(
-    label: &str,
-    value: &str,
-    width: usize,
-    status: UiStatus,
-) -> String {
+fn render_workflow_show_kv_row(label: &str, value: &str, width: usize, status: UiStatus) -> String {
     let mut buf = String::new();
     let _ = palette::write_bold_colored(&mut buf, &format!("{label:<10}"), status.color());
     let _ = palette::write_colored(
@@ -1105,9 +1145,15 @@ fn workflow_trigger_summary(trigger: &rupu_orchestrator::Trigger) -> String {
             if let Some(event) = trigger.event.as_deref() {
                 parts.push(event.to_string());
             }
-            if let Some(filter) = trigger.filter.as_deref().filter(|value| !value.trim().is_empty())
+            if let Some(filter) = trigger
+                .filter
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
             {
-                parts.push(format!("filter {}", crate::cmd::transcript::truncate_single_line(filter, 40)));
+                parts.push(format!(
+                    "filter {}",
+                    crate::cmd::transcript::truncate_single_line(filter, 40)
+                ));
             }
             parts.join("  ·  ")
         }
@@ -1122,7 +1168,11 @@ fn workflow_autoflow_summary(autoflow: &rupu_orchestrator::Autoflow) -> String {
     if let Some(source) = autoflow.source.as_deref() {
         parts.push(source.to_string());
     }
-    if let Some(ttl) = autoflow.claim.as_ref().and_then(|claim| claim.ttl.as_deref()) {
+    if let Some(ttl) = autoflow
+        .claim
+        .as_ref()
+        .and_then(|claim| claim.ttl.as_deref())
+    {
         parts.push(format!("ttl {ttl}"));
     }
     parts.join("  ·  ")
@@ -1164,12 +1214,22 @@ fn workflow_step_table_summary(step: &rupu_orchestrator::Step) -> (&'static str,
         if let Some(max_parallel) = step.max_parallel {
             detail.push_str(&format!("max_parallel {max_parallel}"));
         }
-        return ("parallel", primary, if detail.is_empty() { "—".into() } else { detail });
+        return (
+            "parallel",
+            primary,
+            if detail.is_empty() {
+                "—".into()
+            } else {
+                detail
+            },
+        );
     }
     if let Some(panel) = &step.panel {
         let primary = format!("{} panelists", panel.panelists.len());
-        let mut parts =
-            vec![crate::cmd::transcript::truncate_single_line(&panel.panelists.join(", "), 40)];
+        let mut parts = vec![crate::cmd::transcript::truncate_single_line(
+            &panel.panelists.join(", "),
+            40,
+        )];
         if let Some(max_parallel) = panel.max_parallel {
             parts.push(format!("max_parallel {max_parallel}"));
         }
@@ -1189,7 +1249,11 @@ fn workflow_step_table_summary(step: &rupu_orchestrator::Step) -> (&'static str,
         if let Some(max_parallel) = step.max_parallel {
             parts.push(format!("max_parallel {max_parallel}"));
         }
-        if step.approval.as_ref().is_some_and(|approval| approval.required) {
+        if step
+            .approval
+            .as_ref()
+            .is_some_and(|approval| approval.required)
+        {
             parts.push("approval".into());
         }
         return ("for_each", primary, parts.join("  ·  "));
@@ -1200,13 +1264,21 @@ fn workflow_step_table_summary(step: &rupu_orchestrator::Step) -> (&'static str,
     if !step.actions.is_empty() {
         parts.push(format!("actions {}", step.actions.join(", ")));
     }
-    if let Some(when) = step.when.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(when) = step
+        .when
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         parts.push(format!(
             "when {}",
             crate::cmd::transcript::truncate_single_line(when, 28)
         ));
     }
-    if step.approval.as_ref().is_some_and(|approval| approval.required) {
+    if step
+        .approval
+        .as_ref()
+        .is_some_and(|approval| approval.required)
+    {
         parts.push("approval".into());
     }
     if let Some(contract) = &step.contract {
@@ -1216,7 +1288,15 @@ fn workflow_step_table_summary(step: &rupu_orchestrator::Step) -> (&'static str,
             workflow_contract_format_name(contract.format)
         ));
     }
-    ("linear", primary, if parts.is_empty() { "—".into() } else { parts.join("  ·  ") })
+    (
+        "linear",
+        primary,
+        if parts.is_empty() {
+            "—".into()
+        } else {
+            parts.join("  ·  ")
+        },
+    )
 }
 
 fn yaml_scalar_inline(value: &serde_yaml::Value) -> String {
@@ -1321,7 +1401,11 @@ async fn create(
     let target = dir.join(format!("{name}.yaml"));
     let yml_sibling = dir.join(format!("{name}.yml"));
     if target.exists() || yml_sibling.exists() {
-        let existing = if target.exists() { &target } else { &yml_sibling };
+        let existing = if target.exists() {
+            &target
+        } else {
+            &yml_sibling
+        };
         anyhow::bail!(
             "workflow `{name}` already exists at {} — use `rupu workflow edit {name}` to modify",
             existing.display()

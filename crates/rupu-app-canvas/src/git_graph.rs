@@ -524,18 +524,14 @@ steps:
 "#,
         );
         let rows = render_rows(&wf, |_| NodeStatus::Waiting);
-        assert!(rows
+        assert!(rows.iter().any(|row| row
+            .cells
             .iter()
-            .any(|row| row
-                .cells
-                .iter()
-                .any(|cell| matches!(cell, GraphCell::Label(label) if label == "spec"))));
-        assert!(rows
+            .any(|cell| matches!(cell, GraphCell::Label(label) if label == "spec"))));
+        assert!(rows.iter().any(|row| row
+            .cells
             .iter()
-            .any(|row| row
-                .cells
-                .iter()
-                .any(|cell| matches!(cell, GraphCell::Label(label) if label == "verify"))));
+            .any(|cell| matches!(cell, GraphCell::Label(label) if label == "verify"))));
         assert!(rows.iter().any(|row| row
             .cells
             .iter()

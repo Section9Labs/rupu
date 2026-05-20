@@ -62,9 +62,7 @@ pub fn validate_name(name: &str) -> anyhow::Result<()> {
     }
     for c in name.chars() {
         if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-            anyhow::bail!(
-                "name may only contain letters, digits, `-`, and `_` (got `{c}`)"
-            );
+            anyhow::bail!("name may only contain letters, digits, `-`, and `_` (got `{c}`)");
         }
     }
     Ok(())
@@ -83,9 +81,7 @@ pub fn target_dir(
         "global" => Ok(global.join(subdir)),
         "project" => {
             let root = project_root.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no project root detected; cannot create at project scope"
-                )
+                anyhow::anyhow!("no project root detected; cannot create at project scope")
             })?;
             Ok(root.join(".rupu").join(subdir))
         }
