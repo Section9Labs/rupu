@@ -1908,6 +1908,19 @@ struct SessionInteractiveState {
     /// stacking against the now-authoritative accumulator value.
     streaming_overlay: SessionLiveUsage,
     pricing: PricingConfig,
+    completion: Option<CompletionState>,
+}
+
+#[derive(Clone, Debug)]
+struct CompletionState {
+    /// The prefix the user has typed after the leading `/`.
+    query: String,
+    /// Indices into `SLASH_COMMANDS` for the filtered candidate list.
+    candidates: Vec<usize>,
+    /// Currently highlighted index *within* `candidates`.
+    index: usize,
+    /// First visible row of the 8-row window when `candidates` exceeds it.
+    scroll_offset: usize,
 }
 
 impl SessionInteractiveState {
@@ -1929,6 +1942,7 @@ impl SessionInteractiveState {
             live_usage: SessionLiveUsage::default(),
             streaming_overlay: SessionLiveUsage::default(),
             pricing: PricingConfig::default(),
+            completion: None,
         }
     }
 
@@ -1954,6 +1968,7 @@ impl SessionInteractiveState {
             live_usage: SessionLiveUsage::default(),
             streaming_overlay: SessionLiveUsage::default(),
             pricing: PricingConfig::default(),
+            completion: None,
         };
         state.follow_transcript(
             transcript_path,
@@ -2674,11 +2689,38 @@ fn handle_session_live_keypress(
     key: KeyEvent,
 ) -> anyhow::Result<AttachControl> {
     if state.prompt_active {
+        // Slash-completion popup intercepts navigation keys when open.
+        if state.completion.is_some() {
+            match (key.code, key.modifiers) {
+                (KeyCode::Tab, _) | (KeyCode::Down, _) => {
+                    slash_completion_advance(state);
+                    return Ok(AttachControl::Continue);
+                }
+                (KeyCode::Up, _) => {
+                    slash_completion_retreat(state);
+                    return Ok(AttachControl::Continue);
+                }
+                (KeyCode::Enter, _) => {
+                    slash_completion_accept(state);
+                    return Ok(AttachControl::Continue);
+                }
+                (KeyCode::Esc, _) => {
+                    state.completion = None;
+                    return Ok(AttachControl::Continue);
+                }
+                _ => {}
+            }
+        } else if matches!(key.code, KeyCode::Tab) {
+            slash_completion_open(state);
+            return Ok(AttachControl::Continue);
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Enter, _) => {
                 let input = state.input_buffer.trim().to_string();
                 state.prompt_active = false;
                 state.input_buffer.clear();
+                state.completion = None;
                 if input.is_empty() {
                     return Ok(AttachControl::Continue);
                 }
@@ -2689,11 +2731,13 @@ fn handle_session_live_keypress(
                 if state.input_buffer.is_empty() {
                     state.prompt_active = false;
                 }
+                slash_completion_refilter(state);
                 return Ok(AttachControl::Continue);
             }
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 state.input_buffer.clear();
                 state.prompt_active = false;
+                state.completion = None;
                 return Ok(AttachControl::Continue);
             }
             (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
@@ -2701,10 +2745,12 @@ fn handle_session_live_keypress(
                 if state.input_buffer.is_empty() {
                     state.prompt_active = false;
                 }
+                slash_completion_refilter(state);
                 return Ok(AttachControl::Continue);
             }
             (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 state.input_buffer.push(ch);
+                slash_completion_refilter(state);
                 return Ok(AttachControl::Continue);
             }
             _ => {}
@@ -2887,16 +2933,19 @@ fn build_session_screen_rows_for_size(
     ];
 
     let footer_reserved = 1usize;
+    let completion_rows = render_session_completion_rows(state, width);
+    let completion_reserved = completion_rows.len();
     let available_event_rows = height
         .saturating_sub(rows.len())
         .saturating_sub(footer_reserved)
+        .saturating_sub(completion_reserved)
         .max(1);
     let event_rows = render_session_event_rows(session, state, prefs, width, available_event_rows);
     rows.extend(event_rows);
-    while rows.len() < height.saturating_sub(footer_reserved) {
+    while rows.len() < height.saturating_sub(footer_reserved + completion_reserved) {
         rows.push(String::new());
     }
-
+    rows.extend(completion_rows);
     rows.push(render_session_prompt_line(session, state, width));
     rows.truncate(height);
     rows
@@ -2960,6 +3009,58 @@ fn render_session_header_line(
     let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
     let _ = palette::write_colored(&mut buf, &parts.join("  ·  "), DIM);
     truncate_ansi_line(&buf, width)
+}
+
+fn render_session_completion_rows(state: &SessionInteractiveState, width: usize) -> Vec<String> {
+    let Some(c) = state.completion.as_ref() else {
+        return Vec::new();
+    };
+    if c.candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let window = SLASH_COMPLETION_VISIBLE_ROWS;
+    let visible_count = c.candidates.len().min(window);
+    let start = c
+        .scroll_offset
+        .min(c.candidates.len().saturating_sub(visible_count));
+    let end = (start + visible_count).min(c.candidates.len());
+    let visible = &c.candidates[start..end];
+
+    // Pad name column so descriptions align.
+    let name_width = visible
+        .iter()
+        .map(|&idx| SLASH_COMMANDS[idx].name.len() + 1) // +1 for leading '/'
+        .max()
+        .unwrap_or(0);
+
+    let mut rows = Vec::with_capacity(visible.len() + 1);
+    for (vi, &cmd_idx) in visible.iter().enumerate() {
+        let absolute_idx = start + vi;
+        let cmd = &SLASH_COMMANDS[cmd_idx];
+        let mut row = String::new();
+        let marker = if absolute_idx == c.index {
+            "▸ "
+        } else {
+            "  "
+        };
+        let _ = palette::write_colored(&mut row, marker, BRAND);
+        let name = format!("/{}", cmd.name);
+        let padded = format!("{name:<name_width$}");
+        let _ = palette::write_colored(&mut row, &padded, BRAND);
+        row.push_str("  ");
+        let _ = palette::write_colored(&mut row, cmd.description, DIM);
+        rows.push(truncate_ansi_line(&row, width));
+    }
+
+    let hidden = c.candidates.len() - end;
+    if hidden > 0 {
+        let mut row = String::new();
+        let _ = palette::write_colored(&mut row, &format!("  ↓ +{hidden} more"), DIM);
+        rows.push(truncate_ansi_line(&row, width));
+    }
+
+    rows
 }
 
 fn render_session_prompt_line(
@@ -4351,7 +4452,7 @@ fn transcript_tool_summary(tool: &str, input: &serde_json::Value) -> String {
 fn append_session_help_lines(state: &mut SessionInteractiveState) {
     state.push_line(
         crate::output::palette::Status::Active,
-        "help  ·  type or /command  ·  Enter send or queue  ·  Ctrl-U clear  ·  Ctrl-W word  ·  Esc cancel turn  ·  Ctrl-F cycle view  ·  ↑/↓ scroll  ·  Ctrl-D detach  ·  Ctrl-C quit  ·  F1 help",
+        "help  ·  type or /command  ·  Tab complete /  ·  Enter send or queue  ·  Ctrl-U clear  ·  Ctrl-W word  ·  Esc cancel turn  ·  Ctrl-F cycle view  ·  ↑/↓ scroll  ·  Ctrl-D detach  ·  Ctrl-C quit  ·  F1 help",
     );
     state.push_line(
         crate::output::palette::Status::Active,
@@ -4633,6 +4734,186 @@ fn handle_session_input(
         Some(&detail),
     );
     Ok(AttachControl::Continue)
+}
+
+struct SlashCommand {
+    name: &'static str,
+    description: &'static str,
+    routed: bool,
+}
+
+const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "cancel",
+        description: "cancel the active run",
+        routed: false,
+    },
+    SlashCommand {
+        name: "detach",
+        description: "leave the live view (keep session running)",
+        routed: false,
+    },
+    SlashCommand {
+        name: "help",
+        description: "show available commands",
+        routed: false,
+    },
+    SlashCommand {
+        name: "history",
+        description: "replay prompt history",
+        routed: false,
+    },
+    SlashCommand {
+        name: "issues",
+        description: "(routed) issues show / list",
+        routed: true,
+    },
+    SlashCommand {
+        name: "quit",
+        description: "quit and stop the session",
+        routed: false,
+    },
+    SlashCommand {
+        name: "runs",
+        description: "list runs in this session",
+        routed: false,
+    },
+    SlashCommand {
+        name: "session",
+        description: "(routed) session show / list",
+        routed: true,
+    },
+    SlashCommand {
+        name: "status",
+        description: "session status detail",
+        routed: false,
+    },
+    SlashCommand {
+        name: "stop",
+        description: "stop the worker",
+        routed: false,
+    },
+    SlashCommand {
+        name: "transcript",
+        description: "show the current transcript",
+        routed: false,
+    },
+    SlashCommand {
+        name: "workflow",
+        description: "(routed) workflow show / list / show-run",
+        routed: true,
+    },
+];
+
+const SLASH_COMPLETION_VISIBLE_ROWS: usize = 8;
+
+fn slash_completion_candidates(query: &str) -> Vec<usize> {
+    let needle = query.to_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .enumerate()
+        .filter(|(_, cmd)| cmd.name.starts_with(&needle))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn slash_completion_query(buffer: &str) -> Option<String> {
+    let trimmed = buffer.strip_prefix('/')?;
+    // Argument completion is out of scope; once the user types a space we
+    // assume they've moved past the root and the popup closes.
+    if trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn slash_completion_open(state: &mut SessionInteractiveState) {
+    let Some(query) = slash_completion_query(&state.input_buffer) else {
+        return;
+    };
+    let candidates = slash_completion_candidates(&query);
+    if candidates.is_empty() {
+        return;
+    }
+    state.completion = Some(CompletionState {
+        query,
+        candidates,
+        index: 0,
+        scroll_offset: 0,
+    });
+}
+
+fn slash_completion_refilter(state: &mut SessionInteractiveState) {
+    if state.completion.is_none() {
+        return;
+    }
+    let Some(query) = slash_completion_query(&state.input_buffer) else {
+        state.completion = None;
+        return;
+    };
+    let candidates = slash_completion_candidates(&query);
+    if candidates.is_empty() {
+        state.completion = None;
+        return;
+    }
+    if let Some(c) = state.completion.as_mut() {
+        c.query = query;
+        c.candidates = candidates;
+        c.index = 0;
+        c.scroll_offset = 0;
+    }
+}
+
+fn slash_completion_advance(state: &mut SessionInteractiveState) {
+    let Some(c) = state.completion.as_mut() else {
+        return;
+    };
+    if c.candidates.is_empty() {
+        return;
+    }
+    c.index = (c.index + 1) % c.candidates.len();
+    adjust_scroll_offset(c);
+}
+
+fn slash_completion_retreat(state: &mut SessionInteractiveState) {
+    let Some(c) = state.completion.as_mut() else {
+        return;
+    };
+    if c.candidates.is_empty() {
+        return;
+    }
+    c.index = if c.index == 0 {
+        c.candidates.len() - 1
+    } else {
+        c.index - 1
+    };
+    adjust_scroll_offset(c);
+}
+
+fn adjust_scroll_offset(c: &mut CompletionState) {
+    let window = SLASH_COMPLETION_VISIBLE_ROWS;
+    if c.index < c.scroll_offset {
+        c.scroll_offset = c.index;
+    } else if c.index >= c.scroll_offset + window {
+        c.scroll_offset = c.index + 1 - window;
+    }
+}
+
+fn slash_completion_accept(state: &mut SessionInteractiveState) {
+    let Some(c) = state.completion.as_ref() else {
+        return;
+    };
+    let Some(&cmd_idx) = c.candidates.get(c.index) else {
+        return;
+    };
+    let cmd = &SLASH_COMMANDS[cmd_idx];
+    state.input_buffer.clear();
+    state.input_buffer.push('/');
+    state.input_buffer.push_str(cmd.name);
+    if cmd.routed {
+        state.input_buffer.push(' ');
+    }
+    state.completion = None;
 }
 
 fn parse_attach_command(input: &str) -> Option<AttachCommand> {
@@ -4987,11 +5268,20 @@ fn session_header_label(session: &SessionRecord) -> String {
 fn session_session_totals_detail(session: &SessionRecord) -> String {
     let mut detail = String::new();
     let _ = palette::write_colored(&mut detail, session_upload_indicator(), BRAND);
-    detail.push_str(&format!(" {}  ", format_token_count(session.total_tokens_in)));
+    detail.push_str(&format!(
+        " {}  ",
+        format_token_count(session.total_tokens_in)
+    ));
     let _ = palette::write_colored(&mut detail, session_download_indicator(), BRAND);
-    detail.push_str(&format!(" {}  ", format_token_count(session.total_tokens_out)));
+    detail.push_str(&format!(
+        " {}  ",
+        format_token_count(session.total_tokens_out)
+    ));
     let _ = palette::write_colored(&mut detail, session_cache_indicator(), BRAND);
-    detail.push_str(&format!(" {}", format_token_count(session.total_tokens_cached)));
+    detail.push_str(&format!(
+        " {}",
+        format_token_count(session.total_tokens_cached)
+    ));
     let grand_total = session
         .total_tokens_in
         .saturating_add(session.total_tokens_out)
@@ -7008,7 +7298,9 @@ mod tests {
         // Role header has the new label and the Active status glyph.
         assert!(plain.iter().any(|row| row.starts_with("●  agent")));
         // Agent body rows wear the colored rail.
-        assert!(plain.iter().any(|row| row.starts_with("│ hi from the agent")));
+        assert!(plain
+            .iter()
+            .any(|row| row.starts_with("│ hi from the agent")));
         // User prompt has the brand glyph and matching rail.
         assert!(plain.iter().any(|row| row.starts_with("▸  you")));
         assert!(plain.iter().any(|row| row.starts_with("│ hello there")));
@@ -7154,5 +7446,244 @@ mod tests {
             .text
             .contains(".git/logs/refs/heads/storefront/issue-19"));
         assert!(lines.iter().skip(1).any(|line| line.text.contains("path:")));
+    }
+
+    fn fresh_completion_state() -> SessionInteractiveState {
+        SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        )
+    }
+
+    fn press(
+        state: &mut SessionInteractiveState,
+        session: &SessionRecord,
+        prefs: &UiPrefs,
+        code: KeyCode,
+    ) -> AttachControl {
+        handle_session_live_keypress(
+            Path::new("/tmp/repo"),
+            session,
+            state,
+            prefs,
+            KeyEvent::new(code, KeyModifiers::NONE),
+        )
+        .expect("keypress handled")
+    }
+
+    fn typing_session() -> (SessionRecord, UiPrefs, SessionInteractiveState) {
+        let session = SessionRecord {
+            status: SessionStatus::Running,
+            ..test_session_record()
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = fresh_completion_state();
+        state.prompt_active = true;
+        state.input_buffer.push('/');
+        (session, prefs, state)
+    }
+
+    #[test]
+    fn slash_completion_filters_by_prefix() {
+        let all = slash_completion_candidates("");
+        assert_eq!(all.len(), SLASH_COMMANDS.len());
+
+        let h = slash_completion_candidates("h");
+        let names: Vec<&str> = h.iter().map(|&i| SLASH_COMMANDS[i].name).collect();
+        assert_eq!(names, vec!["help", "history"]);
+
+        assert!(slash_completion_candidates("zz").is_empty());
+    }
+
+    #[test]
+    fn slash_completion_query_closes_when_user_types_argument() {
+        assert_eq!(slash_completion_query("/h"), Some("h".into()));
+        assert_eq!(slash_completion_query("/"), Some(String::new()));
+        assert_eq!(slash_completion_query("/workflow "), None);
+        assert_eq!(slash_completion_query("/workflow show"), None);
+        assert_eq!(slash_completion_query("no slash"), None);
+    }
+
+    #[test]
+    fn slash_completion_tab_opens_popup_when_buffer_starts_with_slash() {
+        let (session, prefs, mut state) = typing_session();
+        press(&mut state, &session, &prefs, KeyCode::Tab);
+        let c = state.completion.as_ref().expect("popup opened");
+        assert_eq!(c.query, "");
+        assert_eq!(c.candidates.len(), SLASH_COMMANDS.len());
+        assert_eq!(c.index, 0);
+    }
+
+    #[test]
+    fn slash_completion_tab_does_not_open_without_slash() {
+        let (session, prefs, mut state) = typing_session();
+        state.input_buffer.clear();
+        state.input_buffer.push('x');
+        press(&mut state, &session, &prefs, KeyCode::Tab);
+        assert!(state.completion.is_none());
+    }
+
+    #[test]
+    fn slash_completion_tab_advances_and_wraps() {
+        let (session, prefs, mut state) = typing_session();
+        press(&mut state, &session, &prefs, KeyCode::Tab);
+        let total = state.completion.as_ref().unwrap().candidates.len();
+        for _ in 0..total - 1 {
+            press(&mut state, &session, &prefs, KeyCode::Tab);
+        }
+        assert_eq!(state.completion.as_ref().unwrap().index, total - 1);
+        press(&mut state, &session, &prefs, KeyCode::Tab);
+        assert_eq!(state.completion.as_ref().unwrap().index, 0);
+    }
+
+    #[test]
+    fn slash_completion_up_decrements_and_wraps() {
+        let (session, prefs, mut state) = typing_session();
+        press(&mut state, &session, &prefs, KeyCode::Tab);
+        let total = state.completion.as_ref().unwrap().candidates.len();
+        press(&mut state, &session, &prefs, KeyCode::Up);
+        assert_eq!(state.completion.as_ref().unwrap().index, total - 1);
+        press(&mut state, &session, &prefs, KeyCode::Up);
+        assert_eq!(state.completion.as_ref().unwrap().index, total - 2);
+    }
+
+    #[test]
+    fn slash_completion_enter_accepts_builtin_without_trailing_space() {
+        let (session, prefs, mut state) = typing_session();
+        state.input_buffer.push('h');
+        slash_completion_open(&mut state);
+        // /h matches help, history — highlight help (index 0).
+        let control = press(&mut state, &session, &prefs, KeyCode::Enter);
+        assert!(matches!(control, AttachControl::Continue));
+        assert!(state.completion.is_none());
+        assert_eq!(state.input_buffer, "/help");
+        // The buffer is now ready for the *next* Enter to dispatch.
+        assert!(state.prompt_active);
+    }
+
+    #[test]
+    fn slash_completion_enter_accepts_routed_with_trailing_space() {
+        let (session, prefs, mut state) = typing_session();
+        state.input_buffer.push('w');
+        slash_completion_open(&mut state);
+        // /w matches only `workflow` (routed).
+        let control = press(&mut state, &session, &prefs, KeyCode::Enter);
+        assert!(matches!(control, AttachControl::Continue));
+        assert!(state.completion.is_none());
+        assert_eq!(state.input_buffer, "/workflow ");
+    }
+
+    #[test]
+    fn slash_completion_esc_closes_without_changes() {
+        let (session, prefs, mut state) = typing_session();
+        state.input_buffer.push('h');
+        slash_completion_open(&mut state);
+        let before = state.input_buffer.clone();
+        press(&mut state, &session, &prefs, KeyCode::Esc);
+        assert!(state.completion.is_none());
+        assert_eq!(state.input_buffer, before);
+    }
+
+    #[test]
+    fn slash_completion_typing_refilters() {
+        let (session, prefs, mut state) = typing_session();
+        press(&mut state, &session, &prefs, KeyCode::Tab);
+        // Popup open with all commands. Type 'h' -> only help, history remain.
+        press(&mut state, &session, &prefs, KeyCode::Char('h'));
+        let c = state.completion.as_ref().expect("popup still open");
+        assert_eq!(c.query, "h");
+        let names: Vec<&str> = c
+            .candidates
+            .iter()
+            .map(|&i| SLASH_COMMANDS[i].name)
+            .collect();
+        assert_eq!(names, vec!["help", "history"]);
+        // Backspace -> popup returns to full list.
+        press(&mut state, &session, &prefs, KeyCode::Backspace);
+        let c = state.completion.as_ref().expect("popup still open");
+        assert_eq!(c.query, "");
+        assert_eq!(c.candidates.len(), SLASH_COMMANDS.len());
+    }
+
+    #[test]
+    fn slash_completion_closes_when_buffer_loses_slash() {
+        let (session, prefs, mut state) = typing_session();
+        press(&mut state, &session, &prefs, KeyCode::Tab);
+        assert!(state.completion.is_some());
+        press(&mut state, &session, &prefs, KeyCode::Backspace);
+        assert!(state.completion.is_none());
+        assert!(state.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn slash_completion_closes_when_no_candidates_match() {
+        let (session, prefs, mut state) = typing_session();
+        press(&mut state, &session, &prefs, KeyCode::Tab);
+        // /z matches nothing — popup should close.
+        press(&mut state, &session, &prefs, KeyCode::Char('z'));
+        assert!(state.completion.is_none());
+        assert_eq!(state.input_buffer, "/z");
+    }
+
+    #[test]
+    fn slash_completion_rows_render_with_marker_above_prompt() {
+        let session = SessionRecord {
+            status: SessionStatus::Running,
+            ..test_session_record()
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = fresh_completion_state();
+        state.prompt_active = true;
+        state.input_buffer.push('/');
+        state.input_buffer.push('h');
+        slash_completion_open(&mut state);
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 120, 20);
+        let plain: Vec<String> = rows.iter().map(|row| strip_ansi(row)).collect();
+
+        let help_idx = plain
+            .iter()
+            .position(|row| row.starts_with("▸ /help"))
+            .expect("help row highlighted");
+        let history_idx = plain
+            .iter()
+            .position(|row| row.trim_start().starts_with("/history"))
+            .expect("history row");
+        let prompt_idx = plain
+            .iter()
+            .position(|row| row.contains("issue-reader"))
+            .expect("prompt row");
+        assert!(help_idx < prompt_idx);
+        assert!(history_idx < prompt_idx);
+        // Help is selected (▸), history is not.
+        assert!(!plain[history_idx].starts_with("▸"));
+    }
+
+    #[test]
+    fn slash_completion_catalog_round_trips_through_parser() {
+        for cmd in SLASH_COMMANDS {
+            let typed = if cmd.routed {
+                format!("/{} list", cmd.name)
+            } else {
+                format!("/{}", cmd.name)
+            };
+            assert!(
+                parse_attach_command(&typed).is_some(),
+                "catalog entry `/{}` should parse",
+                cmd.name
+            );
+        }
     }
 }
