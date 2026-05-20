@@ -1,10 +1,16 @@
-//! Shared editor-spawn helper used by `agent edit` and `workflow edit`.
+//! Shared editor-spawn helper used by `agent edit/create`,
+//! `workflow edit/create`, and `autoflow create`.
 //!
-//! Resolves the editor binary in this order, matching POSIX convention:
+//! Resolution order (highest priority first):
 //!   1. explicit `--editor <bin>` flag (passed through by the caller)
-//!   2. `$VISUAL`
-//!   3. `$EDITOR`
-//!   4. fallback: `vi` on Unix, `notepad` on Windows
+//!   2. `[ui].editor` from layered rupu config (project shadows global)
+//!   3. `$VISUAL`
+//!   4. `$EDITOR`
+//!   5. fallback: `vi` on Unix, `notepad` on Windows
+//!
+//! Config is placed above env vars because `$VISUAL`/`$EDITOR` are often
+//! left at distro defaults (`vi`) — a value the user wrote into their
+//! rupu config is an explicit preference and should win.
 //!
 //! The resolved value may include flags (`code --wait`, `vim -p`); we
 //! split on whitespace and pass the file path as the final positional.
@@ -44,6 +50,11 @@ fn resolve_editor(explicit: Option<&str>) -> Result<String> {
     if let Some(e) = explicit {
         return Ok(e.to_string());
     }
+    if let Some(e) = config_editor() {
+        if !e.trim().is_empty() {
+            return Ok(e);
+        }
+    }
     if let Ok(v) = std::env::var("VISUAL") {
         if !v.trim().is_empty() {
             return Ok(v);
@@ -59,4 +70,18 @@ fn resolve_editor(explicit: Option<&str>) -> Result<String> {
     } else {
         Ok("vi".to_string())
     }
+}
+
+/// Best-effort lookup of `[ui].editor` from the layered config. Any
+/// I/O / parse failure silently falls through to env vars and the OS
+/// default — `edit`/`create` must never refuse to open over a config
+/// issue.
+fn config_editor() -> Option<String> {
+    let global = crate::paths::global_dir().ok()?;
+    let global_cfg = global.join("config.toml");
+    let pwd = std::env::current_dir().ok()?;
+    let project_root = crate::paths::project_root_for(&pwd).ok().flatten();
+    let project_cfg = project_root.map(|p| p.join(".rupu/config.toml"));
+    let cfg = rupu_config::layer_files(Some(&global_cfg), project_cfg.as_deref()).ok()?;
+    cfg.ui.editor
 }

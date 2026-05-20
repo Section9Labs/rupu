@@ -101,6 +101,18 @@ pub enum Action {
         #[arg(long)]
         editor: Option<String>,
     },
+    /// Scaffold a new workflow YAML from a template, then open it for
+    /// editing. Prompts interactively for scope and name when omitted.
+    Create {
+        /// Workflow name (no `.yaml` extension).
+        name: Option<String>,
+        /// Target scope (`global` or `project`). Prompts when omitted.
+        #[arg(long, value_parser = ["global", "project"])]
+        scope: Option<String>,
+        /// Override the editor (e.g. `--editor "code --wait"`).
+        #[arg(long)]
+        editor: Option<String>,
+    },
     /// Run a workflow.
     Run {
         /// Workflow name (filename stem under `workflows/`).
@@ -231,6 +243,11 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             scope,
             editor,
         } => edit(&name, scope.as_deref(), editor.as_deref()).await,
+        Action::Create {
+            name,
+            scope,
+            editor,
+        } => create(name, scope, editor.as_deref()).await,
         Action::Run {
             name,
             target,
@@ -286,6 +303,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Runs { .. } => ("workflow runs", report::TABLE_JSON_CSV),
         Action::ShowRun { .. } => ("workflow show-run", report::PRETTY_TABLE_JSON),
         Action::Edit { .. } => ("workflow edit", report::TABLE_ONLY),
+        Action::Create { .. } => ("workflow create", report::TABLE_ONLY),
         Action::Run { .. } => ("workflow run", report::TABLE_ONLY),
         Action::Approve { .. } => ("workflow approve", report::TABLE_ONLY),
         Action::Reject { .. } => ("workflow reject", report::TABLE_ONLY),
@@ -1247,6 +1265,83 @@ fn truncate_workflow_show_ansi_line(value: &str, width: usize) -> String {
             .into_iter()
             .next()
             .unwrap_or_default()
+    }
+}
+
+/// Minimal valid workflow that parses through the orchestrator: one
+/// linear step delegating to an agent. Comments mark common extension
+/// points without locking the user into them.
+const WORKFLOW_TEMPLATE: &str = r#"name: {{name}}
+description: # one-line summary of what this workflow does
+
+# Optional inputs become `{{ inputs.<key> }}` in step prompts.
+# inputs:
+#   topic:
+#     type: string
+#     required: true
+#     description: What the workflow operates on.
+
+steps:
+  - id: main
+    agent: # agent name from `rupu agent list`
+    actions: []
+    prompt: |
+      Replace this with the prompt the agent should receive. You can
+      reference inputs as {{ inputs.topic }} and prior step outputs as
+      {{ steps.<id>.output }}.
+"#;
+
+async fn create(
+    name: Option<String>,
+    scope: Option<String>,
+    editor_override: Option<&str>,
+) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+
+    let scope = match scope {
+        Some(s) => s,
+        None => crate::cmd::create_common::prompt_scope("workflow", project_root.as_deref())?,
+    };
+    let name = match name {
+        Some(n) => {
+            crate::cmd::create_common::validate_name(n.trim())?;
+            n.trim().to_string()
+        }
+        None => crate::cmd::create_common::prompt_name("workflow")?,
+    };
+
+    let dir = crate::cmd::create_common::target_dir(
+        &scope,
+        &global,
+        project_root.as_deref(),
+        "workflows",
+    )?;
+    let target = dir.join(format!("{name}.yaml"));
+    let yml_sibling = dir.join(format!("{name}.yml"));
+    if target.exists() || yml_sibling.exists() {
+        let existing = if target.exists() { &target } else { &yml_sibling };
+        anyhow::bail!(
+            "workflow `{name}` already exists at {} — use `rupu workflow edit {name}` to modify",
+            existing.display()
+        );
+    }
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(&target, WORKFLOW_TEMPLATE.replace("{{name}}", &name))?;
+    println!("created {} ({scope})", target.display());
+
+    crate::cmd::editor::open_for_edit(editor_override, &target)?;
+
+    match Workflow::parse_file(&target) {
+        Ok(_) => {
+            println!("✓ {name}: workflow YAML parses cleanly");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("⚠ {name}: failed to re-parse after save:\n  {e}");
+            Ok(())
+        }
     }
 }
 

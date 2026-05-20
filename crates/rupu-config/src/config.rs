@@ -69,6 +69,10 @@ pub struct UiConfig {
     /// `auto` (default — page when stdout is a tty and the output
     /// exceeds one screen), `always`, or `never`.
     pub pager: Option<String>,
+    /// External editor command used by `agent edit`/`create` and
+    /// `workflow edit`/`create`. May include flags (e.g. `code --wait`,
+    /// `vim -p`). Resolves between `--editor` (flag) and `$VISUAL`.
+    pub editor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

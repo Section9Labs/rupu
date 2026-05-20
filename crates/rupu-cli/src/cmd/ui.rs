@@ -862,6 +862,7 @@ mod tests {
             palette: Default::default(),
             live_view: None,
             pager: None,
+            editor: None,
         };
         let prefs = UiPrefs::resolve(&cfg, false, None, None, None);
         assert_eq!(prefs.color, ColorMode::Never);
