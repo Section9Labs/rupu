@@ -2460,6 +2460,13 @@ impl SessionInteractiveState {
         prefs: &UiPrefs,
         width: usize,
     ) -> &[String] {
+        debug_assert_eq!(
+            self.entries.len(),
+            self.entry_row_cache.len(),
+            "entry_row_cache must stay in lockstep with entries — \
+             always mutate via push_entry/insert_entry, never bare \
+             entries.push"
+        );
         let dynamic_entry = matches!(
             self.entries.get(index),
             Some(SessionEntry::Assistant {
@@ -3851,14 +3858,17 @@ fn execute_routed_session_command(
     };
 
     for line in stdout.lines() {
-        state.entries.push(SessionEntry::Notice(SessionViewLine {
+        // Must go through push_entry so entry_row_cache stays the same
+        // length as entries — render_cached_entry_rows indexes the cache
+        // directly and panics if it's shorter than entries.
+        state.push_entry(SessionEntry::Notice(SessionViewLine {
             status,
             text: line.to_string(),
             continuation: true,
         }));
     }
     for line in stderr.lines() {
-        state.entries.push(SessionEntry::Notice(SessionViewLine {
+        state.push_entry(SessionEntry::Notice(SessionViewLine {
             status: crate::output::palette::Status::Failed,
             text: line.to_string(),
             continuation: true,
@@ -6648,6 +6658,50 @@ mod tests {
         assert!(state.prompt_active);
         assert_eq!(state.input_buffer, "s");
         assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn routed_command_notice_rows_keep_entry_cache_in_lockstep() {
+        // Regression for the panic in `render_cached_entry_rows`
+        // ("index out of bounds: the len is N but the index is N")
+        // triggered by `/issues` / `/workflow` / `/session` / `/transcript`.
+        // The routed-command output loop used to call `state.entries.push`
+        // directly, leaving `entry_row_cache` shorter than `entries` and
+        // causing the next render to panic.
+        let session = SessionRecord {
+            status: SessionStatus::Running,
+            ..test_session_record()
+        };
+        let prefs = UiPrefs::resolve(
+            &rupu_config::UiConfig::default(),
+            false,
+            None,
+            None,
+            Some(LiveViewMode::Compact),
+        );
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+        // Mimic the post-subprocess output loop from
+        // `execute_routed_session_command`: many notice lines added in
+        // sequence. Before the fix this used bare `entries.push` and
+        // the cache fell behind by exactly this count.
+        for line in 0..40 {
+            state.push_entry(SessionEntry::Notice(SessionViewLine {
+                status: crate::output::palette::Status::Complete,
+                text: format!("routed line {line}"),
+                continuation: true,
+            }));
+        }
+        assert_eq!(state.entries.len(), state.entry_row_cache.len());
+
+        // Render should succeed without panic regardless of viewport size.
+        let rows = build_session_screen_rows_for_size(&session, &mut state, &prefs, 96, 24);
+        assert_eq!(rows.len(), 24);
+        // Cache and entries remain in lockstep after rendering.
+        assert_eq!(state.entries.len(), state.entry_row_cache.len());
     }
 
     #[test]
