@@ -6230,6 +6230,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-coverage"
+version = "0.7.0"
+dependencies = [
+ "chrono",
+ "glob",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "rupu-keychain-acl"
 version = "0.7.0"
 dependencies = [
