@@ -4,5 +4,11 @@
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+pub mod ledger;
 
-pub use catalog::{Concern, Severity, Template, TouchStrength};
+pub use catalog::{
+    builtin_names, flatten, read_snapshot, resolve_builtin, write_snapshot, Concern, ConcernOverride,
+    ConcernsBlock, ConcernsEntry, FlatCatalog, FlattenError, IncludeDirective, ParseError, Severity,
+    SnapshotError, Template, TouchStrength,
+};
+pub use ledger::{target_id, CoveragePaths};
