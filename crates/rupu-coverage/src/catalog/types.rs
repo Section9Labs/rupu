@@ -63,6 +63,55 @@ fn default_template_version() -> u32 {
     1
 }
 
+/// A user-declared concerns block — appears in agent frontmatter or
+/// workflow YAML. A list of entries, each either an inline concern or
+/// an include of a named template.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConcernsBlock {
+    pub entries: Vec<ConcernsEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConcernsEntry {
+    Include(IncludeDirective),
+    Inline(Concern),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncludeDirective {
+    pub include: String,
+    #[serde(default)]
+    pub overrides: Vec<ConcernOverride>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConcernOverride {
+    pub id: String,
+    #[serde(default)]
+    pub severity: Option<Severity>,
+    #[serde(default)]
+    pub applicable_globs: Option<Vec<String>>,
+    #[serde(default)]
+    pub min_strength: Option<TouchStrength>,
+    #[serde(default)]
+    pub references: Option<Vec<String>>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// The flattened catalog — what the harness actually uses. All includes
+/// resolved, all overrides applied, all duplicates rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlatCatalog {
+    pub concerns: Vec<Concern>,
+    /// Source-tracking: for each concern_id, where it came from (template name or "inline").
+    pub sources: std::collections::BTreeMap<String, String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
