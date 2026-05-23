@@ -12,6 +12,7 @@ pub use catalog::{
     SnapshotError, Template, TouchStrength,
 };
 pub use ledger::{
-    target_id, AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence,
-    FileTouchEvent, FindingEvidence, FindingRecord, FindingScope, Surface,
+    target_id, AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, CoverageWriter,
+    CoverageWriterHandle, Evidence, FileTouchEvent, FindingEvidence, FindingRecord, FindingScope,
+    Surface,
 };
