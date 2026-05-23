@@ -376,14 +376,40 @@ are referenced by name (without `.yaml` extension):
 | `owasp-top10-2021` | 10 | OWASP Top 10 web-app security risks (2021 edition) |
 | `owasp-api-top10-2023` | 10 | OWASP API Security Top 10 (2023 edition) |
 | `cwe-top25-2023` | 25 | CWE Top 25 Most Dangerous Software Weaknesses (2023) |
+| `cwe-software-development` | ~440 | Full CWE Software Development view (CWE-699), generated from MITRE source |
+| `cwe-research` | ~930 | Full CWE Research view (CWE-1000), generated from MITRE source |
 | `stride` | 6 | STRIDE threat-modeling categories |
 | `secrets-in-source` | 1 | Single-purpose: hardcoded credentials, keys, tokens |
 | `code-smells` | 12 | Fowler-style code smells (long method, god object, etc.) |
 | `web-security-default` | composite | `include`s the three OWASP templates + secrets-in-source |
 | `api-security-default` | composite | `include`s OWASP API Top 10 + CWE Top 25 + secrets |
 
-Reasonable starting catalog (≈58 unique concerns across the templates,
-post-deduplication). Additional templates (PCI-DSS, NIST SSDF, MASVS,
+The two CWE-full templates are *generated* from MITRE's published source
+(CSV / XML downloads at https://cwe.mitre.org/data/downloads.html) by a
+build script (`crates/rupu-coverage/build/gen_cwe_catalog.rs`) — not
+hand-authored. The script:
+
+1. Downloads the CWE XML for the requested view (`699` or `1000`) at
+   build time, pinned to a specific CWE release (e.g. `4.13`).
+2. Filters entries to the view's member CWEs.
+3. Maps each entry to a `Concern` record:
+   - `id`: `cwe-research:cwe-{N}-{name-slug}` (or `cwe-software-development:cwe-{N}-{name-slug}`)
+   - `name`: `CWE-{N} — {Title}`
+   - `description`: the entry's `Description` + `Extended_Description` fields, truncated to ~600 chars (full form fetchable via `coverage_concerns_detail` — see below).
+   - `severity`: derived heuristic from the entry's `Common_Consequences/Impact` tags (Critical/High/Medium/Low/Info).
+   - `applicable_globs`: derived heuristic from the entry's `Applicable_Platforms/Language` tags. Where the entry is language-agnostic, defaults to `["**"]`.
+   - `references`: the entry's CWE permalink plus any `Taxonomy_Mappings` (OWASP, NIST, SANS) it carries.
+4. Writes the YAML to `templates/concerns/cwe-{view}.yaml`.
+5. Pins the source CWE version in a sibling `cwe-{view}.version.txt` so the snapshot mechanism can record which CWE release the catalog was generated from.
+
+Re-running the generator (e.g. on each `make sync` or whenever MITRE
+publishes a new release) refreshes the template; the snapshot mechanism
+ensures prior runs remain interpretable against the version they were
+written under.
+
+Reasonable starting catalog (≈58 unique concerns across the curated
+templates, plus the two CWE-full templates available on demand for
+exhaustive reviews). Additional templates (PCI-DSS, NIST SSDF, MASVS,
 ASVS chapter-by-chapter, language-specific best-practice sets) can be
 added in follow-up slices without changing the architecture.
 
@@ -749,6 +775,119 @@ concerns:
   - include: secrets-in-source
 ```
 
+### Handling large catalogs (CWE-full and beyond)
+
+The curated templates (Top 10, Top 25, STRIDE, code-smells) are small
+enough to inject *fully* into the agent's system prompt — name, full
+description, applicable_globs, references, all 58 concerns combined fit
+in ~3-4 kB. But the CWE-full templates (~440 and ~930 entries) would
+add 60-150 kB to every prompt: prohibitive in token cost and context
+window pressure.
+
+The catalog system therefore supports **two injection modes**:
+
+**Full mode** (default for small catalogs, ≤ ~80 entries): every
+concern's id, name, full description, applicable_globs, and references
+are rendered into the prompt section under `## Coverage Catalog`.
+
+**Index mode** (auto-selected for catalogs over the size threshold, or
+manually requested via `mode: index` on an `include:` directive): only
+a compact one-line index per concern is rendered — id, name, severity,
+and a one-line summary. The agent receives the index up front and
+fetches full details for any concern it wants to dig into via the
+`coverage_concerns_detail` tool. This trades one round-trip per
+detailed-concern-lookup for ~95% reduction in prompt size.
+
+```yaml
+# Workflow YAML — explicit mode opt-in
+concerns:
+  - include: cwe-research
+    mode: index               # forces index mode regardless of size
+    filter:
+      severity: [high, critical]      # subset by severity
+      tags: [language:rust, owasp]    # subset by taxonomy tags
+      ids: ["cwe-research:cwe-200-*"] # subset by ID glob
+```
+
+#### Catalog filters
+
+When including a large template, users almost always want a subset, not
+all 900 entries. The `filter:` block on an `include:` directive supports:
+
+- **`severity`**: array of severities to keep (e.g. `[high, critical]`).
+- **`tags`**: array of taxonomy tags the entry must carry (the CWE
+  generator emits language and framework tags derived from
+  `Applicable_Platforms`).
+- **`ids`**: array of ID globs the entry's id must match (e.g.
+  `cwe-research:cwe-2[0-9][0-9]-*` to keep only CWE 200-299).
+- **`applicable_to_path`**: a workspace-relative path or glob; only
+  concerns whose `applicable_globs` match this path are kept. Useful
+  for "review just this directory."
+
+Filters compose with AND semantics. The flattened catalog (and the
+snapshot) reflect the filtered subset, not the full template.
+
+#### Two new agent tools for indexed catalogs
+
+**`coverage_concerns_search`** — full-text-ish search over the catalog.
+Returns concern records (in full or summary form) matching a query.
+
+```jsonc
+// Input
+{
+  "query": "command injection",                      // case-insensitive substring match against name + description
+  "filter": {
+    "severity": ["high", "critical"],
+    "applicable_to_path": "src/db/queries.rs"
+  },
+  "limit": 10,
+  "form": "summary"                                  // summary | full (defaults: summary)
+}
+
+// Output
+[
+  {
+    "concern_id": "cwe-research:cwe-78-os-command-injection",
+    "name": "CWE-78 — OS Command Injection",
+    "severity": "critical",
+    "summary": "User input flows into a shell command without proper escaping."
+  },
+  ...
+]
+```
+
+**`coverage_concerns_detail`** — fetch the full record for one or more
+concern ids. Used by the agent when it wants to dig into a concern's
+full description, applicable_globs, references, and (when present)
+taxonomy mappings.
+
+```jsonc
+// Input
+{ "concern_ids": ["cwe-research:cwe-78-os-command-injection"] }
+
+// Output: array of full concern records (description, applicable_globs, references, tags, etc.)
+[ { "id": "...", "name": "...", "description": "...", "severity": "...", "applicable_globs": [...], "references": [...] } ]
+```
+
+Both tools are auto-injected alongside the four core coverage tools
+whenever any included template is rendered in index mode. They're
+no-ops on catalogs rendered in full mode (the agent already has
+everything it needs in the prompt) but always available so workflows
+can mix modes freely.
+
+#### Heuristics for the mode-selection threshold
+
+- **Full mode** is forced when total concerns ≤ 80 (configurable via
+  `[coverage].full_mode_max_concerns` in `config.toml`, default 80).
+- **Index mode** is forced when total concerns > 80.
+- A workflow's explicit `mode:` on an `include:` directive overrides
+  the threshold for that include only.
+- If a workflow mixes a small curated template (full mode) with a
+  large generated one (index mode), both render: the curated concerns
+  appear with full bodies; the generated ones appear as one-line index
+  rows; the agent uses `coverage_concerns_detail` to expand any of the
+  indexed entries when relevant.
+
 ### Audit / report generation
 
 After a run (or on demand via `rupu coverage audit <target>`), the
@@ -775,7 +914,11 @@ human-readable rendering via the existing `rupu-cli` output framework
 ### Tool-prompt section injected by the harness
 
 When `concerns:` is non-empty, the harness appends a section to the
-agent's system prompt:
+agent's system prompt. The rendering form depends on the catalog's
+size and the per-include `mode:` (full vs index — see [Handling large
+catalogs](#handling-large-catalogs-cwe-full-and-beyond)).
+
+**Full mode** (the default for small catalogs):
 
 ```
 ## Coverage Catalog
@@ -803,9 +946,28 @@ References:
 ...
 ```
 
+**Index mode** (auto for large catalogs):
+
+```
+## Coverage Catalog (index)
+
+You have access to a large concern catalog (≈930 entries). The full
+descriptions are not inlined; use `coverage_concerns_search` to find
+concerns relevant to a topic or file, and `coverage_concerns_detail`
+to fetch full text for any specific concern_id.
+
+| concern_id                                       | severity | summary |
+| ------------------------------------------------ | -------- | ------- |
+| cwe-research:cwe-20-improper-input-validation    | high     | Input is not validated before use. |
+| cwe-research:cwe-22-path-traversal               | high     | Path constructed from user input enables out-of-tree access. |
+| cwe-research:cwe-78-os-command-injection         | critical | User input flows into shell command without escaping. |
+| cwe-research:cwe-89-sql-injection                | high     | User input flows into SQL without parameterization. |
+... (≈930 rows in total)
+```
+
 This is the model's source of truth for "what to do." The catalog
 section is rendered from the *effective* catalog snapshot, so any
-overrides and inline concerns are visible to the model.
+overrides, inline concerns, and filters are visible to the model.
 
 ## Components
 
@@ -813,15 +975,18 @@ overrides and inline concerns are visible to the model.
 
 Owns:
 
-- Catalog types (`Concern`, `Catalog`, `Template`) and flatten / merge logic.
+- Catalog types (`Concern`, `Catalog`, `Template`, `IncludeFilter`) and flatten / merge / filter logic.
+- Catalog rendering (full mode vs index mode, prompt-section generation).
 - Ledger types (`FileTouchEvent`, `ConcernAssertion`, `FindingRecord`) and JSONL writers / readers.
-- Tool implementations (`coverage_mark`, `coverage_status`, `coverage_remaining`, `report_finding`) — exposed via the standard `Tool` trait from `rupu-tools`.
-- Catalog template files under `templates/concerns/`.
+- Tool implementations (`coverage_mark`, `coverage_status`, `coverage_remaining`, `report_finding`, `coverage_concerns_search`, `coverage_concerns_detail`) — exposed via the standard `Tool` trait from `rupu-tools`.
+- Curated catalog template files under `templates/concerns/`.
+- CWE generator (`build/gen_cwe_catalog.rs`) — converts MITRE CWE XML into the two `cwe-*` templates.
 - Audit / report generator.
 
 Cargo dependencies: `serde`, `serde_json`, `serde_yaml`, `tokio`, `ulid`,
-`thiserror`, `glob`. No new transitive dependencies the workspace
-doesn't already use.
+`thiserror`, `glob`. Generator additionally pulls `quick-xml` and `reqwest`
+(under a `gen` feature gate so binary builds don't carry them). No new
+transitive dependencies in the workspace's release path.
 
 ### Changes to `rupu-tools`
 
@@ -866,17 +1031,33 @@ crates/rupu-coverage/templates/concerns/
   ├── owasp-top10-2021.yaml
   ├── owasp-api-top10-2023.yaml
   ├── cwe-top25-2023.yaml
+  ├── cwe-software-development.yaml      # generated, ~440 entries
+  ├── cwe-software-development.version.txt
+  ├── cwe-research.yaml                  # generated, ~930 entries
+  ├── cwe-research.version.txt
   ├── stride.yaml
   ├── secrets-in-source.yaml
   ├── code-smells.yaml
   ├── web-security-default.yaml
   └── api-security-default.yaml
+
+crates/rupu-coverage/build/
+  └── gen_cwe_catalog.rs                 # MITRE-XML → YAML generator
 ```
 
-Templates are bundled into the binary via `include_str!` at compile
-time so the CLI is self-sufficient. User-defined templates may live in
-`.rupu/concerns/` (project) or `~/.rupu/concerns/` (global) and are
-discovered by name with project overriding global overriding builtin.
+Curated templates are hand-authored. The two CWE-full templates are
+generated by `gen_cwe_catalog.rs` from MITRE's published CWE XML
+(https://cwe.mitre.org/data/downloads.html), pinned to a specific CWE
+release; the `.version.txt` sidecar records which release each template
+was generated from. Re-running the generator (manually, or as part of
+a periodic refresh task) updates the template; existing snapshots
+remain valid because they record the version they were captured under.
+
+All templates are bundled into the binary via `include_str!` at compile
+time so the CLI is self-sufficient — no runtime download required even
+for the multi-megabyte CWE-research catalog. User-defined templates may
+live in `.rupu/concerns/` (project) or `~/.rupu/concerns/` (global) and
+are discovered by name with project overriding global overriding builtin.
 
 ## Alternatives considered
 
@@ -893,7 +1074,8 @@ discovered by name with project overriding global overriding builtin.
 ## Risks
 
 - **Tool-runtime overhead.** Every tool call emits an event. Mitigated by batched async writes through an MPSC channel; per-call CPU overhead is one Arc clone + one channel send.
-- **Catalog size in the system prompt.** Including all 58 concerns from the default web template adds ≈3-4 kB to the system prompt. Acceptable; if catalogs grow much larger we'd compact via dropping verbose descriptions for less-likely concerns.
+- **Catalog size in the system prompt.** Curated templates total ≈58 concerns and add ≈3-4 kB to the prompt. The CWE-full templates (~440 and ~930) cannot be inlined; they automatically render in index mode (one-line-per-concern table), adding ≈30-80 kB instead of 300+ kB. The agent uses `coverage_concerns_search` / `coverage_concerns_detail` to access full bodies on demand.
+- **CWE source-data drift.** MITRE publishes CWE releases periodically (~yearly minor, occasional major). Generated templates are pinned to a specific release recorded in `.version.txt` and in each snapshot. Refresh requires re-running the generator and revving the version; in-flight snapshots remain interpretable against the version they captured.
 - **Agent gaming.** Agent might mark concerns "clean" without doing the work. Validation against `files.jsonl` catches the trivial cases (claimed-but-not-read). Cross-model audit catches subtler cases (model A says clean, model B finds an issue — surface the disagreement).
 - **Catalog drift across templates.** OWASP / CWE update their lists periodically. Templates are versioned (`version: 1`); when MITRE publishes CWE Top 25 (2024), we ship `cwe-top25-2024.yaml` alongside `cwe-top25-2023.yaml` without breaking existing snapshots.
 - **Multi-target identity ambiguity.** Workflow + agent with the same name in different workspaces should have distinct target_ids. Mitigated by including the workspace's stable identifier in the hash.
@@ -906,6 +1088,9 @@ discovered by name with project overriding global overriding builtin.
 - A second run on the same target without re-running succeeds, and the second-pass agent's `coverage_remaining` call shows only the gaps left by the first run.
 - `rupu coverage audit <target>` produces a structured report identifying gaps, per-concern coverage, and serendipitous findings.
 - All shipped templates (`owasp-top10-2021`, `cwe-top25-2023`, `stride`, etc.) parse cleanly and round-trip through the catalog flattener.
+- `gen_cwe_catalog.rs` runs against a pinned CWE release and produces `cwe-software-development.yaml` (≈440 entries) and `cwe-research.yaml` (≈930 entries) that pass the flattener.
+- An agent run with `concerns: [include: cwe-research, mode: index]` renders the catalog as a one-line-per-concern table, exposes `coverage_concerns_search` / `coverage_concerns_detail`, and total prompt overhead stays under ≈100 kB.
+- A workflow with `filter: { severity: [high, critical] }` on a CWE-full include receives only the high/critical subset in the rendered catalog.
 
 ## Out of scope (this slice)
 
