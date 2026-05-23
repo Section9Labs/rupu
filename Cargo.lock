@@ -6388,6 +6388,7 @@ dependencies = [
  "async-trait",
  "globwalk",
  "predicates",
+ "rupu-coverage",
  "serde",
  "serde_json",
  "tempfile",

@@ -170,6 +170,7 @@ impl StepFactory for DefaultStepFactory {
                 dispatchable_agents: spec.dispatchable_agents.clone(),
                 parent_run_id: parent_run_id_for_tool_ctx,
                 depth: 0,
+                coverage_writer: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),

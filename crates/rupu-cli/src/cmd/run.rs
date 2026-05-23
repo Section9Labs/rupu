@@ -261,6 +261,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         dispatchable_agents: spec.dispatchable_agents.clone(),
         parent_run_id: None,
         depth: 0,
+        coverage_writer: None,
     };
 
     let mode_str = match mode {

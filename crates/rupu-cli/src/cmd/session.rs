@@ -5804,6 +5804,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         dispatchable_agents: session.dispatchable_agents.clone(),
         parent_run_id: None,
         depth: 0,
+        coverage_writer: None,
     };
 
     let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {

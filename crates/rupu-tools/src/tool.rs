@@ -74,6 +74,11 @@ pub struct ToolContext {
     /// depth 0; first child has depth 1; etc.
     #[serde(skip)]
     pub depth: u32,
+    /// Optional coverage writer. When set, file-touching built-in tools
+    /// emit FileTouchEvents to this writer. None disables coverage capture
+    /// entirely (the default outside of a coverage-enabled run).
+    #[serde(skip)]
+    pub coverage_writer: Option<std::sync::Arc<rupu_coverage::CoverageWriter>>,
 }
 
 impl Default for ToolContext {
@@ -86,6 +91,7 @@ impl Default for ToolContext {
             dispatchable_agents: None,
             parent_run_id: None,
             depth: 0,
+            coverage_writer: None,
         }
     }
 }
@@ -269,4 +275,15 @@ pub trait Tool: Send + Sync {
     /// Invoke the tool with JSON-encoded input. The boxed `Send +
     /// Sync` future makes this trait object-safe for `Box<dyn Tool>`.
     async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+}
+
+#[cfg(test)]
+mod coverage_context_tests {
+    use super::*;
+
+    #[test]
+    fn default_tool_context_has_no_coverage_writer() {
+        let ctx = ToolContext::default();
+        assert!(ctx.coverage_writer.is_none());
+    }
 }
