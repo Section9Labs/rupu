@@ -11,4 +11,7 @@ pub use catalog::{
     ConcernsBlock, ConcernsEntry, FlatCatalog, FlattenError, IncludeDirective, ParseError, Severity,
     SnapshotError, Template, TouchStrength,
 };
-pub use ledger::{target_id, CoveragePaths};
+pub use ledger::{
+    target_id, AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence,
+    FileTouchEvent, FindingEvidence, FindingRecord, FindingScope, Surface,
+};
