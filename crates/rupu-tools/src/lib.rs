@@ -13,6 +13,7 @@
 //! are not aware of permission state.
 
 pub mod tool;
+pub mod coverage_emit;
 
 mod path_scope;
 

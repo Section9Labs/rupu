@@ -8,9 +8,12 @@
 //! refused via `error: Some(...)` on the ToolOutput. The file must
 //! already exist (no implicit create — use `write_file` for that).
 
+use crate::coverage_emit::{attribution_from, emit};
 use crate::path_scope::is_inside;
 use crate::tool::{render_file_edit_diff, DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
+use chrono::Utc;
+use rupu_coverage::FileTouchEvent;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Instant;
@@ -90,10 +93,31 @@ impl Tool for EditFileTool {
                 ),
             ));
         }
+        // Compute line range where old_string starts and ends (1-based).
+        let byte_offset = text.find(i.old_string.as_str()).unwrap_or(0);
+        let start_line = (text[..byte_offset].lines().count() as u32) + 1;
+        let old_line_count = i.old_string.lines().count() as u32;
+        let end_line = (start_line + old_line_count).saturating_sub(1).max(start_line);
+        let lines_changed = i.new_string.lines().count() as u32;
+
         let new_text = text.replacen(&i.old_string, &i.new_string, 1);
         if let Err(e) = std::fs::write(&abs, &new_text) {
             return Ok(err_output(started, format!("write {}: {e}", i.path)));
         }
+
+        emit(
+            ctx,
+            FileTouchEvent::Edit {
+                path: i.path.clone(),
+                line_range: [start_line, end_line],
+                lines_changed,
+                tool: "edit_file".to_string(),
+                attribution: attribution_from(ctx),
+                at: Utc::now(),
+            },
+        )
+        .await;
+
         Ok(ToolOutput {
             stdout: format!("edited {}", i.path),
             error: None,

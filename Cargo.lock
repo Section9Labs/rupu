@@ -6386,6 +6386,7 @@ version = "0.7.0"
 dependencies = [
  "assert_fs",
  "async-trait",
+ "chrono",
  "globwalk",
  "predicates",
  "rupu-coverage",

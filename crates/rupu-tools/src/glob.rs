@@ -4,8 +4,11 @@
 //! relative to the workspace root. Pattern syntax is glob-style with
 //! `**` for recursive descent.
 
+use crate::coverage_emit::{attribution_from, emit};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
+use chrono::Utc;
+use rupu_coverage::FileTouchEvent;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Instant;
@@ -65,6 +68,22 @@ impl Tool for GlobTool {
             }
         }
         matches.sort();
+
+        // Emit one FileTouchEvent per matched path (success — walker never
+        // returns a Rust-level error for non-matches, it simply yields nothing).
+        for path in &matches {
+            emit(
+                ctx,
+                FileTouchEvent::Glob {
+                    path: path.clone(),
+                    pattern: i.pattern.clone(),
+                    tool: "glob".to_string(),
+                    attribution: attribution_from(ctx),
+                    at: Utc::now(),
+                },
+            )
+            .await;
+        }
 
         Ok(ToolOutput {
             stdout: matches.join("\n"),

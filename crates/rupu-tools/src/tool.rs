@@ -79,6 +79,21 @@ pub struct ToolContext {
     /// entirely (the default outside of a coverage-enabled run).
     #[serde(skip)]
     pub coverage_writer: Option<std::sync::Arc<rupu_coverage::CoverageWriter>>,
+    /// Surface that initiated this run — populated by the runner. Used to
+    /// tag emitted FileTouchEvents with `surface: workflow | agent | autoflow | session`.
+    /// Tasks 18/19 will wire actual values from the agent/workflow runner.
+    #[serde(skip)]
+    pub surface_tag: Option<String>,
+    /// Run identifier — populated by the runner. Used to tag emitted
+    /// FileTouchEvents with their owning run.
+    /// Tasks 18/19 will wire actual values from the agent/workflow runner.
+    #[serde(skip)]
+    pub run_id: Option<String>,
+    /// Model identifier — populated by the runner. Used to tag emitted
+    /// FileTouchEvents with the model that made the call.
+    /// Tasks 18/19 will wire actual values from the agent/workflow runner.
+    #[serde(skip)]
+    pub model: Option<String>,
 }
 
 impl Default for ToolContext {
@@ -92,6 +107,9 @@ impl Default for ToolContext {
             parent_run_id: None,
             depth: 0,
             coverage_writer: None,
+            surface_tag: None,
+            run_id: None,
+            model: None,
         }
     }
 }

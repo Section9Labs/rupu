@@ -262,6 +262,9 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         parent_run_id: None,
         depth: 0,
         coverage_writer: None,
+        surface_tag: None,
+        run_id: None,
+        model: None,
     };
 
     let mode_str = match mode {

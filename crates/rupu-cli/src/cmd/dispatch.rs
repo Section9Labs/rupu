@@ -139,6 +139,9 @@ impl AgentDispatcher for CliAgentDispatcher {
             parent_run_id: Some(sub_run_id.clone()),
             depth: child_depth,
             coverage_writer: None,
+            surface_tag: None,
+            run_id: None,
+            model: None,
         };
 
         let opts = AgentRunOpts {
