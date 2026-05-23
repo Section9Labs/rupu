@@ -1,0 +1,172 @@
+name: owasp-api-top10-2023
+version: 1
+description: OWASP API Security Top 10 (2023 edition)
+references:
+  - https://owasp.org/API-Security/editions/2023/en/0x11-t10/
+
+concerns:
+  - id: owasp-api-top10-2023:api1-broken-object-level-authorization
+    name: API1:2023 — Broken Object Level Authorization
+    description: |
+      API endpoints that receive an object ID fail to verify that the
+      requesting user is authorized to access that specific object.
+      Attackers can substitute another user's ID to access or modify
+      data they do not own (IDOR at the API level).
+    severity: critical
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/routes/**"
+      - "**/controllers/**"
+      - "**/api/**"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/
+
+  - id: owasp-api-top10-2023:api2-broken-authentication
+    name: API2:2023 — Broken Authentication
+    description: |
+      Authentication mechanisms are implemented incorrectly or are absent,
+      allowing attackers to compromise tokens, impersonate users, or
+      access the API without credentials. Covers weak token validation,
+      missing expiry, and credential-stuffing-susceptible endpoints.
+    severity: critical
+    applicable_globs:
+      - "**/auth/**"
+      - "**/middleware/**"
+      - "**/login/**"
+      - "**/token/**"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xa2-broken-authentication/
+
+  - id: owasp-api-top10-2023:api3-broken-object-property-level-authorization
+    name: API3:2023 — Broken Object Property Level Authorization
+    description: |
+      API endpoints expose object properties that users should not be
+      able to read or write — mass assignment vulnerabilities and
+      over-exposed response fields. Attackers can update privileged
+      fields or read sensitive properties by exploiting missing
+      property-level access control.
+    severity: high
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/serializers/**"
+      - "**/schemas/**"
+      - "**/dto/**"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xa3-broken-object-property-level-authorization/
+
+  - id: owasp-api-top10-2023:api4-unrestricted-resource-consumption
+    name: API4:2023 — Unrestricted Resource Consumption
+    description: |
+      API requests are processed without limits on the number of calls,
+      payload size, or compute resources consumed. Allows denial-of-service
+      attacks and uncontrolled cost amplification in pay-per-use services.
+      Covers missing rate limiting, pagination enforcement, and max-body-size.
+    severity: high
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/api/**"
+      - "**/middleware/**"
+      - "**/routes/**"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xa4-unrestricted-resource-consumption/
+
+  - id: owasp-api-top10-2023:api5-broken-function-level-authorization
+    name: API5:2023 — Broken Function Level Authorization
+    description: |
+      The API exposes administrative or privileged functions to users
+      who should not have access. Often discoverable by fuzzing HTTP
+      methods or changing URL components — e.g. accessing `/admin/`
+      routes from a regular user account.
+    severity: critical
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/routes/**"
+      - "**/middleware/**"
+      - "**/admin/**"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/
+
+  - id: owasp-api-top10-2023:api6-unrestricted-access-to-sensitive-business-flows
+    name: API6:2023 — Unrestricted Access to Sensitive Business Flows
+    description: |
+      Business flows that should be rate-limited or gated — such as
+      purchasing, voting, account creation, or coupon redemption — are
+      accessible at scale without restriction. Attackers automate requests
+      to exploit the business logic rather than break authentication.
+    severity: high
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/api/**"
+      - "**/routes/**"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xa6-unrestricted-access-to-sensitive-business-flows/
+
+  - id: owasp-api-top10-2023:api7-server-side-request-forgery
+    name: API7:2023 — Server Side Request Forgery
+    description: |
+      The API fetches a remote resource using a URL supplied or
+      influenced by the caller without validating the destination.
+      Allows pivoting to internal services, cloud metadata endpoints,
+      or other infrastructure not reachable from the public internet.
+    severity: high
+    applicable_globs:
+      - "**/*.rs"
+      - "**/*.py"
+      - "**/*.ts"
+      - "**/*.js"
+      - "**/*.go"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xa7-server-side-request-forgery/
+
+  - id: owasp-api-top10-2023:api8-security-misconfiguration
+    name: API8:2023 — Security Misconfiguration
+    description: |
+      The API or its supporting infrastructure is configured insecurely —
+      verbose error messages, open CORS policies, missing TLS, default
+      credentials, unnecessary HTTP methods enabled, or unpatched
+      dependencies in the stack.
+    severity: medium
+    applicable_globs:
+      - "**/*.toml"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - "**/*.json"
+      - "**/Dockerfile*"
+      - "**/config/**"
+      - "**/.env*"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xa8-security-misconfiguration/
+
+  - id: owasp-api-top10-2023:api9-improper-inventory-management
+    name: API9:2023 — Improper Inventory Management
+    description: |
+      Old API versions, undocumented endpoints, or debug endpoints
+      remain accessible in production. Attackers target these forgotten
+      surfaces which bypass current security controls or expose deprecated
+      functionality with known vulnerabilities.
+    severity: medium
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/routes/**"
+      - "**/api/**"
+      - "**/v1/**"
+      - "**/v2/**"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xa9-improper-inventory-management/
+
+  - id: owasp-api-top10-2023:api10-unsafe-consumption-of-apis
+    name: API10:2023 — Unsafe Consumption of APIs
+    description: |
+      The application trusts data received from third-party APIs without
+      adequate validation or sanitization. Compromised or malicious
+      upstream APIs can supply payloads that trigger injection, redirect,
+      or other attacks downstream in the consuming application.
+    severity: medium
+    applicable_globs:
+      - "**/*.rs"
+      - "**/*.py"
+      - "**/*.ts"
+      - "**/*.js"
+      - "**/*.go"
+    references:
+      - https://owasp.org/API-Security/editions/2023/en/0xaa-unsafe-consumption-of-apis/

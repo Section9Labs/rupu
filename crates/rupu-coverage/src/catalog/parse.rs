@@ -72,4 +72,24 @@ concerns: []
         let err = parse_template_str(bad, "bad.yaml").unwrap_err();
         assert!(matches!(err, ParseError::Yaml { .. }));
     }
+
+    #[test]
+    fn all_curated_templates_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/concerns");
+        let expected = [
+            "owasp-top10-2021.yaml",
+            "owasp-api-top10-2023.yaml",
+            "cwe-top25-2023.yaml",
+            "stride.yaml",
+            "secrets-in-source.yaml",
+            "code-smells.yaml",
+            "web-security-default.yaml",
+            "api-security-default.yaml",
+        ];
+        for filename in expected {
+            let path = dir.join(filename);
+            parse_template_file(&path)
+                .unwrap_or_else(|e| panic!("failed to parse {filename}: {e}"));
+        }
+    }
 }

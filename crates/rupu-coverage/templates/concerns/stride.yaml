@@ -1,0 +1,50 @@
+name: stride
+version: 1
+description: STRIDE threat modeling categories
+references:
+  - https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool-threats
+
+concerns:
+  - id: stride:spoofing
+    name: Spoofing — identity verification
+    description: |
+      Threats to authentication — fake identities, credential theft,
+      impersonation of users / services / tokens.
+    severity: high
+    applicable_globs: ["**/auth/**", "**/login/**", "**/middleware/**"]
+
+  - id: stride:tampering
+    name: Tampering — data integrity
+    description: |
+      Threats to data integrity in transit or at rest — modification of
+      messages, files, or stored state without authorization.
+    severity: high
+
+  - id: stride:repudiation
+    name: Repudiation — non-repudiation / audit
+    description: |
+      Threats arising from missing or insufficient logging — actions
+      cannot be later proven to have happened.
+    severity: medium
+
+  - id: stride:information-disclosure
+    name: Information Disclosure — confidentiality
+    description: |
+      Unauthorized exposure of data — error messages leaking internals,
+      sensitive data in logs, missing encryption.
+    severity: high
+
+  - id: stride:denial-of-service
+    name: Denial of Service — availability
+    description: |
+      Resource exhaustion, missing rate limits, unbounded recursion,
+      algorithmic-complexity attacks.
+    severity: medium
+
+  - id: stride:elevation-of-privilege
+    name: Elevation of Privilege — authorization
+    description: |
+      Privilege escalation — vertical (user → admin), horizontal
+      (user A → user B), or via missing authorization checks.
+    severity: critical
+    applicable_globs: ["**/auth/**", "**/middleware/**", "**/handlers/**"]

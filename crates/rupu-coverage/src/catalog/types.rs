@@ -55,6 +55,8 @@ pub struct Template {
     #[serde(default)]
     pub references: Vec<String>,
     pub concerns: Vec<Concern>,
+    #[serde(default)]
+    pub includes: Vec<String>,
 }
 
 fn default_template_version() -> u32 {

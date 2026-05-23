@@ -1,0 +1,8 @@
+name: api-security-default
+version: 1
+description: Sensible default for reviewing an API service
+concerns: []
+includes:
+  - owasp-api-top10-2023
+  - cwe-top25-2023
+  - secrets-in-source

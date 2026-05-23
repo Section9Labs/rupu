@@ -1,0 +1,100 @@
+name: code-smells
+version: 1
+description: Fowler-style code smells — design issues that suggest deeper problems
+references:
+  - https://martinfowler.com/bliki/CodeSmell.html
+
+concerns:
+  - id: code-smells:long-method
+    name: Long method
+    description: |
+      Functions / methods that exceed reasonable length (rough heuristic:
+      >100 lines or >40 lines of significant logic). Often a sign of
+      mixed responsibilities.
+    severity: low
+
+  - id: code-smells:god-object
+    name: God object
+    description: |
+      A class or module that has too many responsibilities — knows too
+      much, does too much. Brittle, hard to test.
+    severity: medium
+
+  - id: code-smells:feature-envy
+    name: Feature envy
+    description: |
+      A method that uses methods of another class more than its own —
+      suggests the method belongs in the other class.
+    severity: low
+
+  - id: code-smells:duplicated-code
+    name: Duplicated code
+    description: |
+      Same or similar code in multiple places — bug fixes have to be
+      applied in N places, drift over time.
+    severity: low
+
+  - id: code-smells:data-clumps
+    name: Data clumps
+    description: |
+      Groups of variables that always appear together — method parameters,
+      struct fields, or local variables that travel as a pack. Signals a
+      missing abstraction: these clumps deserve a named type or struct.
+    severity: medium
+
+  - id: code-smells:primitive-obsession
+    name: Primitive obsession
+    description: |
+      Domain concepts represented as raw primitives (strings, integers,
+      booleans) instead of dedicated types. Leads to scattered validation
+      logic and makes the type system unable to prevent misuse.
+    severity: low
+
+  - id: code-smells:switch-statements
+    name: Switch statements
+    description: |
+      Long switch or match expressions dispatching on a type tag or
+      variant. Often signals a missed opportunity for polymorphism; the
+      same discriminant tends to be repeated across the codebase.
+    severity: low
+
+  - id: code-smells:speculative-generality
+    name: Speculative generality
+    description: |
+      Abstractions, hooks, parameters, or extension points added for
+      hypothetical future requirements that have not materialized.
+      Increases complexity without providing current value.
+    severity: low
+
+  - id: code-smells:lazy-class
+    name: Lazy class
+    description: |
+      A class or module that does so little it does not justify its own
+      existence. Adds indirection and conceptual overhead without
+      delivering sufficient functionality to warrant the abstraction.
+    severity: low
+
+  - id: code-smells:large-class
+    name: Large class
+    description: |
+      A class with an excessive number of fields, methods, or lines of
+      code. Sibling of god-object; often the accumulation of incremental
+      growth that was never refactored into cohesive sub-components.
+    severity: medium
+
+  - id: code-smells:divergent-change
+    name: Divergent change
+    description: |
+      A single class is modified for many unrelated reasons — one class
+      changes whenever the persistence layer changes, whenever the
+      business rules change, and whenever the UI changes. Signals that
+      the class holds multiple concerns.
+    severity: medium
+
+  - id: code-smells:shotgun-surgery
+    name: Shotgun surgery
+    description: |
+      A single conceptual change requires small edits scattered across
+      many classes or modules. The inverse of divergent change; suggests
+      a concern is fragmented across the codebase rather than localized.
+    severity: medium
