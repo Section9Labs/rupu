@@ -209,6 +209,12 @@ pub struct AgentRunOpts {
     /// the catalog to the system prompt. `None` (default) disables all
     /// coverage harness machinery.
     pub concerns: Option<rupu_coverage::ConcernsBlock>,
+    /// Override the `scope_name` used when deriving the coverage `target_id`.
+    /// When `None` (default, standalone agent runs), falls back to `agent_name`.
+    /// Workflow runs set this to the workflow name so all steps accumulate
+    /// ledger entries under the same `target_id`, regardless of which agent
+    /// handled each step.
+    pub scope_name: Option<String>,
 }
 
 /// Outcome of a finished run.
@@ -248,7 +254,11 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         if let Some(block) = opts.concerns.clone() {
             let catalog = flatten(&block)
                 .map_err(|e| RunError::Coverage(format!("flatten coverage catalog: {e}")))?;
-            let target = target_id(&opts.workspace_path, &opts.agent_name);
+            let resolved_scope = opts
+                .scope_name
+                .as_deref()
+                .unwrap_or(&opts.agent_name);
+            let target = target_id(&opts.workspace_path, resolved_scope);
             let paths = CoveragePaths::new(&opts.workspace_path, &target);
             paths
                 .ensure_dir()
@@ -802,6 +812,7 @@ mod on_tool_call_tests {
             on_tool_call: Some(cb),
             on_stream_event: None,
             concerns: None,
+            scope_name: None,
         };
 
         run_agent(opts).await.expect("agent run succeeds");

@@ -77,6 +77,7 @@ impl StepFactory for FakeFactory {
             on_tool_call,
             on_stream_event: None,
             concerns: None,
+            scope_name: None,
         }
     }
 }

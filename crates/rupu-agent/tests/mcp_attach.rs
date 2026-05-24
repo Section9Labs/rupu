@@ -57,6 +57,7 @@ async fn mcp_registry_attaches_tools_to_run() {
         on_tool_call: None,
         on_stream_event: None,
         concerns: None,
+        scope_name: None,
     };
 
     run_agent(opts).await.unwrap();

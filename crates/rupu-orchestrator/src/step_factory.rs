@@ -202,7 +202,14 @@ impl StepFactory for DefaultStepFactory {
             step_id: step_id.to_string(),
             on_tool_call,
             on_stream_event: None,
-            concerns: spec.concerns,
+            // Workflow-level concerns take precedence over agent-level concerns.
+            // When the workflow declares `concerns:`, every step uses it —
+            // the agent frontmatter's `concerns:` is ignored for this run.
+            concerns: self.workflow.concerns.clone().or(spec.concerns),
+            // All steps of a workflow share the same target_id (keyed on the
+            // workflow name) so ledger entries accumulate per-workflow, not
+            // per-step-agent.
+            scope_name: Some(self.workflow.name.clone()),
         }
     }
 }

@@ -6292,6 +6292,7 @@ dependencies = [
  "predicates",
  "rupu-agent",
  "rupu-auth",
+ "rupu-coverage",
  "rupu-providers",
  "rupu-runtime",
  "rupu-scm",

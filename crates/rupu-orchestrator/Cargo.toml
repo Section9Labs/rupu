@@ -27,6 +27,7 @@ futures-util.workspace = true
 notify = { workspace = true, default-features = false, features = ["macos_kqueue"] }
 
 # In-workspace
+rupu-coverage = { path = "../rupu-coverage" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-providers = { path = "../rupu-providers" }

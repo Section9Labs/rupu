@@ -70,6 +70,7 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
         on_tool_call: None,
         on_stream_event: None,
         concerns: Some(stride_block()),
+        scope_name: None,
     };
 
     run_agent(opts).await.expect("agent run should succeed");
@@ -162,6 +163,7 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
         on_tool_call: None,
         on_stream_event: None,
         concerns: None,
+        scope_name: None,
     };
 
     run_agent(opts).await.expect("agent run should succeed");
@@ -226,6 +228,7 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
         on_tool_call: None,
         on_stream_event: None,
         concerns: Some(stride_block()),
+        scope_name: None,
     };
 
     run_agent(opts).await.expect("agent run should succeed");

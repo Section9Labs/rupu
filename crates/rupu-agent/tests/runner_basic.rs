@@ -50,6 +50,7 @@ async fn happy_path_one_turn_no_tools() {
         on_tool_call: None,
         on_stream_event: None,
         concerns: None,
+        scope_name: None,
     };
 
     let res = run_agent(opts).await.unwrap();

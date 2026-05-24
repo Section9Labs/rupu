@@ -210,6 +210,7 @@ impl StepFactory for ParallelFactory {
             on_tool_call: None,
             on_stream_event: None,
             concerns: None,
+            scope_name: None,
         }
     }
 }

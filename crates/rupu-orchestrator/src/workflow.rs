@@ -12,6 +12,7 @@
 //! gate-loop and fixer dispatch (see [`Panel`] and
 //! `runner::run_panel_step`).
 
+use rupu_coverage::ConcernsBlock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -639,6 +640,13 @@ pub struct Workflow {
     /// suddenly start writing to issue threads after upgrade.
     #[serde(default, rename = "notifyIssue")]
     pub notify_issue: bool,
+    /// Coverage catalog for this workflow run. When `Some`, every step
+    /// runs with this catalog, overriding any `concerns:` in the step's
+    /// agent frontmatter. The workflow is the single source of truth for
+    /// coverage concerns: all steps share the same `target_id` (derived
+    /// from the workflow name) so their ledger entries accumulate together.
+    #[serde(default)]
+    pub concerns: Option<ConcernsBlock>,
     pub steps: Vec<Step>,
 }
 
@@ -1152,5 +1160,42 @@ pub(crate) fn yaml_scalar_to_string(v: &serde_yaml::Value) -> String {
             .unwrap_or_default()
             .trim()
             .into(),
+    }
+}
+
+#[cfg(test)]
+mod workflow_concerns_tests {
+    use super::*;
+
+    #[test]
+    fn workflow_parses_concerns_block() {
+        let yaml = r#"
+name: test-workflow
+description: coverage test
+concerns:
+  - include: stride
+steps:
+  - id: step1
+    agent: ag
+    actions: []
+    prompt: "do the thing"
+"#;
+        let wf = Workflow::parse(yaml).expect("should parse");
+        let block = wf.concerns.expect("concerns should be Some");
+        assert_eq!(block.entries.len(), 1, "one concern entry");
+    }
+
+    #[test]
+    fn workflow_without_concerns_parses_as_none() {
+        let yaml = r#"
+name: no-concerns
+steps:
+  - id: s1
+    agent: ag
+    actions: []
+    prompt: "do it"
+"#;
+        let wf = Workflow::parse(yaml).expect("should parse");
+        assert!(wf.concerns.is_none(), "concerns should be None by default");
     }
 }

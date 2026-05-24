@@ -181,6 +181,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             on_tool_call: None,
             on_stream_event: None,
             concerns: spec.concerns.clone(),
+            scope_name: None,
         };
 
         let started = std::time::Instant::now();
