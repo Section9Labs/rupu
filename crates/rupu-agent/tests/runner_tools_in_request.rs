@@ -48,6 +48,9 @@ async fn run_passes_all_default_tools_to_provider() {
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: None,
+        concerns: None,
+        scope_name: None,
+        surface_tag: None,
     };
 
     run_agent(opts).await.unwrap();
@@ -135,6 +138,9 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: None,
+        concerns: None,
+        scope_name: None,
+        surface_tag: None,
     };
 
     run_agent(opts).await.unwrap();

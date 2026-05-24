@@ -5,11 +5,16 @@
 //! and `rupu-transcript`. The CLI (Plan 2 Phase 3) calls [`run_agent`]
 //! once per `rupu run` invocation.
 
+use crate::coverage_tools;
 use crate::mcp_tool::McpToolAdapter;
 use crate::permission::PermissionDecision;
 use crate::tool_registry::{default_tool_registry, ToolRegistry};
 use async_trait::async_trait;
 use chrono::Utc;
+use rupu_coverage::{
+    flatten, render_full_mode, target_id, write_snapshot, CoveragePaths, CoverageWriterHandle,
+    FlatCatalog,
+};
 use rupu_mcp::{McpPermission, ServeHandle};
 use rupu_providers::provider::LlmProvider;
 use rupu_providers::types::{
@@ -22,6 +27,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
+
+/// Coverage bundle built from a `concerns:` block. Holds catalog, paths,
+/// and prompt section for use across the run. The `CoverageWriterHandle`
+/// is stored separately so it can be consumed (shutdown) at each exit point.
+struct CoverageBundle {
+    catalog: FlatCatalog,
+    paths: CoveragePaths,
+    prompt_section: String,
+}
 
 const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 
@@ -72,6 +86,8 @@ pub enum RunError {
     NonTtyAskAbort,
     #[error("operator stopped run at turn {turn}")]
     OperatorStop { turn: u32 },
+    #[error("coverage setup: {0}")]
+    Coverage(String),
 }
 
 /// Pluggable permission decider. Three production impls + a `Bypass`
@@ -188,6 +204,22 @@ pub struct AgentRunOpts {
     /// provider is generating. Used by session attach to surface
     /// real-time usage/progress without changing transcript schema.
     pub on_stream_event: Option<OnStreamEventCallback>,
+    /// Coverage concerns block. When `Some`, the runner flattens the
+    /// catalog, writes a snapshot, injects coverage tools, and prepends
+    /// the catalog to the system prompt. `None` (default) disables all
+    /// coverage harness machinery.
+    pub concerns: Option<rupu_coverage::ConcernsBlock>,
+    /// Override the `scope_name` used when deriving the coverage `target_id`.
+    /// When `None` (default, standalone agent runs), falls back to `agent_name`.
+    /// Workflow runs set this to the workflow name so all steps accumulate
+    /// ledger entries under the same `target_id`, regardless of which agent
+    /// handled each step.
+    pub scope_name: Option<String>,
+    /// Override the surface tag written into coverage `FileTouchEvent`s.
+    /// When `None` (default), the runner falls back to `"agent"`.
+    /// The workflow step factory sets this to `"workflow"` so coverage events
+    /// from workflow runs are correctly attributed to the workflow surface.
+    pub surface_tag: Option<String>,
 }
 
 /// Outcome of a finished run.
@@ -219,6 +251,60 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         Some(list) => default_tool_registry().filter_to(list),
         None => default_tool_registry(),
     };
+
+    // Coverage harness: flatten catalog, write snapshot, spawn writer.
+    // The handle is kept separate so it can be consumed (shutdown) at each
+    // exit point, including early returns on provider/operator errors.
+    let (coverage, mut coverage_handle): (Option<CoverageBundle>, Option<CoverageWriterHandle>) =
+        if let Some(block) = opts.concerns.clone() {
+            let catalog = flatten(&block)
+                .map_err(|e| RunError::Coverage(format!("flatten coverage catalog: {e}")))?;
+            let resolved_scope = opts
+                .scope_name
+                .as_deref()
+                .unwrap_or(&opts.agent_name);
+            let target = target_id(&opts.workspace_path, resolved_scope);
+            let paths = CoveragePaths::new(&opts.workspace_path, &target);
+            paths
+                .ensure_dir()
+                .map_err(|e| RunError::Coverage(format!("ensure coverage dir: {e}")))?;
+            write_snapshot(&catalog, &paths.catalog)
+                .map_err(|e| RunError::Coverage(format!("write catalog snapshot: {e}")))?;
+            let handle = CoverageWriterHandle::spawn(paths.clone())
+                .map_err(|e| RunError::Coverage(format!("spawn coverage writer: {e}")))?;
+            let prompt_section = render_full_mode(&catalog);
+            let bundle = CoverageBundle {
+                catalog,
+                paths,
+                prompt_section,
+            };
+            (Some(bundle), Some(handle))
+        } else {
+            (None, None)
+        };
+
+    // Append catalog prompt section to system prompt when coverage is active.
+    if let Some(bundle) = &coverage {
+        opts.agent_system_prompt.push_str("\n\n");
+        opts.agent_system_prompt.push_str(&bundle.prompt_section);
+    }
+
+    // Wire coverage into tool context.
+    if let Some(h) = &coverage_handle {
+        opts.tool_context.coverage_writer = Some(h.writer.clone());
+        opts.tool_context.surface_tag = Some(
+            opts.surface_tag
+                .clone()
+                .unwrap_or_else(|| "agent".to_string()),
+        );
+        opts.tool_context.run_id = Some(opts.run_id.clone());
+        opts.tool_context.model = Some(opts.model.clone());
+    }
+
+    // Register coverage tools when coverage is enabled.
+    if let Some(bundle) = &coverage {
+        coverage_tools::register(&mut registry, bundle.catalog.clone(), bundle.paths.clone());
+    }
 
     // MCP server: spin up before the loop if we have a Registry.
     let mcp_guard: Option<(rupu_mcp::InProcessTransport, ServeHandle)> =
@@ -309,6 +395,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         error: Some(format!("provider: {e}")),
                     })?;
                     writer.flush()?;
+                    opts.tool_context.coverage_writer = None;
+                    if let Some(h) = coverage_handle.take() {
+                        h.shutdown().await;
+                    }
                     return Err(RunError::Provider(e.to_string()));
                 }
             }
@@ -347,6 +437,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         println!();
                     }
                     if let Some(err) = stream_transcript_error {
+                        opts.tool_context.coverage_writer = None;
+                        if let Some(h) = coverage_handle.take() {
+                            h.shutdown().await;
+                        }
                         return Err(RunError::Transcript(err));
                     }
                     r
@@ -360,6 +454,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         error: Some(format!("provider: {e}")),
                     })?;
                     writer.flush()?;
+                    opts.tool_context.coverage_writer = None;
+                    if let Some(h) = coverage_handle.take() {
+                        h.shutdown().await;
+                    }
                     return Err(RunError::Provider(e.to_string()));
                 }
             }
@@ -435,6 +533,10 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         error: Some("operator_stop".into()),
                     })?;
                     writer.flush()?;
+                    opts.tool_context.coverage_writer = None;
+                    if let Some(h) = coverage_handle.take() {
+                        h.shutdown().await;
+                    }
                     return Err(RunError::OperatorStop { turn: turn_idx });
                 }
                 PermissionDecision::AllowAlwaysForToolThisRun => {
@@ -566,6 +668,15 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     if let Some((transport, handle)) = mcp_guard {
         drop(transport);
         let _ = handle.join.await;
+    }
+
+    // Shutdown the coverage writer. Drop the ToolContext's Arc<CoverageWriter>
+    // clone BEFORE calling shutdown so the writer task's mpsc channel closes
+    // cleanly (shutdown drops the handle's Arc, but if ToolContext still holds
+    // a clone the task's recv() would never return None and task.await hangs).
+    opts.tool_context.coverage_writer = None;
+    if let Some(h) = coverage_handle {
+        h.shutdown().await;
     }
 
     Ok(RunResult {
@@ -709,6 +820,9 @@ mod on_tool_call_tests {
             step_id: "s1".into(),
             on_tool_call: Some(cb),
             on_stream_event: None,
+            concerns: None,
+            scope_name: None,
+            surface_tag: None,
         };
 
         run_agent(opts).await.expect("agent run succeeds");

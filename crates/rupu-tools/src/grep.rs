@@ -9,10 +9,14 @@
 //! matches (NOT an error), and 2+ on real failure. We treat 0 and 1
 //! as success; anything else surfaces stderr in `error`.
 
+use crate::coverage_emit::{attribution_from, emit};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
+use chrono::Utc;
+use rupu_coverage::FileTouchEvent;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::time::Instant;
 use tokio::process::Command;
@@ -94,6 +98,43 @@ impl Tool for GrepTool {
                 stderr
             }),
         };
+
+        // Emit one FileTouchEvent per matched file on success paths.
+        // rg output format with --with-filename --line-number --no-heading:
+        //   /abs/path/to/file.rs:42:matched content here
+        if error.is_none() {
+            let mut by_file: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+            for line in stdout.lines() {
+                // Split into at most 3 parts: path, linenum, content
+                let mut parts = line.splitn(3, ':');
+                let raw_path = parts.next().unwrap_or("");
+                let linenum_str = parts.next().unwrap_or("");
+                if let Ok(linenum) = linenum_str.parse::<u32>() {
+                    // Make the path workspace-relative if possible.
+                    let rel_path = std::path::Path::new(raw_path)
+                        .strip_prefix(&ctx.workspace_path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| raw_path.to_string());
+                    by_file.entry(rel_path).or_default().push(linenum);
+                }
+            }
+            for (path, matched_lines) in by_file {
+                let match_count = matched_lines.len() as u32;
+                emit(
+                    ctx,
+                    FileTouchEvent::Grep {
+                        path,
+                        pattern: i.pattern.clone(),
+                        match_count,
+                        matched_lines,
+                        tool: "grep".to_string(),
+                        attribution: attribution_from(ctx),
+                        at: Utc::now(),
+                    },
+                )
+                .await;
+            }
+        }
 
         Ok(ToolOutput {
             stdout,

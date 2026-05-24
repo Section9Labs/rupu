@@ -1,0 +1,359 @@
+name: cwe-top25-2023
+version: 1
+description: 2023 CWE Top 25 Most Dangerous Software Weaknesses
+references:
+  - https://cwe.mitre.org/top25/archive/2023/2023_top25_list.html
+
+concerns:
+  - id: cwe-top25-2023:cwe-787-out-of-bounds-write
+    name: CWE-787 — Out-of-bounds Write (rank #1)
+    description: |
+      Code writes data past the end, or before the beginning, of the
+      intended buffer. Memory-safety bug; common in C/C++ unsafe code
+      and Rust `unsafe` blocks.
+    severity: critical
+    applicable_globs:
+      - "**/*.c"
+      - "**/*.cpp"
+      - "**/*.h"
+      - "**/*.hpp"
+      - "**/*.rs"     # only `unsafe` blocks matter here
+    references:
+      - https://cwe.mitre.org/data/definitions/787.html
+
+  - id: cwe-top25-2023:cwe-79-xss
+    name: CWE-79 — Cross-site Scripting (rank #2)
+    description: |
+      Code includes user-controllable input in HTML/JS output without
+      proper escaping or sanitization, enabling injection of script
+      executed in other users' browsers.
+    severity: high
+    applicable_globs:
+      - "**/*.html"
+      - "**/*.tsx"
+      - "**/*.jsx"
+      - "**/templates/**"
+      - "**/views/**"
+    references:
+      - https://cwe.mitre.org/data/definitions/79.html
+
+  - id: cwe-top25-2023:cwe-89-sql-injection
+    name: CWE-89 — SQL Injection (rank #3)
+    description: |
+      Unsanitized user input flows into SQL query construction.
+      Overlaps with owasp-top10-2021:a03-injection but is included
+      separately so CWE-anchored catalogs are self-contained.
+    severity: high
+    applicable_globs: ["**/*.rs", "**/*.sql", "**/*.py", "**/*.ts", "**/*.js"]
+    references:
+      - https://cwe.mitre.org/data/definitions/89.html
+
+  - id: cwe-top25-2023:cwe-416-use-after-free
+    name: CWE-416 — Use After Free (rank #4)
+    description: |
+      Referencing memory after it has been freed. Memory-safety bug;
+      relevant in C/C++ and Rust `unsafe`.
+    severity: critical
+    applicable_globs:
+      - "**/*.c"
+      - "**/*.cpp"
+      - "**/*.rs"
+    references:
+      - https://cwe.mitre.org/data/definitions/416.html
+
+  - id: cwe-top25-2023:cwe-78-os-command-injection
+    name: CWE-78 — OS Command Injection (rank #5)
+    description: |
+      User input flows into a shell command without proper escaping —
+      enables arbitrary command execution.
+    severity: critical
+    applicable_globs: ["**/*.rs", "**/*.py", "**/*.ts", "**/*.js", "**/*.go", "**/*.sh"]
+    references:
+      - https://cwe.mitre.org/data/definitions/78.html
+
+  - id: cwe-top25-2023:cwe-20-improper-input-validation
+    name: CWE-20 — Improper Input Validation (rank #6)
+    description: |
+      The product does not validate or incorrectly validates input that
+      can affect control flow or data integrity. Failing to validate
+      input allows attackers to supply unexpected data that triggers
+      downstream errors, injections, or logic bypasses.
+    severity: high
+    applicable_globs: ["**/*.rs", "**/*.py", "**/*.ts", "**/*.js", "**/*.go"]
+    references:
+      - https://cwe.mitre.org/data/definitions/20.html
+
+  - id: cwe-top25-2023:cwe-125-out-of-bounds-read
+    name: CWE-125 — Out-of-bounds Read (rank #7)
+    description: |
+      Code reads data beyond the end of an allocated buffer. Can expose
+      sensitive memory contents or cause crashes. Memory-safety bug
+      primarily affecting C/C++ and Rust `unsafe` code.
+    severity: critical
+    applicable_globs:
+      - "**/*.c"
+      - "**/*.cpp"
+      - "**/*.h"
+      - "**/*.hpp"
+      - "**/*.rs"
+    references:
+      - https://cwe.mitre.org/data/definitions/125.html
+
+  - id: cwe-top25-2023:cwe-22-path-traversal
+    name: CWE-22 — Path Traversal (rank #8)
+    description: |
+      User-controlled input contains path-traversal sequences (e.g. `../`)
+      that resolve to files outside the intended directory. Allows
+      reading or writing arbitrary files on the server.
+    severity: high
+    applicable_globs: ["**/*.rs", "**/*.py", "**/*.ts", "**/*.js", "**/*.go"]
+    references:
+      - https://cwe.mitre.org/data/definitions/22.html
+
+  - id: cwe-top25-2023:cwe-352-csrf
+    name: CWE-352 — Cross-Site Request Forgery (rank #9)
+    description: |
+      A web application does not verify that a state-changing request
+      was intentionally submitted by the authenticated user. An attacker
+      tricks the user's browser into issuing requests on their behalf.
+    severity: high
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/middleware/**"
+      - "**/routes/**"
+      - "**/controllers/**"
+    references:
+      - https://cwe.mitre.org/data/definitions/352.html
+
+  - id: cwe-top25-2023:cwe-434-unrestricted-file-upload
+    name: CWE-434 — Unrestricted Upload of File with Dangerous Type (rank #10)
+    description: |
+      The application allows users to upload files without adequately
+      restricting type, name, or content. Attackers can upload executable
+      files, overwrite existing files, or exploit server-side processing.
+    severity: high
+    applicable_globs:
+      - "**/upload/**"
+      - "**/handlers/**"
+      - "**/controllers/**"
+    references:
+      - https://cwe.mitre.org/data/definitions/434.html
+
+  - id: cwe-top25-2023:cwe-862-missing-authorization
+    name: CWE-862 — Missing Authorization (rank #11)
+    description: |
+      The application does not perform an authorization check when an
+      actor attempts to access a resource or perform an action. Any
+      authenticated or unauthenticated user can reach protected endpoints.
+    severity: high
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/routes/**"
+      - "**/controllers/**"
+      - "**/middleware/**"
+    references:
+      - https://cwe.mitre.org/data/definitions/862.html
+
+  - id: cwe-top25-2023:cwe-476-null-pointer-dereference
+    name: CWE-476 — NULL Pointer Dereference (rank #12)
+    description: |
+      Code dereferences a pointer that it expects to be valid but is
+      null, causing a crash. Common in C/C++; guarded by Rust's type
+      system in safe code but can appear in `unsafe` blocks or FFI.
+    severity: medium
+    applicable_globs:
+      - "**/*.c"
+      - "**/*.cpp"
+      - "**/*.rs"
+    references:
+      - https://cwe.mitre.org/data/definitions/476.html
+
+  - id: cwe-top25-2023:cwe-287-improper-authentication
+    name: CWE-287 — Improper Authentication (rank #13)
+    description: |
+      The system does not sufficiently verify that a claimed identity is
+      correct. Covers missing authentication, weak credential checks, and
+      authentication that can be bypassed via request manipulation.
+    severity: high
+    applicable_globs:
+      - "**/auth/**"
+      - "**/login/**"
+      - "**/middleware/**"
+      - "**/session/**"
+    references:
+      - https://cwe.mitre.org/data/definitions/287.html
+
+  - id: cwe-top25-2023:cwe-190-integer-overflow
+    name: CWE-190 — Integer Overflow or Wraparound (rank #14)
+    description: |
+      An integer calculation produces a value that overflows the type's
+      range, silently wrapping to an unexpected value. Often exploited
+      to bypass length checks and trigger out-of-bounds memory access.
+    severity: medium
+    applicable_globs: ["**/*.rs", "**/*.py", "**/*.ts", "**/*.js", "**/*.go"]
+    references:
+      - https://cwe.mitre.org/data/definitions/190.html
+
+  - id: cwe-top25-2023:cwe-502-deserialization-of-untrusted-data
+    name: CWE-502 — Deserialization of Untrusted Data (rank #15)
+    description: |
+      The application deserializes data from an untrusted source without
+      sufficient validation. Attackers can craft malicious payloads that
+      trigger code execution, privilege escalation, or denial of service
+      during the deserialization process.
+    severity: critical
+    applicable_globs:
+      - "**/*.rs"
+      - "**/*.py"
+      - "**/*.ts"
+      - "**/*.js"
+      - "**/*.go"
+    references:
+      - https://cwe.mitre.org/data/definitions/502.html
+
+  - id: cwe-top25-2023:cwe-77-command-injection
+    name: CWE-77 — Improper Neutralization of Special Elements in a Command (rank #16)
+    description: |
+      User-controlled input is incorporated into a command executed by
+      the application without proper neutralization. This is the parent
+      of OS command injection (CWE-78) and covers all interpreter types
+      including shell, SQL, and scripting engines.
+    severity: critical
+    applicable_globs: ["**/*.rs", "**/*.py", "**/*.ts", "**/*.js", "**/*.go", "**/*.sh"]
+    references:
+      - https://cwe.mitre.org/data/definitions/77.html
+
+  - id: cwe-top25-2023:cwe-119-improper-restriction-of-memory-buffer-operations
+    name: CWE-119 — Improper Restriction of Operations within Memory Buffer Bounds (rank #17)
+    description: |
+      The software performs operations on a memory buffer but does not
+      correctly restrict the range of those operations, leading to reads
+      or writes outside the buffer. This is the parent class for CWE-787
+      (out-of-bounds write) and CWE-125 (out-of-bounds read).
+    severity: critical
+    applicable_globs:
+      - "**/*.c"
+      - "**/*.cpp"
+      - "**/*.h"
+      - "**/*.hpp"
+      - "**/*.rs"
+    references:
+      - https://cwe.mitre.org/data/definitions/119.html
+
+  - id: cwe-top25-2023:cwe-798-hardcoded-credentials
+    name: CWE-798 — Use of Hard-coded Credentials (rank #18)
+    description: |
+      The software contains hard-coded credentials such as passwords,
+      API keys, or cryptographic keys. These credentials are accessible
+      to anyone with access to the source or binary and cannot be rotated
+      without a code change.
+    severity: high
+    applicable_globs:
+      - "**/*.rs"
+      - "**/*.py"
+      - "**/*.ts"
+      - "**/*.js"
+      - "**/*.go"
+      - "**/*.toml"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - "**/*.json"
+      - "**/.env*"
+    references:
+      - https://cwe.mitre.org/data/definitions/798.html
+
+  - id: cwe-top25-2023:cwe-918-ssrf
+    name: CWE-918 — Server-Side Request Forgery (rank #19)
+    description: |
+      The server fetches a URL based on user-supplied input without
+      validating or restricting the destination. Attackers can pivot to
+      internal services, cloud metadata endpoints, and intranet resources
+      not accessible from the public internet.
+    severity: high
+    applicable_globs: ["**/*.rs", "**/*.py", "**/*.ts", "**/*.js", "**/*.go"]
+    references:
+      - https://cwe.mitre.org/data/definitions/918.html
+
+  - id: cwe-top25-2023:cwe-306-missing-authentication-for-critical-function
+    name: CWE-306 — Missing Authentication for Critical Function (rank #20)
+    description: |
+      The software does not perform authentication for functionality
+      that requires a proven user identity or sufficient privileges.
+      Administrative or sensitive operations are exposed without any
+      credential check.
+    severity: high
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/routes/**"
+      - "**/controllers/**"
+      - "**/admin/**"
+    references:
+      - https://cwe.mitre.org/data/definitions/306.html
+
+  - id: cwe-top25-2023:cwe-362-race-condition
+    name: CWE-362 — Concurrent Execution using Shared Resource with Improper Synchronization (rank #21)
+    description: |
+      The code accesses a shared resource in a way that allows multiple
+      concurrent threads or processes to interfere with each other.
+      Race conditions can lead to data corruption, privilege escalation,
+      or denial of service.
+    severity: medium
+    applicable_globs: ["**/*.rs", "**/*.py", "**/*.ts", "**/*.js", "**/*.go"]
+    references:
+      - https://cwe.mitre.org/data/definitions/362.html
+
+  - id: cwe-top25-2023:cwe-269-improper-privilege-management
+    name: CWE-269 — Improper Privilege Management (rank #22)
+    description: |
+      The software does not properly assign, modify, track, or check
+      privileges for an actor. This includes excessive privilege grants,
+      failure to drop privileges after use, or incorrect privilege
+      inheritance.
+    severity: high
+    applicable_globs:
+      - "**/auth/**"
+      - "**/middleware/**"
+      - "**/handlers/**"
+      - "**/admin/**"
+    references:
+      - https://cwe.mitre.org/data/definitions/269.html
+
+  - id: cwe-top25-2023:cwe-94-code-injection
+    name: CWE-94 — Improper Control of Generation of Code (rank #23)
+    description: |
+      User-controlled input is incorporated into code that is later
+      interpreted or executed by the application. Enables attackers to
+      inject arbitrary code including through eval, template engines,
+      or dynamic code generation.
+    severity: high
+    applicable_globs: ["**/*.rs", "**/*.py", "**/*.ts", "**/*.js", "**/*.go"]
+    references:
+      - https://cwe.mitre.org/data/definitions/94.html
+
+  - id: cwe-top25-2023:cwe-863-incorrect-authorization
+    name: CWE-863 — Incorrect Authorization (rank #24)
+    description: |
+      The software performs an authorization check but the check is
+      flawed — it checks the wrong attribute, uses the wrong comparison,
+      or can be bypassed through parameter manipulation. The check exists
+      but does not correctly enforce the intended access policy.
+    severity: high
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/routes/**"
+      - "**/controllers/**"
+      - "**/middleware/**"
+    references:
+      - https://cwe.mitre.org/data/definitions/863.html
+
+  - id: cwe-top25-2023:cwe-276-incorrect-default-permissions
+    name: CWE-276 — Incorrect Default Permissions (rank #25)
+    description: |
+      The software installs or creates a resource with permissions that
+      are more permissive than intended by default. Files, directories,
+      or other resources become accessible to unintended actors because
+      restrictive permissions were not explicitly set.
+    severity: medium
+    applicable_globs: ["**/*.rs", "**/*.py", "**/*.ts", "**/*.js", "**/*.go"]
+    references:
+      - https://cwe.mitre.org/data/definitions/276.html

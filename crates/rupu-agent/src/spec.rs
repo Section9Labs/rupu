@@ -6,6 +6,7 @@
 //! `maxTurns`, `permissionMode`). Unknown fields are rejected at parse
 //! time so typos like `permision_mode` surface as errors.
 
+use rupu_coverage::ConcernsBlock;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::types::{ContextManagement, OutputFormat, Speed};
 use rupu_providers::AuthMode;
@@ -99,6 +100,12 @@ struct Frontmatter {
     /// `docs/superpowers/specs/2026-05-08-rupu-sub-agent-dispatch-design.md`.
     #[serde(default, rename = "dispatchableAgents")]
     dispatchable_agents: Option<Vec<String>>,
+    /// Coverage concerns block. When present, the runner flattens the
+    /// catalog, writes a snapshot to `.rupu/coverage/<target>/catalog.yaml`,
+    /// injects the 4 coverage tools, and prepends the catalog to the
+    /// system prompt.
+    #[serde(default)]
+    concerns: Option<ConcernsBlock>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -122,6 +129,8 @@ pub struct AgentSpec {
     /// Per-agent allowlist of children this agent can dispatch via
     /// `dispatch_agent` / `dispatch_agents_parallel`.
     pub dispatchable_agents: Option<Vec<String>>,
+    /// Coverage concerns block parsed from `concerns:` frontmatter.
+    pub concerns: Option<ConcernsBlock>,
     pub system_prompt: String,
 }
 
@@ -160,6 +169,7 @@ impl AgentSpec {
             anthropic_context_management: fm.anthropic_context_management,
             anthropic_speed: fm.anthropic_speed,
             dispatchable_agents: fm.dispatchable_agents,
+            concerns: fm.concerns,
             system_prompt: body.to_string(),
         })
     }

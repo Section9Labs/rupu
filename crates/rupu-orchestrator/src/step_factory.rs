@@ -98,6 +98,7 @@ impl StepFactory for DefaultStepFactory {
                         anthropic_context_management: None,
                         anthropic_speed: None,
                         dispatchable_agents: None,
+                        concerns: None,
                         system_prompt: rendered_prompt.clone(),
                     }
                 });
@@ -170,6 +171,10 @@ impl StepFactory for DefaultStepFactory {
                 dispatchable_agents: spec.dispatchable_agents.clone(),
                 parent_run_id: parent_run_id_for_tool_ctx,
                 depth: 0,
+                coverage_writer: None,
+                surface_tag: None,
+                run_id: None,
+                model: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -197,6 +202,18 @@ impl StepFactory for DefaultStepFactory {
             step_id: step_id.to_string(),
             on_tool_call,
             on_stream_event: None,
+            // Workflow-level concerns take precedence over agent-level concerns.
+            // When the workflow declares `concerns:`, every step uses it —
+            // the agent frontmatter's `concerns:` is ignored for this run.
+            concerns: self.workflow.concerns.clone().or(spec.concerns),
+            // All steps of a workflow share the same target_id (keyed on the
+            // workflow name) so ledger entries accumulate per-workflow, not
+            // per-step-agent.
+            scope_name: Some(self.workflow.name.clone()),
+            // Workflow steps must report as "workflow" surface so coverage
+            // FileTouchEvents are correctly attributed; the runner defaults
+            // to "agent" when this is None.
+            surface_tag: Some("workflow".to_string()),
         }
     }
 }

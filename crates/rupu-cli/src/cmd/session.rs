@@ -5804,6 +5804,10 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         dispatchable_agents: session.dispatchable_agents.clone(),
         parent_run_id: None,
         depth: 0,
+        coverage_writer: None,
+        surface_tag: None,
+        run_id: None,
+        model: None,
     };
 
     let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
@@ -5872,6 +5876,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: Some(on_stream_event),
+        concerns: None,
+        scope_name: None,
+        surface_tag: None,
     };
 
     let outcome = rupu_agent::run_agent(opts).await;

@@ -6078,6 +6078,7 @@ dependencies = [
  "pty-process",
  "rupu-auth",
  "rupu-config",
+ "rupu-coverage",
  "rupu-mcp",
  "rupu-providers",
  "rupu-scm",
@@ -6230,6 +6231,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-coverage"
+version = "0.7.0"
+dependencies = [
+ "chrono",
+ "glob",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "ulid",
+]
+
+[[package]]
 name = "rupu-keychain-acl"
 version = "0.7.0"
 dependencies = [
@@ -6274,6 +6292,7 @@ dependencies = [
  "predicates",
  "rupu-agent",
  "rupu-auth",
+ "rupu-coverage",
  "rupu-providers",
  "rupu-runtime",
  "rupu-scm",
@@ -6369,8 +6388,10 @@ version = "0.7.0"
 dependencies = [
  "assert_fs",
  "async-trait",
+ "chrono",
  "globwalk",
  "predicates",
+ "rupu-coverage",
  "serde",
  "serde_json",
  "tempfile",

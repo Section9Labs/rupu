@@ -9,9 +9,12 @@
 //! workspace")` on the ToolOutput. The tool itself returns `Ok(...)` —
 //! the agent sees the error and decides what to do.
 
+use crate::coverage_emit::{attribution_from, emit};
 use crate::path_scope::is_inside;
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
+use chrono::Utc;
+use rupu_coverage::FileTouchEvent;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Instant;
@@ -62,11 +65,24 @@ impl Tool for ReadFileTool {
         }
         match std::fs::read_to_string(&abs) {
             Ok(text) => {
+                let line_count = text.lines().count() as u32;
                 let mut out = String::with_capacity(text.len() + 64);
                 for (idx, line) in text.lines().enumerate() {
                     use std::fmt::Write;
                     writeln!(out, "{}\t{}", idx + 1, line).expect("write to String never fails");
                 }
+                let end_line = if line_count == 0 { 1 } else { line_count };
+                emit(
+                    ctx,
+                    FileTouchEvent::Read {
+                        path: i.path.clone(),
+                        line_range: [1, end_line],
+                        tool: "read_file".to_string(),
+                        attribution: attribution_from(ctx),
+                        at: Utc::now(),
+                    },
+                )
+                .await;
                 Ok(ToolOutput {
                     stdout: out,
                     error: None,

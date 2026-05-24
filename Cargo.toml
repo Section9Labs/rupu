@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rupu-app-canvas",
     "crates/rupu-app",
+    "crates/rupu-coverage",
     "crates/rupu-transcript",
     "crates/rupu-runtime",
     "crates/rupu-config",
@@ -70,6 +71,7 @@ http = "1"
 ed25519-dalek = { version = "2", features = ["serde", "rand_core", "zeroize"] }
 base64 = "0.22"
 lru = "0.12"
+glob = "0.3"
 
 # CLI / templating (used in Plan 2 but pinned now for cohesion)
 clap = { version = "4", features = ["derive"] }

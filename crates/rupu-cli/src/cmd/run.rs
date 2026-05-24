@@ -261,6 +261,10 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         dispatchable_agents: spec.dispatchable_agents.clone(),
         parent_run_id: None,
         depth: 0,
+        coverage_writer: None,
+        surface_tag: None,
+        run_id: None,
+        model: None,
     };
 
     let mode_str = match mode {
@@ -344,6 +348,9 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: None,
+        concerns: spec.concerns.clone(),
+        scope_name: None,
+        surface_tag: None,
     };
 
     // Spawn the agent in a background task and tail the transcript with

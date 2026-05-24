@@ -70,6 +70,9 @@ impl StepFactory for FakeFactory {
             step_id: step_id.to_string(),
             on_tool_call,
             on_stream_event: None,
+            concerns: None,
+            scope_name: None,
+            surface_tag: None,
         }
     }
 }

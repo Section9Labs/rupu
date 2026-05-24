@@ -1,0 +1,151 @@
+name: owasp-top10-2021
+version: 1
+description: OWASP Top 10 web application security risks (2021 edition)
+references:
+  - https://owasp.org/Top10/
+
+concerns:
+  - id: owasp-top10-2021:a01-broken-access-control
+    name: A01:2021 — Broken Access Control
+    description: |
+      Restrictions on what authenticated users are allowed to do are
+      not enforced — vertical and horizontal privilege escalation,
+      missing function-level authorization, CORS misconfiguration,
+      forced browsing of authenticated pages as anonymous, IDOR.
+    severity: critical
+    applicable_globs:
+      - "**/handlers/**"
+      - "**/controllers/**"
+      - "**/middleware/**"
+      - "**/routes/**"
+      - "**/api/**"
+    references:
+      - https://owasp.org/Top10/A01_2021-Broken_Access_Control/
+
+  - id: owasp-top10-2021:a02-cryptographic-failures
+    name: A02:2021 — Cryptographic Failures
+    description: |
+      Failures related to cryptography, often leading to sensitive data
+      exposure — weak algorithms (MD5, SHA-1, DES), hardcoded keys,
+      missing TLS, predictable randomness for security-sensitive use.
+    severity: high
+    applicable_globs: ["**"]
+    references:
+      - https://owasp.org/Top10/A02_2021-Cryptographic_Failures/
+
+  - id: owasp-top10-2021:a03-injection
+    name: A03:2021 — Injection
+    description: |
+      User-controllable data interpolated into interpreters without
+      parameterization or escaping — SQL, NoSQL, OS command, LDAP, XPath,
+      ORM expression injection.
+    severity: high
+    applicable_globs: ["**/*.rs", "**/*.sql", "**/*.py", "**/*.ts", "**/*.js"]
+    references:
+      - https://owasp.org/Top10/A03_2021-Injection/
+      - https://cwe.mitre.org/data/definitions/89.html
+
+  - id: owasp-top10-2021:a04-insecure-design
+    name: A04:2021 — Insecure Design
+    description: |
+      Missing or ineffective control design — absent rate limiting,
+      missing threat modeling, business logic flaws, insecure trust
+      boundaries.
+    severity: medium
+    applicable_globs: ["**"]
+    references:
+      - https://owasp.org/Top10/A04_2021-Insecure_Design/
+
+  - id: owasp-top10-2021:a05-security-misconfiguration
+    name: A05:2021 — Security Misconfiguration
+    description: |
+      Insecure default configurations, incomplete configurations,
+      verbose error messages exposing internals, unnecessary features
+      enabled, missing security headers, outdated dependencies.
+    severity: medium
+    applicable_globs:
+      - "**/*.toml"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - "**/Dockerfile*"
+      - "**/docker-compose*.yml"
+      - "**/config/**"
+      - "**/*.env*"
+    references:
+      - https://owasp.org/Top10/A05_2021-Security_Misconfiguration/
+
+  - id: owasp-top10-2021:a06-vulnerable-components
+    name: A06:2021 — Vulnerable and Outdated Components
+    description: |
+      Dependencies with known vulnerabilities, end-of-life components,
+      unmaintained transitive dependencies.
+    severity: medium
+    applicable_globs:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/go.mod"
+      - "**/go.sum"
+      - "**/requirements*.txt"
+      - "**/poetry.lock"
+      - "**/Pipfile*"
+    references:
+      - https://owasp.org/Top10/A06_2021-Vulnerable_and_Outdated_Components/
+
+  - id: owasp-top10-2021:a07-identification-and-authentication-failures
+    name: A07:2021 — Identification and Authentication Failures
+    description: |
+      Weak credential management, missing or weak MFA, predictable
+      session identifiers, missing brute-force protection, plaintext or
+      reversible password storage.
+    severity: high
+    applicable_globs:
+      - "**/auth/**"
+      - "**/login/**"
+      - "**/session/**"
+      - "**/middleware/**"
+    references:
+      - https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/
+
+  - id: owasp-top10-2021:a08-software-and-data-integrity-failures
+    name: A08:2021 — Software and Data Integrity Failures
+    description: |
+      Insecure deserialization, missing integrity verification on
+      software updates and CI/CD artifacts, unsigned dependencies.
+    severity: medium
+    applicable_globs:
+      - "**/*.rs"
+      - "**/*.py"
+      - "**/*.ts"
+      - "**/*.js"
+      - "**/.github/workflows/**"
+    references:
+      - https://owasp.org/Top10/A08_2021-Software_and_Data_Integrity_Failures/
+
+  - id: owasp-top10-2021:a09-security-logging-and-monitoring-failures
+    name: A09:2021 — Security Logging and Monitoring Failures
+    description: |
+      Missing audit logs for security-relevant events, logs lacking
+      sufficient context, plaintext sensitive data in logs, no alerting.
+    severity: medium
+    applicable_globs: ["**"]
+    references:
+      - https://owasp.org/Top10/A09_2021-Security_Logging_and_Monitoring_Failures/
+
+  - id: owasp-top10-2021:a10-ssrf
+    name: A10:2021 — Server-Side Request Forgery (SSRF)
+    description: |
+      Code fetches a URL based on user input without validating the
+      destination — allows requests to internal services, cloud metadata
+      endpoints (169.254.169.254), and SSRF-amplified attacks.
+    severity: high
+    applicable_globs:
+      - "**/*.rs"
+      - "**/*.py"
+      - "**/*.ts"
+      - "**/*.js"
+      - "**/*.go"
+    references:
+      - https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
+      - https://cwe.mitre.org/data/definitions/918.html

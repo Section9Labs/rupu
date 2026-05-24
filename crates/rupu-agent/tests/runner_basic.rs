@@ -49,6 +49,9 @@ async fn happy_path_one_turn_no_tools() {
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: None,
+        concerns: None,
+        scope_name: None,
+        surface_tag: None,
     };
 
     let res = run_agent(opts).await.unwrap();

@@ -81,6 +81,9 @@ impl StepFactory for FakeFactory {
             step_id: step_id.to_string(),
             on_tool_call,
             on_stream_event: None,
+            concerns: None,
+            scope_name: None,
+            surface_tag: None,
         }
     }
 }
@@ -447,6 +450,9 @@ impl StepFactory for FailingFactory {
             step_id: step_id.to_string(),
             on_tool_call,
             on_stream_event: None,
+            concerns: None,
+            scope_name: None,
+            surface_tag: None,
         }
     }
 }
@@ -1184,6 +1190,9 @@ impl StepFactory for PanelFactory {
             step_id: step_id.to_string(),
             on_tool_call,
             on_stream_event: None,
+            concerns: None,
+            scope_name: None,
+            surface_tag: None,
         }
     }
 }
@@ -1424,6 +1433,9 @@ impl StepFactory for LoopingPanelFactory {
             step_id: step_id.to_string(),
             on_tool_call,
             on_stream_event: None,
+            concerns: None,
+            scope_name: None,
+            surface_tag: None,
         }
     }
 }

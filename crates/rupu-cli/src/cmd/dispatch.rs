@@ -138,6 +138,10 @@ impl AgentDispatcher for CliAgentDispatcher {
             dispatchable_agents: spec.dispatchable_agents.clone(),
             parent_run_id: Some(sub_run_id.clone()),
             depth: child_depth,
+            coverage_writer: None,
+            surface_tag: None,
+            run_id: None,
+            model: None,
         };
 
         let opts = AgentRunOpts {
@@ -176,6 +180,9 @@ impl AgentDispatcher for CliAgentDispatcher {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: None,
+            concerns: spec.concerns.clone(),
+            scope_name: None,
+            surface_tag: None,
         };
 
         let started = std::time::Instant::now();

@@ -185,6 +185,10 @@ impl StepFactory for ParallelFactory {
                 dispatchable_agents: Some(vec!["security-reviewer".into(), "perf-reviewer".into()]),
                 parent_run_id: parent_run_id_for_ctx,
                 depth: 0,
+                coverage_writer: None,
+                surface_tag: None,
+                run_id: None,
+                model: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),
@@ -205,6 +209,9 @@ impl StepFactory for ParallelFactory {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: None,
+            concerns: None,
+            scope_name: None,
+            surface_tag: None,
         }
     }
 }

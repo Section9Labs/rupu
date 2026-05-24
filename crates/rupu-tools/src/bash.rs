@@ -16,8 +16,11 @@
 //! (Ok(ToolOutput { error: None, ... })) and the agent sees the exit
 //! code via the `CommandRun` derived event.
 
+use crate::coverage_emit::{attribution_from, emit};
 use crate::tool::{DerivedEvent, Tool, ToolContext, ToolError, ToolOutput};
 use async_trait::async_trait;
+use chrono::Utc;
+use rupu_coverage::FileTouchEvent;
 use serde::Deserialize;
 use serde_json::Value;
 use std::process::Stdio;
@@ -100,6 +103,29 @@ impl Tool for BashTool {
                 } else {
                     format!("{stdout}\n[stderr]\n{stderr}")
                 };
+
+                // Emit Cmd events for tokens that look like existing file paths.
+                // Skip flag tokens (starting with '-') and the shell invocation itself.
+                for token in i.command.split_whitespace() {
+                    if token.starts_with('-') {
+                        continue;
+                    }
+                    let candidate = ctx.workspace_path.join(token);
+                    if candidate.is_file() {
+                        emit(
+                            ctx,
+                            FileTouchEvent::Cmd {
+                                path: token.to_string(),
+                                command: i.command.clone(),
+                                tool: "bash".to_string(),
+                                attribution: attribution_from(ctx),
+                                at: Utc::now(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+
                 Ok(ToolOutput {
                     stdout: combined,
                     error: None,
