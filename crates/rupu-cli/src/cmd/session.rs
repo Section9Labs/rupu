@@ -5878,6 +5878,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         on_stream_event: Some(on_stream_event),
         concerns: None,
         scope_name: None,
+        surface_tag: None,
     };
 
     let outcome = rupu_agent::run_agent(opts).await;

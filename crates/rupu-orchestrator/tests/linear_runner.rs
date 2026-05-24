@@ -83,6 +83,7 @@ impl StepFactory for FakeFactory {
             on_stream_event: None,
             concerns: None,
             scope_name: None,
+            surface_tag: None,
         }
     }
 }
@@ -451,6 +452,7 @@ impl StepFactory for FailingFactory {
             on_stream_event: None,
             concerns: None,
             scope_name: None,
+            surface_tag: None,
         }
     }
 }
@@ -1190,6 +1192,7 @@ impl StepFactory for PanelFactory {
             on_stream_event: None,
             concerns: None,
             scope_name: None,
+            surface_tag: None,
         }
     }
 }
@@ -1432,6 +1435,7 @@ impl StepFactory for LoopingPanelFactory {
             on_stream_event: None,
             concerns: None,
             scope_name: None,
+            surface_tag: None,
         }
     }
 }

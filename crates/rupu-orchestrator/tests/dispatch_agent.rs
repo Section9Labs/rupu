@@ -196,6 +196,7 @@ impl StepFactory for DispatchFactory {
             on_stream_event: None,
             concerns: None,
             scope_name: None,
+            surface_tag: None,
         }
     }
 }
@@ -354,6 +355,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 on_stream_event: None,
                 concerns: None,
                 scope_name: None,
+                surface_tag: None,
             }
         }
     }

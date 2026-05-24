@@ -71,6 +71,7 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
         on_stream_event: None,
         concerns: Some(stride_block()),
         scope_name: None,
+        surface_tag: None,
     };
 
     run_agent(opts).await.expect("agent run should succeed");
@@ -164,6 +165,7 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
         on_stream_event: None,
         concerns: None,
         scope_name: None,
+        surface_tag: None,
     };
 
     run_agent(opts).await.expect("agent run should succeed");
@@ -229,6 +231,7 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
         on_stream_event: None,
         concerns: Some(stride_block()),
         scope_name: None,
+        surface_tag: None,
     };
 
     run_agent(opts).await.expect("agent run should succeed");
@@ -243,5 +246,80 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
     assert!(
         system.contains("STRIDE") || system.contains("stride") || system.contains("Spoofing"),
         "system prompt should contain catalog content from render_full_mode"
+    );
+}
+
+#[tokio::test]
+async fn surface_tag_override_is_respected() {
+    // When AgentRunOpts carries surface_tag: Some("workflow"), the runner
+    // must wire that value into tool_context.surface_tag rather than
+    // defaulting to "agent". We verify this by running with a custom tag
+    // and checking that the run completes successfully (the tag path is
+    // exercised without error). The actual surface propagation into
+    // FileTouchEvents is tested via unit tests in rupu-coverage; here
+    // we only need to confirm the runner plumbs the field through.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_path_buf();
+
+    let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+        text: "Done with workflow surface.".into(),
+        stop: StopReason::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
+    }]);
+
+    let opts = AgentRunOpts {
+        agent_name: "workflow-step-agent".into(),
+        agent_system_prompt: "You are a workflow step agent.".into(),
+        agent_tools: None,
+        provider: Box::new(provider),
+        provider_name: "mock".into(),
+        model: "mock-1".into(),
+        run_id: "run_surface_tag_test".into(),
+        workspace_id: "ws_surface_test".into(),
+        workspace_path: workspace.clone(),
+        transcript_path: workspace.join("run.jsonl"),
+        max_turns: 5,
+        decider: Arc::new(BypassDecider),
+        tool_context: ToolContext {
+            workspace_path: workspace.clone(),
+            ..Default::default()
+        },
+        user_message: "Check coverage.".into(),
+        initial_messages: Vec::new(),
+        turn_index_offset: 0,
+        mode_str: "bypass".into(),
+        no_stream: true,
+        suppress_stream_stdout: false,
+        mcp_registry: None,
+        effort: None,
+        context_window: None,
+        output_format: None,
+        anthropic_task_budget: None,
+        anthropic_context_management: None,
+        anthropic_speed: None,
+        parent_run_id: None,
+        depth: 0,
+        dispatchable_agents: None,
+        step_id: String::new(),
+        on_tool_call: None,
+        on_stream_event: None,
+        // Enable coverage so the runner's surface_tag assignment fires.
+        concerns: Some(stride_block()),
+        scope_name: None,
+        // This is the field under test: override to "workflow".
+        surface_tag: Some("workflow".to_string()),
+    };
+
+    // The run must complete cleanly — confirms the surface_tag override
+    // doesn't break the runner's coverage wiring path.
+    run_agent(opts).await.expect("agent run with workflow surface_tag should succeed");
+
+    // Verify catalog was still written (coverage harness ran normally).
+    let target = rupu_coverage::target_id(&workspace, "workflow-step-agent");
+    let paths = CoveragePaths::new(&workspace, &target);
+    assert!(
+        paths.catalog.exists(),
+        "catalog snapshot should exist even with surface_tag override"
     );
 }

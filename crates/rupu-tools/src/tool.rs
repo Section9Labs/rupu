@@ -79,19 +79,17 @@ pub struct ToolContext {
     /// entirely (the default outside of a coverage-enabled run).
     #[serde(skip)]
     pub coverage_writer: Option<std::sync::Arc<rupu_coverage::CoverageWriter>>,
-    /// Surface that initiated this run — populated by the runner. Used to
-    /// tag emitted FileTouchEvents with `surface: workflow | agent | autoflow | session`.
-    /// Tasks 18/19 will wire actual values from the agent/workflow runner.
+    /// Surface that initiated this run — populated by the runner from
+    /// `AgentRunOpts.surface_tag`. The agent runner defaults to `"agent"`;
+    /// the workflow step factory sets it to `"workflow"` via `AgentRunOpts`.
     #[serde(skip)]
     pub surface_tag: Option<String>,
-    /// Run identifier — populated by the runner. Used to tag emitted
-    /// FileTouchEvents with their owning run.
-    /// Tasks 18/19 will wire actual values from the agent/workflow runner.
+    /// Run identifier — populated by the agent runner from `AgentRunOpts.run_id`.
+    /// Used to tag emitted FileTouchEvents with their owning run.
     #[serde(skip)]
     pub run_id: Option<String>,
-    /// Model identifier — populated by the runner. Used to tag emitted
-    /// FileTouchEvents with the model that made the call.
-    /// Tasks 18/19 will wire actual values from the agent/workflow runner.
+    /// Model identifier — populated by the agent runner from `AgentRunOpts.model`.
+    /// Used to tag emitted FileTouchEvents with the model that made the call.
     #[serde(skip)]
     pub model: Option<String>,
 }

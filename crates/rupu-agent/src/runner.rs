@@ -215,6 +215,11 @@ pub struct AgentRunOpts {
     /// ledger entries under the same `target_id`, regardless of which agent
     /// handled each step.
     pub scope_name: Option<String>,
+    /// Override the surface tag written into coverage `FileTouchEvent`s.
+    /// When `None` (default), the runner falls back to `"agent"`.
+    /// The workflow step factory sets this to `"workflow"` so coverage events
+    /// from workflow runs are correctly attributed to the workflow surface.
+    pub surface_tag: Option<String>,
 }
 
 /// Outcome of a finished run.
@@ -287,7 +292,11 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // Wire coverage into tool context.
     if let Some(h) = &coverage_handle {
         opts.tool_context.coverage_writer = Some(h.writer.clone());
-        opts.tool_context.surface_tag = Some("agent".to_string());
+        opts.tool_context.surface_tag = Some(
+            opts.surface_tag
+                .clone()
+                .unwrap_or_else(|| "agent".to_string()),
+        );
         opts.tool_context.run_id = Some(opts.run_id.clone());
         opts.tool_context.model = Some(opts.model.clone());
     }
@@ -813,6 +822,7 @@ mod on_tool_call_tests {
             on_stream_event: None,
             concerns: None,
             scope_name: None,
+            surface_tag: None,
         };
 
         run_agent(opts).await.expect("agent run succeeds");

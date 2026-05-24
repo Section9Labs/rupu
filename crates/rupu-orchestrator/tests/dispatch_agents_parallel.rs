@@ -211,6 +211,7 @@ impl StepFactory for ParallelFactory {
             on_stream_event: None,
             concerns: None,
             scope_name: None,
+            surface_tag: None,
         }
     }
 }

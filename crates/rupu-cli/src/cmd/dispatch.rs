@@ -182,6 +182,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             on_stream_event: None,
             concerns: spec.concerns.clone(),
             scope_name: None,
+            surface_tag: None,
         };
 
         let started = std::time::Instant::now();

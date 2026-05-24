@@ -210,6 +210,10 @@ impl StepFactory for DefaultStepFactory {
             // workflow name) so ledger entries accumulate per-workflow, not
             // per-step-agent.
             scope_name: Some(self.workflow.name.clone()),
+            // Workflow steps must report as "workflow" surface so coverage
+            // FileTouchEvents are correctly attributed; the runner defaults
+            // to "agent" when this is None.
+            surface_tag: Some("workflow".to_string()),
         }
     }
 }

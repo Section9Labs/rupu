@@ -350,6 +350,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         on_stream_event: None,
         concerns: spec.concerns.clone(),
         scope_name: None,
+        surface_tag: None,
     };
 
     // Spawn the agent in a background task and tail the transcript with
