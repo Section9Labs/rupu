@@ -5,6 +5,9 @@
 
 pub mod catalog;
 pub mod ledger;
+pub mod tools;
+
+pub use tools::{coverage_mark, CoverageMarkError, CoverageMarkInput, CoverageMarkOutput};
 
 pub use catalog::{
     builtin_names, flatten, read_snapshot, resolve_builtin, write_snapshot, Concern, ConcernOverride,
