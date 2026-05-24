@@ -282,7 +282,7 @@ impl Tool for ReportFindingTool {
                 },
                 "scope": {
                     "type": "string",
-                    "enum": ["line", "function", "file", "module", "repo"],
+                    "enum": ["line", "file", "repo"],
                     "description": "Scope at which the finding applies."
                 },
                 "summary": {

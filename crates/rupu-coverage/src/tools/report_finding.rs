@@ -127,4 +127,25 @@ mod tests {
         .unwrap();
         assert!(out.id.starts_with("fnd_"));
     }
+
+    /// Verify that all three JSON strings that the `report_finding` tool schema
+    /// advertises ("line", "file", "repo") deserialize cleanly into `FindingScope`.
+    /// If the schema enum and the Rust enum ever diverge, serde will reject the
+    /// value with an obscure error rather than a compile-time failure — this test
+    /// catches that mismatch at the unit level before it affects LLM calls.
+    #[test]
+    fn all_schema_scope_values_deserialize_to_finding_scope() {
+        for (json_str, expected) in [
+            ("\"line\"", FindingScope::Line),
+            ("\"file\"", FindingScope::File),
+            ("\"repo\"", FindingScope::Repo),
+        ] {
+            let decoded: FindingScope = serde_json::from_str(json_str)
+                .unwrap_or_else(|e| panic!("failed to deserialize scope {json_str:?}: {e}"));
+            assert_eq!(
+                decoded, expected,
+                "scope {json_str:?} should round-trip cleanly"
+            );
+        }
+    }
 }
