@@ -7,7 +7,10 @@ pub mod catalog;
 pub mod ledger;
 pub mod tools;
 
-pub use tools::{coverage_mark, CoverageMarkError, CoverageMarkInput, CoverageMarkOutput};
+pub use tools::{
+    coverage_mark, coverage_remaining, coverage_status, CoverageMarkError, CoverageMarkInput,
+    CoverageMarkOutput, CoverageRemainingInput, CoverageStatusInput, RemainingItem,
+};
 
 pub use catalog::{
     builtin_names, flatten, read_snapshot, resolve_builtin, write_snapshot, Concern, ConcernOverride,
