@@ -56,6 +56,7 @@ async fn mcp_registry_attaches_tools_to_run() {
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: None,
+        concerns: None,
     };
 
     run_agent(opts).await.unwrap();

@@ -66,27 +66,27 @@ fn default_template_version() -> u32 {
 /// A user-declared concerns block — appears in agent frontmatter or
 /// workflow YAML. A list of entries, each either an inline concern or
 /// an include of a named template.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ConcernsBlock {
     pub entries: Vec<ConcernsEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ConcernsEntry {
     Include(IncludeDirective),
     Inline(Concern),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncludeDirective {
     pub include: String,
     #[serde(default)]
     pub overrides: Vec<ConcernOverride>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConcernOverride {
     pub id: String,
     #[serde(default)]

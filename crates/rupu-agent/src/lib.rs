@@ -11,6 +11,8 @@
 
 // implemented in Task 11
 pub mod action;
+// Task 18: coverage tool wrappers (injected when concerns: is present)
+pub mod coverage_tools;
 // implemented in Task 3
 pub mod loader;
 // Tasks 17+18: MCP tool adapter + runner wiring

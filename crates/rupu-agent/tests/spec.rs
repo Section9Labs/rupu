@@ -124,3 +124,25 @@ fn rejects_invalid_speed() {
     let s = "---\nname: x\nanthropicSpeed: turbo\n---\nbody\n";
     assert!(AgentSpec::parse(s).is_err(), "only `fast` is accepted");
 }
+
+#[test]
+fn parses_concerns_block() {
+    let s = r#"---
+name: coverage-agent
+concerns:
+  - include: stride
+  - include: secrets-in-source
+---
+Body text.
+"#;
+    let spec = AgentSpec::parse(s).unwrap();
+    let block = spec.concerns.expect("concerns should be Some");
+    assert_eq!(block.entries.len(), 2);
+}
+
+#[test]
+fn concerns_defaults_to_none_when_absent() {
+    let s = "---\nname: hello\n---\nbody\n";
+    let spec = AgentSpec::parse(s).unwrap();
+    assert!(spec.concerns.is_none());
+}

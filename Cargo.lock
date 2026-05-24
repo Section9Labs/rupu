@@ -6078,6 +6078,7 @@ dependencies = [
  "pty-process",
  "rupu-auth",
  "rupu-config",
+ "rupu-coverage",
  "rupu-mcp",
  "rupu-providers",
  "rupu-scm",

@@ -348,6 +348,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: None,
+        concerns: spec.concerns.clone(),
     };
 
     // Spawn the agent in a background task and tail the transcript with

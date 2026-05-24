@@ -180,6 +180,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             step_id: String::new(),
             on_tool_call: None,
             on_stream_event: None,
+            concerns: spec.concerns.clone(),
         };
 
         let started = std::time::Instant::now();

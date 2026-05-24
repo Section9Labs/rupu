@@ -98,6 +98,7 @@ impl StepFactory for DefaultStepFactory {
                         anthropic_context_management: None,
                         anthropic_speed: None,
                         dispatchable_agents: None,
+                        concerns: None,
                         system_prompt: rendered_prompt.clone(),
                     }
                 });
@@ -201,6 +202,7 @@ impl StepFactory for DefaultStepFactory {
             step_id: step_id.to_string(),
             on_tool_call,
             on_stream_event: None,
+            concerns: spec.concerns,
         }
     }
 }
