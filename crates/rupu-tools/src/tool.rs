@@ -92,6 +92,11 @@ pub struct ToolContext {
     /// Used to tag emitted FileTouchEvents with the model that made the call.
     #[serde(skip)]
     pub model: Option<String>,
+    /// Optional user-declared tool→path-arg mappings, so unrecognized tools
+    /// (MCP-provided, custom) can still contribute FileTouchEvents. `None`
+    /// means no mappings are loaded; built-in tools self-instrument regardless.
+    #[serde(skip)]
+    pub tool_mappings: Option<std::sync::Arc<rupu_coverage::ToolMappings>>,
 }
 
 impl Default for ToolContext {
@@ -108,6 +113,7 @@ impl Default for ToolContext {
             surface_tag: None,
             run_id: None,
             model: None,
+            tool_mappings: None,
         }
     }
 }

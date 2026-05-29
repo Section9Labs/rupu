@@ -5808,6 +5808,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         surface_tag: None,
         run_id: None,
         model: None,
+        tool_mappings: None,
     };
 
     let decider: Arc<dyn PermissionDecider> = match session.permission_mode.as_str() {
