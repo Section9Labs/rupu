@@ -3,8 +3,10 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod catalog;
 pub mod ledger;
+pub mod tool_mappings;
 pub mod tools;
 
 #[cfg(feature = "gen")]
@@ -25,8 +27,12 @@ pub use catalog::{
     ConcernOverride, ConcernsBlock, ConcernsEntry, FlatCatalog, FlattenError, IncludeDirective,
     ParseError, Severity, SnapshotError, Template, TouchStrength, DEFAULT_FULL_MODE_THRESHOLD,
 };
+pub use audit::{AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster};
+pub use audit::generate::audit as run_audit;
+pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};
 pub use ledger::{
-    file_views, read_concern_assertions, read_file_events, target_id, AssertionStatus, Attribution,
-    ConcernAssertion, CoveragePaths, CoverageWriter, CoverageWriterHandle, Evidence, FileTouchEvent,
-    FileView, FindingEvidence, FindingRecord, FindingScope, Surface,
+    discover_targets, file_views, read_concern_assertions, read_file_events, read_findings,
+    target_id, AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, CoverageWriter,
+    CoverageWriterHandle, DiscoveredTarget, Evidence, FileTouchEvent, FileView, FindingEvidence,
+    FindingRecord, FindingScope, Surface,
 };

@@ -9,6 +9,7 @@ pub mod cleanup;
 pub mod completers;
 pub mod completions;
 pub mod config;
+pub mod coverage;
 pub mod create_common;
 pub mod cron;
 pub mod dispatch;

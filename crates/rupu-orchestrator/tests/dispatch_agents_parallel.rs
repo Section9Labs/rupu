@@ -189,6 +189,7 @@ impl StepFactory for ParallelFactory {
                 surface_tag: None,
                 run_id: None,
                 model: None,
+                tool_mappings: None,
             },
             user_message: rendered_prompt,
             initial_messages: Vec::new(),

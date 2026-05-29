@@ -47,14 +47,24 @@ impl Tool for McpToolAdapter {
         self.input_schema.clone()
     }
 
-    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-        match self.dispatcher.call(self.name, input).await {
-            Ok(text) => Ok(ToolOutput {
-                stdout: text,
-                error: None,
-                duration_ms: 0,
-                derived: None,
-            }),
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        match self.dispatcher.call(self.name, input.clone()).await {
+            Ok(text) => {
+                // Emit a FileTouchEvent for user-declared tool mappings so
+                // MCP/custom tools contribute to coverage even though they
+                // don't self-instrument like built-in tools do.
+                if let Some(event) =
+                    rupu_tools::coverage_emit::mapped_touch(ctx, self.name, &input)
+                {
+                    rupu_tools::coverage_emit::emit(ctx, event).await;
+                }
+                Ok(ToolOutput {
+                    stdout: text,
+                    error: None,
+                    duration_ms: 0,
+                    derived: None,
+                })
+            }
             Err(e) => match e {
                 McpError::PermissionDenied { .. } => Err(ToolError::PermissionDenied),
                 other => Err(ToolError::Execution(other.to_string())),

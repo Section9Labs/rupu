@@ -142,6 +142,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             surface_tag: None,
             run_id: None,
             model: None,
+            tool_mappings: None,
         };
 
         let opts = AgentRunOpts {

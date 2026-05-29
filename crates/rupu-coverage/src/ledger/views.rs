@@ -1,5 +1,5 @@
 use crate::catalog::types::TouchStrength;
-use crate::ledger::events::{Attribution, ConcernAssertion, FileTouchEvent};
+use crate::ledger::events::{Attribution, ConcernAssertion, FileTouchEvent, FindingRecord};
 use crate::ledger::paths::CoveragePaths;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,18 @@ pub fn read_concern_assertions(paths: &CoveragePaths) -> std::io::Result<Vec<Con
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<ConcernAssertion>(l).ok())
+        .collect())
+}
+
+pub fn read_findings(paths: &CoveragePaths) -> std::io::Result<Vec<FindingRecord>> {
+    if !paths.findings.exists() {
+        return Ok(vec![]);
+    }
+    let raw = std::fs::read_to_string(&paths.findings)?;
+    Ok(raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<FindingRecord>(l).ok())
         .collect())
 }
 
@@ -110,6 +122,43 @@ mod tests {
             model: "m".to_string(),
             surface: Surface::Workflow,
         }
+    }
+
+    #[test]
+    fn read_findings_parses_jsonl_and_handles_missing_file() {
+        use crate::catalog::types::Severity;
+        use crate::ledger::events::{Attribution, FindingEvidence, FindingRecord, FindingScope, Surface};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+
+        assert!(read_findings(&paths).unwrap().is_empty());
+
+        paths.ensure_dir().unwrap();
+        let rec = FindingRecord {
+            id: "fnd_1".to_string(),
+            file_path: Some("src/a.rs".to_string()),
+            line_range: Some([1, 5]),
+            scope: FindingScope::Line,
+            summary: "x".to_string(),
+            severity: Severity::High,
+            concern_id: Some("ssrf".to_string()),
+            evidence: FindingEvidence {
+                code_excerpt: None,
+                rationale: "r".to_string(),
+                references: vec![],
+            },
+            declared_by: Attribution {
+                run_id: "r".to_string(),
+                model: "m".to_string(),
+                surface: Surface::Workflow,
+            },
+            declared_at: chrono::Utc::now(),
+        };
+        std::fs::write(&paths.findings, serde_json::to_string(&rec).unwrap() + "\n").unwrap();
+        let got = read_findings(&paths).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "fnd_1");
     }
 
     #[test]
