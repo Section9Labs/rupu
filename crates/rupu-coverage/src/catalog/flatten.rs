@@ -61,6 +61,14 @@ where
             template_concerns.extend(nested.concerns);
         }
 
+        // Apply per-include filter (subset selector) before overrides
+        // and duplicate-id detection. An empty filter is a no-op.
+        if let Some(filter) = &directive.filter {
+            if !filter.is_empty() {
+                template_concerns.retain(|c| filter.matches(c));
+            }
+        }
+
         // Apply overrides — must target a concern that exists in the
         // resolved template (after nested includes).
         let template_ids: std::collections::HashSet<&str> =
@@ -239,5 +247,44 @@ mod tests {
         assert!(cat.concerns.iter().any(|c| c.id.starts_with("owasp-top10-2021:")));
         assert!(cat.concerns.iter().any(|c| c.id.starts_with("cwe-top25-2023:")));
         assert!(cat.concerns.iter().any(|c| c.id == "secrets-in-source"));
+    }
+
+    #[test]
+    fn filter_subsets_included_template() {
+        use crate::catalog::filter::ConcernFilter;
+        use crate::catalog::types::{CatalogMode, Severity};
+
+        let block = ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: CatalogMode::Auto,
+                filter: Some(ConcernFilter {
+                    severity: vec![Severity::Critical],
+                    ..Default::default()
+                }),
+            })],
+        };
+        let cat = flatten(&block).unwrap();
+        // Only elevation-of-privilege is Critical in stride.
+        assert_eq!(cat.concerns.len(), 1);
+        assert_eq!(cat.concerns[0].id, "stride:elevation-of-privilege");
+    }
+
+    #[test]
+    fn empty_filter_is_no_op() {
+        use crate::catalog::filter::ConcernFilter;
+        use crate::catalog::types::CatalogMode;
+
+        let block = ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: CatalogMode::Auto,
+                filter: Some(ConcernFilter::default()),
+            })],
+        };
+        let cat = flatten(&block).unwrap();
+        assert_eq!(cat.concerns.len(), 6);
     }
 }
