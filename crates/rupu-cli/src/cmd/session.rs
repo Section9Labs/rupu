@@ -245,6 +245,7 @@ enum AttachCommand {
     History,
     Transcript,
     Runs,
+    Coverage,
     Routed(RoutedAttachCommand),
 }
 
@@ -388,6 +389,11 @@ struct SessionRecord {
     message_history: Vec<Message>,
     #[serde(default)]
     runs: Vec<SessionRunRecord>,
+    /// Coverage concerns block resolved from the agent's frontmatter at
+    /// session start. When `Some`, each turn runs with the coverage
+    /// harness active (target_id derived from `(workspace, session_id)`).
+    #[serde(default)]
+    concerns: Option<rupu_coverage::ConcernsBlock>,
 }
 
 impl SessionRecord {
@@ -1355,6 +1361,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         total_tokens_cached: 0,
         message_history: Vec::new(),
         runs: Vec::new(),
+        concerns: spec.concerns.clone(),
     };
     write_session(&global, SessionScope::Active, &session)?;
     launch_turn(&global, &session_id, user_message, args.detach, args.view).await
@@ -2895,6 +2902,7 @@ fn execute_session_live_command(
         AttachCommand::History => append_session_history_lines(state, session),
         AttachCommand::Transcript => append_session_transcript_lines(state, session),
         AttachCommand::Runs => append_session_runs_lines(state, session),
+        AttachCommand::Coverage => append_session_coverage_lines(state, session),
         AttachCommand::Cancel => {
             let detail = cancel_active_turn_in_place(global, &session.session_id)?
                 .unwrap_or_else(|| "no active turn".into());
@@ -4560,6 +4568,78 @@ fn append_session_runs_lines(state: &mut SessionInteractiveState, session: &Sess
     }
 }
 
+fn append_session_coverage_lines(state: &mut SessionInteractiveState, session: &SessionRecord) {
+    if session.concerns.is_none() {
+        state.push_line(
+            crate::output::palette::Status::Skipped,
+            "coverage  ·  this session's agent doesn't declare `concerns:`",
+        );
+        return;
+    }
+    let target = rupu_coverage::target_id(&session.workspace_path, &session.session_id);
+    let paths = rupu_coverage::CoveragePaths::new(&session.workspace_path, &target);
+    if !paths.catalog.exists() {
+        state.push_line(
+            crate::output::palette::Status::Skipped,
+            "coverage  ·  no ledger yet for this session (run a turn first)",
+        );
+        return;
+    }
+    let report = match rupu_coverage::run_audit(&paths) {
+        Ok(r) => r,
+        Err(e) => {
+            state.push_line(
+                crate::output::palette::Status::Failed,
+                format!("coverage  ·  audit error: {e}"),
+            );
+            return;
+        }
+    };
+    state.push_line(
+        crate::output::palette::Status::Active,
+        format!(
+            "coverage  ·  {}/{} concerns complete  ·  {} gap files",
+            report.complete_concerns, report.total_concerns, report.total_gap_files
+        ),
+    );
+    // Show the worst-offending concerns (top 5 by gap-file count).
+    let mut sorted: Vec<&rupu_coverage::ConcernCoverage> = report.concerns.iter().collect();
+    sorted.sort_by(|a, b| b.gap_files.len().cmp(&a.gap_files.len()));
+    for c in sorted.iter().take(5).filter(|c| !c.is_complete()) {
+        state.push_line(
+            crate::output::palette::Status::Awaiting,
+            format!(
+                "  GAP  ·  {}  ·  {} of {} files unasserted",
+                c.concern_id,
+                c.gap_files.len(),
+                c.in_scope_files.len()
+            ),
+        );
+    }
+    let disagreements = report
+        .cross_model
+        .iter()
+        .filter(|x| x.disagreement)
+        .count();
+    if disagreements > 0 {
+        state.push_line(
+            crate::output::palette::Status::Awaiting,
+            format!(
+                "cross-model  ·  {disagreements} (concern, file) pair(s) with model disagreement",
+            ),
+        );
+    }
+    if !report.serendipitous.is_empty() {
+        state.push_line(
+            crate::output::palette::Status::Active,
+            format!(
+                "serendipitous findings  ·  {} cluster(s)",
+                report.serendipitous.len()
+            ),
+        );
+    }
+}
+
 fn handle_attach_keypress(
     global: &Path,
     session: &SessionRecord,
@@ -4759,6 +4839,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         routed: false,
     },
     SlashCommand {
+        name: "coverage",
+        description: "show coverage audit for this session's target",
+        routed: false,
+    },
+    SlashCommand {
         name: "detach",
         description: "leave the live view (keep session running)",
         routed: false,
@@ -4938,6 +5023,7 @@ fn parse_attach_command(input: &str) -> Option<AttachCommand> {
         "history" => Some(AttachCommand::History),
         "transcript" => Some(AttachCommand::Transcript),
         "runs" => Some(AttachCommand::Runs),
+        "coverage" => Some(AttachCommand::Coverage),
         _ => parse_routed_attach_command(command).map(AttachCommand::Routed),
     }
 }
@@ -5038,6 +5124,7 @@ fn execute_attach_command(
         }
         AttachCommand::Detach => return Ok(AttachControl::Exit(AttachExit::Detach)),
         AttachCommand::Quit => return Ok(AttachControl::Exit(AttachExit::Quit)),
+        AttachCommand::Coverage => render_session_coverage(printer, session),
         AttachCommand::Routed(_) => {
             printer.sideband_event(
                 crate::output::palette::Status::Awaiting,
@@ -5170,6 +5257,50 @@ fn render_session_runs(printer: &mut crate::output::LineStreamPrinter, session: 
         let detail = format!("{status}  ·  {}", run.run_id);
         printer.sideband_event(crate::output::palette::Status::Active, "run", Some(&detail));
     }
+}
+
+fn render_session_coverage(
+    printer: &mut crate::output::LineStreamPrinter,
+    session: &SessionRecord,
+) {
+    if session.concerns.is_none() {
+        printer.sideband_event(
+            crate::output::palette::Status::Skipped,
+            "coverage",
+            Some("this session's agent doesn't declare `concerns:`"),
+        );
+        return;
+    }
+    let target = rupu_coverage::target_id(&session.workspace_path, &session.session_id);
+    let paths = rupu_coverage::CoveragePaths::new(&session.workspace_path, &target);
+    if !paths.catalog.exists() {
+        printer.sideband_event(
+            crate::output::palette::Status::Skipped,
+            "coverage",
+            Some("no ledger yet for this session (run a turn first)"),
+        );
+        return;
+    }
+    let report = match rupu_coverage::run_audit(&paths) {
+        Ok(r) => r,
+        Err(e) => {
+            printer.sideband_event(
+                crate::output::palette::Status::Failed,
+                "coverage",
+                Some(&format!("audit error: {e}")),
+            );
+            return;
+        }
+    };
+    let summary = format!(
+        "{}/{} concerns complete  ·  {} gap files",
+        report.complete_concerns, report.total_concerns, report.total_gap_files
+    );
+    printer.sideband_event(
+        crate::output::palette::Status::Active,
+        "coverage",
+        Some(&summary),
+    );
 }
 
 fn render_session_attach_intro(
@@ -5877,9 +6008,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         step_id: String::new(),
         on_tool_call: None,
         on_stream_event: Some(on_stream_event),
-        concerns: None,
-        scope_name: None,
-        surface_tag: None,
+        concerns: session.concerns.clone(),
+        // Sessions key their coverage ledger off the session_id so multiple
+        // sessions against the same workspace stay distinct, and target_id
+        // matches the spec's per-session derivation.
+        scope_name: Some(session.session_id.clone()),
+        surface_tag: Some("session".to_string()),
     };
 
     let outcome = rupu_agent::run_agent(opts).await;
@@ -6479,6 +6613,10 @@ mod tests {
         assert!(matches!(
             parse_attach_command("/runs"),
             Some(AttachCommand::Runs)
+        ));
+        assert!(matches!(
+            parse_attach_command("/coverage"),
+            Some(AttachCommand::Coverage)
         ));
         assert!(parse_attach_command("plain prompt").is_none());
         assert!(parse_attach_command("/unknown").is_none());
@@ -7463,6 +7601,7 @@ mod tests {
                 pid: None,
                 error: None,
             }],
+            concerns: None,
         }
     }
 
