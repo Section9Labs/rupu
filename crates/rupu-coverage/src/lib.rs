@@ -27,6 +27,7 @@ pub use catalog::{
     ParseError, Severity, SnapshotError, Template, TouchStrength, DEFAULT_FULL_MODE_THRESHOLD,
 };
 pub use audit::{AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster};
+pub use audit::generate::audit as run_audit;
 pub use ledger::{
     file_views, read_concern_assertions, read_file_events, read_findings, target_id,
     AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, CoverageWriter,
