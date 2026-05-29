@@ -151,6 +151,8 @@ mod tests {
             entries: vec![ConcernsEntry::Include(IncludeDirective {
                 include: "stride".to_string(),
                 overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let cat = flatten(&block).unwrap();
@@ -167,6 +169,8 @@ mod tests {
                 ConcernsEntry::Include(IncludeDirective {
                     include: "stride".to_string(),
                     overrides: vec![],
+                    mode: crate::catalog::types::CatalogMode::Auto,
+                    filter: None,
                 }),
                 ConcernsEntry::Inline(custom),
             ],
@@ -191,6 +195,8 @@ mod tests {
                     severity: Some(Severity::Critical),
                     ..Default::default()
                 }],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let cat = flatten(&block).unwrap();
@@ -208,6 +214,8 @@ mod tests {
             entries: vec![ConcernsEntry::Include(IncludeDirective {
                 include: "not-a-real-template".to_string(),
                 overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let err = flatten(&block).unwrap_err();
@@ -220,6 +228,8 @@ mod tests {
             entries: vec![ConcernsEntry::Include(IncludeDirective {
                 include: "web-security-default".to_string(),
                 overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let cat = flatten(&block).unwrap();

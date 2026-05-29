@@ -107,6 +107,8 @@ mod tests {
             entries: vec![ConcernsEntry::Include(IncludeDirective {
                 include: "secrets-in-source".to_string(),
                 overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let catalog = flatten(&block).unwrap();

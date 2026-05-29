@@ -1,3 +1,4 @@
+use crate::catalog::filter::ConcernFilter;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -79,11 +80,27 @@ pub enum ConcernsEntry {
     Inline(Concern),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CatalogMode {
+    /// Render every concern's full body into the system prompt.
+    Full,
+    /// Render a one-line summary table; concerns fetched on demand.
+    Index,
+    /// Auto-select based on total concern count and config threshold.
+    #[default]
+    Auto,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncludeDirective {
     pub include: String,
     #[serde(default)]
     pub overrides: Vec<ConcernOverride>,
+    #[serde(default)]
+    pub mode: CatalogMode,
+    #[serde(default)]
+    pub filter: Option<ConcernFilter>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

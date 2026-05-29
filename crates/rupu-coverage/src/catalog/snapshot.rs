@@ -48,6 +48,8 @@ mod tests {
             entries: vec![ConcernsEntry::Include(IncludeDirective {
                 include: "stride".to_string(),
                 overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let original = flatten(&block).unwrap();
