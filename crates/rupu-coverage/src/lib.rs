@@ -14,11 +14,10 @@ pub use tools::{
 };
 
 pub use catalog::{
-    builtin_names, flatten, read_snapshot, render_full_mode, render_index_mode, resolve_builtin,
-    write_snapshot,
-    CatalogMode, Concern, ConcernFilter, ConcernOverride, ConcernsBlock, ConcernsEntry,
-    FlatCatalog, FlattenError, IncludeDirective, ParseError, Severity, SnapshotError, Template,
-    TouchStrength,
+    builtin_names, flatten, partition_by_mode, read_snapshot, render_full_mode, render_index_mode,
+    resolve_builtin, resolve_modes, write_snapshot, CatalogMode, Concern, ConcernFilter,
+    ConcernOverride, ConcernsBlock, ConcernsEntry, FlatCatalog, FlattenError, IncludeDirective,
+    ParseError, Severity, SnapshotError, Template, TouchStrength, DEFAULT_FULL_MODE_THRESHOLD,
 };
 pub use ledger::{
     file_views, read_concern_assertions, read_file_events, target_id, AssertionStatus, Attribution,
