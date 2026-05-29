@@ -127,6 +127,12 @@ pub struct FlatCatalog {
     pub concerns: Vec<Concern>,
     /// Source-tracking: for each concern_id, where it came from (template name or "inline").
     pub sources: std::collections::BTreeMap<String, String>,
+    /// Requested render mode per concern_id. Reflects the `mode:` on
+    /// the include the concern came from (or `Auto` for inline
+    /// concerns and for include directives that didn't set `mode:`).
+    /// Actual full-vs-index choice happens in mode_selection.rs.
+    #[serde(default)]
+    pub render_modes: std::collections::BTreeMap<String, CatalogMode>,
 }
 
 #[cfg(test)]

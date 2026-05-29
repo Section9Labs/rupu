@@ -1,5 +1,5 @@
 use crate::catalog::builtin::resolve_builtin;
-use crate::catalog::types::{Concern, ConcernsBlock, ConcernsEntry, FlatCatalog, Template};
+use crate::catalog::types::{CatalogMode, Concern, ConcernsBlock, ConcernsEntry, FlatCatalog, Template};
 use std::collections::BTreeMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -39,10 +39,12 @@ where
     // Pass 1: collect inline concerns first so they win on duplicate ids.
     let mut by_id: BTreeMap<String, Concern> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
+    let mut render_modes: BTreeMap<String, CatalogMode> = BTreeMap::new();
     for entry in &block.entries {
         if let ConcernsEntry::Inline(concern) = entry {
             by_id.insert(concern.id.clone(), concern.clone());
             sources.insert(concern.id.clone(), "inline".to_string());
+            render_modes.insert(concern.id.clone(), CatalogMode::Auto);
         }
     }
 
@@ -126,12 +128,16 @@ where
             sources
                 .entry(concern.id.clone())
                 .or_insert_with(|| directive.include.clone());
+            render_modes
+                .entry(concern.id.clone())
+                .or_insert(directive.mode);
         }
     }
 
     Ok(FlatCatalog {
         concerns: by_id.into_values().collect(),
         sources,
+        render_modes,
     })
 }
 
@@ -269,6 +275,22 @@ mod tests {
         // Only elevation-of-privilege is Critical in stride.
         assert_eq!(cat.concerns.len(), 1);
         assert_eq!(cat.concerns[0].id, "stride:elevation-of-privilege");
+    }
+
+    #[test]
+    fn flatten_records_render_mode_per_concern() {
+        use crate::catalog::types::CatalogMode;
+
+        let block = ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: CatalogMode::Index,
+                filter: None,
+            })],
+        };
+        let cat = flatten(&block).unwrap();
+        assert_eq!(cat.render_modes.get("stride:spoofing"), Some(&CatalogMode::Index));
     }
 
     #[test]
