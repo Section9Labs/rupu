@@ -9,5 +9,5 @@ pub use events::{
 };
 pub use paths::CoveragePaths;
 pub use target_id::target_id;
-pub use views::{file_views, read_concern_assertions, read_file_events, FileView};
+pub use views::{file_views, read_concern_assertions, read_file_events, read_findings, FileView};
 pub use writer::{CoverageWriter, CoverageWriterHandle};

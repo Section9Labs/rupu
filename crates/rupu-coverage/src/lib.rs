@@ -26,7 +26,8 @@ pub use catalog::{
     ParseError, Severity, SnapshotError, Template, TouchStrength, DEFAULT_FULL_MODE_THRESHOLD,
 };
 pub use ledger::{
-    file_views, read_concern_assertions, read_file_events, target_id, AssertionStatus, Attribution,
-    ConcernAssertion, CoveragePaths, CoverageWriter, CoverageWriterHandle, Evidence, FileTouchEvent,
-    FileView, FindingEvidence, FindingRecord, FindingScope, Surface,
+    file_views, read_concern_assertions, read_file_events, read_findings, target_id,
+    AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, CoverageWriter,
+    CoverageWriterHandle, Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord,
+    FindingScope, Surface,
 };
