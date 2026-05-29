@@ -80,6 +80,8 @@ concerns: []
             "owasp-top10-2021.yaml",
             "owasp-api-top10-2023.yaml",
             "cwe-top25-2023.yaml",
+            "cwe-research.yaml",
+            "cwe-software-development.yaml",
             "stride.yaml",
             "secrets-in-source.yaml",
             "code-smells.yaml",

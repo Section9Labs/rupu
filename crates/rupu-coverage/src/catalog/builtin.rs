@@ -16,6 +16,14 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
         include_str!("../../templates/concerns/cwe-top25-2023.yaml"),
     ),
     (
+        "cwe-research",
+        include_str!("../../templates/concerns/cwe-research.yaml"),
+    ),
+    (
+        "cwe-software-development",
+        include_str!("../../templates/concerns/cwe-software-development.yaml"),
+    ),
+    (
         "stride",
         include_str!("../../templates/concerns/stride.yaml"),
     ),
