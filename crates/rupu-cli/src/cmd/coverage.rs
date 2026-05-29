@@ -15,6 +15,16 @@ pub enum Action {
         #[command(subcommand)]
         action: TemplatesAction,
     },
+    /// Print the effective catalog snapshot for a target.
+    Catalog {
+        /// Target id (from `coverage list`).
+        target_id: String,
+    },
+    /// Show the derived ledger view (touched files + assertions + findings).
+    Show {
+        /// Target id (from `coverage list`).
+        target_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -33,6 +43,8 @@ pub async fn handle(action: Action, _format: Option<OutputFormat>) -> ExitCode {
     let result = match action {
         Action::List => workspace().and_then(|ws| run_list_in(&ws)),
         Action::Templates { action } => run_templates(action),
+        Action::Catalog { target_id } => workspace().and_then(|ws| run_catalog_in(&ws, &target_id)),
+        Action::Show { target_id } => workspace().and_then(|ws| run_show_in(&ws, &target_id)),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -80,6 +92,50 @@ fn run_templates(action: TemplatesAction) -> Result<()> {
     }
 }
 
+fn run_catalog_in(workspace: &Path, target_id: &str) -> Result<()> {
+    let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
+    if !paths.catalog.exists() {
+        anyhow::bail!("no catalog snapshot for target `{target_id}`");
+    }
+    let catalog = rupu_coverage::read_snapshot(&paths.catalog)?;
+    println!("{} concerns in effective catalog", catalog.concerns.len());
+    for c in &catalog.concerns {
+        println!("  {}  [{:?}]  {}", c.id, c.severity, c.name);
+    }
+    Ok(())
+}
+
+fn run_show_in(workspace: &Path, target_id: &str) -> Result<()> {
+    let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
+    let events = rupu_coverage::read_file_events(&paths)?;
+    let views = rupu_coverage::file_views(&events);
+    let assertions = rupu_coverage::read_concern_assertions(&paths)?;
+    let findings = rupu_coverage::read_findings(&paths)?;
+
+    println!("== files touched ({}) ==", views.len());
+    for v in &views {
+        println!("  {}  [{}]", v.path, format!("{:?}", v.strongest).to_lowercase());
+    }
+    println!("== concern assertions ({}) ==", assertions.len());
+    for a in &assertions {
+        println!(
+            "  {} · {} · {:?} · {}",
+            a.concern_id, a.file_path, a.status, a.declared_by.model
+        );
+    }
+    println!("== findings ({}) ==", findings.len());
+    for f in &findings {
+        println!(
+            "  {} · {:?} · {} · {}",
+            f.id,
+            f.severity,
+            f.file_path.as_deref().unwrap_or("(repo)"),
+            f.summary
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +160,40 @@ mod tests {
     #[test]
     fn templates_show_known_runs() {
         assert!(run_templates(TemplatesAction::Show { name: "stride".into() }).is_ok());
+    }
+
+    #[test]
+    fn catalog_missing_snapshot_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(run_catalog_in(tmp.path(), "missing").is_err());
+    }
+
+    #[test]
+    fn show_empty_target_is_ok() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No ledger files → empty sections, no error.
+        assert!(run_show_in(tmp.path(), "missing").is_ok());
+    }
+
+    #[test]
+    fn catalog_prints_snapshot_concerns() {
+        use rupu_coverage::{
+            flatten, write_snapshot, CatalogMode, ConcernsBlock, ConcernsEntry, CoveragePaths,
+            IncludeDirective,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        paths.ensure_dir().unwrap();
+        let cat = flatten(&ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: CatalogMode::Auto,
+                filter: None,
+            })],
+        })
+        .unwrap();
+        write_snapshot(&cat, &paths.catalog).unwrap();
+        assert!(run_catalog_in(tmp.path(), "tgt").is_ok());
     }
 }
