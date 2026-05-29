@@ -1,4 +1,5 @@
 use crate::catalog::mode_selection::partition_by_mode;
+use crate::catalog::text::first_sentence;
 use crate::catalog::types::{Concern, FlatCatalog};
 
 /// Render the catalog into the agent's system prompt, splitting
@@ -126,24 +127,6 @@ to fetch full text for any specific concern_id.\n\n",
     out
 }
 
-fn first_sentence(text: &str) -> String {
-    let trimmed = text.trim();
-    // Cap at 200 bytes, walking back to a UTF-8 char boundary so we
-    // never slice through a multi-byte char (CWE descriptions contain
-    // non-ASCII punctuation).
-    let mut end_cap = trimmed.len().min(200);
-    while end_cap < trimmed.len() && !trimmed.is_char_boundary(end_cap) {
-        end_cap -= 1;
-    }
-    let mut end = end_cap;
-    if let Some(idx) = trimmed[..end_cap].find(". ") {
-        end = idx + 1;
-    } else if let Some(idx) = trimmed[..end_cap].find(".\n") {
-        end = idx + 1;
-    }
-    trimmed[..end].replace('\n', " ").trim().to_string()
-}
-
 fn escape_pipes(text: &str) -> String {
     text.replace('|', "\\|")
 }
@@ -188,13 +171,6 @@ mod tests {
         assert!(rendered.contains("(6 entries)"));
         assert!(rendered.contains("| concern_id | severity | summary |"));
         assert!(rendered.contains("| stride:spoofing | high |"));
-    }
-
-    #[test]
-    fn first_sentence_handles_trailing_period() {
-        assert_eq!(first_sentence("Short summary."), "Short summary.");
-        assert_eq!(first_sentence("First. Second."), "First.");
-        assert_eq!(first_sentence("Multiline\nsummary."), "Multiline summary.");
     }
 
     #[test]
