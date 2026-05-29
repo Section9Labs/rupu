@@ -65,6 +65,7 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
     let mut in_description = false;
     let mut in_extended = false;
     let mut in_impact = false;
+    let mut cur_impact_text = String::new();
 
     let mut buf = Vec::new();
     loop {
@@ -109,10 +110,7 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
                             .get_or_insert_with(String::new)
                             .push_str(&text);
                     } else if in_impact {
-                        let trimmed = text.trim().to_string();
-                        if !trimmed.is_empty() {
-                            w.impact_tags.push(trimmed);
-                        }
+                        cur_impact_text.push_str(&text);
                     }
                 }
             }
@@ -153,9 +151,18 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
                             weaknesses.push(w);
                         }
                     }
-                    "Description" => in_description = false,
-                    "Extended_Description" => in_extended = false,
-                    "Impact" => in_impact = false,
+                    "Description" if in_description => in_description = false,
+                    "Extended_Description" if in_extended => in_extended = false,
+                    "Impact" if in_impact => {
+                        in_impact = false;
+                        let accumulated = cur_impact_text.trim().to_string();
+                        if !accumulated.is_empty() {
+                            if let Some(ref mut w) = cur_weakness {
+                                w.impact_tags.push(accumulated);
+                            }
+                        }
+                        cur_impact_text.clear();
+                    }
                     "Category" => {
                         if let Some((id, members)) = cur_category.take() {
                             categories.insert(id, members);
@@ -175,19 +182,27 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
         buf.clear();
     }
 
-    // Flatten view membership: expand category refs to their weakness members.
+    // Flatten view membership: iteratively expand category refs until only weakness IDs remain.
     let views = views_raw
         .into_iter()
         .map(|mut v| {
-            let mut ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-            for member in std::mem::take(&mut v.member_weakness_ids) {
-                if let Some(cat_members) = categories.get(&member) {
-                    ids.extend(cat_members.iter().copied());
+            let mut resolved: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            let mut pending: Vec<u32> = std::mem::take(&mut v.member_weakness_ids);
+            let mut visited_categories: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
+            while let Some(id) = pending.pop() {
+                if let Some(cat_members) = categories.get(&id) {
+                    // `id` is a category — expand its members and keep resolving.
+                    // Guard against (pathological) category cycles.
+                    if visited_categories.insert(id) {
+                        pending.extend(cat_members.iter().copied());
+                    }
                 } else {
-                    ids.insert(member);
+                    // `id` is a weakness (not present in the categories map).
+                    resolved.insert(id);
                 }
             }
-            v.member_weakness_ids = ids.into_iter().collect();
+            v.member_weakness_ids = resolved.into_iter().collect();
             v
         })
         .collect();
@@ -234,7 +249,12 @@ fn attr_u32(
         Some(s) => s
             .parse::<u32>()
             .map(Some)
-            .map_err(|_| CweXmlError::Malformed(format!("expected u32 for {key:?}, got {s:?}"))),
+            .map_err(|_| {
+                CweXmlError::Malformed(format!(
+                    "expected u32 for {:?}, got {s:?}",
+                    String::from_utf8_lossy(key)
+                ))
+            }),
     }
 }
 
@@ -319,5 +339,48 @@ mod tests {
         let view = &parsed.views[0];
         // The view referenced category 119, which contains 787 and 125.
         assert_eq!(view.member_weakness_ids, vec![125, 787]); // sorted by BTreeSet
+    }
+
+    const FIXTURE_NESTED_CATEGORIES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Weakness_Catalog>
+  <Weaknesses>
+    <Weakness ID="400" Name="Uncontrolled Resource Consumption">
+      <Description>desc</Description>
+    </Weakness>
+    <Weakness ID="770" Name="Allocation Without Limits">
+      <Description>desc</Description>
+    </Weakness>
+  </Weaknesses>
+  <Categories>
+    <Category ID="664" Name="Pillar">
+      <Relationships>
+        <Has_Member CWE_ID="399" View_ID="1000" />
+      </Relationships>
+    </Category>
+    <Category ID="399" Name="Resource Management">
+      <Relationships>
+        <Has_Member CWE_ID="400" View_ID="1000" />
+        <Has_Member CWE_ID="770" View_ID="1000" />
+      </Relationships>
+    </Category>
+  </Categories>
+  <Views>
+    <View ID="1000" Name="Research">
+      <Members>
+        <Has_Member CWE_ID="664" View_ID="1000" />
+      </Members>
+    </View>
+  </Views>
+</Weakness_Catalog>
+"#;
+
+    #[test]
+    fn view_expands_nested_categories_to_all_weaknesses() {
+        let parsed = parse_cwe_xml_str(FIXTURE_NESTED_CATEGORIES).expect("parses");
+        let view = &parsed.views[0];
+        // View 1000 → category 664 → category 399 → weaknesses 400, 770.
+        // The one-level expansion would have yielded [399] (a category id);
+        // the fix must yield the actual weakness ids.
+        assert_eq!(view.member_weakness_ids, vec![400, 770]);
     }
 }
