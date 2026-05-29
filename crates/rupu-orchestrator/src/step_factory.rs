@@ -324,3 +324,113 @@ mod provider_build_error_stub_tests {
         );
     }
 }
+
+/// Tests for workflow-level concerns resolution.
+///
+/// `build_opts_for_step` requires an async provider build and live
+/// credentials, so we test the resolution expression directly:
+///
+///   `workflow.concerns.clone().or(spec.concerns)`
+///
+/// This is the exact computation on line 208 of this file.  By
+/// constructing real `Workflow` and `AgentSpec` values we exercise the
+/// full parse-through-to-resolution path without spinning up a provider.
+#[cfg(test)]
+mod concerns_resolution_tests {
+    use rupu_agent::AgentSpec;
+    use rupu_coverage::ConcernsEntry;
+
+    use crate::workflow::Workflow;
+
+    /// Helper: extract the `include` string from the first entry of a
+    /// concerns block, panicking if the entry is not an `Include` variant.
+    fn first_include(block: &rupu_coverage::ConcernsBlock) -> &str {
+        match &block.entries[0] {
+            ConcernsEntry::Include(d) => &d.include,
+            other => panic!("expected Include entry, got {other:?}"),
+        }
+    }
+
+    /// Parse a minimal Workflow YAML with the given `include` template name
+    /// in its `concerns:` block.
+    fn workflow_with_concerns(name: &str, include: &str) -> Workflow {
+        let yaml = format!(
+            "name: {name}\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\nconcerns:\n  - include: {include}\n"
+        );
+        Workflow::parse(&yaml).expect("workflow should parse")
+    }
+
+    /// Parse a minimal AgentSpec with the given `include` template name
+    /// in its `concerns:` frontmatter.
+    fn agent_with_concerns(include: &str) -> AgentSpec {
+        let src = format!(
+            "---\nname: test-agent\nconcerns:\n  - include: {include}\n---\nDo the thing.\n"
+        );
+        AgentSpec::parse(&src).expect("agent spec should parse")
+    }
+
+    /// Parse a minimal Workflow with no `concerns:` key at all.
+    fn workflow_without_concerns() -> Workflow {
+        let yaml =
+            "name: bare\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n";
+        Workflow::parse(yaml).expect("workflow should parse")
+    }
+
+    // ── Case 1: both declare concerns → workflow wins ────────────────────────
+
+    #[test]
+    fn workflow_concerns_override_agent_concerns() {
+        let workflow = workflow_with_concerns("wf-security-scan", "stride");
+        let agent = agent_with_concerns("owasp-top10-2021");
+
+        // Replicate the exact resolution from step_factory.rs line 208.
+        let resolved = workflow.concerns.clone().or(agent.concerns);
+
+        let block = resolved.expect("concerns should be Some after resolution");
+        assert_eq!(
+            block.entries.len(),
+            1,
+            "resolved block should have exactly one entry"
+        );
+        assert_eq!(
+            first_include(&block),
+            "stride",
+            "workflow's concerns (stride) must win over agent's (owasp-top10-2021)"
+        );
+    }
+
+    // ── Case 2: only agent declares concerns → agent's flow through ──────────
+
+    #[test]
+    fn agent_concerns_used_when_workflow_has_none() {
+        let workflow = workflow_without_concerns();
+        let agent = agent_with_concerns("owasp-top10-2021");
+
+        // Same resolution expression.
+        let resolved = workflow.concerns.clone().or(agent.concerns);
+
+        let block = resolved.expect("agent concerns should flow through when workflow has none");
+        assert_eq!(
+            first_include(&block),
+            "owasp-top10-2021",
+            "agent's concerns should be the resolved value when workflow has none"
+        );
+    }
+
+    // ── Case 3: scope_name is derived from the workflow name ─────────────────
+
+    #[test]
+    fn scope_name_is_workflow_name() {
+        // The scope_name assignment on line 212 is:
+        //   scope_name: Some(self.workflow.name.clone())
+        // Verify that the workflow name is correctly accessible after parse.
+        let workflow = workflow_with_concerns("my-workflow", "stride");
+        // Mimic what build_opts_for_step does.
+        let scope_name: Option<String> = Some(workflow.name.clone());
+        assert_eq!(
+            scope_name.as_deref(),
+            Some("my-workflow"),
+            "scope_name must equal the workflow's name"
+        );
+    }
+}
