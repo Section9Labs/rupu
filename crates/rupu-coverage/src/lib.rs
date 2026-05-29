@@ -29,8 +29,8 @@ pub use catalog::{
 pub use audit::{AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster};
 pub use audit::generate::audit as run_audit;
 pub use ledger::{
-    file_views, read_concern_assertions, read_file_events, read_findings, target_id,
-    AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, CoverageWriter,
-    CoverageWriterHandle, Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord,
-    FindingScope, Surface,
+    discover_targets, file_views, read_concern_assertions, read_file_events, read_findings,
+    target_id, AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, CoverageWriter,
+    CoverageWriterHandle, DiscoveredTarget, Evidence, FileTouchEvent, FileView, FindingEvidence,
+    FindingRecord, FindingScope, Surface,
 };
