@@ -1,4 +1,5 @@
 use crate::catalog::filter::ConcernFilter;
+use crate::catalog::text::first_sentence;
 use crate::catalog::types::{Concern, FlatCatalog};
 use serde::{Deserialize, Serialize};
 
@@ -103,21 +104,6 @@ fn severity_label(s: crate::catalog::types::Severity) -> String {
         Critical => "critical",
     }
     .to_string()
-}
-
-fn first_sentence(text: &str) -> String {
-    let trimmed = text.trim();
-    let mut end_cap = trimmed.len().min(200);
-    while end_cap < trimmed.len() && !trimmed.is_char_boundary(end_cap) {
-        end_cap -= 1;
-    }
-    let mut end = end_cap;
-    if let Some(idx) = trimmed[..end_cap].find(". ") {
-        end = idx + 1;
-    } else if let Some(idx) = trimmed[..end_cap].find(".\n") {
-        end = idx + 1;
-    }
-    trimmed[..end].replace('\n', " ").trim().to_string()
 }
 
 #[cfg(test)]

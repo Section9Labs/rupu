@@ -15,7 +15,7 @@
 //!   6. Reads `files.jsonl` and asserts the expected events landed.
 
 use rupu_coverage::{CoveragePaths, CoverageWriterHandle, FileTouchEvent};
-use rupu_tools::{EditFileTool, GlobTool, ReadFileTool, Tool, ToolContext};
+use rupu_tools::{BashTool, EditFileTool, GlobTool, GrepTool, ReadFileTool, Tool, ToolContext};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -290,6 +290,220 @@ async fn glob_no_events_when_nothing_matches() {
     assert!(
         events.is_empty(),
         "no events when no files match; got: {events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// grep
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn grep_emits_grep_events_for_matched_files() {
+    // Guard: skip gracefully if `rg` is not on PATH.
+    if std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP grep_emits_grep_events_for_matched_files: `rg` not found in PATH");
+        return;
+    }
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    // file_a contains the pattern; file_b does not.
+    std::fs::write(
+        workspace.path().join("file_a.txt"),
+        "hello world\nrust is great\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("file_b.txt"), "no match here\n").unwrap();
+
+    let ledger = tempfile::TempDir::new().unwrap();
+    let paths = CoveragePaths::new(ledger.path(), "test-target");
+    let handle = CoverageWriterHandle::spawn(paths.clone()).unwrap();
+
+    {
+        let ctx = ctx_with_coverage(workspace.path(), handle.writer.clone());
+        let tool = GrepTool;
+        let out = tool
+            .invoke(json!({ "pattern": "hello" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "grep should succeed: {out:?}");
+        assert!(
+            out.stdout.contains("file_a.txt"),
+            "stdout should mention the matching file"
+        );
+    }
+
+    handle.shutdown().await;
+
+    let events = read_events(&paths);
+    assert_eq!(
+        events.len(),
+        1,
+        "expected exactly one Grep event (file_a only); got: {events:?}"
+    );
+    match &events[0] {
+        FileTouchEvent::Grep {
+            path,
+            pattern,
+            match_count,
+            tool,
+            ..
+        } => {
+            assert_eq!(path, "file_a.txt");
+            assert_eq!(pattern, "hello");
+            assert_eq!(*match_count, 1, "one matching line");
+            assert_eq!(tool, "grep");
+        }
+        other => panic!("expected Grep event, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn grep_no_events_when_nothing_matches() {
+    // Guard: skip gracefully if `rg` is not on PATH.
+    if std::process::Command::new("rg")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("SKIP grep_no_events_when_nothing_matches: `rg` not found in PATH");
+        return;
+    }
+
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("only.txt"), "no relevant content\n").unwrap();
+
+    let ledger = tempfile::TempDir::new().unwrap();
+    let paths = CoveragePaths::new(ledger.path(), "test-target");
+    let handle = CoverageWriterHandle::spawn(paths.clone()).unwrap();
+
+    {
+        let ctx = ctx_with_coverage(workspace.path(), handle.writer.clone());
+        let tool = GrepTool;
+        let out = tool
+            .invoke(json!({ "pattern": "PATTERN_THAT_WONT_MATCH_ANYTHING" }), &ctx)
+            .await
+            .unwrap();
+        // Exit code 1 (no matches) is NOT an error for rg.
+        assert!(out.error.is_none(), "no-match grep should succeed: {out:?}");
+    }
+
+    handle.shutdown().await;
+
+    let events = read_events(&paths);
+    assert!(
+        events.is_empty(),
+        "no events expected when pattern doesn't match; got: {events:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// bash
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bash_emits_cmd_events_for_workspace_path_args() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("target.txt"), "some content\n").unwrap();
+
+    let ledger = tempfile::TempDir::new().unwrap();
+    let paths = CoveragePaths::new(ledger.path(), "test-target");
+    let handle = CoverageWriterHandle::spawn(paths.clone()).unwrap();
+
+    {
+        let ctx = ctx_with_coverage(workspace.path(), handle.writer.clone());
+        let tool = BashTool;
+        let out = tool
+            .invoke(json!({ "command": "wc -l target.txt" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "bash should succeed: {out:?}");
+    }
+
+    handle.shutdown().await;
+
+    let events = read_events(&paths);
+    assert_eq!(
+        events.len(),
+        1,
+        "expected one Cmd event for target.txt; got: {events:?}"
+    );
+    match &events[0] {
+        FileTouchEvent::Cmd {
+            path,
+            command,
+            tool,
+            ..
+        } => {
+            assert_eq!(path, "target.txt");
+            assert_eq!(command, "wc -l target.txt");
+            assert_eq!(tool, "bash");
+        }
+        other => panic!("expected Cmd event, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn bash_skips_flag_tokens() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let ledger = tempfile::TempDir::new().unwrap();
+    let paths = CoveragePaths::new(ledger.path(), "test-target");
+    let handle = CoverageWriterHandle::spawn(paths.clone()).unwrap();
+
+    {
+        let ctx = ctx_with_coverage(workspace.path(), handle.writer.clone());
+        let tool = BashTool;
+        // `ls -la` — `-la` starts with `-` so should be skipped; `ls` is not a
+        // file in the workspace, so no Cmd event should be emitted at all.
+        let out = tool
+            .invoke(json!({ "command": "ls -la" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "bash should succeed: {out:?}");
+    }
+
+    handle.shutdown().await;
+
+    let events = read_events(&paths);
+    assert!(
+        events.is_empty(),
+        "flag tokens and non-file tokens should not emit Cmd events; got: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn bash_no_events_for_non_file_tokens() {
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let ledger = tempfile::TempDir::new().unwrap();
+    let paths = CoveragePaths::new(ledger.path(), "test-target");
+    let handle = CoverageWriterHandle::spawn(paths.clone()).unwrap();
+
+    {
+        let ctx = ctx_with_coverage(workspace.path(), handle.writer.clone());
+        let tool = BashTool;
+        // `echo hello` — neither token is an existing workspace file.
+        let out = tool
+            .invoke(json!({ "command": "echo hello" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.error.is_none(), "bash should succeed: {out:?}");
+        assert!(
+            out.stdout.contains("hello"),
+            "echo output should contain 'hello'"
+        );
+    }
+
+    handle.shutdown().await;
+
+    let events = read_events(&paths);
+    assert!(
+        events.is_empty(),
+        "non-file tokens should produce no Cmd events; got: {events:?}"
     );
 }
 

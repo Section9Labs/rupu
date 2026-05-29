@@ -1,4 +1,4 @@
-use crate::ledger::events::{ConcernAssertion, FileTouchEvent, FindingRecord};
+use crate::ledger::events::FileTouchEvent;
 use crate::ledger::paths::CoveragePaths;
 use std::sync::Arc;
 use tokio::fs::OpenOptions;
@@ -11,8 +11,6 @@ const CHANNEL_CAPACITY: usize = 1024;
 #[derive(Debug)]
 enum WriteRequest {
     File(FileTouchEvent),
-    Concern(ConcernAssertion),
-    Finding(FindingRecord),
     Flush(tokio::sync::oneshot::Sender<()>),
 }
 
@@ -52,14 +50,6 @@ impl CoverageWriter {
     pub async fn record_file_touch(&self, event: FileTouchEvent) {
         let _ = self.tx.send(WriteRequest::File(event)).await;
     }
-
-    pub async fn record_concern(&self, assertion: ConcernAssertion) {
-        let _ = self.tx.send(WriteRequest::Concern(assertion)).await;
-    }
-
-    pub async fn record_finding(&self, record: FindingRecord) {
-        let _ = self.tx.send(WriteRequest::Finding(record)).await;
-    }
 }
 
 async fn run_writer(paths: CoveragePaths, mut rx: mpsc::Receiver<WriteRequest>) {
@@ -75,30 +65,6 @@ async fn run_writer(paths: CoveragePaths, mut rx: mpsc::Receiver<WriteRequest>) 
             return;
         }
     };
-    let mut concerns_f = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.concerns)
-        .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!(?e, path = ?paths.concerns, "open coverage concerns.jsonl");
-            return;
-        }
-    };
-    let mut findings_f = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.findings)
-        .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!(?e, path = ?paths.findings, "open coverage findings.jsonl");
-            return;
-        }
-    };
 
     while let Some(req) = rx.recv().await {
         match req {
@@ -108,29 +74,13 @@ async fn run_writer(paths: CoveragePaths, mut rx: mpsc::Receiver<WriteRequest>) 
                     let _ = files_f.write_all(b"\n").await;
                 }
             }
-            WriteRequest::Concern(a) => {
-                if let Ok(line) = serde_json::to_string(&a) {
-                    let _ = concerns_f.write_all(line.as_bytes()).await;
-                    let _ = concerns_f.write_all(b"\n").await;
-                }
-            }
-            WriteRequest::Finding(f) => {
-                if let Ok(line) = serde_json::to_string(&f) {
-                    let _ = findings_f.write_all(line.as_bytes()).await;
-                    let _ = findings_f.write_all(b"\n").await;
-                }
-            }
             WriteRequest::Flush(ack) => {
                 let _ = files_f.flush().await;
-                let _ = concerns_f.flush().await;
-                let _ = findings_f.flush().await;
                 let _ = ack.send(());
             }
         }
     }
     let _ = files_f.flush().await;
-    let _ = concerns_f.flush().await;
-    let _ = findings_f.flush().await;
 }
 
 #[cfg(test)]

@@ -19,7 +19,34 @@ pub fn coverage_status(
     input: CoverageStatusInput,
 ) -> std::io::Result<Vec<ConcernAssertion>> {
     let all = read_concern_assertions(paths)?;
-    Ok(all
+
+    // Within-run supersede: for each (concern_id, file_path, run_id), keep only
+    // the last occurrence (most recent in append order).  Cross-run entries with
+    // the same concern+file but a different run_id are intentionally preserved so
+    // callers can observe multi-run disagreement.
+    let deduped = {
+        use std::collections::HashMap;
+        // Map from (concern_id, file_path, run_id) → index into `out`.
+        let mut index: HashMap<(String, String, String), usize> = HashMap::new();
+        let mut out: Vec<ConcernAssertion> = Vec::with_capacity(all.len());
+        for a in all {
+            let key = (
+                a.concern_id.clone(),
+                a.file_path.clone(),
+                a.declared_by.run_id.clone(),
+            );
+            if let Some(&pos) = index.get(&key) {
+                // Replace the earlier entry in-place; preserve first-appearance order.
+                out[pos] = a;
+            } else {
+                index.insert(key, out.len());
+                out.push(a);
+            }
+        }
+        out
+    };
+
+    Ok(deduped
         .into_iter()
         .filter(|a| {
             input.concern_id.as_deref().is_none_or(|c| a.concern_id == c)
@@ -88,5 +115,36 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].file_path, "src/handlers/users.rs");
+    }
+
+    #[test]
+    fn within_run_remark_supersedes_earlier() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        // Same concern+file+run, marked twice: examined then clean.
+        let mut a1 = assertion("ssrf", "src/a.rs");
+        a1.status = AssertionStatus::Examined;
+        let mut a2 = assertion("ssrf", "src/a.rs");
+        a2.status = AssertionStatus::Clean;
+        // both same run_id (the assertion() helper uses run_id "r")
+        write_jsonl(&paths, &[a1, a2]);
+        let results = coverage_status(&paths, CoverageStatusInput::default()).unwrap();
+        assert_eq!(results.len(), 1, "re-mark should supersede");
+        assert_eq!(results[0].status, AssertionStatus::Clean);
+    }
+
+    #[test]
+    fn cross_run_assertions_are_preserved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let mut a1 = assertion("ssrf", "src/a.rs");
+        a1.declared_by.run_id = "run_A".to_string();
+        a1.status = AssertionStatus::Clean;
+        let mut a2 = assertion("ssrf", "src/a.rs");
+        a2.declared_by.run_id = "run_B".to_string();
+        a2.status = AssertionStatus::Finding;
+        write_jsonl(&paths, &[a1, a2]);
+        let results = coverage_status(&paths, CoverageStatusInput::default()).unwrap();
+        assert_eq!(results.len(), 2, "different runs must both be kept");
     }
 }

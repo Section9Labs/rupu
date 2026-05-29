@@ -255,7 +255,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // Coverage harness: flatten catalog, write snapshot, spawn writer.
     // The handle is kept separate so it can be consumed (shutdown) at each
     // exit point, including early returns on provider/operator errors.
-    let (coverage, mut coverage_handle): (Option<CoverageBundle>, Option<CoverageWriterHandle>) =
+    let (coverage, coverage_handle): (Option<CoverageBundle>, Option<CoverageWriterHandle>) =
         if let Some(block) = opts.concerns.clone() {
             let catalog = flatten(&block)
                 .map_err(|e| RunError::Coverage(format!("flatten coverage catalog: {e}")))?;
@@ -362,330 +362,330 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     let mut total_out: u64 = 0;
     let mut runtime_mode = parse_mode_for_runtime(&opts.mode_str);
 
-    let result_status = loop {
-        if turn_idx >= opts.max_turns {
-            break RunStatus::Error;
-        }
-        writer.write(&Event::TurnStart { turn_idx })?;
-        let req = LlmRequest {
-            model: opts.model.clone(),
-            system: Some(opts.agent_system_prompt.clone()),
-            messages: messages.clone(),
-            max_tokens: 4096,
-            tools: tool_defs.clone(),
-            cell_id: None,
-            trace_id: None,
-            thinking: opts.effort,
-            context_window: opts.context_window,
-            task_type: None,
-            output_format: opts.output_format,
-            anthropic_task_budget: opts.anthropic_task_budget,
-            anthropic_context_management: opts.anthropic_context_management,
-            anthropic_speed: opts.anthropic_speed,
-        };
-        let resp: LlmResponse = if opts.no_stream {
-            match opts.provider.send(&req).await {
-                Ok(r) => r,
-                Err(e) => {
-                    writer.write(&Event::RunComplete {
-                        run_id: opts.run_id.clone(),
-                        status: RunStatus::Error,
-                        total_tokens: total_in + total_out,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        error: Some(format!("provider: {e}")),
-                    })?;
-                    writer.flush()?;
-                    opts.tool_context.coverage_writer = None;
-                    if let Some(h) = coverage_handle.take() {
-                        h.shutdown().await;
-                    }
-                    return Err(RunError::Provider(e.to_string()));
-                }
+    // -----------------------------------------------------------------------
+    // Inner fallible block.  Every `?` inside here propagates out to
+    // `inner_result`; the unconditional teardown below then runs on BOTH
+    // success and error paths, guaranteeing the coverage writer is always
+    // flushed before we return.
+    // -----------------------------------------------------------------------
+    let inner_result: Result<RunResult, RunError> = async {
+        let result_status = loop {
+            if turn_idx >= opts.max_turns {
+                break RunStatus::Error;
             }
-        } else {
-            let suppress = opts.suppress_stream_stdout;
-            let mut stream_transcript_error: Option<rupu_transcript::WriteError> = None;
-            let mut on_event = |ev: StreamEvent| {
-                if let Some(cb) = opts.on_stream_event.as_ref() {
-                    cb(ev.clone());
-                }
-                match ev {
-                    StreamEvent::TextDelta(chunk) => {
-                        if !chunk.is_empty() && stream_transcript_error.is_none() {
-                            if let Err(err) = writer
-                                .write(&Event::AssistantDelta {
-                                    content: chunk.clone(),
-                                })
-                                .and_then(|_| writer.flush())
-                            {
-                                stream_transcript_error = Some(err);
-                            }
-                        }
-                        if !suppress {
-                            use std::io::Write;
-                            print!("{chunk}");
-                            let _ = std::io::stdout().flush();
-                        }
-                    }
-                    StreamEvent::UsageSnapshot(_) => {}
-                    StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => {}
-                }
+            writer.write(&Event::TurnStart { turn_idx })?;
+            let req = LlmRequest {
+                model: opts.model.clone(),
+                system: Some(opts.agent_system_prompt.clone()),
+                messages: messages.clone(),
+                max_tokens: 4096,
+                tools: tool_defs.clone(),
+                cell_id: None,
+                trace_id: None,
+                thinking: opts.effort,
+                context_window: opts.context_window,
+                task_type: None,
+                output_format: opts.output_format,
+                anthropic_task_budget: opts.anthropic_task_budget,
+                anthropic_context_management: opts.anthropic_context_management,
+                anthropic_speed: opts.anthropic_speed,
             };
-            match opts.provider.stream(&req, &mut on_event).await {
-                Ok(r) => {
-                    if !suppress {
-                        println!();
+            let resp: LlmResponse = if opts.no_stream {
+                match opts.provider.send(&req).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        writer.write(&Event::RunComplete {
+                            run_id: opts.run_id.clone(),
+                            status: RunStatus::Error,
+                            total_tokens: total_in + total_out,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            error: Some(format!("provider: {e}")),
+                        })?;
+                        writer.flush()?;
+                        return Err(RunError::Provider(e.to_string()));
                     }
-                    if let Some(err) = stream_transcript_error {
-                        opts.tool_context.coverage_writer = None;
-                        if let Some(h) = coverage_handle.take() {
-                            h.shutdown().await;
-                        }
-                        return Err(RunError::Transcript(err));
-                    }
-                    r
                 }
-                Err(e) => {
-                    writer.write(&Event::RunComplete {
-                        run_id: opts.run_id.clone(),
-                        status: RunStatus::Error,
-                        total_tokens: total_in + total_out,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        error: Some(format!("provider: {e}")),
-                    })?;
-                    writer.flush()?;
-                    opts.tool_context.coverage_writer = None;
-                    if let Some(h) = coverage_handle.take() {
-                        h.shutdown().await;
-                    }
-                    return Err(RunError::Provider(e.to_string()));
-                }
-            }
-        };
-        total_in += resp.usage.input_tokens as u64;
-        total_out += resp.usage.output_tokens as u64;
-        writer.write(&Event::Usage {
-            provider: opts.provider_name.clone(),
-            model: if resp.model.is_empty() {
-                opts.model.clone()
             } else {
-                resp.model.clone()
-            },
-            input_tokens: resp.usage.input_tokens,
-            output_tokens: resp.usage.output_tokens,
-            cached_tokens: resp.usage.cached_tokens,
-        })?;
-
-        // Emit any text content as assistant_message events; collect
-        // tool_use blocks for dispatch.
-        let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
-        for block in &resp.content {
-            match block {
-                ContentBlock::Text { text } => {
-                    writer.write(&Event::AssistantMessage {
-                        content: text.clone(),
-                        thinking: None,
-                    })?;
-                }
-                ContentBlock::ToolUse { id, name, input } => {
-                    writer.write(&Event::ToolCall {
-                        call_id: id.clone(),
-                        tool: name.clone(),
-                        input: input.clone(),
-                    })?;
-                    tool_uses.push((id.clone(), name.clone(), input.clone()));
-                }
-                ContentBlock::ToolResult { .. } => {
-                    // Models don't produce tool_result blocks themselves;
-                    // those originate from the runtime feeding tool
-                    // outputs back. Ignore if seen.
-                }
-            }
-        }
-
-        // Dispatch tool calls in order.
-        let mut tool_results: Vec<(String, String, Option<String>)> = Vec::new();
-        for (call_id, tool_name, input) in tool_uses {
-            // Permission gate.
-            let decision = opts.decider.decide(
-                runtime_mode,
-                &tool_name,
-                &input,
-                &opts.workspace_path.display().to_string(),
-            )?;
-            match decision {
-                PermissionDecision::Deny => {
-                    writer.write(&Event::ToolResult {
-                        call_id: call_id.clone(),
-                        output: String::new(),
-                        error: Some("permission_denied".into()),
-                        duration_ms: 0,
-                    })?;
-                    tool_results.push((call_id, String::new(), Some("permission_denied".into())));
-                    continue;
-                }
-                PermissionDecision::StopRun => {
-                    writer.write(&Event::RunComplete {
-                        run_id: opts.run_id.clone(),
-                        status: RunStatus::Aborted,
-                        total_tokens: total_in + total_out,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        error: Some("operator_stop".into()),
-                    })?;
-                    writer.flush()?;
-                    opts.tool_context.coverage_writer = None;
-                    if let Some(h) = coverage_handle.take() {
-                        h.shutdown().await;
+                let suppress = opts.suppress_stream_stdout;
+                let mut stream_transcript_error: Option<rupu_transcript::WriteError> = None;
+                let mut on_event = |ev: StreamEvent| {
+                    if let Some(cb) = opts.on_stream_event.as_ref() {
+                        cb(ev.clone());
                     }
-                    return Err(RunError::OperatorStop { turn: turn_idx });
-                }
-                PermissionDecision::AllowAlwaysForToolThisRun => {
-                    runtime_mode = PermissionMode::Bypass;
-                }
-                PermissionDecision::Allow => {}
-            }
-
-            let tool: Arc<dyn Tool> = match registry.get(&tool_name) {
-                Some(t) => t,
-                None => {
-                    writer.write(&Event::ToolResult {
-                        call_id: call_id.clone(),
-                        output: String::new(),
-                        error: Some(format!("unknown tool: {tool_name}")),
-                        duration_ms: 0,
-                    })?;
-                    tool_results.push((call_id, String::new(), Some("unknown_tool".into())));
-                    continue;
+                    match ev {
+                        StreamEvent::TextDelta(chunk) => {
+                            if !chunk.is_empty() && stream_transcript_error.is_none() {
+                                if let Err(err) = writer
+                                    .write(&Event::AssistantDelta {
+                                        content: chunk.clone(),
+                                    })
+                                    .and_then(|_| writer.flush())
+                                {
+                                    stream_transcript_error = Some(err);
+                                }
+                            }
+                            if !suppress {
+                                use std::io::Write;
+                                print!("{chunk}");
+                                let _ = std::io::stdout().flush();
+                            }
+                        }
+                        StreamEvent::UsageSnapshot(_) => {}
+                        StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => {}
+                    }
+                };
+                match opts.provider.stream(&req, &mut on_event).await {
+                    Ok(r) => {
+                        if !suppress {
+                            println!();
+                        }
+                        if let Some(err) = stream_transcript_error {
+                            return Err(RunError::Transcript(err));
+                        }
+                        r
+                    }
+                    Err(e) => {
+                        writer.write(&Event::RunComplete {
+                            run_id: opts.run_id.clone(),
+                            status: RunStatus::Error,
+                            total_tokens: total_in + total_out,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            error: Some(format!("provider: {e}")),
+                        })?;
+                        writer.flush()?;
+                        return Err(RunError::Provider(e.to_string()));
+                    }
                 }
             };
-            if let Some(cb) = opts.on_tool_call.as_ref() {
-                cb(&opts.step_id, &tool_name);
+            total_in += resp.usage.input_tokens as u64;
+            total_out += resp.usage.output_tokens as u64;
+            writer.write(&Event::Usage {
+                provider: opts.provider_name.clone(),
+                model: if resp.model.is_empty() {
+                    opts.model.clone()
+                } else {
+                    resp.model.clone()
+                },
+                input_tokens: resp.usage.input_tokens,
+                output_tokens: resp.usage.output_tokens,
+                cached_tokens: resp.usage.cached_tokens,
+            })?;
+
+            // Emit any text content as assistant_message events; collect
+            // tool_use blocks for dispatch.
+            let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
+            for block in &resp.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        writer.write(&Event::AssistantMessage {
+                            content: text.clone(),
+                            thinking: None,
+                        })?;
+                    }
+                    ContentBlock::ToolUse { id, name, input } => {
+                        writer.write(&Event::ToolCall {
+                            call_id: id.clone(),
+                            tool: name.clone(),
+                            input: input.clone(),
+                        })?;
+                        tool_uses.push((id.clone(), name.clone(), input.clone()));
+                    }
+                    ContentBlock::ToolResult { .. } => {
+                        // Models don't produce tool_result blocks themselves;
+                        // those originate from the runtime feeding tool
+                        // outputs back. Ignore if seen.
+                    }
+                }
             }
-            let started_tool = Instant::now();
-            match tool.invoke(input.clone(), &opts.tool_context).await {
-                Ok(out) => {
-                    let clamped_stdout = clamp_tool_result_text(&out.stdout);
-                    writer.write(&Event::ToolResult {
-                        call_id: call_id.clone(),
-                        output: clamped_stdout.clone(),
-                        error: out.error.clone(),
-                        duration_ms: started_tool.elapsed().as_millis() as u64,
-                    })?;
-                    if let Some(d) = out.derived.clone() {
-                        match d {
-                            DerivedEvent::FileEdit { path, kind, diff } => {
-                                writer.write(&Event::FileEdit {
-                                    path,
-                                    kind: parse_file_edit_kind(&kind),
-                                    diff,
-                                })?;
-                            }
-                            DerivedEvent::CommandRun {
-                                argv,
-                                cwd,
-                                exit_code,
-                                stdout_bytes,
-                                stderr_bytes,
-                            } => {
-                                writer.write(&Event::CommandRun {
+
+            // Dispatch tool calls in order.
+            let mut tool_results: Vec<(String, String, Option<String>)> = Vec::new();
+            for (call_id, tool_name, input) in tool_uses {
+                // Permission gate.
+                let decision = opts.decider.decide(
+                    runtime_mode,
+                    &tool_name,
+                    &input,
+                    &opts.workspace_path.display().to_string(),
+                )?;
+                match decision {
+                    PermissionDecision::Deny => {
+                        writer.write(&Event::ToolResult {
+                            call_id: call_id.clone(),
+                            output: String::new(),
+                            error: Some("permission_denied".into()),
+                            duration_ms: 0,
+                        })?;
+                        tool_results
+                            .push((call_id, String::new(), Some("permission_denied".into())));
+                        continue;
+                    }
+                    PermissionDecision::StopRun => {
+                        writer.write(&Event::RunComplete {
+                            run_id: opts.run_id.clone(),
+                            status: RunStatus::Aborted,
+                            total_tokens: total_in + total_out,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            error: Some("operator_stop".into()),
+                        })?;
+                        writer.flush()?;
+                        return Err(RunError::OperatorStop { turn: turn_idx });
+                    }
+                    PermissionDecision::AllowAlwaysForToolThisRun => {
+                        runtime_mode = PermissionMode::Bypass;
+                    }
+                    PermissionDecision::Allow => {}
+                }
+
+                let tool: Arc<dyn Tool> = match registry.get(&tool_name) {
+                    Some(t) => t,
+                    None => {
+                        writer.write(&Event::ToolResult {
+                            call_id: call_id.clone(),
+                            output: String::new(),
+                            error: Some(format!("unknown tool: {tool_name}")),
+                            duration_ms: 0,
+                        })?;
+                        tool_results.push((call_id, String::new(), Some("unknown_tool".into())));
+                        continue;
+                    }
+                };
+                if let Some(cb) = opts.on_tool_call.as_ref() {
+                    cb(&opts.step_id, &tool_name);
+                }
+                let started_tool = Instant::now();
+                match tool.invoke(input.clone(), &opts.tool_context).await {
+                    Ok(out) => {
+                        let clamped_stdout = clamp_tool_result_text(&out.stdout);
+                        writer.write(&Event::ToolResult {
+                            call_id: call_id.clone(),
+                            output: clamped_stdout.clone(),
+                            error: out.error.clone(),
+                            duration_ms: started_tool.elapsed().as_millis() as u64,
+                        })?;
+                        if let Some(d) = out.derived.clone() {
+                            match d {
+                                DerivedEvent::FileEdit { path, kind, diff } => {
+                                    writer.write(&Event::FileEdit {
+                                        path,
+                                        kind: parse_file_edit_kind(&kind),
+                                        diff,
+                                    })?;
+                                }
+                                DerivedEvent::CommandRun {
                                     argv,
                                     cwd,
                                     exit_code,
                                     stdout_bytes,
                                     stderr_bytes,
-                                })?;
+                                } => {
+                                    writer.write(&Event::CommandRun {
+                                        argv,
+                                        cwd,
+                                        exit_code,
+                                        stdout_bytes,
+                                        stderr_bytes,
+                                    })?;
+                                }
                             }
                         }
+                        tool_results.push((call_id, clamped_stdout, out.error));
                     }
-                    tool_results.push((call_id, clamped_stdout, out.error));
-                }
-                Err(e) => {
-                    let msg = format!("{e}");
-                    writer.write(&Event::ToolResult {
-                        call_id: call_id.clone(),
-                        output: String::new(),
-                        error: Some(msg.clone()),
-                        duration_ms: started_tool.elapsed().as_millis() as u64,
-                    })?;
-                    tool_results.push((call_id, String::new(), Some(msg)));
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        writer.write(&Event::ToolResult {
+                            call_id: call_id.clone(),
+                            output: String::new(),
+                            error: Some(msg.clone()),
+                            duration_ms: started_tool.elapsed().as_millis() as u64,
+                        })?;
+                        tool_results.push((call_id, String::new(), Some(msg)));
+                    }
                 }
             }
-        }
 
-        writer.write(&Event::TurnEnd {
-            turn_idx,
-            tokens_in: Some(resp.usage.input_tokens as u64),
-            tokens_out: Some(resp.usage.output_tokens as u64),
+            writer.write(&Event::TurnEnd {
+                turn_idx,
+                tokens_in: Some(resp.usage.input_tokens as u64),
+                tokens_out: Some(resp.usage.output_tokens as u64),
+            })?;
+            writer.flush()?;
+
+            // Append assistant + tool_result(s) to messages so the next
+            // turn sees them. `Message::assistant` only takes &str, so we
+            // construct a multi-block assistant message manually.
+            messages.push(Message {
+                role: Role::Assistant,
+                content: resp.content.clone(),
+            });
+            if !tool_results.is_empty() {
+                let mut blocks: Vec<ContentBlock> = Vec::new();
+                for (call_id, output, error) in tool_results {
+                    let is_error = error.is_some();
+                    let content = if let Some(e) = error {
+                        clamp_tool_result_text(&format!("error: {e}\n{output}"))
+                    } else {
+                        output
+                    };
+                    blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: call_id,
+                        content,
+                        is_error,
+                    });
+                }
+                messages.push(Message {
+                    role: Role::User,
+                    content: blocks,
+                });
+            }
+
+            turn_idx += 1;
+            // `stop_reason` is `Option<StopReason>`. None → keep looping.
+            if matches!(resp.stop_reason, Some(StopReason::EndTurn)) {
+                break RunStatus::Ok;
+            }
+        };
+
+        writer.write(&Event::RunComplete {
+            run_id: opts.run_id.clone(),
+            status: result_status,
+            total_tokens: total_in + total_out,
+            duration_ms: started.elapsed().as_millis() as u64,
+            error: None,
         })?;
         writer.flush()?;
 
-        // Append assistant + tool_result(s) to messages so the next
-        // turn sees them. `Message::assistant` only takes &str, so we
-        // construct a multi-block assistant message manually.
-        messages.push(Message {
-            role: Role::Assistant,
-            content: resp.content.clone(),
-        });
-        if !tool_results.is_empty() {
-            let mut blocks: Vec<ContentBlock> = Vec::new();
-            for (call_id, output, error) in tool_results {
-                let is_error = error.is_some();
-                let content = if let Some(e) = error {
-                    clamp_tool_result_text(&format!("error: {e}\n{output}"))
-                } else {
-                    output
-                };
-                blocks.push(ContentBlock::ToolResult {
-                    tool_use_id: call_id,
-                    content,
-                    is_error,
-                });
-            }
-            messages.push(Message {
-                role: Role::User,
-                content: blocks,
-            });
+        // Drop the MCP transport so the server's recv() returns None and exits.
+        // Then await its JoinHandle for deterministic shutdown.
+        if let Some((transport, handle)) = mcp_guard {
+            drop(transport);
+            let _ = handle.join.await;
         }
 
-        turn_idx += 1;
-        // `stop_reason` is `Option<StopReason>`. None → keep looping.
-        if matches!(resp.stop_reason, Some(StopReason::EndTurn)) {
-            break RunStatus::Ok;
-        }
-    };
-
-    writer.write(&Event::RunComplete {
-        run_id: opts.run_id.clone(),
-        status: result_status,
-        total_tokens: total_in + total_out,
-        duration_ms: started.elapsed().as_millis() as u64,
-        error: None,
-    })?;
-    writer.flush()?;
-
-    // Drop the MCP transport so the server's recv() returns None and exits.
-    // Then await its JoinHandle for deterministic shutdown.
-    if let Some((transport, handle)) = mcp_guard {
-        drop(transport);
-        let _ = handle.join.await;
+        Ok(RunResult {
+            status: result_status,
+            turns: turn_idx.saturating_sub(initial_turn_idx),
+            total_tokens_in: total_in,
+            total_tokens_out: total_out,
+            final_messages: messages,
+        })
     }
+    .await;
 
-    // Shutdown the coverage writer. Drop the ToolContext's Arc<CoverageWriter>
-    // clone BEFORE calling shutdown so the writer task's mpsc channel closes
-    // cleanly (shutdown drops the handle's Arc, but if ToolContext still holds
-    // a clone the task's recv() would never return None and task.await hangs).
+    // -----------------------------------------------------------------------
+    // Unconditional coverage-writer teardown — runs on BOTH success and error.
+    //
+    // Drop the ToolContext's Arc<CoverageWriter> clone BEFORE calling shutdown
+    // so the writer task's mpsc channel closes cleanly.  If ToolContext still
+    // holds a clone when shutdown() awaits the JoinHandle, the task's recv()
+    // never sees EOF and the await hangs indefinitely.
+    // -----------------------------------------------------------------------
     opts.tool_context.coverage_writer = None;
     if let Some(h) = coverage_handle {
         h.shutdown().await;
     }
 
-    Ok(RunResult {
-        status: result_status,
-        turns: turn_idx.saturating_sub(initial_turn_idx),
-        total_tokens_in: total_in,
-        total_tokens_out: total_out,
-        final_messages: messages,
-    })
+    inner_result
 }
 
 fn parse_mode_for_event(s: &str) -> RunMode {
