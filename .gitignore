@@ -7,3 +7,5 @@
 .worktrees/
 .claude/
 .superpowers/
+crates/rupu-coverage/build/cwe/*.xml
+crates/rupu-coverage/build/cwe/*.zip

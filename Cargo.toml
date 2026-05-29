@@ -111,6 +111,9 @@ hmac = "0.12"
 hex = "0.4"
 subtle = "2"
 
+# XML parsing (CWE catalog generator, feature-gated)
+quick-xml = "0.36"
+
 # Test deps
 tempfile = "3"
 assert_fs = "1"

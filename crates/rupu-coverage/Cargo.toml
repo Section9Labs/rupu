@@ -9,6 +9,14 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+gen = ["dep:quick-xml"]
+
+[[bin]]
+name = "gen_cwe_catalog"
+path = "src/bin/gen_cwe_catalog.rs"
+required-features = ["gen"]
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -20,6 +28,7 @@ chrono.workspace = true
 ulid.workspace = true
 glob.workspace = true
 sha2.workspace = true
+quick-xml = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
