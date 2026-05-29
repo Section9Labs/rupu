@@ -1,5 +1,5 @@
 use crate::catalog::builtin::resolve_builtin;
-use crate::catalog::types::{Concern, ConcernsBlock, ConcernsEntry, FlatCatalog, Template};
+use crate::catalog::types::{CatalogMode, Concern, ConcernsBlock, ConcernsEntry, FlatCatalog, Template};
 use std::collections::BTreeMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -39,10 +39,12 @@ where
     // Pass 1: collect inline concerns first so they win on duplicate ids.
     let mut by_id: BTreeMap<String, Concern> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
+    let mut render_modes: BTreeMap<String, CatalogMode> = BTreeMap::new();
     for entry in &block.entries {
         if let ConcernsEntry::Inline(concern) = entry {
             by_id.insert(concern.id.clone(), concern.clone());
             sources.insert(concern.id.clone(), "inline".to_string());
+            render_modes.insert(concern.id.clone(), CatalogMode::Auto);
         }
     }
 
@@ -59,6 +61,14 @@ where
         for nested_name in &template.includes {
             let nested = resolve(nested_name)?;
             template_concerns.extend(nested.concerns);
+        }
+
+        // Apply per-include filter (subset selector) before overrides
+        // and duplicate-id detection. An empty filter is a no-op.
+        if let Some(filter) = &directive.filter {
+            if !filter.is_empty() {
+                template_concerns.retain(|c| filter.matches(c));
+            }
         }
 
         // Apply overrides — must target a concern that exists in the
@@ -118,12 +128,16 @@ where
             sources
                 .entry(concern.id.clone())
                 .or_insert_with(|| directive.include.clone());
+            render_modes
+                .entry(concern.id.clone())
+                .or_insert(directive.mode);
         }
     }
 
     Ok(FlatCatalog {
         concerns: by_id.into_values().collect(),
         sources,
+        render_modes,
     })
 }
 
@@ -151,6 +165,8 @@ mod tests {
             entries: vec![ConcernsEntry::Include(IncludeDirective {
                 include: "stride".to_string(),
                 overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let cat = flatten(&block).unwrap();
@@ -167,6 +183,8 @@ mod tests {
                 ConcernsEntry::Include(IncludeDirective {
                     include: "stride".to_string(),
                     overrides: vec![],
+                    mode: crate::catalog::types::CatalogMode::Auto,
+                    filter: None,
                 }),
                 ConcernsEntry::Inline(custom),
             ],
@@ -191,6 +209,8 @@ mod tests {
                     severity: Some(Severity::Critical),
                     ..Default::default()
                 }],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let cat = flatten(&block).unwrap();
@@ -208,6 +228,8 @@ mod tests {
             entries: vec![ConcernsEntry::Include(IncludeDirective {
                 include: "not-a-real-template".to_string(),
                 overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let err = flatten(&block).unwrap_err();
@@ -220,6 +242,8 @@ mod tests {
             entries: vec![ConcernsEntry::Include(IncludeDirective {
                 include: "web-security-default".to_string(),
                 overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
             })],
         };
         let cat = flatten(&block).unwrap();
@@ -229,5 +253,60 @@ mod tests {
         assert!(cat.concerns.iter().any(|c| c.id.starts_with("owasp-top10-2021:")));
         assert!(cat.concerns.iter().any(|c| c.id.starts_with("cwe-top25-2023:")));
         assert!(cat.concerns.iter().any(|c| c.id == "secrets-in-source"));
+    }
+
+    #[test]
+    fn filter_subsets_included_template() {
+        use crate::catalog::filter::ConcernFilter;
+        use crate::catalog::types::{CatalogMode, Severity};
+
+        let block = ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: CatalogMode::Auto,
+                filter: Some(ConcernFilter {
+                    severity: vec![Severity::Critical],
+                    ..Default::default()
+                }),
+            })],
+        };
+        let cat = flatten(&block).unwrap();
+        // Only elevation-of-privilege is Critical in stride.
+        assert_eq!(cat.concerns.len(), 1);
+        assert_eq!(cat.concerns[0].id, "stride:elevation-of-privilege");
+    }
+
+    #[test]
+    fn flatten_records_render_mode_per_concern() {
+        use crate::catalog::types::CatalogMode;
+
+        let block = ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: CatalogMode::Index,
+                filter: None,
+            })],
+        };
+        let cat = flatten(&block).unwrap();
+        assert_eq!(cat.render_modes.get("stride:spoofing"), Some(&CatalogMode::Index));
+    }
+
+    #[test]
+    fn empty_filter_is_no_op() {
+        use crate::catalog::filter::ConcernFilter;
+        use crate::catalog::types::CatalogMode;
+
+        let block = ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: CatalogMode::Auto,
+                filter: Some(ConcernFilter::default()),
+            })],
+        };
+        let cat = flatten(&block).unwrap();
+        assert_eq!(cat.concerns.len(), 6);
     }
 }

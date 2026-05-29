@@ -12,8 +12,8 @@ use crate::tool_registry::{default_tool_registry, ToolRegistry};
 use async_trait::async_trait;
 use chrono::Utc;
 use rupu_coverage::{
-    flatten, render_full_mode, target_id, write_snapshot, CoveragePaths, CoverageWriterHandle,
-    FlatCatalog,
+    flatten, render_prompt_section, target_id, write_snapshot, CoveragePaths,
+    CoverageWriterHandle, FlatCatalog, DEFAULT_FULL_MODE_THRESHOLD,
 };
 use rupu_mcp::{McpPermission, ServeHandle};
 use rupu_providers::provider::LlmProvider;
@@ -272,7 +272,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 .map_err(|e| RunError::Coverage(format!("write catalog snapshot: {e}")))?;
             let handle = CoverageWriterHandle::spawn(paths.clone())
                 .map_err(|e| RunError::Coverage(format!("spawn coverage writer: {e}")))?;
-            let prompt_section = render_full_mode(&catalog);
+            let prompt_section = render_prompt_section(&catalog, DEFAULT_FULL_MODE_THRESHOLD);
             let bundle = CoverageBundle {
                 catalog,
                 paths,

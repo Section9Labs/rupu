@@ -15,6 +15,8 @@ async fn end_to_end_workflow_with_stride_catalog() {
         entries: vec![ConcernsEntry::Include(IncludeDirective {
             include: "stride".to_string(),
             overrides: vec![],
+            mode: rupu_coverage::CatalogMode::Auto,
+            filter: None,
         })],
     };
     let catalog = flatten(&block).unwrap();
