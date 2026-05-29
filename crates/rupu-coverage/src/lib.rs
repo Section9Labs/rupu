@@ -3,6 +3,7 @@
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
 
+pub mod audit;
 pub mod catalog;
 pub mod ledger;
 pub mod tools;
@@ -25,6 +26,7 @@ pub use catalog::{
     ConcernOverride, ConcernsBlock, ConcernsEntry, FlatCatalog, FlattenError, IncludeDirective,
     ParseError, Severity, SnapshotError, Template, TouchStrength, DEFAULT_FULL_MODE_THRESHOLD,
 };
+pub use audit::{AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster};
 pub use ledger::{
     file_views, read_concern_assertions, read_file_events, read_findings, target_id,
     AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, CoverageWriter,
