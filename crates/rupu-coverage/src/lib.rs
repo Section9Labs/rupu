@@ -8,7 +8,8 @@ pub mod ledger;
 pub mod tools;
 
 pub use tools::{
-    coverage_concerns_search, coverage_mark, coverage_remaining, coverage_status, report_finding,
+    coverage_concerns_detail, coverage_concerns_search, coverage_mark, coverage_remaining,
+    coverage_status, report_finding, CoverageConcernsDetailInput, CoverageConcernsDetailOutput,
     CoverageConcernsSearchInput, CoverageMarkError, CoverageMarkInput, CoverageMarkOutput,
     CoverageRemainingInput, CoverageStatusInput, RemainingItem, ReportFindingError,
     ReportFindingInput, ReportFindingOutput, SearchResult, SearchResultForm, SearchResultSummary,
