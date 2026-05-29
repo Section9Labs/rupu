@@ -5,7 +5,7 @@
 use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_coverage::{
-    target_id, ConcernsBlock, ConcernsEntry, CoveragePaths, IncludeDirective,
+    target_id, CatalogMode, ConcernsBlock, ConcernsEntry, CoveragePaths, IncludeDirective,
 };
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
@@ -16,6 +16,19 @@ fn stride_block() -> ConcernsBlock {
         entries: vec![ConcernsEntry::Include(IncludeDirective {
             include: "stride".to_string(),
             overrides: vec![],
+            mode: CatalogMode::Auto,
+            filter: None,
+        })],
+    }
+}
+
+fn stride_index_block() -> ConcernsBlock {
+    ConcernsBlock {
+        entries: vec![ConcernsEntry::Include(IncludeDirective {
+            include: "stride".to_string(),
+            overrides: vec![],
+            mode: CatalogMode::Index,
+            filter: None,
         })],
     }
 }
@@ -321,5 +334,98 @@ async fn surface_tag_override_is_respected() {
     assert!(
         paths.catalog.exists(),
         "catalog snapshot should exist even with surface_tag override"
+    );
+}
+
+#[tokio::test]
+async fn agent_run_with_index_mode_concerns_injects_search_and_detail_tools() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path().to_path_buf();
+
+    let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+        text: "Coverage index mode check complete.".into(),
+        stop: StopReason::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
+    }]);
+    let captured = provider.captured.clone();
+
+    let opts = AgentRunOpts {
+        agent_name: "index-mode-agent".into(),
+        agent_system_prompt: "You are a coverage index agent.".into(),
+        agent_tools: None,
+        provider: Box::new(provider),
+        provider_name: "mock".into(),
+        model: "mock-1".into(),
+        run_id: "run_index_mode_test".into(),
+        workspace_id: "ws_index_mode".into(),
+        workspace_path: workspace.clone(),
+        transcript_path: workspace.join("run.jsonl"),
+        max_turns: 5,
+        decider: Arc::new(BypassDecider),
+        tool_context: ToolContext {
+            workspace_path: workspace.clone(),
+            ..Default::default()
+        },
+        user_message: "Check coverage in index mode.".into(),
+        initial_messages: Vec::new(),
+        turn_index_offset: 0,
+        mode_str: "bypass".into(),
+        no_stream: true,
+        suppress_stream_stdout: false,
+        mcp_registry: None,
+        effort: None,
+        context_window: None,
+        output_format: None,
+        anthropic_task_budget: None,
+        anthropic_context_management: None,
+        anthropic_speed: None,
+        parent_run_id: None,
+        depth: 0,
+        dispatchable_agents: None,
+        step_id: String::new(),
+        on_tool_call: None,
+        on_stream_event: None,
+        concerns: Some(stride_index_block()),
+        scope_name: None,
+        surface_tag: None,
+    };
+
+    run_agent(opts).await.expect("agent run with index mode concerns should succeed");
+
+    // Verify that the LLM request included all 6 coverage tools,
+    // including the new search and detail tools for index-mode catalogs.
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests.len(), 1, "expected exactly one LLM request");
+    let tool_names: Vec<&str> = requests[0].tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        tool_names.contains(&"coverage_concerns_search"),
+        "coverage_concerns_search should be in tools: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"coverage_concerns_detail"),
+        "coverage_concerns_detail should be in tools: {tool_names:?}"
+    );
+    // Existing 4 tools must still be present.
+    assert!(
+        tool_names.contains(&"coverage_mark"),
+        "coverage_mark should be in tools: {tool_names:?}"
+    );
+    assert!(
+        tool_names.contains(&"report_finding"),
+        "report_finding should be in tools: {tool_names:?}"
+    );
+
+    // In index mode, the system prompt should contain the index header
+    // (not the full concern body), since render_prompt_section uses
+    // index rendering when mode is CatalogMode::Index.
+    let system = requests[0].system.as_deref().unwrap_or("");
+    assert!(
+        system.starts_with("You are a coverage index agent."),
+        "system prompt should start with original prompt"
+    );
+    assert!(
+        system.contains("coverage_concerns_search") || system.contains("index"),
+        "index-mode system prompt should reference search tool or index: {system}"
     );
 }

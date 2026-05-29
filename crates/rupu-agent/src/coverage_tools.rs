@@ -6,9 +6,10 @@
 
 use async_trait::async_trait;
 use rupu_coverage::{
-    coverage_mark, coverage_remaining, coverage_status, report_finding, Attribution,
-    CoverageMarkInput, CoverageRemainingInput, CoverageStatusInput, CoveragePaths, FlatCatalog,
-    ReportFindingInput, Surface,
+    coverage_concerns_detail, coverage_concerns_search, coverage_mark, coverage_remaining,
+    coverage_status, report_finding, Attribution, CoverageConcernsDetailInput,
+    CoverageConcernsSearchInput, CoverageMarkInput, CoveragePaths, CoverageRemainingInput,
+    CoverageStatusInput, FlatCatalog, ReportFindingInput, Surface,
 };
 use rupu_tools::{Tool, ToolContext, ToolError, ToolOutput};
 use serde_json::Value;
@@ -327,10 +328,114 @@ impl Tool for ReportFindingTool {
 }
 
 // ---------------------------------------------------------------------------
+// coverage_concerns_search
+// ---------------------------------------------------------------------------
+
+pub struct CoverageConcernsSearchTool {
+    catalog: Arc<FlatCatalog>,
+}
+
+#[async_trait]
+impl Tool for CoverageConcernsSearchTool {
+    fn name(&self) -> &'static str {
+        "coverage_concerns_search"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search the concern catalog by substring and/or filter. Returns up to `limit` \
+matching concerns in summary form (id, name, severity, summary) by default, or full \
+form if `form: 'full'`. Use when the catalog is too large to inline in the prompt."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Case-insensitive substring match against id, name, description."
+                },
+                "filter": {
+                    "type": "object",
+                    "properties": {
+                        "severity": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["info", "low", "medium", "high", "critical"]
+                            }
+                        },
+                        "tags": { "type": "array", "items": { "type": "string" } },
+                        "ids": { "type": "array", "items": { "type": "string" } },
+                        "applicable_to_path": { "type": "string" }
+                    }
+                },
+                "limit": { "type": "integer", "default": 20 },
+                "form": {
+                    "type": "string",
+                    "enum": ["summary", "full"],
+                    "default": "summary"
+                }
+            }
+        })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let parsed: CoverageConcernsSearchInput = serde_json::from_value(input)
+            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let results = coverage_concerns_search(&self.catalog, parsed);
+        let text = serde_json::to_string_pretty(&results)
+            .unwrap_or_else(|_| "[]".to_string());
+        Ok(ok_output(text, started))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// coverage_concerns_detail
+// ---------------------------------------------------------------------------
+
+pub struct CoverageConcernsDetailTool {
+    catalog: Arc<FlatCatalog>,
+}
+
+#[async_trait]
+impl Tool for CoverageConcernsDetailTool {
+    fn name(&self) -> &'static str {
+        "coverage_concerns_detail"
+    }
+
+    fn description(&self) -> &'static str {
+        "Fetch full concern records by id. Use after coverage_concerns_search finds a \
+relevant concern and you need its full description, applicable_globs, or references."
+    }
+
+    fn input_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["concern_ids"],
+            "properties": {
+                "concern_ids": { "type": "array", "items": { "type": "string" } }
+            }
+        })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let started = Instant::now();
+        let parsed: CoverageConcernsDetailInput = serde_json::from_value(input)
+            .map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let out = coverage_concerns_detail(&self.catalog, parsed);
+        let text = serde_json::to_string_pretty(&out)
+            .unwrap_or_else(|_| "{}".to_string());
+        Ok(ok_output(text, started))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register all 4 coverage tools into the provided registry.
+/// Register all 6 coverage tools into the provided registry.
 pub fn register(
     registry: &mut crate::tool_registry::ToolRegistry,
     catalog: FlatCatalog,
@@ -361,6 +466,18 @@ pub fn register(
         "report_finding",
         Arc::new(ReportFindingTool {
             paths,
+        }),
+    );
+    registry.insert(
+        "coverage_concerns_search",
+        Arc::new(CoverageConcernsSearchTool {
+            catalog: catalog.clone(),
+        }),
+    );
+    registry.insert(
+        "coverage_concerns_detail",
+        Arc::new(CoverageConcernsDetailTool {
+            catalog,
         }),
     );
 }
