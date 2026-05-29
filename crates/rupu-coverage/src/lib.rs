@@ -14,7 +14,8 @@ pub use tools::{
 };
 
 pub use catalog::{
-    builtin_names, flatten, read_snapshot, render_full_mode, resolve_builtin, write_snapshot,
+    builtin_names, flatten, read_snapshot, render_full_mode, render_index_mode, resolve_builtin,
+    write_snapshot,
     CatalogMode, Concern, ConcernFilter, ConcernOverride, ConcernsBlock, ConcernsEntry,
     FlatCatalog, FlattenError, IncludeDirective, ParseError, Severity, SnapshotError, Template,
     TouchStrength,
