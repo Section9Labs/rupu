@@ -2,9 +2,7 @@
 //! `RawWeakness` and `RawView` structs that the mapper layer (Task 13)
 //! transforms into our Concern type.
 
-#[allow(unused_imports)] // used in Task 12 state machine
 use quick_xml::events::Event;
-#[allow(unused_imports)] // used in Task 12 state machine
 use quick_xml::reader::Reader;
 use std::path::Path;
 
@@ -50,14 +48,194 @@ pub fn parse_cwe_xml(path: &Path) -> Result<ParsedCwe, CweXmlError> {
     parse_cwe_xml_str(&xml)
 }
 
-pub fn parse_cwe_xml_str(_xml: &str) -> Result<ParsedCwe, CweXmlError> {
-    // Skeleton: the real event-driven parser is implemented in Task 12,
-    // which replaces this body. For now, return an empty result so the
-    // module compiles and the smoke test can call it.
-    Ok(ParsedCwe {
-        weaknesses: Vec::new(),
-        views: Vec::new(),
-    })
+pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut weaknesses: Vec<RawWeakness> = Vec::new();
+    let mut views_raw: Vec<RawView> = Vec::new();
+    // category id -> list of weakness ids it contains
+    let mut categories: std::collections::HashMap<u32, Vec<u32>> =
+        std::collections::HashMap::new();
+
+    // current-context tracking
+    let mut cur_weakness: Option<RawWeakness> = None;
+    let mut cur_category: Option<(u32, Vec<u32>)> = None;
+    let mut cur_view: Option<RawView> = None;
+    let mut in_description = false;
+    let mut in_extended = false;
+    let mut in_impact = false;
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(ref e) => {
+                let name = elem_local_name(e);
+                match name.as_str() {
+                    "Weakness" => {
+                        cur_weakness = Some(RawWeakness {
+                            id: attr_u32(e, b"ID", &reader)?.unwrap_or(0),
+                            name: attr_string(e, b"Name", &reader)?.unwrap_or_default(),
+                            description: String::new(),
+                            extended_description: None,
+                            impact_tags: Vec::new(),
+                            applicable_languages: Vec::new(),
+                        });
+                    }
+                    "Description" if cur_weakness.is_some() => in_description = true,
+                    "Extended_Description" if cur_weakness.is_some() => in_extended = true,
+                    "Impact" if cur_weakness.is_some() => in_impact = true,
+                    "Category" => {
+                        let id = attr_u32(e, b"ID", &reader)?.unwrap_or(0);
+                        cur_category = Some((id, Vec::new()));
+                    }
+                    "View" => {
+                        cur_view = Some(RawView {
+                            id: attr_u32(e, b"ID", &reader)?.unwrap_or(0),
+                            name: attr_string(e, b"Name", &reader)?.unwrap_or_default(),
+                            member_weakness_ids: Vec::new(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Event::Text(ref e) => {
+                let text = e.unescape()?.into_owned();
+                if let Some(ref mut w) = cur_weakness {
+                    if in_description {
+                        w.description.push_str(&text);
+                    } else if in_extended {
+                        w.extended_description
+                            .get_or_insert_with(String::new)
+                            .push_str(&text);
+                    } else if in_impact {
+                        let trimmed = text.trim().to_string();
+                        if !trimmed.is_empty() {
+                            w.impact_tags.push(trimmed);
+                        }
+                    }
+                }
+            }
+            Event::Empty(ref e) => {
+                let name = elem_local_name(e);
+                match name.as_str() {
+                    "Language" => {
+                        if let Some(ref mut w) = cur_weakness {
+                            if let Some(lang) = attr_string(e, b"Name", &reader)? {
+                                w.applicable_languages.push(lang);
+                            }
+                        }
+                    }
+                    "Has_Member" => {
+                        if let Some(id) = attr_u32(e, b"CWE_ID", &reader)? {
+                            if let Some((_, ref mut members)) = cur_category {
+                                members.push(id);
+                            } else if let Some(ref mut v) = cur_view {
+                                v.member_weakness_ids.push(id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(ref e) => {
+                let name = end_local_name(e);
+                match name.as_str() {
+                    "Weakness" => {
+                        if let Some(mut w) = cur_weakness.take() {
+                            w.description = w.description.trim().to_string();
+                            if let Some(ref mut ed) = w.extended_description {
+                                *ed = ed.trim().to_string();
+                                if ed.is_empty() {
+                                    w.extended_description = None;
+                                }
+                            }
+                            weaknesses.push(w);
+                        }
+                    }
+                    "Description" => in_description = false,
+                    "Extended_Description" => in_extended = false,
+                    "Impact" => in_impact = false,
+                    "Category" => {
+                        if let Some((id, members)) = cur_category.take() {
+                            categories.insert(id, members);
+                        }
+                    }
+                    "View" => {
+                        if let Some(v) = cur_view.take() {
+                            views_raw.push(v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    // Flatten view membership: expand category refs to their weakness members.
+    let views = views_raw
+        .into_iter()
+        .map(|mut v| {
+            let mut ids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+            for member in std::mem::take(&mut v.member_weakness_ids) {
+                if let Some(cat_members) = categories.get(&member) {
+                    ids.extend(cat_members.iter().copied());
+                } else {
+                    ids.insert(member);
+                }
+            }
+            v.member_weakness_ids = ids.into_iter().collect();
+            v
+        })
+        .collect();
+
+    Ok(ParsedCwe { weaknesses, views })
+}
+
+/// Extract the local name (without namespace prefix) from a `BytesStart`.
+fn elem_local_name(e: &quick_xml::events::BytesStart<'_>) -> String {
+    String::from_utf8_lossy(e.name().local_name().as_ref()).into_owned()
+}
+
+/// Extract the local name from a `BytesEnd`.
+fn end_local_name(e: &quick_xml::events::BytesEnd<'_>) -> String {
+    String::from_utf8_lossy(e.name().local_name().as_ref()).into_owned()
+}
+
+/// Find an attribute by byte-string key and return its decoded string value,
+/// or `None` if the attribute is absent.
+fn attr_string(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    reader: &Reader<&[u8]>,
+) -> Result<Option<String>, CweXmlError> {
+    let decoder = reader.decoder();
+    for attr in e.attributes() {
+        let attr = attr.map_err(quick_xml::Error::from)?;
+        if attr.key.as_ref() == key {
+            let val = attr.decode_and_unescape_value(decoder)?;
+            return Ok(Some(val.into_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// Find an attribute by byte-string key and parse it as `u32`.
+fn attr_u32(
+    e: &quick_xml::events::BytesStart<'_>,
+    key: &[u8],
+    reader: &Reader<&[u8]>,
+) -> Result<Option<u32>, CweXmlError> {
+    match attr_string(e, key, reader)? {
+        None => Ok(None),
+        Some(s) => s
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| CweXmlError::Malformed(format!("expected u32 for {key:?}, got {s:?}"))),
+    }
 }
 
 #[cfg(test)]
@@ -93,12 +271,53 @@ mod tests {
 "#;
 
     #[test]
-    fn parses_minimal_fixture_without_panicking() {
-        // Skeleton just verifies the parser runs cleanly on a tiny fixture.
-        // Full parsing is implemented in Task 12 (which replaces the
-        // parse_cwe_xml_str body and these assertions).
+    fn parses_minimal_fixture() {
         let parsed = parse_cwe_xml_str(TINY_FIXTURE).expect("parses");
-        let _ = parsed.weaknesses.len();
-        let _ = parsed.views.len();
+        assert_eq!(parsed.weaknesses.len(), 1);
+        assert_eq!(parsed.weaknesses[0].id, 787);
+        assert_eq!(parsed.weaknesses[0].name, "Out-of-bounds Write");
+        assert!(parsed.weaknesses[0].description.contains("writes data past the end"));
+        assert_eq!(parsed.weaknesses[0].applicable_languages, vec!["C", "C++"]);
+        assert_eq!(parsed.weaknesses[0].impact_tags, vec!["Modify Memory"]);
+
+        assert_eq!(parsed.views.len(), 1);
+        assert_eq!(parsed.views[0].id, 699);
+        assert_eq!(parsed.views[0].member_weakness_ids, vec![787]);
+    }
+
+    const FIXTURE_WITH_CATEGORY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Weakness_Catalog>
+  <Weaknesses>
+    <Weakness ID="787" Name="OOB Write">
+      <Description>desc</Description>
+    </Weakness>
+    <Weakness ID="125" Name="OOB Read">
+      <Description>desc</Description>
+    </Weakness>
+  </Weaknesses>
+  <Categories>
+    <Category ID="119" Name="Memory Buffer Errors">
+      <Relationships>
+        <Has_Member CWE_ID="787" View_ID="1000" />
+        <Has_Member CWE_ID="125" View_ID="1000" />
+      </Relationships>
+    </Category>
+  </Categories>
+  <Views>
+    <View ID="1000" Name="Research">
+      <Members>
+        <Has_Member CWE_ID="119" View_ID="1000" />
+      </Members>
+    </View>
+  </Views>
+</Weakness_Catalog>
+"#;
+
+    #[test]
+    fn view_expands_category_members() {
+        let parsed = parse_cwe_xml_str(FIXTURE_WITH_CATEGORY).expect("parses");
+        let view = &parsed.views[0];
+        // The view referenced category 119, which contains 787 and 125.
+        assert_eq!(view.member_weakness_ids, vec![125, 787]); // sorted by BTreeSet
     }
 }
