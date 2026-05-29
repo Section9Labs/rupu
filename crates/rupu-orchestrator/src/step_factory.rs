@@ -19,6 +19,19 @@ use rupu_tools::{AgentDispatcher, ToolContext};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Resolve which concerns block a workflow step runs against.
+///
+/// Workflow-level concerns take precedence over the agent's own
+/// (`workflow.or(agent)`): when a workflow declares `concerns:`, every
+/// step uses it and the agent frontmatter's block is ignored. When the
+/// workflow declares none, the agent's block flows through.
+pub(crate) fn resolve_step_concerns(
+    workflow_concerns: Option<rupu_coverage::ConcernsBlock>,
+    agent_concerns: Option<rupu_coverage::ConcernsBlock>,
+) -> Option<rupu_coverage::ConcernsBlock> {
+    workflow_concerns.or(agent_concerns)
+}
+
 /// `StepFactory` impl that resolves each step's `agent:` against
 /// the project- and global-scope `agents/` dirs and constructs a
 /// real provider via [`rupu_runtime::provider_factory::build_for_provider`].
@@ -205,7 +218,7 @@ impl StepFactory for DefaultStepFactory {
             // Workflow-level concerns take precedence over agent-level concerns.
             // When the workflow declares `concerns:`, every step uses it —
             // the agent frontmatter's `concerns:` is ignored for this run.
-            concerns: self.workflow.concerns.clone().or(spec.concerns),
+            concerns: resolve_step_concerns(self.workflow.concerns.clone(), spec.concerns),
             // All steps of a workflow share the same target_id (keyed on the
             // workflow name) so ledger entries accumulate per-workflow, not
             // per-step-agent.
@@ -328,15 +341,13 @@ mod provider_build_error_stub_tests {
 /// Tests for workflow-level concerns resolution.
 ///
 /// `build_opts_for_step` requires an async provider build and live
-/// credentials, so we test the resolution expression directly:
-///
-///   `workflow.concerns.clone().or(spec.concerns)`
-///
-/// This is the exact computation on line 208 of this file.  By
-/// constructing real `Workflow` and `AgentSpec` values we exercise the
-/// full parse-through-to-resolution path without spinning up a provider.
+/// credentials, so we can't drive it directly. Instead these tests call
+/// the same `resolve_step_concerns` helper that `build_opts_for_step`
+/// uses, with real parsed `Workflow` and `AgentSpec` values — so they
+/// genuinely guard the production resolution (not a re-implementation).
 #[cfg(test)]
 mod concerns_resolution_tests {
+    use super::resolve_step_concerns;
     use rupu_agent::AgentSpec;
     use rupu_coverage::ConcernsEntry;
 
@@ -383,8 +394,8 @@ mod concerns_resolution_tests {
         let workflow = workflow_with_concerns("wf-security-scan", "stride");
         let agent = agent_with_concerns("owasp-top10-2021");
 
-        // Replicate the exact resolution from step_factory.rs line 208.
-        let resolved = workflow.concerns.clone().or(agent.concerns);
+        // Call the same helper build_opts_for_step uses.
+        let resolved = resolve_step_concerns(workflow.concerns.clone(), agent.concerns);
 
         let block = resolved.expect("concerns should be Some after resolution");
         assert_eq!(
@@ -406,8 +417,8 @@ mod concerns_resolution_tests {
         let workflow = workflow_without_concerns();
         let agent = agent_with_concerns("owasp-top10-2021");
 
-        // Same resolution expression.
-        let resolved = workflow.concerns.clone().or(agent.concerns);
+        // Same helper.
+        let resolved = resolve_step_concerns(workflow.concerns.clone(), agent.concerns);
 
         let block = resolved.expect("agent concerns should flow through when workflow has none");
         assert_eq!(
