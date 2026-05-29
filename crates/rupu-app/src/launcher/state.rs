@@ -162,6 +162,7 @@ mod tests {
             },
             notify_issue: false,
             steps: vec![],
+            concerns: None,
         }
     }
 
