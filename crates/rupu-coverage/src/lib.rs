@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod catalog;
 pub mod ledger;
+pub mod tool_mappings;
 pub mod tools;
 
 #[cfg(feature = "gen")]
@@ -28,6 +29,7 @@ pub use catalog::{
 };
 pub use audit::{AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster};
 pub use audit::generate::audit as run_audit;
+pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};
 pub use ledger::{
     discover_targets, file_views, read_concern_assertions, read_file_events, read_findings,
     target_id, AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, CoverageWriter,
