@@ -55,7 +55,7 @@ concerns:
 - id: cwe-software-development:cwe-1037-processor-optimization-removal-or-modification-of-security-critical-code
   name: CWE-1037 — Processor Optimization Removal or Modification of Security-critical Code
   description: The developer builds a security-critical protection mechanism into the software, but the processor optimizes the execution of the program such that the mechanism is removed or modified.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1011,7 +1011,7 @@ concerns:
 - id: cwe-software-development:cwe-125-out-of-bounds-read
   name: CWE-125 — Out-of-bounds Read
   description: The product reads data past the end, or before the beginning, of the intended buffer.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**/*.c'
   - '**/*.cpp'
@@ -1310,7 +1310,7 @@ concerns:
     The product parses numeric input assuming base 10 (decimal) values, but it does not account for inputs that use a different base number (radix).
 
     Frequently, a numeric input that begins with "0" is treated as octal, or "0x" causes it to be treated as hexadecimal, e.g. by the inet_addr() function. For example, "023" (octal) is 35 decimal, or "0x31" is 49 decimal. Other bases may be used as well. If the developer assumes decimal-only inputs, the code could produce incorrect numbers when the inputs are parsed using a different base. This can result in unexpected and/or dangerous behavior. For ...
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1376,7 +1376,7 @@ concerns:
     The product does not properly handle input in which an inconsistency exists between two or more special characters or reserved words.
 
     An example of this problem would be if paired characters appear in the wrong order, or if the special characters are not properly nested.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1409,7 +1409,7 @@ concerns:
     The product does not properly account for differences in case sensitivity when accessing or determining the properties of a resource, leading to inconsistent results.
 
     Improperly handled case sensitive data can lead to several possible consequences, including:case-insensitive passwords reducing the size of the key space, making brute force attacks easierbypassing filters or access controls using alternate namesmultiple interpretation errors using alternate names.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1432,7 +1432,7 @@ concerns:
 - id: cwe-software-development:cwe-182-collapse-of-data-into-unsafe-value
   name: CWE-182 — Collapse of Data into Unsafe Value
   description: The product filters data in a way that causes it to be reduced or "collapsed" into an unsafe value that violates an expected security property.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1442,7 +1442,7 @@ concerns:
 - id: cwe-software-development:cwe-183-permissive-list-of-allowed-inputs
   name: CWE-183 — Permissive List of Allowed Inputs
   description: The product implements a protection mechanism that relies on a list of inputs (or properties of inputs) that are explicitly allowed by policy because the inputs are assumed to be safe, but the list is too permissive - that is, it allows an input that is unsafe, leading to resultant weaknesses.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1452,7 +1452,7 @@ concerns:
 - id: cwe-software-development:cwe-184-incomplete-list-of-disallowed-inputs
   name: CWE-184 — Incomplete List of Disallowed Inputs
   description: The product implements a protection mechanism that relies on a list of inputs (or properties of inputs) that are not allowed by policy or otherwise require other action to neutralize before additional processing takes place, but the list is incomplete.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1465,7 +1465,7 @@ concerns:
     A regular expression is overly restrictive, which prevents dangerous values from being detected.
 
     This weakness is not about regular expression complexity. Rather, it is about a regular expression that does not match all values that are intended. Consider the use of a regexp to identify acceptable values or to spot unwanted terms. An overly restrictive regexp misses some potentially security-relevant values leading to either false positives *or* false negatives, depending on how the regexp is being used within the code. Consider the expression /[0-8]/ where the intention was /[0-9]/.  This ...
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1548,7 +1548,7 @@ concerns:
 - id: cwe-software-development:cwe-204-observable-response-discrepancy
   name: CWE-204 — Observable Response Discrepancy
   description: The product provides different responses to incoming requests in a way that reveals internal state information to an unauthorized actor outside of the intended control sphere.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1561,7 +1561,7 @@ concerns:
     The product's behaviors indicate important differences that may be observed by unauthorized actors in a way that reveals (1) its internal state or decision process, or (2) differences from other products with equivalent functionality.
 
     Ideally, a product should provide as little information about its internal operations as possible.  Otherwise, attackers could use knowledge of these internal operations to simplify or optimize their attack.  In some cases, behavioral discrepancies can be used by attackers to form a side channel.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -1574,7 +1574,7 @@ concerns:
     Two separate operations in a product require different amounts of time to complete, in a way that is observable to an actor and reveals security-relevant information about the state of the product, such as whether a particular operation was successful or not.
 
     In security-relevant contexts, even small variations in timing can be exploited by attackers to indirectly infer certain details about the product's internal operations.  For example, in some cryptographic algorithms, attackers can use timing differences to infer certain properties about a private key, making the key easier to guess. ...
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2046,7 +2046,7 @@ concerns:
 - id: cwe-software-development:cwe-289-authentication-bypass-by-alternate-name
   name: CWE-289 — Authentication Bypass by Alternate Name
   description: The product performs authentication based on the name of a resource being accessed, or the name of the actor performing the access, but it does not properly check all possible names for that resource or actor.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2105,7 +2105,7 @@ concerns:
     The requirements for the product dictate the use of an established authentication algorithm, but the implementation of the algorithm is incorrect.
 
     This incorrect implementation may allow authentication to be bypassed.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2115,7 +2115,7 @@ concerns:
 - id: cwe-software-development:cwe-305-authentication-bypass-by-primary-weakness
   name: CWE-305 — Authentication Bypass by Primary Weakness
   description: The authentication algorithm is sound, but the implemented mechanism can be bypassed as the result of a separate weakness that is primary to the authentication error.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2135,7 +2135,7 @@ concerns:
 - id: cwe-software-development:cwe-307-improper-restriction-of-excessive-authentication-attempts
   name: CWE-307 — Improper Restriction of Excessive Authentication Attempts
   description: The product does not implement sufficient measures to prevent multiple failed authentication attempts within a short time frame.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2145,7 +2145,7 @@ concerns:
 - id: cwe-software-development:cwe-308-use-of-single-factor-authentication
   name: CWE-308 — Use of Single-factor Authentication
   description: The product uses an authentication algorithm that uses a single factor (e.g., a password) in a security context that should require more than one factor.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2188,7 +2188,7 @@ concerns:
     The product performs a key exchange with an actor without verifying the identity of that actor.
 
     Performing a key exchange will preserve the integrity of the information sent between two entities, but this will not guarantee that the entities are who they claim they are. This may enable an attacker to impersonate an actor by modifying traffic between the two entities.  Typically, this involves a victim client that contacts a malicious server that is impersonating a trusted server. If the client skips authentication or ignores an authentication failure, the malicious server may request authe...
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2221,7 +2221,7 @@ concerns:
 - id: cwe-software-development:cwe-325-missing-cryptographic-step
   name: CWE-325 — Missing Cryptographic Step
   description: The product does not implement a required step in a cryptographic algorithm, resulting in weaker encryption than advertised by the algorithm.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2234,7 +2234,7 @@ concerns:
     The product uses an algorithm that produces a digest (output value) that does not meet security expectations for a hash function that allows an adversary to reasonably determine the original input (preimage attack), find another input that can produce the same hash (2nd preimage attack), or find multiple inputs that evaluate to the same hash (birthday attack).
 
     A hash function is defined as an algorithm that maps arbitrarily sized data into a fixed-sized digest (output) such that the following properties hold:The algorithm is not invertible (also called "one-way" or "not reversible")The alg...
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2244,7 +2244,7 @@ concerns:
 - id: cwe-software-development:cwe-331-insufficient-entropy
   name: CWE-331 — Insufficient Entropy
   description: The product uses an algorithm or scheme that produces insufficient entropy, leaving patterns or clusters of values that are more likely to occur than others.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2254,7 +2254,7 @@ concerns:
 - id: cwe-software-development:cwe-334-small-space-of-random-values
   name: CWE-334 — Small Space of Random Values
   description: The number of possible random values is smaller than needed by the product, making it more susceptible to brute force attacks.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2264,7 +2264,7 @@ concerns:
 - id: cwe-software-development:cwe-335-incorrect-usage-of-seeds-in-pseudo-random-number-generator-prng
   name: CWE-335 — Incorrect Usage of Seeds in Pseudo-Random Number Generator (PRNG)
   description: "The product uses a Pseudo-Random Number Generator (PRNG) but does not correctly manage seeds.\n\nPRNGs are deterministic and, while their output appears\n\t\t   random, they cannot actually create entropy. They rely on\n\t\t   cryptographically secure and unique seeds for entropy so\n\t\t   proper seeding is critical to the secure operation of the\n\t\t   PRNG.Management of seeds could be broken down into two main areas:(1) protecting seeds as cryptographic material (such as a cryptographic key);(2) whenever possible, using a uniquely generated seed from\n\t\t   a cryptographically secure sourcePRNGs requir..."
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2277,7 +2277,7 @@ concerns:
     The product uses a Pseudo-Random Number Generator (PRNG) in a security context, but the PRNG's algorithm is not cryptographically strong.
 
     When a non-cryptographic PRNG is used in a cryptographic context, it can expose the cryptography to certain types of attacks.Often a pseudo-random number generator (PRNG) is not designed for cryptography. Sometimes a mediocre source of randomness is sufficient or preferable for algorithms that use random numbers. Weak generators generally take less processing power and/or do not use the precious, finite, entropy sources on a system. While such PRNGs migh...
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2360,7 +2360,7 @@ concerns:
 - id: cwe-software-development:cwe-349-acceptance-of-extraneous-untrusted-data-with-trusted-data
   name: CWE-349 — Acceptance of Extraneous Untrusted Data With Trusted Data
   description: The product, when processing trusted data, accepts any untrusted data that is also included with the trusted data, treating the untrusted data as if it were trusted.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2429,7 +2429,7 @@ concerns:
 - id: cwe-software-development:cwe-358-improperly-implemented-security-check-for-standard
   name: CWE-358 — Improperly Implemented Security Check for Standard
   description: The product does not implement or incorrectly implements one or more security-relevant checks as specified by the design of a standardized algorithm, protocol, or technique.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -2805,7 +2805,7 @@ concerns:
     The product is vulnerable to file system contents disclosure through path equivalence. Path equivalence involves the use of special characters in file and directory names. The associated manipulations are intended to generate multiple names for the same object.
 
     Path equivalence is usually employed in order to circumvent access controls expressed using an incomplete set of file name or file path representations. This is different from path traversal, wherein the manipulations are performed to generate a name for a different object.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -3014,7 +3014,7 @@ concerns:
 - id: cwe-software-development:cwe-444-inconsistent-interpretation-of-http-requests-http-request-response-smuggling
   name: CWE-444 — Inconsistent Interpretation of HTTP Requests ('HTTP Request/Response Smuggling')
   description: "The product acts as an intermediary HTTP agent\n         (such as a proxy or firewall) in the data flow between two\n         entities such as a client and server, but it does not\n         interpret malformed HTTP requests or responses in ways that\n         are consistent with how the messages will be processed by\n         those entities that are at the ultimate destination.\n\nHTTP requests or responses (\"messages\") can be\n\t   malformed or unexpected in ways that cause web servers or\n\t   clients to interpret the messages in different ways than\n\t   intermediary HTTP agents such as load balancer..."
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -3438,7 +3438,7 @@ concerns:
     The product mixes trusted and untrusted data in the same data structure or structured message.
 
     A trust boundary can be thought of as line drawn through a program. On one side of the line, data is untrusted. On the other side of the line, data is assumed to be trustworthy. The purpose of validation logic is to allow data to safely cross the trust boundary - to move from untrusted to trusted. A trust boundary violation occurs when a program blurs the line between what is trusted and what is untrusted. By combining trusted and untrusted data in the same data structure, it becomes easier for p...
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -3551,7 +3551,7 @@ concerns:
 - id: cwe-software-development:cwe-549-missing-password-field-masking
   name: CWE-549 — Missing Password Field Masking
   description: The product does not mask passwords during entry, increasing the potential for attackers to observe and capture passwords.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -3564,7 +3564,7 @@ concerns:
     If a web server does not fully parse requested URLs before it examines them for authorization, it may be possible for an attacker to bypass authorization protection.
 
     For instance, the character strings /./ and / both mean current directory. If /SomeDirectory is a protected directory and an attacker requests /./SomeDirectory, the attacker may be able to gain access to the resource if /./ is not converted to / before the authorization check is performed.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -3807,7 +3807,7 @@ concerns:
 - id: cwe-software-development:cwe-611-improper-restriction-of-xml-external-entity-reference
   name: CWE-611 — Improper Restriction of XML External Entity Reference
   description: The product processes an XML document that can contain XML entities with URIs that resolve to documents outside of the intended sphere of control, causing the product to embed incorrect documents into its output.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -3818,7 +3818,7 @@ concerns:
 - id: cwe-software-development:cwe-613-insufficient-session-expiration
   name: CWE-613 — Insufficient Session Expiration
   description: According to WASC, "Insufficient Session Expiration is when a web site permits an attacker to reuse old session credentials or session IDs for authorization."
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -3909,7 +3909,7 @@ concerns:
     The product uses a regular expression that does not sufficiently restrict the set of allowed values.
 
     This effectively causes the regexp to accept substrings that match the pattern, which produces a partial comparison to the target. In some cases, this can lead to other weaknesses. Common errors include:not identifying the beginning and end of the target stringusing wildcards instead of acceptable character rangesothers
-  severity: critical
+  severity: high
   applicable_globs:
   - '**/*.php'
   min_strength: read
@@ -4113,7 +4113,7 @@ concerns:
     The product uses multiple resources that can have the same identifier, in a context in which unique identifiers are required.
 
     If the product assumes that each resource has a unique identifier, the product could operate on the wrong resource if attackers can cause multiple resources to be associated with the same identifier.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read
@@ -4172,7 +4172,7 @@ concerns:
 - id: cwe-software-development:cwe-733-compiler-optimization-removal-or-modification-of-security-critical-code
   name: CWE-733 — Compiler Optimization Removal or Modification of Security-critical Code
   description: The developer builds a security-critical protection mechanism into the software, but the compiler optimizes the program such that the mechanism is removed or modified.
-  severity: critical
+  severity: high
   applicable_globs:
   - '**/*.c'
   - '**/*.cpp'
@@ -4519,7 +4519,7 @@ concerns:
     The product uses a CAPTCHA challenge, but the challenge can be guessed or automatically recognized by a non-human actor.
 
     An automated attacker could bypass the intended protection of the CAPTCHA challenge and perform actions at a higher frequency than humanly possible, such as launching spam attacks.There can be several different causes of a guessable CAPTCHA:An audio or visual image that does not have sufficient distortion from the unobfuscated source image.A question is generated with a format that can be automatically recognized, such as a math question.A question for which the number o...
-  severity: critical
+  severity: high
   applicable_globs:
   - '**'
   min_strength: read

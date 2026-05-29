@@ -91,13 +91,16 @@ fn compose_description(w: &RawWeakness) -> String {
 
 fn severity_from_impact(impact_tags: &[String]) -> Severity {
     let s: String = impact_tags.join(" ").to_lowercase();
+    // Critical: direct path to code execution / privilege escalation / memory corruption.
     if s.contains("execute unauthorized code")
         || s.contains("gain privileges")
-        || s.contains("bypass protection")
         || s.contains("modify memory")
     {
         Severity::Critical
-    } else if s.contains("read application data")
+    // High: serious but not directly RCE/privesc — "bypass protection" moves here
+    // (CWE-1004 class rates ~CVSS 7.5, not Critical).
+    } else if s.contains("bypass protection")
+        || s.contains("read application data")
         || s.contains("modify application data")
         || s.contains("read memory")
         || s.contains("hide activities")
@@ -261,6 +264,16 @@ mod tests {
             Severity::Medium
         );
         assert_eq!(severity_from_impact(&[]), Severity::Medium);
+        // Bypass Protection Mechanism is High, not Critical (CWE-1004 class).
+        assert_eq!(
+            severity_from_impact(&["Bypass Protection Mechanism".to_string()]),
+            Severity::High
+        );
+        // Gain Privileges remains Critical.
+        assert_eq!(
+            severity_from_impact(&["Gain Privileges or Assume Identity".to_string()]),
+            Severity::Critical
+        );
     }
 
     #[test]
