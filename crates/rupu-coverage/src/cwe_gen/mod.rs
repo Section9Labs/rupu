@@ -2,4 +2,5 @@
 //! Compiled only under the `gen` feature.
 
 pub mod mapping;
+pub mod template;
 pub mod xml;

@@ -1,7 +1,9 @@
 //! Generator: parses MITRE's published CWE XML and emits a rupu-coverage
-//! concerns YAML template. See `crates/rupu-coverage/build/cwe/README.md`
-//! for the refresh workflow.
+//! concerns YAML template.
 
+use rupu_coverage::cwe_gen::mapping::map_view_to_concerns;
+use rupu_coverage::cwe_gen::template::build_template;
+use rupu_coverage::cwe_gen::xml::parse_cwe_xml;
 use std::path::PathBuf;
 
 #[derive(Debug)]
@@ -38,17 +40,57 @@ fn parse_args() -> Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
     eprintln!(
-        "generating CWE catalog: view={} release={} xml={} out={}",
+        "Parsing CWE XML: view={} release={} xml={}",
         args.view,
         args.release,
-        args.xml.display(),
-        args.out.display(),
+        args.xml.display()
     );
-    // Subsequent tasks (11-14) fill this in:
-    // 1. Parse XML into raw weakness + view records.
-    // 2. Map to Concern records (severity / applicable_globs heuristics).
-    // 3. Serialize as Template YAML.
-    // 4. Write .version.txt sidecar.
-    eprintln!("(generator skeleton — body implemented in subsequent tasks)");
+
+    let parsed = parse_cwe_xml(&args.xml)?;
+    eprintln!(
+        "Parsed {} weaknesses, {} views",
+        parsed.weaknesses.len(),
+        parsed.views.len(),
+    );
+
+    let (namespace, view_name) = match args.view {
+        699 => ("cwe-software-development", "Software Development"),
+        1000 => ("cwe-research", "Research"),
+        other => return Err(format!("unsupported view {other}; supported: 699, 1000").into()),
+    };
+
+    let concerns = map_view_to_concerns(&parsed, args.view, namespace)
+        .ok_or_else(|| format!("view {} not found in XML", args.view))?;
+    eprintln!(
+        "Mapped {} concerns for view {} ({})",
+        concerns.len(),
+        args.view,
+        view_name
+    );
+
+    let template = build_template(namespace, view_name, concerns);
+    let yaml = serde_yaml::to_string(&template)?;
+
+    if let Some(parent) = args.out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&args.out, &yaml)?;
+    eprintln!("Wrote {}", args.out.display());
+
+    // Sidecar: <out-stem>.version.txt next to the YAML.
+    let mut version_path = args.out.clone();
+    let stem = version_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("cwe")
+        .to_string();
+    version_path.set_file_name(format!("{stem}.version.txt"));
+    let stamp = chrono::Utc::now().to_rfc3339();
+    std::fs::write(
+        &version_path,
+        format!("cwe_release: {}\ngenerated_at: {}\n", args.release, stamp),
+    )?;
+    eprintln!("Wrote {}", version_path.display());
+
     Ok(())
 }
