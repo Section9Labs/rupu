@@ -7,6 +7,9 @@ pub mod catalog;
 pub mod ledger;
 pub mod tools;
 
+#[cfg(feature = "gen")]
+pub mod cwe_gen;
+
 pub use tools::{
     coverage_concerns_detail, coverage_concerns_search, coverage_mark, coverage_remaining,
     coverage_status, report_finding, CoverageConcernsDetailInput, CoverageConcernsDetailOutput,
