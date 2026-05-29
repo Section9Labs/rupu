@@ -12,10 +12,24 @@ pub fn map_view_to_concerns(
     namespace: &str,
 ) -> Option<Vec<Concern>> {
     let view = parsed.views.iter().find(|v| v.id == view_id)?;
+
+    // A weakness belongs to the view if EITHER:
+    //  (a) it is reachable through the view's category `<Has_Member>`
+    //      membership (used by views like CWE-699 Software Development), OR
+    //  (b) it declares the view in its own `<Related_Weaknesses>` via a
+    //      `View_ID` (used by graph views like CWE-1000 Research Concepts,
+    //      whose `<Members>` only list the top-level pillars).
+    let mut member_ids: std::collections::BTreeSet<u32> =
+        view.member_weakness_ids.iter().copied().collect();
+    for w in &parsed.weaknesses {
+        if w.member_of_views.contains(&view_id) {
+            member_ids.insert(w.id);
+        }
+    }
+
     let weakness_by_id: std::collections::HashMap<u32, &RawWeakness> =
         parsed.weaknesses.iter().map(|w| (w.id, w)).collect();
-    let mut concerns: Vec<Concern> = view
-        .member_weakness_ids
+    let mut concerns: Vec<Concern> = member_ids
         .iter()
         .filter_map(|id| weakness_by_id.get(id).copied())
         .map(|w| map_weakness(w, namespace))
@@ -161,7 +175,57 @@ mod tests {
             extended_description: None,
             impact_tags: vec!["Modify Memory".to_string()],
             applicable_languages: vec!["C".to_string(), "C++".to_string()],
+            member_of_views: vec![1000, 699],
         }
+    }
+
+    #[test]
+    fn map_view_includes_weaknesses_by_related_weakness_membership() {
+        use crate::cwe_gen::xml::{ParsedCwe, RawView};
+        // A graph-type view whose <Members> list only the pillar, but two
+        // weaknesses declare membership via member_of_views.
+        let parsed = ParsedCwe {
+            weaknesses: vec![
+                RawWeakness {
+                    id: 787,
+                    name: "OOB Write".to_string(),
+                    description: "d".to_string(),
+                    extended_description: None,
+                    impact_tags: vec![],
+                    applicable_languages: vec![],
+                    member_of_views: vec![1000],
+                },
+                RawWeakness {
+                    id: 125,
+                    name: "OOB Read".to_string(),
+                    description: "d".to_string(),
+                    extended_description: None,
+                    impact_tags: vec![],
+                    applicable_languages: vec![],
+                    member_of_views: vec![1000],
+                },
+                RawWeakness {
+                    id: 79,
+                    name: "XSS".to_string(),
+                    description: "d".to_string(),
+                    extended_description: None,
+                    impact_tags: vec![],
+                    applicable_languages: vec![],
+                    member_of_views: vec![699], // NOT in view 1000
+                },
+            ],
+            views: vec![RawView {
+                id: 1000,
+                name: "Research".to_string(),
+                member_weakness_ids: vec![], // pillars resolved to nothing here
+            }],
+        };
+        let concerns = map_view_to_concerns(&parsed, 1000, "cwe-research").unwrap();
+        // 787 and 125 declare view 1000; 79 does not.
+        assert_eq!(concerns.len(), 2);
+        assert!(concerns.iter().any(|c| c.id.contains("cwe-787-")));
+        assert!(concerns.iter().any(|c| c.id.contains("cwe-125-")));
+        assert!(!concerns.iter().any(|c| c.id.contains("cwe-79-")));
     }
 
     #[test]

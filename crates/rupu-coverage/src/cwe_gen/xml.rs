@@ -16,6 +16,12 @@ pub struct RawWeakness {
     pub impact_tags: Vec<String>,
     /// E.g. `["C", "C++"]`. Empty when language-agnostic.
     pub applicable_languages: Vec<String>,
+    /// View IDs this weakness declares membership in via its
+    /// `<Related_Weaknesses>` (`<Related_Weakness ... View_ID="X">`).
+    /// This is how graph-type views (e.g. CWE-1000 Research Concepts)
+    /// express their full membership — distinct from category
+    /// `<Has_Member>` membership used by views like CWE-699.
+    pub member_of_views: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,14 +72,22 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
     let mut in_extended = false;
     let mut in_impact = false;
     let mut cur_impact_text = String::new();
+    // Element-nesting depth. Used to capture ONLY the weakness's
+    // direct-child <Description>/<Extended_Description> — CWE weaknesses
+    // contain many nested <Description> elements (Detection_Methods,
+    // Common_Consequences, etc.) that must not pollute the summary.
+    let mut depth: i32 = 0;
+    let mut weakness_depth: i32 = -1;
 
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf)? {
             Event::Start(ref e) => {
+                depth += 1;
                 let name = elem_local_name(e);
                 match name.as_str() {
                     "Weakness" => {
+                        weakness_depth = depth;
                         cur_weakness = Some(RawWeakness {
                             id: attr_u32(e, b"ID", &reader)?.unwrap_or(0),
                             name: attr_string(e, b"Name", &reader)?.unwrap_or_default(),
@@ -81,10 +95,18 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
                             extended_description: None,
                             impact_tags: Vec::new(),
                             applicable_languages: Vec::new(),
+                            member_of_views: Vec::new(),
                         });
                     }
-                    "Description" if cur_weakness.is_some() => in_description = true,
-                    "Extended_Description" if cur_weakness.is_some() => in_extended = true,
+                    // Only the direct child of <Weakness> (depth == weakness_depth + 1).
+                    "Description" if cur_weakness.is_some() && depth == weakness_depth + 1 => {
+                        in_description = true
+                    }
+                    "Extended_Description" if cur_weakness.is_some() && depth == weakness_depth + 1 => {
+                        in_extended = true
+                    }
+                    // <Impact> only appears in Common_Consequences/Consequence;
+                    // no other <Impact> exists, so no depth gate needed.
                     "Impact" if cur_weakness.is_some() => in_impact = true,
                     "Category" => {
                         let id = attr_u32(e, b"ID", &reader)?.unwrap_or(0);
@@ -133,6 +155,20 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
                             }
                         }
                     }
+                    "Related_Weakness" => {
+                        // Graph-view membership: a weakness declares the
+                        // views it belongs to via its Related_Weakness
+                        // View_ID attributes. Collect them so the mapper
+                        // can resolve views (e.g. CWE-1000) that aren't
+                        // expressed through category Has_Member.
+                        if let Some(ref mut w) = cur_weakness {
+                            if let Some(view_id) = attr_u32(e, b"View_ID", &reader)? {
+                                if !w.member_of_views.contains(&view_id) {
+                                    w.member_of_views.push(view_id);
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -150,6 +186,7 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
                             }
                             weaknesses.push(w);
                         }
+                        weakness_depth = -1;
                     }
                     "Description" if in_description => in_description = false,
                     "Extended_Description" if in_extended => in_extended = false,
@@ -175,6 +212,7 @@ pub fn parse_cwe_xml_str(xml: &str) -> Result<ParsedCwe, CweXmlError> {
                     }
                     _ => {}
                 }
+                depth -= 1;
             }
             Event::Eof => break,
             _ => {}
@@ -382,5 +420,89 @@ mod tests {
         // The one-level expansion would have yielded [399] (a category id);
         // the fix must yield the actual weakness ids.
         assert_eq!(view.member_weakness_ids, vec![400, 770]);
+    }
+
+    const FIXTURE_GRAPH_VIEW: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Weakness_Catalog>
+  <Weaknesses>
+    <Weakness ID="787" Name="OOB Write">
+      <Description>desc</Description>
+      <Related_Weaknesses>
+        <Related_Weakness Nature="ChildOf" CWE_ID="119" View_ID="1000" Ordinal="Primary"/>
+        <Related_Weakness Nature="ChildOf" CWE_ID="119" View_ID="699" Ordinal="Primary"/>
+      </Related_Weaknesses>
+    </Weakness>
+    <Weakness ID="125" Name="OOB Read">
+      <Description>desc</Description>
+      <Related_Weaknesses>
+        <Related_Weakness Nature="ChildOf" CWE_ID="119" View_ID="1000" Ordinal="Primary"/>
+      </Related_Weaknesses>
+    </Weakness>
+  </Weaknesses>
+  <Views>
+    <View ID="1000" Name="Research Concepts" Type="Graph">
+      <Members>
+        <Has_Member CWE_ID="664" View_ID="1000" />
+      </Members>
+    </View>
+  </Views>
+</Weakness_Catalog>
+"#;
+
+    #[test]
+    fn weaknesses_record_their_view_membership_from_related_weaknesses() {
+        let parsed = parse_cwe_xml_str(FIXTURE_GRAPH_VIEW).expect("parses");
+        let oob_write = parsed.weaknesses.iter().find(|w| w.id == 787).unwrap();
+        assert_eq!(oob_write.member_of_views, vec![1000, 699]);
+        let oob_read = parsed.weaknesses.iter().find(|w| w.id == 125).unwrap();
+        assert_eq!(oob_read.member_of_views, vec![1000]);
+    }
+
+    const FIXTURE_NESTED_DESCRIPTIONS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Weakness_Catalog>
+  <Weaknesses>
+    <Weakness ID="1004" Name="Sensitive Cookie">
+      <Description>The product uses a cookie without the HttpOnly flag.</Description>
+      <Extended_Description>This allows client-side scripts to read the cookie.</Extended_Description>
+      <Common_Consequences>
+        <Consequence>
+          <Scope>Confidentiality</Scope>
+          <Impact>Read Application Data</Impact>
+          <Description>Theft of the cookie value.</Description>
+        </Consequence>
+      </Common_Consequences>
+      <Detection_Methods>
+        <Detection_Method>
+          <Method>Automated Static Analysis</Method>
+          <Description>SAST tools can find some instances of this weakness.</Description>
+        </Detection_Method>
+      </Detection_Methods>
+    </Weakness>
+  </Weaknesses>
+  <Views>
+    <View ID="699" Name="Software Development">
+      <Members>
+        <Has_Member CWE_ID="1004" />
+      </Members>
+    </View>
+  </Views>
+</Weakness_Catalog>
+"#;
+
+    #[test]
+    fn captures_only_direct_child_description_not_nested() {
+        let parsed = parse_cwe_xml_str(FIXTURE_NESTED_DESCRIPTIONS).expect("parses");
+        let w = &parsed.weaknesses[0];
+        // The weakness's own description — NOT the Consequence or
+        // Detection_Method descriptions nested deeper.
+        assert_eq!(w.description, "The product uses a cookie without the HttpOnly flag.");
+        assert_eq!(
+            w.extended_description.as_deref(),
+            Some("This allows client-side scripts to read the cookie.")
+        );
+        assert!(!w.description.contains("SAST"));
+        assert!(!w.description.contains("Theft"));
+        // The Impact from Common_Consequences is still captured.
+        assert_eq!(w.impact_tags, vec!["Read Application Data"]);
     }
 }
