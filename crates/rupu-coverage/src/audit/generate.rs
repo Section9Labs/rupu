@@ -74,24 +74,37 @@ fn concern_coverage(
                 .collect();
 
             let mut asserted: BTreeSet<String> = BTreeSet::new();
+            let mut na_files: BTreeSet<String> = BTreeSet::new();
             let (mut clean, mut findings, mut examined, mut not_applicable) =
                 (0u32, 0u32, 0u32, 0u32);
             for a in assertions.iter().filter(|a| a.concern_id == concern.id) {
                 match a.status {
-                    AssertionStatus::Clean => clean += 1,
-                    AssertionStatus::Finding => findings += 1,
-                    AssertionStatus::Examined => examined += 1,
-                    AssertionStatus::NotApplicable => not_applicable += 1,
-                }
-                if a.status != AssertionStatus::NotApplicable {
-                    asserted.insert(a.file_path.clone());
+                    AssertionStatus::Clean => {
+                        clean += 1;
+                        asserted.insert(a.file_path.clone());
+                    }
+                    AssertionStatus::Finding => {
+                        findings += 1;
+                        asserted.insert(a.file_path.clone());
+                    }
+                    AssertionStatus::Examined => {
+                        examined += 1;
+                        asserted.insert(a.file_path.clone());
+                    }
+                    AssertionStatus::NotApplicable => {
+                        not_applicable += 1;
+                        // The agent explicitly declared this concern doesn't
+                        // apply here — exclude from gap accounting (but don't
+                        // count as actively asserted either).
+                        na_files.insert(a.file_path.clone());
+                    }
                 }
             }
 
             let asserted_files: Vec<String> = asserted.iter().cloned().collect();
             let gap_files: Vec<String> = in_scope
                 .iter()
-                .filter(|f| !asserted.contains(*f))
+                .filter(|f| !asserted.contains(*f) && !na_files.contains(*f))
                 .cloned()
                 .collect();
 
@@ -276,6 +289,29 @@ mod tests {
             }
         }
         assert!(spoofing.asserted_files.contains(&"src/a.rs".to_string()));
+    }
+
+    #[test]
+    fn not_applicable_excludes_file_from_gap() {
+        let catalog = stride_catalog();
+        let views = file_views(&[read_event("src/a.rs")]);
+        // The agent marked spoofing as NotApplicable for src/a.rs — the file
+        // should NOT count as actively asserted, but ALSO should NOT count as
+        // a gap (the agent explicitly declared the concern out-of-scope).
+        let assertions = vec![assertion(
+            "stride:spoofing",
+            "src/a.rs",
+            AssertionStatus::NotApplicable,
+            "m1",
+        )];
+        let cov = concern_coverage(&catalog, &views, &assertions);
+        let spoofing = cov
+            .iter()
+            .find(|c| c.concern_id == "stride:spoofing")
+            .unwrap();
+        assert_eq!(spoofing.not_applicable, 1);
+        assert!(!spoofing.asserted_files.contains(&"src/a.rs".to_string()));
+        assert!(!spoofing.gap_files.contains(&"src/a.rs".to_string()));
     }
 
     #[test]
