@@ -6204,6 +6204,7 @@ dependencies = [
  "rupu-app-canvas",
  "rupu-auth",
  "rupu-config",
+ "rupu-coverage",
  "rupu-mcp",
  "rupu-orchestrator",
  "rupu-providers",

@@ -103,6 +103,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::mcp::Action,
     },
+    /// Inspect agentic coverage ledgers and concern catalogs.
+    Coverage {
+        #[command(subcommand)]
+        action: cmd::coverage::Action,
+    },
     /// Schedule-driven workflow firing (designed for system cron).
     Cron {
         #[command(subcommand)]
@@ -198,6 +203,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Issues { action } => cmd::issues::handle(action, cli.format).await,
         Cmd::Init(args) => cmd::init::handle(args).await,
         Cmd::Mcp { action } => cmd::mcp::handle(action).await,
+        Cmd::Coverage { action } => cmd::coverage::handle(action, cli.format).await,
         Cmd::Cron { action } => cmd::cron::handle(action, cli.format).await,
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
         Cmd::Usage(args) => cmd::usage::handle(*args, cli.format).await,
@@ -239,6 +245,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::Mcp { .. } => output::formats::ensure_supported(
             "mcp",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Coverage { .. } => output::formats::ensure_supported(
+            "coverage",
             format,
             &[output::formats::OutputFormat::Table],
         ),
