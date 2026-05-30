@@ -1916,6 +1916,14 @@ struct SessionInteractiveState {
     streaming_overlay: SessionLiveUsage,
     pricing: PricingConfig,
     completion: Option<CompletionState>,
+    /// Cached `(complete_concerns, total_concerns)` for the header coverage
+    /// indicator. `None` until the session's ledger exists (first turn) or
+    /// when the agent declares no `concerns:`. Refreshed on a wall-clock
+    /// throttle by `maybe_refresh_coverage` so the audit isn't re-run on
+    /// every redraw tick.
+    coverage_summary: Option<(usize, usize)>,
+    /// Last time `maybe_refresh_coverage` ran the audit, for throttling.
+    coverage_checked_at: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -1950,6 +1958,8 @@ impl SessionInteractiveState {
             streaming_overlay: SessionLiveUsage::default(),
             pricing: PricingConfig::default(),
             completion: None,
+            coverage_summary: None,
+            coverage_checked_at: None,
         }
     }
 
@@ -1976,6 +1986,8 @@ impl SessionInteractiveState {
             streaming_overlay: SessionLiveUsage::default(),
             pricing: PricingConfig::default(),
             completion: None,
+            coverage_summary: None,
+            coverage_checked_at: None,
         };
         state.follow_transcript(
             transcript_path,
@@ -2367,6 +2379,32 @@ impl SessionInteractiveState {
         }
     }
 
+    /// Refresh the cached header coverage `(complete, total)` summary, at
+    /// most once every `COVERAGE_REFRESH_INTERVAL`. Runs the audit off the
+    /// session's ledger; clears the cache when the agent declares no
+    /// `concerns:`. Cheap (a handful of small per-session JSONL files), but
+    /// throttled so it never runs on the per-frame redraw path.
+    fn maybe_refresh_coverage(&mut self, session: &SessionRecord) {
+        if session.concerns.is_none() {
+            self.coverage_summary = None;
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        let due = self
+            .coverage_checked_at
+            .map(|prev| {
+                now.duration_since(prev)
+                    .map(|elapsed| elapsed >= COVERAGE_REFRESH_INTERVAL)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.coverage_checked_at = Some(now);
+        self.coverage_summary = session_coverage_summary(session);
+    }
+
     fn sync_live_usage_from_record(
         &mut self,
         session: &SessionRecord,
@@ -2620,6 +2658,7 @@ fn attach_blocking_interactive(
             state.sync_runtime_status(session.status);
             let live_usage = read_session_live_usage(global, scope, session_id)?;
             state.sync_live_usage_from_record(&session, live_usage.as_ref());
+            state.maybe_refresh_coverage(&session);
 
             state.reconcile_queued_prompts(&session);
 
@@ -3020,6 +3059,9 @@ fn render_session_header_line(
     let queued_runs = session_pending_run_count(session);
     if queued_runs > 0 {
         parts.push(format!("queued {queued_runs}"));
+    }
+    if let Some((complete, total)) = state.coverage_summary {
+        parts.push(format!("coverage {complete}/{total} concerns"));
     }
     let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
     let _ = palette::write_colored(&mut buf, &parts.join("  ·  "), DIM);
@@ -4566,6 +4608,30 @@ fn append_session_runs_lines(state: &mut SessionInteractiveState, session: &Sess
             ),
         );
     }
+}
+
+/// How often the live header re-runs the audit for its `coverage N/M`
+/// indicator. The counts only move when a turn writes new assertions, so a
+/// few seconds of staleness is invisible while keeping IO off the redraw path.
+const COVERAGE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Compute `(complete_concerns, total_concerns)` for the session's coverage
+/// ledger. Returns `None` when the agent declares no `concerns:`, the ledger
+/// hasn't been created yet (no turn has run), the audit errors, or the
+/// effective catalog is empty — in every one of those cases the header simply
+/// omits the indicator rather than showing a misleading `0/0`.
+fn session_coverage_summary(session: &SessionRecord) -> Option<(usize, usize)> {
+    session.concerns.as_ref()?;
+    let target = rupu_coverage::target_id(&session.workspace_path, &session.session_id);
+    let paths = rupu_coverage::CoveragePaths::new(&session.workspace_path, &target);
+    if !paths.catalog.exists() {
+        return None;
+    }
+    let report = rupu_coverage::run_audit(&paths).ok()?;
+    if report.total_concerns == 0 {
+        return None;
+    }
+    Some((report.complete_concerns, report.total_concerns))
 }
 
 fn append_session_coverage_lines(state: &mut SessionInteractiveState, session: &SessionRecord) {
@@ -6631,6 +6697,64 @@ mod tests {
     }
 
     #[test]
+    fn session_coverage_summary_reflects_ledger_state() {
+        use rupu_coverage::{
+            flatten, write_snapshot, Attribution, CatalogMode, ConcernsBlock, ConcernsEntry,
+            CoveragePaths, FileTouchEvent, IncludeDirective, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut session = test_session_record();
+        session.workspace_path = tmp.path().to_path_buf();
+        session.session_id = "ses_cov01".into();
+
+        // No `concerns:` declared → no indicator.
+        session.concerns = None;
+        assert_eq!(session_coverage_summary(&session), None);
+
+        // Concerns declared but no ledger written yet → still no indicator
+        // (the header omits a misleading 0/0 until the first turn lands).
+        let block = ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: CatalogMode::Auto,
+                filter: None,
+            })],
+        };
+        session.concerns = Some(block.clone());
+        assert_eq!(session_coverage_summary(&session), None);
+
+        // Snapshot the catalog and record a touched file at the session's
+        // derived target. Every stride concern now has an in-scope file with
+        // no assertion → all gaps → `0/total` complete. (The numerator and
+        // denominator mirror `complete_concerns`/`total_concerns` from the
+        // shared audit, so the header agrees with what `/coverage` prints.)
+        let target = rupu_coverage::target_id(&session.workspace_path, &session.session_id);
+        let paths = CoveragePaths::new(&session.workspace_path, &target);
+        paths.ensure_dir().unwrap();
+        let cat = flatten(&block).unwrap();
+        let total = cat.concerns.len();
+        write_snapshot(&cat, &paths.catalog).unwrap();
+        let touch = FileTouchEvent::Read {
+            path: "src/auth/login.rs".into(),
+            line_range: [1, 80],
+            tool: "read_file".into(),
+            attribution: Attribution {
+                run_id: "r".into(),
+                model: "m".into(),
+                surface: Surface::Workflow,
+            },
+            at: Utc::now(),
+        };
+        std::fs::write(&paths.files, serde_json::to_string(&touch).unwrap() + "\n").unwrap();
+
+        let summary = session_coverage_summary(&session).expect("summary once ledger exists");
+        assert_eq!(summary, (0, total));
+        assert!(total > 0);
+    }
+
+    #[test]
     fn session_status_detail_includes_current_run_and_mode() {
         let session = test_session_record();
         let detail = session_status_detail(&session);
@@ -7203,6 +7327,25 @@ mod tests {
         // grand total = 120 + 45 + 18 = 183
         assert!(header.contains("total 183"));
         assert!(header.contains("~$"));
+    }
+
+    #[test]
+    fn retained_session_header_shows_coverage_indicator_when_cached() {
+        let session = test_session_record();
+        let mut state = SessionInteractiveState::new(
+            PathBuf::from("/tmp/repo/.rupu/transcripts/run_live123.jsonl"),
+            Some("run_live123".into()),
+            LiveViewMode::Compact,
+        );
+
+        // No cached summary → the header omits the coverage part entirely.
+        assert!(!render_session_header_line(&session, &state, 160).contains("coverage"));
+
+        // Once `maybe_refresh_coverage` has populated the cache, the header
+        // renders `coverage <complete>/<total> concerns`.
+        state.coverage_summary = Some((3, 7));
+        let header = render_session_header_line(&session, &state, 160);
+        assert!(header.contains("coverage 3/7 concerns"));
     }
 
     #[test]
