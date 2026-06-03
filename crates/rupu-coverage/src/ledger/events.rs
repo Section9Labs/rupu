@@ -95,6 +95,28 @@ impl FileTouchEvent {
             FileTouchEvent::Unknown { .. } => None,
         }
     }
+
+    pub fn attribution(&self) -> &Attribution {
+        match self {
+            FileTouchEvent::Read { attribution, .. }
+            | FileTouchEvent::Grep { attribution, .. }
+            | FileTouchEvent::Glob { attribution, .. }
+            | FileTouchEvent::Edit { attribution, .. }
+            | FileTouchEvent::Cmd { attribution, .. }
+            | FileTouchEvent::Unknown { attribution, .. } => attribution,
+        }
+    }
+
+    pub fn at(&self) -> DateTime<Utc> {
+        match self {
+            FileTouchEvent::Read { at, .. }
+            | FileTouchEvent::Grep { at, .. }
+            | FileTouchEvent::Glob { at, .. }
+            | FileTouchEvent::Edit { at, .. }
+            | FileTouchEvent::Cmd { at, .. }
+            | FileTouchEvent::Unknown { at, .. } => *at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -169,6 +191,30 @@ mod tests {
             model: "claude-sonnet-4-6".to_string(),
             surface: Surface::Workflow,
         }
+    }
+
+    #[test]
+    fn file_touch_event_exposes_attribution_and_at() {
+        let at = Utc::now();
+        let ev = FileTouchEvent::Read {
+            path: "src/a.rs".to_string(),
+            line_range: [1, 10],
+            tool: "read_file".to_string(),
+            attribution: attribution(),
+            at,
+        };
+        assert_eq!(ev.attribution().run_id, "run_01KS19A4MQXP");
+        assert_eq!(ev.at(), at);
+
+        // Unknown has no path but still carries attribution + timestamp.
+        let unknown = FileTouchEvent::Unknown {
+            tool: "mystery".to_string(),
+            arg_hash: "deadbeef".to_string(),
+            attribution: attribution(),
+            at,
+        };
+        assert_eq!(unknown.attribution().model, "claude-sonnet-4-6");
+        assert_eq!(unknown.at(), at);
     }
 
     #[test]
