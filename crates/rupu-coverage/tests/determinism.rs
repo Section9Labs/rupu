@@ -33,17 +33,24 @@ fn block_two_includes(a: &str, b: &str) -> ConcernsBlock {
 
 #[test]
 fn render_is_byte_stable_across_repeated_calls() {
+    // A purity assertion (no I/O, no global state, no RNG), not a
+    // runtime-nondeterminism guard. The substantive order-independence
+    // proofs are the two tests below.
     let catalog = flatten(&block_two_includes("stride", "secrets-in-source")).unwrap();
     let first = render_prompt_section(&catalog, DEFAULT_FULL_MODE_THRESHOLD);
     let second = render_prompt_section(&catalog, DEFAULT_FULL_MODE_THRESHOLD);
-    assert_eq!(first, second, "render_prompt_section must be a pure function");
+    assert_eq!(
+        first, second,
+        "render_prompt_section must be a pure function"
+    );
 }
 
 #[test]
 fn render_is_independent_of_include_order() {
     // The SAME logical catalog, declared in two different include orders,
     // must render to identical bytes — proving concern ordering is
-    // canonical (sorted by id), not input-order-dependent.
+    // canonical (sorted by id), not input-order-dependent. Full mode: all
+    // 7 concerns are inlined under the default threshold.
     let ab = flatten(&block_two_includes("stride", "secrets-in-source")).unwrap();
     let ba = flatten(&block_two_includes("secrets-in-source", "stride")).unwrap();
     let rendered_ab = render_prompt_section(&ab, DEFAULT_FULL_MODE_THRESHOLD);
@@ -51,6 +58,23 @@ fn render_is_independent_of_include_order() {
     assert_eq!(
         rendered_ab, rendered_ba,
         "render must not depend on the order includes are declared in"
+    );
+}
+
+#[test]
+fn render_is_independent_of_include_order_index_mode() {
+    // Same order-independence guarantee for the INDEX-mode render path —
+    // the path large CWE catalogs take. A threshold of 0 forces every
+    // concern into the one-line index table instead of inlining bodies,
+    // exercising the `partition_by_mode` index bucket the full-mode tests
+    // never reach.
+    let ab = flatten(&block_two_includes("stride", "secrets-in-source")).unwrap();
+    let ba = flatten(&block_two_includes("secrets-in-source", "stride")).unwrap();
+    let rendered_ab = render_prompt_section(&ab, 0);
+    let rendered_ba = render_prompt_section(&ba, 0);
+    assert_eq!(
+        rendered_ab, rendered_ba,
+        "index-mode render must not depend on include order"
     );
 }
 

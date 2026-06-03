@@ -109,7 +109,10 @@ mod tests {
         // Feed file events whose paths are NOT in sorted order. The output
         // must still come back ordered by (concern_id, file_path), and be
         // identical across two calls — the determinism contract for the
-        // live file list the model sees.
+        // live file list the model sees. (The inputs happen to be sorted by
+        // file_views/flatten today, so this pins the contract rather than
+        // isolating the explicit sort; the sort is the local guarantee that
+        // keeps it holding if those helpers' ordering ever changes.)
         let catalog = flatten(&ConcernsBlock {
             entries: vec![ConcernsEntry::Include(IncludeDirective {
                 include: "stride".to_string(),
