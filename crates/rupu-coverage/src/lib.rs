@@ -30,7 +30,7 @@ pub use catalog::{
 };
 pub use audit::{AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster};
 pub use audit::generate::audit as run_audit;
-pub use diff::generate::{run_diff, DiffError, RunSelector};
+pub use diff::generate::{list_runs, run_diff, DiffError, RunSelector};
 pub use diff::{CellRef, FindingThemeRef, RunDiff, RunListEntry, VerdictFlip};
 pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};
 pub use ledger::{

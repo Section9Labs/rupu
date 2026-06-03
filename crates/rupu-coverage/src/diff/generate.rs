@@ -2,8 +2,10 @@
 //! `run_diff` / `list_runs` entry points.
 
 use crate::audit::generate::theme_key;
-use crate::diff::types::{CellRef, FindingThemeRef, RunDiff, VerdictFlip};
-use crate::ledger::events::{AssertionStatus, ConcernAssertion, FileTouchEvent, FindingRecord};
+use crate::diff::types::{CellRef, FindingThemeRef, RunDiff, RunListEntry, VerdictFlip};
+use crate::ledger::events::{
+    AssertionStatus, ConcernAssertion, FileTouchEvent, FindingRecord, Surface,
+};
 use crate::ledger::paths::CoveragePaths;
 use crate::ledger::views::{read_concern_assertions, read_file_events, read_findings};
 use chrono::{DateTime, Utc};
@@ -261,6 +263,71 @@ pub fn run_diff(
     })
 }
 
+/// List every run on a target with its identity and contribution counts,
+/// most-recent-first.
+pub fn list_runs(paths: &CoveragePaths) -> Result<Vec<RunListEntry>, DiffError> {
+    let files = read_file_events(paths)?;
+    let assertions = read_concern_assertions(paths)?;
+    let findings = read_findings(paths)?;
+    let ordered = ordered_runs(&files, &assertions, &findings);
+
+    let mut out = Vec::with_capacity(ordered.len());
+    for run_id in ordered {
+        let single: BTreeSet<String> = [run_id.clone()].into_iter().collect();
+        let c = contribution(&single, &files, &assertions, &findings);
+
+        // Identity (model, surface) and earliest timestamp from any of the
+        // run's ledger rows. Every row for a run carries the same model +
+        // surface, so the first match is representative.
+        let mut model = String::new();
+        let mut surface = Surface::Session;
+        let mut started_at: Option<DateTime<Utc>> = None;
+        let mut consider = |attr_run: &str, m: &str, s: Surface, at: DateTime<Utc>| {
+            if attr_run == run_id {
+                if model.is_empty() {
+                    model = m.to_string();
+                    surface = s;
+                }
+                started_at = Some(match started_at {
+                    Some(cur) if cur <= at => cur,
+                    _ => at,
+                });
+            }
+        };
+        for f in &files {
+            let a = f.attribution();
+            consider(&a.run_id, &a.model, a.surface, f.at());
+        }
+        for a in &assertions {
+            consider(
+                &a.declared_by.run_id,
+                &a.declared_by.model,
+                a.declared_by.surface,
+                a.declared_at,
+            );
+        }
+        for f in &findings {
+            consider(
+                &f.declared_by.run_id,
+                &f.declared_by.model,
+                f.declared_by.surface,
+                f.declared_at,
+            );
+        }
+
+        out.push(RunListEntry {
+            run_id,
+            started_at: started_at.unwrap_or_else(Utc::now),
+            model,
+            surface,
+            cells_asserted: c.cells.len(),
+            findings: c.finding_themes.len(),
+            files_touched: c.touched.len(),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +572,28 @@ mod tests {
         write_ledgers(&paths, &files, &assertions, &[]);
         let diff = run_diff(&paths, &RunSelector::Previous, &RunSelector::Latest).unwrap();
         assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn list_runs_reports_counts_most_recent_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        let files = vec![read_event("run_old", 100), read_event("run_new", 200)];
+        let assertions = vec![
+            assertion("run_old", "c1", "src/a.rs", AssertionStatus::Clean, 100),
+            assertion("run_new", "c1", "src/a.rs", AssertionStatus::Finding, 200),
+            assertion("run_new", "c2", "src/b.rs", AssertionStatus::Clean, 201),
+        ];
+        let findings = vec![finding("run_new", Some("c1"), "something something here now ok yes")];
+        write_ledgers(&paths, &files, &assertions, &findings);
+
+        let runs = list_runs(&paths).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_id, "run_new");
+        assert_eq!(runs[1].run_id, "run_old");
+        assert_eq!(runs[0].cells_asserted, 2);
+        assert_eq!(runs[0].findings, 1);
+        assert_eq!(runs[0].files_touched, 1);
+        assert_eq!(runs[0].started_at, DateTime::<Utc>::from_timestamp(200, 0).unwrap());
     }
 }
