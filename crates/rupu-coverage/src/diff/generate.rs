@@ -24,6 +24,10 @@ pub enum RunSelector {
 
 impl FromStr for RunSelector {
     type Err = std::convert::Infallible;
+    /// `latest` and `previous` are reserved keywords; any other string is
+    /// taken as an explicit run id. A run literally named `latest` or
+    /// `previous` is therefore unreachable as an explicit selector (run
+    /// ids are ULID-style, so this is a non-issue in practice).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "latest" => RunSelector::Latest,
@@ -114,8 +118,10 @@ pub(crate) struct Contribution {
 }
 
 /// Build a contribution from the ledgers, restricted to `runs`. Cell
-/// supersession matches the audit: assertions are applied in timestamp
-/// order so the last write within the run set wins.
+/// supersession applies assertions in `declared_at` order so the last
+/// write within the run set wins. (The audit collapses by raw ledger
+/// order; for an append-only ledger written chronologically the two
+/// agree, and ordering by timestamp is robust to out-of-order writes.)
 pub(crate) fn contribution(
     runs: &BTreeSet<String>,
     files: &[FileTouchEvent],
@@ -321,7 +327,10 @@ pub fn list_runs(paths: &CoveragePaths) -> Result<Vec<RunListEntry>, DiffError> 
 
         out.push(RunListEntry {
             run_id,
-            started_at: started_at.unwrap_or_else(Utc::now),
+            // Always `Some` (the run is in `ordered` only because it has
+            // a ledger row); the deterministic fallback avoids injecting
+            // wall-clock time on the unreachable path.
+            started_at: started_at.unwrap_or(DateTime::<Utc>::MIN_UTC),
             model,
             surface,
             cells_asserted: c.cells.len(),

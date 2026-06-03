@@ -46,7 +46,7 @@ pub struct RunDiff {
 }
 
 impl RunDiff {
-    /// True when the two contributions are identical across all four
+    /// True when the two contributions are identical across all
     /// dimensions (no changes to report).
     pub fn is_empty(&self) -> bool {
         self.newly_asserted.is_empty()
