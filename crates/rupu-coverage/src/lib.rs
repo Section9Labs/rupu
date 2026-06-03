@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod catalog;
+pub mod diff;
 pub mod ledger;
 pub mod tool_mappings;
 pub mod tools;
