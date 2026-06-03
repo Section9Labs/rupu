@@ -71,6 +71,11 @@ pub fn coverage_remaining(
             });
         }
     }
+    out.sort_by(|a, b| {
+        a.concern_id
+            .cmp(&b.concern_id)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+    });
     Ok(out)
 }
 
@@ -97,6 +102,59 @@ mod tests {
             .map(|e| serde_json::to_string(e).unwrap() + "\n")
             .collect();
         std::fs::write(&paths.files, body).unwrap();
+    }
+
+    #[test]
+    fn remaining_output_is_sorted_by_concern_then_path() {
+        // Feed file events whose paths are NOT in sorted order. The output
+        // must still come back ordered by (concern_id, file_path), and be
+        // identical across two calls — the determinism contract for the
+        // live file list the model sees.
+        let catalog = flatten(&ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
+            })],
+        })
+        .unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(dir.path(), "tgt");
+        // Events in deliberately reversed path order.
+        let events = vec![
+            FileTouchEvent::Read {
+                path: "src/zeta.rs".to_string(),
+                line_range: [1, 10],
+                tool: "read_file".to_string(),
+                attribution: attribution(),
+                at: Utc::now(),
+            },
+            FileTouchEvent::Read {
+                path: "src/alpha.rs".to_string(),
+                line_range: [1, 10],
+                tool: "read_file".to_string(),
+                attribution: attribution(),
+                at: Utc::now(),
+            },
+        ];
+        write_events(&paths, &events);
+
+        let out1 = coverage_remaining(&paths, &catalog, CoverageRemainingInput::default()).unwrap();
+        let out2 = coverage_remaining(&paths, &catalog, CoverageRemainingInput::default()).unwrap();
+        assert_eq!(out1.len(), out2.len());
+
+        // Identical across calls.
+        let key = |r: &RemainingItem| (r.concern_id.clone(), r.file_path.clone());
+        let keys1: Vec<_> = out1.iter().map(key).collect();
+        let keys2: Vec<_> = out2.iter().map(key).collect();
+        assert_eq!(keys1, keys2, "remaining output must be stable across calls");
+
+        // Globally sorted by (concern_id, file_path).
+        let mut sorted = keys1.clone();
+        sorted.sort();
+        assert_eq!(keys1, sorted, "remaining output must be sorted by (concern_id, file_path)");
     }
 
     #[test]
