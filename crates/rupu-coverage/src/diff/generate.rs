@@ -123,7 +123,10 @@ pub(crate) fn contribution(
     findings: &[FindingRecord],
 ) -> Contribution {
     let mut touched: BTreeSet<String> = BTreeSet::new();
-    for f in files.iter().filter(|f| runs.contains(&f.attribution().run_id)) {
+    for f in files
+        .iter()
+        .filter(|f| runs.contains(&f.attribution().run_id))
+    {
         if let Some(path) = f.path() {
             touched.insert(path.to_string());
         }
@@ -140,7 +143,10 @@ pub(crate) fn contribution(
     }
 
     let mut finding_themes: BTreeSet<(Option<String>, String)> = BTreeSet::new();
-    for f in findings.iter().filter(|f| runs.contains(&f.declared_by.run_id)) {
+    for f in findings
+        .iter()
+        .filter(|f| runs.contains(&f.declared_by.run_id))
+    {
         finding_themes.insert((f.concern_id.clone(), theme_key(&f.summary)));
     }
 
@@ -234,10 +240,8 @@ pub fn run_diff(
         .collect();
 
     // File-touch delta.
-    let mut newly_touched: Vec<String> =
-        c.touched.difference(&b.touched).cloned().collect();
-    let mut no_longer_touched: Vec<String> =
-        b.touched.difference(&c.touched).cloned().collect();
+    let mut newly_touched: Vec<String> = c.touched.difference(&b.touched).cloned().collect();
+    let mut no_longer_touched: Vec<String> = b.touched.difference(&c.touched).cloned().collect();
 
     // Deterministic ordering for stable output.
     let cell_key = |r: &CellRef| (r.concern_id.clone(), r.file_path.clone());
@@ -353,7 +357,13 @@ mod tests {
         }
     }
 
-    fn assertion(run: &str, concern: &str, file: &str, status: AssertionStatus, secs: i64) -> ConcernAssertion {
+    fn assertion(
+        run: &str,
+        concern: &str,
+        file: &str,
+        status: AssertionStatus,
+        secs: i64,
+    ) -> ConcernAssertion {
         ConcernAssertion {
             concern_id: concern.to_string(),
             file_path: file.to_string(),
@@ -497,14 +507,17 @@ mod tests {
             Some(&AssertionStatus::Finding)
         );
         // run_b's cell is excluded.
-        assert!(!c.cells.contains_key(&("c2".to_string(), "src/b.rs".to_string())));
+        assert!(!c
+            .cells
+            .contains_key(&("c2".to_string(), "src/b.rs".to_string())));
         // Touched paths come only from run_a.
         assert!(c.touched.contains("src/a.rs"));
         assert!(c.touched.contains("src/only_a.rs"));
         // Finding themes are (concern_id, theme_key); run_b's is excluded.
-        assert!(c
-            .finding_themes
-            .contains(&(Some("c1".to_string()), theme_key("sql injection in login handler path"))));
+        assert!(c.finding_themes.contains(&(
+            Some("c1".to_string()),
+            theme_key("sql injection in login handler path")
+        )));
         assert_eq!(c.finding_themes.len(), 1);
     }
 
@@ -547,14 +560,30 @@ mod tests {
 
         assert_eq!(diff.base_runs, vec!["run_old"]);
         assert_eq!(diff.compare_runs, vec!["run_new"]);
-        assert!(diff.newly_asserted.iter().any(|c| c.concern_id == "c3" && c.file_path == "src/c.rs"));
-        assert!(diff.no_longer_asserted.iter().any(|c| c.concern_id == "c2" && c.file_path == "src/b.rs"));
-        let flip = diff.verdict_flips.iter().find(|f| f.concern_id == "c1").unwrap();
+        assert!(diff
+            .newly_asserted
+            .iter()
+            .any(|c| c.concern_id == "c3" && c.file_path == "src/c.rs"));
+        assert!(diff
+            .no_longer_asserted
+            .iter()
+            .any(|c| c.concern_id == "c2" && c.file_path == "src/b.rs"));
+        let flip = diff
+            .verdict_flips
+            .iter()
+            .find(|f| f.concern_id == "c1")
+            .unwrap();
         assert_eq!(flip.base_status, AssertionStatus::Clean);
         assert_eq!(flip.compare_status, AssertionStatus::Finding);
         assert!(flip.high_signal);
-        assert!(diff.findings_appeared.iter().any(|f| f.theme.starts_with("beta")));
-        assert!(diff.findings_disappeared.iter().any(|f| f.theme.starts_with("alpha")));
+        assert!(diff
+            .findings_appeared
+            .iter()
+            .any(|f| f.theme.starts_with("beta")));
+        assert!(diff
+            .findings_disappeared
+            .iter()
+            .any(|f| f.theme.starts_with("alpha")));
         assert!(diff.newly_touched.contains(&"src/c.rs".to_string()));
         assert!(diff.no_longer_touched.contains(&"src/b.rs".to_string()));
         assert!(!diff.is_empty());
@@ -584,7 +613,11 @@ mod tests {
             assertion("run_new", "c1", "src/a.rs", AssertionStatus::Finding, 200),
             assertion("run_new", "c2", "src/b.rs", AssertionStatus::Clean, 201),
         ];
-        let findings = vec![finding("run_new", Some("c1"), "something something here now ok yes")];
+        let findings = vec![finding(
+            "run_new",
+            Some("c1"),
+            "something something here now ok yes",
+        )];
         write_ledgers(&paths, &files, &assertions, &findings);
 
         let runs = list_runs(&paths).unwrap();
@@ -594,6 +627,9 @@ mod tests {
         assert_eq!(runs[0].cells_asserted, 2);
         assert_eq!(runs[0].findings, 1);
         assert_eq!(runs[0].files_touched, 1);
-        assert_eq!(runs[0].started_at, DateTime::<Utc>::from_timestamp(200, 0).unwrap());
+        assert_eq!(
+            runs[0].started_at,
+            DateTime::<Utc>::from_timestamp(200, 0).unwrap()
+        );
     }
 }
