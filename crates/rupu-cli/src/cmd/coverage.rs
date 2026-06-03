@@ -339,7 +339,11 @@ fn run_runs_in(workspace: &Path, target_id: &str, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("coverage runs · target {} · {} run(s)", target_id, runs.len());
+    println!(
+        "coverage runs · target {} · {} run(s)",
+        target_id,
+        runs.len()
+    );
     if runs.is_empty() {
         return Ok(());
     }
@@ -505,11 +509,11 @@ mod tests {
 
     #[test]
     fn diff_on_two_run_target_json_and_human() {
+        use chrono::{DateTime, Utc};
         use rupu_coverage::{
             AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence,
             FileTouchEvent, Surface,
         };
-        use chrono::{DateTime, Utc};
 
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CoveragePaths::new(tmp.path(), "tgt");
@@ -576,10 +580,10 @@ mod tests {
 
     #[test]
     fn runs_list_json_and_human() {
+        use chrono::{DateTime, Utc};
         use rupu_coverage::{
             AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence, Surface,
         };
-        use chrono::{DateTime, Utc};
 
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = CoveragePaths::new(tmp.path(), "tgt");
