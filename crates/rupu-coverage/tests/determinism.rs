@@ -74,3 +74,21 @@ fn catalog_snapshot_is_independent_of_include_order() {
         "catalog snapshot YAML must not depend on include order"
     );
 }
+
+#[test]
+fn stride_catalog_render_matches_snapshot() {
+    // Pins the exact rendered bytes for a curated catalog. A diff here
+    // means the prompt format changed — intentional changes are accepted
+    // with `cargo insta review`; unintended ones are caught in review.
+    let catalog = flatten(&ConcernsBlock {
+        entries: vec![ConcernsEntry::Include(IncludeDirective {
+            include: "stride".to_string(),
+            overrides: vec![],
+            mode: CatalogMode::Auto,
+            filter: None,
+        })],
+    })
+    .unwrap();
+    let rendered = render_prompt_section(&catalog, DEFAULT_FULL_MODE_THRESHOLD);
+    insta::assert_snapshot!("stride_catalog_render", rendered);
+}
