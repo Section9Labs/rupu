@@ -44,8 +44,8 @@ pub fn coverage_remaining(
             .filter_map(|p| glob::Pattern::new(p).ok())
             .collect();
         for view in &views {
-            let matches_glob = patterns.is_empty()
-                || patterns.iter().any(|p| p.matches(&view.path));
+            let matches_glob =
+                patterns.is_empty() || patterns.iter().any(|p| p.matches(&view.path));
             if !matches_glob {
                 continue;
             }
@@ -154,7 +154,10 @@ mod tests {
         // Globally sorted by (concern_id, file_path).
         let mut sorted = keys1.clone();
         sorted.sort();
-        assert_eq!(keys1, sorted, "remaining output must be sorted by (concern_id, file_path)");
+        assert_eq!(
+            keys1, sorted,
+            "remaining output must be sorted by (concern_id, file_path)"
+        );
     }
 
     #[test]
@@ -181,7 +184,8 @@ mod tests {
             }],
         );
         // No assertions yet → src/config.rs should appear as remaining.
-        let remaining = coverage_remaining(&paths, &catalog, CoverageRemainingInput::default()).unwrap();
+        let remaining =
+            coverage_remaining(&paths, &catalog, CoverageRemainingInput::default()).unwrap();
         assert!(remaining
             .iter()
             .any(|r| r.file_path == "src/config.rs" && r.reason == "no_assertion"));
