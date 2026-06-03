@@ -2,7 +2,10 @@
 //! `run_diff` / `list_runs` entry points.
 
 use crate::audit::generate::theme_key;
+use crate::diff::types::{CellRef, FindingThemeRef, RunDiff, VerdictFlip};
 use crate::ledger::events::{AssertionStatus, ConcernAssertion, FileTouchEvent, FindingRecord};
+use crate::ledger::paths::CoveragePaths;
+use crate::ledger::views::{read_concern_assertions, read_file_events, read_findings};
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -42,7 +45,6 @@ pub enum DiffError {
 /// Run ids ordered most-recent-first. "Recency" is the maximum timestamp
 /// observed for a run across all three ledgers; ties break by run id
 /// ascending for stability.
-#[allow(dead_code)]
 pub(crate) fn ordered_runs(
     files: &[FileTouchEvent],
     assertions: &[ConcernAssertion],
@@ -76,7 +78,6 @@ pub(crate) fn ordered_runs(
 
 /// Resolve a selector against the recency-ordered run list. v1 returns a
 /// single-element Vec.
-#[allow(dead_code)]
 pub(crate) fn resolve_selector(
     selector: &RunSelector,
     ordered: &[String],
@@ -101,7 +102,6 @@ pub(crate) fn resolve_selector(
 }
 
 /// One run set's contribution to a target, reduced for diffing.
-#[allow(dead_code)]
 pub(crate) struct Contribution {
     /// `(concern_id, file_path) -> last status` for assertions by these runs.
     pub cells: BTreeMap<(String, String), AssertionStatus>,
@@ -114,7 +114,6 @@ pub(crate) struct Contribution {
 /// Build a contribution from the ledgers, restricted to `runs`. Cell
 /// supersession matches the audit: assertions are applied in timestamp
 /// order so the last write within the run set wins.
-#[allow(dead_code)]
 pub(crate) fn contribution(
     runs: &BTreeSet<String>,
     files: &[FileTouchEvent],
@@ -150,11 +149,124 @@ pub(crate) fn contribution(
     }
 }
 
+/// Diff two run selectors against a target's ledgers. `base` is the
+/// earlier reference; `compare` is the run under inspection.
+pub fn run_diff(
+    paths: &CoveragePaths,
+    base: &RunSelector,
+    compare: &RunSelector,
+) -> Result<RunDiff, DiffError> {
+    let files = read_file_events(paths)?;
+    let assertions = read_concern_assertions(paths)?;
+    let findings = read_findings(paths)?;
+
+    let ordered = ordered_runs(&files, &assertions, &findings);
+    let base_runs = resolve_selector(base, &ordered)?;
+    let compare_runs = resolve_selector(compare, &ordered)?;
+
+    let base_set: BTreeSet<String> = base_runs.iter().cloned().collect();
+    let compare_set: BTreeSet<String> = compare_runs.iter().cloned().collect();
+    let b = contribution(&base_set, &files, &assertions, &findings);
+    let c = contribution(&compare_set, &files, &assertions, &findings);
+
+    // Cell-coverage delta.
+    let mut newly_asserted: Vec<CellRef> = c
+        .cells
+        .iter()
+        .filter(|(k, _)| !b.cells.contains_key(*k))
+        .map(|((concern_id, file_path), status)| CellRef {
+            concern_id: concern_id.clone(),
+            file_path: file_path.clone(),
+            status: *status,
+        })
+        .collect();
+    let mut no_longer_asserted: Vec<CellRef> = b
+        .cells
+        .iter()
+        .filter(|(k, _)| !c.cells.contains_key(*k))
+        .map(|((concern_id, file_path), status)| CellRef {
+            concern_id: concern_id.clone(),
+            file_path: file_path.clone(),
+            status: *status,
+        })
+        .collect();
+
+    // Verdict flips: cells in both with a changed status.
+    let mut verdict_flips: Vec<VerdictFlip> = b
+        .cells
+        .iter()
+        .filter_map(|(k, base_status)| {
+            c.cells.get(k).and_then(|compare_status| {
+                if base_status != compare_status {
+                    Some(VerdictFlip {
+                        concern_id: k.0.clone(),
+                        file_path: k.1.clone(),
+                        base_status: *base_status,
+                        compare_status: *compare_status,
+                        high_signal: *base_status == AssertionStatus::Clean
+                            && *compare_status == AssertionStatus::Finding,
+                    })
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    // Finding themes appeared / disappeared.
+    let mut findings_appeared: Vec<FindingThemeRef> = c
+        .finding_themes
+        .difference(&b.finding_themes)
+        .map(|(concern_id, theme)| FindingThemeRef {
+            concern_id: concern_id.clone(),
+            theme: theme.clone(),
+        })
+        .collect();
+    let mut findings_disappeared: Vec<FindingThemeRef> = b
+        .finding_themes
+        .difference(&c.finding_themes)
+        .map(|(concern_id, theme)| FindingThemeRef {
+            concern_id: concern_id.clone(),
+            theme: theme.clone(),
+        })
+        .collect();
+
+    // File-touch delta.
+    let mut newly_touched: Vec<String> =
+        c.touched.difference(&b.touched).cloned().collect();
+    let mut no_longer_touched: Vec<String> =
+        b.touched.difference(&c.touched).cloned().collect();
+
+    // Deterministic ordering for stable output.
+    let cell_key = |r: &CellRef| (r.concern_id.clone(), r.file_path.clone());
+    newly_asserted.sort_by_key(cell_key);
+    no_longer_asserted.sort_by_key(cell_key);
+    verdict_flips.sort_by_key(|f| (f.concern_id.clone(), f.file_path.clone()));
+    let theme_key_sort = |r: &FindingThemeRef| (r.concern_id.clone(), r.theme.clone());
+    findings_appeared.sort_by_key(theme_key_sort);
+    findings_disappeared.sort_by_key(theme_key_sort);
+    newly_touched.sort();
+    no_longer_touched.sort();
+
+    Ok(RunDiff {
+        base_runs,
+        compare_runs,
+        newly_asserted,
+        no_longer_asserted,
+        verdict_flips,
+        findings_appeared,
+        findings_disappeared,
+        newly_touched,
+        no_longer_touched,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::types::Severity;
     use crate::ledger::events::{Attribution, Evidence, FindingEvidence, FindingScope, Surface};
+    use crate::ledger::paths::CoveragePaths;
 
     fn attribution(run_id: &str) -> Attribution {
         Attribution {
@@ -264,6 +376,30 @@ mod tests {
         assert!(matches!(err, DiffError::NoRunMatches(s) if s == "latest"));
     }
 
+    fn write_ledgers(
+        paths: &CoveragePaths,
+        files: &[FileTouchEvent],
+        assertions: &[ConcernAssertion],
+        findings: &[FindingRecord],
+    ) {
+        paths.ensure_dir().unwrap();
+        let f: String = files
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        std::fs::write(&paths.files, f).unwrap();
+        let a: String = assertions
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        std::fs::write(&paths.concerns, a).unwrap();
+        let fi: String = findings
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect();
+        std::fs::write(&paths.findings, fi).unwrap();
+    }
+
     #[test]
     fn contribution_collects_cells_touched_and_themes_for_run_set() {
         let runs: BTreeSet<String> = ["run_a".to_string()].into_iter().collect();
@@ -303,5 +439,71 @@ mod tests {
             .finding_themes
             .contains(&(Some("c1".to_string()), theme_key("sql injection in login handler path"))));
         assert_eq!(c.finding_themes.len(), 1);
+    }
+
+    #[test]
+    fn run_diff_reports_all_four_dimensions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+
+        let files = vec![
+            read_event("run_old", 100), // a.rs
+            FileTouchEvent::Read {
+                path: "src/b.rs".to_string(),
+                line_range: [1, 5],
+                tool: "read_file".to_string(),
+                attribution: attribution("run_old"),
+                at: DateTime::<Utc>::from_timestamp(101, 0).unwrap(),
+            },
+            read_event("run_new", 200), // a.rs
+            FileTouchEvent::Read {
+                path: "src/c.rs".to_string(),
+                line_range: [1, 5],
+                tool: "read_file".to_string(),
+                attribution: attribution("run_new"),
+                at: DateTime::<Utc>::from_timestamp(201, 0).unwrap(),
+            },
+        ];
+        let assertions = vec![
+            assertion("run_old", "c1", "src/a.rs", AssertionStatus::Clean, 100),
+            assertion("run_old", "c2", "src/b.rs", AssertionStatus::Clean, 101),
+            assertion("run_new", "c1", "src/a.rs", AssertionStatus::Finding, 200),
+            assertion("run_new", "c3", "src/c.rs", AssertionStatus::Clean, 201),
+        ];
+        let findings = vec![
+            finding("run_old", Some("c1"), "alpha alpha alpha alpha alpha alpha"),
+            finding("run_new", Some("c1"), "beta beta beta beta beta beta"),
+        ];
+        write_ledgers(&paths, &files, &assertions, &findings);
+
+        let diff = run_diff(&paths, &RunSelector::Previous, &RunSelector::Latest).unwrap();
+
+        assert_eq!(diff.base_runs, vec!["run_old"]);
+        assert_eq!(diff.compare_runs, vec!["run_new"]);
+        assert!(diff.newly_asserted.iter().any(|c| c.concern_id == "c3" && c.file_path == "src/c.rs"));
+        assert!(diff.no_longer_asserted.iter().any(|c| c.concern_id == "c2" && c.file_path == "src/b.rs"));
+        let flip = diff.verdict_flips.iter().find(|f| f.concern_id == "c1").unwrap();
+        assert_eq!(flip.base_status, AssertionStatus::Clean);
+        assert_eq!(flip.compare_status, AssertionStatus::Finding);
+        assert!(flip.high_signal);
+        assert!(diff.findings_appeared.iter().any(|f| f.theme.starts_with("beta")));
+        assert!(diff.findings_disappeared.iter().any(|f| f.theme.starts_with("alpha")));
+        assert!(diff.newly_touched.contains(&"src/c.rs".to_string()));
+        assert!(diff.no_longer_touched.contains(&"src/b.rs".to_string()));
+        assert!(!diff.is_empty());
+    }
+
+    #[test]
+    fn run_diff_identical_runs_is_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        let files = vec![read_event("run_old", 100), read_event("run_new", 200)];
+        let assertions = vec![
+            assertion("run_old", "c1", "src/a.rs", AssertionStatus::Clean, 100),
+            assertion("run_new", "c1", "src/a.rs", AssertionStatus::Clean, 200),
+        ];
+        write_ledgers(&paths, &files, &assertions, &[]);
+        let diff = run_diff(&paths, &RunSelector::Previous, &RunSelector::Latest).unwrap();
+        assert!(diff.is_empty());
     }
 }
