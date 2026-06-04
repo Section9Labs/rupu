@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod catalog;
+pub mod diff;
 pub mod ledger;
 pub mod tool_mappings;
 pub mod tools;
@@ -29,6 +30,8 @@ pub use catalog::{
 };
 pub use audit::{AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster};
 pub use audit::generate::audit as run_audit;
+pub use diff::generate::{list_runs, run_diff, DiffError, RunSelector};
+pub use diff::{CellRef, FindingThemeRef, RunDiff, RunListEntry, VerdictFlip};
 pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};
 pub use ledger::{
     discover_targets, file_views, read_concern_assertions, read_file_events, read_findings,

@@ -38,6 +38,26 @@ pub enum Action {
         /// Target id (from `coverage list`).
         target_id: String,
     },
+    /// Diff two runs against a target (defaults to `previous latest`).
+    Diff {
+        /// Target id (from `coverage list`).
+        target_id: String,
+        /// Base run selector: a run id, `latest`, or `previous`.
+        base: Option<String>,
+        /// Compare run selector: a run id, `latest`, or `previous`.
+        compare: Option<String>,
+        /// Emit machine-readable JSON instead of the human summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the runs recorded against a target (to find ids to diff).
+    Runs {
+        /// Target id (from `coverage list`).
+        target_id: String,
+        /// Emit machine-readable JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -62,6 +82,15 @@ pub async fn handle(action: Action, _format: Option<OutputFormat>) -> ExitCode {
             workspace().and_then(|ws| run_audit_in(&ws, &target_id, json))
         }
         Action::Gap { target_id } => workspace().and_then(|ws| run_gap_in(&ws, &target_id)),
+        Action::Diff {
+            target_id,
+            base,
+            compare,
+            json,
+        } => workspace().and_then(|ws| run_diff_in(&ws, &target_id, base, compare, json)),
+        Action::Runs { target_id, json } => {
+            workspace().and_then(|ws| run_runs_in(&ws, &target_id, json))
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -202,6 +231,134 @@ fn run_audit_in(workspace: &Path, target_id: &str, json: bool) -> Result<()> {
         for s in &report.serendipitous {
             println!("  ({}) {}  {:?}", s.count, s.theme, s.finding_ids);
         }
+    }
+    Ok(())
+}
+
+fn run_diff_in(
+    workspace: &Path,
+    target_id: &str,
+    base: Option<String>,
+    compare: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let (base, compare) = match (base, compare) {
+        (None, None) => ("previous".to_string(), "latest".to_string()),
+        (Some(b), Some(c)) => (b, c),
+        _ => anyhow::bail!("provide both base and compare run selectors, or neither"),
+    };
+    // RunSelector::from_str is infallible (any non-keyword is a run id).
+    let base_sel: rupu_coverage::RunSelector = base.parse().unwrap();
+    let compare_sel: rupu_coverage::RunSelector = compare.parse().unwrap();
+
+    let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
+    let diff = rupu_coverage::run_diff(&paths, &base_sel, &compare_sel)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&diff)?);
+        return Ok(());
+    }
+
+    println!(
+        "coverage diff · target {} · base {} → compare {}",
+        target_id,
+        diff.base_runs.join(","),
+        diff.compare_runs.join(","),
+    );
+    if diff.is_empty() {
+        println!();
+        println!("no changes between the two runs");
+        return Ok(());
+    }
+
+    println!();
+    println!("== cell-coverage delta ==");
+    println!("  + newly asserted: {}", diff.newly_asserted.len());
+    for c in &diff.newly_asserted {
+        println!("      {} · {}  [{:?}]", c.concern_id, c.file_path, c.status);
+    }
+    println!("  - no longer asserted: {}", diff.no_longer_asserted.len());
+    for c in &diff.no_longer_asserted {
+        println!("      {} · {}  [{:?}]", c.concern_id, c.file_path, c.status);
+    }
+
+    if !diff.verdict_flips.is_empty() {
+        println!();
+        println!("== verdict flips ==");
+        for f in &diff.verdict_flips {
+            let mark = if f.high_signal { "!" } else { " " };
+            println!(
+                "  [{}] {} · {}  {:?} → {:?}",
+                mark, f.concern_id, f.file_path, f.base_status, f.compare_status
+            );
+        }
+    }
+
+    if !diff.findings_appeared.is_empty() || !diff.findings_disappeared.is_empty() {
+        println!();
+        println!("== findings (theme-based, best-effort) ==");
+        println!("  + appeared: {}", diff.findings_appeared.len());
+        for f in &diff.findings_appeared {
+            println!(
+                "      ({}) {}",
+                f.concern_id.as_deref().unwrap_or("-"),
+                f.theme
+            );
+        }
+        println!("  - disappeared: {}", diff.findings_disappeared.len());
+        for f in &diff.findings_disappeared {
+            println!(
+                "      ({}) {}",
+                f.concern_id.as_deref().unwrap_or("-"),
+                f.theme
+            );
+        }
+    }
+
+    if !diff.newly_touched.is_empty() || !diff.no_longer_touched.is_empty() {
+        println!();
+        println!("== file-touch delta ==");
+        println!("  + newly touched: {}", diff.newly_touched.len());
+        for p in &diff.newly_touched {
+            println!("      {p}");
+        }
+        println!("  - no longer touched: {}", diff.no_longer_touched.len());
+        for p in &diff.no_longer_touched {
+            println!("      {p}");
+        }
+    }
+    Ok(())
+}
+
+fn run_runs_in(workspace: &Path, target_id: &str, json: bool) -> Result<()> {
+    let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
+    let runs = rupu_coverage::list_runs(&paths)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs)?);
+        return Ok(());
+    }
+
+    println!(
+        "coverage runs · target {} · {} run(s)",
+        target_id,
+        runs.len()
+    );
+    if runs.is_empty() {
+        return Ok(());
+    }
+    println!();
+    for r in &runs {
+        println!(
+            "  {} · {} · {:?} · {}  (cells {} / findings {} / files {})",
+            r.run_id,
+            r.started_at.to_rfc3339(),
+            r.surface,
+            r.model,
+            r.cells_asserted,
+            r.findings,
+            r.files_touched,
+        );
     }
     Ok(())
 }
@@ -348,5 +505,113 @@ mod tests {
         assert!(run_audit_in(tmp.path(), "tgt", true).is_ok()); // json
         assert!(run_audit_in(tmp.path(), "tgt", false).is_ok()); // human
         assert!(run_gap_in(tmp.path(), "tgt").is_ok());
+    }
+
+    #[test]
+    fn diff_on_two_run_target_json_and_human() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence,
+            FileTouchEvent, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        paths.ensure_dir().unwrap();
+
+        let attr = |run: &str| Attribution {
+            run_id: run.to_string(),
+            model: "m".to_string(),
+            surface: Surface::Session,
+        };
+        let read = |run: &str, path: &str, secs: i64| FileTouchEvent::Read {
+            path: path.to_string(),
+            line_range: [1, 10],
+            tool: "read_file".to_string(),
+            attribution: attr(run),
+            at: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+        };
+        let files = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&read("run_old", "src/a.rs", 100)).unwrap(),
+            serde_json::to_string(&read("run_new", "src/a.rs", 200)).unwrap(),
+        );
+        std::fs::write(&paths.files, files).unwrap();
+
+        let mark = |run: &str, status: AssertionStatus, secs: i64| ConcernAssertion {
+            concern_id: "c1".to_string(),
+            file_path: "src/a.rs".to_string(),
+            status,
+            evidence: Evidence {
+                summary: "s".to_string(),
+                line_ranges: vec![],
+                finding_ids: vec![],
+            },
+            declared_by: attr(run),
+            declared_at: DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
+        };
+        let concerns = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&mark("run_old", AssertionStatus::Clean, 100)).unwrap(),
+            serde_json::to_string(&mark("run_new", AssertionStatus::Finding, 200)).unwrap(),
+        );
+        std::fs::write(&paths.concerns, concerns).unwrap();
+
+        assert!(run_diff_in(tmp.path(), "tgt", None, None, true).is_ok());
+        assert!(run_diff_in(tmp.path(), "tgt", None, None, false).is_ok());
+        assert!(run_diff_in(
+            tmp.path(),
+            "tgt",
+            Some("run_old".to_string()),
+            Some("run_new".to_string()),
+            false
+        )
+        .is_ok());
+        assert!(run_diff_in(tmp.path(), "tgt", Some("run_old".to_string()), None, false).is_err());
+        assert!(run_diff_in(
+            tmp.path(),
+            "tgt",
+            Some("nope".to_string()),
+            Some("run_new".to_string()),
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn runs_list_json_and_human() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, Evidence, Surface,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        paths.ensure_dir().unwrap();
+
+        let a = ConcernAssertion {
+            concern_id: "c1".to_string(),
+            file_path: "src/a.rs".to_string(),
+            status: AssertionStatus::Clean,
+            evidence: Evidence {
+                summary: "s".to_string(),
+                line_ranges: vec![],
+                finding_ids: vec![],
+            },
+            declared_by: Attribution {
+                run_id: "run_one".to_string(),
+                model: "m".to_string(),
+                surface: Surface::Session,
+            },
+            declared_at: DateTime::<Utc>::from_timestamp(100, 0).unwrap(),
+        };
+        std::fs::write(&paths.concerns, serde_json::to_string(&a).unwrap() + "\n").unwrap();
+
+        assert!(run_runs_in(tmp.path(), "tgt", true).is_ok());
+        assert!(run_runs_in(tmp.path(), "tgt", false).is_ok());
+
+        let empty = CoveragePaths::new(tmp.path(), "empty");
+        empty.ensure_dir().unwrap();
+        assert!(run_runs_in(tmp.path(), "empty", false).is_ok());
     }
 }

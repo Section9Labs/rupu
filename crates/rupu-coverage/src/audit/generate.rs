@@ -199,7 +199,7 @@ fn serendipitous(findings: &[FindingRecord]) -> Vec<SerendipitousCluster> {
         .collect()
 }
 
-fn theme_key(summary: &str) -> String {
+pub(crate) fn theme_key(summary: &str) -> String {
     summary
         .split_whitespace()
         .take(6)
