@@ -58,6 +58,13 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Replay an agent run by id, appending a new run to the same target.
+    Rerun {
+        /// Target id (from `coverage list`).
+        target_id: String,
+        /// Run id to replay (from `coverage runs`).
+        run_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -73,6 +80,11 @@ fn workspace() -> Result<PathBuf> {
 }
 
 pub async fn handle(action: Action, _format: Option<OutputFormat>) -> ExitCode {
+    // `rerun` dispatches a full sub-run (async) and owns its own exit code.
+    if let Action::Rerun { target_id, run_id } = action {
+        return run_rerun_in(&target_id, &run_id).await;
+    }
+
     let result = match action {
         Action::List => workspace().and_then(|ws| run_list_in(&ws)),
         Action::Templates { action } => run_templates(action),
@@ -91,6 +103,7 @@ pub async fn handle(action: Action, _format: Option<OutputFormat>) -> ExitCode {
         Action::Runs { target_id, json } => {
             workspace().and_then(|ws| run_runs_in(&ws, &target_id, json))
         }
+        Action::Rerun { .. } => unreachable!("handled above"),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -363,6 +376,76 @@ fn run_runs_in(workspace: &Path, target_id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
+    let ws = match workspace() {
+        Ok(ws) => ws,
+        Err(e) => {
+            eprintln!("coverage error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let paths = rupu_coverage::CoveragePaths::new(&ws, target_id);
+
+    let manifest = match rupu_coverage::find_manifest(&paths, run_id) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            eprintln!(
+                "coverage error: no manifest for run '{run_id}' on target '{target_id}' \
+                 (runs before Slice B are not replayable)"
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("coverage error: reading manifests: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let invocation = match rupu_coverage::plan_rerun(&manifest) {
+        Ok(inv) => inv,
+        Err(e) => {
+            // Explicit "not yet supported" for session/workflow/autoflow.
+            eprintln!("coverage error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The replay derives its target from the cwd; require the user to run
+    // from the recorded workspace so the new run lands on the same target.
+    if invocation.workspace_path != ws {
+        eprintln!(
+            "coverage error: run '{run_id}' was recorded in workspace {:?}; \
+             cd there and re-run `rupu coverage rerun {target_id} {run_id}`",
+            invocation.workspace_path
+        );
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "rerun · replaying agent '{}' on target {} …",
+        invocation.agent_name, target_id
+    );
+
+    let args = crate::cmd::run::Args {
+        agent: invocation.agent_name.clone(),
+        target: None,
+        prompt: Some(invocation.user_prompt.clone()),
+        mode: Some(invocation.permission_mode.clone()),
+        no_stream: false,
+        view: None,
+        into: None,
+        tmp: false,
+    };
+    let code = crate::cmd::run::handle(args).await;
+
+    println!();
+    println!(
+        "rerun complete · diff against the original with:\n  \
+         rupu coverage diff {target_id} {run_id} latest"
+    );
+    code
+}
+
 fn run_gap_in(workspace: &Path, target_id: &str) -> Result<()> {
     let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
     let report = rupu_coverage::run_audit(&paths)?;
@@ -576,6 +659,56 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn rerun_missing_manifest_is_detectable() {
+        use rupu_coverage::CoveragePaths;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        paths.ensure_dir().unwrap();
+        // No runs.jsonl written → find_manifest returns None, which the CLI
+        // surfaces as the "not replayable" error.
+        assert!(rupu_coverage::find_manifest(&paths, "run_x")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn rerun_unsupported_surface_errors() {
+        use chrono::{DateTime, Utc};
+        use rupu_coverage::{
+            append_manifest, find_manifest, plan_rerun, CatalogMode, ConcernsBlock, ConcernsEntry,
+            CoveragePaths, IncludeDirective, RunManifest, Surface,
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "tgt");
+        let m = RunManifest {
+            run_id: "run_sess".to_string(),
+            started_at: DateTime::<Utc>::from_timestamp(1, 0).unwrap(),
+            surface: Surface::Session,
+            agent_name: "a".to_string(),
+            provider: "anthropic".to_string(),
+            model: "m".to_string(),
+            permission_mode: "bypass".to_string(),
+            user_prompt: "go".to_string(),
+            concerns: ConcernsBlock {
+                entries: vec![ConcernsEntry::Include(IncludeDirective {
+                    include: "stride".to_string(),
+                    overrides: vec![],
+                    mode: CatalogMode::Auto,
+                    filter: None,
+                })],
+            },
+            scope_name: "ses_1".to_string(),
+            workspace_path: tmp.path().to_path_buf(),
+        };
+        append_manifest(&paths, &m).unwrap();
+        let loaded = find_manifest(&paths, "run_sess").unwrap().unwrap();
+        assert!(
+            plan_rerun(&loaded).is_err(),
+            "session rerun must be rejected"
+        );
     }
 
     #[test]
