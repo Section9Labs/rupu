@@ -1,0 +1,56 @@
+---
+source: crates/rupu-coverage/tests/determinism.rs
+assertion_line: 93
+expression: rendered
+---
+## Coverage Catalog
+
+You are reviewing this workspace against the following concerns. For each (file × concern) you assess, call `coverage_mark` with the appropriate status. For each issue you discover, call `report_finding`. Files you read, grep, or edit are tracked automatically — you do not need to declare them.
+
+### stride:denial-of-service
+**Name:** Denial of Service — availability
+**Severity:** medium
+**Applies to:** **
+
+Resource exhaustion, missing rate limits, unbounded recursion,
+algorithmic-complexity attacks.
+
+### stride:elevation-of-privilege
+**Name:** Elevation of Privilege — authorization
+**Severity:** critical
+**Applies to:** **/auth/**, **/middleware/**, **/handlers/**
+
+Privilege escalation — vertical (user → admin), horizontal
+(user A → user B), or via missing authorization checks.
+
+### stride:information-disclosure
+**Name:** Information Disclosure — confidentiality
+**Severity:** high
+**Applies to:** **
+
+Unauthorized exposure of data — error messages leaking internals,
+sensitive data in logs, missing encryption.
+
+### stride:repudiation
+**Name:** Repudiation — non-repudiation / audit
+**Severity:** medium
+**Applies to:** **
+
+Threats arising from missing or insufficient logging — actions
+cannot be later proven to have happened.
+
+### stride:spoofing
+**Name:** Spoofing — identity verification
+**Severity:** high
+**Applies to:** **/auth/**, **/login/**, **/middleware/**
+
+Threats to authentication — fake identities, credential theft,
+impersonation of users / services / tokens.
+
+### stride:tampering
+**Name:** Tampering — data integrity
+**Severity:** high
+**Applies to:** **
+
+Threats to data integrity in transit or at rest — modification of
+messages, files, or stored state without authorization.
