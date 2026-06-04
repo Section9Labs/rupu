@@ -7,6 +7,7 @@ pub mod audit;
 pub mod catalog;
 pub mod diff;
 pub mod ledger;
+pub mod rerun;
 pub mod tool_mappings;
 pub mod tools;
 
@@ -41,4 +42,5 @@ pub use ledger::{
     Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord, FindingScope, RunManifest,
     Surface,
 };
+pub use rerun::{plan_rerun, RerunError, RerunInvocation};
 pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};
