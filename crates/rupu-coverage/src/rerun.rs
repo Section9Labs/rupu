@@ -23,6 +23,15 @@ pub enum RerunError {
 
 /// Validate the manifest's surface and reconstruct the replay invocation.
 /// v1: only `Surface::Agent` is dispatchable.
+///
+/// NOTE: v1 agent replay dispatches through `rupu run <agent>`, which
+/// re-resolves `provider` / `model` / `concerns` from the agent's CURRENT
+/// frontmatter + config — it does NOT apply the manifest's recorded values
+/// for those. Only `agent_name` / `user_prompt` / `permission_mode` /
+/// `workspace_path` drive the replay. The other manifest fields are a record
+/// of the original run (and the basis for a future higher-fidelity replay
+/// that pins them); a session/workflow rerun author must not assume they are
+/// authoritative for dispatch.
 pub fn plan_rerun(manifest: &RunManifest) -> Result<RerunInvocation, RerunError> {
     match manifest.surface {
         Surface::Agent => Ok(RerunInvocation {
