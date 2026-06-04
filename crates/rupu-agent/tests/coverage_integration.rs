@@ -5,7 +5,8 @@
 use rupu_agent::runner::{BypassDecider, CapturingMockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
 use rupu_coverage::{
-    target_id, CatalogMode, ConcernsBlock, ConcernsEntry, CoveragePaths, IncludeDirective,
+    read_manifests, target_id, CatalogMode, ConcernsBlock, ConcernsEntry, CoveragePaths,
+    IncludeDirective, Surface,
 };
 use rupu_providers::types::StopReason;
 use rupu_tools::ToolContext;
@@ -125,6 +126,17 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
         tool_names.contains(&"report_finding"),
         "report_finding should be in tools: {tool_names:?}"
     );
+
+    // Verify the run manifest was captured.
+    let manifests = read_manifests(&paths).unwrap();
+    assert_eq!(manifests.len(), 1, "exactly one manifest row expected");
+    let m = &manifests[0];
+    assert_eq!(m.run_id, "run_cov_test");
+    assert_eq!(m.agent_name, "test-agent");
+    assert_eq!(m.surface, Surface::Agent);
+    assert_eq!(m.scope_name, "test-agent");
+    assert_eq!(m.user_prompt, "Check coverage.");
+    assert_eq!(m.workspace_path, workspace);
 }
 
 #[tokio::test]

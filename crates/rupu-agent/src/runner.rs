@@ -270,6 +270,33 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 .map_err(|e| RunError::Coverage(format!("ensure coverage dir: {e}")))?;
             write_snapshot(&catalog, &paths.catalog)
                 .map_err(|e| RunError::Coverage(format!("write catalog snapshot: {e}")))?;
+            // Capture a run manifest describing this run's defining inputs.
+            // This is the single all-surfaces seam (workflow / agent /
+            // autoflow / session all reach run_agent), so every run becomes
+            // replay-describable. Failure to write the manifest must not
+            // abort the run — log and continue.
+            let surface = match opts.surface_tag.as_deref() {
+                Some("workflow") => rupu_coverage::Surface::Workflow,
+                Some("autoflow") => rupu_coverage::Surface::Autoflow,
+                Some("session") => rupu_coverage::Surface::Session,
+                _ => rupu_coverage::Surface::Agent,
+            };
+            let manifest = rupu_coverage::RunManifest {
+                run_id: opts.run_id.clone(),
+                started_at: chrono::Utc::now(),
+                surface,
+                agent_name: opts.agent_name.clone(),
+                provider: opts.provider_name.clone(),
+                model: opts.model.clone(),
+                permission_mode: opts.mode_str.clone(),
+                user_prompt: opts.user_message.clone(),
+                concerns: block.clone(),
+                scope_name: resolved_scope.to_string(),
+                workspace_path: opts.workspace_path.clone(),
+            };
+            if let Err(e) = rupu_coverage::append_manifest(&paths, &manifest) {
+                tracing::warn!(error = %e, "failed to write coverage run manifest");
+            }
             let handle = CoverageWriterHandle::spawn(paths.clone())
                 .map_err(|e| RunError::Coverage(format!("spawn coverage writer: {e}")))?;
             let prompt_section = render_prompt_section(&catalog, DEFAULT_FULL_MODE_THRESHOLD);
