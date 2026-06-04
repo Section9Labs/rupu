@@ -6246,6 +6246,7 @@ version = "0.7.0"
 dependencies = [
  "chrono",
  "glob",
+ "insta",
  "quick-xml 0.36.2",
  "serde",
  "serde_json",
