@@ -8,6 +8,7 @@ pub struct CoveragePaths {
     pub concerns: PathBuf,
     pub findings: PathBuf,
     pub catalog: PathBuf,
+    pub runs: PathBuf,
 }
 
 impl CoveragePaths {
@@ -18,6 +19,7 @@ impl CoveragePaths {
             concerns: root.join("concerns.jsonl"),
             findings: root.join("findings.jsonl"),
             catalog: root.join("catalog.yaml"),
+            runs: root.join("runs.jsonl"),
             root,
         }
     }
@@ -40,6 +42,7 @@ mod tests {
         assert_eq!(paths.concerns, paths.root.join("concerns.jsonl"));
         assert_eq!(paths.findings, paths.root.join("findings.jsonl"));
         assert_eq!(paths.catalog, paths.root.join("catalog.yaml"));
+        assert_eq!(paths.runs, paths.root.join("runs.jsonl"));
     }
 
     #[test]

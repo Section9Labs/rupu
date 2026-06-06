@@ -7,6 +7,7 @@ pub mod audit;
 pub mod catalog;
 pub mod diff;
 pub mod ledger;
+pub mod rerun;
 pub mod tool_mappings;
 pub mod tools;
 
@@ -21,21 +22,25 @@ pub use tools::{
     ReportFindingInput, ReportFindingOutput, SearchResult, SearchResultForm, SearchResultSummary,
 };
 
+pub use audit::generate::audit as run_audit;
+pub use audit::{
+    AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster,
+};
 pub use catalog::{
     builtin_names, flatten, partition_by_mode, read_snapshot, render_full_mode, render_index_mode,
-    render_prompt_section,
-    resolve_builtin, resolve_modes, write_snapshot, CatalogMode, Concern, ConcernFilter,
-    ConcernOverride, ConcernsBlock, ConcernsEntry, FlatCatalog, FlattenError, IncludeDirective,
-    ParseError, Severity, SnapshotError, Template, TouchStrength, DEFAULT_FULL_MODE_THRESHOLD,
+    render_prompt_section, resolve_builtin, resolve_modes, write_snapshot, CatalogMode, Concern,
+    ConcernFilter, ConcernOverride, ConcernsBlock, ConcernsEntry, FlatCatalog, FlattenError,
+    IncludeDirective, ParseError, Severity, SnapshotError, Template, TouchStrength,
+    DEFAULT_FULL_MODE_THRESHOLD,
 };
-pub use audit::{AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster};
-pub use audit::generate::audit as run_audit;
 pub use diff::generate::{list_runs, run_diff, DiffError, RunSelector};
 pub use diff::{CellRef, FindingThemeRef, RunDiff, RunListEntry, VerdictFlip};
-pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};
 pub use ledger::{
-    discover_targets, file_views, read_concern_assertions, read_file_events, read_findings,
-    target_id, AssertionStatus, Attribution, ConcernAssertion, CoveragePaths, CoverageWriter,
-    CoverageWriterHandle, DiscoveredTarget, Evidence, FileTouchEvent, FileView, FindingEvidence,
-    FindingRecord, FindingScope, Surface,
+    append_manifest, discover_targets, file_views, find_manifest, read_concern_assertions,
+    read_file_events, read_findings, read_manifests, target_id, AssertionStatus, Attribution,
+    ConcernAssertion, CoveragePaths, CoverageWriter, CoverageWriterHandle, DiscoveredTarget,
+    Evidence, FileTouchEvent, FileView, FindingEvidence, FindingRecord, FindingScope, RunManifest,
+    Surface,
 };
+pub use rerun::{plan_rerun, RerunError, RerunInvocation};
+pub use tool_mappings::{load_tool_mappings, ToolMapping, ToolMappings};
