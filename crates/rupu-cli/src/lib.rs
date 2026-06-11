@@ -248,11 +248,7 @@ fn ensure_output_format_supported(
             format,
             &[output::formats::OutputFormat::Table],
         ),
-        Cmd::Coverage { .. } => output::formats::ensure_supported(
-            "coverage",
-            format,
-            &[output::formats::OutputFormat::Table],
-        ),
+        Cmd::Coverage { action } => cmd::coverage::ensure_output_format(action, format),
         Cmd::Cron { action } => cmd::cron::ensure_output_format(action, format),
         Cmd::Webhook { .. } => output::formats::ensure_supported(
             "webhook",
