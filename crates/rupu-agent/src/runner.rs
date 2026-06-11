@@ -645,6 +645,11 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 role: Role::Assistant,
                 content: resp.content.clone(),
             });
+            // Whether the model requested any tool calls this turn. This — not
+            // `stop_reason` — is the real "should I continue?" signal: tool
+            // calls produce tool_results that we append below as a user
+            // message, so the next request ends with a user turn.
+            let made_tool_calls = !tool_results.is_empty();
             if !tool_results.is_empty() {
                 let mut blocks: Vec<ContentBlock> = Vec::new();
                 for (call_id, output, error) in tool_results {
@@ -667,8 +672,16 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             }
 
             turn_idx += 1;
-            // `stop_reason` is `Option<StopReason>`. None → keep looping.
-            if matches!(resp.stop_reason, Some(StopReason::EndTurn)) {
+            // Continue only when the model requested tools (we appended their
+            // results as a user message, so the next request ends with a user
+            // turn). With no tool calls the assistant's message is the final
+            // answer — terminate. Continuing would re-send a conversation
+            // ending in an assistant message, which models without prefill
+            // support reject ("the conversation must end with a user message"),
+            // and which is the wrong behaviour in general. `stop_reason` is
+            // only a hint: an unrecognized/absent value deserializes to `None`,
+            // so it must not be the sole terminator.
+            if !made_tool_calls {
                 break RunStatus::Ok;
             }
         };
@@ -864,6 +877,83 @@ mod on_tool_call_tests {
             log[0].starts_with("s1:"),
             "expected step_id 's1' prefix, got {}",
             log[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn final_answer_without_tool_calls_terminates_regardless_of_stop_reason() {
+        // Regression: a final assistant turn with NO tool calls must end the
+        // run. The loop previously broke only on `Some(EndTurn)`; a non-EndTurn
+        // stop reason (e.g. `MaxTokens`, or an unrecognized value that
+        // deserializes to `None`) made it loop again and re-send a conversation
+        // ending in an assistant message — which some models reject with a 400:
+        // "the conversation must end with a user message" (no prefill support).
+        //
+        // The mock has a SINGLE scripted turn, so if the loop wrongly continues
+        // it exhausts the script on the next turn and `run_agent` errors. A
+        // clean `Ok` in exactly one turn proves it terminated correctly.
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_test.jsonl");
+
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "All done — final answer, no tools to call.".into(),
+            stop: StopReason::MaxTokens,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+
+        let opts = AgentRunOpts {
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_terminate_no_tools".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "do the thing".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: None,
+            on_stream_event: None,
+            concerns: None,
+            scope_name: None,
+            surface_tag: None,
+        };
+
+        let result = run_agent(opts)
+            .await
+            .expect("run should complete cleanly, not loop into an exhausted script");
+        assert_eq!(
+            result.status,
+            RunStatus::Ok,
+            "a no-tool-call final turn must complete Ok"
+        );
+        assert_eq!(
+            result.turns, 1,
+            "must terminate after the single turn, not continue looping"
         );
     }
 }
