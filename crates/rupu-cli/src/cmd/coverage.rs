@@ -175,14 +175,16 @@ impl CollectionOutput for CoverageListOutput {
             println!("no coverage targets under .rupu/coverage/");
             return Ok(());
         }
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["Target", "Assertions", "Catalog"]);
         for t in &self.report.rows {
-            println!(
-                "{}  ·  {} assertions  ·  catalog: {}",
-                t.target_id,
-                t.assertions,
-                if t.has_catalog { "yes" } else { "no" }
-            );
+            table.add_row(vec![
+                comfy_table::Cell::new(&t.target_id),
+                comfy_table::Cell::new(t.assertions.to_string()),
+                comfy_table::Cell::new(if t.has_catalog { "yes" } else { "no" }),
+            ]);
         }
+        println!("{table}");
         Ok(())
     }
 }
@@ -246,9 +248,12 @@ impl CollectionOutput for TemplatesListOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["Template"]);
         for r in &self.report.rows {
-            println!("{}", r.name);
+            table.add_row(vec![comfy_table::Cell::new(&r.name)]);
         }
+        println!("{table}");
         Ok(())
     }
 }
@@ -294,9 +299,16 @@ impl CollectionOutput for TemplatesShowOutput {
     }
 
     fn render_table(&self) -> anyhow::Result<()> {
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["Concern", "Severity", "Name"]);
         for c in &self.report.rows {
-            println!("{}  [{}]  {}", c.id, c.severity, c.name);
+            table.add_row(vec![
+                comfy_table::Cell::new(&c.id),
+                comfy_table::Cell::new(&c.severity),
+                comfy_table::Cell::new(&c.name),
+            ]);
         }
+        println!("{table}");
         Ok(())
     }
 }
@@ -378,9 +390,16 @@ impl CollectionOutput for CatalogOutput {
 
     fn render_table(&self) -> anyhow::Result<()> {
         println!("{} concerns in effective catalog", self.report.rows.len());
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["Concern", "Severity", "Name"]);
         for c in &self.report.rows {
-            println!("  {}  [{}]  {}", c.id, c.severity, c.name);
+            table.add_row(vec![
+                comfy_table::Cell::new(&c.id),
+                comfy_table::Cell::new(&c.severity),
+                comfy_table::Cell::new(&c.name),
+            ]);
         }
+        println!("{table}");
         Ok(())
     }
 }
@@ -445,31 +464,52 @@ impl DetailOutput for CoverageShowOutput {
         let assertions = &self.report.assertions;
         let findings = &self.report.findings;
 
-        println!("== files touched ({}) ==", views.len());
-        for v in views {
-            println!(
-                "  {}  [{}]",
-                v.path,
-                format!("{:?}", v.strongest).to_lowercase()
-            );
+        println!();
+        println!("Files touched ({})", views.len());
+        {
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["Path", "Strongest"]);
+            for v in views {
+                table.add_row(vec![
+                    comfy_table::Cell::new(&v.path),
+                    comfy_table::Cell::new(format!("{:?}", v.strongest).to_lowercase()),
+                ]);
+            }
+            println!("{table}");
         }
-        println!("== concern assertions ({}) ==", assertions.len());
-        for a in assertions {
-            println!(
-                "  {} · {} · {:?} · {}",
-                a.concern_id, a.file_path, a.status, a.declared_by.model
-            );
+
+        println!();
+        println!("Concern assertions ({})", assertions.len());
+        {
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["Concern", "File", "Status", "Model"]);
+            for a in assertions {
+                table.add_row(vec![
+                    comfy_table::Cell::new(&a.concern_id),
+                    comfy_table::Cell::new(&a.file_path),
+                    comfy_table::Cell::new(format!("{:?}", a.status)),
+                    comfy_table::Cell::new(&a.declared_by.model),
+                ]);
+            }
+            println!("{table}");
         }
-        println!("== findings ({}) ==", findings.len());
-        for f in findings {
-            println!(
-                "  {} · {:?} · {} · {}",
-                f.id,
-                f.severity,
-                f.file_path.as_deref().unwrap_or("(repo)"),
-                f.summary
-            );
+
+        println!();
+        println!("Findings ({})", findings.len());
+        {
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["ID", "Severity", "File", "Summary"]);
+            for f in findings {
+                table.add_row(vec![
+                    comfy_table::Cell::new(&f.id),
+                    comfy_table::Cell::new(format!("{:?}", f.severity)),
+                    comfy_table::Cell::new(f.file_path.as_deref().unwrap_or("(repo)")),
+                    comfy_table::Cell::new(&f.summary),
+                ]);
+            }
+            println!("{table}");
         }
+
         Ok(())
     }
 }
@@ -523,41 +563,56 @@ impl DetailOutput for AuditOutput {
             report.total_concerns,
             report.total_gap_files
         );
-        println!();
-        println!("== per-concern ==");
-        for c in &report.concerns {
-            let mark = if c.is_complete() { "ok" } else { "GAP" };
-            println!(
-                "  [{}] {}  [{:?}]  in_scope={} asserted={} gap={}  (clean {} / finding {} / examined {} / n/a {})",
-                mark,
-                c.concern_id,
-                c.severity,
-                c.in_scope_files.len(),
-                c.asserted_files.len(),
-                c.gap_files.len(),
-                c.clean,
-                c.findings,
-                c.examined,
-                c.not_applicable,
-            );
+        {
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec![
+                "Concern", "Severity", "In-scope", "Asserted", "Gap", "Clean", "Finding",
+                "Examined", "N/A", "Status",
+            ]);
+            for c in &report.concerns {
+                table.add_row(vec![
+                    comfy_table::Cell::new(&c.concern_id),
+                    comfy_table::Cell::new(format!("{:?}", c.severity)),
+                    comfy_table::Cell::new(c.in_scope_files.len().to_string()),
+                    comfy_table::Cell::new(c.asserted_files.len().to_string()),
+                    comfy_table::Cell::new(c.gap_files.len().to_string()),
+                    comfy_table::Cell::new(c.clean.to_string()),
+                    comfy_table::Cell::new(c.findings.to_string()),
+                    comfy_table::Cell::new(c.examined.to_string()),
+                    comfy_table::Cell::new(c.not_applicable.to_string()),
+                    comfy_table::Cell::new(if c.is_complete() { "ok" } else { "GAP" }),
+                ]);
+            }
+            println!("{table}");
         }
         if !report.cross_model.is_empty() {
             println!();
-            println!("== cross-model ==");
+            println!("Cross-model ({}):", report.cross_model.len());
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["Concern", "File", "Disagree", "Models"]);
             for x in &report.cross_model {
-                let tag = if x.disagreement { "DISAGREE" } else { "agree" };
-                println!(
-                    "  [{}] {} · {} · {:?}",
-                    tag, x.concern_id, x.file_path, x.model_statuses
-                );
+                table.add_row(vec![
+                    comfy_table::Cell::new(&x.concern_id),
+                    comfy_table::Cell::new(&x.file_path),
+                    comfy_table::Cell::new(if x.disagreement { "yes" } else { "no" }),
+                    comfy_table::Cell::new(format!("{:?}", x.model_statuses)),
+                ]);
             }
+            println!("{table}");
         }
         if !report.serendipitous.is_empty() {
             println!();
-            println!("== serendipitous findings ==");
+            println!("Serendipitous findings ({}):", report.serendipitous.len());
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["Theme", "Count", "Finding IDs"]);
             for s in &report.serendipitous {
-                println!("  ({}) {}  {:?}", s.count, s.theme, s.finding_ids);
+                table.add_row(vec![
+                    comfy_table::Cell::new(&s.theme),
+                    comfy_table::Cell::new(s.count.to_string()),
+                    comfy_table::Cell::new(format!("{:?}", s.finding_ids)),
+                ]);
             }
+            println!("{table}");
         }
         Ok(())
     }
@@ -614,24 +669,15 @@ impl CollectionOutput for GapOutput {
             println!("no coverage gaps");
             return Ok(());
         }
-        // Re-group by concern_id for the human view.
-        let mut concern_files: Vec<(&str, Vec<&str>)> = Vec::new();
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec!["Concern", "Gap file"]);
         for row in &self.report.rows {
-            match concern_files.last_mut() {
-                Some((id, files)) if *id == row.concern_id.as_str() => {
-                    files.push(&row.file);
-                }
-                _ => {
-                    concern_files.push((&row.concern_id, vec![&row.file]));
-                }
-            }
+            table.add_row(vec![
+                comfy_table::Cell::new(&row.concern_id),
+                comfy_table::Cell::new(&row.file),
+            ]);
         }
-        for (concern_id, files) in &concern_files {
-            println!("{} ({} gap files):", concern_id, files.len());
-            for f in files {
-                println!("  {f}");
-            }
-        }
+        println!("{table}");
         Ok(())
     }
 }
@@ -694,62 +740,105 @@ impl DetailOutput for DiffOutput {
             return Ok(());
         }
 
-        println!();
-        println!("== cell-coverage delta ==");
-        println!("  + newly asserted: {}", diff.newly_asserted.len());
-        for c in &diff.newly_asserted {
-            println!("      {} · {}  [{:?}]", c.concern_id, c.file_path, c.status);
+        if !diff.newly_asserted.is_empty() {
+            println!();
+            println!(
+                "cell-coverage delta — newly asserted ({})",
+                diff.newly_asserted.len()
+            );
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["Concern", "File", "Status"]);
+            for c in &diff.newly_asserted {
+                table.add_row(vec![
+                    comfy_table::Cell::new(&c.concern_id),
+                    comfy_table::Cell::new(&c.file_path),
+                    comfy_table::Cell::new(format!("{:?}", c.status)),
+                ]);
+            }
+            println!("{table}");
         }
-        println!("  - no longer asserted: {}", diff.no_longer_asserted.len());
-        for c in &diff.no_longer_asserted {
-            println!("      {} · {}  [{:?}]", c.concern_id, c.file_path, c.status);
+
+        if !diff.no_longer_asserted.is_empty() {
+            println!();
+            println!(
+                "cell-coverage delta — no longer asserted ({})",
+                diff.no_longer_asserted.len()
+            );
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["Concern", "File", "Status"]);
+            for c in &diff.no_longer_asserted {
+                table.add_row(vec![
+                    comfy_table::Cell::new(&c.concern_id),
+                    comfy_table::Cell::new(&c.file_path),
+                    comfy_table::Cell::new(format!("{:?}", c.status)),
+                ]);
+            }
+            println!("{table}");
         }
 
         if !diff.verdict_flips.is_empty() {
             println!();
-            println!("== verdict flips ==");
+            println!("verdict flips ({})", diff.verdict_flips.len());
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["Concern", "File", "Base", "Compare", "High-signal"]);
             for f in &diff.verdict_flips {
-                let mark = if f.high_signal { "!" } else { " " };
-                println!(
-                    "  [{}] {} · {}  {:?} → {:?}",
-                    mark, f.concern_id, f.file_path, f.base_status, f.compare_status
-                );
+                table.add_row(vec![
+                    comfy_table::Cell::new(&f.concern_id),
+                    comfy_table::Cell::new(&f.file_path),
+                    comfy_table::Cell::new(format!("{:?}", f.base_status)),
+                    comfy_table::Cell::new(format!("{:?}", f.compare_status)),
+                    comfy_table::Cell::new(if f.high_signal { "!" } else { "" }),
+                ]);
             }
+            println!("{table}");
         }
 
-        if !diff.findings_appeared.is_empty() || !diff.findings_disappeared.is_empty() {
+        if !diff.findings_appeared.is_empty() {
             println!();
-            println!("== findings (theme-based, best-effort) ==");
-            println!("  + appeared: {}", diff.findings_appeared.len());
+            println!("findings appeared ({})", diff.findings_appeared.len());
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["Concern", "Theme"]);
             for f in &diff.findings_appeared {
-                println!(
-                    "      ({}) {}",
-                    f.concern_id.as_deref().unwrap_or("-"),
-                    f.theme
-                );
+                table.add_row(vec![
+                    comfy_table::Cell::new(f.concern_id.as_deref().unwrap_or("-")),
+                    comfy_table::Cell::new(&f.theme),
+                ]);
             }
-            println!("  - disappeared: {}", diff.findings_disappeared.len());
+            println!("{table}");
+        }
+
+        if !diff.findings_disappeared.is_empty() {
+            println!();
+            println!("findings disappeared ({})", diff.findings_disappeared.len());
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["Concern", "Theme"]);
             for f in &diff.findings_disappeared {
-                println!(
-                    "      ({}) {}",
-                    f.concern_id.as_deref().unwrap_or("-"),
-                    f.theme
-                );
+                table.add_row(vec![
+                    comfy_table::Cell::new(f.concern_id.as_deref().unwrap_or("-")),
+                    comfy_table::Cell::new(&f.theme),
+                ]);
             }
+            println!("{table}");
         }
 
         if !diff.newly_touched.is_empty() || !diff.no_longer_touched.is_empty() {
             println!();
-            println!("== file-touch delta ==");
-            println!("  + newly touched: {}", diff.newly_touched.len());
+            println!(
+                "file-touch delta ({} added, {} removed)",
+                diff.newly_touched.len(),
+                diff.no_longer_touched.len()
+            );
+            let mut table = crate::output::tables::new_table();
+            table.set_header(vec!["File", "Change"]);
             for p in &diff.newly_touched {
-                println!("      {p}");
+                table.add_row(vec![comfy_table::Cell::new(p), comfy_table::Cell::new("+")]);
             }
-            println!("  - no longer touched: {}", diff.no_longer_touched.len());
             for p in &diff.no_longer_touched {
-                println!("      {p}");
+                table.add_row(vec![comfy_table::Cell::new(p), comfy_table::Cell::new("-")]);
             }
+            println!("{table}");
         }
+
         Ok(())
     }
 }
@@ -844,19 +933,22 @@ impl CollectionOutput for RunsOutput {
         if runs.is_empty() {
             return Ok(());
         }
-        println!();
+        let mut table = crate::output::tables::new_table();
+        table.set_header(vec![
+            "Run", "Started", "Surface", "Model", "Cells", "Findings", "Files",
+        ]);
         for r in runs {
-            println!(
-                "  {} · {} · {:?} · {}  (cells {} / findings {} / files {})",
-                r.run_id,
-                r.started_at.to_rfc3339(),
-                r.surface,
-                r.model,
-                r.cells_asserted,
-                r.findings,
-                r.files_touched,
-            );
+            table.add_row(vec![
+                comfy_table::Cell::new(&r.run_id),
+                comfy_table::Cell::new(r.started_at.to_rfc3339()),
+                comfy_table::Cell::new(format!("{:?}", r.surface)),
+                comfy_table::Cell::new(&r.model),
+                comfy_table::Cell::new(r.cells_asserted.to_string()),
+                comfy_table::Cell::new(r.findings.to_string()),
+                comfy_table::Cell::new(r.files_touched.to_string()),
+            ]);
         }
+        println!("{table}");
         Ok(())
     }
 }
