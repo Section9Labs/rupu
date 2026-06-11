@@ -62,19 +62,25 @@ async fn provider_error_propagates_and_writes_run_complete() {
 
 #[tokio::test]
 async fn max_turns_aborts_with_run_complete() {
-    // A script that always continues — the loop should hit max_turns.
+    // A script that genuinely keeps requesting tool calls — each tool call
+    // yields a tool_result the runner sends back as a user message, so the loop
+    // legitimately continues and must hit max_turns and abort with Error.
+    // (A text-only turn now correctly terminates the loop, so max_turns must be
+    // exercised with real tool calls, not a spurious non-EndTurn stop reason.)
     let provider = MockProvider::new(vec![
-        ScriptedTurn::AssistantText {
-            text: "1".into(),
+        ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: "c1".into(),
+            tool_name: "read_file".into(),
+            tool_input: serde_json::json!({ "path": "." }),
             stop: StopReason::ToolUse,
-            input_tokens: 1,
-            output_tokens: 1,
         },
-        ScriptedTurn::AssistantText {
-            text: "2".into(),
+        ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: "c2".into(),
+            tool_name: "read_file".into(),
+            tool_input: serde_json::json!({ "path": "." }),
             stop: StopReason::ToolUse,
-            input_tokens: 1,
-            output_tokens: 1,
         },
     ]);
     let tmp = assert_fs::TempDir::new().unwrap();
