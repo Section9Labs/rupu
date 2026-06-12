@@ -33,6 +33,7 @@ Then edit names, providers, models, and tool lists to match your repo and operat
 | `issue-commenter` | Post one focused issue comment |
 | `writer` | Summarize or aggregate text without side effects |
 | `security-reviewer` | Structured security panel reviewer |
+| `security-assessor` | Standalone security assessor with a coverage ledger (see `docs/coverage.md`) |
 | `performance-reviewer` | Structured performance panel reviewer |
 | `maintainability-reviewer` | Structured maintainability panel reviewer |
 | `finding-fixer` | Address panel findings and emit a revised review subject |
