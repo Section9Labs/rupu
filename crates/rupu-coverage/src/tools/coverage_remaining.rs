@@ -1,5 +1,4 @@
 use crate::catalog::types::{FlatCatalog, TouchStrength};
-use crate::ledger::events::AssertionStatus;
 use crate::ledger::paths::CoveragePaths;
 use crate::ledger::views::{file_views, read_concern_assertions, read_file_events};
 use serde::{Deserialize, Serialize};
@@ -50,11 +49,15 @@ pub fn coverage_remaining(
                 continue;
             }
             let strong_enough = view.strongest >= min_strength;
-            let asserted = assertions.iter().any(|a| {
-                a.concern_id == concern.id
-                    && a.file_path == view.path
-                    && a.status != AssertionStatus::NotApplicable
-            });
+            // Any assertion for this (concern, file) — including
+            // `not_applicable` — means the cell has been assessed and is no
+            // longer remaining work. (Treating NA as unasserted left NA-marked
+            // cells listed forever, so the agent could never drive the counter
+            // to zero and re-marked them across runs.) This matches how the
+            // audit excludes NA from gaps.
+            let asserted = assertions
+                .iter()
+                .any(|a| a.concern_id == concern.id && a.file_path == view.path);
             if asserted {
                 continue;
             }
@@ -192,5 +195,70 @@ mod tests {
         assert!(remaining
             .iter()
             .any(|r| r.file_path == "src/config.rs" && r.reason == "no_assertion"));
+    }
+
+    #[test]
+    fn not_applicable_assertion_removes_the_cell_from_remaining() {
+        // Regression: a file explicitly marked `not_applicable` for a concern
+        // is an assessed cell, not remaining work. Previously `coverage_remaining`
+        // ignored NA assertions, so NA-marked cells stayed listed as
+        // `no_assertion` forever — the agent could never drive the counter to
+        // zero and re-marked them across runs (duplicate ledger rows).
+        use crate::ledger::events::{AssertionStatus, ConcernAssertion, Evidence};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = CoveragePaths::new(tmp.path(), "t");
+        let catalog = flatten(&ConcernsBlock {
+            entries: vec![ConcernsEntry::Include(IncludeDirective {
+                include: "stride".to_string(),
+                overrides: vec![],
+                mode: crate::catalog::types::CatalogMode::Auto,
+                filter: None,
+            })],
+        })
+        .unwrap();
+        write_events(
+            &paths,
+            &[FileTouchEvent::Read {
+                path: "src/x.rs".to_string(),
+                line_range: [1, 10],
+                tool: "read_file".to_string(),
+                attribution: attribution(),
+                at: Utc::now(),
+            }],
+        );
+        // `stride:tampering` applies to `src/x.rs` (it shows up as remaining
+        // before any assertion). Mark that exact cell NotApplicable.
+        let na = ConcernAssertion {
+            concern_id: "stride:tampering".to_string(),
+            file_path: "src/x.rs".to_string(),
+            status: AssertionStatus::NotApplicable,
+            evidence: Evidence {
+                summary: "n/a here".to_string(),
+                line_ranges: vec![],
+                finding_ids: vec![],
+            },
+            declared_by: attribution(),
+            declared_at: Utc::now(),
+        };
+        std::fs::write(&paths.concerns, serde_json::to_string(&na).unwrap() + "\n").unwrap();
+
+        let remaining =
+            coverage_remaining(&paths, &catalog, CoverageRemainingInput::default()).unwrap();
+
+        // The NA-marked cell must NOT be remaining.
+        assert!(
+            !remaining
+                .iter()
+                .any(|r| r.concern_id == "stride:tampering" && r.file_path == "src/x.rs"),
+            "a not_applicable assertion must remove (concern, file) from coverage_remaining; got {remaining:?}"
+        );
+        // NA only removes its own cell — other matching concerns still remain.
+        assert!(
+            remaining
+                .iter()
+                .any(|r| r.concern_id == "stride:repudiation" && r.file_path == "src/x.rs"),
+            "unasserted concerns on the same file must still be remaining"
+        );
     }
 }
