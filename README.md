@@ -21,6 +21,10 @@ transcript on every run. A single Rust binary that:
   `rupu webhook serve` long-running process.
 - Renders runs as live terminal streams (`rupu workflow run` / `rupu run`),
   with `rupu watch <run_id>` to re-attach to anything in flight.
+- Records an auditable **coverage** ledger for review-shaped tasks — what the
+  agent examined, for which concerns (OWASP / CWE / STRIDE / …), and what it
+  found — that accumulates across runs and is diff-able and replayable
+  (`rupu coverage`; see [docs/coverage.md](docs/coverage.md)).
 
 What's NOT in this binary yet: the SaaS dashboard, the remote sandbox runtime,
 and the native desktop app — those are slices D + E. See [TODO.md](TODO.md) for
@@ -251,6 +255,7 @@ coverage gaps.
 - `docs/workflow-format.md` — complete workflow schema reference
 - `docs/workflow-authoring.md` — how to design good workflows
 - `docs/development-flows.md` — recommended engineering flows
+- `docs/coverage.md` — agentic coverage harness (ledgers, catalogs, audit / diff / rerun)
 - `examples/README.md` — copyable agents and workflows
 
 ## Subcommands
@@ -265,6 +270,8 @@ rupu workflow runs                    List recent persisted runs
 rupu workflow {approve, reject} <id>  Resume / cancel a paused-for-approval run
 rupu watch <run_id> [--replay]        Re-attach to any past or in-flight run
 rupu transcript {list, show}          Browse JSONL transcripts
+rupu coverage {list, show, audit, gap} Inspect agentic coverage ledgers (+ catalog, templates)
+rupu coverage {runs, diff, rerun}     Compare and replay coverage runs
 rupu issues {list, show, run}         Issue-tracker surface (auto-detects from cwd)
 rupu repos list                       List configured-platform repositories
 rupu cron {list, tick, events}        Cron + polled-event trigger runtime
