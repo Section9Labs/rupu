@@ -71,6 +71,7 @@ impl StepFactory for FakeFactory {
             on_tool_call,
             on_stream_event: None,
             concerns: None,
+            max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
         }

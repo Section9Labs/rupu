@@ -112,6 +112,7 @@ impl StepFactory for DefaultStepFactory {
                         anthropic_speed: None,
                         dispatchable_agents: None,
                         concerns: None,
+                        max_tokens: None,
                         system_prompt: rendered_prompt.clone(),
                     }
                 });
@@ -220,6 +221,9 @@ impl StepFactory for DefaultStepFactory {
             // When the workflow declares `concerns:`, every step uses it —
             // the agent frontmatter's `concerns:` is ignored for this run.
             concerns: resolve_step_concerns(self.workflow.concerns.clone(), spec.concerns),
+            max_tokens: spec
+                .max_tokens
+                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
             // All steps of a workflow share the same target_id (keyed on the
             // workflow name) so ledger entries accumulate per-workflow, not
             // per-step-agent.

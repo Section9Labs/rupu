@@ -6,6 +6,10 @@ model: claude-sonnet-4-6
 permissionMode: readonly
 maxTurns: 60
 effort: high
+# Report-writing agents need a large output budget so the model can think
+# + write the full report + emit `write_file` in a single turn.  Extended
+# thinking (`effort: high`) draws from the same pool as text output.
+maxTokens: 32000
 # Read-only investigation + PR review. `edit_file`/`write_file` are omitted on
 # top of readonly mode. The coverage tools (coverage_mark, report_finding,
 # coverage_remaining, coverage_status, coverage_concerns_search/detail) are
