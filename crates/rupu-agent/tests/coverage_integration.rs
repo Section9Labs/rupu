@@ -85,6 +85,7 @@ async fn agent_run_with_concerns_writes_catalog_snapshot() {
         on_stream_event: None,
         concerns: Some(stride_block()),
         scope_name: None,
+        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         surface_tag: None,
     };
 
@@ -190,6 +191,7 @@ async fn agent_run_without_concerns_does_not_inject_coverage_tools() {
         on_stream_event: None,
         concerns: None,
         scope_name: None,
+        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         surface_tag: None,
     };
 
@@ -256,6 +258,7 @@ async fn agent_run_with_concerns_injects_catalog_into_system_prompt() {
         on_stream_event: None,
         concerns: Some(stride_block()),
         scope_name: None,
+        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         surface_tag: None,
     };
 
@@ -331,6 +334,7 @@ async fn surface_tag_override_is_respected() {
         on_stream_event: None,
         // Enable coverage so the runner's surface_tag assignment fires.
         concerns: Some(stride_block()),
+        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         scope_name: None,
         // This is the field under test: override to "workflow".
         surface_tag: Some("workflow".to_string()),
@@ -338,7 +342,9 @@ async fn surface_tag_override_is_respected() {
 
     // The run must complete cleanly — confirms the surface_tag override
     // doesn't break the runner's coverage wiring path.
-    run_agent(opts).await.expect("agent run with workflow surface_tag should succeed");
+    run_agent(opts)
+        .await
+        .expect("agent run with workflow surface_tag should succeed");
 
     // Verify catalog was still written (coverage harness ran normally).
     let target = rupu_coverage::target_id(&workspace, "workflow-step-agent");
@@ -400,10 +406,13 @@ async fn agent_run_with_index_mode_concerns_injects_search_and_detail_tools() {
         on_stream_event: None,
         concerns: Some(stride_index_block()),
         scope_name: None,
+        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         surface_tag: None,
     };
 
-    run_agent(opts).await.expect("agent run with index mode concerns should succeed");
+    run_agent(opts)
+        .await
+        .expect("agent run with index mode concerns should succeed");
 
     // Verify that the LLM request included all 6 coverage tools,
     // including the new search and detail tools for index-mode catalogs.

@@ -106,6 +106,12 @@ struct Frontmatter {
     /// system prompt.
     #[serde(default)]
     concerns: Option<ConcernsBlock>,
+    /// Per-request output-token budget (`max_tokens` in the LLM request).
+    /// `None` falls back to `runner::DEFAULT_MAX_TOKENS` (8192). Raise it for
+    /// agents that emit large output (e.g. writing reports) — note extended
+    /// thinking (`effort`) draws from this same budget.
+    #[serde(default, rename = "maxTokens")]
+    max_tokens: Option<u32>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -131,6 +137,9 @@ pub struct AgentSpec {
     pub dispatchable_agents: Option<Vec<String>>,
     /// Coverage concerns block parsed from `concerns:` frontmatter.
     pub concerns: Option<ConcernsBlock>,
+    /// Per-request output-token budget. `None` falls back to
+    /// `runner::DEFAULT_MAX_TOKENS` (8192).
+    pub max_tokens: Option<u32>,
     pub system_prompt: String,
 }
 
@@ -170,6 +179,7 @@ impl AgentSpec {
             anthropic_speed: fm.anthropic_speed,
             dispatchable_agents: fm.dispatchable_agents,
             concerns: fm.concerns,
+            max_tokens: fm.max_tokens,
             system_prompt: body.to_string(),
         })
     }

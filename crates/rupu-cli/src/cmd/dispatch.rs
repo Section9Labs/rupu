@@ -182,6 +182,9 @@ impl AgentDispatcher for CliAgentDispatcher {
             on_tool_call: None,
             on_stream_event: None,
             concerns: spec.concerns.clone(),
+            max_tokens: spec
+                .max_tokens
+                .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
             scope_name: None,
             surface_tag: None,
         };

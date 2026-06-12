@@ -49,6 +49,7 @@ async fn run_passes_all_default_tools_to_provider() {
         on_tool_call: None,
         on_stream_event: None,
         concerns: None,
+        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         scope_name: None,
         surface_tag: None,
     };
@@ -139,6 +140,7 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         on_tool_call: None,
         on_stream_event: None,
         concerns: None,
+        max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         scope_name: None,
         surface_tag: None,
     };

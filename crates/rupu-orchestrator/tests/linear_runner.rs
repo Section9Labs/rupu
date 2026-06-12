@@ -82,6 +82,7 @@ impl StepFactory for FakeFactory {
             on_tool_call,
             on_stream_event: None,
             concerns: None,
+            max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
         }
@@ -451,6 +452,7 @@ impl StepFactory for FailingFactory {
             on_tool_call,
             on_stream_event: None,
             concerns: None,
+            max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
         }
@@ -1191,6 +1193,7 @@ impl StepFactory for PanelFactory {
             on_tool_call,
             on_stream_event: None,
             concerns: None,
+            max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
         }
@@ -1434,6 +1437,7 @@ impl StepFactory for LoopingPanelFactory {
             on_tool_call,
             on_stream_event: None,
             concerns: None,
+            max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
         }

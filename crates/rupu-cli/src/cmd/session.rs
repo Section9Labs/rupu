@@ -394,6 +394,11 @@ struct SessionRecord {
     /// harness active (target_id derived from `(workspace, session_id)`).
     #[serde(default)]
     concerns: Option<rupu_coverage::ConcernsBlock>,
+    /// Per-request output-token budget captured from `spec.max_tokens` at
+    /// session start. `None` falls back to `runner::DEFAULT_MAX_TOKENS` (8192)
+    /// on each turn.
+    #[serde(default)]
+    max_tokens: Option<u32>,
 }
 
 impl SessionRecord {
@@ -1362,6 +1367,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         message_history: Vec::new(),
         runs: Vec::new(),
         concerns: spec.concerns.clone(),
+        max_tokens: spec.max_tokens,
     };
     write_session(&global, SessionScope::Active, &session)?;
     launch_turn(&global, &session_id, user_message, args.detach, args.view).await
@@ -4682,11 +4688,7 @@ fn append_session_coverage_lines(state: &mut SessionInteractiveState, session: &
             ),
         );
     }
-    let disagreements = report
-        .cross_model
-        .iter()
-        .filter(|x| x.disagreement)
-        .count();
+    let disagreements = report.cross_model.iter().filter(|x| x.disagreement).count();
     if disagreements > 0 {
         state.push_line(
             crate::output::palette::Status::Awaiting,
@@ -6075,6 +6077,9 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         on_tool_call: None,
         on_stream_event: Some(on_stream_event),
         concerns: session.concerns.clone(),
+        max_tokens: session
+            .max_tokens
+            .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
         // Sessions key their coverage ledger off the session_id so multiple
         // sessions against the same workspace stay distinct, and target_id
         // matches the spec's per-session derivation.
@@ -7745,6 +7750,7 @@ mod tests {
                 error: None,
             }],
             concerns: None,
+            max_tokens: None,
         }
     }
 

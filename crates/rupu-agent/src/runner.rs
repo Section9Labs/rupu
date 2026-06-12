@@ -12,8 +12,8 @@ use crate::tool_registry::{default_tool_registry, ToolRegistry};
 use async_trait::async_trait;
 use chrono::Utc;
 use rupu_coverage::{
-    flatten, render_prompt_section, target_id, write_snapshot, CoveragePaths,
-    CoverageWriterHandle, FlatCatalog, DEFAULT_FULL_MODE_THRESHOLD,
+    flatten, render_prompt_section, target_id, write_snapshot, CoveragePaths, CoverageWriterHandle,
+    FlatCatalog, DEFAULT_FULL_MODE_THRESHOLD,
 };
 use rupu_mcp::{McpPermission, ServeHandle};
 use rupu_providers::provider::LlmProvider;
@@ -38,6 +38,12 @@ struct CoverageBundle {
 }
 
 const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
+
+/// Default per-request output-token budget when an agent doesn't set
+/// `maxTokens`. 4096 was too low for output-heavy agents (it truncated
+/// responses before a tool call could be emitted, especially with extended
+/// thinking, which draws from the same budget).
+pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Callback invoked by `run_agent` immediately before each tool
 /// dispatch. The runner translates this into `Event::StepWorking
@@ -209,6 +215,8 @@ pub struct AgentRunOpts {
     /// the catalog to the system prompt. `None` (default) disables all
     /// coverage harness machinery.
     pub concerns: Option<rupu_coverage::ConcernsBlock>,
+    /// Per-request output-token budget (`max_tokens`). See `DEFAULT_MAX_TOKENS`.
+    pub max_tokens: u32,
     /// Override the `scope_name` used when deriving the coverage `target_id`.
     /// When `None` (default, standalone agent runs), falls back to `agent_name`.
     /// Workflow runs set this to the workflow name so all steps accumulate
@@ -259,10 +267,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
         if let Some(block) = opts.concerns.clone() {
             let catalog = flatten(&block)
                 .map_err(|e| RunError::Coverage(format!("flatten coverage catalog: {e}")))?;
-            let resolved_scope = opts
-                .scope_name
-                .as_deref()
-                .unwrap_or(&opts.agent_name);
+            let resolved_scope = opts.scope_name.as_deref().unwrap_or(&opts.agent_name);
             let target = target_id(&opts.workspace_path, resolved_scope);
             let paths = CoveragePaths::new(&opts.workspace_path, &target);
             paths
@@ -405,7 +410,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 model: opts.model.clone(),
                 system: Some(opts.agent_system_prompt.clone()),
                 messages: messages.clone(),
-                max_tokens: 4096,
+                max_tokens: opts.max_tokens,
                 tools: tool_defs.clone(),
                 cell_id: None,
                 trace_id: None,
@@ -543,8 +548,11 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             error: Some("permission_denied".into()),
                             duration_ms: 0,
                         })?;
-                        tool_results
-                            .push((call_id, String::new(), Some("permission_denied".into())));
+                        tool_results.push((
+                            call_id,
+                            String::new(),
+                            Some("permission_denied".into()),
+                        ));
                         continue;
                     }
                     PermissionDecision::StopRun => {
@@ -861,6 +869,7 @@ mod on_tool_call_tests {
             on_tool_call: Some(cb),
             on_stream_event: None,
             concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
         };
@@ -939,6 +948,7 @@ mod on_tool_call_tests {
             on_tool_call: None,
             on_stream_event: None,
             concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
         };
