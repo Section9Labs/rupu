@@ -111,6 +111,11 @@ pub enum Action {
     Compact {
         #[arg(add = ArgValueCompleter::new(active_session_ids))]
         session_id: String,
+        /// Context-window size (tokens) to size compaction against. Overrides
+        /// the session's stored `contextWindowTokens`; required for sessions
+        /// created before that field existed.
+        #[arg(long)]
+        window: Option<u32>,
     },
     #[command(name = "_worker", hide = true)]
     RunWorker(RunWorkerArgs),
@@ -1062,7 +1067,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::Send(args) => send(args).await,
         Action::Attach { session_id, view } => attach(&session_id, view).await,
         Action::Stop { session_id } => stop(&session_id).await,
-        Action::Compact { session_id } => compact(&session_id).await,
+        Action::Compact { session_id, window } => compact(&session_id, window).await,
         Action::RunWorker(args) => run_worker(args).await,
         Action::RunTurn(args) => run_turn(args).await,
     };
@@ -5793,7 +5798,21 @@ async fn stop(session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn compact(session_id: &str) -> anyhow::Result<()> {
+/// The input-token count of the LAST turn recorded in a transcript — a single
+/// turn's prompt size, not the run's cumulative total. Used to calibrate
+/// compaction sizing to real tokens.
+fn last_turn_input_tokens(path: &Path) -> Option<u32> {
+    let iter = JsonlReader::iter(path).ok()?;
+    let mut last = None;
+    for event in iter.flatten() {
+        if let TranscriptEvent::Usage { input_tokens, .. } = event {
+            last = Some(input_tokens);
+        }
+    }
+    last
+}
+
+async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, session_id)?;
     ensure_active_scope(scope, "session compact")?;
@@ -5805,12 +5824,15 @@ async fn compact(session_id: &str) -> anyhow::Result<()> {
         );
     }
 
-    let context_window_tokens = session.context_window_tokens.ok_or_else(|| {
-        anyhow::anyhow!(
-            "session {} has no context_window_tokens set; compaction requires a window size",
-            session_id
-        )
-    })?;
+    let context_window_tokens = window_override
+        .or(session.context_window_tokens)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "session {} has no contextWindowTokens set; pass --window <tokens> \
+                 (e.g. --window 1000000) — sessions created before this field existed don't store it",
+                session_id
+            )
+        })?;
 
     if session.message_history.len() < 4 {
         println!(
@@ -5841,11 +5863,18 @@ async fn compact(session_id: &str) -> anyhow::Result<()> {
         })
         .sum();
 
+    // Calibrate sizing to a real SINGLE-turn input size, not a run's cumulative
+    // `total_tokens_in` (which sums every turn/retry and badly over-estimates
+    // tokens-per-char, making compaction far too aggressive). Read the last
+    // Usage event from the most recent transcript; fall back to a dense-content
+    // estimate (~0.5 tok/char) if no transcript usage is available.
     let last_input_tokens: u32 = session
-        .runs
-        .last()
-        .map(|r| r.total_tokens_in as u32)
-        .unwrap_or_else(|| (total_chars / 4).max(1) as u32);
+        .active_transcript_path
+        .as_ref()
+        .or(session.last_transcript_path.as_ref())
+        .and_then(|p| last_turn_input_tokens(p))
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| (total_chars / 2).max(1) as u32);
 
     // Build the provider the same way the worker does.
     let global_cfg_path = global.join("config.toml");
