@@ -1523,6 +1523,16 @@ fn attach_blocking(
     session_id: &str,
     view: Option<LiveViewMode>,
 ) -> anyhow::Result<()> {
+    // Attaching to an operator-stopped session resumes it: flip it back to
+    // Idle so the next turn spawns a fresh worker. `stop` set status=Stopped,
+    // which `send`/`enqueue_turn_request` reject — without this, a stopped
+    // session could only be replaced, never continued.
+    {
+        let (mut session, scope) = read_session(global, session_id)?;
+        if matches!(scope, SessionScope::Active) && reactivate_stopped(&mut session) {
+            write_session(global, scope, &session)?;
+        }
+    }
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let cfg = rupu_config::layer_files(
@@ -5723,6 +5733,24 @@ async fn stop(session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Re-activate a session the operator previously stopped so it can take new
+/// turns again. Attaching to a stopped session calls this: it flips
+/// `Stopped` → `Idle` and clears the operator-stop marker, after which the
+/// next turn spawns a fresh worker via [`ensure_session_worker`]. No-op
+/// (returns `false`) for any non-stopped status, so it is safe to call on
+/// every attach.
+fn reactivate_stopped(session: &mut SessionRecord) -> bool {
+    if session.status != SessionStatus::Stopped {
+        return false;
+    }
+    session.status = SessionStatus::Idle;
+    if session.last_error.as_deref() == Some("stopped by operator") {
+        session.last_error = None;
+    }
+    session.updated_at = Utc::now();
+    true
+}
+
 fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> {
     let (mut session, scope) = read_session(&global, session_id)?;
     ensure_active_scope(scope, "session stop")?;
@@ -7088,6 +7116,34 @@ mod tests {
         assert_eq!(session.status, SessionStatus::Idle);
         assert_eq!(session.worker_pid, None);
         assert_eq!(session.active_pid, None);
+    }
+
+    #[test]
+    fn reactivate_stopped_resumes_to_idle_and_clears_operator_error() {
+        let mut session = SessionRecord {
+            status: SessionStatus::Stopped,
+            last_error: Some("stopped by operator".into()),
+            ..test_session_record()
+        };
+        assert!(reactivate_stopped(&mut session));
+        assert_eq!(session.status, SessionStatus::Idle);
+        assert_eq!(session.last_error, None);
+        // Idempotent: a session that is no longer stopped is left untouched.
+        assert!(!reactivate_stopped(&mut session));
+        assert_eq!(session.status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn reactivate_stopped_preserves_a_non_operator_error() {
+        let mut session = SessionRecord {
+            status: SessionStatus::Stopped,
+            last_error: Some("provider: boom".into()),
+            ..test_session_record()
+        };
+        assert!(reactivate_stopped(&mut session));
+        assert_eq!(session.status, SessionStatus::Idle);
+        // Only the operator-stop marker is cleared; real errors are kept.
+        assert_eq!(session.last_error.as_deref(), Some("provider: boom"));
     }
 
     #[test]
