@@ -78,9 +78,9 @@ catalog etc. always remain).
 
 1. **Partition** into `task | middle | recent`:
    - `task` = the first message (the original user objective). Always kept.
-   - `recent` = the most-recent messages whose estimated token sum (chars / 4)
-     is ≤ `recent_budget` (default: half the window,
-     `context_window_tokens / 2`), walking from the end. Never split a
+   - `recent` = the most-recent messages whose raw char sum is ≤
+     `recent_budget_chars` (derived via calibration — see "Token estimation and
+     recent-sizing calibration" below), walking from the end. Never split a
      tool_use/tool_result pair — if the boundary lands between an assistant
      tool_use and its following tool_result user message, include both. Always
      keep at least the last complete exchange.
@@ -125,13 +125,37 @@ catalog etc. always remain).
    (session.rs:6176) and persists it. **The compacted state therefore sticks
    across turns with no session.rs changes.**
 
-## Token estimation
+## Token estimation and recent-sizing calibration
 
-A pure helper `estimate_tokens(messages: &[Message]) -> usize` summing
-`content.len() / 4` across text/tool blocks. Used only to size `recent` (step 1);
-triggering uses the provider's real `input_tokens`. Approximation is acceptable
-because B (reactive trim+retry) remains the floor if an estimate is off and a
-rebuilt request still overflows.
+**Triggering** uses the provider's real `resp.usage.input_tokens` — no
+client-side tokenizer is needed here.
+
+**Sizing the recent window** uses a calibrated char budget rather than a fixed
+chars/4 estimate. The old approach (chars/4 against `context_window_tokens / 2`)
+undercounted real tokens ~2x for code/JSON-heavy conversations: a history
+costing ~990k real tokens estimated at ~520k, which fell within the ~500k
+budget, leaving nothing to summarize and silently skipping compaction.
+
+The calibrated approach (`compact_context`, threading `last_input_tokens` from
+the triggering turn):
+
+1. Sum raw chars across all message content blocks: `total_chars`.
+2. Derive tokens-per-char from the provider's real charge:
+   `tokens_per_char = max(0.25, last_input_tokens / total_chars)`.
+   The 0.25 floor matches the minimum that chars/4 would give; guarding avoids
+   division-by-zero and extreme values.
+3. Target landing the kept-recent portion at **half the compaction threshold**
+   (e.g. 750k threshold → land recent at ~375k tokens), giving real headroom
+   before the next compaction triggers.
+4. Convert to a char budget:
+   `recent_budget_chars = (threshold / 2) / tokens_per_char`.
+
+`partition_for_compaction` now accepts `recent_budget_chars: usize` and
+accumulates `message_chars(msg)` (raw char count of all content blocks) walking
+from the end, instead of the old `estimate_tokens` (chars/4) approximation.
+
+A legacy `estimate_tokens` helper is kept for reference and unit tests but is
+no longer called by production sizing paths.
 
 ## Layering with B (existing reactive trim+retry)
 

@@ -105,6 +105,8 @@ fn is_context_overflow(err: &str) -> bool {
 }
 
 /// Estimate token count for a slice of messages using chars/4 approximation.
+/// Kept for reference and tests; production sizing now uses calibrated char budgets.
+#[allow(dead_code)]
 pub(crate) fn estimate_tokens(messages: &[Message]) -> usize {
     messages
         .iter()
@@ -116,6 +118,22 @@ pub(crate) fn estimate_tokens(messages: &[Message]) -> usize {
                 (name.len() + input_str.len()) / 4
             }
             ContentBlock::ToolResult { content, .. } => content.len() / 4,
+        })
+        .sum()
+}
+
+/// Sum raw character counts across all content blocks in a message.
+/// Used for char-budget partitioning (calibrated via the provider's real token count).
+fn message_chars(m: &Message) -> usize {
+    m.content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.len(),
+            ContentBlock::ToolUse { name, input, .. } => {
+                let input_str = input.to_string();
+                name.len() + input_str.len()
+            }
+            ContentBlock::ToolResult { content, .. } => content.len(),
         })
         .sum()
 }
@@ -137,17 +155,23 @@ pub(crate) fn effective_compact_threshold(
 /// - `messages[middle_start..recent_start]` = middle to summarise
 /// - `messages[recent_start..]` = recent verbatim
 ///
+/// `recent_budget_chars` is a raw character budget derived from the provider's
+/// real `input_tokens` (see `compact_context`). Walking in chars avoids the
+/// ~2x undercount that the old `chars/4` token estimate produced for code/JSON
+/// heavy conversations, which caused compaction to treat the entire history as
+/// "recent" and skip.
+///
 /// Returns `None` if there is nothing in the middle (i.e. `recent_start <= 1`).
 pub(crate) fn partition_for_compaction(
     messages: &[Message],
-    recent_budget_tokens: usize,
+    recent_budget_chars: usize,
 ) -> Option<(usize, usize)> {
     let middle_start = 1usize;
     if messages.len() <= 2 {
         return None;
     }
 
-    // Walk from the end, accumulating tokens, to find recent_start.
+    // Walk from the end, accumulating chars, to find recent_start.
     let mut accumulated = 0usize;
     let mut recent_start = messages.len();
 
@@ -155,16 +179,16 @@ pub(crate) fn partition_for_compaction(
     let min_recent_start = messages.len().saturating_sub(2);
 
     for i in (middle_start..messages.len()).rev() {
-        let msg_tokens = estimate_tokens(std::slice::from_ref(&messages[i]));
+        let msg_chars = message_chars(&messages[i]);
         if recent_start <= min_recent_start {
             // We've reached the minimum we must keep — stop.
             break;
         }
-        if accumulated + msg_tokens > recent_budget_tokens && recent_start <= messages.len() - 2 {
+        if accumulated + msg_chars > recent_budget_chars && recent_start <= messages.len() - 2 {
             // Adding this message would exceed the budget and we already have ≥2.
             break;
         }
-        accumulated += msg_tokens;
+        accumulated += msg_chars;
         recent_start = i;
     }
 
@@ -209,20 +233,45 @@ pub(crate) fn rebuild_compacted(
 
 /// Run one compaction cycle on `messages`. Returns `true` if compaction
 /// was performed (messages mutated), `false` if it was skipped (no mutation).
+///
+/// `last_input_tokens` is the provider's real input token count from the
+/// triggering turn. It is used to calibrate a char→token ratio so that the
+/// recent-message budget is expressed in raw chars that correspond to the
+/// correct token count, rather than relying on a fixed chars/4 estimate that
+/// undercounts code/JSON-heavy conversations by ~2x.
 async fn compact_context(
     messages: &mut Vec<Message>,
     opts: &mut AgentRunOpts,
     run_id: &str,
     seq: u32,
     writer: &mut JsonlWriter,
+    last_input_tokens: u32,
 ) -> bool {
     let context_window_tokens = match opts.context_window_tokens {
         Some(w) => w,
         None => return false,
     };
-    let recent_budget = (context_window_tokens / 2) as usize;
 
-    let (middle_start, recent_start) = match partition_for_compaction(messages, recent_budget) {
+    // Calibrate: derive tokens-per-char from what the provider actually charged.
+    // `last_input_tokens` covers system prompt + messages; the system prompt is
+    // typically small relative to the conversation, so we use total message chars
+    // as the denominator and guard with a floor of 0.25 (the minimum a naive
+    // chars/4 assumption would give).
+    let total_chars: usize = messages.iter().map(message_chars).sum();
+    let tokens_per_char = (last_input_tokens as f64 / total_chars.max(1) as f64).max(0.25_f64);
+
+    // Land the kept-recent portion at ~half the compaction threshold so there
+    // is real headroom before the next compaction triggers. This is the key fix:
+    // with the old chars/4 estimate a 990k-token conversation was sized at ~520k,
+    // which fell within the 500k recent_budget, so nothing was summarized.
+    let threshold =
+        effective_compact_threshold(opts.context_window_tokens, opts.compact_at_percent)
+            .unwrap_or(context_window_tokens as u64 / 2);
+    let target_recent_tokens = (threshold / 2) as f64;
+    let recent_budget_chars = (target_recent_tokens / tokens_per_char) as usize;
+
+    let (middle_start, recent_start) = match partition_for_compaction(messages, recent_budget_chars)
+    {
         Some(p) => p,
         None => return false,
     };
@@ -795,12 +844,14 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 if resp.usage.input_tokens as u64 > threshold {
                     compaction_seq += 1;
                     let run_id_clone = opts.run_id.clone();
+                    let last_input_tokens = resp.usage.input_tokens;
                     let _ = compact_context(
                         &mut messages,
                         &mut opts,
                         &run_id_clone,
                         compaction_seq,
                         &mut writer,
+                        last_input_tokens,
                     )
                     .await;
                 }
@@ -1703,8 +1754,8 @@ mod compaction_tests {
             msgs.push(text_msg(Role::User, &format!("user {i}")));
         }
         // msgs has 9 messages: [task, a0, u0, a1, u1, a2, u2, a3, u3]
-        // With very small budget (1 token), we still keep at least 2
-        let result = partition_for_compaction(&msgs, 1);
+        // With very small char budget (4 chars), we still keep at least 2.
+        let result = partition_for_compaction(&msgs, 4);
         assert!(result.is_some(), "should partition a 9-message convo");
         let (middle_start, recent_start) = result.unwrap();
         assert_eq!(middle_start, 1);
@@ -1722,7 +1773,8 @@ mod compaction_tests {
             text_msg(Role::User, "task"),
             text_msg(Role::Assistant, "done"),
         ];
-        assert_eq!(partition_for_compaction(&msgs, 1000), None);
+        // Budget in chars: 4000 chars (well above the tiny convo)
+        assert_eq!(partition_for_compaction(&msgs, 4000), None);
     }
 
     #[test]
@@ -1735,9 +1787,9 @@ mod compaction_tests {
             tool_result_msg(),
             text_msg(Role::Assistant, "step 2"),
         ];
-        // With a very small budget, recent_start might initially land on the tool_result msg.
+        // With a very small char budget (4), recent_start might initially land on the tool_result msg.
         // The pair-protection should move it back to include the tool_use assistant msg.
-        let result = partition_for_compaction(&msgs, 1);
+        let result = partition_for_compaction(&msgs, 4);
         if let Some((_, recent_start)) = result {
             // If recent_start points into the tool_use/tool_result pair,
             // it must start at the assistant tool_use, not the user tool_result.
@@ -1758,6 +1810,87 @@ mod compaction_tests {
                 );
             }
         }
+    }
+
+    /// Regression test for the dense-content compaction bug.
+    ///
+    /// Before the fix, `partition_for_compaction` used `estimate_tokens` (chars/4)
+    /// against a token budget (`context_window_tokens / 2`). For code/JSON-heavy
+    /// conversations the chars/4 estimate undercounts real tokens ~2x, so a history
+    /// that is really ~990k tokens looked like ~520k estimated tokens — within the
+    /// ~500k budget — and the entire history was treated as "recent", leaving nothing
+    /// to summarize. This test asserts that a char budget well below the total chars
+    /// of a dense conversation correctly identifies a non-empty middle section.
+    #[test]
+    fn partition_budget_in_chars_reclaims_middle_for_dense_content() {
+        // Build 8 messages with large char payloads (simulating JSON/code content).
+        let dense_chunk = "x".repeat(50_000); // 50k chars per message
+        let mut msgs = vec![text_msg(Role::User, "task")];
+        for i in 0..3 {
+            msgs.push(text_msg(
+                Role::Assistant,
+                &format!("assistant {i}: {dense_chunk}"),
+            ));
+            msgs.push(text_msg(Role::User, &format!("user {i}: {dense_chunk}")));
+        }
+        msgs.push(text_msg(
+            Role::Assistant,
+            &format!("final assistant: {dense_chunk}"),
+        ));
+        // Total: 1 task + 3 assistant + 3 user + 1 assistant = 8 messages
+        // Each of the 7 non-task messages has ~50k+ chars → ~350k total chars.
+
+        // recent_budget_chars = 60k chars → only fits 1 message (~50k chars),
+        // meaning recent_start > 1 and there IS a non-empty middle to summarize.
+        let recent_budget_chars = 60_000usize;
+        let result = partition_for_compaction(&msgs, recent_budget_chars);
+
+        assert!(
+            result.is_some(),
+            "dense conversation with small char budget must find a middle section"
+        );
+        let (middle_start, recent_start) = result.unwrap();
+        assert_eq!(middle_start, 1, "task is always at index 0");
+        assert!(
+            recent_start > 1,
+            "recent_start must be > 1 so there is something in the middle to summarize; got {recent_start}"
+        );
+
+        // Verify the middle is non-empty.
+        assert!(
+            recent_start > middle_start,
+            "middle (messages[{middle_start}..{recent_start}]) must be non-empty"
+        );
+    }
+
+    /// Calibration sanity check: when the provider reports ~2× the chars/4 estimate
+    /// (as happens with dense code), the derived recent_budget_chars should be
+    /// roughly half what a naive chars/4==tokens assumption would give.
+    #[test]
+    fn calibration_halves_budget_when_tokens_are_2x_char_estimate() {
+        // Construct a scenario: 400k chars of messages, chars/4 estimate = 100k tokens.
+        // Provider actually reports 200k tokens (2× the estimate).
+        let total_chars: usize = 400_000;
+        let last_input_tokens: u32 = 200_000;
+
+        // Compute tokens_per_char (mirroring compact_context logic).
+        let tokens_per_char = (last_input_tokens as f64 / total_chars.max(1) as f64).max(0.25_f64);
+
+        // Threshold at 75% of 1M window = 750k tokens; target recent = half = 375k tokens.
+        let threshold: u64 = 750_000;
+        let target_recent_tokens = (threshold / 2) as f64;
+        let recent_budget_chars = (target_recent_tokens / tokens_per_char) as usize;
+
+        // Naive chars/4 path: recent_budget_tokens = window/2 = 500k tokens.
+        // In chars that would be 500k * 4 = 2_000_000 chars.
+        // Calibrated path with 2x real density: recent_budget_chars ≈ 375k / 0.5 = 750_000 chars.
+        // So calibrated is ~750k vs naive ~2M — roughly 2.7× smaller.
+        // The key property: calibrated_budget < naive_budget by a significant factor.
+        let naive_budget_chars: usize = 2_000_000;
+        assert!(
+            recent_budget_chars < naive_budget_chars / 2,
+            "calibrated char budget ({recent_budget_chars}) should be much smaller than naive budget ({naive_budget_chars}) when real tokens are 2x the estimate"
+        );
     }
 
     #[test]
@@ -1849,8 +1982,17 @@ mod compaction_tests {
         let original_len = messages.len();
 
         let mut writer = JsonlWriter::create(&transcript_path).expect("writer");
-        let result =
-            compact_context(&mut messages, &mut opts, "run_compact_test", 1, &mut writer).await;
+        // Pass a realistic last_input_tokens (simulating 800k real tokens for
+        // the 4-message test conversation).
+        let result = compact_context(
+            &mut messages,
+            &mut opts,
+            "run_compact_test",
+            1,
+            &mut writer,
+            800_000,
+        )
+        .await;
 
         assert!(
             !result,
