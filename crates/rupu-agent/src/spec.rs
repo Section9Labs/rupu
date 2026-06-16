@@ -112,6 +112,17 @@ struct Frontmatter {
     /// thinking (`effort`) draws from this same budget.
     #[serde(default, rename = "maxTokens")]
     max_tokens: Option<u32>,
+    /// Model context-window size in tokens. When set, enables proactive
+    /// LLM context compaction: the runner summarises older turns before
+    /// the next turn when the previous turn's input exceeded
+    /// `compactAtPercent` of this value. Absent → compaction disabled.
+    #[serde(default, rename = "contextWindowTokens")]
+    context_window_tokens: Option<u32>,
+    /// Percentage of `contextWindowTokens` at which to trigger compaction.
+    /// Defaults to 80 when `contextWindowTokens` is set and this is
+    /// omitted. Clamped to `[10, 95]`.
+    #[serde(default, rename = "compactAtPercent")]
+    compact_at_percent: Option<u8>,
 }
 
 /// Parsed agent file. The body of the markdown is the system prompt.
@@ -140,6 +151,10 @@ pub struct AgentSpec {
     /// Per-request output-token budget. `None` falls back to
     /// `runner::DEFAULT_MAX_TOKENS` (8192).
     pub max_tokens: Option<u32>,
+    /// Model context-window size in tokens. When set, enables LLM context compaction.
+    pub context_window_tokens: Option<u32>,
+    /// Compact-at percentage threshold. See `compactAtPercent` frontmatter.
+    pub compact_at_percent: Option<u8>,
     pub system_prompt: String,
 }
 
@@ -180,6 +195,8 @@ impl AgentSpec {
             dispatchable_agents: fm.dispatchable_agents,
             concerns: fm.concerns,
             max_tokens: fm.max_tokens,
+            context_window_tokens: fm.context_window_tokens,
+            compact_at_percent: fm.compact_at_percent,
             system_prompt: body.to_string(),
         })
     }
@@ -188,5 +205,36 @@ impl AgentSpec {
     pub fn parse_file(path: &std::path::Path) -> Result<Self, AgentSpecParseError> {
         let s = std::fs::read_to_string(path)?;
         Self::parse(&s)
+    }
+}
+
+#[cfg(test)]
+mod compaction_config_tests {
+    use super::AgentSpec;
+
+    #[test]
+    fn parses_context_compaction_fields() {
+        let src = "---
+name: test
+contextWindowTokens: 1000000
+compactAtPercent: 75
+---
+You are a test agent.
+";
+        let spec = AgentSpec::parse(src).expect("parse ok");
+        assert_eq!(spec.context_window_tokens, Some(1_000_000));
+        assert_eq!(spec.compact_at_percent, Some(75));
+    }
+
+    #[test]
+    fn compaction_fields_absent_yields_none() {
+        let src = "---
+name: test
+---
+You are a test agent.
+";
+        let spec = AgentSpec::parse(src).expect("parse ok");
+        assert_eq!(spec.context_window_tokens, None);
+        assert_eq!(spec.compact_at_percent, None);
     }
 }

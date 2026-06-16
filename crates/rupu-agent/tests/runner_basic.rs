@@ -53,6 +53,8 @@ async fn happy_path_one_turn_no_tools() {
         max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         scope_name: None,
         surface_tag: None,
+        context_window_tokens: None,
+        compact_at_percent: None,
     };
 
     let res = run_agent(opts).await.unwrap();

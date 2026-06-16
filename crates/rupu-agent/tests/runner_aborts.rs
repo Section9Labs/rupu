@@ -47,6 +47,8 @@ fn opts(
         max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         scope_name: None,
         surface_tag: None,
+        context_window_tokens: None,
+        compact_at_percent: None,
     }
 }
 

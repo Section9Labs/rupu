@@ -187,6 +187,8 @@ impl AgentDispatcher for CliAgentDispatcher {
                 .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
             scope_name: None,
             surface_tag: None,
+            context_window_tokens: spec.context_window_tokens,
+            compact_at_percent: spec.compact_at_percent,
         };
 
         let started = std::time::Instant::now();

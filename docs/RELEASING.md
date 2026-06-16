@@ -47,6 +47,10 @@ For your current platform:
 make release                       # cargo build --release + sign with Developer ID
 cd target/release
 strip rupu                         # smaller binary; no debug symbols
+# strip INVALIDATES the signature `make release` just applied — re-sign the
+# stripped binary, or macOS SIGKILLs it on launch (and codesign --verify fails).
+( cd ../.. && scripts/sign-dev.sh release )
+codesign --verify --verbose=1 rupu # sanity: must report "valid on disk"
 TARGET=$(rustc -vV | awk '/^host/ { print $2 }')   # e.g., aarch64-apple-darwin
 NAME="rupu-${TAG}-${TARGET}"
 tar -czf "${NAME}.tar.gz" rupu

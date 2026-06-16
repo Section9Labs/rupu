@@ -371,6 +371,12 @@ struct SessionRecord {
     active_pid: Option<u32>,
     #[serde(default)]
     worker_pid: Option<u32>,
+    /// Unix mtime (secs) of the `rupu` binary that spawned the current worker.
+    /// On the next turn we compare it to the running binary's mtime; if the
+    /// binary is newer the worker is stale (running old code) and is restarted
+    /// so a freshly-installed build takes effect without a manual stop.
+    #[serde(default)]
+    worker_binary_mtime: Option<i64>,
     #[serde(default)]
     last_run_id: Option<String>,
     #[serde(default)]
@@ -399,6 +405,12 @@ struct SessionRecord {
     /// on each turn.
     #[serde(default)]
     max_tokens: Option<u32>,
+    /// Model context-window size in tokens for compaction. Captured from spec at session start.
+    #[serde(default)]
+    context_window_tokens: Option<u32>,
+    /// Compact-at percentage. Captured from spec at session start.
+    #[serde(default)]
+    compact_at_percent: Option<u8>,
 }
 
 impl SessionRecord {
@@ -1357,6 +1369,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         active_transcript_path: None,
         active_pid: None,
         worker_pid: None,
+        worker_binary_mtime: None,
         last_run_id: None,
         last_transcript_path: None,
         last_error: None,
@@ -1368,6 +1381,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         runs: Vec::new(),
         concerns: spec.concerns.clone(),
         max_tokens: spec.max_tokens,
+        context_window_tokens: spec.context_window_tokens,
+        compact_at_percent: spec.compact_at_percent,
     };
     write_session(&global, SessionScope::Active, &session)?;
     launch_turn(&global, &session_id, user_message, args.detach, args.view).await
@@ -1473,13 +1488,50 @@ fn enqueue_turn_request(global: &Path, session_id: &str, prompt: String) -> anyh
     Ok(run_id)
 }
 
+/// Unix mtime (secs) of the currently-running `rupu` binary, or `None` if it
+/// can't be determined.
+fn current_binary_mtime() -> Option<i64> {
+    let exe = std::env::current_exe().ok()?;
+    let modified = std::fs::metadata(exe).ok()?.modified().ok()?;
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(secs as i64)
+}
+
+/// Whether a running worker is stale — i.e. spawned by an older binary than the
+/// one now on disk, so it would execute outdated code. A worker with no recorded
+/// stamp (spawned before this stamping existed) is treated as stale so it gets
+/// restarted once onto the current binary. If the current binary's mtime can't
+/// be read, we keep the worker (don't churn on uncertainty).
+fn worker_is_stale(binary_mtime: Option<i64>, worker_stamp: Option<i64>) -> bool {
+    match (binary_mtime, worker_stamp) {
+        (Some(now), Some(stamp)) => now > stamp,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 fn ensure_session_worker(
     global: &Path,
     session: &mut SessionRecord,
     scope: SessionScope,
 ) -> anyhow::Result<u32> {
     if let Some(pid) = session.worker_pid.filter(|pid| pid_is_running(*pid)) {
-        return Ok(pid);
+        if !worker_is_stale(current_binary_mtime(), session.worker_binary_mtime) {
+            return Ok(pid);
+        }
+        // The `rupu` binary was updated since this worker spawned — restart it
+        // so the new build's code takes effect (compaction fixes, etc.) without
+        // a manual `session stop`.
+        tracing::info!(
+            pid,
+            session_id = %session.session_id,
+            "session worker is running an older binary; restarting onto the current build"
+        );
+        eprintln!("↻ restarting session worker onto the updated rupu binary");
+        let _ = terminate_pid(pid);
     }
     session.worker_pid = None;
     if session.status != SessionStatus::Running {
@@ -1501,6 +1553,7 @@ fn ensure_session_worker(
 
     let pid = child.id();
     session.worker_pid = Some(pid);
+    session.worker_binary_mtime = current_binary_mtime();
     session.updated_at = Utc::now();
     if session.status == SessionStatus::Running {
         session.active_pid = Some(pid);
@@ -6108,6 +6161,8 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         max_tokens: session
             .max_tokens
             .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
+        context_window_tokens: session.context_window_tokens,
+        compact_at_percent: session.compact_at_percent,
         // Sessions key their coverage ledger off the session_id so multiple
         // sessions against the same workspace stay distinct, and target_id
         // matches the spec's per-session derivation.
@@ -7119,6 +7174,20 @@ mod tests {
     }
 
     #[test]
+    fn worker_is_stale_detects_a_newer_binary() {
+        // binary newer than the worker's stamp -> stale (restart)
+        assert!(worker_is_stale(Some(200), Some(100)));
+        // same age or older -> not stale (keep)
+        assert!(!worker_is_stale(Some(100), Some(100)));
+        assert!(!worker_is_stale(Some(100), Some(200)));
+        // worker has no stamp (spawned before stamping existed) -> stale
+        assert!(worker_is_stale(Some(100), None));
+        // can't read the current binary's mtime -> keep (don't churn)
+        assert!(!worker_is_stale(None, Some(100)));
+        assert!(!worker_is_stale(None, None));
+    }
+
+    #[test]
     fn reactivate_stopped_resumes_to_idle_and_clears_operator_error() {
         let mut session = SessionRecord {
             status: SessionStatus::Stopped,
@@ -7781,6 +7850,7 @@ mod tests {
             )),
             active_pid: Some(1234),
             worker_pid: Some(1234),
+            worker_binary_mtime: None,
             last_run_id: Some("run_prev123".into()),
             last_transcript_path: Some(PathBuf::from(
                 "/tmp/repo/.rupu/transcripts/run_prev123.jsonl",
@@ -7807,6 +7877,8 @@ mod tests {
             }],
             concerns: None,
             max_tokens: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
         }
     }
 
