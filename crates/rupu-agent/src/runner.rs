@@ -75,6 +75,35 @@ fn clamp_tool_result_text(input: &str) -> String {
     )
 }
 
+/// Drop the oldest assistant↔user exchange from the conversation so the
+/// next request fits the model's context window. Preserves Anthropic's
+/// invariants: the message list still starts with the original (user)
+/// message, roles stay alternating, and tool_use/tool_result pairs are
+/// removed together (we remove a single adjacent [Assistant, User] pair,
+/// which keeps strict alternation intact). Never touches the first message
+/// (the anchor user turn) or the last message (the current turn). Returns
+/// the number of messages dropped (0 if there is nothing safe to drop).
+fn trim_oldest_exchange(messages: &mut Vec<Message>) -> usize {
+    // Need at least: anchor user [0], one droppable exchange [1,2], and the
+    // current turn [last]. So len >= 4 and indices 1,2 must not be the last.
+    if messages.len() < 4 {
+        return 0;
+    }
+    if messages[1].role == Role::Assistant && messages[2].role == Role::User {
+        messages.drain(1..=2);
+        return 2;
+    }
+    0
+}
+
+/// Return true when the provider error string signals a context-window overflow.
+fn is_context_overflow(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("prompt is too long")
+        || e.contains("too many tokens")
+        || e.contains("context window")
+}
+
 /// Errors that can occur during an agent run.
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -406,7 +435,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 break RunStatus::Error;
             }
             writer.write(&Event::TurnStart { turn_idx })?;
-            let req = LlmRequest {
+            let mut req = LlmRequest {
                 model: opts.model.clone(),
                 system: Some(opts.agent_system_prompt.clone()),
                 messages: messages.clone(),
@@ -422,70 +451,88 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 anthropic_context_management: opts.anthropic_context_management,
                 anthropic_speed: opts.anthropic_speed,
             };
-            let resp: LlmResponse = if opts.no_stream {
-                match opts.provider.send(&req).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        writer.write(&Event::RunComplete {
-                            run_id: opts.run_id.clone(),
-                            status: RunStatus::Error,
-                            total_tokens: total_in + total_out,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            error: Some(format!("provider: {e}")),
-                        })?;
-                        writer.flush()?;
-                        return Err(RunError::Provider(e.to_string()));
-                    }
-                }
-            } else {
-                let suppress = opts.suppress_stream_stdout;
-                let mut stream_transcript_error: Option<rupu_transcript::WriteError> = None;
-                let mut on_event = |ev: StreamEvent| {
-                    if let Some(cb) = opts.on_stream_event.as_ref() {
-                        cb(ev.clone());
-                    }
-                    match ev {
-                        StreamEvent::TextDelta(chunk) => {
-                            if !chunk.is_empty() && stream_transcript_error.is_none() {
-                                if let Err(err) = writer
-                                    .write(&Event::AssistantDelta {
-                                        content: chunk.clone(),
-                                    })
-                                    .and_then(|_| writer.flush())
-                                {
-                                    stream_transcript_error = Some(err);
+            let mut trim_attempts = 0u32;
+            let resp: LlmResponse = loop {
+                let send_result: Result<LlmResponse, rupu_providers::ProviderError> = if opts
+                    .no_stream
+                {
+                    opts.provider.send(&req).await
+                } else {
+                    let suppress = opts.suppress_stream_stdout;
+                    let mut stream_transcript_error: Option<rupu_transcript::WriteError> = None;
+                    let mut on_event = |ev: StreamEvent| {
+                        if let Some(cb) = opts.on_stream_event.as_ref() {
+                            cb(ev.clone());
+                        }
+                        match ev {
+                            StreamEvent::TextDelta(chunk) => {
+                                if !chunk.is_empty() && stream_transcript_error.is_none() {
+                                    if let Err(err) = writer
+                                        .write(&Event::AssistantDelta {
+                                            content: chunk.clone(),
+                                        })
+                                        .and_then(|_| writer.flush())
+                                    {
+                                        stream_transcript_error = Some(err);
+                                    }
+                                }
+                                if !suppress {
+                                    use std::io::Write;
+                                    print!("{chunk}");
+                                    let _ = std::io::stdout().flush();
                                 }
                             }
-                            if !suppress {
-                                use std::io::Write;
-                                print!("{chunk}");
-                                let _ = std::io::stdout().flush();
-                            }
+                            StreamEvent::UsageSnapshot(_) => {}
+                            StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => {}
                         }
-                        StreamEvent::UsageSnapshot(_) => {}
-                        StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => {}
-                    }
-                };
-                match opts.provider.stream(&req, &mut on_event).await {
-                    Ok(r) => {
+                    };
+                    let result = opts.provider.stream(&req, &mut on_event).await;
+                    if result.is_ok() {
                         if !suppress {
                             println!();
                         }
                         if let Some(err) = stream_transcript_error {
                             return Err(RunError::Transcript(err));
                         }
-                        r
                     }
+                    result
+                };
+                match send_result {
+                    Ok(r) => break r,
                     Err(e) => {
+                        let e_str = e.to_string();
+                        if is_context_overflow(&e_str) && trim_attempts <= 64 {
+                            if trim_oldest_exchange(&mut req.messages) > 0 {
+                                trim_attempts += 1;
+                                writer.write(&Event::AssistantDelta {
+                                    content: "[context trimmed to fit window; retrying]\n".into(),
+                                })?;
+                                writer.flush()?;
+                                tracing::warn!(
+                                    "context overflow – trimmed messages, attempt {trim_attempts}"
+                                );
+                                continue;
+                            }
+                            // Cannot trim further — surface as ContextOverflow.
+                            writer.write(&Event::RunComplete {
+                                run_id: opts.run_id.clone(),
+                                status: RunStatus::Error,
+                                total_tokens: total_in + total_out,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                error: Some(format!("context overflow: {e_str}")),
+                            })?;
+                            writer.flush()?;
+                            return Err(RunError::ContextOverflow { turn: turn_idx });
+                        }
                         writer.write(&Event::RunComplete {
                             run_id: opts.run_id.clone(),
                             status: RunStatus::Error,
                             total_tokens: total_in + total_out,
                             duration_ms: started.elapsed().as_millis() as u64,
-                            error: Some(format!("provider: {e}")),
+                            error: Some(format!("provider: {e_str}")),
                         })?;
                         writer.flush()?;
-                        return Err(RunError::Provider(e.to_string()));
+                        return Err(RunError::Provider(e_str));
                     }
                 }
             };
@@ -1016,6 +1063,107 @@ mod tool_result_clamp_tests {
         let clamped = clamp_tool_result_text(&raw);
         assert!(clamped.len() < raw.len());
         assert!(clamped.contains("[truncated "));
+    }
+}
+
+#[cfg(test)]
+mod context_trim_tests {
+    use super::{is_context_overflow, trim_oldest_exchange};
+    use rupu_providers::types::{ContentBlock, Message, Role};
+
+    fn user_msg(text: &str) -> Message {
+        Message::user(text)
+    }
+
+    fn assistant_msg(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn trim_drops_indices_1_and_2_from_5_message_list() {
+        // [user0, assistant1, user2, assistant3, user4]
+        // After trim: [user0, assistant3, user4]
+        let mut msgs = vec![
+            user_msg("anchor"),
+            assistant_msg("first assistant"),
+            user_msg("first tool result"),
+            assistant_msg("second assistant"),
+            user_msg("second tool result"),
+        ];
+        let dropped = trim_oldest_exchange(&mut msgs);
+        assert_eq!(dropped, 2, "should drop 2 messages");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, Role::User);
+        // msgs[0] is still the anchor
+        assert_eq!(msgs[1].role, Role::Assistant);
+        assert_eq!(msgs[2].role, Role::User);
+        // Verify the right messages remain
+        match &msgs[1].content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "second assistant"),
+            _ => panic!("expected text block"),
+        }
+    }
+
+    #[test]
+    fn trim_returns_0_for_list_shorter_than_4() {
+        // 3-message list: nothing safe to drop
+        let mut msgs = vec![
+            user_msg("anchor"),
+            assistant_msg("assistant"),
+            user_msg("user"),
+        ];
+        assert_eq!(trim_oldest_exchange(&mut msgs), 0);
+        assert_eq!(msgs.len(), 3, "list must be unchanged");
+    }
+
+    #[test]
+    fn trim_returns_0_for_2_message_list() {
+        let mut msgs = vec![user_msg("hi"), assistant_msg("hello")];
+        assert_eq!(trim_oldest_exchange(&mut msgs), 0);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn repeated_trim_shrinks_until_0() {
+        // 7-message list: [u, a, u, a, u, a, u]
+        // trim 1: [u, a, u, a, u] (dropped indices 1,2)
+        // trim 2: [u, a, u]       (dropped indices 1,2)
+        // trim 3: returns 0 (len < 4)
+        let mut msgs = vec![
+            user_msg("u0"),
+            assistant_msg("a1"),
+            user_msg("u2"),
+            assistant_msg("a3"),
+            user_msg("u4"),
+            assistant_msg("a5"),
+            user_msg("u6"),
+        ];
+        assert_eq!(trim_oldest_exchange(&mut msgs), 2);
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(trim_oldest_exchange(&mut msgs), 2);
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(trim_oldest_exchange(&mut msgs), 0);
+        assert_eq!(msgs.len(), 3, "no further shrinkage when len < 4");
+    }
+
+    #[test]
+    fn is_context_overflow_matches_known_phrases() {
+        assert!(is_context_overflow("prompt is too long for the model"));
+        assert!(is_context_overflow("too many tokens in request"));
+        assert!(is_context_overflow("exceeds context window limit"));
+        assert!(is_context_overflow("PROMPT IS TOO LONG")); // case-insensitive
+    }
+
+    #[test]
+    fn is_context_overflow_does_not_match_unrelated_errors() {
+        assert!(!is_context_overflow("network error"));
+        assert!(!is_context_overflow("invalid api key"));
+        assert!(!is_context_overflow("rate limited"));
     }
 }
 

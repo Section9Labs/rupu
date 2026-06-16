@@ -217,8 +217,9 @@ fn model_supports_context_management(model: &str) -> bool {
 ///   * `context-1m-2025-08-07` — only when the model string carries the
 ///     `[1m]` suffix.
 ///   * `interleaved-thinking-2025-05-14` — 4-tier+ models.
-///   * `context-management-2025-06-27` — 4-tier+ models.
-fn build_oauth_beta_csv(model: &str) -> String {
+///   * `context-management-2025-06-27` — 4-tier+ models OR when the
+///     caller explicitly opts in via `wants_context_management`.
+fn build_oauth_beta_csv(model: &str, wants_context_management: bool) -> String {
     let is_haiku = model.to_ascii_lowercase().contains("haiku");
     let mut betas: Vec<&str> = Vec::with_capacity(10);
     if !is_haiku {
@@ -231,7 +232,7 @@ fn build_oauth_beta_csv(model: &str) -> String {
     if model_supports_interleaved_thinking(model) {
         betas.push("interleaved-thinking-2025-05-14");
     }
-    if model_supports_context_management(model) {
+    if model_supports_context_management(model) || wants_context_management {
         betas.push("context-management-2025-06-27");
     }
     betas.push("prompt-caching-scope-2026-01-05");
@@ -719,6 +720,7 @@ impl AnthropicClient {
         builder: reqwest::RequestBuilder,
         model: &str,
         context_window: Option<crate::model_tier::ContextWindow>,
+        wants_context_management: bool,
     ) -> reqwest::RequestBuilder {
         // Headers verbatim from MITM capture of real `claude --print`
         // against api.anthropic.com. Order is preserved to match the
@@ -765,7 +767,7 @@ impl AnthropicClient {
                 // suffix because that's what claude-cli does and what the
                 // server gates on).
                 let _ = context_window;
-                let beta_csv = build_oauth_beta_csv(model);
+                let beta_csv = build_oauth_beta_csv(model, wants_context_management);
                 b.header("Authorization", format!("Bearer {access_token}"))
                     .header("anthropic-beta", beta_csv)
                     .header("x-app", "cli")
@@ -816,7 +818,7 @@ impl AnthropicClient {
         };
         let model_for_betas = "claude-sonnet-4-6";
         let req = self.client.get(&bootstrap_url);
-        let req = self.apply_auth_headers(req, model_for_betas, None);
+        let req = self.apply_auth_headers(req, model_for_betas, None, false);
         // Cap this best-effort warmup at 10s so a slow / hanging
         // bootstrap endpoint can't strand the agent at the spinner
         // before its first message turn. The shared HTTP client
@@ -872,7 +874,12 @@ impl AnthropicClient {
                 .header("Content-Type", "application/json")
                 .json(&body);
             let response = self
-                .apply_auth_headers(builder, &request.model, request.context_window)
+                .apply_auth_headers(
+                    builder,
+                    &request.model,
+                    request.context_window,
+                    request.anthropic_context_management.is_some(),
+                )
                 .send()
                 .await?;
 
@@ -953,7 +960,12 @@ impl AnthropicClient {
                     .header("Content-Type", "application/json")
                     .json(&body);
                 let resp = self
-                    .apply_auth_headers(builder, &request.model, request.context_window)
+                    .apply_auth_headers(
+                        builder,
+                        &request.model,
+                        request.context_window,
+                        request.anthropic_context_management.is_some(),
+                    )
                     .send()
                     .await?;
 
@@ -1650,7 +1662,7 @@ mod tests {
         // Regression: shipping `context-1m-2025-08-07` on a stock 200K
         // model triggers a 429 `"Extra usage is required for long
         // context requests"` on accounts without extra-usage billing.
-        let csv = build_oauth_beta_csv("claude-sonnet-4-6");
+        let csv = build_oauth_beta_csv("claude-sonnet-4-6", false);
         assert!(
             !csv.contains("context-1m-2025-08-07"),
             "context-1m must not be sent without [1m] suffix; got: {csv}"
@@ -1661,7 +1673,7 @@ mod tests {
 
     #[test]
     fn beta_csv_includes_context_1m_when_suffix_present() {
-        let csv = build_oauth_beta_csv("claude-sonnet-4-6[1m]");
+        let csv = build_oauth_beta_csv("claude-sonnet-4-6[1m]", false);
         assert!(
             csv.contains("context-1m-2025-08-07"),
             "context-1m must be sent when [1m] suffix is present; got: {csv}"
@@ -1670,7 +1682,7 @@ mod tests {
 
     #[test]
     fn beta_csv_drops_claude_code_for_haiku() {
-        let csv = build_oauth_beta_csv("claude-haiku-4-5");
+        let csv = build_oauth_beta_csv("claude-haiku-4-5", false);
         assert!(
             !csv.contains("claude-code-20250219"),
             "claude-code beta is gated to non-Haiku tiers; got: {csv}"
@@ -1679,7 +1691,7 @@ mod tests {
 
     #[test]
     fn beta_csv_omits_4_tier_betas_for_pre_4_models() {
-        let csv = build_oauth_beta_csv("claude-3-5-sonnet-20241022");
+        let csv = build_oauth_beta_csv("claude-3-5-sonnet-20241022", false);
         assert!(
             !csv.contains("interleaved-thinking-2025-05-14"),
             "interleaved-thinking must be 4-tier+; got: {csv}"
@@ -1687,6 +1699,17 @@ mod tests {
         assert!(
             !csv.contains("context-management-2025-06-27"),
             "context-management must be 4-tier+; got: {csv}"
+        );
+    }
+
+    #[test]
+    fn beta_csv_includes_context_management_when_explicitly_opted_in() {
+        // A pre-4 model that wouldn't normally get context-management-2025-06-27
+        // should include it when wants_context_management is true.
+        let csv = build_oauth_beta_csv("claude-3-5-sonnet-20241022", true);
+        assert!(
+            csv.contains("context-management-2025-06-27"),
+            "explicit opt-in must include context-management beta; got: {csv}"
         );
     }
 
