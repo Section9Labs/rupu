@@ -231,84 +231,55 @@ pub(crate) fn rebuild_compacted(
     result
 }
 
-/// Run one compaction cycle on `messages`. Returns `true` if compaction
-/// was performed (messages mutated), `false` if it was skipped (no mutation).
-///
-/// `last_input_tokens` is the provider's real input token count from the
-/// triggering turn. It is used to calibrate a char→token ratio so that the
-/// recent-message budget is expressed in raw chars that correspond to the
-/// correct token count, rather than relying on a fixed chars/4 estimate that
-/// undercounts code/JSON-heavy conversations by ~2x.
-async fn compact_context(
-    messages: &mut Vec<Message>,
-    opts: &mut AgentRunOpts,
-    run_id: &str,
-    seq: u32,
-    writer: &mut JsonlWriter,
-    last_input_tokens: u32,
-) -> bool {
-    let context_window_tokens = match opts.context_window_tokens {
-        Some(w) => w,
-        None => return false,
-    };
+/// Result of compacting a conversation: the new (shorter) message list and how
+/// many middle messages were replaced by the summary.
+pub struct CompactionOutcome {
+    pub messages: Vec<Message>,
+    pub summarized_messages: usize,
+}
 
+/// Compact a conversation by summarising the middle messages. Returns
+/// `Ok(Some(outcome))` when compaction was performed, `Ok(None)` when the
+/// history is too short or there is nothing to summarise.
+///
+/// `last_input_tokens` is the provider's real input token count from the most
+/// recent turn. It is used to calibrate a char→token ratio so the recent-message
+/// budget is expressed in raw chars that correspond to the correct token count,
+/// rather than relying on a fixed chars/4 estimate that undercounts code/JSON-heavy
+/// conversations by ~2x.
+pub async fn compact_messages(
+    messages: &[Message],
+    provider: &mut dyn LlmProvider,
+    model: &str,
+    context_window_tokens: u32,
+    compact_at_percent: Option<u8>,
+    last_input_tokens: u32,
+) -> Result<Option<CompactionOutcome>, rupu_providers::ProviderError> {
     // Calibrate: derive tokens-per-char from what the provider actually charged.
-    // `last_input_tokens` covers system prompt + messages; the system prompt is
-    // typically small relative to the conversation, so we use total message chars
-    // as the denominator and guard with a floor of 0.25 (the minimum a naive
-    // chars/4 assumption would give).
     let total_chars: usize = messages.iter().map(message_chars).sum();
     let tokens_per_char = (last_input_tokens as f64 / total_chars.max(1) as f64).max(0.25_f64);
 
-    // Land the kept-recent portion at ~half the compaction threshold so there
-    // is real headroom before the next compaction triggers. This is the key fix:
-    // with the old chars/4 estimate a 990k-token conversation was sized at ~520k,
-    // which fell within the 500k recent_budget, so nothing was summarized.
-    let threshold =
-        effective_compact_threshold(opts.context_window_tokens, opts.compact_at_percent)
-            .unwrap_or(context_window_tokens as u64 / 2);
+    let threshold = effective_compact_threshold(Some(context_window_tokens), compact_at_percent)
+        .unwrap_or(context_window_tokens as u64 / 2);
     let target_recent_tokens = (threshold / 2) as f64;
     let recent_budget_chars = (target_recent_tokens / tokens_per_char) as usize;
 
     let (middle_start, recent_start) = match partition_for_compaction(messages, recent_budget_chars)
     {
         Some(p) => p,
-        None => return false,
+        None => return Ok(None),
     };
 
-    // Best-effort dump of the full pre-compaction messages as JSON.
-    let backup_display = if let Some(parent) = opts.transcript_path.parent() {
-        let compaction_dir = parent.join("compaction");
-        let backup_filename = format!("{run_id}-{seq}.json");
-        let backup_path = compaction_dir.join(&backup_filename);
-        if let Err(e) = std::fs::create_dir_all(&compaction_dir) {
-            tracing::warn!(error = %e, "failed to create compaction dir");
-        }
-        match serde_json::to_string_pretty(messages) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&backup_path, &json) {
-                    tracing::warn!(error = %e, path = %backup_path.display(), "failed to write compaction backup");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to serialize messages for backup");
-            }
-        }
-        backup_path.display().to_string()
-    } else {
-        "(no backup path)".to_string()
-    };
-
-    // Build summary request: messages[0..recent_start] with a summarisation instruction.
+    // Build summary request.
     let summary_prompt = "Summarize the conversation so far for continuation. \
 Preserve, as concise structured notes: the objective/task; key decisions and \
 conclusions; findings and their locations; files/areas already examined; the \
 current state; and any open threads or planned next steps. Omit chit-chat and \
 redundant tool output. This summary replaces the omitted turns, so it must be \
 self-contained.";
-    let summary_max_tokens = opts.max_tokens.min(8192);
+    let summary_max_tokens = 8192u32;
     let summary_req = LlmRequest {
-        model: opts.model.clone(),
+        model: model.to_string(),
         system: Some(summary_prompt.to_string()),
         messages: messages[..recent_start].to_vec(),
         max_tokens: summary_max_tokens,
@@ -324,13 +295,7 @@ self-contained.";
         anthropic_speed: None,
     };
 
-    let summary_resp = match opts.provider.send(&summary_req).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "compaction summariser call failed — skipping compaction");
-            return false;
-        }
-    };
+    let summary_resp = provider.send(&summary_req).await?;
 
     // Extract summary text from the response.
     let summary: String = summary_resp
@@ -360,28 +325,99 @@ self-contained.";
         .collect::<Vec<_>>()
         .join("\n");
 
-    let middle_len = recent_start - middle_start;
+    let summarized_messages = recent_start - middle_start;
     let recent: Vec<Message> = messages[recent_start..].to_vec();
-    *messages = rebuild_compacted(&task_text, &summary, recent);
+    let rebuilt = rebuild_compacted(&task_text, &summary, recent);
 
-    let note =
-        format!("[context compacted: summarized {middle_len} turns; backup {backup_display}]\n");
-    if let Err(e) = writer
-        .write(&Event::AssistantDelta {
-            content: note.clone(),
-        })
-        .and_then(|_| writer.flush())
+    Ok(Some(CompactionOutcome {
+        messages: rebuilt,
+        summarized_messages,
+    }))
+}
+
+/// Run one compaction cycle on `messages`. Returns `true` if compaction
+/// was performed (messages mutated), `false` if it was skipped (no mutation).
+///
+/// `last_input_tokens` is the provider's real input token count from the
+/// triggering turn. It is used to calibrate a char→token ratio so that the
+/// recent-message budget is expressed in raw chars that correspond to the
+/// correct token count, rather than relying on a fixed chars/4 estimate that
+/// undercounts code/JSON-heavy conversations by ~2x.
+async fn compact_context(
+    messages: &mut Vec<Message>,
+    opts: &mut AgentRunOpts,
+    run_id: &str,
+    seq: u32,
+    writer: &mut JsonlWriter,
+    last_input_tokens: u32,
+) -> bool {
+    let context_window_tokens = match opts.context_window_tokens {
+        Some(w) => w,
+        None => return false,
+    };
+
+    // Best-effort dump of the full pre-compaction messages as JSON before
+    // calling compact_messages (which may mutate state via the provider).
+    let backup_display = if let Some(parent) = opts.transcript_path.parent() {
+        let compaction_dir = parent.join("compaction");
+        let backup_filename = format!("{run_id}-{seq}.json");
+        let backup_path = compaction_dir.join(&backup_filename);
+        if let Err(e) = std::fs::create_dir_all(&compaction_dir) {
+            tracing::warn!(error = %e, "failed to create compaction dir");
+        }
+        match serde_json::to_string_pretty(messages) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&backup_path, &json) {
+                    tracing::warn!(error = %e, path = %backup_path.display(), "failed to write compaction backup");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize messages for backup");
+            }
+        }
+        backup_path.display().to_string()
+    } else {
+        "(no backup path)".to_string()
+    };
+
+    match compact_messages(
+        messages,
+        opts.provider.as_mut(),
+        &opts.model,
+        context_window_tokens,
+        opts.compact_at_percent,
+        last_input_tokens,
+    )
+    .await
     {
-        tracing::warn!(error = %e, "failed to write compaction event to transcript");
+        Ok(Some(outcome)) => {
+            let middle_len = outcome.summarized_messages;
+            *messages = outcome.messages;
+            let note = format!(
+                "[context compacted: summarized {middle_len} turns; backup {backup_display}]\n"
+            );
+            if let Err(e) = writer
+                .write(&Event::AssistantDelta {
+                    content: note.clone(),
+                })
+                .and_then(|_| writer.flush())
+            {
+                tracing::warn!(error = %e, "failed to write compaction event to transcript");
+            }
+            tracing::info!(
+                middle_len,
+                remaining = messages.len(),
+                backup = %backup_display,
+                "context compacted"
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(error = %e, "compaction summariser call failed — skipping compaction");
+            false
+        }
     }
-    tracing::info!(
-        middle_len,
-        remaining = messages.len(),
-        backup = %backup_display,
-        "context compacted"
-    );
-
-    true
 }
 
 /// Errors that can occur during an agent run.
@@ -2002,6 +2038,78 @@ mod compaction_tests {
             messages.len(),
             original_len,
             "messages must be unchanged after error"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_messages_returns_outcome_with_mock_provider() {
+        // Build a dense message list that will exceed compaction threshold.
+        // Use a tiny window (1000 tokens) and many messages so partition finds a middle.
+        let dense_chunk = "x".repeat(1000); // 1000 chars per message
+        let mut msgs = vec![text_msg(Role::User, &format!("task: {dense_chunk}"))];
+        for i in 0..5 {
+            msgs.push(text_msg(
+                Role::Assistant,
+                &format!("assistant {i}: {dense_chunk}"),
+            ));
+            msgs.push(text_msg(Role::User, &format!("user {i}: {dense_chunk}")));
+        }
+        // 11 messages total, each ~1k chars
+
+        let mut provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "Summary of prior work.".to_string(),
+            stop: StopReason::EndTurn,
+            input_tokens: 500,
+            output_tokens: 10,
+        }]);
+
+        // With a 1000-token window and ~11k chars at high token density, compaction
+        // should find a non-empty middle.
+        let result = compact_messages(
+            &msgs,
+            &mut provider,
+            "mock-1",
+            1000,
+            Some(80),
+            900, // simulate near-threshold input tokens
+        )
+        .await;
+
+        let outcome = result.expect("no provider error").expect("should compact");
+        assert_eq!(
+            outcome.messages[0].role,
+            Role::User,
+            "first message must be user"
+        );
+        // The combined task+summary message must contain the summary text.
+        let first_text = match &outcome.messages[0].content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text block"),
+        };
+        assert!(
+            first_text.contains("Summary of prior work"),
+            "summary text must appear in first message"
+        );
+        assert!(
+            outcome.summarized_messages > 0,
+            "summarized_messages must be > 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_messages_returns_none_for_tiny_history() {
+        let msgs = vec![
+            text_msg(Role::User, "task"),
+            text_msg(Role::Assistant, "done"),
+        ];
+
+        let mut provider = MockProvider::new(vec![]);
+
+        let result = compact_messages(&msgs, &mut provider, "mock-1", 1_000_000, None, 100).await;
+
+        assert!(
+            result.expect("no error").is_none(),
+            "2-message history should return None"
         );
     }
 }

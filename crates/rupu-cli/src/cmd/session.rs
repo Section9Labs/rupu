@@ -107,6 +107,11 @@ pub enum Action {
         #[arg(add = ArgValueCompleter::new(active_session_ids))]
         session_id: String,
     },
+    /// Compact a session's stored conversation (summarize older turns now).
+    Compact {
+        #[arg(add = ArgValueCompleter::new(active_session_ids))]
+        session_id: String,
+    },
     #[command(name = "_worker", hide = true)]
     RunWorker(RunWorkerArgs),
     #[command(name = "_run-turn", hide = true)]
@@ -1057,6 +1062,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::Send(args) => send(args).await,
         Action::Attach { session_id, view } => attach(&session_id, view).await,
         Action::Stop { session_id } => stop(&session_id).await,
+        Action::Compact { session_id } => compact(&session_id).await,
         Action::RunWorker(args) => run_worker(args).await,
         Action::RunTurn(args) => run_turn(args).await,
     };
@@ -1078,6 +1084,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Send(_) => ("session send", report::TABLE_ONLY),
         Action::Attach { .. } => ("session attach", report::TABLE_ONLY),
         Action::Stop { .. } => ("session stop", report::TABLE_ONLY),
+        Action::Compact { .. } => ("session compact", report::TABLE_ONLY),
         Action::RunWorker(_) => ("session _worker", report::TABLE_ONLY),
         Action::RunTurn(_) => ("session _run-turn", report::TABLE_ONLY),
     };
@@ -5783,6 +5790,113 @@ pub(crate) fn prune_archived_sessions(
 async fn stop(session_id: &str) -> anyhow::Result<()> {
     stop_session_in_place(&paths::global_dir()?, session_id)?;
     println!("stopped session {session_id}");
+    Ok(())
+}
+
+async fn compact(session_id: &str) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let (mut session, scope) = read_session(&global, session_id)?;
+    ensure_active_scope(scope, "session compact")?;
+
+    if session.status == SessionStatus::Running {
+        anyhow::bail!(
+            "cannot compact session {} while it is running; stop it first",
+            session_id
+        );
+    }
+
+    let context_window_tokens = session.context_window_tokens.ok_or_else(|| {
+        anyhow::anyhow!(
+            "session {} has no context_window_tokens set; compaction requires a window size",
+            session_id
+        )
+    })?;
+
+    if session.message_history.len() < 4 {
+        println!(
+            "nothing to compact: session {} has fewer than 4 messages in history",
+            session_id
+        );
+        return Ok(());
+    }
+
+    // Derive last_input_tokens from the most recent run, or fall back to a
+    // chars/4 estimate so the calibration in compact_messages still works.
+    let total_chars: usize = session
+        .message_history
+        .iter()
+        .map(|m| {
+            m.content
+                .iter()
+                .map(|b| match b {
+                    rupu_providers::types::ContentBlock::Text { text } => text.len(),
+                    rupu_providers::types::ContentBlock::ToolUse { name, input, .. } => {
+                        name.len() + input.to_string().len()
+                    }
+                    rupu_providers::types::ContentBlock::ToolResult { content, .. } => {
+                        content.len()
+                    }
+                })
+                .sum::<usize>()
+        })
+        .sum();
+
+    let last_input_tokens: u32 = session
+        .runs
+        .last()
+        .map(|r| r.total_tokens_in as u32)
+        .unwrap_or_else(|| (total_chars / 4).max(1) as u32);
+
+    // Build the provider the same way the worker does.
+    let global_cfg_path = global.join("config.toml");
+    let project_cfg_path = session
+        .project_root
+        .as_ref()
+        .map(|p| p.join(".rupu/config.toml"));
+    let _cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let resolver = rupu_auth::KeychainResolver::new();
+
+    let provider_config = provider_factory::ProviderConfig {
+        anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+    };
+    let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
+        &session.provider_name,
+        &session.model,
+        session.auth_mode,
+        &resolver,
+        &provider_config,
+    )
+    .await?;
+
+    match rupu_agent::compact_messages(
+        &session.message_history,
+        provider.as_mut(),
+        &session.model,
+        context_window_tokens,
+        session.compact_at_percent,
+        last_input_tokens,
+    )
+    .await
+    {
+        Ok(Some(outcome)) => {
+            let summarized = outcome.summarized_messages;
+            let before = session.message_history.len();
+            session.message_history = outcome.messages;
+            let after = session.message_history.len();
+            session.updated_at = Utc::now();
+            write_session(&global, scope, &session)?;
+            println!(
+                "compacted session {session_id}: summarized {summarized} messages, history {before} → {after} messages"
+            );
+        }
+        Ok(None) => {
+            println!("nothing to compact: history is too short or already compact");
+        }
+        Err(e) => {
+            anyhow::bail!("compaction failed: {e}");
+        }
+    }
+
     Ok(())
 }
 
