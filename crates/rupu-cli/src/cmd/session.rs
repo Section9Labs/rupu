@@ -399,6 +399,12 @@ struct SessionRecord {
     /// on each turn.
     #[serde(default)]
     max_tokens: Option<u32>,
+    /// Model context-window size in tokens for compaction. Captured from spec at session start.
+    #[serde(default)]
+    context_window_tokens: Option<u32>,
+    /// Compact-at percentage. Captured from spec at session start.
+    #[serde(default)]
+    compact_at_percent: Option<u8>,
 }
 
 impl SessionRecord {
@@ -1368,6 +1374,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         runs: Vec::new(),
         concerns: spec.concerns.clone(),
         max_tokens: spec.max_tokens,
+        context_window_tokens: spec.context_window_tokens,
+        compact_at_percent: spec.compact_at_percent,
     };
     write_session(&global, SessionScope::Active, &session)?;
     launch_turn(&global, &session_id, user_message, args.detach, args.view).await
@@ -6108,6 +6116,8 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         max_tokens: session
             .max_tokens
             .unwrap_or(rupu_agent::runner::DEFAULT_MAX_TOKENS),
+        context_window_tokens: session.context_window_tokens,
+        compact_at_percent: session.compact_at_percent,
         // Sessions key their coverage ledger off the session_id so multiple
         // sessions against the same workspace stay distinct, and target_id
         // matches the spec's per-session derivation.
@@ -7807,6 +7817,8 @@ mod tests {
             }],
             concerns: None,
             max_tokens: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
         }
     }
 

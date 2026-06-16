@@ -187,6 +187,8 @@ impl StepFactory for ParallelFactory {
                 depth: 0,
                 coverage_writer: None,
                 surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
                 run_id: None,
                 model: None,
                 tool_mappings: None,
@@ -214,6 +216,8 @@ impl StepFactory for ParallelFactory {
             max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
         }
     }
 }

@@ -113,6 +113,8 @@ impl StepFactory for DefaultStepFactory {
                         dispatchable_agents: None,
                         concerns: None,
                         max_tokens: None,
+                        context_window_tokens: None,
+                        compact_at_percent: None,
                         system_prompt: rendered_prompt.clone(),
                     }
                 });
@@ -232,6 +234,8 @@ impl StepFactory for DefaultStepFactory {
             // FileTouchEvents are correctly attributed; the runner defaults
             // to "agent" when this is None.
             surface_tag: Some("workflow".to_string()),
+            context_window_tokens: spec.context_window_tokens,
+            compact_at_percent: spec.compact_at_percent,
         }
     }
 }

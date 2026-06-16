@@ -104,6 +104,232 @@ fn is_context_overflow(err: &str) -> bool {
         || e.contains("context window")
 }
 
+/// Estimate token count for a slice of messages using chars/4 approximation.
+pub(crate) fn estimate_tokens(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.len() / 4,
+            ContentBlock::ToolUse { name, input, .. } => {
+                let input_str = input.to_string();
+                (name.len() + input_str.len()) / 4
+            }
+            ContentBlock::ToolResult { content, .. } => content.len() / 4,
+        })
+        .sum()
+}
+
+/// Compute the token count at which compaction triggers.
+/// Returns `None` if `context_window_tokens` is `None` (compaction disabled).
+pub(crate) fn effective_compact_threshold(
+    context_window_tokens: Option<u32>,
+    compact_at_percent: Option<u8>,
+) -> Option<u64> {
+    let window = context_window_tokens?;
+    let pct = compact_at_percent.unwrap_or(80).clamp(10, 95) as u64;
+    Some(window as u64 * pct / 100)
+}
+
+/// Partition `messages` into `(middle_start, recent_start)` for compaction.
+///
+/// - `messages[0..middle_start]` = task (always index 0, so `middle_start = 1`)
+/// - `messages[middle_start..recent_start]` = middle to summarise
+/// - `messages[recent_start..]` = recent verbatim
+///
+/// Returns `None` if there is nothing in the middle (i.e. `recent_start <= 1`).
+pub(crate) fn partition_for_compaction(
+    messages: &[Message],
+    recent_budget_tokens: usize,
+) -> Option<(usize, usize)> {
+    let middle_start = 1usize;
+    if messages.len() <= 2 {
+        return None;
+    }
+
+    // Walk from the end, accumulating tokens, to find recent_start.
+    let mut accumulated = 0usize;
+    let mut recent_start = messages.len();
+
+    // Always keep at least the last 2 messages (one complete exchange).
+    let min_recent_start = messages.len().saturating_sub(2);
+
+    for i in (middle_start..messages.len()).rev() {
+        let msg_tokens = estimate_tokens(std::slice::from_ref(&messages[i]));
+        if recent_start <= min_recent_start {
+            // We've reached the minimum we must keep — stop.
+            break;
+        }
+        if accumulated + msg_tokens > recent_budget_tokens && recent_start <= messages.len() - 2 {
+            // Adding this message would exceed the budget and we already have ≥2.
+            break;
+        }
+        accumulated += msg_tokens;
+        recent_start = i;
+    }
+
+    // Don't split a tool_use / tool_result pair:
+    // if messages[recent_start] is a User message with ToolResult content
+    // AND messages[recent_start - 1] is an Assistant with ToolUse content,
+    // move recent_start back by 1 to include the assistant turn.
+    if recent_start > middle_start && recent_start < messages.len() {
+        let is_tool_result_user = messages[recent_start].role == Role::User
+            && messages[recent_start]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+        let prev_is_tool_use_assistant = messages[recent_start - 1].role == Role::Assistant
+            && messages[recent_start - 1]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        if is_tool_result_user && prev_is_tool_use_assistant {
+            recent_start -= 1;
+        }
+    }
+
+    if recent_start <= middle_start {
+        return None;
+    }
+
+    Some((middle_start, recent_start))
+}
+
+/// Rebuild the compacted message list from task text, a summary, and the recent messages.
+pub(crate) fn rebuild_compacted(
+    task_text: &str,
+    summary: &str,
+    recent: Vec<Message>,
+) -> Vec<Message> {
+    let combined = format!("{task_text}\n\n## Summary of prior work\n{summary}");
+    let mut result = vec![Message::user(&combined)];
+    result.extend(recent);
+    result
+}
+
+/// Run one compaction cycle on `messages`. Returns `true` if compaction
+/// was performed (messages mutated), `false` if it was skipped (no mutation).
+async fn compact_context(
+    messages: &mut Vec<Message>,
+    opts: &mut AgentRunOpts,
+    run_id: &str,
+    seq: u32,
+    writer: &mut JsonlWriter,
+) -> bool {
+    let context_window_tokens = match opts.context_window_tokens {
+        Some(w) => w,
+        None => return false,
+    };
+    let recent_budget = (context_window_tokens / 2) as usize;
+
+    let (middle_start, recent_start) = match partition_for_compaction(messages, recent_budget) {
+        Some(p) => p,
+        None => return false,
+    };
+
+    // Best-effort dump of the full pre-compaction messages as JSON.
+    let backup_display = if let Some(parent) = opts.transcript_path.parent() {
+        let compaction_dir = parent.join("compaction");
+        let backup_filename = format!("{run_id}-{seq}.json");
+        let backup_path = compaction_dir.join(&backup_filename);
+        if let Err(e) = std::fs::create_dir_all(&compaction_dir) {
+            tracing::warn!(error = %e, "failed to create compaction dir");
+        }
+        match serde_json::to_string_pretty(messages) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&backup_path, &json) {
+                    tracing::warn!(error = %e, path = %backup_path.display(), "failed to write compaction backup");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize messages for backup");
+            }
+        }
+        backup_path.display().to_string()
+    } else {
+        "(no backup path)".to_string()
+    };
+
+    // Build summary request: messages[0..recent_start] with a summarisation instruction.
+    let summary_prompt = "Summarize the conversation so far for continuation. Preserve, as concise         structured notes: the objective/task; key decisions and conclusions;         findings and their locations; files/areas already examined; the current         state; and any open threads or planned next steps. Omit chit-chat and         redundant tool output. This summary replaces the omitted turns, so it must         be self-contained.";
+    let summary_max_tokens = opts.max_tokens.min(8192);
+    let summary_req = LlmRequest {
+        model: opts.model.clone(),
+        system: Some(summary_prompt.to_string()),
+        messages: messages[..recent_start].to_vec(),
+        max_tokens: summary_max_tokens,
+        tools: vec![],
+        cell_id: None,
+        trace_id: None,
+        thinking: None,
+        context_window: None,
+        task_type: None,
+        output_format: None,
+        anthropic_task_budget: None,
+        anthropic_context_management: None,
+        anthropic_speed: None,
+    };
+
+    let summary_resp = match opts.provider.send(&summary_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "compaction summariser call failed — skipping compaction");
+            return false;
+        }
+    };
+
+    // Extract summary text from the response.
+    let summary: String = summary_resp
+        .content
+        .iter()
+        .filter_map(|b| {
+            if let ContentBlock::Text { text } = b {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Extract task text from messages[0].
+    let task_text: String = messages[0]
+        .content
+        .iter()
+        .filter_map(|b| {
+            if let ContentBlock::Text { text } = b {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let middle_len = recent_start - middle_start;
+    let recent: Vec<Message> = messages[recent_start..].to_vec();
+    *messages = rebuild_compacted(&task_text, &summary, recent);
+
+    let note =
+        format!("[context compacted: summarized {middle_len} turns; backup {backup_display}]\n");
+    if let Err(e) = writer
+        .write(&Event::AssistantDelta {
+            content: note.clone(),
+        })
+        .and_then(|_| writer.flush())
+    {
+        tracing::warn!(error = %e, "failed to write compaction event to transcript");
+    }
+    tracing::info!(
+        middle_len,
+        remaining = messages.len(),
+        backup = %backup_display,
+        "context compacted"
+    );
+
+    true
+}
+
 /// Errors that can occur during an agent run.
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -246,6 +472,10 @@ pub struct AgentRunOpts {
     pub concerns: Option<rupu_coverage::ConcernsBlock>,
     /// Per-request output-token budget (`max_tokens`). See `DEFAULT_MAX_TOKENS`.
     pub max_tokens: u32,
+    /// Model context-window size in tokens for compaction. `None` = compaction disabled.
+    pub context_window_tokens: Option<u32>,
+    /// Threshold percentage for compaction. Defaults to 80, clamped to [10, 95].
+    pub compact_at_percent: Option<u8>,
     /// Override the `scope_name` used when deriving the coverage `target_id`.
     /// When `None` (default, standalone agent runs), falls back to `agent_name`.
     /// Workflow runs set this to the workflow name so all steps accumulate
@@ -430,6 +660,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // flushed before we return.
     // -----------------------------------------------------------------------
     let inner_result: Result<RunResult, RunError> = async {
+        let mut compaction_seq = 0u32;
         let result_status = loop {
             if turn_idx >= opts.max_turns {
                 break RunStatus::Error;
@@ -549,6 +780,26 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 output_tokens: resp.usage.output_tokens,
                 cached_tokens: resp.usage.cached_tokens,
             })?;
+
+            // Proactive context compaction: if the previous turn's input exceeded
+            // the configured threshold, summarise older turns before building the
+            // next request. Must run after usage accounting.
+            if let Some(threshold) =
+                effective_compact_threshold(opts.context_window_tokens, opts.compact_at_percent)
+            {
+                if resp.usage.input_tokens as u64 > threshold {
+                    compaction_seq += 1;
+                    let run_id_clone = opts.run_id.clone();
+                    let _ = compact_context(
+                        &mut messages,
+                        &mut opts,
+                        &run_id_clone,
+                        compaction_seq,
+                        &mut writer,
+                    )
+                    .await;
+                }
+            }
 
             // Emit any text content as assistant_message events; collect
             // tool_use blocks for dispatch.
@@ -919,6 +1170,8 @@ mod on_tool_call_tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
         };
 
         run_agent(opts).await.expect("agent run succeeds");
@@ -998,6 +1251,8 @@ mod on_tool_call_tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
         };
 
         let result = run_agent(opts)
@@ -1341,5 +1596,265 @@ impl LlmProvider for CapturingMockProvider {
 
     fn provider_id(&self) -> rupu_providers::ProviderId {
         self.inner.provider_id()
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use rupu_providers::types::{ContentBlock, Message, Role};
+
+    fn text_msg(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn tool_use_msg() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "/foo"}),
+            }],
+        }
+    }
+
+    fn tool_result_msg() -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "file content here".to_string(),
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn estimate_tokens_monotonic_and_approx_chars_over_4() {
+        let msgs_short = vec![text_msg(Role::User, "hello")];
+        let msgs_long = vec![text_msg(
+            Role::User,
+            "hello world this is a longer message that has many chars",
+        )];
+        let short = estimate_tokens(&msgs_short);
+        let long = estimate_tokens(&msgs_long);
+        assert!(long > short, "longer message should estimate more tokens");
+        // "hello" → 5/4 = 1
+        assert_eq!(short, 1);
+        // 56 chars / 4 = 14
+        assert_eq!(long, 14);
+    }
+
+    #[test]
+    fn effective_compact_threshold_none_when_window_none() {
+        assert_eq!(effective_compact_threshold(None, None), None);
+        assert_eq!(effective_compact_threshold(None, Some(75)), None);
+    }
+
+    #[test]
+    fn effective_compact_threshold_1m_at_75_pct() {
+        assert_eq!(
+            effective_compact_threshold(Some(1_000_000), Some(75)),
+            Some(750_000)
+        );
+    }
+
+    #[test]
+    fn effective_compact_threshold_default_80_when_percent_none() {
+        assert_eq!(
+            effective_compact_threshold(Some(1_000_000), None),
+            Some(800_000)
+        );
+    }
+
+    #[test]
+    fn effective_compact_threshold_clamps_high_to_95() {
+        assert_eq!(
+            effective_compact_threshold(Some(1_000_000), Some(99)),
+            Some(950_000)
+        );
+    }
+
+    #[test]
+    fn effective_compact_threshold_clamps_low_to_10() {
+        assert_eq!(
+            effective_compact_threshold(Some(1_000_000), Some(5)),
+            Some(100_000)
+        );
+    }
+
+    #[test]
+    fn partition_keeps_last_2_and_returns_middle() {
+        // 10-message alternating convo
+        let mut msgs = vec![text_msg(Role::User, "task")];
+        for i in 0..4 {
+            msgs.push(text_msg(Role::Assistant, &format!("assistant {i}")));
+            msgs.push(text_msg(Role::User, &format!("user {i}")));
+        }
+        // msgs has 9 messages: [task, a0, u0, a1, u1, a2, u2, a3, u3]
+        // With very small budget (1 token), we still keep at least 2
+        let result = partition_for_compaction(&msgs, 1);
+        assert!(result.is_some(), "should partition a 9-message convo");
+        let (middle_start, recent_start) = result.unwrap();
+        assert_eq!(middle_start, 1);
+        assert!(
+            recent_start >= msgs.len() - 2,
+            "recent should include at least last 2"
+        );
+        assert!(recent_start > middle_start, "middle must be non-empty");
+    }
+
+    #[test]
+    fn partition_tiny_convo_returns_none() {
+        // 2-message convo: [task, assistant] — nothing to summarise
+        let msgs = vec![
+            text_msg(Role::User, "task"),
+            text_msg(Role::Assistant, "done"),
+        ];
+        assert_eq!(partition_for_compaction(&msgs, 1000), None);
+    }
+
+    #[test]
+    fn partition_does_not_split_tool_use_tool_result_pair() {
+        // [task, assistant_text, assistant_tool_use, user_tool_result, assistant_final]
+        let msgs = vec![
+            text_msg(Role::User, "task"),
+            text_msg(Role::Assistant, "step 1"),
+            tool_use_msg(),
+            tool_result_msg(),
+            text_msg(Role::Assistant, "step 2"),
+        ];
+        // With a very small budget, recent_start might initially land on the tool_result msg.
+        // The pair-protection should move it back to include the tool_use assistant msg.
+        let result = partition_for_compaction(&msgs, 1);
+        if let Some((_, recent_start)) = result {
+            // If recent_start points into the tool_use/tool_result pair,
+            // it must start at the assistant tool_use, not the user tool_result.
+            if recent_start < msgs.len() {
+                assert!(
+                    !(msgs[recent_start].role == Role::User
+                        && msgs[recent_start]
+                            .content
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                        && recent_start > 0
+                        && msgs[recent_start - 1].role == Role::Assistant
+                        && msgs[recent_start - 1]
+                            .content
+                            .iter()
+                            .any(|b| matches!(b, ContentBlock::ToolUse { .. }))),
+                    "recent_start must not split a tool_use/tool_result pair"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rebuild_compacted_starts_with_user_and_contains_summary() {
+        let recent = vec![
+            text_msg(Role::Assistant, "recent assistant turn"),
+            text_msg(Role::User, "recent user turn"),
+        ];
+        let result = rebuild_compacted("do the task", "summary here", recent.clone());
+        assert!(!result.is_empty());
+        assert_eq!(result[0].role, Role::User, "first message must be user");
+        let first_text = match &result[0].content[0] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("expected text block"),
+        };
+        assert!(
+            first_text.contains("do the task"),
+            "task text must be in first message"
+        );
+        assert!(
+            first_text.contains("summary here"),
+            "summary must be in first message"
+        );
+        // Recent messages are preserved after the task/summary message.
+        assert_eq!(result.len(), 1 + recent.len());
+        assert_eq!(result[1].role, Role::Assistant);
+    }
+
+    #[tokio::test]
+    async fn compact_context_returns_false_on_provider_error_and_leaves_messages_unchanged() {
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_compaction_test.jsonl");
+
+        // Provider that errors on every call.
+        let provider = MockProvider::new(vec![ScriptedTurn::ProviderError(
+            "summary call failed".to_string(),
+        )]);
+
+        let mut opts = AgentRunOpts {
+            agent_name: "test".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_compact_test".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path: transcript_path.clone(),
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "task".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: None,
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: Some(1_000_000),
+            compact_at_percent: Some(75),
+        };
+
+        let mut messages = vec![
+            Message::user("task"),
+            Message::assistant("step 1"),
+            Message::user("result 1"),
+            Message::assistant("step 2"),
+        ];
+        let original_len = messages.len();
+
+        let mut writer = JsonlWriter::create(&transcript_path).expect("writer");
+        let result =
+            compact_context(&mut messages, &mut opts, "run_compact_test", 1, &mut writer).await;
+
+        assert!(
+            !result,
+            "compact_context must return false on provider error"
+        );
+        assert_eq!(
+            messages.len(),
+            original_len,
+            "messages must be unchanged after error"
+        );
     }
 }

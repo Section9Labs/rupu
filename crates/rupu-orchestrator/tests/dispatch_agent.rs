@@ -172,6 +172,8 @@ impl StepFactory for DispatchFactory {
                 depth: 0,
                 coverage_writer: None,
                 surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
                 run_id: None,
                 model: None,
                 tool_mappings: None,
@@ -199,6 +201,8 @@ impl StepFactory for DispatchFactory {
             max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
             scope_name: None,
             surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
         }
     }
 }
@@ -333,6 +337,8 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                     depth: 0,
                     coverage_writer: None,
                     surface_tag: None,
+                    context_window_tokens: None,
+                    compact_at_percent: None,
                     run_id: None,
                     model: None,
                     tool_mappings: None,
@@ -360,6 +366,8 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
                 scope_name: None,
                 surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
             }
         }
     }

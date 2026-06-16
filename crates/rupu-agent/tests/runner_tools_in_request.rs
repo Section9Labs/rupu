@@ -52,6 +52,8 @@ async fn run_passes_all_default_tools_to_provider() {
         max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         scope_name: None,
         surface_tag: None,
+        context_window_tokens: None,
+        compact_at_percent: None,
     };
 
     run_agent(opts).await.unwrap();
@@ -143,6 +145,8 @@ async fn run_with_agent_tools_filter_passes_only_listed_tools() {
         max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
         scope_name: None,
         surface_tag: None,
+        context_window_tokens: None,
+        compact_at_percent: None,
     };
 
     run_agent(opts).await.unwrap();
