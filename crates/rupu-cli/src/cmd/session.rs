@@ -48,7 +48,9 @@ use rupu_providers::AuthMode;
 use rupu_runtime::provider_factory;
 use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, ToolContext};
-use rupu_transcript::{Event as TranscriptEvent, FileEditKind, JsonlReader, RunMode, RunStatus};
+use rupu_transcript::{
+    Event as TranscriptEvent, FileEditKind, JsonlReader, JsonlWriter, RunMode, RunStatus,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -251,6 +253,7 @@ enum AttachCommand {
     Detach,
     Quit,
     Cancel,
+    Compact,
     Stop,
     History,
     Transcript,
@@ -318,6 +321,11 @@ struct SessionTurnRequest {
     prompt: String,
     transcript_path: PathBuf,
     enqueued_at: DateTime<Utc>,
+    /// When `true` the worker runs on-demand compaction instead of a normal
+    /// agent turn. The `prompt` field is set to `"[compact]"` and ignored by
+    /// the runner; only the transcript and run bookkeeping are used.
+    #[serde(default)]
+    compact: bool,
 }
 
 impl SessionTurnRequest {
@@ -1495,6 +1503,69 @@ fn enqueue_turn_request(global: &Path, session_id: &str, prompt: String) -> anyh
             prompt,
             transcript_path,
             enqueued_at,
+            compact: false,
+        },
+    )?;
+    Ok(run_id)
+}
+
+/// Enqueue a compaction-only pseudo-turn. The worker will call
+/// `rupu_agent::compact_messages` in-place instead of running a full agent
+/// turn. Like `enqueue_turn_request` but sets `compact: true` and uses a
+/// synthetic `"[compact]"` prompt.
+fn enqueue_compact_request(global: &Path, session_id: &str) -> anyhow::Result<String> {
+    let (mut session, scope) = read_session(global, session_id)?;
+    ensure_active_scope(scope, "session compact")?;
+    if reconcile_stale_session(&mut session) {
+        write_session(global, scope, &session)?;
+    }
+    if session.status == SessionStatus::Stopped {
+        anyhow::bail!("session {} is stopped", session.session_id);
+    }
+
+    let worker_pid = ensure_session_worker(global, &mut session, scope)?;
+
+    let run_id = format!("run_{}", Ulid::new());
+    let transcript_path = session.transcripts_dir.join(format!("{run_id}.jsonl"));
+    let request_id = Ulid::new().to_string();
+    let enqueued_at = Utc::now();
+    if session.status != SessionStatus::Running {
+        session.status = SessionStatus::Running;
+        session.active_run_id = Some(run_id.clone());
+        session.active_transcript_path = Some(transcript_path.clone());
+        session.active_pid = Some(worker_pid);
+        clear_session_live_usage(global, scope, &session.session_id)?;
+    }
+    session.updated_at = enqueued_at;
+    session.last_error = None;
+    session.runs.push(SessionRunRecord {
+        run_id: run_id.clone(),
+        prompt: "[compact]".to_string(),
+        transcript_path: transcript_path.clone(),
+        started_at: enqueued_at,
+        completed_at: None,
+        status: None,
+        total_tokens_in: 0,
+        total_tokens_out: 0,
+        total_tokens_cached: 0,
+        duration_ms: 0,
+        pid: None,
+        error: None,
+    });
+    write_session(global, scope, &session)?;
+
+    enqueue_session_turn_request(
+        global,
+        scope,
+        &session.session_id,
+        SessionTurnRequest {
+            version: SessionTurnRequest::VERSION,
+            request_id,
+            run_id: run_id.clone(),
+            prompt: "[compact]".to_string(),
+            transcript_path,
+            enqueued_at,
+            compact: true,
         },
     )?;
     Ok(run_id)
@@ -2005,6 +2076,11 @@ struct SessionInteractiveState {
     coverage_summary: Option<(usize, usize)>,
     /// Last time `maybe_refresh_coverage` ran the audit, for throttling.
     coverage_checked_at: Option<std::time::SystemTime>,
+    /// Input-token count from the most recent completed turn (a single-turn
+    /// prompt size, not a cumulative total). Used to render the context gauge
+    /// against `session.context_window_tokens`. Updated each time a
+    /// `TranscriptEvent::Usage` event is received; reset to 0 on `RunStart`.
+    last_turn_input_tokens: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2041,6 +2117,7 @@ impl SessionInteractiveState {
             completion: None,
             coverage_summary: None,
             coverage_checked_at: None,
+            last_turn_input_tokens: 0,
         }
     }
 
@@ -2069,6 +2146,7 @@ impl SessionInteractiveState {
             completion: None,
             coverage_summary: None,
             coverage_checked_at: None,
+            last_turn_input_tokens: 0,
         };
         state.follow_transcript(
             transcript_path,
@@ -2299,6 +2377,8 @@ impl SessionInteractiveState {
                 self.live_usage.input_tokens += *input_tokens as u64;
                 self.live_usage.output_tokens += *output_tokens as u64;
                 self.live_usage.cached_tokens += *cached_tokens as u64;
+                // Track the most recent single-turn input size for the context gauge.
+                self.last_turn_input_tokens = *input_tokens as u64;
                 // Authoritative per-turn usage just landed. The on-disk
                 // streaming estimate for THIS turn is now redundant —
                 // zero the overlay so we don't keep displaying it on top
@@ -3031,6 +3111,27 @@ fn execute_session_live_command(
                 format!("cancel requested  ·  {detail}"),
             );
         }
+        AttachCommand::Compact => {
+            if session.status == SessionStatus::Running {
+                state.push_line(
+                    crate::output::palette::Status::Failed,
+                    "compact unavailable  ·  cancel the active run first (/cancel)",
+                );
+            } else if session.context_window_tokens.is_none() {
+                state.push_line(
+                    crate::output::palette::Status::Failed,
+                    "compact unavailable  ·  session has no contextWindowTokens; \
+                     set it on the agent for new sessions, or use \
+                     `rupu session compact <id> --window <n>`",
+                );
+            } else {
+                let run_id = enqueue_compact_request(global, &session.session_id)?;
+                state.push_line(
+                    crate::output::palette::Status::Working,
+                    format!("compacting context  ·  {}", compact_session_run_id(&run_id)),
+                );
+            }
+        }
         AttachCommand::Stop => {
             stop_session_in_place(global, &session.session_id)?;
             state.push_line(crate::output::palette::Status::Failed, "session stopped");
@@ -3146,6 +3247,19 @@ fn render_session_header_line(
     }
     let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
     let _ = palette::write_colored(&mut buf, &parts.join("  ·  "), DIM);
+
+    // Context gauge: `  ·  ctx 52K/200K 26%` — only when window is known and
+    // we have at least one completed turn's input-token count.
+    if let Some(gauge) = session_context_gauge(session, state) {
+        let window = session.context_window_tokens.unwrap_or(1) as u64;
+        let last_input = state.last_turn_input_tokens;
+        let pct = (last_input * 100).saturating_div(window.max(1));
+        let compact_at = session.compact_at_percent.unwrap_or(80);
+        let color = context_gauge_color(pct, compact_at);
+        let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
+        let _ = palette::write_colored(&mut buf, &gauge, color);
+    }
+
     truncate_ansi_line(&buf, width)
 }
 
@@ -4982,6 +5096,11 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         routed: false,
     },
     SlashCommand {
+        name: "compact",
+        description: "summarize older context now (frees the window)",
+        routed: false,
+    },
+    SlashCommand {
         name: "coverage",
         description: "show coverage audit for this session's target",
         routed: false,
@@ -5162,6 +5281,7 @@ fn parse_attach_command(input: &str) -> Option<AttachCommand> {
         "detach" => Some(AttachCommand::Detach),
         "quit" | "exit" => Some(AttachCommand::Quit),
         "cancel" => Some(AttachCommand::Cancel),
+        "compact" => Some(AttachCommand::Compact),
         "stop" => Some(AttachCommand::Stop),
         "history" => Some(AttachCommand::History),
         "transcript" => Some(AttachCommand::Transcript),
@@ -5257,6 +5377,28 @@ fn execute_attach_command(
         AttachCommand::Transcript => render_session_transcript(printer, session),
         AttachCommand::Runs => render_session_runs(printer, session),
         AttachCommand::Cancel => cancel_active_turn(global, &session.session_id, printer)?,
+        AttachCommand::Compact => {
+            if session.context_window_tokens.is_none() {
+                printer.sideband_event(
+                    crate::output::palette::Status::Failed,
+                    "compact unavailable",
+                    Some("session has no contextWindowTokens; use `rupu session compact <id> --window <n>`"),
+                );
+            } else {
+                match enqueue_compact_request(global, &session.session_id) {
+                    Ok(run_id) => printer.sideband_event(
+                        crate::output::palette::Status::Working,
+                        "compacting context",
+                        Some(&run_id),
+                    ),
+                    Err(e) => printer.sideband_event(
+                        crate::output::palette::Status::Failed,
+                        "compact failed",
+                        Some(&e.to_string()),
+                    ),
+                }
+            }
+        }
         AttachCommand::Stop => {
             stop_session_in_place(global, &session.session_id)?;
             printer.sideband_event(
@@ -5606,6 +5748,60 @@ fn format_token_count(n: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+/// Compact human-readable token count: `1,234` → `1.2K`, `999,999` → `1000K`,
+/// `1,000,000` → `1.0M`, etc. Used for the context gauge where space is tight.
+fn format_token_compact(n: u64) -> String {
+    if n >= 1_000_000 {
+        let m = n as f64 / 1_000_000.0;
+        if m < 10.0 {
+            format!("{m:.1}M")
+        } else {
+            format!("{:.0}M", m)
+        }
+    } else if n >= 1_000 {
+        let k = n as f64 / 1_000.0;
+        if k < 10.0 {
+            format!("{k:.1}K")
+        } else {
+            format!("{:.0}K", k)
+        }
+    } else {
+        n.to_string()
+    }
+}
+
+/// Build the context gauge segment for the status header, e.g. `ctx 52K/200K 26%`.
+/// Returns `None` when `context_window_tokens` is absent or `last_input` is 0.
+fn session_context_gauge(
+    session: &SessionRecord,
+    state: &SessionInteractiveState,
+) -> Option<String> {
+    let window = session.context_window_tokens? as u64;
+    let last_input = state.last_turn_input_tokens;
+    if last_input == 0 || window == 0 {
+        return None;
+    }
+    let pct = (last_input * 100).saturating_div(window);
+    Some(format!(
+        "ctx {}/{} {}%",
+        format_token_compact(last_input),
+        format_token_compact(window),
+        pct
+    ))
+}
+
+/// Palette color for the context gauge percentage.
+fn context_gauge_color(pct: u64, compact_at: u8) -> owo_colors::Rgb {
+    let warn_threshold = (compact_at as u64).saturating_sub(15);
+    if pct >= compact_at as u64 {
+        palette::FAILED
+    } else if pct >= warn_threshold {
+        palette::AWAITING
+    } else {
+        palette::COMPLETE
+    }
 }
 
 fn session_recent_prompt(session: &SessionRecord) -> Option<String> {
@@ -6104,12 +6300,16 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
             write_session(&global, scope, &session)?;
             clear_session_live_usage(&global, scope, &args.session_id)?;
 
-            let result = run_turn(RunTurnArgs {
-                session_id: args.session_id.clone(),
-                run_id: request.run_id.clone(),
-                prompt: request.prompt.clone(),
-            })
-            .await;
+            let result = if request.compact {
+                run_compact_request(&global, scope, &args.session_id, &request).await
+            } else {
+                run_turn(RunTurnArgs {
+                    session_id: args.session_id.clone(),
+                    run_id: request.run_id.clone(),
+                    prompt: request.prompt.clone(),
+                })
+                .await
+            };
             let _ = fs::remove_file(&claimed_path);
 
             if let Err(err) = result {
@@ -6155,6 +6355,269 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
         }
         let _ = clear_session_live_usage(&global, scope, &args.session_id);
     }
+    Ok(())
+}
+
+/// Execute an on-demand compaction pseudo-turn in the worker.
+///
+/// Builds the provider, calls `rupu_agent::compact_messages`, writes a
+/// minimal transcript (RunStart → AssistantDelta → RunComplete), updates
+/// `session.message_history`, and returns the session to `Idle`. The TUI
+/// renders the transcript exactly like a regular turn.
+async fn run_compact_request(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+    request: &SessionTurnRequest,
+) -> anyhow::Result<()> {
+    let (mut session, _scope) = read_session(global, session_id)?;
+
+    let resolver = rupu_auth::KeychainResolver::new();
+    let provider_config = provider_factory::ProviderConfig {
+        anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+    };
+    let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
+        &session.provider_name,
+        &session.model,
+        session.auth_mode,
+        &resolver,
+        &provider_config,
+    )
+    .await?;
+
+    paths::ensure_dir(&session.transcripts_dir)?;
+
+    // Determine the mode string for the transcript RunStart event.
+    let run_mode = match session.permission_mode.as_str() {
+        "ask" => RunMode::Ask,
+        "readonly" => RunMode::Readonly,
+        _ => RunMode::Bypass,
+    };
+
+    let mut writer = JsonlWriter::create(&request.transcript_path)?;
+    let started_at = Utc::now();
+    writer.write(&TranscriptEvent::RunStart {
+        run_id: request.run_id.clone(),
+        workspace_id: session.workspace_id.clone(),
+        agent: session.agent_name.clone(),
+        provider: session.provider_name.clone(),
+        model: session.model.clone(),
+        started_at,
+        mode: run_mode,
+    })?;
+    writer.flush()?;
+
+    // Guard: too few messages or no window configured — nothing to compact.
+    let context_window_tokens = match session.context_window_tokens {
+        Some(w) => w,
+        None => {
+            let msg = "[compact skipped: session has no contextWindowTokens]".to_string();
+            writer.write(&TranscriptEvent::AssistantDelta {
+                content: msg.clone(),
+            })?;
+            writer.write(&TranscriptEvent::RunComplete {
+                run_id: request.run_id.clone(),
+                status: RunStatus::Ok,
+                total_tokens: 0,
+                duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                error: None,
+            })?;
+            writer.flush()?;
+            finalize_compact_run(
+                global,
+                scope,
+                session_id,
+                &mut session,
+                request,
+                &started_at,
+                RunStatus::Ok,
+                None,
+            )?;
+            return Ok(());
+        }
+    };
+
+    if session.message_history.len() < 4 {
+        let msg = "[compact skipped: fewer than 4 messages in history]".to_string();
+        writer.write(&TranscriptEvent::AssistantDelta { content: msg })?;
+        writer.write(&TranscriptEvent::RunComplete {
+            run_id: request.run_id.clone(),
+            status: RunStatus::Ok,
+            total_tokens: 0,
+            duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+            error: None,
+        })?;
+        writer.flush()?;
+        finalize_compact_run(
+            global,
+            scope,
+            session_id,
+            &mut session,
+            request,
+            &started_at,
+            RunStatus::Ok,
+            None,
+        )?;
+        return Ok(());
+    }
+
+    // Derive last_input_tokens the same way the CLI `compact` command does.
+    let total_chars: usize = session
+        .message_history
+        .iter()
+        .map(|m| {
+            m.content
+                .iter()
+                .map(|b| match b {
+                    rupu_providers::types::ContentBlock::Text { text } => text.len(),
+                    rupu_providers::types::ContentBlock::ToolUse { name, input, .. } => {
+                        name.len() + input.to_string().len()
+                    }
+                    rupu_providers::types::ContentBlock::ToolResult { content, .. } => {
+                        content.len()
+                    }
+                })
+                .sum::<usize>()
+        })
+        .sum();
+    let last_input_tokens: u32 = session
+        .active_transcript_path
+        .as_ref()
+        .or(session.last_transcript_path.as_ref())
+        .and_then(|p| last_turn_input_tokens(p))
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| (total_chars / 2).max(1) as u32);
+
+    let before = session.message_history.len();
+    match rupu_agent::compact_messages(
+        &session.message_history,
+        provider.as_mut(),
+        &session.model,
+        context_window_tokens,
+        session.compact_at_percent,
+        last_input_tokens,
+    )
+    .await
+    {
+        Ok(Some(outcome)) => {
+            let summarized = outcome.summarized_messages;
+            session.message_history = outcome.messages;
+            let after = session.message_history.len();
+            let content = format!(
+                "[context compacted: summarized {} messages; {} → {} kept]\n",
+                summarized, before, after
+            );
+            writer.write(&TranscriptEvent::AssistantDelta { content })?;
+            writer.write(&TranscriptEvent::RunComplete {
+                run_id: request.run_id.clone(),
+                status: RunStatus::Ok,
+                total_tokens: 0,
+                duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                error: None,
+            })?;
+            writer.flush()?;
+            finalize_compact_run(
+                global,
+                scope,
+                session_id,
+                &mut session,
+                request,
+                &started_at,
+                RunStatus::Ok,
+                None,
+            )?;
+        }
+        Ok(None) => {
+            writer.write(&TranscriptEvent::AssistantDelta {
+                content: "[compact: history is too short or already compact]\n".to_string(),
+            })?;
+            writer.write(&TranscriptEvent::RunComplete {
+                run_id: request.run_id.clone(),
+                status: RunStatus::Ok,
+                total_tokens: 0,
+                duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                error: None,
+            })?;
+            writer.flush()?;
+            finalize_compact_run(
+                global,
+                scope,
+                session_id,
+                &mut session,
+                request,
+                &started_at,
+                RunStatus::Ok,
+                None,
+            )?;
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            writer.write(&TranscriptEvent::RunComplete {
+                run_id: request.run_id.clone(),
+                status: RunStatus::Error,
+                total_tokens: 0,
+                duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                error: Some(err_str.clone()),
+            })?;
+            writer.flush()?;
+            finalize_compact_run(
+                global,
+                scope,
+                session_id,
+                &mut session,
+                request,
+                &started_at,
+                RunStatus::Error,
+                Some(err_str),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Update session bookkeeping after a compact pseudo-turn completes.
+fn finalize_compact_run(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+    session: &mut SessionRecord,
+    request: &SessionTurnRequest,
+    started_at: &DateTime<Utc>,
+    status: RunStatus,
+    error: Option<String>,
+) -> anyhow::Result<()> {
+    // Re-read the session so we pick up any concurrent writes (mirror of the
+    // normal run_turn pattern).
+    let (mut s, _scope) = read_session(global, session_id)?;
+    s.updated_at = Utc::now();
+    s.active_run_id = None;
+    s.active_transcript_path = None;
+    s.active_pid = None;
+    s.last_run_id = Some(request.run_id.clone());
+    s.last_transcript_path = Some(request.transcript_path.clone());
+    // Persist compacted message history.
+    s.message_history = session.message_history.clone();
+    s.status = if status == RunStatus::Ok {
+        SessionStatus::Idle
+    } else {
+        SessionStatus::Failed
+    };
+    s.last_error = error.clone();
+    let duration_ms = Utc::now()
+        .signed_duration_since(*started_at)
+        .num_milliseconds()
+        .max(0) as u64;
+    if let Some(run) = s.runs.iter_mut().find(|r| r.run_id == request.run_id) {
+        run.completed_at = Some(Utc::now());
+        run.status = Some(status);
+        run.duration_ms = duration_ms;
+        run.transcript_path = request.transcript_path.clone();
+        if let Some(e) = &error {
+            run.error = Some(e.clone());
+        }
+    }
+    write_session(global, scope, &s)?;
     Ok(())
 }
 
@@ -6912,6 +7375,10 @@ mod tests {
             Some(AttachCommand::Runs)
         ));
         assert!(matches!(
+            parse_attach_command("/compact"),
+            Some(AttachCommand::Compact)
+        ));
+        assert!(matches!(
             parse_attach_command("/coverage"),
             Some(AttachCommand::Coverage)
         ));
@@ -7267,6 +7734,7 @@ mod tests {
                 prompt: "first".into(),
                 transcript_path: session.transcripts_dir.join("run_oldest.jsonl"),
                 enqueued_at: Utc::now(),
+                compact: false,
             },
         )
         .expect("enqueue oldest");
@@ -7281,6 +7749,7 @@ mod tests {
                 prompt: "second".into(),
                 transcript_path: session.transcripts_dir.join("run_newest.jsonl"),
                 enqueued_at: Utc::now(),
+                compact: false,
             },
         )
         .expect("enqueue newest");
