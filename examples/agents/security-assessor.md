@@ -10,6 +10,13 @@ effort: high
 # + write the full report + emit `write_file` in a single turn.  Extended
 # thinking (`effort: high`) draws from the same pool as text output.
 maxTokens: 32000
+# Context compaction (optional). Set `contextWindowTokens` to your model's
+# context window to enable it: when a turn's input exceeds `compactAtPercent`
+# of that window, the runtime summarizes older turns into one compact message
+# (keeping the original task + recent turns verbatim) so long sessions don't
+# grow until they hit the limit. claude-sonnet-4-6 is a 200k-window model.
+contextWindowTokens: 200000
+compactAtPercent: 80
 # Read-only investigation + PR review. `edit_file`/`write_file` are omitted on
 # top of readonly mode. The coverage tools (coverage_mark, report_finding,
 # coverage_remaining, coverage_status, coverage_concerns_search/detail) are

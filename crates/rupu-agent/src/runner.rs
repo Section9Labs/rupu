@@ -251,7 +251,12 @@ async fn compact_context(
     };
 
     // Build summary request: messages[0..recent_start] with a summarisation instruction.
-    let summary_prompt = "Summarize the conversation so far for continuation. Preserve, as concise         structured notes: the objective/task; key decisions and conclusions;         findings and their locations; files/areas already examined; the current         state; and any open threads or planned next steps. Omit chit-chat and         redundant tool output. This summary replaces the omitted turns, so it must         be self-contained.";
+    let summary_prompt = "Summarize the conversation so far for continuation. \
+Preserve, as concise structured notes: the objective/task; key decisions and \
+conclusions; findings and their locations; files/areas already examined; the \
+current state; and any open threads or planned next steps. Omit chit-chat and \
+redundant tool output. This summary replaces the omitted turns, so it must be \
+self-contained.";
     let summary_max_tokens = opts.max_tokens.min(8192);
     let summary_req = LlmRequest {
         model: opts.model.clone(),
