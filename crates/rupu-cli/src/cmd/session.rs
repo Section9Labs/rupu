@@ -3229,7 +3229,7 @@ fn render_session_header_line(
 
     let mut parts = vec![
         session.status.as_str().to_string(),
-        truncate_single_line(&session.model, 24),
+        truncate_single_line(compact_model_name(&session.model), 24),
     ];
     if let Some(effort) = session_effort_detail(session) {
         parts.push(effort);
@@ -3243,7 +3243,7 @@ fn render_session_header_line(
         parts.push(format!("queued {queued_runs}"));
     }
     if let Some((complete, total)) = state.coverage_summary {
-        parts.push(format!("coverage {complete}/{total} concerns"));
+        parts.push(format!("Cov {complete}/{total}"));
     }
     let _ = palette::write_colored(&mut buf, "  ·  ", DIM);
     let _ = palette::write_colored(&mut buf, &parts.join("  ·  "), DIM);
@@ -3420,17 +3420,17 @@ fn session_live_status_detail_parts(
     let usage = state.display_usage();
     if include_usage {
         let output_count = if usage.output_tokens_estimated {
-            format!("~{}", format_token_count(usage.output_tokens))
+            format!("~{}", format_token_compact(usage.output_tokens))
         } else {
-            format_token_count(usage.output_tokens)
+            format_token_compact(usage.output_tokens)
         };
         detail.push_str("  ·  ");
         let _ = palette::write_colored(&mut detail, session_upload_indicator(), BRAND);
-        detail.push_str(&format!(" {}  ", format_token_count(usage.input_tokens)));
+        detail.push_str(&format!("{} ", format_token_compact(usage.input_tokens)));
         let _ = palette::write_colored(&mut detail, session_download_indicator(), BRAND);
-        detail.push_str(&format!(" {output_count}  "));
+        detail.push_str(&format!("{output_count} "));
         let _ = palette::write_colored(&mut detail, session_cache_indicator(), BRAND);
-        detail.push_str(&format!(" {}", format_token_count(usage.cached_tokens)));
+        detail.push_str(&format_token_compact(usage.cached_tokens));
     }
     detail
 }
@@ -5695,31 +5695,29 @@ fn session_session_totals_detail(session: &SessionRecord) -> String {
     let mut detail = String::new();
     let _ = palette::write_colored(&mut detail, session_upload_indicator(), BRAND);
     detail.push_str(&format!(
-        " {}  ",
-        format_token_count(session.total_tokens_in)
+        "{} ",
+        format_token_compact(session.total_tokens_in)
     ));
     let _ = palette::write_colored(&mut detail, session_download_indicator(), BRAND);
     detail.push_str(&format!(
-        " {}  ",
-        format_token_count(session.total_tokens_out)
+        "{} ",
+        format_token_compact(session.total_tokens_out)
     ));
     let _ = palette::write_colored(&mut detail, session_cache_indicator(), BRAND);
-    detail.push_str(&format!(
-        " {}",
-        format_token_count(session.total_tokens_cached)
-    ));
-    let grand_total = session
-        .total_tokens_in
-        .saturating_add(session.total_tokens_out)
-        .saturating_add(session.total_tokens_cached);
-    detail.push_str(&format!("  ·  total {}", format_token_count(grand_total)));
+    detail.push_str(&format_token_compact(session.total_tokens_cached));
     detail
 }
 
 fn session_effort_detail(session: &SessionRecord) -> Option<String> {
     session
         .effort
-        .map(|effort| format!("effort {}", format!("{effort:?}").to_ascii_lowercase()))
+        .map(|effort| format!("⚡{}", format!("{effort:?}").to_ascii_lowercase()))
+}
+
+/// Drop the `claude-` vendor prefix for a tighter status line. Other vendors
+/// (e.g. OpenAI ids like `gpt-4o`) have no such prefix and are left as-is.
+fn compact_model_name(model: &str) -> &str {
+    model.strip_prefix("claude-").unwrap_or(model)
 }
 
 fn session_total_cost_detail(
@@ -5733,7 +5731,7 @@ fn session_total_cost_detail(
         &session.agent_name,
     )?;
     Some(format!(
-        "~${:.4}",
+        "${:.2}",
         pricing.cost_usd(session.total_tokens_in, session.total_tokens_out, 0)
     ))
 }
@@ -5784,12 +5782,7 @@ fn session_context_gauge(
         return None;
     }
     let pct = (last_input * 100).saturating_div(window);
-    Some(format!(
-        "ctx {}/{} {}%",
-        format_token_compact(last_input),
-        format_token_compact(window),
-        pct
-    ))
+    Some(format!("{pct}%"))
 }
 
 /// Palette color for the context gauge percentage.
