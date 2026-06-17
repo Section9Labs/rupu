@@ -299,6 +299,32 @@ pub struct ResumeState {
     /// every other approval gate in the workflow still fires
     /// normally.
     pub approved_step_id: String,
+    /// Per-step set of unit indices that already SUCCEEDED in a prior
+    /// run. A partially-completed fan-out step is NOT in
+    /// `already_done`, so it re-runs — but these units are replayed
+    /// from disk instead of re-dispatched. Map `step_id` → {unit
+    /// index → its prior `ItemResult`}. Empty for the approval-resume
+    /// path (which has no partially-completed fan-out steps).
+    pub completed_units:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<usize, ItemResult>>,
+}
+
+impl ResumeState {
+    /// Resume context that only carries prior step results + the
+    /// approved step id (the original approval-resume shape). No
+    /// per-unit fan-out checkpoints.
+    pub fn from_approval(
+        run_id: String,
+        prior_step_results: Vec<StepResult>,
+        approved_step_id: String,
+    ) -> Self {
+        Self {
+            run_id,
+            prior_step_results,
+            approved_step_id,
+            completed_units: std::collections::BTreeMap::new(),
+        }
+    }
 }
 
 pub async fn run_workflow(
@@ -688,7 +714,7 @@ async fn run_steps_inner(
         } else if step.parallel.is_some() {
             run_parallel_step(step, &ctx, opts, effective_continue_on_error).await
         } else if step.for_each.is_some() {
-            run_fanout_step(step, &ctx, opts, effective_continue_on_error).await
+            run_fanout_step(run_id, step, &ctx, opts, effective_continue_on_error).await
         } else {
             run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await
         };
@@ -967,6 +993,7 @@ async fn run_linear_step(
 /// `success=false` and the rest still run; otherwise the first
 /// failed item aborts the workflow.
 async fn run_fanout_step(
+    workflow_run_id: &str,
     step: &Step,
     ctx: &StepContext,
     opts: &OrchestratorRunOpts,
@@ -1003,12 +1030,58 @@ async fn run_fanout_step(
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let total = items.len();
 
+    // Resume: units that already SUCCEEDED in a prior run are replayed
+    // from disk rather than re-dispatched. `completed_units[step.id]`
+    // is keyed by the unit's 0-based index in the rendered list. The
+    // list is deterministic on resume, so the index is a stable key —
+    // but if the rendered list length differs from what was
+    // checkpointed (the underlying for_each source changed), we can't
+    // trust the index mapping, so we fall back to re-running every unit.
+    let mut resumed: std::collections::BTreeMap<usize, ItemResult> =
+        std::collections::BTreeMap::new();
+    if let Some(prior) = opts
+        .resume_from
+        .as_ref()
+        .and_then(|r| r.completed_units.get(&step.id))
+    {
+        let checkpointed_len = prior.keys().copied().max().map(|m| m + 1).unwrap_or(0);
+        if checkpointed_len > total {
+            warn!(
+                step = %step.id,
+                checkpointed = checkpointed_len,
+                rendered = total,
+                "resume: checkpointed fan-out length exceeds rendered list; re-running all units"
+            );
+        } else {
+            for (idx, item_result) in prior {
+                if *idx >= total {
+                    continue;
+                }
+                if item_result.success {
+                    resumed.insert(*idx, item_result.clone());
+                }
+            }
+            if !resumed.is_empty() {
+                info!(
+                    step = %step.id,
+                    replayed = resumed.len(),
+                    total,
+                    "resume: replaying succeeded fan-out units from disk"
+                );
+            }
+        }
+    }
+
     // Render each item's prompt up front so a per-item template
     // error is reported before any agent dispatches. Each item gets
     // its own clone of the parent context with `item` + `loop` bound.
+    // Units already replayed from a prior run's checkpoint are skipped.
     let mut prepared: Vec<(usize, serde_json::Value, String, String, PathBuf)> =
         Vec::with_capacity(total);
     for (idx, item) in items.iter().enumerate() {
+        if resumed.contains_key(&idx) {
+            continue;
+        }
         let item_ctx = ctx.clone().with_item(
             item.clone(),
             LoopInfo {
@@ -1112,6 +1185,33 @@ async fn run_fanout_step(
     }
     item_outcomes.sort_by_key(|o| o.idx);
 
+    // Persist every freshly-dispatched unit's checkpoint as soon as
+    // the fan-out's tasks have joined — BEFORE the `continue_on_error`
+    // abort check below, so a crash/early-return mid-fan-out still
+    // leaves the finished units (success AND failure) durable on disk
+    // for `rupu workflow resume`. Replayed (`resumed`) units are
+    // already on disk from the prior run, so we don't re-append them.
+    // `workflow_run_id` is empty in the in-memory (no run-store) mode.
+    if let Some(store) = &opts.run_store {
+        if !workflow_run_id.is_empty() {
+            for o in &item_outcomes {
+                let checkpoint = crate::runs::UnitCheckpoint {
+                    step_id: step.id.clone(),
+                    index: o.idx,
+                    item: o.item.clone(),
+                    run_id: o.run_id.clone(),
+                    transcript_path: o.transcript_path.clone(),
+                    output: o.output.clone(),
+                    success: o.success,
+                    finished_at: chrono::Utc::now(),
+                };
+                if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
+                    warn!(step = %step.id, index = o.idx, error = %e, "failed to append unit checkpoint");
+                }
+            }
+        }
+    }
+
     // Apply `continue_on_error`: if not set, the first failed item
     // aborts the workflow. We surface the original RunError.
     if !continue_on_error {
@@ -1125,7 +1225,11 @@ async fn run_fanout_step(
         }
     }
 
-    let items_vec: Vec<ItemResult> = item_outcomes
+    // Merge freshly-dispatched outcomes with units replayed from a
+    // prior run's checkpoint, then sort so the assembled step result
+    // is identical in shape to a fresh run (all units present, in
+    // declared order).
+    let mut items_vec: Vec<ItemResult> = item_outcomes
         .iter()
         .map(|o| ItemResult {
             index: o.idx,
@@ -1138,6 +1242,8 @@ async fn run_fanout_step(
             success: o.success,
         })
         .collect();
+    items_vec.extend(resumed.into_values());
+    items_vec.sort_by_key(|i| i.index);
     let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
     let aggregate_output = serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".into());
     let success = items_vec.iter().all(|i| i.success);

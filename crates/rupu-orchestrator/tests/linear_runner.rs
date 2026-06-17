@@ -1063,11 +1063,11 @@ async fn resume_from_approval_picks_up_at_awaited_step() {
         workflow_yaml: Some(body.clone()),
         issue: None,
         issue_ref: None,
-        resume_from: Some(rupu_orchestrator::ResumeState {
-            run_id: run_id.clone(),
+        resume_from: Some(rupu_orchestrator::ResumeState::from_approval(
+            run_id.clone(),
             prior_step_results,
-            approved_step_id: "deploy".into(),
-        }),
+            "deploy".into(),
+        )),
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
@@ -1780,4 +1780,312 @@ steps:
         "awaiting_since always set on pause"
     );
     assert!(record.expires_at.is_none(), "no timeout → no expires_at");
+}
+
+// -- Per-unit fan-out checkpoints + resume -----------------------------------
+
+const WF_FANOUT_CHECKPOINT: &str = r#"
+name: fanout-checkpoint
+steps:
+  - id: review_each
+    agent: ag
+    actions: []
+    for_each: |
+      a.rs
+      b.rs
+      c.rs
+    prompt: "review {{ item }}"
+"#;
+
+#[tokio::test]
+async fn unit_checkpoints_persist_each_fanout_item() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let runs_root = tmp.path().join("runs");
+    let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
+    let wf = Workflow::parse(WF_FANOUT_CHECKPOINT).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_cp".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(WF_FANOUT_CHECKPOINT.to_string()),
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let checkpoints = store.read_unit_checkpoints(&res.run_id).unwrap();
+    assert_eq!(checkpoints.len(), 3, "one checkpoint per fan-out unit");
+    assert!(checkpoints.iter().all(|c| c.success));
+    let mut indices: Vec<usize> = checkpoints.iter().map(|c| c.index).collect();
+    indices.sort_unstable();
+    assert_eq!(indices, vec![0, 1, 2]);
+    assert!(checkpoints.iter().all(|c| c.step_id == "review_each"));
+}
+
+// Factory that records every rendered prompt it builds opts for, and
+// fails any item whose prompt contains "FAIL". Lets the resume test
+// prove which units were re-dispatched on the second pass.
+struct RecordingFailingFactory {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingFailingFactory {
+    fn new() -> Self {
+        Self {
+            seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl StepFactory for RecordingFailingFactory {
+    async fn build_opts_for_step(
+        &self,
+        step_id: &str,
+        agent_name: &str,
+        rendered_prompt: String,
+        run_id: String,
+        workspace_id: String,
+        workspace_path: std::path::PathBuf,
+        transcript_path: std::path::PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+    ) -> AgentRunOpts {
+        self.seen.lock().unwrap().push(rendered_prompt.clone());
+        let turn = if rendered_prompt.contains("FAIL") {
+            ScriptedTurn::ProviderError("simulated failure for resume test".into())
+        } else {
+            ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }
+        };
+        let provider = MockProvider::new(vec![turn]);
+        AgentRunOpts {
+            agent_name: format!("ag-{agent_name}"),
+            agent_system_prompt: "echo".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id,
+            workspace_id,
+            workspace_path,
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: ToolContext::default(),
+            user_message: rendered_prompt,
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: false,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: step_id.to_string(),
+            on_tool_call,
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
+        }
+    }
+}
+
+// for_each list comes from inputs so we can render the SAME list on
+// resume but swap the failing item to a passing one (the deterministic
+// index is the stable resume key).
+const WF_FANOUT_RESUME: &str = r#"
+name: fanout-resume
+inputs:
+  units: { type: string, default: "" }
+steps:
+  - id: review_each
+    agent: ag
+    actions: []
+    for_each: "{{ inputs.units }}"
+    prompt: "{{ item }}"
+"#;
+
+#[tokio::test]
+async fn resume_reruns_only_failed_fanout_units() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let runs_root = tmp.path().join("runs");
+    let store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(runs_root));
+    let wf = Workflow::parse(WF_FANOUT_RESUME).unwrap();
+
+    // First pass: item index 1 fails. With no continue_on_error the
+    // run fails — but every unit's checkpoint is persisted before the
+    // abort, so 2/3 units land on disk as success.
+    let first_factory = Arc::new(RecordingFailingFactory::new());
+    let mut inputs = std::collections::BTreeMap::new();
+    inputs.insert("units".to_string(), "ok-0\nFAIL-1\nok-2".to_string());
+    let opts = OrchestratorRunOpts {
+        workflow: wf.clone(),
+        inputs: inputs.clone(),
+        workspace_id: "ws_resume_fanout".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().join("transcripts"),
+        factory: Arc::clone(&first_factory) as Arc<dyn StepFactory>,
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(WF_FANOUT_RESUME.to_string()),
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+    };
+    let err = run_workflow(opts)
+        .await
+        .expect_err("first pass should fail");
+    assert!(
+        err.to_string().contains("simulated failure"),
+        "unexpected error: {err}"
+    );
+
+    // Find the run id from the store (single run).
+    let listed = store.list().unwrap();
+    assert_eq!(listed.len(), 1);
+    let run_id = listed[0].id.clone();
+    assert_eq!(listed[0].status, rupu_orchestrator::RunStatus::Failed);
+
+    // 3 checkpoints total; exactly the two ok-* units succeeded.
+    let checkpoints = store.read_unit_checkpoints(&run_id).unwrap();
+    assert_eq!(checkpoints.len(), 3, "all three units checkpointed");
+    let succeeded: std::collections::BTreeSet<usize> = checkpoints
+        .iter()
+        .filter(|c| c.success)
+        .map(|c| c.index)
+        .collect();
+    assert_eq!(
+        succeeded,
+        std::collections::BTreeSet::from([0, 2]),
+        "only the two ok-* units (indices 0 and 2) should have succeeded"
+    );
+
+    // Build resume state from the persisted checkpoints (only successes).
+    let mut completed_units: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<usize, rupu_orchestrator::ItemResult>,
+    > = std::collections::BTreeMap::new();
+    for cp in checkpoints.iter().filter(|c| c.success) {
+        completed_units
+            .entry(cp.step_id.clone())
+            .or_default()
+            .insert(
+                cp.index,
+                rupu_orchestrator::ItemResult {
+                    index: cp.index,
+                    item: cp.item.clone(),
+                    sub_id: String::new(),
+                    rendered_prompt: String::new(),
+                    run_id: cp.run_id.clone(),
+                    transcript_path: cp.transcript_path.clone(),
+                    output: cp.output.clone(),
+                    success: true,
+                },
+            );
+    }
+
+    // Flip the persisted record back to Running (the CLI's resume_run
+    // does this; tests mutate directly).
+    let mut record = store.load(&run_id).unwrap();
+    record.status = rupu_orchestrator::RunStatus::Running;
+    record.finished_at = None;
+    record.error_message = None;
+    store.update(&record).unwrap();
+
+    // Second pass: same item list, but a now-passing factory. Only the
+    // previously-failed unit (index 1) should be re-dispatched.
+    let resume_factory = Arc::new(RecordingFailingFactory::new());
+    // Swap the failing item so the resumed unit passes this time.
+    let mut resume_inputs = std::collections::BTreeMap::new();
+    resume_inputs.insert("units".to_string(), "ok-0\nnow-1\nok-2".to_string());
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: resume_inputs,
+        workspace_id: record.workspace_id.clone(),
+        workspace_path: record.workspace_path.clone(),
+        transcript_dir: record.transcript_dir.clone(),
+        factory: Arc::clone(&resume_factory) as Arc<dyn StepFactory>,
+        event: None,
+        run_store: Some(std::sync::Arc::clone(&store)),
+        workflow_yaml: Some(WF_FANOUT_RESUME.to_string()),
+        resume_from: Some(rupu_orchestrator::ResumeState {
+            run_id: run_id.clone(),
+            prior_step_results: Vec::new(),
+            approved_step_id: String::new(),
+            completed_units,
+        }),
+        issue: None,
+        issue_ref: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+
+    // Only ONE unit was re-dispatched on the resume pass.
+    let seen = resume_factory.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "resume should re-dispatch only the previously-failed unit, saw: {seen:?}"
+    );
+    assert!(
+        seen[0].contains("now-1"),
+        "the re-dispatched unit should be the previously-failed index 1, got: {seen:?}"
+    );
+
+    // The assembled step result has all 3 units, in declared order, all
+    // successful (2 replayed from disk + 1 freshly re-run).
+    let fan = &res.step_results[0];
+    assert_eq!(fan.items.len(), 3, "all three units present in the result");
+    assert!(fan.success, "step should now succeed");
+    let indices: Vec<usize> = fan.items.iter().map(|i| i.index).collect();
+    assert_eq!(indices, vec![0, 1, 2], "units in declared order");
+    // Replayed units carry their prior output; the re-run unit carries
+    // the fresh echo.
+    assert!(
+        fan.items[0].output.contains("ok-0"),
+        "index 0 replayed output: {}",
+        fan.items[0].output
+    );
+    assert!(
+        fan.items[1].output.contains("now-1"),
+        "index 1 freshly-run output: {}",
+        fan.items[1].output
+    );
+    assert!(
+        fan.items[2].output.contains("ok-2"),
+        "index 2 replayed output: {}",
+        fan.items[2].output
+    );
+
+    // Run completed.
+    let record = store.load(&run_id).unwrap();
+    assert_eq!(record.status, rupu_orchestrator::RunStatus::Completed);
 }

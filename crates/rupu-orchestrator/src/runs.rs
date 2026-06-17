@@ -273,6 +273,31 @@ pub struct ItemResultRecord {
     pub success: bool,
 }
 
+/// One durable per-unit checkpoint for a fan-out (`for_each`) step,
+/// appended to `unit_checkpoints.jsonl` the moment a unit's agent run
+/// finishes (success or failure). On `rupu workflow resume` the
+/// successful checkpoints are replayed from disk instead of being
+/// re-dispatched, so a partially-completed fan-out step only re-runs
+/// the units that didn't already succeed.
+///
+/// `index` is the unit's 0-based position in the rendered `for_each`
+/// list. The list is deterministic on resume (it reads the same file
+/// / inputs), so the index is a stable key across runs. If the
+/// rendered list length differs from what was checkpointed the runner
+/// falls back to re-running every unit (it logs a warning rather than
+/// trusting a stale index).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnitCheckpoint {
+    pub step_id: String,
+    pub index: usize,
+    pub item: serde_json::Value,
+    pub run_id: String,
+    pub transcript_path: PathBuf,
+    pub output: String,
+    pub success: bool,
+    pub finished_at: DateTime<Utc>,
+}
+
 impl From<&StepResult> for StepResultRecord {
     fn from(sr: &StepResult) -> Self {
         Self {
@@ -401,6 +426,10 @@ impl RunStore {
         self.run_dir(run_id).join("step_results.jsonl")
     }
 
+    fn unit_checkpoints_log(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("unit_checkpoints.jsonl")
+    }
+
     /// Sub-run directory: lives under the parent's run dir so cleanup
     /// follows parent lifecycle. See spec § 5.1.
     fn sub_run_dir(&self, parent_run_id: &str, sub_run_id: &str) -> PathBuf {
@@ -443,9 +472,10 @@ impl RunStore {
         }
         std::fs::create_dir_all(&dir)?;
         std::fs::write(self.workflow_snapshot(&record.id), workflow_yaml)?;
-        // Touch the step-results log so subsequent appends don't
-        // need to create+open.
+        // Touch the step-results + unit-checkpoint logs so subsequent
+        // appends don't need to create+open.
         File::create(self.step_results_log(&record.id))?;
+        File::create(self.unit_checkpoints_log(&record.id))?;
         write_atomic(
             &self.run_json(&record.id),
             &serde_json::to_vec_pretty(&record)?,
@@ -556,6 +586,53 @@ impl RunStore {
             // writes. The CLI 'show-run' view would rather render N-1
             // valid rows than fail entirely.
             if let Ok(rec) = serde_json::from_str::<StepResultRecord>(&line) {
+                out.push(rec);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Append one fan-out unit's checkpoint to `unit_checkpoints.jsonl`.
+    /// Append-mode + a single `write_all`, so a crash mid-write leaves
+    /// the line either fully present or absent. Called by the runner as
+    /// each `for_each` unit finishes (success or failure) so resume can
+    /// replay the finished units.
+    pub fn append_unit_checkpoint(
+        &self,
+        run_id: &str,
+        checkpoint: &UnitCheckpoint,
+    ) -> Result<(), RunStoreError> {
+        let mut line = serde_json::to_vec(checkpoint)?;
+        line.push(b'\n');
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.unit_checkpoints_log(run_id))?;
+        f.write_all(&line)?;
+        Ok(())
+    }
+
+    /// Read every unit checkpoint for a run, in append order. A missing
+    /// file yields an empty vec (a run that never reached a fan-out
+    /// step, or a pre-resume-feature run). Malformed lines are skipped,
+    /// mirroring `read_step_results`.
+    pub fn read_unit_checkpoints(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<UnitCheckpoint>, RunStoreError> {
+        let path = self.unit_checkpoints_log(run_id);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let f = File::open(path)?;
+        let reader = BufReader::new(f);
+        let mut out = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(rec) = serde_json::from_str::<UnitCheckpoint>(&line) {
                 out.push(rec);
             }
         }
@@ -1061,6 +1138,54 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].step_id, "a");
         assert_eq!(rows[1].step_id, "b");
+    }
+
+    #[test]
+    fn append_and_read_unit_checkpoints_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_units");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let cp0 = UnitCheckpoint {
+            step_id: "review_each".into(),
+            index: 0,
+            item: serde_json::json!("a.rs"),
+            run_id: "run_unit_a".into(),
+            transcript_path: PathBuf::from("/tmp/a.jsonl"),
+            output: "reviewed a".into(),
+            success: true,
+            finished_at: Utc::now(),
+        };
+        let cp1 = UnitCheckpoint {
+            step_id: "review_each".into(),
+            index: 1,
+            item: serde_json::json!("b.rs"),
+            run_id: "run_unit_b".into(),
+            transcript_path: PathBuf::from("/tmp/b.jsonl"),
+            output: String::new(),
+            success: false,
+            finished_at: Utc::now(),
+        };
+        store.append_unit_checkpoint(&rec.id, &cp0).unwrap();
+        store.append_unit_checkpoint(&rec.id, &cp1).unwrap();
+
+        let rows = store.read_unit_checkpoints(&rec.id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].index, 0);
+        assert!(rows[0].success);
+        assert_eq!(rows[0].item, serde_json::json!("a.rs"));
+        assert_eq!(rows[1].index, 1);
+        assert!(!rows[1].success);
+    }
+
+    #[test]
+    fn read_unit_checkpoints_missing_file_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        // No run created, no file on disk.
+        let rows = store.read_unit_checkpoints("never_ran").unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
