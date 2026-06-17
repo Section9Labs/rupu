@@ -187,8 +187,6 @@ impl StepFactory for ParallelFactory {
                 depth: 0,
                 coverage_writer: None,
                 surface_tag: None,
-                context_window_tokens: None,
-                compact_at_percent: None,
                 run_id: None,
                 model: None,
                 tool_mappings: None,

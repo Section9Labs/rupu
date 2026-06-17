@@ -348,6 +348,53 @@ async fn for_each_accepts_a_json_array_of_objects() {
         .contains("review b.py (python)"));
 }
 
+#[tokio::test]
+async fn for_each_sources_items_from_read_file() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let units = tmp.path().join("units.json");
+    std::fs::write(&units, r#"["x.rs","y.rs"]"#).unwrap();
+    // Absolute path: the test's cwd is the repo, not the workspace. At real
+    // runtime `rupu workflow run` is invoked from the target dir, so a relative
+    // `reports/units.json` resolves against it.
+    let wf_yaml = r#"
+name: from-file
+steps:
+  - id: work
+    agent: ag
+    actions: []
+    for_each: "{{ read_file('UNITS_PATH') }}"
+    prompt: "do {{ item }}"
+"#
+    .replace("UNITS_PATH", &units.display().to_string());
+    let wf = Workflow::parse(&wf_yaml).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_orch_readfile".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: None,
+    };
+    let res = run_workflow(opts).await.unwrap();
+    let fan = &res.step_results[0];
+    assert_eq!(fan.items.len(), 2, "should fan out over the file's 2 items");
+    let paths: Vec<&str> = fan
+        .items
+        .iter()
+        .map(|i| i.item.as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(paths, vec!["x.rs", "y.rs"]);
+}
+
 const WF_FOREACH_FROM_INPUTS: &str = r#"
 name: items-from-inputs
 inputs:

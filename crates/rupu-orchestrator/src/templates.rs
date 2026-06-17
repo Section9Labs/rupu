@@ -307,6 +307,23 @@ pub fn render_step_prompt(
         RenderMode::Permissive => UndefinedBehavior::Chainable,
         RenderMode::Strict => UndefinedBehavior::Strict,
     });
+    // `read_file('path')` — read a workspace file's contents into the template,
+    // resolved relative to the run's working directory. Lets control flow be
+    // driven by a file a prior step wrote (e.g.
+    // `for_each: "{{ read_file('reports/units.json') }}"`) rather than by the
+    // agent's chat output, which is far more deterministic. Errors loudly if the
+    // file is missing so a fan-out never silently runs over nothing.
+    env.add_function(
+        "read_file",
+        |path: String| -> Result<String, minijinja::Error> {
+            std::fs::read_to_string(&path).map_err(|e| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("read_file({path:?}) failed: {e}"),
+                )
+            })
+        },
+    );
     env.add_template("step", template)
         .map_err(|e| RenderError::Template(e.to_string()))?;
     let tmpl = env
@@ -524,5 +541,40 @@ mod strict_tests {
         let ctx = StepContext::new();
         let err = render_step_prompt("{{ issue.title }}", &ctx, RenderMode::Strict).unwrap_err();
         assert!(err.to_string().contains("template:"));
+    }
+}
+
+#[cfg(test)]
+mod read_file_tests {
+    use super::*;
+
+    #[test]
+    fn read_file_returns_contents() {
+        let path = std::env::temp_dir().join(format!("rupu_read_file_{}.json", std::process::id()));
+        std::fs::write(&path, "[\"services/a\",\"services/b\"]").expect("write fixture");
+        let ctx = StepContext::new();
+        let rendered = render_step_prompt(
+            &format!("{{{{ read_file({:?}) }}}}", path.to_string_lossy()),
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("render");
+        assert_eq!(rendered, "[\"services/a\",\"services/b\"]");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_file_errors_loudly_on_missing_file() {
+        let ctx = StepContext::new();
+        let err = render_step_prompt(
+            "{{ read_file('/no/such/rupu/units.json') }}",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("read_file"),
+            "error should name read_file: {err}"
+        );
     }
 }
