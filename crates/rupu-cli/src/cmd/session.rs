@@ -5748,27 +5748,10 @@ fn format_token_count(n: u64) -> String {
     out.chars().rev().collect()
 }
 
-/// Compact human-readable token count: `1,234` → `1.2K`, `999,999` → `1000K`,
-/// `1,000,000` → `1.0M`, etc. Used for the context gauge where space is tight.
-fn format_token_compact(n: u64) -> String {
-    if n >= 1_000_000 {
-        let m = n as f64 / 1_000_000.0;
-        if m < 10.0 {
-            format!("{m:.1}M")
-        } else {
-            format!("{:.0}M", m)
-        }
-    } else if n >= 1_000 {
-        let k = n as f64 / 1_000.0;
-        if k < 10.0 {
-            format!("{k:.1}K")
-        } else {
-            format!("{:.0}K", k)
-        }
-    } else {
-        n.to_string()
-    }
-}
+// Compact token formatting (`1.2K` / `1.0M`) lives in
+// `crate::output::fmt` so the status header and the live workflow run
+// view share one implementation.
+use crate::output::fmt::format_token_compact;
 
 /// Build the context gauge segment for the status header, e.g. `ctx 52K/200K 26%`.
 /// Returns `None` when `context_window_tokens` is absent or `last_input` is 0.

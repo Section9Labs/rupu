@@ -51,6 +51,32 @@ pub enum Event {
         step_id: String,
         reason: String,
     },
+    /// One fan-out (`for_each` / `parallel`) unit began its agent run.
+    /// Emitted immediately before the unit is dispatched so the live
+    /// view can mark that unit working and re-point the focus feed at
+    /// the unit's transcript.
+    UnitStarted {
+        run_id: String,
+        step_id: String,
+        index: usize,
+        /// The `for_each` item rendered to a short string (e.g. the path).
+        unit_key: String,
+        agent: Option<String>,
+        transcript_path: PathBuf,
+    },
+    /// One fan-out unit finished. `tokens_in` / `tokens_out` are
+    /// best-effort: the runner's per-unit dispatch result does not carry
+    /// token counts, so they are emitted as `0` (tokens still flow to the
+    /// live view via the per-unit transcript tail).
+    UnitCompleted {
+        run_id: String,
+        step_id: String,
+        index: usize,
+        unit_key: String,
+        success: bool,
+        tokens_in: u64,
+        tokens_out: u64,
+    },
     RunCompleted {
         run_id: String,
         status: RunStatus,
@@ -73,6 +99,8 @@ impl Event {
             | Event::StepCompleted { run_id, .. }
             | Event::StepFailed { run_id, .. }
             | Event::StepSkipped { run_id, .. }
+            | Event::UnitStarted { run_id, .. }
+            | Event::UnitCompleted { run_id, .. }
             | Event::RunCompleted { run_id, .. }
             | Event::RunFailed { run_id, .. } => run_id,
         }

@@ -1126,6 +1126,15 @@ async fn run_fanout_step(
         let rendered_clone = rendered.clone();
         let run_id_clone = run_id.clone();
         let transcript_clone = transcript_path.clone();
+        // Per-unit live-view events. Cloned into the task so emission
+        // ordering reflects the unit's REAL start/finish under
+        // `max_parallel` concurrency (the started/completed pair brackets
+        // the dispatch inside the spawned future, after the semaphore
+        // permit is held).
+        let event_sink = opts.event_sink.clone();
+        let workflow_run_id = workflow_run_id.to_string();
+        let unit_key = fanout_unit_key(&item_value);
+        let unit_agent = agent_name_root.clone();
 
         handles.push(tokio::spawn(async move {
             // Held for the duration of this item's run; dropping it
@@ -1134,6 +1143,19 @@ async fn run_fanout_step(
                 .acquire_owned()
                 .await
                 .expect("semaphore not closed");
+            if let Some(sink) = event_sink.as_ref() {
+                sink.emit(
+                    &workflow_run_id,
+                    &crate::executor::Event::UnitStarted {
+                        run_id: workflow_run_id.clone(),
+                        step_id: step_id.clone(),
+                        index: idx,
+                        unit_key: unit_key.clone(),
+                        agent: Some(unit_agent.clone()),
+                        transcript_path: transcript_clone.clone(),
+                    },
+                );
+            }
             let outcome = dispatch_one(
                 &factory,
                 &step_id,
@@ -1152,6 +1174,23 @@ async fn run_fanout_step(
             };
             let output =
                 read_final_assistant_text(&transcript_clone, success, &run_id_clone, &step_id);
+            if let Some(sink) = event_sink.as_ref() {
+                // Tokens are not available from the dispatch result
+                // (`dispatch_one` returns `Result<()>`); emit 0 — the live
+                // view still tails the unit transcript for token deltas.
+                sink.emit(
+                    &workflow_run_id,
+                    &crate::executor::Event::UnitCompleted {
+                        run_id: workflow_run_id.clone(),
+                        step_id: step_id.clone(),
+                        index: idx,
+                        unit_key: unit_key.clone(),
+                        success,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                    },
+                );
+            }
             FanoutItemOutcome {
                 idx,
                 item: item_value,
@@ -1553,6 +1592,23 @@ fn parse_fanout_items(rendered: &str) -> Vec<serde_json::Value> {
         .filter(|s| !s.is_empty())
         .map(|s| serde_json::Value::String(s.to_string()))
         .collect()
+}
+
+/// Render a fan-out item value to a short, single-line live-view label.
+fn fanout_unit_key(item: &serde_json::Value) -> String {
+    const MAX: usize = 60;
+    let raw = match item {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX {
+        one_line
+    } else {
+        let mut out: String = one_line.chars().take(MAX - 1).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// Validate user-provided `inputs` against the workflow's declared

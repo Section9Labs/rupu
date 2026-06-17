@@ -5,8 +5,10 @@
 //! any pipe, and any CI runner.
 
 pub mod diag;
+pub mod fmt;
 pub mod formats;
 pub mod jsonl_reader;
+pub mod live_run;
 pub mod palette;
 pub mod printer;
 pub mod report;
