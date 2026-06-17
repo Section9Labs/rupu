@@ -550,6 +550,32 @@ That means fixer agents should preserve the important context in the revised sub
 
 Workflow templates use minijinja. Missing variables render as empty strings.
 
+### Template functions
+
+| Function | Returns | Notes |
+| --- | --- | --- |
+| `read_file('<path>')` | File contents as a string | Path is resolved against the run's working directory. Errors loudly (the run fails) if the file is missing. |
+
+`read_file` lets control flow be driven by a **file a prior step wrote** instead of by an agent's chat output, which is far more deterministic. The canonical use is sourcing a `for_each:` list from a file:
+
+```yaml
+steps:
+  - id: plan
+    agent: planner
+    actions: []
+    prompt: |
+      Decide the work items and write them as a JSON array to reports/items.json.
+  - id: work
+    agent: worker
+    actions: []
+    # Reads the file the planner wrote — the agent's final message is irrelevant.
+    for_each: "{{ read_file('reports/items.json') }}"
+    prompt: |
+      Process item {{ item }} ({{ loop.index }} / {{ loop.length }}).
+```
+
+Because `for_each:` JSON-parses a value that starts with `[`, have the upstream step write a clean JSON array file; the downstream `for_each` then never depends on the agent being terse in chat. The same function works in `prompt:` and `when:` templates.
+
 ### Always available
 
 | Variable | Meaning |
