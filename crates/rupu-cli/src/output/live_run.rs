@@ -143,6 +143,11 @@ pub struct ActiveFocus {
     pub step_id: Option<String>,
     pub unit_key: Option<String>,
     pub agent: Option<String>,
+    /// Transcript of the active fan-out UNIT (set by `UnitStarted`). The
+    /// live loop tails this in preference to `run.json`'s active-step
+    /// transcript, which is null during a fan-out. `None` for linear
+    /// steps (the loop falls back to the active-step transcript).
+    pub active_unit_transcript: Option<std::path::PathBuf>,
     pub feed: Vec<ActivityLine>,
     pub last_event_at: Option<DateTime<Utc>>,
 }
@@ -288,6 +293,65 @@ impl LiveRunState {
                     step.status = NodeStatus::Skipped;
                 }
             }
+            WfEvent::UnitStarted {
+                step_id,
+                index,
+                unit_key,
+                agent,
+                transcript_path,
+                ..
+            } => {
+                // Re-focus on this unit: its transcript drives the feed.
+                self.active.step_id = Some(step_id.clone());
+                self.active.unit_key = Some(unit_key.clone());
+                if agent.is_some() {
+                    self.active.agent = agent.clone();
+                }
+                self.active.active_unit_transcript = Some(transcript_path.clone());
+                self.active.feed.clear();
+                self.active.last_event_at = None;
+                if let Some(step) = self.step_mut(step_id) {
+                    if !matches!(step.status, NodeStatus::Complete | NodeStatus::Failed) {
+                        step.status = NodeStatus::Working;
+                    }
+                    ensure_unit_slot(&mut step.units, *index);
+                    let unit = &mut step.units[*index];
+                    unit.key = unit_key.clone();
+                    unit.status = NodeStatus::Working;
+                }
+            }
+            WfEvent::UnitCompleted {
+                step_id,
+                index,
+                unit_key,
+                success,
+                tokens_in,
+                tokens_out,
+                ..
+            } => {
+                if let Some(step) = self.step_mut(step_id) {
+                    ensure_unit_slot(&mut step.units, *index);
+                    let unit = &mut step.units[*index];
+                    if unit.key.is_empty() {
+                        unit.key = unit_key.clone();
+                    }
+                    unit.status = if *success {
+                        NodeStatus::Complete
+                    } else {
+                        NodeStatus::Failed
+                    };
+                    unit.tokens += tokens_in + tokens_out;
+                    step.tokens_in += tokens_in;
+                    step.tokens_out += tokens_out;
+                    // Keep the collapsed `done/total` summary coherent: at
+                    // minimum the step has as many units as the highest
+                    // index seen so far.
+                    let seen = step.units.len();
+                    step.fanout_total = Some(step.fanout_total.unwrap_or(0).max(seen));
+                }
+                self.tokens_in += tokens_in;
+                self.tokens_out += tokens_out;
+            }
             WfEvent::RunCompleted {
                 status,
                 finished_at,
@@ -350,6 +414,21 @@ impl LiveRunState {
             RunStatus::Rejected => ("rejected", FAILED),
             RunStatus::Pending => ("pending", DIM),
         }
+    }
+}
+
+/// Grow `units` so that `index` is addressable, filling any gap with
+/// `Waiting` placeholder units. Fan-out events arrive per-unit (in real
+/// start/finish order under concurrency), so the vector may be sparse
+/// until every unit has started.
+fn ensure_unit_slot(units: &mut Vec<UnitState>, index: usize) {
+    if units.len() <= index {
+        units.resize_with(index + 1, || UnitState {
+            key: String::new(),
+            status: NodeStatus::Waiting,
+            tokens: 0,
+            elapsed_secs: 0,
+        });
     }
 }
 
@@ -859,29 +938,44 @@ pub async fn run_live_view(
         interval.tick().await;
         tick += 1;
 
-        // Drain workflow events.
+        // Drain workflow events. `UnitStarted` may re-point the focus to
+        // a fan-out unit's transcript (see below).
         for ev in events_tailer.drain_events() {
             state.apply(&ev);
         }
 
-        // Refresh the active transcript path from run.json + drain it.
+        // Decide which transcript drives the focus feed. During a
+        // fan-out the active UNIT's transcript (from the most recent
+        // `UnitStarted`) wins; `run.json`'s active_step_transcript_path
+        // is null then. For a linear step, fall back to that path.
         if let Ok(record) = store.load(&run_id) {
             if let Some(step_id) = record.active_step_id.clone() {
-                state.active.step_id = Some(step_id.clone());
-                if record.active_step_agent.is_some() {
-                    state.active.agent = record.active_step_agent.clone();
-                }
-                if let Some(path) = record.active_step_transcript_path.clone() {
-                    let need_new = transcript_tailer
-                        .as_ref()
-                        .map(|(p, _)| p != &path)
-                        .unwrap_or(true);
-                    if need_new {
-                        transcript_tailer =
-                            Some((path.clone(), crate::output::TranscriptTailer::new(path)));
-                        state.active.feed.clear();
+                // Don't clobber a fan-out unit focus set by UnitStarted.
+                if state.active.active_unit_transcript.is_none() {
+                    state.active.step_id = Some(step_id.clone());
+                    if record.active_step_agent.is_some() {
+                        state.active.agent = record.active_step_agent.clone();
                     }
                 }
+            }
+        }
+        let desired_transcript = state.active.active_unit_transcript.clone().or_else(|| {
+            store
+                .load(&run_id)
+                .ok()
+                .and_then(|r| r.active_step_transcript_path)
+        });
+        if let Some(path) = desired_transcript {
+            let need_new = transcript_tailer
+                .as_ref()
+                .map(|(p, _)| p != &path)
+                .unwrap_or(true);
+            if need_new {
+                transcript_tailer =
+                    Some((path.clone(), crate::output::TranscriptTailer::new(path)));
+                // `apply(UnitStarted)` already cleared the feed; clearing
+                // again here is harmless and covers the linear re-point.
+                state.active.feed.clear();
             }
         }
         if let Some((_, tailer)) = transcript_tailer.as_mut() {
@@ -1131,6 +1225,7 @@ mod tests {
                 step_id: Some("assess".into()),
                 unit_key: Some("app-gw".into()),
                 agent: Some("oracle-assessor".into()),
+                active_unit_transcript: None,
                 feed: Vec::new(),
                 last_event_at: Some(ts(31)),
             },
@@ -1349,6 +1444,98 @@ mod tests {
         assert_eq!(kind, ActivityKind::Finding);
         assert!(text.starts_with("HIGH"), "{text:?}");
         assert!(text.contains("path traversal"), "{text:?}");
+    }
+
+    #[test]
+    fn apply_unit_started_marks_unit_working_and_sets_active_transcript() {
+        let mut state = fanout_state(true);
+        // Pre-seed stale feed to prove the unit switch resets it.
+        state.push_activity(ts(1), ActivityKind::Text, "stale");
+        let path = std::path::PathBuf::from("/runs/run_unit2.jsonl");
+        state.apply(&WfEvent::UnitStarted {
+            run_id: "run_01ABC".into(),
+            step_id: "assess".into(),
+            index: 2,
+            unit_key: "app-gw".into(),
+            agent: Some("oracle-assessor".into()),
+            transcript_path: path.clone(),
+        });
+        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
+        assert_eq!(step.units[2].status, NodeStatus::Working);
+        assert_eq!(step.units[2].key, "app-gw");
+        assert_eq!(state.active.step_id.as_deref(), Some("assess"));
+        assert_eq!(state.active.unit_key.as_deref(), Some("app-gw"));
+        assert_eq!(state.active.active_unit_transcript.as_ref(), Some(&path));
+        assert!(state.active.feed.is_empty(), "feed reset on unit switch");
+    }
+
+    #[test]
+    fn apply_unit_completed_marks_done_and_adds_tokens() {
+        let mut state = fanout_state(true);
+        let step_tokens_before = state
+            .steps
+            .iter()
+            .find(|s| s.id == "assess")
+            .unwrap()
+            .tokens_in;
+        let run_in_before = state.tokens_in;
+        let run_out_before = state.tokens_out;
+        // Unit 3 starts Waiting in the fixture; complete it.
+        state.apply(&WfEvent::UnitCompleted {
+            run_id: "run_01ABC".into(),
+            step_id: "assess".into(),
+            index: 3,
+            unit_key: "rtc".into(),
+            success: true,
+            tokens_in: 1000,
+            tokens_out: 250,
+        });
+        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
+        assert_eq!(step.units[3].status, NodeStatus::Complete);
+        assert_eq!(step.units[3].tokens, 1250);
+        assert_eq!(step.tokens_in, step_tokens_before + 1000);
+        assert_eq!(step.tokens_out, 250);
+        assert_eq!(state.tokens_in, run_in_before + 1000);
+        assert_eq!(state.tokens_out, run_out_before + 250);
+        // done_units now counts conf-manager + tlb-agent + rtc = 3.
+        assert_eq!(step.done_units(), 3);
+    }
+
+    #[test]
+    fn apply_unit_completed_failure_marks_failed() {
+        let mut state = fanout_state(true);
+        state.apply(&WfEvent::UnitCompleted {
+            run_id: "run_01ABC".into(),
+            step_id: "assess".into(),
+            index: 2,
+            unit_key: "app-gw".into(),
+            success: false,
+            tokens_in: 0,
+            tokens_out: 0,
+        });
+        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
+        assert_eq!(step.units[2].status, NodeStatus::Failed);
+    }
+
+    #[test]
+    fn apply_unit_started_grows_units_for_fresh_fanout() {
+        // A fresh fan-out step (no pre-seeded units) should grow its
+        // unit vector to address the started index, filling gaps with
+        // Waiting placeholders.
+        let mut state = fanout_state(true);
+        state.steps[1].units.clear();
+        state.apply(&WfEvent::UnitStarted {
+            run_id: "run_01ABC".into(),
+            step_id: "assess".into(),
+            index: 3,
+            unit_key: "rtc".into(),
+            agent: Some("oracle-assessor".into()),
+            transcript_path: std::path::PathBuf::from("/runs/u3.jsonl"),
+        });
+        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
+        assert_eq!(step.units.len(), 4);
+        assert_eq!(step.units[3].status, NodeStatus::Working);
+        assert_eq!(step.units[0].status, NodeStatus::Waiting);
     }
 
     #[test]

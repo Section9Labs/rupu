@@ -50,8 +50,50 @@ fn to_anyhow_with_input_snippet(
         anyhow::anyhow!("{formatted}")
     }
 }
+use rupu_orchestrator::runner::{OrchestratorRunResult, RunWorkflowError as RunWfErr};
 use rupu_orchestrator::Workflow;
 use serde::Serialize;
+
+/// Is the opt-in live three-zone view (dashboard + git-graph spine +
+/// focus feed) enabled? Gated behind `RUPU_LIVE_VIEW=1` (or `true`) and
+/// a stdout tty so the default line-printer path is unchanged.
+fn live_view_enabled(stdout_is_tty: bool) -> bool {
+    stdout_is_tty
+        && std::env::var("RUPU_LIVE_VIEW")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+/// Drive `run_workflow(opts)` while painting the live three-zone view in
+/// a sibling task, returning the workflow result. The view tails
+/// `events.jsonl` + the active (unit or step) transcript and stops when
+/// the run reaches a terminal state. Shared by `run` and `resume_run`.
+async fn run_workflow_with_live_view(
+    opts: OrchestratorRunOpts,
+    view_workflow: Workflow,
+    runs_dir: PathBuf,
+    run_id: String,
+) -> Result<OrchestratorRunResult, RunWfErr> {
+    let runner_task = tokio::spawn(run_workflow(opts));
+    let view_task = tokio::spawn(async move {
+        let _ = crate::output::live_run::run_live_view(view_workflow, runs_dir, run_id).await;
+    });
+    let result = match runner_task.await {
+        Ok(r) => r,
+        Err(e) => {
+            // A panicked runner task is a hard failure; surface it as an
+            // io error (the closest typed variant) so the caller's
+            // existing error mapping applies.
+            view_task.abort();
+            return Err(RunWfErr::Io(std::io::Error::other(format!(
+                "workflow task panicked: {e}"
+            ))));
+        }
+    };
+    // Give the view a brief moment to paint the final frame, then stop it.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(300), view_task).await;
+    result
+}
 use std::collections::BTreeMap;
 use std::io;
 use std::io::IsTerminal;
@@ -2169,6 +2211,9 @@ async fn resume_run(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         }
     };
 
+    // Clone the workflow for the live view before `opts` consumes it.
+    let view_workflow = workflow.clone();
+
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -2203,7 +2248,18 @@ async fn resume_run(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         );
     }
 
-    let result = run_workflow(opts).await?;
+    // Open the same live three-zone view on resume (same gate as `run`).
+    // The view seeds step status live from `events.jsonl` going forward:
+    // resumed steps emit `StepSkipped`, re-run units emit `UnitStarted` /
+    // `UnitCompleted`, so the spine fills in as the run progresses. We do
+    // NOT pre-seed prior ✓ from the run-store into LiveRunState here
+    // (the events stream re-establishes status as it replays).
+    let result = if live_view_enabled(io::stdout().is_terminal()) {
+        run_workflow_with_live_view(opts, view_workflow, global.join("runs"), run_id.to_string())
+            .await?
+    } else {
+        run_workflow(opts).await?
+    };
     for sr in &result.step_results {
         if sr.run_id.is_empty() {
             continue;
@@ -3278,31 +3334,19 @@ async fn execute_workflow_invocation(
     // view does not handle approval gates; runs that pause render the
     // awaiting glyph and the loop exits when the run reaches a terminal
     // state.
-    let live_view_enabled = ctx.attach_ui
-        && std::env::var("RUPU_LIVE_VIEW")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-        && io::stdout().is_terminal()
-        && ctx.shared_printer.is_none();
+    let use_live_view = ctx.attach_ui
+        && ctx.shared_printer.is_none()
+        && live_view_enabled(io::stdout().is_terminal());
 
-    let workflow_result = if live_view_enabled {
-        let runner_task = tokio::spawn(run_workflow(opts));
-        let view_workflow = workflow_for_resume.clone();
-        let view_runs_dir = runs_dir.clone();
-        let view_run_id = run_id.clone();
-        let view_task = tokio::spawn(async move {
-            let _ =
-                crate::output::live_run::run_live_view(view_workflow, view_runs_dir, view_run_id)
-                    .await;
-        });
-        let result = runner_task
-            .await
-            .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
-            .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?;
-        // Give the view a brief moment to paint the final frame, then
-        // stop it.
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), view_task).await;
-        result
+    let workflow_result = if use_live_view {
+        run_workflow_with_live_view(
+            opts,
+            workflow_for_resume.clone(),
+            runs_dir.clone(),
+            run_id.clone(),
+        )
+        .await
+        .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
     } else if ctx.attach_ui {
         let runner_task = tokio::spawn(run_workflow(opts));
         let rid = run_id.clone();
