@@ -710,7 +710,7 @@ async fn run_steps_inner(
         let step_timer = std::time::Instant::now();
 
         let dispatch_result = if step.panel.is_some() {
-            run_panel_step(step, &ctx, opts, effective_continue_on_error).await
+            run_panel_step(run_id, step, &ctx, opts, effective_continue_on_error).await
         } else if step.parallel.is_some() {
             run_parallel_step(step, &ctx, opts, effective_continue_on_error).await
         } else if step.for_each.is_some() {
@@ -1713,6 +1713,7 @@ pub fn resolve_inputs(
 /// Panelists that emit no parseable findings contribute zero findings
 /// and a warning is logged.
 async fn run_panel_step(
+    workflow_run_id: &str,
     step: &Step,
     ctx: &StepContext,
     opts: &OrchestratorRunOpts,
@@ -1722,6 +1723,11 @@ async fn run_panel_step(
         .panel
         .as_ref()
         .expect("run_panel_step called for a non-panel step");
+
+    // Monotonic unit index across every panelist + fixer dispatch in
+    // this panel run, so the live view's `UnitState` slots grow in a
+    // stable order (iter1 panelists, then iter1 fixer, then iter2…).
+    let mut unit_index: usize = 0;
 
     // Render the initial subject once against the parent context.
     // When a `gate:` loop is configured, subsequent iterations
@@ -1736,9 +1742,19 @@ async fn run_panel_step(
 
     // No gate → run a single panel pass and return.
     let Some(gate) = &panel.gate else {
-        return run_panel_iteration(step, panel, ctx, opts, continue_on_error, &initial_subject)
-            .await
-            .map(|p| p.into_step_result(step, &initial_subject, 1, true));
+        return run_panel_iteration(
+            workflow_run_id,
+            1,
+            &mut unit_index,
+            step,
+            panel,
+            ctx,
+            opts,
+            continue_on_error,
+            &initial_subject,
+        )
+        .await
+        .map(|p| p.into_step_result(step, &initial_subject, 1, true));
     };
 
     // Gate loop. Each iteration:
@@ -1752,7 +1768,18 @@ async fn run_panel_step(
     let mut iterations = 0u32;
     let (final_pass, resolved) = loop {
         iterations += 1;
-        let pass = run_panel_iteration(step, panel, ctx, opts, continue_on_error, &subject).await?;
+        let pass = run_panel_iteration(
+            workflow_run_id,
+            iterations,
+            &mut unit_index,
+            step,
+            panel,
+            ctx,
+            opts,
+            continue_on_error,
+            &subject,
+        )
+        .await?;
         let max_sev = pass.max_severity();
         let cleared = match max_sev {
             None => true,
@@ -1774,7 +1801,18 @@ async fn run_panel_step(
         // Dispatch the fixer with the findings as input. Its output
         // becomes the next iteration's subject.
         let fixer_subject = render_fixer_input(&subject, &pass.findings);
-        let fixer_outcome = dispatch_fixer(step, &gate.fix_with, &fixer_subject, opts).await?;
+        let fixer_index = unit_index;
+        unit_index += 1;
+        let fixer_outcome = dispatch_fixer(
+            workflow_run_id,
+            iterations,
+            fixer_index,
+            step,
+            &gate.fix_with,
+            &fixer_subject,
+            opts,
+        )
+        .await?;
         match fixer_outcome {
             FixerOutcome::Ok { output } => {
                 subject = output;
@@ -1882,7 +1920,11 @@ fn render_fixer_input(subject: &str, findings: &[Finding]) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_fixer(
+    workflow_run_id: &str,
+    iteration: u32,
+    unit_index: usize,
     step: &Step,
     fixer_agent: &str,
     rendered_prompt: &str,
@@ -1890,6 +1932,20 @@ async fn dispatch_fixer(
 ) -> Result<FixerOutcome, RunWorkflowError> {
     let run_id = format!("run_{}", Ulid::new());
     let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
+    let unit_key = format!("iter{iteration}:fix:{fixer_agent}");
+    if let Some(sink) = opts.event_sink.as_ref() {
+        sink.emit(
+            workflow_run_id,
+            &crate::executor::Event::UnitStarted {
+                run_id: workflow_run_id.to_string(),
+                step_id: step.id.clone(),
+                index: unit_index,
+                unit_key: unit_key.clone(),
+                agent: Some(fixer_agent.to_string()),
+                transcript_path: transcript_path.clone(),
+            },
+        );
+    }
     let outcome = dispatch_one(
         &opts.factory,
         &step.id,
@@ -1902,6 +1958,21 @@ async fn dispatch_fixer(
         None,
     )
     .await;
+    let success = outcome.is_ok();
+    if let Some(sink) = opts.event_sink.as_ref() {
+        sink.emit(
+            workflow_run_id,
+            &crate::executor::Event::UnitCompleted {
+                run_id: workflow_run_id.to_string(),
+                step_id: step.id.clone(),
+                index: unit_index,
+                unit_key: unit_key.clone(),
+                success,
+                tokens_in: 0,
+                tokens_out: 0,
+            },
+        );
+    }
     match outcome {
         Ok(()) => {
             let output = read_final_assistant_text(&transcript_path, true, &run_id, &step.id);
@@ -1914,7 +1985,11 @@ async fn dispatch_fixer(
 /// Run one panel iteration: dispatch all panelists in parallel
 /// against `current_subject` and aggregate findings. Used by both
 /// the single-pass and gate-loop paths.
+#[allow(clippy::too_many_arguments)]
 async fn run_panel_iteration(
+    workflow_run_id: &str,
+    iteration: u32,
+    unit_index: &mut usize,
     step: &Step,
     panel: &crate::workflow::Panel,
     ctx: &StepContext,
@@ -1927,9 +2002,14 @@ async fn run_panel_iteration(
 
     // Each panelist's prompt is either the per-step `prompt:`
     // template (rendered against the parent context plus a `subject`
-    // binding) or — when omitted — the current subject verbatim.
-    let mut prepared: Vec<(usize, String, String, String, PathBuf)> = Vec::with_capacity(total);
-    for (idx, panelist) in panel.panelists.iter().enumerate() {
+    // binding) or — when omitted — the current subject verbatim. A
+    // monotonic `unit_index` (shared across the whole panel run) is
+    // assigned here so the live view slots grow in a stable order;
+    // `unit_key` is `iter{N}:{panelist}` so re-runs across iterations
+    // render as distinct rows.
+    let mut prepared: Vec<(usize, usize, String, String, String, String, PathBuf)> =
+        Vec::with_capacity(total);
+    for (sub_idx, panelist) in panel.panelists.iter().enumerate() {
         let mut item_ctx = ctx.clone();
         item_ctx
             .inputs
@@ -1946,13 +2026,24 @@ async fn run_panel_iteration(
         };
         let run_id = format!("run_{}", Ulid::new());
         let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
-        prepared.push((idx, panelist.clone(), rendered, run_id, transcript_path));
+        let view_index = *unit_index;
+        *unit_index += 1;
+        let unit_key = format!("iter{iteration}:{panelist}");
+        prepared.push((
+            sub_idx,
+            view_index,
+            unit_key,
+            panelist.clone(),
+            rendered,
+            run_id,
+            transcript_path,
+        ));
     }
 
     // Spawn each panelist with the concurrency cap.
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let mut handles = Vec::with_capacity(total);
-    for (idx, agent_name, rendered, run_id, transcript_path) in prepared {
+    for (idx, view_index, unit_key, agent_name, rendered, run_id, transcript_path) in prepared {
         let permit_sem = semaphore.clone();
         let factory = Arc::clone(&opts.factory);
         let parent_step_id = step.id.clone();
@@ -1962,12 +2053,31 @@ async fn run_panel_iteration(
         let run_id_clone = run_id.clone();
         let transcript_clone = transcript_path.clone();
         let agent_name_clone = agent_name.clone();
+        // Per-unit live-view events. Cloned into the task so emission
+        // brackets the panelist's REAL start/finish under the panel's
+        // `max_parallel` concurrency, mirroring the fan-out path.
+        let event_sink = opts.event_sink.clone();
+        let workflow_run_id = workflow_run_id.to_string();
+        let unit_agent = agent_name.clone();
 
         handles.push(tokio::spawn(async move {
             let _permit = permit_sem
                 .acquire_owned()
                 .await
                 .expect("semaphore not closed");
+            if let Some(sink) = event_sink.as_ref() {
+                sink.emit(
+                    &workflow_run_id,
+                    &crate::executor::Event::UnitStarted {
+                        run_id: workflow_run_id.clone(),
+                        step_id: parent_step_id.clone(),
+                        index: view_index,
+                        unit_key: unit_key.clone(),
+                        agent: Some(unit_agent.clone()),
+                        transcript_path: transcript_clone.clone(),
+                    },
+                );
+            }
             let outcome = dispatch_one(
                 &factory,
                 &parent_step_id,
@@ -1990,6 +2100,20 @@ async fn run_panel_iteration(
                 &run_id_clone,
                 &parent_step_id,
             );
+            if let Some(sink) = event_sink.as_ref() {
+                sink.emit(
+                    &workflow_run_id,
+                    &crate::executor::Event::UnitCompleted {
+                        run_id: workflow_run_id.clone(),
+                        step_id: parent_step_id.clone(),
+                        index: view_index,
+                        unit_key: unit_key.clone(),
+                        success,
+                        tokens_in: 0,
+                        tokens_out: 0,
+                    },
+                );
+            }
             PanelOutcome {
                 idx,
                 source: agent_name,

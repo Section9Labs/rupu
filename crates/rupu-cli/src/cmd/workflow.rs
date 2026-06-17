@@ -54,14 +54,21 @@ use rupu_orchestrator::runner::{OrchestratorRunResult, RunWorkflowError as RunWf
 use rupu_orchestrator::Workflow;
 use serde::Serialize;
 
-/// Is the opt-in live three-zone view (dashboard + git-graph spine +
-/// focus feed) enabled? Gated behind `RUPU_LIVE_VIEW=1` (or `true`) and
-/// a stdout tty so the default line-printer path is unchanged.
-fn live_view_enabled(stdout_is_tty: bool) -> bool {
-    stdout_is_tty
-        && std::env::var("RUPU_LIVE_VIEW")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+/// Is the live three-zone view (dashboard + git-graph spine + focus
+/// feed) enabled? It is the DEFAULT for interactive runs: on whenever
+/// stdout is a tty, UNLESS the caller opts out via `--plain` or the
+/// `RUPU_LIVE_VIEW=0` / `false` escape hatch. Non-tty always falls back
+/// to the line printer.
+fn live_view_enabled(stdout_is_tty: bool, plain: bool) -> bool {
+    if !stdout_is_tty || plain {
+        return false;
+    }
+    // `RUPU_LIVE_VIEW` is now an OFF switch: any value other than
+    // `0` / `false` leaves the (default-on) live view enabled.
+    let env_off = std::env::var("RUPU_LIVE_VIEW")
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    !env_off
 }
 
 /// Drive `run_workflow(opts)` while painting the live three-zone view in
@@ -176,6 +183,9 @@ pub enum Action {
         /// Control live output density (`focused` | `full`).
         #[arg(long, value_enum)]
         view: Option<LiveViewMode>,
+        /// Use the plain line printer instead of the live graph view.
+        #[arg(long)]
+        plain: bool,
     },
     /// List recent workflow runs from the persistent run-store
     /// (`<global>/runs/`). Newest first.
@@ -252,6 +262,9 @@ pub enum Action {
         /// (`ask` | `bypass` | `readonly`).
         #[arg(long)]
         mode: Option<String>,
+        /// Use the plain line printer instead of the live graph view.
+        #[arg(long)]
+        plain: bool,
     },
 }
 
@@ -306,7 +319,19 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             input,
             mode,
             view,
-        } => run(&name, target.as_deref(), input, mode.as_deref(), None, view).await,
+            plain,
+        } => {
+            run(
+                &name,
+                target.as_deref(),
+                input,
+                mode.as_deref(),
+                None,
+                view,
+                plain,
+            )
+            .await
+        }
         Action::Runs {
             limit,
             status,
@@ -341,7 +366,11 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
         Action::Cancel { run_id } => cancel(&run_id).await,
-        Action::Resume { run_id, mode } => resume_run(&run_id, mode.as_deref()).await,
+        Action::Resume {
+            run_id,
+            mode,
+            plain,
+        } => resume_run(&run_id, mode.as_deref(), plain).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -2041,7 +2070,7 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
 /// rows are replayed into context); a partially-completed fan-out
 /// step re-runs but its already-succeeded units are replayed from the
 /// `unit_checkpoints.jsonl` instead of re-dispatched.
-async fn resume_run(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
+async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
@@ -2254,7 +2283,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
     // `UnitCompleted`, so the spine fills in as the run progresses. We do
     // NOT pre-seed prior ✓ from the run-store into LiveRunState here
     // (the events stream re-establishes status as it replays).
-    let result = if live_view_enabled(io::stdout().is_terminal()) {
+    let result = if live_view_enabled(io::stdout().is_terminal(), plain) {
         run_workflow_with_live_view(opts, view_workflow, global.join("runs"), run_id.to_string())
             .await?
     } else {
@@ -2490,6 +2519,10 @@ pub struct ExplicitWorkflowRunContext {
     pub live_event_hook: Option<crate::output::workflow_printer::LiveWorkflowEventHook>,
     pub shared_printer: Option<Arc<Mutex<crate::output::LineStreamPrinter>>>,
     pub live_view: LiveViewMode,
+    /// Force the plain line printer (the `--plain` opt-out). When the
+    /// run is non-interactive this is irrelevant (the line printer is
+    /// always used); on a tty it disables the default live graph view.
+    pub plain: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2535,7 +2568,7 @@ pub async fn run_by_name(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event, false, None, None).await
+    run_with_outcome(name, None, inputs, mode, event, false, None, None, false).await
 }
 
 /// Variant of [`run_by_name`] that pins the run-id. Used by the
@@ -2551,7 +2584,18 @@ pub async fn run_by_name_with_run_id(
     event: Option<serde_json::Value>,
     run_id: String,
 ) -> anyhow::Result<RunOutcomeSummary> {
-    run_with_outcome(name, None, inputs, mode, event, false, Some(run_id), None).await
+    run_with_outcome(
+        name,
+        None,
+        inputs,
+        mode,
+        event,
+        false,
+        Some(run_id),
+        None,
+        false,
+    )
+    .await
 }
 
 /// Run a specific workflow file using the same execution pipeline as
@@ -2587,9 +2631,10 @@ pub async fn run_by_path(
 /// (interactive line-stream by default) so the issue-targeted run
 /// looks identical to the user.
 pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyhow::Result<()> {
-    run(name, Some(target), Vec::new(), mode, None, None).await
+    run(name, Some(target), Vec::new(), mode, None, None, false).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     name: &str,
     target: Option<&str>,
@@ -2597,8 +2642,9 @@ async fn run(
     mode: Option<&str>,
     event: Option<serde_json::Value>,
     view: Option<LiveViewMode>,
+    plain: bool,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event, true, None, view)
+    run_with_outcome(name, target, inputs, mode, event, true, None, view, plain)
         .await
         .map(|_| ())
 }
@@ -2616,6 +2662,7 @@ async fn run_with_outcome(
     attach_ui: bool,
     run_id_override: Option<String>,
     view: Option<LiveViewMode>,
+    plain: bool,
 ) -> anyhow::Result<RunOutcomeSummary> {
     let path = locate_workflow(name)?;
     let body = std::fs::read_to_string(&path)?;
@@ -2783,6 +2830,7 @@ async fn run_with_outcome(
             live_event_hook: None,
             shared_printer: None,
             live_view,
+            plain,
         },
     )
     .await
@@ -2850,6 +2898,7 @@ async fn run_path_with_outcome(
             live_event_hook: None,
             shared_printer: None,
             live_view: view.unwrap_or(LiveViewMode::Focused),
+            plain: false,
         },
     )
     .await
@@ -3336,7 +3385,7 @@ async fn execute_workflow_invocation(
     // state.
     let use_live_view = ctx.attach_ui
         && ctx.shared_printer.is_none()
-        && live_view_enabled(io::stdout().is_terminal());
+        && live_view_enabled(io::stdout().is_terminal(), ctx.plain);
 
     let workflow_result = if use_live_view {
         run_workflow_with_live_view(
@@ -3638,6 +3687,36 @@ mod tests {
     use rupu_orchestrator::{RunRecord, RunStatus};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn live_view_gate_defaults_on_for_tty() {
+        // Run env-sensitive assertions under one test so the global
+        // `RUPU_LIVE_VIEW` mutation is not racing parallel tests.
+        let prev = std::env::var("RUPU_LIVE_VIEW").ok();
+        std::env::remove_var("RUPU_LIVE_VIEW");
+
+        // tty + not plain + no env override => default ON.
+        assert!(live_view_enabled(true, false));
+        // --plain forces the line printer even on a tty.
+        assert!(!live_view_enabled(true, true));
+        // non-tty always uses the line printer.
+        assert!(!live_view_enabled(false, false));
+        assert!(!live_view_enabled(false, true));
+
+        // RUPU_LIVE_VIEW=0 / false is an OFF escape hatch.
+        std::env::set_var("RUPU_LIVE_VIEW", "0");
+        assert!(!live_view_enabled(true, false));
+        std::env::set_var("RUPU_LIVE_VIEW", "false");
+        assert!(!live_view_enabled(true, false));
+        // Any other value leaves the default-on view enabled.
+        std::env::set_var("RUPU_LIVE_VIEW", "1");
+        assert!(live_view_enabled(true, false));
+
+        match prev {
+            Some(v) => std::env::set_var("RUPU_LIVE_VIEW", v),
+            None => std::env::remove_var("RUPU_LIVE_VIEW"),
+        }
+    }
 
     fn sample_run_record(status: RunStatus, runner_pid: Option<u32>) -> RunRecord {
         RunRecord {
