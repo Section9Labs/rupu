@@ -85,6 +85,63 @@ impl TranscriptTailer {
     }
 }
 
+/// Incremental byte-offset tailer for an orchestrator `events.jsonl`
+/// (the executor step-event log). Same deferral semantics as
+/// [`TranscriptTailer`] but parses [`rupu_orchestrator::executor::Event`].
+pub struct WfEventTailer {
+    path: PathBuf,
+    offset: u64,
+}
+
+impl WfEventTailer {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            offset: 0,
+        }
+    }
+
+    /// Drain newly-appended complete lines as parsed executor events.
+    pub fn drain_events(&mut self) -> Vec<rupu_orchestrator::executor::Event> {
+        let Ok(mut file) = std::fs::File::open(&self.path) else {
+            return Vec::new();
+        };
+        let Ok(metadata) = file.metadata() else {
+            return Vec::new();
+        };
+        if metadata.len() < self.offset {
+            self.offset = 0;
+        }
+        if metadata.len() <= self.offset {
+            return Vec::new();
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return Vec::new();
+        }
+        let mut new_bytes = Vec::new();
+        if file.read_to_end(&mut new_bytes).is_err() {
+            return Vec::new();
+        }
+        let mut consumed = 0usize;
+        let mut events = Vec::new();
+        for line in new_bytes.split_inclusive(|&b| b == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
+            }
+            consumed += line.len();
+            let trimmed = &line[..line.len() - 1];
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(ev) = serde_json::from_slice::<rupu_orchestrator::executor::Event>(trimmed) {
+                events.push(ev);
+            }
+        }
+        self.offset += consumed as u64;
+        events
+    }
+}
+
 impl TranscriptHistoryPager {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();

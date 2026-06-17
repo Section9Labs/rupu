@@ -3272,7 +3272,38 @@ async fn execute_workflow_invocation(
         event_sink: event_sink_for_run,
     };
 
-    let workflow_result = if ctx.attach_ui {
+    // Opt-in live three-zone view (dashboard + git-graph spine + focus
+    // feed). Gated behind `RUPU_LIVE_VIEW=1` + a tty so the default
+    // line-printer path (with its approval loop) is unchanged. The live
+    // view does not handle approval gates; runs that pause render the
+    // awaiting glyph and the loop exits when the run reaches a terminal
+    // state.
+    let live_view_enabled = ctx.attach_ui
+        && std::env::var("RUPU_LIVE_VIEW")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        && io::stdout().is_terminal()
+        && ctx.shared_printer.is_none();
+
+    let workflow_result = if live_view_enabled {
+        let runner_task = tokio::spawn(run_workflow(opts));
+        let view_workflow = workflow_for_resume.clone();
+        let view_runs_dir = runs_dir.clone();
+        let view_run_id = run_id.clone();
+        let view_task = tokio::spawn(async move {
+            let _ =
+                crate::output::live_run::run_live_view(view_workflow, view_runs_dir, view_run_id)
+                    .await;
+        });
+        let result = runner_task
+            .await
+            .map_err(|e| anyhow::anyhow!("workflow task panicked: {e}"))?
+            .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?;
+        // Give the view a brief moment to paint the final frame, then
+        // stop it.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), view_task).await;
+        result
+    } else if ctx.attach_ui {
         let runner_task = tokio::spawn(run_workflow(opts));
         let rid = run_id.clone();
 
