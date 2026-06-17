@@ -201,6 +201,16 @@ pub enum Action {
         /// `rupu workflow run`.
         run_id: String,
     },
+    /// Resume a failed/cancelled run, re-running only the agent runs
+    /// that didn't succeed.
+    Resume {
+        /// Full run id (`run_<ULID>`) of the terminal run to resume.
+        run_id: String,
+        /// Override permission mode for the resumed run
+        /// (`ask` | `bypass` | `readonly`).
+        #[arg(long)]
+        mode: Option<String>,
+    },
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {
@@ -289,6 +299,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
         Action::Cancel { run_id } => cancel(&run_id).await,
+        Action::Resume { run_id, mode } => resume_run(&run_id, mode.as_deref()).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -308,6 +319,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Approve { .. } => ("workflow approve", report::TABLE_ONLY),
         Action::Reject { .. } => ("workflow reject", report::TABLE_ONLY),
         Action::Cancel { .. } => ("workflow cancel", report::TABLE_ONLY),
+        Action::Resume { .. } => ("workflow resume", report::TABLE_ONLY),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
@@ -1896,11 +1908,11 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         dispatcher: Some(dispatcher_dyn),
     });
 
-    let resume = rupu_orchestrator::ResumeState {
-        run_id: run_id.to_string(),
+    let resume = rupu_orchestrator::ResumeState::from_approval(
+        run_id.to_string(),
         prior_step_results,
-        approved_step_id: awaited_step_id.clone(),
-    };
+        awaited_step_id.clone(),
+    );
     let event_sink_for_resume = {
         let runs_dir = global.join("runs");
         let events_path = runs_dir.join(run_id).join("events.jsonl");
@@ -1963,6 +1975,251 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
             println!();
             println!(
                 "rupu: workflow paused again at step `{}` (run {})",
+                info.step_id, result.run_id
+            );
+            println!("      prompt: {}", info.prompt);
+            println!(
+                "      approve with: rupu workflow approve {}",
+                result.run_id
+            );
+        }
+        None => {
+            println!(
+                "rupu: workflow run {} finished (inspect with: rupu workflow show-run {})",
+                result.run_id, result.run_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resume a terminal (`failed` / `cancelled` / `rejected`) run,
+/// re-running only the agent runs that didn't already succeed.
+/// Completed steps are skipped wholesale (their `step_results.jsonl`
+/// rows are replayed into context); a partially-completed fan-out
+/// step re-runs but its already-succeeded units are replayed from the
+/// `unit_checkpoints.jsonl` instead of re-dispatched.
+async fn resume_run(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    paths::ensure_dir(&global)?;
+    let runs_dir = global.join("runs");
+    let store = Arc::new(rupu_orchestrator::RunStore::new(runs_dir));
+
+    let mut record = store.load(run_id).map_err(|e| match e {
+        rupu_orchestrator::RunStoreError::NotFound(id) => {
+            anyhow::anyhow!("run not found: {id}\n  hint: list runs with `rupu workflow runs`")
+        }
+        other => anyhow::anyhow!("load run record: {other}"),
+    })?;
+
+    // Guard: don't double-run an in-flight run, and don't re-run a
+    // run that already completed.
+    use rupu_orchestrator::RunStatus;
+    match record.status {
+        RunStatus::Running | RunStatus::Pending => {
+            anyhow::bail!(
+                "run {run_id} is `{}` — refusing to resume an in-flight run (cancel it first with `rupu workflow cancel {run_id}`)",
+                record.status.as_str()
+            );
+        }
+        RunStatus::Completed => {
+            anyhow::bail!("run {run_id} already completed — nothing to resume");
+        }
+        RunStatus::AwaitingApproval => {
+            anyhow::bail!(
+                "run {run_id} is awaiting approval — use `rupu workflow approve {run_id}` (or `reject`) instead of `resume`"
+            );
+        }
+        // Resume applies to terminal failure states.
+        RunStatus::Failed | RunStatus::Rejected => {}
+    }
+
+    // Rebuild context from disk: workflow YAML snapshot + prior step
+    // results + per-unit fan-out checkpoints.
+    let body = store
+        .read_workflow_snapshot(run_id)
+        .map_err(|e| anyhow::anyhow!("read workflow snapshot: {e}"))?;
+    let workflow = Workflow::parse(&body)?;
+    let prior_records = store
+        .read_step_results(run_id)
+        .map_err(|e| anyhow::anyhow!("read step results: {e}"))?;
+    let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
+        .iter()
+        .map(rupu_orchestrator::StepResult::from)
+        .collect();
+
+    // Group the unit checkpoints by step_id, keeping only the units
+    // that SUCCEEDED. Last write wins per index (a prior partial
+    // re-run may have appended a fresh checkpoint for the same index).
+    let checkpoints = store
+        .read_unit_checkpoints(run_id)
+        .map_err(|e| anyhow::anyhow!("read unit checkpoints: {e}"))?;
+    let mut completed_units: BTreeMap<String, BTreeMap<usize, rupu_orchestrator::ItemResult>> =
+        BTreeMap::new();
+    let mut replayed_units = 0usize;
+    for cp in &checkpoints {
+        let per_step = completed_units.entry(cp.step_id.clone()).or_default();
+        if cp.success {
+            per_step.insert(
+                cp.index,
+                rupu_orchestrator::ItemResult {
+                    index: cp.index,
+                    item: cp.item.clone(),
+                    sub_id: String::new(),
+                    rendered_prompt: String::new(),
+                    run_id: cp.run_id.clone(),
+                    transcript_path: cp.transcript_path.clone(),
+                    output: cp.output.clone(),
+                    success: true,
+                },
+            );
+        } else {
+            // A later failure for the same index supersedes an earlier
+            // success only if it's the most recent record; the
+            // append-order iteration here makes last-write-win natural.
+            per_step.remove(&cp.index);
+        }
+    }
+    // Steps that already appear as completed in step_results don't need
+    // unit replay (they're skipped wholesale); drop their unit maps so
+    // we only carry partially-completed fan-out steps.
+    let done_step_ids: std::collections::BTreeSet<String> = prior_step_results
+        .iter()
+        .map(|s| s.step_id.clone())
+        .collect();
+    completed_units.retain(|step_id, units| {
+        if done_step_ids.contains(step_id) {
+            return false;
+        }
+        replayed_units += units.len();
+        !units.is_empty()
+    });
+
+    // Restore inputs, event, issue, workspace path from the record.
+    let inputs_map: BTreeMap<String, String> = record.inputs.clone();
+    let event = record.event.clone();
+    let issue_payload = record.issue.clone();
+    let issue_ref_text = record.issue_ref.clone();
+    let workspace_path = record.workspace_path.clone();
+    let transcripts = record.transcript_dir.clone();
+    paths::ensure_dir(&transcripts)?;
+
+    // Flip the persisted record back to Running and clear the prior
+    // terminal markers so the runner's terminal-flip block at the end
+    // updates it coherently.
+    record.status = RunStatus::Running;
+    record.finished_at = None;
+    record.error_message = None;
+    record.runner_pid = Some(std::process::id());
+    store
+        .update(&record)
+        .map_err(|e| anyhow::anyhow!("flip run to running: {e}"))?;
+
+    // Resolve project_root from the persisted workspace path so
+    // agent/config discovery picks up the same `.rupu/` dir the
+    // original run used.
+    let project_root = paths::project_root_for(&workspace_path)?;
+
+    // Standard wiring (mirrors `approve` above).
+    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
+    let global_cfg_path = global.join("config.toml");
+    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
+    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
+    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
+
+    let mode_str = mode.unwrap_or("ask").to_string();
+    let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
+        global.clone(),
+        project_root.clone(),
+        record.workspace_id.clone(),
+        workspace_path.clone(),
+        Arc::clone(&resolver),
+        mode_str.clone(),
+        Arc::clone(&mcp_registry),
+        Arc::clone(&store),
+    );
+    let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+    let factory = Arc::new(DefaultStepFactory {
+        workflow: workflow.clone(),
+        global: global.clone(),
+        project_root: project_root.clone(),
+        resolver,
+        mode_str,
+        mcp_registry,
+        system_prompt_suffix: None,
+        dispatcher: Some(dispatcher_dyn),
+    });
+
+    let already_done_steps: Vec<String> = done_step_ids.iter().cloned().collect();
+    let resume = rupu_orchestrator::ResumeState {
+        run_id: run_id.to_string(),
+        prior_step_results,
+        approved_step_id: String::new(),
+        completed_units,
+    };
+
+    let event_sink_for_resume = {
+        let events_path = global.join("runs").join(run_id).join("events.jsonl");
+        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
+            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open events.jsonl for resume; continuing without event sink");
+                None
+            }
+        }
+    };
+
+    let opts = OrchestratorRunOpts {
+        workflow,
+        inputs: inputs_map,
+        workspace_id: record.workspace_id.clone(),
+        workspace_path,
+        transcript_dir: transcripts,
+        factory,
+        event,
+        issue: issue_payload,
+        issue_ref: issue_ref_text,
+        run_store: Some(store),
+        workflow_yaml: Some(body),
+        resume_from: Some(resume),
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: event_sink_for_resume,
+    };
+
+    println!("rupu: resuming run {run_id}");
+    if already_done_steps.is_empty() {
+        println!("      no completed steps to skip; re-running from the start");
+    } else {
+        println!(
+            "      skipping {} already-completed step(s): {}",
+            already_done_steps.len(),
+            already_done_steps.join(", ")
+        );
+    }
+    if replayed_units > 0 {
+        println!(
+            "      replaying {replayed_units} already-succeeded fan-out unit(s) from disk; only failed/missing units re-run"
+        );
+    }
+
+    let result = run_workflow(opts).await?;
+    for sr in &result.step_results {
+        if sr.run_id.is_empty() {
+            continue;
+        }
+        println!(
+            "rupu: step {} run {} -> {}",
+            sr.step_id,
+            sr.run_id,
+            sr.transcript_path.display()
+        );
+    }
+    match &result.awaiting {
+        Some(info) => {
+            println!();
+            println!(
+                "rupu: workflow paused at step `{}` (run {})",
                 info.step_id, result.run_id
             );
             println!("      prompt: {}", info.prompt);
@@ -3125,11 +3382,11 @@ async fn execute_workflow_invocation(
                         .iter()
                         .map(rupu_orchestrator::StepResult::from)
                         .collect();
-                    let resume = rupu_orchestrator::ResumeState {
-                        run_id: current_run_id.clone(),
+                    let resume = rupu_orchestrator::ResumeState::from_approval(
+                        current_run_id.clone(),
                         prior_step_results,
-                        approved_step_id: awaited_step_id,
-                    };
+                        awaited_step_id,
+                    );
                     let factory_dyn: Arc<dyn rupu_orchestrator::StepFactory> =
                         factory_for_resume.clone();
                     let resume_event_sink = {
