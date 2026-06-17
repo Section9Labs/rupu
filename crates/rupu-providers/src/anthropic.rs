@@ -153,6 +153,20 @@ const ANTHROPIC_AGENT_SDK_SELF_DESCRIPTION: &str =
 const MAX_RATE_LIMIT_RETRIES: u32 = 1;
 /// Initial backoff for 429 retries (doubles each attempt).
 const INITIAL_BACKOFF_MS: u64 = 2000;
+/// Idle timeout for a streaming response: if no bytes arrive for this long the
+/// model is considered stalled (a connection is open but the server stopped
+/// emitting — observed with some preview models during long prefill). The
+/// request is aborted and re-sent. This is an *idle* (per-chunk) timeout, not a
+/// total one, so legitimately-long generations are never cut off mid-stream.
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+/// How many times to re-send a stalled stream before giving up. Retries only
+/// happen on a *prefill* stall (before any output) to avoid duplicating a
+/// partially-streamed response.
+const MAX_STREAM_IDLE_RETRIES: u32 = 10;
+/// Total timeout for a one-shot (non-streaming) `send` request. Generous —
+/// covers prefill + full generation — but bounded so a hung connection can't
+/// block forever.
+const SEND_TOTAL_TIMEOUT_SECS: u64 = 600;
 
 const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -873,15 +887,29 @@ impl AnthropicClient {
                 .post(&self.api_url)
                 .header("Content-Type", "application/json")
                 .json(&body);
-            let response = self
+            let send_fut = self
                 .apply_auth_headers(
                     builder,
                     &request.model,
                     request.context_window,
                     request.anthropic_context_management.is_some(),
                 )
-                .send()
-                .await?;
+                .send();
+            // Total timeout: a one-shot request that never responds (hung
+            // connection / stalled model) must not block forever.
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(SEND_TOTAL_TIMEOUT_SECS),
+                send_fut,
+            )
+            .await
+            {
+                Ok(r) => r?,
+                Err(_elapsed) => {
+                    return Err(ProviderError::Transient(anyhow::anyhow!(
+                        "send request timed out after {SEND_TOTAL_TIMEOUT_SECS}s (model stalled)"
+                    )))
+                }
+            };
 
             let status = response.status();
             if status.as_u16() == 429 {
@@ -939,85 +967,140 @@ impl AnthropicClient {
         self.ensure_valid_token().await?;
         let body = self.build_request_body(request, true);
 
-        // Retry loop for 429 rate-limits
-        let response = {
-            let mut last_err = None;
-            let mut got_response = None;
-            for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
-                if attempt > 0 {
-                    let backoff = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
-                    warn!(
-                        attempt,
-                        backoff_ms = backoff,
-                        "rate-limited (429), retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
-                }
-
-                let builder = self
-                    .client
-                    .post(&self.api_url)
-                    .header("Content-Type", "application/json")
-                    .json(&body);
-                let resp = self
-                    .apply_auth_headers(
-                        builder,
-                        &request.model,
-                        request.context_window,
-                        request.anthropic_context_management.is_some(),
-                    )
-                    .send()
-                    .await?;
-
-                let status = resp.status();
-                if status.as_u16() == 429 {
-                    let text = resp.text().await.unwrap_or_default();
-                    last_err = Some(ProviderError::Api {
-                        status: 429,
-                        message: text,
-                    });
-                    continue;
-                }
-                if !status.is_success() {
-                    let text = resp.text().await.unwrap_or_default();
-                    let truncated = if text.len() > 4096 {
-                        format!("{}... (truncated)", &text[..4096])
-                    } else {
-                        text
-                    };
-                    return Err(ProviderError::Api {
-                        status: status.as_u16(),
-                        message: truncated,
-                    });
-                }
-                got_response = Some(resp);
-                break;
+        // Outer retry loop: if the model stalls (no bytes for
+        // STREAM_IDLE_TIMEOUT_SECS) during prefill — connection open, server
+        // silent — abort and re-send, up to MAX_STREAM_IDLE_RETRIES times.
+        for idle_attempt in 0..=MAX_STREAM_IDLE_RETRIES {
+            if idle_attempt > 0 {
+                warn!(
+                    attempt = idle_attempt,
+                    idle_secs = STREAM_IDLE_TIMEOUT_SECS,
+                    "stream stalled (no bytes); re-sending request"
+                );
             }
-            match got_response {
-                Some(r) => r,
-                None => {
-                    return Err(last_err.unwrap_or_else(|| ProviderError::Api {
-                        status: 429,
-                        message: "rate-limited after max retries".into(),
-                    }))
+
+            // Retry loop for 429 rate-limits
+            let response = {
+                let mut last_err = None;
+                let mut got_response = None;
+                for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+                    if attempt > 0 {
+                        let backoff = INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
+                        warn!(
+                            attempt,
+                            backoff_ms = backoff,
+                            "rate-limited (429), retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                    }
+
+                    let builder = self
+                        .client
+                        .post(&self.api_url)
+                        .header("Content-Type", "application/json")
+                        .json(&body);
+                    let resp = self
+                        .apply_auth_headers(
+                            builder,
+                            &request.model,
+                            request.context_window,
+                            request.anthropic_context_management.is_some(),
+                        )
+                        .send()
+                        .await?;
+
+                    let status = resp.status();
+                    if status.as_u16() == 429 {
+                        let text = resp.text().await.unwrap_or_default();
+                        last_err = Some(ProviderError::Api {
+                            status: 429,
+                            message: text,
+                        });
+                        continue;
+                    }
+                    if !status.is_success() {
+                        let text = resp.text().await.unwrap_or_default();
+                        let truncated = if text.len() > 4096 {
+                            format!("{}... (truncated)", &text[..4096])
+                        } else {
+                            text
+                        };
+                        return Err(ProviderError::Api {
+                            status: status.as_u16(),
+                            message: truncated,
+                        });
+                    }
+                    got_response = Some(resp);
+                    break;
                 }
+                match got_response {
+                    Some(r) => r,
+                    None => {
+                        return Err(last_err.unwrap_or_else(|| ProviderError::Api {
+                            status: 429,
+                            message: "rate-limited after max retries".into(),
+                        }))
+                    }
+                }
+            };
+
+            let mut parser = SseParser::new();
+            let mut accumulator = StreamAccumulator::new();
+            let mut response = response;
+            let mut emitted_content = false;
+
+            // Read chunks with a per-chunk IDLE timeout. A timeout means the
+            // server stopped emitting bytes — treat as a stall.
+            let stalled = loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+                    response.chunk(),
+                )
+                .await
+                {
+                    Ok(chunk_result) => match chunk_result? {
+                        Some(chunk) => {
+                            for event in parser.feed(&chunk)? {
+                                self.process_sse_event(&event, &mut accumulator, &mut |ev| {
+                                    if matches!(
+                                        ev,
+                                        StreamEvent::TextDelta(_)
+                                            | StreamEvent::ToolUseStart { .. }
+                                            | StreamEvent::InputJsonDelta(_)
+                                    ) {
+                                        emitted_content = true;
+                                    }
+                                    on_event(ev);
+                                })?;
+                            }
+                        }
+                        None => break false, // stream completed normally
+                    },
+                    Err(_elapsed) => break true, // idle timeout → stalled
+                }
+            };
+
+            if !stalled {
+                return accumulator
+                    .into_response()
+                    .ok_or(ProviderError::UnexpectedEndOfStream);
             }
-        };
 
-        let mut parser = SseParser::new();
-        let mut accumulator = StreamAccumulator::new();
-        let mut response = response;
-
-        while let Some(chunk) = response.chunk().await? {
-            let events = parser.feed(&chunk)?;
-            for event in events {
-                self.process_sse_event(&event, &mut accumulator, &mut on_event)?;
+            // Stalled. Retry only on a *prefill* stall (nothing emitted yet)
+            // with retries left; a mid-stream stall can't be re-sent without
+            // duplicating already-streamed output, so it fails.
+            if emitted_content || idle_attempt == MAX_STREAM_IDLE_RETRIES {
+                let reason = if emitted_content {
+                    "mid-response".to_string()
+                } else {
+                    format!("during prefill, after {idle_attempt} retries")
+                };
+                return Err(ProviderError::Transient(anyhow::anyhow!(
+                    "stream idle for {STREAM_IDLE_TIMEOUT_SECS}s — model stalled ({reason})"
+                )));
             }
         }
-
-        accumulator
-            .into_response()
-            .ok_or(ProviderError::UnexpectedEndOfStream)
+        unreachable!("stream idle-retry loop always returns")
     }
 
     fn build_request_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
