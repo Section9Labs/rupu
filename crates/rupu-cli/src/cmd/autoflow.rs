@@ -9840,6 +9840,7 @@ pub(crate) async fn execute_autoflow_cycle(
             live_event_hook,
             shared_printer,
             live_view: crate::cmd::ui::LiveViewMode::Focused,
+            plain: false,
         },
     )
     .await;
@@ -10659,6 +10660,7 @@ pub(crate) async fn execute_pending_dispatch_workflow(
             live_event_hook,
             shared_printer,
             live_view: crate::cmd::ui::LiveViewMode::Focused,
+            plain: false,
         },
     )
     .await;

@@ -213,6 +213,97 @@ steps:
 }
 
 #[tokio::test]
+async fn panel_emits_per_panelist_unit_events() {
+    // A gate-less panel with two panelists should emit one
+    // UnitStarted/UnitCompleted pair per panelist, keyed
+    // `iter1:<panelist>`, so the live view expands the sweep step like
+    // a fan-out.
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let sink: Arc<CollectSink> = Arc::new(CollectSink::default());
+
+    let wf_yaml = r#"
+name: panel-units
+steps:
+  - id: sweep
+    panel:
+      subject: "review this"
+      panelists:
+        - reviewer-a
+        - reviewer-b
+"#;
+
+    let wf = Workflow::parse(wf_yaml).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_panel".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(FakeFactory),
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+    };
+
+    run_workflow(opts).await.unwrap();
+
+    let events = sink.events.lock().unwrap();
+    let started: Vec<(usize, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::UnitStarted {
+                step_id,
+                index,
+                unit_key,
+                ..
+            } if step_id == "sweep" => Some((*index, unit_key.clone())),
+            _ => None,
+        })
+        .collect();
+    let completed: Vec<(usize, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::UnitCompleted {
+                step_id,
+                index,
+                unit_key,
+                ..
+            } if step_id == "sweep" => Some((*index, unit_key.clone())),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        started.len(),
+        2,
+        "two panelist UnitStarted events: {started:?}"
+    );
+    assert_eq!(
+        completed.len(),
+        2,
+        "two panelist UnitCompleted events: {completed:?}"
+    );
+    // Monotonic indices 0,1 and iter1-prefixed keys.
+    let mut indices: Vec<usize> = started.iter().map(|(i, _)| *i).collect();
+    indices.sort_unstable();
+    assert_eq!(indices, vec![0, 1], "indices grow monotonically");
+    assert!(
+        started.iter().any(|(_, k)| k == "iter1:reviewer-a"),
+        "keyed iter1:reviewer-a: {started:?}"
+    );
+    assert!(
+        started.iter().any(|(_, k)| k == "iter1:reviewer-b"),
+        "keyed iter1:reviewer-b: {started:?}"
+    );
+}
+
+#[tokio::test]
 async fn no_event_sink_does_not_emit_any_events() {
     // Smoke test: running without an event_sink should not panic and
     // should still return correct results.

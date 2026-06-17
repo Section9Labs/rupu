@@ -398,6 +398,35 @@ impl LiveRunState {
         self.tokens_out += tokens_out;
     }
 
+    /// Add a per-turn token delta (from the active transcript's `Usage`
+    /// event) to the currently-active fan-out / panel unit, and keep the
+    /// owning step + run totals consistent.
+    ///
+    /// The live loop tails the active unit's transcript and drains each
+    /// `Usage` event exactly once, so these deltas accumulate without
+    /// double-counting. When the active unit changes, the previous unit's
+    /// accumulated total stays put (this only touches the active slot).
+    /// Falls back to crediting the active step when no unit is in focus
+    /// (a linear step's transcript).
+    pub fn add_active_tokens(&mut self, tokens_in: u64, tokens_out: u64) {
+        let step_id = match self.active.step_id.clone() {
+            Some(id) => id,
+            None => return,
+        };
+        let unit_key = self.active.unit_key.clone();
+        if let Some(step) = self.step_mut(&step_id) {
+            if let Some(key) = unit_key {
+                if let Some(unit) = step.units.iter_mut().find(|u| u.key == key) {
+                    unit.tokens += tokens_in + tokens_out;
+                }
+            }
+            step.tokens_in += tokens_in;
+            step.tokens_out += tokens_out;
+        }
+        self.tokens_in += tokens_in;
+        self.tokens_out += tokens_out;
+    }
+
     /// Seconds since the run started, given a `now`.
     pub fn elapsed_secs(&self, now: DateTime<Utc>) -> i64 {
         self.started_at
@@ -981,6 +1010,18 @@ pub async fn run_live_view(
         if let Some((_, tailer)) = transcript_tailer.as_mut() {
             for ev in tailer.drain() {
                 let now = Utc::now();
+                // Per-turn token usage from the active unit's transcript
+                // feeds the unit's `⇡tokens` (the orchestrator's
+                // `UnitCompleted` carries 0). Drained once per event, so
+                // accumulation does not double-count across ticks.
+                if let rupu_transcript::Event::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } = &ev
+                {
+                    state.add_active_tokens(*input_tokens as u64, *output_tokens as u64);
+                }
                 if let Some((kind, text)) = map_transcript_event(&ev, now) {
                     state.push_activity(now, kind, text);
                 }
@@ -1536,6 +1577,40 @@ mod tests {
         assert_eq!(step.units.len(), 4);
         assert_eq!(step.units[3].status, NodeStatus::Working);
         assert_eq!(step.units[0].status, NodeStatus::Waiting);
+    }
+
+    #[test]
+    fn add_active_tokens_sums_into_active_unit_and_totals() {
+        let mut state = fanout_state(true);
+        // Focus the app-gw unit (index 2) like an UnitStarted would.
+        state.active.step_id = Some("assess".into());
+        state.active.unit_key = Some("app-gw".into());
+        let unit_before = state.steps[1].units[2].tokens;
+        let step_in_before = state.steps[1].tokens_in;
+        let run_in_before = state.tokens_in;
+
+        // Two per-turn Usage deltas accumulate (no double-count).
+        state.add_active_tokens(1000, 250);
+        state.add_active_tokens(500, 100);
+
+        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
+        let unit = step.units.iter().find(|u| u.key == "app-gw").unwrap();
+        assert_eq!(unit.tokens, unit_before + 1500 + 350);
+        assert_eq!(step.tokens_in, step_in_before + 1500);
+        assert_eq!(state.tokens_in, run_in_before + 1500);
+
+        // A later unit switch leaves the prior unit's total in place.
+        state.active.unit_key = Some("rtc".into());
+        state.add_active_tokens(42, 0);
+        let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
+        let app_gw = step.units.iter().find(|u| u.key == "app-gw").unwrap();
+        assert_eq!(
+            app_gw.tokens,
+            unit_before + 1850,
+            "completed unit unchanged"
+        );
+        let rtc = step.units.iter().find(|u| u.key == "rtc").unwrap();
+        assert_eq!(rtc.tokens, 42);
     }
 
     #[test]
