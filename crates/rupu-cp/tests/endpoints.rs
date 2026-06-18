@@ -282,6 +282,23 @@ async fn session_detail_returns_active_session() {
     assert!(body.get("message_history").is_none());
 }
 
+#[tokio::test]
+async fn session_detail_500_for_corrupt_session_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    // Directory exists but session.json contains invalid JSON.
+    let sess_dir = global.join("sessions").join("sess-corrupt");
+    std::fs::create_dir_all(&sess_dir).unwrap();
+    std::fs::write(sess_dir.join("session.json"), b"not valid json {{{{").unwrap();
+
+    let addr = spawn_server(global, global).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/sessions/sess-corrupt"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 500, "corrupt session.json should yield 500, not 404");
+}
+
 // ---------------------------------------------------------------------------
 // D. Workers
 // ---------------------------------------------------------------------------

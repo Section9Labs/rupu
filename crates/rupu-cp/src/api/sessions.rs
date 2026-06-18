@@ -42,8 +42,35 @@ struct SessionDto {
     target: Option<String>,
 }
 
-/// Try to load and parse `session.json` inside `dir`. Returns `None`
-/// when the file is absent or fails to parse (with a warning).
+/// Try to load and parse `session.json` inside `dir`.
+///
+/// Returns:
+/// - `Ok(None)`  — file does not exist (caller should treat as 404)
+/// - `Ok(Some)`  — file exists and parsed successfully
+/// - `Err(_)`    — file exists but could not be read or parsed (→ 500)
+fn load_session_file(dir: &std::path::Path) -> Result<Option<SessionDto>, ApiError> {
+    let path = dir.join("session.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(ApiError::internal(format!(
+                "failed to read {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    match serde_json::from_str::<SessionDto>(&text) {
+        Ok(dto) => Ok(Some(dto)),
+        Err(e) => Err(ApiError::internal(format!(
+            "failed to parse {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Try to load and parse `session.json` inside `dir` for list scanning.
+/// Returns `None` when the file is absent or fails to parse (with a warning).
 fn try_load_session(dir: &std::path::Path) -> Option<SessionDto> {
     let path = dir.join("session.json");
     let text = match std::fs::read_to_string(&path) {
@@ -85,11 +112,24 @@ fn scan_session_dir(
             continue;
         }
         if let Some(dto) = try_load_session(&dir) {
-            let mut val = serde_json::to_value(dto).unwrap_or(serde_json::Value::Null);
-            if let serde_json::Value::Object(ref mut map) = val {
-                map.insert("scope".to_string(), serde_json::Value::String(scope.to_string()));
+            match serde_json::to_value(dto) {
+                Ok(mut val) => {
+                    if let serde_json::Value::Object(ref mut map) = val {
+                        map.insert(
+                            "scope".to_string(),
+                            serde_json::Value::String(scope.to_string()),
+                        );
+                    }
+                    out.push(val);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_dir = %dir.display(),
+                        error = %e,
+                        "failed to serialize session dto; skipping"
+                    );
+                }
             }
-            out.push(val);
         }
     }
 }
@@ -123,8 +163,12 @@ async fn get_session(
         return Err(ApiError::not_found(format!("session {id} not found")));
     };
 
-    let dto = try_load_session(&dir)
-        .ok_or_else(|| ApiError::not_found(format!("session {id} session.json missing or unparseable")))?;
+    // load_session_file distinguishes missing (Ok(None)→404) from IO/parse
+    // errors on an existing file (Err→500).
+    let dto = match load_session_file(&dir)? {
+        Some(dto) => dto,
+        None => return Err(ApiError::not_found(format!("session {id} not found"))),
+    };
 
     let mut val =
         serde_json::to_value(dto).map_err(|e| ApiError::internal(e.to_string()))?;

@@ -38,7 +38,13 @@ async fn list_coverage(
     let mut summaries = Vec::with_capacity(targets.len());
     for t in targets {
         let paths = CoveragePaths::new(&s.workspace_dir, &t.target_id);
-        let findings = read_findings(&paths).unwrap_or_default().len();
+        let findings = match read_findings(&paths) {
+            Ok(f) => f.len(),
+            Err(ref e) => {
+                tracing::warn!(target_id = %t.target_id, error = %e, "failed to read findings; using 0");
+                0
+            }
+        };
         summaries.push(CoverageSummary {
             target_id: t.target_id,
             assertion_lines: t.assertion_lines,
