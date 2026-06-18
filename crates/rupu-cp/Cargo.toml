@@ -18,6 +18,7 @@ serde_json.workspace = true
 tower-http = { workspace = true, features = ["trace"] }
 tracing.workspace = true
 anyhow.workspace = true
+futures-util = { workspace = true }
 
 # In-workspace
 rupu-orchestrator = { path = "../rupu-orchestrator" }
@@ -30,5 +31,8 @@ rupu-coverage = { path = "../rupu-coverage" }
 [dev-dependencies]
 chrono.workspace = true
 tempfile.workspace = true
-reqwest = { workspace = true, features = ["json"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+reqwest = { workspace = true, features = ["json", "stream"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio-util = { workspace = true, features = ["io"] }
+futures-util = { workspace = true }
+serde_json.workspace = true

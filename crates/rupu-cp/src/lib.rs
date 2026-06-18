@@ -5,6 +5,7 @@
 pub mod api;
 pub mod error;
 pub mod server;
+pub mod sse;
 pub mod state;
 
 use anyhow::Context as _;

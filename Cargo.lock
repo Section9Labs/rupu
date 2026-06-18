@@ -6267,6 +6267,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "futures-util",
  "reqwest",
  "rupu-agent",
  "rupu-config",
@@ -6278,6 +6279,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower-http",
  "tracing",
 ]

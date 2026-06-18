@@ -16,6 +16,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::api::workers::routes())
         .merge(crate::api::coverage::routes())
         .merge(crate::api::dashboard::routes())
+        .merge(crate::api::events::routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
