@@ -118,6 +118,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::webhook::Action,
     },
+    /// Control-plane HTTP server for the rupu web UI.
+    Cp {
+        #[command(subcommand)]
+        action: cmd::cp::Action,
+    },
     /// Aggregate token spend across persisted transcripts.
     Usage(Box<cmd::usage::UsageArgs>),
     /// Re-attach to an existing run.
@@ -206,6 +211,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Coverage { action } => cmd::coverage::handle(action, cli.format).await,
         Cmd::Cron { action } => cmd::cron::handle(action, cli.format).await,
         Cmd::Webhook { action } => cmd::webhook::handle(action).await,
+        Cmd::Cp { action } => cmd::cp::handle(action).await,
         Cmd::Usage(args) => cmd::usage::handle(*args, cli.format).await,
         Cmd::Watch(args) => cmd::watch::handle(args).await,
         Cmd::Completions { action } => cmd::completions::handle(action).await,
@@ -252,6 +258,11 @@ fn ensure_output_format_supported(
         Cmd::Cron { action } => cmd::cron::ensure_output_format(action, format),
         Cmd::Webhook { .. } => output::formats::ensure_supported(
             "webhook",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Cp { .. } => output::formats::ensure_supported(
+            "cp",
             format,
             &[output::formats::OutputFormat::Table],
         ),

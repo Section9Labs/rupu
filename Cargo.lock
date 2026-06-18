@@ -4994,7 +4994,7 @@ dependencies = [
  "snafu",
  "tokio",
  "tower",
- "tower-http",
+ "tower-http 0.6.8",
  "tracing",
  "url",
  "web-time",
@@ -6020,7 +6020,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http",
+ "tower-http 0.6.8",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -6205,6 +6205,7 @@ dependencies = [
  "rupu-auth",
  "rupu-config",
  "rupu-coverage",
+ "rupu-cp",
  "rupu-mcp",
  "rupu-orchestrator",
  "rupu-providers",
@@ -6257,6 +6258,23 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+]
+
+[[package]]
+name = "rupu-cp"
+version = "0.9.13"
+dependencies = [
+ "anyhow",
+ "axum",
+ "reqwest",
+ "rupu-config",
+ "rupu-orchestrator",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower-http 0.5.2",
+ "tracing",
 ]
 
 [[package]]
@@ -8022,6 +8040,23 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-util",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e9cd434a998747dd2c4276bc96ee2e0c7a2eadf3cae88e52be55a05fa9053f5"
+dependencies = [
+ "bitflags 2.11.1",
+ "bytes",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "pin-project-lite",
  "tower-layer",
  "tower-service",
  "tracing",
