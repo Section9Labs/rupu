@@ -286,9 +286,9 @@ export interface SessionSummary {
 // ---------------------------------------------------------------------------
 
 export interface WorkerCapabilities {
-  backends: string[];
-  scm_hosts: string[];
-  permission_modes: string[];
+  backends?: string[];
+  scm_hosts?: string[];
+  permission_modes?: string[];
 }
 
 export interface WorkerRecord {
@@ -315,9 +315,9 @@ export interface CoverageSummary {
 
 export interface CoverageDetail {
   target_id: string;
-  /** ConcernAssertion[] — typed loosely; the page narrows what it renders. */
+  assertion_lines: number;
+  has_catalog: boolean;
   assertions: unknown[];
-  /** FindingRecord[] — typed loosely. */
   findings: unknown[];
 }
 
