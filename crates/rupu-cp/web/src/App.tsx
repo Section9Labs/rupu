@@ -1,10 +1,37 @@
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import Layout from './components/Layout';
+import Dashboard from './pages/Dashboard';
+import Runs from './pages/Runs';
+import Events from './pages/Events';
+import Coverage from './pages/Coverage';
+import Workflows from './pages/Workflows';
+import Agents from './pages/Agents';
+import Sessions from './pages/Sessions';
+import Workers from './pages/Workers';
+import Settings from './pages/Settings';
+
 export default function App() {
   return (
-    <div className="min-h-screen bg-bg text-ink flex items-center justify-center">
-      <div className="text-center space-y-2">
-        <h1 className="text-2xl font-semibold tracking-tight">rupu Control Plane</h1>
-        <p className="text-ink-dim text-sm">UI scaffold — pages coming soon.</p>
-      </div>
-    </div>
+    <BrowserRouter>
+      <ErrorBoundary>
+        <Routes>
+          <Route element={<Layout />}>
+            {/* Index redirect */}
+            <Route index element={<Navigate to="/dashboard" replace />} />
+            {/* Pages */}
+            <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/runs/*" element={<Runs />} />
+            <Route path="/events" element={<Events />} />
+            <Route path="/coverage" element={<Coverage />} />
+            <Route path="/workflows/*" element={<Workflows />} />
+            <Route path="/agents/*" element={<Agents />} />
+            <Route path="/sessions/*" element={<Sessions />} />
+            <Route path="/workers/*" element={<Workers />} />
+            <Route path="/settings" element={<Settings />} />
+          </Route>
+        </Routes>
+      </ErrorBoundary>
+    </BrowserRouter>
   );
 }
