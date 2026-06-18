@@ -108,7 +108,7 @@ url = "2"
 
 # Webhook receiver / control-plane (axum chosen for async-native + tower middleware)
 axum = "0.7"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["trace"] }
 hmac = "0.12"
 hex = "0.4"
 subtle = "2"
