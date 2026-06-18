@@ -134,17 +134,25 @@ fn scan_session_dir(
     }
 }
 
-async fn list_sessions(
-    State(s): State<AppState>,
-) -> ApiResult<Json<Vec<serde_json::Value>>> {
+/// Collect all sessions from both active and archive dirs. Each entry has an
+/// injected `"scope"` key (`"active"` or `"archived"`). Exposed as
+/// `pub(crate)` so that the dashboard aggregate can reuse the scan without
+/// duplicating logic.
+pub(crate) fn collect_sessions(global_dir: &std::path::Path) -> Vec<serde_json::Value> {
     let mut sessions = Vec::new();
-    scan_session_dir(&s.global_dir.join("sessions"), "active", &mut sessions);
+    scan_session_dir(&global_dir.join("sessions"), "active", &mut sessions);
     scan_session_dir(
-        &s.global_dir.join("sessions-archive"),
+        &global_dir.join("sessions-archive"),
         "archived",
         &mut sessions,
     );
-    Ok(Json(sessions))
+    sessions
+}
+
+async fn list_sessions(
+    State(s): State<AppState>,
+) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    Ok(Json(collect_sessions(&s.global_dir)))
 }
 
 async fn get_session(
