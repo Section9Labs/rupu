@@ -342,12 +342,75 @@ export interface CoverageSummary {
   findings: number;
 }
 
+/** Evidence attached to a `ConcernAssertion`. */
+export interface AssertionEvidence {
+  summary: string;
+  line_ranges: number[][];
+}
+
+/**
+ * One concern assertion from the per-target coverage JSONL.
+ * `status` is snake_case on the wire; map via `normAssertionStatus`.
+ */
+export interface ConcernAssertion {
+  concern_id: string;
+  file_path: string;
+  /** Raw wire value — use `normAssertionStatus` to map to the display union. */
+  status: string;
+  evidence: AssertionEvidence;
+  declared_by: unknown;
+  declared_at: string;
+}
+
+/** Normalised assertion status — tolerant of unknown future values. */
+export type AssertionStatus = 'clean' | 'finding' | 'examined' | 'not_applicable' | 'unknown';
+
+export function normAssertionStatus(raw: string): AssertionStatus {
+  switch (raw.toLowerCase()) {
+    case 'clean':          return 'clean';
+    case 'finding':        return 'finding';
+    case 'examined':       return 'examined';
+    case 'not_applicable': return 'not_applicable';
+    default:               return 'unknown';
+  }
+}
+
+/** Severity levels for findings — matches the `sev.*` Tailwind palette. */
+export type FindingSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+
+const SEV_ORDER: FindingSeverity[] = ['critical', 'high', 'medium', 'low', 'info'];
+
+export function normFindingSeverity(raw: string): FindingSeverity {
+  const v = raw.toLowerCase() as FindingSeverity;
+  return SEV_ORDER.includes(v) ? v : 'info';
+}
+
+/** Severity sort key: lower = more severe (for ascending sort). */
+export function sevRank(s: FindingSeverity): number {
+  return SEV_ORDER.indexOf(s);
+}
+
+/** One finding record from the per-target findings JSONL. */
+export interface FindingRecord {
+  id: string;
+  file_path?: string | null;
+  line_range?: [number, number] | null;
+  scope: unknown;
+  summary: string;
+  /** Raw wire value — use `normFindingSeverity` to get a `FindingSeverity`. */
+  severity: string;
+  concern_id?: string | null;
+  evidence: unknown;
+  declared_by: unknown;
+  declared_at: string;
+}
+
 export interface CoverageDetail {
   target_id: string;
   assertion_lines: number;
   has_catalog: boolean;
-  assertions: unknown[];
-  findings: unknown[];
+  assertions: ConcernAssertion[];
+  findings: FindingRecord[];
 }
 
 // ---------------------------------------------------------------------------

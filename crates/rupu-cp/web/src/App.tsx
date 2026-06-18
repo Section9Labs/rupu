@@ -6,6 +6,7 @@ import Runs from './pages/Runs';
 import RunDetail from './pages/RunDetail';
 import Events from './pages/Events';
 import Coverage from './pages/Coverage';
+import CoverageDetail from './pages/CoverageDetail';
 import Workflows from './pages/Workflows';
 import Agents from './pages/Agents';
 import Sessions from './pages/Sessions';
@@ -26,6 +27,7 @@ export default function App() {
             <Route path="/runs/:id" element={<RunDetail />} />
             <Route path="/events" element={<Events />} />
             <Route path="/coverage" element={<Coverage />} />
+            <Route path="/coverage/:target" element={<CoverageDetail />} />
             <Route path="/workflows/*" element={<Workflows />} />
             <Route path="/agents/*" element={<Agents />} />
             <Route path="/sessions/*" element={<Sessions />} />
