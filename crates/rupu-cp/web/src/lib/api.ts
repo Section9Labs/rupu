@@ -109,7 +109,11 @@ export interface StepResultRecord {
  * Common narrowed variants below; catch-all fields on the base allow
  * callers to read any variant without exhaustive narrowing.
  */
-export type RunEvent =
+/**
+ * The concrete, fully-narrowable event variants (each has a string-literal
+ * `type`). Switching on `type` over this union narrows cleanly.
+ */
+export type KnownRunEvent =
   | RunStartedEvent
   | StepStartedEvent
   | StepWorkingEvent
@@ -120,8 +124,9 @@ export type RunEvent =
   | UnitStartedEvent
   | UnitCompletedEvent
   | RunCompletedEvent
-  | RunFailedEvent
-  | UnknownRunEvent;
+  | RunFailedEvent;
+
+export type RunEvent = KnownRunEvent | UnknownRunEvent;
 
 interface RunEventBase {
   type: string;
@@ -209,6 +214,30 @@ export interface RunFailedEvent extends RunEventBase {
 export interface UnknownRunEvent extends RunEventBase {
   type: string;
   step_id?: string;
+}
+
+const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
+  'run_started',
+  'step_started',
+  'step_working',
+  'step_awaiting_approval',
+  'step_completed',
+  'step_failed',
+  'step_skipped',
+  'unit_started',
+  'unit_completed',
+  'run_completed',
+  'run_failed',
+]);
+
+/**
+ * Type-guard that narrows a `RunEvent` to a fully-typed `KnownRunEvent`.
+ * Needed because `UnknownRunEvent.type` is `string`, so a bare `switch` on
+ * `type` never removes the catch-all from the union (its fields stay `unknown`).
+ * Guard first, then switch over the narrowed `KnownRunEvent`.
+ */
+export function isKnownRunEvent(ev: RunEvent): ev is KnownRunEvent {
+  return KNOWN_EVENT_TYPES.has(ev.type as KnownRunEvent['type']);
 }
 
 // ---------------------------------------------------------------------------
