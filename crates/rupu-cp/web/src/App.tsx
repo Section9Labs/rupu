@@ -8,8 +8,11 @@ import Events from './pages/Events';
 import Coverage from './pages/Coverage';
 import CoverageDetail from './pages/CoverageDetail';
 import Workflows from './pages/Workflows';
+import WorkflowDetail from './pages/WorkflowDetail';
 import Agents from './pages/Agents';
+import AgentDetail from './pages/AgentDetail';
 import Sessions from './pages/Sessions';
+import SessionDetail from './pages/SessionDetail';
 import Workers from './pages/Workers';
 import Settings from './pages/Settings';
 
@@ -28,10 +31,13 @@ export default function App() {
             <Route path="/events" element={<Events />} />
             <Route path="/coverage" element={<Coverage />} />
             <Route path="/coverage/:target" element={<CoverageDetail />} />
-            <Route path="/workflows/*" element={<Workflows />} />
-            <Route path="/agents/*" element={<Agents />} />
-            <Route path="/sessions/*" element={<Sessions />} />
-            <Route path="/workers/*" element={<Workers />} />
+            <Route path="/workflows" element={<Workflows />} />
+            <Route path="/workflows/:name" element={<WorkflowDetail />} />
+            <Route path="/agents" element={<Agents />} />
+            <Route path="/agents/:name" element={<AgentDetail />} />
+            <Route path="/sessions" element={<Sessions />} />
+            <Route path="/sessions/:id" element={<SessionDetail />} />
+            <Route path="/workers" element={<Workers />} />
             <Route path="/settings" element={<Settings />} />
           </Route>
         </Routes>
