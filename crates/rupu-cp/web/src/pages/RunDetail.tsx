@@ -9,14 +9,13 @@ import { ArrowLeft, GitBranch, ListOrdered, Pause } from 'lucide-react';
 import {
   api,
   isKnownRunEvent,
-  type RunEvent,
   type RunRecord,
   type StepResultRecord,
 } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
 import { TabBar, TabButton } from '../components/TabBar';
 import RunGraph from '../components/RunGraph';
-import RunEventFeed, { type ConnectionState } from '../components/RunEventFeed';
+import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
 import { emptyRunStatus, reduceRunStatus, type RunStatusState } from '../lib/runStatus';
 import { absoluteTime } from '../lib/time';
 
@@ -33,11 +32,13 @@ export default function RunDetail() {
   const [tab, setTab] = useState<Tab>('graph');
 
   // Live state, fed by the single SSE subscription below.
-  const [events, setEvents] = useState<RunEvent[]>([]);
+  const [events, setEvents] = useState<SeqEvent[]>([]);
   const [live, setLive] = useState<RunStatusState>(emptyRunStatus);
   const [connection, setConnection] = useState<ConnectionState>('connecting');
   // The latest run status as overridden by run_completed / run_failed events.
   const [liveRunStatus, setLiveRunStatus] = useState<RunRecord['status'] | null>(null);
+  // Monotonically-increasing sequence counter — stable key source for SeqEvent.
+  const seqRef = useRef<number>(0);
 
   // Initial fetch of the persisted run + step records.
   useEffect(() => {
@@ -68,15 +69,17 @@ export default function RunDetail() {
     setEvents([]);
     setLive(emptyRunStatus());
     liveRef.current = emptyRunStatus();
+    seqRef.current = 0;
     setConnection('connecting');
 
     const unsubscribe = api.subscribeRunLog(
       id,
       (ev) => {
         setConnection('live');
+        const seq = ++seqRef.current;
         setEvents((prev) => {
           const next = prev.length >= MAX_EVENTS ? prev.slice(prev.length - MAX_EVENTS + 1) : prev;
-          return [...next, ev];
+          return [...next, { seq, event: ev }];
         });
         const nextLive = reduceRunStatus(liveRef.current, ev);
         liveRef.current = nextLive;
@@ -93,7 +96,7 @@ export default function RunDetail() {
 
   const agentByStepId = useMemo(() => {
     const m: Record<string, string> = {};
-    for (const ev of events) {
+    for (const { event: ev } of events) {
       if (!isKnownRunEvent(ev)) continue;
       if ((ev.type === 'step_started' || ev.type === 'unit_started') && ev.agent) {
         m[ev.step_id] = ev.agent;

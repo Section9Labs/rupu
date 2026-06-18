@@ -113,7 +113,7 @@ function RunStepNodeView({ data, selected }: NodeProps<RunStepNode>) {
               t.badge,
             )}
           >
-            {data.status.replace('_', ' ')}
+            {data.status.replace(/_/g, ' ')}
           </span>
         </div>
         {data.agent && (

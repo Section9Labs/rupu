@@ -26,6 +26,12 @@ import { formatDurationMs } from '../lib/time';
 
 export type ConnectionState = 'connecting' | 'live' | 'reconnecting';
 
+/** A RunEvent paired with a monotonically-increasing sequence id for stable React keys. */
+export interface SeqEvent {
+  seq: number;
+  event: RunEvent;
+}
+
 interface Visual {
   icon: LucideIcon;
   ring: string; // dot ring/bg
@@ -121,7 +127,7 @@ export default function RunEventFeed({
   events,
   connection,
 }: {
-  events: RunEvent[];
+  events: SeqEvent[];
   connection: ConnectionState;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -166,7 +172,7 @@ export default function RunEventFeed({
           </div>
         ) : (
           <ol className="timeline-list relative py-3 pl-5 pr-4">
-            {events.map((ev, i) => {
+            {events.map(({ seq, event: ev }, i) => {
               const known = isKnownRunEvent(ev);
               const v = known ? visualFor(ev) : UNKNOWN_VISUAL;
               const Icon = v.icon;
@@ -175,7 +181,7 @@ export default function RunEventFeed({
               const isLast = i === events.length - 1;
               return (
                 <li
-                  key={i}
+                  key={seq}
                   className="timeline-item relative flex gap-3 pb-3 last:pb-0"
                 >
                   {/* connector line */}
