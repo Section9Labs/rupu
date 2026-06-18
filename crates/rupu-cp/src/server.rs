@@ -10,6 +10,11 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .merge(crate::api::runs::routes())
+        .merge(crate::api::agents::routes())
+        .merge(crate::api::workflows::routes())
+        .merge(crate::api::sessions::routes())
+        .merge(crate::api::workers::routes())
+        .merge(crate::api::coverage::routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

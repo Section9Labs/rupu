@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 axum.workspace = true
 tokio = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tower-http = { workspace = true, features = ["trace"] }
 tracing.workspace = true
@@ -20,6 +21,10 @@ anyhow.workspace = true
 # In-workspace
 rupu-orchestrator = { path = "../rupu-orchestrator" }
 rupu-config = { path = "../rupu-config" }
+rupu-agent = { path = "../rupu-agent" }
+rupu-workspace = { path = "../rupu-workspace" }
+rupu-runtime = { path = "../rupu-runtime" }
+rupu-coverage = { path = "../rupu-coverage" }
 
 [dev-dependencies]
 chrono.workspace = true
