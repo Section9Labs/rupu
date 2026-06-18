@@ -17,6 +17,9 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::api::coverage::routes())
         .merge(crate::api::dashboard::routes())
         .merge(crate::api::events::routes())
+        // Registered routes above match first; anything else (incl. client-side
+        // routes like `/runs/abc`) falls through to the embedded SPA.
+        .fallback(crate::embed::static_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

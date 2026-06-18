@@ -1,4 +1,4 @@
-.PHONY: build release sign-dev sign-release run install sync gh-build bump fmt lint test gates app-smoke app-run clean help
+.PHONY: build release sign-dev sign-release run install sync gh-build bump fmt lint test gates app-smoke app-run cp cp-web clean help
 
 # Default target: a quick development build that's already code-signed
 # so the macOS keychain doesn't re-prompt on every iteration.
@@ -9,6 +9,16 @@ build:
 release:
 	cargo build --release -p rupu-cli
 	@scripts/sign-dev.sh release
+
+# Build the control-plane web UI, then the CLI that embeds it.
+# rupu-cp embeds crates/rupu-cp/web/dist/ at compile time via rust-embed,
+# so the web build must run BEFORE the cargo build to embed the real UI
+# (otherwise build.rs writes an honest "not built" placeholder).
+cp-web:
+	cd crates/rupu-cp/web && npm ci && npm run build
+
+cp: cp-web
+	cargo build -p rupu-cli
 
 # Sign-only targets (useful if you build via cargo directly):
 sign-dev:

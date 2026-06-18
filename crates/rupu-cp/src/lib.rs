@@ -3,6 +3,7 @@
 //! `serve` is the main entrypoint; wire it from `rupu cp serve`.
 
 pub mod api;
+pub mod embed;
 pub mod error;
 pub mod server;
 pub mod sse;
