@@ -80,10 +80,12 @@ async fn run_workflow_with_live_view(
     view_workflow: Workflow,
     runs_dir: PathBuf,
     run_id: String,
+    pricing: rupu_config::PricingConfig,
 ) -> Result<OrchestratorRunResult, RunWfErr> {
     let runner_task = tokio::spawn(run_workflow(opts));
     let view_task = tokio::spawn(async move {
-        let _ = crate::output::live_run::run_live_view(view_workflow, runs_dir, run_id).await;
+        let _ =
+            crate::output::live_run::run_live_view(view_workflow, runs_dir, run_id, pricing).await;
     });
     let result = match runner_task.await {
         Ok(r) => r,
@@ -2284,8 +2286,14 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
     // NOT pre-seed prior ✓ from the run-store into LiveRunState here
     // (the events stream re-establishes status as it replays).
     let result = if live_view_enabled(io::stdout().is_terminal(), plain) {
-        run_workflow_with_live_view(opts, view_workflow, global.join("runs"), run_id.to_string())
-            .await?
+        run_workflow_with_live_view(
+            opts,
+            view_workflow,
+            global.join("runs"),
+            run_id.to_string(),
+            cfg.pricing.clone(),
+        )
+        .await?
     } else {
         run_workflow(opts).await?
     };
@@ -3393,6 +3401,7 @@ async fn execute_workflow_invocation(
             workflow_for_resume.clone(),
             runs_dir.clone(),
             run_id.clone(),
+            cfg.pricing.clone(),
         )
         .await
         .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?

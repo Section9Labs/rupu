@@ -427,6 +427,34 @@ impl LiveRunState {
         self.tokens_out += tokens_out;
     }
 
+    /// Price a single per-turn `Usage` delta and accumulate it into the
+    /// run-total `cost`. Called as each `Usage` transcript event is
+    /// drained (once per event, alongside [`add_active_tokens`]), so cost
+    /// accrues monotonically without double-counting. `provider`/`model`
+    /// come from the `Usage` event itself; `agent` is the active step's
+    /// agent (the agent-level pricing fallback).
+    ///
+    /// When no pricing tier matches the `(provider, model, agent)` triple
+    /// the delta is skipped — `cost` only becomes `Some` once at least one
+    /// priced delta has landed, mirroring `run_cost_usd`'s "None unless a
+    /// price was found" contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accumulate_cost(
+        &mut self,
+        pricing: &rupu_config::PricingConfig,
+        provider: &str,
+        model: &str,
+        agent: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+    ) {
+        if let Some(p) = crate::pricing::lookup(pricing, provider, model, agent) {
+            let delta = p.cost_usd(input_tokens, output_tokens, cached_tokens);
+            self.cost = Some(self.cost.unwrap_or(0.0) + delta);
+        }
+    }
+
     /// Seconds since the run started, given a `now`.
     pub fn elapsed_secs(&self, now: DateTime<Utc>) -> i64 {
         self.started_at
@@ -459,6 +487,48 @@ fn ensure_unit_slot(units: &mut Vec<UnitState>, index: usize) {
             elapsed_secs: 0,
         });
     }
+}
+
+/// Overall run progress in `[0, 1]`, blending completed whole steps with
+/// the currently-active step's intra-step progress so the bar advances
+/// during a long fan-out / panel step rather than freezing between
+/// `StepCompleted` events.
+///
+/// `progress = (completed_steps + active_step_fraction) / total`, where
+/// `active_step_fraction` is:
+///   - fan-out (`for_each` / `parallel`): `done_units / total_units`
+///     (units in `Complete`/`Failed` over `fanout_total` or `units.len()`),
+///   - panel: `iteration / max_iterations`,
+///   - linear / unknown: `0.0`.
+///
+/// The active step is the one in `Active`/`Working` status (it is NOT
+/// counted in `completed_steps`). Clamped to `[0, 1]`.
+fn overall_progress_fraction(state: &LiveRunState) -> f64 {
+    let total = state.steps.len().max(1) as f64;
+    let completed = state.completed_steps() as f64;
+
+    let active_fraction = state
+        .steps
+        .iter()
+        .find(|s| matches!(s.status, NodeStatus::Active | NodeStatus::Working))
+        .map(|step| match step.kind {
+            StepKind::ForEach | StepKind::Parallel => {
+                let total_units = step.fanout_total.unwrap_or(step.units.len());
+                if total_units == 0 {
+                    0.0
+                } else {
+                    (step.done_units() as f64 / total_units as f64).clamp(0.0, 1.0)
+                }
+            }
+            StepKind::Panel => match step.panel_iter {
+                Some((iter, max)) if max > 0 => (iter as f64 / max as f64).clamp(0.0, 1.0),
+                _ => 0.0,
+            },
+            StepKind::Linear => 0.0,
+        })
+        .unwrap_or(0.0);
+
+    ((completed + active_fraction) / total).clamp(0.0, 1.0)
 }
 
 fn step_kind(step: &rupu_orchestrator::Step) -> StepKind {
@@ -525,7 +595,10 @@ pub fn render_dashboard(state: &LiveRunState, now: DateTime<Utc>, width: usize) 
         })
         .unwrap_or("");
     let bar_w = 24usize;
-    let filled = (done * bar_w).checked_div(total).unwrap_or(0).min(bar_w);
+    // Blend completed steps with the active step's intra-step progress so
+    // the bar visibly advances during a long fan-out / panel step instead
+    // of freezing between `StepCompleted` events.
+    let filled = ((overall_progress_fraction(state) * bar_w as f64).round() as usize).min(bar_w);
     let mut prog = String::new();
     let _ = palette::write_colored(&mut prog, &format!("step {done}/{total}   "), DIM);
     let _ = palette::write_colored(&mut prog, &"█".repeat(filled), RUNNING);
@@ -944,6 +1017,7 @@ pub async fn run_live_view(
     workflow: Workflow,
     runs_dir: std::path::PathBuf,
     run_id: String,
+    pricing: rupu_config::PricingConfig,
 ) -> std::io::Result<()> {
     use crossterm::cursor::{Hide, MoveToColumn, MoveToPreviousLine, Show};
     use crossterm::style::Print;
@@ -1015,12 +1089,27 @@ pub async fn run_live_view(
                 // `UnitCompleted` carries 0). Drained once per event, so
                 // accumulation does not double-count across ticks.
                 if let rupu_transcript::Event::Usage {
+                    provider,
+                    model,
                     input_tokens,
                     output_tokens,
-                    ..
+                    cached_tokens,
                 } = &ev
                 {
                     state.add_active_tokens(*input_tokens as u64, *output_tokens as u64);
+                    // Price this delta from the event's own provider/model
+                    // (covers mid-run model swaps) and the active step's
+                    // agent for the agent-level pricing fallback.
+                    let agent = state.active.agent.clone().unwrap_or_default();
+                    state.accumulate_cost(
+                        &pricing,
+                        provider,
+                        model,
+                        &agent,
+                        *input_tokens as u64,
+                        *output_tokens as u64,
+                        *cached_tokens as u64,
+                    );
                 }
                 if let Some((kind, text)) = map_transcript_event(&ev, now) {
                     state.push_activity(now, kind, text);
@@ -1292,14 +1381,16 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_progress_bar_fills_completed_over_total() {
+    fn dashboard_progress_bar_blends_active_step_units() {
+        // 1 of 4 steps complete (understand), plus the active fan-out
+        // `assess` step is 2/5 units done. The bar is unit-aware:
+        // (1 + 0.4) / 4 = 0.35 → 0.35 * 24 = 8.4 → round = 8 filled.
         let state = fanout_state(true);
         let rows = stripped(render_dashboard(&state, ts(31), 79));
-        // 1 of 4 steps complete (understand). Bar is 24 wide → 6 filled.
         let prog = rows.iter().find(|r| r.contains("step ")).unwrap();
         assert!(prog.contains("step 1/4"), "got {prog:?}");
-        assert_eq!(prog.matches('█').count(), 6, "got {prog:?}");
-        assert_eq!(prog.matches('░').count(), 18, "got {prog:?}");
+        assert_eq!(prog.matches('█').count(), 8, "got {prog:?}");
+        assert_eq!(prog.matches('░').count(), 16, "got {prog:?}");
     }
 
     #[test]
@@ -1611,6 +1702,124 @@ mod tests {
         );
         let rtc = step.units.iter().find(|u| u.key == "rtc").unwrap();
         assert_eq!(rtc.tokens, 42);
+    }
+
+    #[test]
+    fn overall_progress_fraction_blends_active_fanout() {
+        // 4 steps, step 2 (`assess`) active with 2 of 5 units done.
+        // (1 completed + 2/5) / 4 = 1.4 / 4 = 0.35.
+        let state = fanout_state(true);
+        let frac = overall_progress_fraction(&state);
+        assert!((frac - 0.35).abs() < 1e-9, "got {frac}");
+    }
+
+    #[test]
+    fn overall_progress_fraction_panel_uses_iteration() {
+        // Make the panel the only active step: clear the fan-out's
+        // active status so only `sweep` (panel iter 2/10) is active.
+        let mut state = fanout_state(true);
+        state.steps[1].status = NodeStatus::Complete; // assess no longer active
+                                                      // completed = understand + assess = 2; active = sweep panel 2/10.
+                                                      // (2 + 0.2) / 4 = 0.55.
+        let frac = overall_progress_fraction(&state);
+        assert!((frac - 0.55).abs() < 1e-9, "got {frac}");
+    }
+
+    #[test]
+    fn overall_progress_fraction_spec_example() {
+        // Spec example: 4 steps, step 2 active at 3/5 units ⇒
+        // (1 + 0.6) / 4 = 0.4.
+        let mut state = fanout_state(true);
+        // Mark a third unit complete so done_units = 3 of 5.
+        state.steps[1].units[3].status = NodeStatus::Complete;
+        let frac = overall_progress_fraction(&state);
+        assert!((frac - 0.4).abs() < 1e-9, "got {frac}");
+    }
+
+    #[test]
+    fn overall_progress_fraction_clamped_to_unit_interval() {
+        let mut state = fanout_state(true);
+        // All steps complete → fraction is 1.0 (no active step).
+        for step in &mut state.steps {
+            step.status = NodeStatus::Complete;
+        }
+        let frac = overall_progress_fraction(&state);
+        assert!((frac - 1.0).abs() < 1e-9, "got {frac}");
+    }
+
+    #[test]
+    fn accumulate_cost_prices_usage_deltas() {
+        // Built-in anthropic pricing exists for claude-sonnet-4-6:
+        // input 3.0 / output 15.0 per Mtok. cost starts None.
+        let mut state = fanout_state(true);
+        state.cost = None;
+        let pricing = rupu_config::PricingConfig::default();
+
+        // 1M input + 1M output → 3.0 + 15.0 = 18.0.
+        state.accumulate_cost(
+            &pricing,
+            "anthropic",
+            "claude-sonnet-4-6",
+            "oracle-assessor",
+            1_000_000,
+            1_000_000,
+            0,
+        );
+        assert_eq!(state.cost, Some(18.0));
+
+        // A second delta accumulates rather than overwrites.
+        state.accumulate_cost(
+            &pricing,
+            "anthropic",
+            "claude-sonnet-4-6",
+            "oracle-assessor",
+            0,
+            1_000_000,
+            0,
+        );
+        assert_eq!(state.cost, Some(33.0));
+    }
+
+    #[test]
+    fn accumulate_cost_unknown_model_leaves_cost_untouched() {
+        let mut state = fanout_state(true);
+        state.cost = None;
+        let pricing = rupu_config::PricingConfig::default();
+        // No pricing tier matches → cost stays None (the `—` placeholder).
+        state.accumulate_cost(
+            &pricing,
+            "nonesuch-provider",
+            "nonesuch-model",
+            "nonesuch-agent",
+            1_000_000,
+            1_000_000,
+            0,
+        );
+        assert_eq!(state.cost, None);
+    }
+
+    #[test]
+    fn add_active_tokens_credits_linear_step_when_no_unit() {
+        // A linear step is active (unit_key = None, as set by
+        // `apply(StepStarted)`); a drained `Usage` delta must update the
+        // step + run totals via the `unit_key = None` branch.
+        let mut state = fanout_state(true);
+        state.active.step_id = Some("understand".into());
+        state.active.unit_key = None;
+        let step_in_before = state.steps[0].tokens_in;
+        let step_out_before = state.steps[0].tokens_out;
+        let run_in_before = state.tokens_in;
+        let run_out_before = state.tokens_out;
+
+        state.add_active_tokens(1500, 400);
+
+        let step = state.steps.iter().find(|s| s.id == "understand").unwrap();
+        assert_eq!(step.tokens_in, step_in_before + 1500);
+        assert_eq!(step.tokens_out, step_out_before + 400);
+        assert_eq!(state.tokens_in, run_in_before + 1500);
+        assert_eq!(state.tokens_out, run_out_before + 400);
+        // No units on a linear step → none mutated.
+        assert!(step.units.is_empty());
     }
 
     #[test]
