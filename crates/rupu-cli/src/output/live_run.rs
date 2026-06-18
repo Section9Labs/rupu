@@ -971,12 +971,73 @@ fn truncate_plain(s: &str, max: usize) -> String {
     }
 }
 
+/// ANSI-aware single-row truncation to at most `width` *visible* columns.
+///
+/// Counts visible columns via [`visible_len`] (ANSI SGR runs are
+/// zero-width) so color codes are neither counted nor split mid-escape.
+/// A row that already fits is returned unchanged. A row that overflows is
+/// cut to the first `width` visible columns (reusing [`wrap_with_ansi`]'s
+/// SGR-preserving split), with the final visible column replaced by `…`
+/// so the truncation reads cleanly and never wraps onto a second line.
+fn truncate_to_width(row: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if visible_len(row) <= width {
+        return row.to_string();
+    }
+    // First wrap piece is exactly `width` visible columns wide, with the
+    // active SGR state preserved and a trailing reset. Replace its last
+    // visible char with `…`.
+    let head = crate::output::printer::wrap_with_ansi(row, width)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+
+    // Walk `head` and drop the last visible char, inserting `…` in its
+    // place while keeping all SGR runs intact.
+    let total_visible = visible_len(&head);
+    let mut out = String::with_capacity(head.len() + 3);
+    let mut seen = 0usize;
+    let mut chars = head.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            out.push(c);
+            for inner in chars.by_ref() {
+                out.push(inner);
+                if inner == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        seen += 1;
+        if seen == total_visible {
+            out.push('…');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Combined view
 // ---------------------------------------------------------------------------
 
-/// Stack the three zones into a single fixed-height block. Zone 3 grows
-/// to fill the remaining terminal height below Zones 1 + 2.
+/// Stack the three zones into a single block that is HARD-bounded to the
+/// viewport: at most `term_height` rows, and every row at most
+/// `term_width` visible columns. The alt-screen loop owns the terminal,
+/// so a frame that overflows either dimension would scroll/wrap and
+/// corrupt the display — hence the clamp lives here, not in the loop.
+///
+/// Budget (top-down, fixed zones win): dashboard (~5 rows) + a blank +
+/// graph + a blank + focus feed. The focus feed takes whatever rows
+/// remain after the dashboard and graph. If the dashboard + graph alone
+/// exceed the height, the graph is clipped with a trailing `… (+N more)`
+/// row so the dashboard always survives. Each emitted row is then
+/// truncated to `term_width` visible columns (ANSI-aware), so no row ever
+/// wraps onto a second physical line.
 pub fn render_view(
     state: &LiveRunState,
     workflow: &Workflow,
@@ -985,30 +1046,108 @@ pub fn render_view(
     term_height: usize,
 ) -> Vec<String> {
     let width = term_width.max(20);
-    let mut out = Vec::new();
+    let height = term_height.max(1);
 
-    out.extend(render_dashboard(state, now, width));
-    out.push(String::new());
-    out.extend(render_graph(state, workflow, width));
-    out.push(String::new());
+    let dashboard = render_dashboard(state, now, width);
+    let graph = render_graph(state, workflow, width);
 
-    let used = out.len();
-    let focus_height = term_height.saturating_sub(used).max(3);
-    out.extend(render_focus(state, now, width, focus_height));
+    let mut out: Vec<String> = Vec::new();
 
-    out
+    // Zone 1 — dashboard always wins; if even it overflows, clip it.
+    out.extend(dashboard);
+    if out.len() > height {
+        out.truncate(height);
+        return clamp_rows_width(out, width);
+    }
+
+    // Separator + Zone 2 — graph. Reserve at least one row for the graph
+    // (or its "+N more" marker) when there's room; clip with a marker if
+    // dashboard + separator + graph would overflow.
+    if out.len() < height {
+        out.push(String::new());
+    }
+    let remaining_for_graph = height.saturating_sub(out.len());
+    if remaining_for_graph == 0 {
+        out.truncate(height);
+        return clamp_rows_width(out, width);
+    }
+    if graph.len() > remaining_for_graph {
+        // Keep what fits, minus one row for the truncation marker.
+        let keep = remaining_for_graph.saturating_sub(1);
+        let hidden = graph.len() - keep;
+        out.extend(graph.into_iter().take(keep));
+        let mut marker = String::new();
+        let _ = palette::write_colored(&mut marker, &format!("… (+{hidden} more)"), DIM);
+        out.push(marker);
+        out.truncate(height);
+        return clamp_rows_width(out, width);
+    }
+    out.extend(graph);
+
+    // Separator + Zone 3 — focus feed fills whatever rows remain.
+    if out.len() < height {
+        out.push(String::new());
+    }
+    let focus_height = height.saturating_sub(out.len());
+    if focus_height > 0 {
+        out.extend(render_focus(state, now, width, focus_height));
+    }
+
+    // Final guards: never exceed the height, never exceed the width.
+    out.truncate(height);
+    clamp_rows_width(out, width)
+}
+
+/// Truncate every row to at most `width` visible columns (ANSI-aware).
+fn clamp_rows_width(rows: Vec<String>, width: usize) -> Vec<String> {
+    rows.into_iter()
+        .map(|r| truncate_to_width(&r, width))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
 // Live loop (best-effort; cursor control validated by running it)
 // ---------------------------------------------------------------------------
 
-/// Drive the live three-zone view in place until the run reaches a
-/// terminal state. Tails `events.jsonl` for step status, reads
+/// RAII guard that owns the alternate screen for the live view. On entry
+/// it switches to the alt screen and hides the cursor; on `Drop` it shows
+/// the cursor and leaves the alt screen — restoring the user's normal
+/// terminal on EVERY exit path (normal return, early return, panic,
+/// Ctrl-C). Mirrors `session.rs`'s `SessionScreenGuard`.
+struct AltScreenGuard;
+
+impl AltScreenGuard {
+    fn enter() -> std::io::Result<Self> {
+        use crossterm::cursor::Hide;
+        use crossterm::execute;
+        use crossterm::terminal::EnterAlternateScreen;
+        execute!(std::io::stdout(), EnterAlternateScreen, Hide)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AltScreenGuard {
+    fn drop(&mut self) {
+        use crossterm::cursor::Show;
+        use crossterm::execute;
+        use crossterm::terminal::LeaveAlternateScreen;
+        let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
+    }
+}
+
+/// Drive the live three-zone view on the alternate screen until the run
+/// reaches a terminal state. Tails `events.jsonl` for step status, reads
 /// `run.json` for the active step's transcript path, and tails that
 /// transcript for the focus feed. Repaints on a ~100ms tick and
-/// immediately after each event batch. No alt-screen — the final frame
-/// stays on the terminal.
+/// immediately after each event batch.
+///
+/// The view fully owns the terminal via [`AltScreenGuard`]: every tick
+/// re-queries the terminal size (resize-aware), rebuilds a frame bounded
+/// to the viewport by [`render_view`], homes the cursor and clears, then
+/// repaints. No `MoveToPreviousLine`/`prev_lines` bookkeeping — the frame
+/// can never overflow or wrap, so it can never stack. The guard restores
+/// the normal screen on every exit path; a short final summary line is
+/// printed to the restored screen.
 ///
 /// Best-effort: any I/O hiccup degrades to the next tick. The caller
 /// guards entry behind a tty check; non-tty falls back to the existing
@@ -1019,10 +1158,10 @@ pub async fn run_live_view(
     run_id: String,
     pricing: rupu_config::PricingConfig,
 ) -> std::io::Result<()> {
-    use crossterm::cursor::{Hide, MoveToColumn, MoveToPreviousLine, Show};
+    use crossterm::cursor::MoveTo;
+    use crossterm::queue;
     use crossterm::style::Print;
     use crossterm::terminal::{self, Clear, ClearType};
-    use crossterm::{execute, queue};
     use std::io::Write;
 
     let store = rupu_orchestrator::RunStore::new(runs_dir.clone());
@@ -1032,9 +1171,10 @@ pub async fn run_live_view(
 
     let mut transcript_tailer: Option<(std::path::PathBuf, crate::output::TranscriptTailer)> = None;
     let mut tick: u64 = 0;
-    let mut prev_lines: u16 = 0;
     let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, Hide);
+    // Take the alternate screen. The guard restores the normal screen
+    // (and cursor) on every exit path via Drop.
+    let _screen = AltScreenGuard::enter()?;
 
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
     loop {
@@ -1117,36 +1257,41 @@ pub async fn run_live_view(
             }
         }
 
-        // Repaint.
+        // Repaint. Re-query the size every tick so a mid-run terminal
+        // resize is reflected immediately. `render_view` hard-bounds the
+        // frame to `(cols, rows)` so it can never overflow or wrap.
         let now = Utc::now();
         let (cols, rows) = terminal::size().unwrap_or((100, 30));
         let _ = tick; // spinner advance is handled via heartbeat / glyphs
-        let frame = render_view(
-            &state,
-            &workflow,
-            now,
-            cols as usize,
-            (rows as usize).min(40),
-        );
+        let frame = render_view(&state, &workflow, now, cols as usize, rows as usize);
 
-        if prev_lines > 0 {
-            let _ = queue!(stdout, MoveToPreviousLine(prev_lines));
-        }
-        let _ = queue!(stdout, MoveToColumn(0), Clear(ClearType::FromCursorDown));
+        let _ = queue!(stdout, MoveTo(0, 0), Clear(ClearType::All));
         for line in &frame {
             let _ = queue!(stdout, Print(line), Print("\r\n"));
         }
         let _ = stdout.flush();
-        prev_lines = frame.len() as u16;
 
         if state.status.is_terminal() {
             break;
         }
     }
 
-    // Final repaint already reflects the terminal state; leave it on
-    // screen and restore the cursor.
-    let _ = execute!(stdout, MoveToColumn(0), Show);
+    // Render one final frame reflecting the terminal state, then drop the
+    // guard to restore the normal screen and print a short summary there.
+    let now = Utc::now();
+    let (cols, rows) = terminal::size().unwrap_or((100, 30));
+    let frame = render_view(&state, &workflow, now, cols as usize, rows as usize);
+    let _ = queue!(stdout, MoveTo(0, 0), Clear(ClearType::All));
+    for line in &frame {
+        let _ = queue!(stdout, Print(line), Print("\r\n"));
+    }
+    let _ = stdout.flush();
+
+    drop(_screen);
+
+    let (label, _) = state.status_label();
+    let _ = writeln!(stdout, "{label} · run {run_id}");
+    let _ = stdout.flush();
     Ok(())
 }
 
@@ -1842,5 +1987,92 @@ mod tests {
         assert!(plain.iter().any(|r| r.contains("understand")));
         assert!(plain.iter().any(|r| r.starts_with("╭ ")));
         assert!(plain.iter().any(|r| r.starts_with("╰")));
+    }
+
+    /// A state with many steps, each a fan-out with many units, so the
+    /// graph alone is far taller than any small viewport — forces the
+    /// height-truncation (graph clip) path.
+    fn many_steps_state() -> LiveRunState {
+        let mut base = fanout_state(true);
+        let mut steps = Vec::new();
+        for i in 0..40 {
+            let mut units = Vec::new();
+            for u in 0..6 {
+                units.push(UnitState {
+                    key: format!("very-long-unit-name-that-overflows-{i}-{u}"),
+                    status: NodeStatus::Working,
+                    tokens: 120_000,
+                    elapsed_secs: 8,
+                });
+            }
+            steps.push(StepState {
+                id: format!("step-with-a-deliberately-long-identifier-{i}"),
+                kind: StepKind::ForEach,
+                agent: Some("for_each".into()),
+                status: NodeStatus::Working,
+                tokens_in: 500_000,
+                tokens_out: 0,
+                elapsed_secs: 0,
+                units,
+                fanout_total: Some(6),
+                panel_iter: None,
+                panel_findings: 0,
+            });
+        }
+        base.steps = steps;
+        base
+    }
+
+    #[test]
+    fn render_view_bounds_height_and_width() {
+        let state = many_steps_state();
+        for (w, h) in [(40usize, 10usize), (20, 6), (60, 15), (30, 3)] {
+            let rows = render_view(&state, &empty_workflow(), ts(31), w, h);
+            assert!(
+                rows.len() <= h,
+                "({w},{h}) produced {} rows (> {h})",
+                rows.len()
+            );
+            for (i, r) in rows.iter().enumerate() {
+                assert!(
+                    visible_len(r) <= w,
+                    "({w},{h}) row {i} visible_len {} > {w}: {r:?}",
+                    visible_len(r)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_view_emits_more_marker_when_graph_clipped() {
+        let state = many_steps_state();
+        // Dashboard (~5) + separator + graph (huge) into a 12-row viewport
+        // must clip the graph and surface the "+N more" marker.
+        let rows = render_view(&state, &empty_workflow(), ts(31), 80, 12);
+        assert!(rows.len() <= 12);
+        let plain = stripped(rows);
+        assert!(
+            plain.iter().any(|r| r.contains("more)")),
+            "expected a truncation marker, got: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn truncate_to_width_is_ansi_aware() {
+        // Plain string longer than width gets an ellipsis at the width.
+        let t = truncate_to_width("abcdefgh", 4);
+        assert_eq!(visible_len(&t), 4);
+        assert!(t.ends_with('…'));
+
+        // A colored string: ANSI must not be counted and the visible
+        // width must respect the bound.
+        let mut colored = String::new();
+        let _ = palette::write_colored(&mut colored, "abcdefghij", palette::BRAND);
+        let t = truncate_to_width(&colored, 5);
+        assert_eq!(visible_len(&t), 5, "colored truncation: {t:?}");
+        assert!(t.contains('\x1b'), "color codes preserved");
+
+        // A string that already fits is returned unchanged.
+        assert_eq!(truncate_to_width("hi", 10), "hi");
     }
 }
