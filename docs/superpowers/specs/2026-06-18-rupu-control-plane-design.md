@@ -195,18 +195,21 @@ DTOs reuse the existing serde types (`RunRecord`, `Event`, `WorkerRecord`,
   hosts (the `WorkerRecord` registry + an Okesu-style tunnel/relay), cookie
   sessions + roles. The single-host data shapes were chosen to extend here.
 
-## Non-goals / open decisions
+## Decisions (confirmed) + non-goals
+- **Okesu reuse = vendor a trimmed copy (DECIDED).** Copy `Okesu/web` into
+  `crates/rupu-cp/web`, strip the domain-specific pages/components
+  (Investigations, Catalog, Federation, Daimon/Finding internals), keep the
+  design system + shell + generic components, remap the rest. rupu's CP then
+  **diverges freely** — no shared design package (the two products will
+  diverge; the point is to save UI coding, not to couple them).
+- **Coverage is a first-class Phase-1 page (DECIDED).** It's the headline
+  "how far is each project getting" progress signal — `Coverage` ships in
+  Phase 1 (targets list + per-target status/findings). Richer grid/Kanban
+  parity with Okesu Findings can deepen later, but the page is in P1.
 - **DB:** none in Phase 1 (file stores are authoritative). Revisit only for
   list-scale.
-- **Auth:** localhost + optional token in Phase 1; full RBAC in Phase 4.
-- **Coverage UI depth:** Phase 1 lists targets + findings; the richer
-  grid/Kanban (Okesu Findings parity) can deepen later.
-- **Okesu code reuse mechanics:** copy `Okesu/web` into `crates/rupu-cp/web`,
-  strip the domain-specific pages/components (Investigations, Catalog,
-  Federation, Daimon/Finding internals), keep the design system + shell +
-  generic components, and remap the rest. Decision to confirm: vendor a trimmed
-  copy (clean, diverges over time) vs. a shared design package (more coupling).
-  Recommendation: **vendor a trimmed copy** — the two products will diverge.
+- **Auth:** localhost-bound + optional `--token` in Phase 1; full cookie/RBAC
+  in Phase 4 (when exposed beyond localhost / multi-user).
 
 ## Testing
 - Backend: handler unit tests over a temp `RunStore`/`WorkerStore` (mirror the
