@@ -9,6 +9,7 @@ async fn healthz() -> &'static str {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .merge(crate::api::runs::routes())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
