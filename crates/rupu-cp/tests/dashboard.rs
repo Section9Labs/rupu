@@ -78,9 +78,7 @@ fn seed_coverage_target(workspace: &Path, target_id: &str, assertion_lines: usiz
         "declared_at": "2026-06-16T00:00:00Z"
     })
     .to_string();
-    let content = std::iter::repeat(format!("{line}\n"))
-        .take(assertion_lines)
-        .collect::<String>();
+    let content = format!("{line}\n").repeat(assertion_lines);
     std::fs::write(&paths.concerns, content).unwrap();
 }
 
@@ -255,7 +253,7 @@ async fn dashboard_empty_state_returns_zeros() {
 
     assert_eq!(body["runs"]["total"].as_u64(), Some(0));
     assert!(
-        body["recent_runs"].as_array().map_or(false, |a| a.is_empty()),
+        body["recent_runs"].as_array().is_some_and(|a| a.is_empty()),
         "recent_runs should be empty"
     );
     assert_eq!(body["sessions"]["total"].as_u64(), Some(0));

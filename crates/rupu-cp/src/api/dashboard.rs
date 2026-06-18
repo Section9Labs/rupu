@@ -95,9 +95,11 @@ async fn get_dashboard(State(s): State<AppState>) -> ApiResult<Json<DashboardRes
     };
 
     // --- recent_runs (top 10 sorted descending by started_at) ---------------
-    // RunStore::list() already returns sorted descending by started_at.
-    let recent_runs: Vec<RecentRun> = all_runs
-        .iter()
+    // Defensive sort so this is correct regardless of RunStore::list() ordering.
+    let mut runs_sorted = all_runs.iter().collect::<Vec<_>>();
+    runs_sorted.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    let recent_runs: Vec<RecentRun> = runs_sorted
+        .into_iter()
         .take(10)
         .map(|r| RecentRun {
             id: r.id.clone(),
@@ -131,7 +133,10 @@ async fn get_dashboard(State(s): State<AppState>) -> ApiResult<Json<DashboardRes
     let worker_count = worker_store
         .list()
         .map(|w| w.len())
-        .unwrap_or(0);
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "dashboard: failed to list workers; using 0");
+            0
+        });
 
     // --- coverage ------------------------------------------------------------
     let (cov_targets, cov_assertions) = match discover_targets(&s.workspace_dir) {
