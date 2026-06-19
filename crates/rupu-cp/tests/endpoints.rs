@@ -15,7 +15,7 @@ async fn spawn_server(
 ) -> std::net::SocketAddr {
     let state = rupu_cp::state::AppState::new(global.into(), PricingConfig::default())
         .with_workspace_dir(workspace.into());
-    let app = rupu_cp::server::router(state);
+    let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

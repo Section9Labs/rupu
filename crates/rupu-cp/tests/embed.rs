@@ -11,7 +11,7 @@ async fn spawn_server() -> SocketAddr {
         rupu_cp::state::AppState::new(dir.path().into(), rupu_config::PricingConfig::default());
     // Keep the tempdir alive for the lifetime of the test process.
     std::mem::forget(dir);
-    let app = rupu_cp::server::router(state);
+    let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

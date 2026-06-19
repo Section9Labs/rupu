@@ -17,6 +17,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tower-http = { workspace = true, features = ["trace"] }
 tracing.workspace = true
+subtle.workspace = true
 anyhow.workspace = true
 futures-util = { workspace = true }
 rust-embed.workspace = true

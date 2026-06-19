@@ -12,8 +12,9 @@ pub enum Action {
         /// Address to bind. Defaults to 127.0.0.1:7878.
         #[arg(long, default_value = "127.0.0.1:7878")]
         bind: SocketAddr,
-        /// Optional bearer token. When set, all `/api/*` routes require
-        /// `Authorization: Bearer <token>`.
+        /// Optional bearer token. If set, `/api/*` requires
+        /// `Authorization: Bearer <token>` (the web UI and `/healthz` remain
+        /// open on localhost).
         #[arg(long)]
         token: Option<String>,
     },

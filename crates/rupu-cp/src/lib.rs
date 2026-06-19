@@ -24,13 +24,7 @@ pub struct ServeOpts {
 
 pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let app_state = state::AppState::new(opts.global_dir, PricingConfig::default());
-    let app = server::router(app_state);
-
-    // TODO(T2+): when token is set, add a tower middleware layer that
-    // validates `Authorization: Bearer <token>` for all `/api/*` routes.
-    if opts.token.is_some() {
-        tracing::warn!("--token set but bearer auth middleware not yet implemented (T2+)");
-    }
+    let app = server::router(app_state, opts.token);
 
     let listener = tokio::net::TcpListener::bind(opts.bind)
         .await

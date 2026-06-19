@@ -86,8 +86,3 @@ async fn events_stream(
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(sse.into_response())
 }
-
-/// Type alias to keep the idle-stream arm tidy in callers that need the
-/// concrete type. Not currently exported; kept for potential reuse.
-#[allow(dead_code)]
-type IdleSseStream = Sse<stream::Pending<Result<SseEvent, Infallible>>>;
