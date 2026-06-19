@@ -279,13 +279,12 @@ export interface StepNodeDto {
 export interface UnitCheckpoint {
   step_id: string;
   index: number;
-  /** The for_each item — this is the unit "key". */
-  item: string;
-  run_id?: string;
-  transcript_path?: string | null;
-  output?: string | null;
+  item: unknown;            // serde_json::Value — may be a string, object, or array
+  run_id: string;
+  transcript_path: string;
+  output: string;
   success: boolean;
-  finished_at?: string | null;
+  finished_at: string;      // ISO-8601
 }
 
 export interface RunGraphResponse {
