@@ -69,7 +69,10 @@ export interface RunGraphModel {
 
 /** Coerce `item: unknown` from a UnitCheckpoint to a display string. */
 function coerceItem(item: unknown): string {
-  return typeof item === 'string' ? item : JSON.stringify(item);
+  // `JSON.stringify(undefined) === undefined`, so guard the total path:
+  // strings pass through; everything else stringifies, falling back to
+  // `String(item)` when stringify yields undefined (e.g. `item === undefined`).
+  return typeof item === 'string' ? item : (JSON.stringify(item) ?? String(item));
 }
 
 /** Zero-fill a byState counter object. */

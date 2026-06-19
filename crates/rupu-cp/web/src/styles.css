@@ -94,3 +94,47 @@
 .timeline-list > li {
   transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
 }
+
+/* ------------------------------------------------------------------ */
+/* Run-graph node + edge animation (Task 11)                          */
+/* Faithful to the approved graph-pro / fanout-loop mockups:          */
+/*   • running node  → soft blue pulse ring                           */
+/*   • awaiting node → soft amber pulse ring                          */
+/*   • active edge   → blue "marching-ants" (xyflow paints the path,  */
+/*     so animate stroke-dashoffset on the SVG path itself)           */
+/* ------------------------------------------------------------------ */
+@keyframes rg-pulse-blue {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(24, 96, 242, 0.45); }
+  50%      { box-shadow: 0 0 0 7px rgba(24, 96, 242, 0); }
+}
+@keyframes rg-pulse-amber {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.45); }
+  50%      { box-shadow: 0 0 0 7px rgba(245, 158, 11, 0); }
+}
+.rg-pulse-run   { animation: rg-pulse-blue  1.7s ease-in-out infinite; }
+.rg-pulse-await { animation: rg-pulse-amber 1.7s ease-in-out infinite; }
+
+@keyframes rg-march {
+  to { stroke-dashoffset: -28; }
+}
+/* xyflow renders the edge as `path.react-flow__edge-path`; mark the
+ * active/awaiting edges via a wrapper class on the <g> and animate the
+ * dashed stroke so the ants march along the rendered curve. */
+.react-flow__edge.rg-edge-active .react-flow__edge-path {
+  stroke: #1860f2;
+  stroke-width: 2;
+  stroke-dasharray: 7 7;
+  animation: rg-march 0.7s linear infinite;
+}
+.react-flow__edge.rg-edge-await .react-flow__edge-path {
+  stroke: #f59e0b;
+  stroke-width: 2;
+  stroke-dasharray: 6 6;
+  animation: rg-march 0.9s linear infinite;
+}
+
+/* Animated panel-loop back-edge marker (round-counter loop cue). */
+@keyframes rg-loop-spin {
+  to { transform: rotate(360deg); }
+}
+.rg-loop-spin { animation: rg-loop-spin 2.4s linear infinite; display: inline-block; }
