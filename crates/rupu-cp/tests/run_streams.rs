@@ -118,3 +118,147 @@ async fn list_autoflows_empty_when_no_store_dir() {
         "no cycles seeded, response should be []; got {arr:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Agent runs tests
+// ---------------------------------------------------------------------------
+
+/// Write a minimal `<run_id>.meta.json` into `<global>/transcripts/`.
+fn seed_standalone_meta(global_dir: &std::path::Path, run_id: &str) {
+    let transcripts = global_dir.join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let meta = serde_json::json!({
+        "version": 1,
+        "run_id": run_id,
+        "session_id": null,
+        "workspace_path": "/tmp/repo",
+        "backend_id": "local_checkout",
+        "trigger_source": "run_cli"
+    });
+    let path = transcripts.join(format!("{run_id}.meta.json"));
+    std::fs::write(path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+}
+
+/// Write a `session.json` with one embedded run into
+/// `<global>/sessions/<session_id>/session.json`.
+fn seed_session_with_run(
+    global_dir: &std::path::Path,
+    session_id: &str,
+    agent_name: &str,
+    run_id: &str,
+) {
+    let session_dir = global_dir.join("sessions").join(session_id);
+    std::fs::create_dir_all(&session_dir).unwrap();
+    let transcript_path = format!("/tmp/.rupu/transcripts/{run_id}.jsonl");
+    let session = serde_json::json!({
+        "version": 1,
+        "session_id": session_id,
+        "agent_name": agent_name,
+        "runs": [
+            {
+                "run_id": run_id,
+                "prompt": "do the thing",
+                "transcript_path": transcript_path,
+                "started_at": "2026-06-01T10:00:00Z",
+                "status": "ok"
+            }
+        ]
+    });
+    std::fs::write(
+        session_dir.join("session.json"),
+        serde_json::to_string_pretty(&session).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn list_agent_runs_returns_standalone_meta() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_standalone_meta(tmp.path(), "run_standalone_01");
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/runs/agents"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "expected 200 OK");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("body should be a JSON array");
+    assert!(!arr.is_empty(), "expected at least one row; got []");
+
+    let row = arr
+        .iter()
+        .find(|r| r["run_id"].as_str() == Some("run_standalone_01"))
+        .expect("run_standalone_01 should be present");
+
+    assert_eq!(row["source"].as_str(), Some("standalone"), "source mismatch");
+    assert_eq!(
+        row["trigger_source"].as_str(),
+        Some("run_cli"),
+        "trigger_source mismatch"
+    );
+}
+
+#[tokio::test]
+async fn list_agent_runs_returns_session_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_session_with_run(tmp.path(), "sess_01", "my-agent", "run_session_01");
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/runs/agents"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "expected 200 OK");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("body should be a JSON array");
+
+    let row = arr
+        .iter()
+        .find(|r| r["run_id"].as_str() == Some("run_session_01"))
+        .expect("run_session_01 should be present");
+
+    assert_eq!(row["source"].as_str(), Some("session"), "source mismatch");
+    assert_eq!(
+        row["agent"].as_str(),
+        Some("my-agent"),
+        "agent name mismatch"
+    );
+    assert_eq!(
+        row["session_id"].as_str(),
+        Some("sess_01"),
+        "session_id mismatch"
+    );
+    assert_eq!(row["status"].as_str(), Some("ok"), "status mismatch");
+    assert_eq!(
+        row["started_at"].as_str(),
+        Some("2026-06-01T10:00:00Z"),
+        "started_at mismatch"
+    );
+}
+
+#[tokio::test]
+async fn list_agent_runs_empty_when_no_dirs() {
+    // global_dir has no transcripts/ or sessions/ — should return [] not 500.
+    let tmp = tempfile::tempdir().unwrap();
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/runs/agents"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "missing dirs should return 200, not 500"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("body should be a JSON array");
+    assert!(
+        arr.is_empty(),
+        "no data seeded, response should be []; got {arr:?}"
+    );
+}
