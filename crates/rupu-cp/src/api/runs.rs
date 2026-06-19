@@ -23,7 +23,7 @@ pub fn routes() -> Router<AppState> {
 /// - `"event"` — an SCM/webhook event fired the run (`event` field is set).
 /// - `"cron"` — a polled-event / cron wake fired it (`source_wake_id` is set).
 /// - `"manual"` — direct / manual dispatch (neither field is set).
-fn trigger_of(r: &RunRecord) -> &'static str {
+pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
     if r.event.is_some() {
         "event"
     } else if r.source_wake_id.is_some() {
@@ -38,13 +38,13 @@ fn trigger_of(r: &RunRecord) -> &'static str {
 /// The full record (including step results) is available at
 /// `GET /api/runs/:id`.
 #[derive(serde::Serialize)]
-struct RunListRow {
-    id: String,
-    workflow_name: String,
-    status: RunStatus,
-    started_at: chrono::DateTime<chrono::Utc>,
-    finished_at: Option<chrono::DateTime<chrono::Utc>>,
-    trigger: &'static str,
+pub(crate) struct RunListRow {
+    pub(crate) id: String,
+    pub(crate) workflow_name: String,
+    pub(crate) status: RunStatus,
+    pub(crate) started_at: chrono::DateTime<chrono::Utc>,
+    pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) trigger: &'static str,
 }
 
 impl From<&RunRecord> for RunListRow {
