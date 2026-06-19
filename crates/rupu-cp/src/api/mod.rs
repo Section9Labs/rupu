@@ -4,6 +4,7 @@ pub mod coverage;
 pub mod dashboard;
 pub mod events;
 pub mod graph;
+pub mod projects;
 pub mod run_streams;
 pub mod runs;
 pub mod sessions;
