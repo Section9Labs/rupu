@@ -296,7 +296,7 @@ export interface UnitCheckpoint {
   run_id: string;
   transcript_path: string;
   output: string;
-  success: boolean;
+  success: boolean | null;
   finished_at: string;      // ISO-8601
 }
 

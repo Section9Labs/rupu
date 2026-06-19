@@ -322,6 +322,53 @@ describe('units from checkpoints', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 4b. Unit checkpoint success: null → running (started, not completed)
+// ---------------------------------------------------------------------------
+
+describe('unit checkpoint with success: null', () => {
+  function makeNullUnit(success: boolean | null): UnitCheckpoint {
+    return {
+      step_id: 'b', index: 0, item: 'file-a.ts',
+      run_id: runId(), transcript_path: '/tmp/t0.jsonl',
+      output: '', success, finished_at: '2026-06-18T00:01:00Z',
+    };
+  }
+
+  it('success: null → unit state is running', () => {
+    const g = makeGraph({ units: [makeNullUnit(null)] });
+    const model = buildRunGraphModel(g, []);
+    const unit = model.nodeById('b')!.fanout!.units[0];
+    expect(unit.state).toBe('running');
+  });
+
+  it('success: true → unit state is done', () => {
+    const g = makeGraph({ units: [makeNullUnit(true)] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('b')!.fanout!.units[0].state).toBe('done');
+  });
+
+  it('success: false → unit state is failed', () => {
+    const g = makeGraph({ units: [makeNullUnit(false)] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('b')!.fanout!.units[0].state).toBe('failed');
+  });
+
+  it('success: null unit counts as running in fanout.byState', () => {
+    const g = makeGraph({ units: [makeNullUnit(null)] });
+    const model = buildRunGraphModel(g, []);
+    const { byState } = model.nodeById('b')!.fanout!;
+    expect(byState.running).toBe(1);
+    expect(byState.failed).toBe(0);
+  });
+
+  it('success: null unit flips parent step from pending to running', () => {
+    const g = makeGraph({ units: [makeNullUnit(null)] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('b')!.state).toBe('running');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. coerceItem: object item → JSON string key
 // ---------------------------------------------------------------------------
 

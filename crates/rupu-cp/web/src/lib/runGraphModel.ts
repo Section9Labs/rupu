@@ -151,10 +151,11 @@ export function buildRunGraphModel(
       units = new Map<number, UnitView>();
       unitsByStep.set(cp.step_id, units);
     }
+    const unitState: StepState = cp.success === true ? 'done' : cp.success === false ? 'failed' : 'running';
     const unit: UnitView = {
       index: cp.index,
       key: coerceItem(cp.item),
-      state: cp.success ? 'done' : 'failed',
+      state: unitState,
       transcriptPath: cp.transcript_path,
     };
     units.set(cp.index, unit);
