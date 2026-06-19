@@ -365,9 +365,9 @@ impl LiveRunState {
                 self.status = RunStatus::Failed;
                 self.finished_at = Some(*finished_at);
             }
-            // Round counter for the CLI live view — no per-step state
-            // change needed here; the TUI displays the counter via the
-            // step's active unit feed.
+            // PanelRound drives the web Control Plane's live round
+            // counter; the CLI live view does not render it, so no
+            // per-step state change is needed here.
             WfEvent::PanelRound { .. } => {}
         }
     }
