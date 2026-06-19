@@ -6285,6 +6285,7 @@ dependencies = [
  "rupu-coverage",
  "rupu-orchestrator",
  "rupu-runtime",
+ "rupu-transcript",
  "rupu-workspace",
  "rust-embed",
  "serde",

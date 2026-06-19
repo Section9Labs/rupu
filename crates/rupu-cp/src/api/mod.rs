@@ -8,5 +8,6 @@ pub mod projects;
 pub mod run_streams;
 pub mod runs;
 pub mod sessions;
+pub mod transcript;
 pub mod workers;
 pub mod workflows;
