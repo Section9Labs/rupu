@@ -123,8 +123,19 @@ export default function AgentRuns() {
   );
 }
 
+/** Returns true when the status string indicates the run is still in progress. */
+function isRunning(status: string | null | undefined): boolean {
+  return status === 'running' || status === 'awaiting_approval';
+}
+
 function AgentRunEntry({ run }: { run: AgentRunRow }) {
-  return (
+  const live = isRunning(run.status);
+
+  const transcriptHref = run.transcript_path
+    ? `/transcript?path=${encodeURIComponent(run.transcript_path)}&live=${live ? 1 : 0}`
+    : null;
+
+  const inner = (
     <div className="flex items-start gap-4 px-4 py-3">
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 flex-wrap">
@@ -134,6 +145,9 @@ function AgentRunEntry({ run }: { run: AgentRunRow }) {
           <span className="text-[11px] text-ink-mute font-mono">{shortId(run.run_id)}</span>
           <SourceChip source={run.source} />
           {run.status && <StatusBadge status={run.status} />}
+          {transcriptHref && (
+            <span className="ml-auto text-[10px] text-brand-600 font-medium">View transcript →</span>
+          )}
         </div>
 
         <div className="text-[11px] text-ink-dim mt-0.5 flex items-center gap-3 flex-wrap">
@@ -167,6 +181,19 @@ function AgentRunEntry({ run }: { run: AgentRunRow }) {
       </div>
     </div>
   );
+
+  if (transcriptHref) {
+    return (
+      <Link
+        to={transcriptHref}
+        className="block hover:bg-slate-50 transition-colors"
+      >
+        {inner}
+      </Link>
+    );
+  }
+
+  return <div className="opacity-75">{inner}</div>;
 }
 
 function AgentRunsEmpty() {

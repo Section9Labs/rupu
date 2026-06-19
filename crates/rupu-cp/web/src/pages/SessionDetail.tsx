@@ -1,26 +1,66 @@
-// Session detail — read-only field summary for one session. The backend does
-// NOT return a transcript here (that's a later task), so we show only the
-// session record fields. Route: /sessions/:id
+// Session detail — identity fields + turn-runs list (sessions-as-containers).
+// The turn-runs are sourced by filtering getAgentRuns() by session_id client-side;
+// no separate session-runs endpoint is needed (resolved open decision).
+// Route: /sessions/:id
 
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
-import { api, type SessionSummary } from '../lib/api';
+import { ArrowLeft, RefreshCw } from 'lucide-react';
+import { api, type SessionSummary, type AgentRunRow } from '../lib/api';
 import { cn } from '../lib/cn';
 import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function shortId(id: string): string {
+  return id.length > 10 ? `${id.slice(0, 8)}…` : id;
+}
+
+function isRunning(status: string | null | undefined): boolean {
+  return status === 'running' || status === 'awaiting_approval';
+}
+
+const STATUS_CLS: Record<string, string> = {
+  running:           'bg-blue-50 text-blue-700 ring-blue-200',
+  completed:         'bg-green-50 text-green-700 ring-green-200',
+  failed:            'bg-red-50 text-red-700 ring-red-200',
+  awaiting_approval: 'bg-amber-50 text-amber-800 ring-amber-200',
+  rejected:          'bg-red-50 text-red-700 ring-red-200',
+  pending:           'bg-slate-100 text-slate-600 ring-slate-200',
+};
+
+function StatusBadge({ status }: { status: string }) {
+  const cls = STATUS_CLS[status] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  return (
+    <span className={cn('inline-flex items-center rounded ring-1 text-[10px] font-medium px-1.5 py-0.5', cls)}>
+      {status}
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
 
 export default function SessionDetailPage() {
   const { id = '' } = useParams<{ id: string }>();
 
   const [session, setSession] = useState<SessionSummary | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
 
+  const [turnRuns, setTurnRuns] = useState<AgentRunRow[] | null>(null);
+  const [runsError, setRunsError] = useState<string | null>(null);
+  const [runsRefreshing, setRunsRefreshing] = useState(false);
+
+  // Fetch session identity
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
     setSession(null);
-    setError(null);
+    setSessionError(null);
     api
       .getSession(id)
       .then((data) => {
@@ -29,19 +69,43 @@ export default function SessionDetailPage() {
       })
       .catch((e: unknown) => {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load session');
+        setSessionError(e instanceof Error ? e.message : 'Failed to load session');
       });
     return () => {
       cancelled = true;
     };
   }, [id]);
 
-  if (error) {
+  // Fetch + filter agent runs for this session
+  const loadTurnRuns = () => {
+    if (!id) return;
+    setRunsRefreshing(true);
+    api
+      .getAgentRuns()
+      .then((all) => {
+        setTurnRuns(all.filter((r) => r.session_id === id));
+        setRunsError(null);
+      })
+      .catch((e: unknown) => {
+        setRunsError(e instanceof Error ? e.message : 'Failed to load turn runs');
+      })
+      .finally(() => setRunsRefreshing(false));
+  };
+
+  useEffect(() => {
+    loadTurnRuns();
+    // Poll every 5 s so live runs surface quickly
+    const t = window.setInterval(loadTurnRuns, 5000);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
+
+  if (sessionError) {
     return (
       <div className="p-8">
         <BackLink />
         <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          {error}
+          {sessionError}
         </div>
       </div>
     );
@@ -56,10 +120,19 @@ export default function SessionDetailPage() {
     );
   }
 
+  // Sort turn-runs newest-first
+  const sortedTurns = [...(turnRuns ?? [])].sort((a, b) => {
+    if (!a.started_at && !b.started_at) return 0;
+    if (!a.started_at) return 1;
+    if (!b.started_at) return -1;
+    return Date.parse(b.started_at) - Date.parse(a.started_at);
+  });
+
   return (
     <div className="p-8 max-w-5xl">
       <BackLink />
 
+      {/* Session identity header */}
       <header className="mt-3">
         <div className="flex flex-wrap items-center gap-2">
           <h1 className="text-2xl font-semibold text-ink break-all font-mono">
@@ -74,6 +147,7 @@ export default function SessionDetailPage() {
         </div>
       </header>
 
+      {/* Identity fields */}
       <section className="mt-6">
         <dl className="bg-panel border border-border rounded-xl shadow-card divide-y divide-border overflow-hidden">
           <Field label="Agent" value={session.agent_name} mono />
@@ -107,9 +181,111 @@ export default function SessionDetailPage() {
           </div>
         </dl>
       </section>
+
+      {/* Turn-runs: session as container */}
+      <section className="mt-8">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-base font-semibold text-ink">
+            Turn Runs
+            {turnRuns !== null && (
+              <span className="ml-2 text-sm font-normal text-ink-dim">({sortedTurns.length})</span>
+            )}
+          </h2>
+          <button
+            type="button"
+            onClick={loadTurnRuns}
+            className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-border bg-panel text-ink hover:bg-slate-100"
+          >
+            <RefreshCw size={12} className={cn(runsRefreshing && 'animate-spin')} />
+            Refresh
+          </button>
+        </div>
+
+        {runsError && (
+          <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {runsError}
+          </div>
+        )}
+
+        {turnRuns === null ? (
+          <div className="text-sm text-ink-dim">Loading turn runs…</div>
+        ) : sortedTurns.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-border bg-panel/50 py-10 flex flex-col items-center justify-center text-center">
+            <p className="text-sm text-ink-dim">No turn runs recorded for this session yet.</p>
+          </div>
+        ) : (
+          <div className="rounded-xl border border-border bg-panel shadow-card divide-y divide-border overflow-hidden">
+            {sortedTurns.map((run) => (
+              <TurnRunRow key={run.run_id} run={run} />
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Turn run row
+// ---------------------------------------------------------------------------
+
+function TurnRunRow({ run }: { run: AgentRunRow }) {
+  const live = isRunning(run.status);
+  const transcriptHref = run.transcript_path
+    ? `/transcript?path=${encodeURIComponent(run.transcript_path)}&live=${live ? 1 : 0}`
+    : null;
+
+  const inner = (
+    <div className="flex items-start gap-4 px-4 py-3">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-sm font-medium text-ink font-mono">{shortId(run.run_id)}</span>
+          {run.agent && (
+            <span className="text-[11px] text-ink-dim">{run.agent}</span>
+          )}
+          {run.status && <StatusBadge status={run.status} />}
+          {transcriptHref && (
+            <span className="ml-auto text-[10px] text-brand-600 font-medium">View transcript →</span>
+          )}
+        </div>
+
+        <div className="text-[11px] text-ink-dim mt-0.5 flex items-center gap-3 flex-wrap">
+          {run.started_at ? (
+            <span>started {relativeTime(run.started_at)}</span>
+          ) : (
+            <span className="text-ink-mute">no timing</span>
+          )}
+          {run.trigger_source && (
+            <span>via <span className="font-mono">{run.trigger_source}</span></span>
+          )}
+        </div>
+
+        {run.transcript_path && (
+          <div className="mt-1 text-[10px] text-ink-mute font-mono truncate" title={run.transcript_path}>
+            {run.transcript_path}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  if (transcriptHref) {
+    return (
+      <Link
+        to={transcriptHref}
+        className="block hover:bg-slate-50 transition-colors"
+      >
+        {inner}
+      </Link>
+    );
+  }
+
+  return <div>{inner}</div>;
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
 
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
