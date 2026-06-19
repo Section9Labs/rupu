@@ -2,7 +2,7 @@
 // assertion grid (what was assessed). Route: /coverage/:target
 
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ShieldCheck, ShieldOff } from 'lucide-react';
 import {
   api,
@@ -24,6 +24,8 @@ const ASSERTION_CAP = 200;
 
 export default function CoverageDetail() {
   const { target = '' } = useParams<{ target: string }>();
+  const [searchParams] = useSearchParams();
+  const wsId = searchParams.get('ws_id') ?? undefined;
 
   const [detail, setDetail] = useState<CoverageDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -34,7 +36,7 @@ export default function CoverageDetail() {
     setDetail(null);
     setError(null);
     api
-      .getCoverageDetail(target)
+      .getCoverageDetail(target, wsId)
       .then((data) => {
         if (cancelled) return;
         setDetail(data);
@@ -46,7 +48,7 @@ export default function CoverageDetail() {
     return () => {
       cancelled = true;
     };
-  }, [target]);
+  }, [target, wsId]);
 
   if (error) {
     return (

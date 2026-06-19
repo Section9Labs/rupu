@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use rupu_coverage::discover_targets;
 use rupu_orchestrator::runs::RunStatus;
 use rupu_workspace::worker_store::WorkerStore;
+use rupu_workspace::WorkspaceStore;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -139,16 +140,25 @@ async fn get_dashboard(State(s): State<AppState>) -> ApiResult<Json<DashboardRes
         });
 
     // --- coverage ------------------------------------------------------------
-    let (cov_targets, cov_assertions) = match discover_targets(&s.workspace_dir) {
-        Ok(targets) => {
-            let assertions: usize = targets.iter().map(|t| t.assertion_lines).sum();
-            (targets.len(), assertions)
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "dashboard: failed to discover coverage targets; using zeros");
-            (0, 0)
-        }
+    // Coverage lives per-PROJECT under each registered workspace's
+    // `<path>/.rupu/coverage/`. Aggregate target/assertion counts across the
+    // registry (cheap: discover only, no audit). A missing registry → zeros.
+    let workspace_store = WorkspaceStore {
+        root: s.global_dir.join("workspaces"),
     };
+    let mut cov_targets = 0usize;
+    let mut cov_assertions = 0usize;
+    for w in workspace_store.list().unwrap_or_default() {
+        match discover_targets(std::path::Path::new(&w.path)) {
+            Ok(targets) => {
+                cov_assertions += targets.iter().map(|t| t.assertion_lines).sum::<usize>();
+                cov_targets += targets.len();
+            }
+            Err(e) => {
+                tracing::warn!(ws_id = %w.id, error = %e, "dashboard: failed to discover coverage targets; skipping workspace");
+            }
+        }
+    }
 
     Ok(Json(DashboardResponse {
         runs: runs_summary,

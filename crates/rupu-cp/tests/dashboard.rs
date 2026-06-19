@@ -82,6 +82,17 @@ fn seed_coverage_target(workspace: &Path, target_id: &str, assertion_lines: usiz
     std::fs::write(&paths.concerns, content).unwrap();
 }
 
+/// Register a workspace TOML pointing at `path` so registry-driven aggregation
+/// (coverage tile) can discover its `.rupu/coverage/`.
+fn seed_workspace_toml(dir: &Path, id: &str, path: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let toml = format!(
+        "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-06-16T00:00:00Z\"\n",
+        path.to_str().unwrap()
+    );
+    std::fs::write(dir.join(format!("{id}.toml")), toml).unwrap();
+}
+
 fn minimal_session_json(id: &str) -> String {
     serde_json::json!({
         "session_id": id,
@@ -153,7 +164,10 @@ async fn dashboard_aggregate_correct_counts() {
     seed_worker(&worker_store, "dash_worker_1");
 
     // -- coverage (1 target, 3 assertion lines)
+    // The dashboard tile aggregates coverage across the registered workspaces,
+    // so register `workspace` (which holds the seeded `.rupu/coverage/`).
     seed_coverage_target(workspace, "dash_target_1", 3);
+    seed_workspace_toml(&global.join("workspaces"), "ws_dash", workspace);
 
     let addr = spawn_server(global, workspace).await;
 

@@ -437,6 +437,10 @@ export interface WorkerRecord {
 // ---------------------------------------------------------------------------
 
 export interface CoverageSummary {
+  /** Owning workspace id — target_ids can collide across workspaces. */
+  ws_id: string;
+  /** Workspace path basename — group/attribution key. */
+  project: string;
   target_id: string;
   assertion_lines: number;
   has_catalog: boolean;
@@ -507,6 +511,8 @@ export interface FindingRecord {
 }
 
 export interface CoverageDetail {
+  ws_id?: string;
+  project?: string;
   target_id: string;
   assertion_lines: number;
   has_catalog: boolean;
@@ -616,8 +622,9 @@ export const api = {
   getCoverage(): Promise<CoverageSummary[]> {
     return request<CoverageSummary[]>('/api/coverage');
   },
-  getCoverageDetail(target: string): Promise<CoverageDetail> {
-    return request<CoverageDetail>(`/api/coverage/${encodeURIComponent(target)}`);
+  getCoverageDetail(target: string, wsId?: string): Promise<CoverageDetail> {
+    const qs = wsId ? `?ws_id=${encodeURIComponent(wsId)}` : '';
+    return request<CoverageDetail>(`/api/coverage/${encodeURIComponent(target)}${qs}`);
   },
 
   /**
