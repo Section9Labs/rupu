@@ -1,5 +1,6 @@
 import type { LucideIcon } from 'lucide-react';
 import {
+  FolderGit2,
   LayoutDashboard,
   MessageSquare,
   Radio,
@@ -41,6 +42,7 @@ export type NavSection =
 
 export const sidebarNav: NavSection[] = [
   { kind: 'leaf', item: { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, enabled: true } },
+  { kind: 'leaf', item: { to: '/projects', label: 'Projects', icon: FolderGit2, enabled: true } },
   { kind: 'divider' },
   { kind: 'group', group: {
     id: 'runs', label: 'Runs', items: [
