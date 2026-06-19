@@ -9,7 +9,7 @@
 
 Phase 1 shipped an Observe Control Plane whose Runs view is shallow: it lists only orchestrator workflow runs, and the run graph paints only steps that have *already produced a result* (no pending/awaiting states, flat linear chain, no fan-out/loop structure, minimal motion). This slice deepens the live run view into a professional workflow-run graph and broadens what "Runs" surfaces — addressing four pieces of operator feedback:
 
-1. **Broaden the activity surface.** Distinct sidebar destinations per activity domain (Runs / Autoflows / Sessions / Workflows), not just workflow runs under one "Runs" page.
+1. **Broaden the activity surface.** Separate the authored *definitions* (Build) from their *executions* (Runs), each grouped by domain — Agents / Workflows / Autoflows — so "Runs" surfaces agent and autoflow executions, not just direct workflow runs.
 2. **Show every step, always, with correct per-step state** (pending / running / awaiting / done / failed / skipped) — not only completed steps.
 3. **Tasteful live animation** of the active frontier (running node + inbound edge).
 4. **Render step *types* distinctly** — `for_each` (data fan-out), `parallel` (named sub-steps), `panel + gate` fix-loops, and approval gates each get their own visual treatment.
@@ -23,31 +23,37 @@ The design language was researched against Dagster, Prefect, Temporal, Argo Work
 ## Part 1 — Activity surface (sidebar IA)
 
 ### Decision
-Per-domain sidebar destinations rather than one merged feed, with unified-feed-style filtering *within* each destination. Revised nav:
+The organizing principle: **Build holds the authored *definitions*; Runs holds their *executions*.** Both are grouped by the same three domains — Agents, Workflows, Autoflows — so an operator can move from "the thing I wrote" to "every time it ran" and back. Revised nav:
 
 ```
 Dashboard
+── Runs ──            (executions, grouped by what ran)
+  Agents              agent runs — standalone `rupu run` + per-session invocations
+  Workflows           orchestrator runs launched directly
+  Autoflows           trigger-fired runs / autoflow cycles
 ── Observe ──
-  Runs          (all orchestrator runs; filter by trigger: manual / cron / event)
-  Autoflows     (NEW — autoflow cycle history; each cycle links to its run)
   Live Events
   Coverage
-── Build ──
-  Workflows     (definitions)
+── Build ──           (authored definitions)
+  Workflows
   Agents
-── Run ──
+  Autoflows
+── Fleet ──           (renamed from "Run" to avoid colliding with the Runs group)
   Sessions
   Workers
 Settings
 ```
 
-### Rationale & data sources
-- **Runs** stays backed by `RunStore` (orchestrator `RunRecord`s). `RunRecord` already carries the trigger payload (`event: Option<serde_json::Value>`); the list gains **trigger-type filter chips** (manual / cron / event) so triggered (autoflow/webhook/cron) runs are visible and distinguishable instead of unlabeled. No new store.
-- **Autoflows** (new) is backed by `rupu_runtime::autoflow_history::AutoflowHistoryStore` (`AutoflowCycleRecord` / `AutoflowCycleEvent`, each carrying an optional `run_id`). This is the higher-level lens — *which autoflow definition fired, when, and how each cycle resolved* — cross-linking into the corresponding Run. A new read endpoint surfaces it.
-- **Sessions / Workflows / Workers** already exist as Phase-1 pages; only nav grouping changes.
+Each Runs sub-item is a unified list for that domain with in-list filters (e.g. status, trigger). Routes: `/runs/agents`, `/runs/workflows`, `/runs/autoflows` (executions) vs `/workflows`, `/agents`, `/autoflows` (definitions).
 
-### Explicitly deferred
-One-shot `rupu run` agent invocations are **not** persisted as `RunRecord`s (the `RunStore` is orchestrator-only); they produce transcripts under the session/transcript stores. Surfacing them as "agent runs" would require a new persistence path and is **out of scope** here — noted so the absence is intentional, not an oversight. Sessions already cover persistent agent activity.
+### Data sources (all grounded — no new persistence)
+- **Runs › Workflows** — `RunStore` `RunRecord`s launched directly (no trigger `event`). Existing store.
+- **Runs › Autoflows** — trigger-fired runs. Two complementary sources: `RunRecord`s carrying a trigger payload (`event: Option<serde_json::Value>`), and the higher-level cycle history in `rupu_runtime::autoflow_history::AutoflowHistoryStore` (`AutoflowCycleRecord`, each carrying an optional `run_id` that cross-links to the run). The Autoflows list shows cycles → drill into the run graph.
+- **Runs › Agents** — agent-level executions, from two real sources: (1) **standalone `rupu run`** writes a `StandaloneRunMetadata` sidecar `<transcripts>/<run_id>.meta.json` (`run_id`, `session_id?`, `trigger_source`, workspace/repo/issue refs) per run — scan the transcripts dir for `*.meta.json`; (2) **session invocations** — each session's `SessionRunRecord`s (`run_id`, `prompt`, `transcript_path`, `started_at`/`completed_at`, `status`, token counts). Both are read as the on-disk contract (the same black-box approach Phase-1 uses for sessions), so `rupu-cp` stays a read adapter and doesn't depend on `rupu-cli` internals. Each agent run links to its transcript (and, for sub-agent dispatch, to the parent workflow run via `RunStore::create_sub_run`'s `<runs>/<parent>/sub/<id>/`).
+- **Build › Workflows / Agents** — already Phase-1 pages (definitions). **Build › Autoflows** (new) — the autoflow definitions; surfaced via the autoflow definition source the CLI's autoflow listing uses (a small read adapter; exact reader pinned in the plan).
+- **Sessions / Workers** — existing Phase-1 pages; only the nav group label changes (Run → Fleet).
+
+The previously-deferred "agent runs" are therefore **in scope**: the `.meta.json` sidecars + `SessionRunRecord`s make them queryable without new persistence. Only the *run-graph* (Part 2) is workflow/autoflow-specific; an agent run's "view" is its transcript + metadata (no multi-step DAG), so Runs › Agents is a list → transcript, not a graph.
 
 ---
 
@@ -122,11 +128,14 @@ Returns the assembled graph inputs so the client doesn't re-derive structure fro
 - `units` is assembled from `unit_checkpoints.jsonl` (terminal per-unit state) — the live deltas still come from the SSE stream.
 - A new dedicated endpoint (rather than fattening `GET /api/runs/{id}`) keeps the graph model explicit and the existing detail endpoint lean.
 
-### 3.2 `GET /api/autoflows` (new)
-Lists recent autoflow cycles from `AutoflowHistoryStore::list_recent` → `[{ autoflow, cycle_id, status, run_id?, started_at, finished_at, outcome }]` (slim DTO over `AutoflowCycleRecord`). Detail (`GET /api/autoflows/{id}` or the cycle events via `list_recent_events`) is a follow-up; the list + cross-link to the run is the Phase-1.5 bar. Tolerate a missing store dir → `[]`.
+### 3.2 Runs, by domain (new + extended)
+Three list endpoints backing the Runs sub-items:
+- `GET /api/runs/workflows` — `RunStore` runs launched directly (no trigger `event`). (The existing `GET /api/runs` is kept as the unfiltered superset; the slim DTO gains `trigger: "manual" | "cron" | "event"` derived from the record so the UI can filter.)
+- `GET /api/runs/autoflows` — autoflow cycles from `AutoflowHistoryStore::list_recent` → `[{ autoflow, cycle_id, status, run_id?, started_at, finished_at, outcome }]` (slim DTO over `AutoflowCycleRecord`), each cross-linking to its run; plus trigger-fired `RunRecord`s. Tolerate a missing store dir → `[]`.
+- `GET /api/runs/agents` — agent runs merged from (a) `<transcripts>/*.meta.json` (`StandaloneRunMetadata`, parsed via a minimal CP-side DTO) and (b) `SessionRunRecord`s scanned from the session stores. Slim DTO: `[{ run_id, agent?, session_id?, trigger_source, status?, started_at, transcript_path }]`. Each row links to its transcript.
 
-### 3.3 Runs list — trigger-type
-`GET /api/runs` gains nothing structural; the existing `RunRecord.event`/trigger is exposed in the slim list DTO (a `trigger: "manual" | "cron" | "event"` derivation) so the UI can filter. Derive trigger type from the run record (presence/shape of `event`) — no new store.
+### 3.3 Autoflow definitions (Build)
+`GET /api/autoflows` (definitions) lists authored autoflows for the Build › Autoflows page, via the same source the CLI's autoflow listing uses (read adapter; exact reader pinned in the plan). Distinct from `GET /api/runs/autoflows` (executions).
 
 ### 3.4 Panel-round visibility (scoped, flagged)
 There is **no dedicated panel-round Event variant** today; panel-loop iterations surface only through generic step events. To drive a crisp live **round counter** and per-round state, add a minimal signal — preferred: a new `Event::PanelRound { run_id, step_id, round, max_iterations, max_severity_remaining }` emitted by the runner's gate loop (mirrors `UnitStarted`). This is the one backend change beyond pure read-adapters; it is small and isolated. **Fallback if descoped:** render the panel/gate construct structurally and show round state only from `step_results`/notes (coarser, post-hoc), with the live counter deferred. The plan will treat the event addition as its own task so it can be cut without blocking the rest.
@@ -140,9 +149,10 @@ Rework `crates/rupu-cp/web` Runs/RunDetail:
 - **`lib/graphLayout.ts`** — dagre LR layout + structure-hash cache → node positions.
 - **`components/RunGraph.tsx`** — React Flow canvas; consumes the model + positions; one custom node component per type (`StepNode`, `ParallelContainerNode`, `FanoutNode`, `PanelLoopNode`/gate). Animated edges on the active frontier.
 - **`components/FanoutDrill.tsx`** — the virtualized, filterable unit drill-in list.
-- **`pages/Runs.tsx`** — trigger-type filter chips.
-- **`pages/Autoflows.tsx`** (new) + nav entry; rows cross-link to `/runs/:id`.
-- Keep the existing single-SSE-subscription pattern in `RunDetail` feeding both the graph model and the event feed.
+- **Nav restructure** (`lib/sidebarNav.ts`) — add the **Runs** group (Agents / Workflows / Autoflows executions), add **Build › Autoflows**, rename **Run → Fleet**.
+- **Runs execution pages** — `pages/runs/WorkflowRuns.tsx` (+ filters; today's `Runs.tsx` becomes this), `pages/runs/AutoflowRuns.tsx` (cycles, cross-link to `/runs/:id` graph), `pages/runs/AgentRuns.tsx` (list → transcript; no graph). Shared list primitives reused.
+- **Build › Autoflows** — `pages/AutoflowsDefs.tsx` (definitions list).
+- `RunDetail` (the graph) is reached from Workflow/Autoflow run rows; keep the existing single-SSE-subscription pattern feeding both the graph model and the event feed.
 
 ---
 
@@ -153,7 +163,7 @@ Rework `crates/rupu-cp/web` Runs/RunDetail:
 
 ---
 
-## Open decisions for review
-1. **Sidebar placement of Autoflows** — under Observe (next to Runs, as drafted) vs. under Build (next to Workflows, since an autoflow is a workflow+trigger). Drafted under Observe.
-2. **`PanelRound` event** — include the small runner change (crisp live round counter) in this slice, or descope to the coarse post-hoc fallback? Drafted as a separate, cuttable task.
-3. **Small-N fan-out threshold** — default 12 inline before collapsing. Tunable.
+## Resolved decisions
+1. **Sidebar IA** — Build = definitions (Workflows / Agents / Autoflows); Runs = executions grouped the same (Agents / Workflows / Autoflows); "Run" group renamed "Fleet" (Sessions / Workers). (matt)
+2. **`PanelRound` event** — included, as its own isolated/cuttable task, to drive a crisp live round counter (matt deferred to recommendation; revisit if it adds friction).
+3. **Small-N fan-out threshold** — 12 inline before collapsing to X/N + % bar. (matt)
