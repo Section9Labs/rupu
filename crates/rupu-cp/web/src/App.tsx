@@ -2,7 +2,6 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import Layout from './components/Layout';
 import Dashboard from './pages/Dashboard';
-import Runs from './pages/Runs';
 import RunDetail from './pages/RunDetail';
 import Events from './pages/Events';
 import Coverage from './pages/Coverage';
@@ -11,10 +10,14 @@ import Workflows from './pages/Workflows';
 import WorkflowDetail from './pages/WorkflowDetail';
 import Agents from './pages/Agents';
 import AgentDetail from './pages/AgentDetail';
+import AutoflowsDefs from './pages/AutoflowsDefs';
 import Sessions from './pages/Sessions';
 import SessionDetail from './pages/SessionDetail';
 import Workers from './pages/Workers';
 import Settings from './pages/Settings';
+import AgentRuns from './pages/runs/AgentRuns';
+import WorkflowRuns from './pages/runs/WorkflowRuns';
+import AutoflowRuns from './pages/runs/AutoflowRuns';
 
 export default function App() {
   return (
@@ -26,7 +29,13 @@ export default function App() {
             <Route index element={<Navigate to="/dashboard" replace />} />
             {/* Pages */}
             <Route path="/dashboard" element={<Dashboard />} />
-            <Route path="/runs" element={<Runs />} />
+            {/* Run-stream pages — static segments MUST precede the :id wildcard */}
+            <Route path="/runs/agents"    element={<AgentRuns />} />
+            <Route path="/runs/workflows" element={<WorkflowRuns />} />
+            <Route path="/runs/autoflows" element={<AutoflowRuns />} />
+            {/* Bare /runs → redirect to workflow runs (canonical execution list) */}
+            <Route path="/runs" element={<Navigate to="/runs/workflows" replace />} />
+            {/* Run detail graph — wildcard must come after static /runs/* segments */}
             <Route path="/runs/:id" element={<RunDetail />} />
             <Route path="/events" element={<Events />} />
             <Route path="/coverage" element={<Coverage />} />
@@ -35,6 +44,7 @@ export default function App() {
             <Route path="/workflows/:name" element={<WorkflowDetail />} />
             <Route path="/agents" element={<Agents />} />
             <Route path="/agents/:name" element={<AgentDetail />} />
+            <Route path="/autoflows" element={<AutoflowsDefs />} />
             <Route path="/sessions" element={<Sessions />} />
             <Route path="/sessions/:id" element={<SessionDetail />} />
             <Route path="/workers" element={<Workers />} />

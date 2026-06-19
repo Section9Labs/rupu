@@ -1,9 +1,9 @@
 import type { LucideIcon } from 'lucide-react';
 import {
-  Activity,
   LayoutDashboard,
   MessageSquare,
   Radio,
+  Repeat,
   Server,
   Settings,
   ShieldCheck,
@@ -22,7 +22,7 @@ export type NavLeaf = {
 
 // String-literal union — keeps group ids type-safe and distinct from
 // any NavLeaf.to (the latter are paths starting with `/`).
-export type GroupID = 'observe' | 'build' | 'run';
+export type GroupID = 'runs' | 'observe' | 'build' | 'fleet';
 
 // One nav-group renders as a collapsible section header followed by
 // its `items`.
@@ -43,9 +43,15 @@ export const sidebarNav: NavSection[] = [
   { kind: 'leaf', item: { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, enabled: true } },
   { kind: 'divider' },
   { kind: 'group', group: {
+    id: 'runs', label: 'Runs', items: [
+      { to: '/runs/agents',    label: 'Agents',    icon: Sparkles,  enabled: true },
+      { to: '/runs/workflows', label: 'Workflows', icon: Workflow,  enabled: true },
+      { to: '/runs/autoflows', label: 'Autoflows', icon: Repeat,    enabled: true },
+    ],
+  }},
+  { kind: 'group', group: {
     id: 'observe', label: 'Observe', items: [
-      { to: '/runs',     label: 'Runs',        icon: Activity,   enabled: true },
-      { to: '/events',   label: 'Live Events', icon: Radio,      enabled: true },
+      { to: '/events',   label: 'Live Events', icon: Radio,       enabled: true },
       { to: '/coverage', label: 'Coverage',    icon: ShieldCheck, enabled: true },
     ],
   }},
@@ -53,10 +59,11 @@ export const sidebarNav: NavSection[] = [
     id: 'build', label: 'Build', items: [
       { to: '/workflows', label: 'Workflows', icon: Workflow, enabled: true },
       { to: '/agents',    label: 'Agents',    icon: Sparkles, enabled: true },
+      { to: '/autoflows', label: 'Autoflows', icon: Repeat,   enabled: true },
     ],
   }},
   { kind: 'group', group: {
-    id: 'run', label: 'Run', items: [
+    id: 'fleet', label: 'Fleet', items: [
       { to: '/sessions', label: 'Sessions', icon: MessageSquare, enabled: true },
       { to: '/workers',  label: 'Workers',  icon: Server,        enabled: true },
     ],
