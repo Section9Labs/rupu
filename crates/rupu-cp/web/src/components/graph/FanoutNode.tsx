@@ -14,6 +14,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
 import { STATE_STYLE, glyphBg } from './stepStyle';
+import { nodeSize, FANOUT_INLINE_THRESHOLD, FANOUT_INLINE_COLS } from '../../lib/nodeSize';
 
 export interface FanoutNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -25,20 +26,21 @@ type FanoutFlowNode = Node<FanoutNodeData, 'fanout'>;
 
 const handleStyle = { background: '#bfdbfe', width: 6, height: 6, border: 'none' } as const;
 
-const INLINE_THRESHOLD = 12;
+const INLINE_THRESHOLD = FANOUT_INLINE_THRESHOLD;
 const PREVIEW_CELLS = 60;
 
 function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const { node, onOpenUnit, onExpandFanout } = data;
   const fo = node.fanout;
   const running = node.state === 'running';
+  const box = nodeSize(node);
 
   // No fan-out data yet (units haven't started) — render a slim pending card.
   if (!fo || fo.total === 0) {
     return (
       <div
         className={['relative rounded-[12px] border px-3 py-2', running ? 'rg-pulse-run' : 'opacity-75'].join(' ')}
-        style={{ borderColor: '#bfdbfe', background: '#eff6ff', minWidth: 150 }}
+        style={{ borderColor: '#bfdbfe', background: '#eff6ff', width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
         <div className="text-[10px] font-bold uppercase tracking-wide text-[#1860f2]">
@@ -59,11 +61,11 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
 
   // ---- Small fan-out: inline clickable grid -------------------------------
   if (total <= INLINE_THRESHOLD) {
-    const cols = Math.min(total, 8);
+    const cols = Math.min(total, FANOUT_INLINE_COLS);
     return (
       <div
         className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
-        style={{ borderColor: '#bfdbfe', background: '#eff6ff', minWidth: 150 }}
+        style={{ borderColor: '#bfdbfe', background: '#eff6ff', width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
         <div className="mb-1 flex items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-wide text-[#1860f2]">
@@ -97,7 +99,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   return (
     <div
       className={['relative rounded-[12px] border bg-white px-3 py-2.5 shadow-card', running ? 'rg-pulse-run' : ''].join(' ')}
-      style={{ borderColor: '#bfdbfe', minWidth: 210 }}
+      style={{ borderColor: '#bfdbfe', width: box.width, minHeight: box.height }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 

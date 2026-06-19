@@ -8,6 +8,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
 import { STATE_STYLE } from './stepStyle';
+import { STEP_W, STEP_H } from '../../lib/nodeSize';
 
 export interface StepNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -36,7 +37,7 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
         awaiting ? 'rg-pulse-await' : '',
         node.state === 'pending' ? 'opacity-75' : '',
       ].join(' ')}
-      style={{ borderColor: '#e5e7eb', minWidth: 132 }}
+      style={{ borderColor: '#e5e7eb', width: STEP_W, minHeight: STEP_H }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
