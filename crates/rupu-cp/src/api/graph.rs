@@ -1,12 +1,58 @@
-//! Pure mapper: [`rupu_orchestrator::Workflow`] → [`StepDag`] DTO.
+//! Workflow → [`StepDag`] DTO mapper **and** the `GET /api/runs/:id/graph`
+//! route that assembles the full run-graph response.
 //!
-//! Used by `GET /api/runs/:id/graph` (Task 2) to send a slim, serialisable
-//! representation of the workflow's step graph to the control-plane UI.
-//! This module has zero I/O or async concerns — it is a deterministic
-//! transformation of an already-parsed [`Workflow`].
+//! The mapper half is a pure, sync, infallible transformation; the route
+//! half does the I/O and error-mapping.
 
-use rupu_orchestrator::Workflow;
+use crate::{
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
+use axum::{
+    extract::{Path, State},
+    routing::get,
+    Json, Router,
+};
+use rupu_orchestrator::{RunStoreError, Workflow};
 use serde::Serialize;
+
+// ── Route ────────────────────────────────────────────────────────────────
+
+pub fn routes() -> Router<AppState> {
+    Router::new().route("/api/runs/:id/graph", get(run_graph))
+}
+
+async fn run_graph(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // 1. Verify the run exists (gives us the RunRecord too).
+    let run = s.run_store.load(&id).map_err(|e| match e {
+        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        other => ApiError::internal(other.to_string()),
+    })?;
+
+    // 2. Load the workflow YAML snapshot saved at run-start.
+    let yaml = s
+        .run_store
+        .read_workflow_snapshot(&id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // 3. Parse the snapshot and build the DAG DTO.
+    let wf = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
+    let dag = to_step_dag(&wf);
+
+    // 4. Step results and unit checkpoints — missing files = empty vecs.
+    let step_results = s.run_store.read_step_results(&id).unwrap_or_default();
+    let units = s.run_store.read_unit_checkpoints(&id).unwrap_or_default();
+
+    Ok(Json(serde_json::json!({
+        "run": run,
+        "workflow": dag,
+        "step_results": step_results,
+        "units": units,
+    })))
+}
 
 // ── DTOs ────────────────────────────────────────────────────────────────
 

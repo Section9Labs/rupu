@@ -54,7 +54,8 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         .merge(crate::api::workers::routes())
         .merge(crate::api::coverage::routes())
         .merge(crate::api::dashboard::routes())
-        .merge(crate::api::events::routes());
+        .merge(crate::api::events::routes())
+        .merge(crate::api::graph::routes());
 
     let api = match token {
         Some(t) => api.layer(from_fn_with_state(Arc::new(t), require_bearer)),
