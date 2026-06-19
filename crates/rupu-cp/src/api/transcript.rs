@@ -13,10 +13,17 @@ use crate::{
 };
 use axum::{
     extract::{Query, State},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::get,
     Json, Router,
 };
+use futures_util::StreamExt as _;
+use std::convert::Infallible;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Canonicalize `raw`; require a `.jsonl` file whose canonical path is inside
 /// one of `allowed_roots` (themselves canonicalized). Rejects traversal,
@@ -63,7 +70,9 @@ fn allowed_roots(s: &AppState) -> Vec<PathBuf> {
 }
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/transcript", get(get_transcript))
+    Router::new()
+        .route("/api/transcript", get(get_transcript))
+        .route("/api/transcript/stream", get(stream_transcript))
 }
 
 async fn get_transcript(
@@ -78,4 +87,33 @@ async fn get_transcript(
         .collect();
     let summary = rupu_transcript::JsonlReader::summary(&path).ok();
     Ok(Json(serde_json::json!({ "events": events, "summary": summary })))
+}
+
+/// `GET /api/transcript/stream?path=` — SSE live-tail of a transcript JSONL.
+///
+/// Validation runs first and is the SAME security boundary as the static
+/// [`get_transcript`] endpoint (400 on an invalid / out-of-root path). On
+/// success, opens a [`TranscriptTail`] and maps each parsed
+/// [`rupu_transcript::Event`] to an SSE `data:` line of JSON; the connection
+/// stays open, emitting events as the transcript grows.
+///
+/// [`TranscriptTail`]: crate::transcript_tail::TranscriptTail
+async fn stream_transcript(State(s): State<AppState>, Query(q): Query<PathQ>) -> Response {
+    let path = match validate_transcript_path(&q.path, &allowed_roots(&s)) {
+        Ok(p) => p,
+        Err(e) => return ApiError::bad_request(e).into_response(),
+    };
+    let tail = match crate::transcript_tail::TranscriptTail::open(&path).await {
+        Ok(t) => t,
+        Err(e) => return ApiError::internal(e.to_string()).into_response(),
+    };
+    let stream = tail.map(|ev| {
+        let sse = SseEvent::default()
+            .json_data(&ev)
+            .unwrap_or_else(|_| SseEvent::default().comment("event serialize error"));
+        Ok::<_, Infallible>(sse)
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }

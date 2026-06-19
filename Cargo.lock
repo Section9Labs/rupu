@@ -6279,6 +6279,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "mime_guess",
+ "notify",
  "reqwest",
  "rupu-agent",
  "rupu-config",
