@@ -8,7 +8,7 @@
 // Faithful to the approved graph-pro / fanout-loop mockups. Rendering is
 // validated by a human — the bar here is a correct, strict-typed structure.
 
-import { useMemo } from 'react';
+import { useCallback, useMemo } from 'react';
 import {
   Background,
   BackgroundVariant,
@@ -19,6 +19,7 @@ import {
   ReactFlowProvider,
   type Edge,
   type Node,
+  type NodeMouseHandler,
   type NodeTypes,
 } from '@xyflow/react';
 import type { GraphNode, RunGraphModel } from '../lib/runGraphModel';
@@ -62,11 +63,20 @@ interface NodeData extends Record<string, unknown> {
   onExpandFanout?: (stepId: string) => void;
 }
 
+/** A transcript selection emitted by clicking a step node or a fan-out unit. */
+export interface NodeSelection {
+  path: string | null;
+  live: boolean;
+  label: string;
+}
+
 interface Props {
   model: RunGraphModel;
   positions: Map<string, Pos>;
   onOpenUnit?: (stepId: string, index: number) => void;
   onExpandFanout?: (stepId: string) => void;
+  /** Emitted on click of a step node or a fan-out unit square. */
+  onSelectNode?: (sel: NodeSelection) => void;
 }
 
 export default function RunGraph(props: Props) {
@@ -77,7 +87,44 @@ export default function RunGraph(props: Props) {
   );
 }
 
-function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout }: Props) {
+function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectNode }: Props) {
+  // Clicking a fan-out unit square selects that unit's transcript AND keeps the
+  // existing drill behavior. Wrap onOpenUnit so the unit click does both.
+  const handleOpenUnit = useCallback(
+    (stepId: string, index: number) => {
+      onOpenUnit?.(stepId, index);
+      if (onSelectNode) {
+        const unit = model.nodeById(stepId)?.fanout?.units.find((u) => u.index === index);
+        if (unit) {
+          onSelectNode({
+            path: unit.transcriptPath ?? null,
+            live: unit.state === 'running',
+            label: unit.key,
+          });
+        }
+      }
+    },
+    [onOpenUnit, onSelectNode, model],
+  );
+
+  // Clicking a step (non-fanout) node selects its transcript. Fan-out unit
+  // selection is handled via handleOpenUnit on the inner unit squares.
+  const handleNodeClick = useCallback<NodeMouseHandler<Node<NodeData>>>(
+    (_evt, flowNode) => {
+      if (!onSelectNode) return;
+      const node = flowNode.data.node;
+      // for_each nodes select via their unit squares (handleOpenUnit), not the
+      // node body — skip to avoid clobbering a unit selection.
+      if (node.kind === 'for_each') return;
+      onSelectNode({
+        path: node.transcriptPath ?? null,
+        live: node.state === 'running',
+        label: node.id,
+      });
+    },
+    [onSelectNode],
+  );
+
   const nodes = useMemo<Node<NodeData>[]>(() => {
     return model.nodes.map((node) => {
       const pos = positions.get(node.id);
@@ -85,12 +132,12 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout }: Props) 
         id: node.id,
         type: flowKind(node.kind),
         position: pos ? { x: pos.x, y: pos.y } : { x: 0, y: 0 },
-        data: { node, onOpenUnit, onExpandFanout },
+        data: { node, onOpenUnit: handleOpenUnit, onExpandFanout },
         draggable: false,
         selectable: true,
       };
     });
-  }, [model, positions, onOpenUnit, onExpandFanout]);
+  }, [model, positions, handleOpenUnit, onExpandFanout]);
 
   const edges = useMemo<Edge[]>(() => {
     return model.edges.map((e) => {
@@ -130,6 +177,7 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout }: Props) 
         nodes={nodes}
         edges={edges}
         nodeTypes={NODE_TYPES}
+        onNodeClick={handleNodeClick}
         nodesDraggable={false}
         nodesConnectable={false}
         elementsSelectable
