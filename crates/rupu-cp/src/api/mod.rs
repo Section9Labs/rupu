@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod autoflows;
 pub mod coverage;
 pub mod dashboard;
 pub mod events;
