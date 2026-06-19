@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
-import { api, type RunRecord, type RunStatusStr } from '../lib/api';
+import { api, type RunListRow, type RunStatusStr } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader, type SectionTone } from '../components/lists/SectionHeader';
@@ -21,7 +21,7 @@ function shortId(id: string): string {
 }
 
 export default function Runs() {
-  const [runs, setRuns] = useState<RunRecord[] | null>(null);
+  const [runs, setRuns] = useState<RunListRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -92,7 +92,7 @@ function RunSection({
 }: {
   tone: SectionTone;
   label: string;
-  runs: RunRecord[];
+  runs: RunListRow[];
 }) {
   if (runs.length === 0) return null;
   return (
@@ -107,7 +107,7 @@ function RunSection({
   );
 }
 
-function RunRow({ run }: { run: RunRecord }) {
+function RunRow({ run }: { run: RunListRow }) {
   return (
     <Link
       to={`/runs/${encodeURIComponent(run.id)}`}
