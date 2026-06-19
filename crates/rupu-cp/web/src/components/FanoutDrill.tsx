@@ -1,10 +1,7 @@
 // FanoutDrill — the drill-in panel for a large `for_each` step. A state-
-// filterable, scrollable list of units; each row is glyph · key · state ·
-// transcript path. Faithful to the fanout-loop mockup's drill-in list.
-//
-// No transcript route exists yet, so `transcriptPath` is rendered as plain
-// monospace text (not fabricated into a link). Rows are capped with an explicit
-// "+N more" line — never silently truncated.
+// filterable, scrollable list of units; each row is a clickable button that
+// selects that unit's transcript via onSelectUnit. Rows are capped with an
+// explicit "+N more" line — never silently truncated.
 
 import { useMemo, useState } from 'react';
 import { X } from 'lucide-react';
@@ -27,14 +24,22 @@ function matches(filter: Filter, state: StepState): boolean {
   return state === filter;
 }
 
+export interface UnitSelection {
+  path: string | null;
+  live: boolean;
+  label: string;
+}
+
 export default function FanoutDrill({
   stepId,
   units,
   onClose,
+  onSelectUnit,
 }: {
   stepId?: string;
   units: UnitView[];
   onClose: () => void;
+  onSelectUnit: (sel: UnitSelection) => void;
 }) {
   const [filter, setFilter] = useState<Filter>('all');
 
@@ -95,23 +100,35 @@ export default function FanoutDrill({
             {shown.map((u) => {
               const st = STATE_STYLE[u.state];
               return (
-                <li key={u.index} className="flex items-center gap-2 py-1.5 text-[11px]">
-                  <span
-                    className="inline-flex h-[13px] w-[13px] shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"
-                    style={{ background: glyphBg(u.state) }}
-                    aria-hidden
+                <li key={u.index}>
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 py-1.5 text-left text-[11px] hover:bg-slate-50 cursor-pointer"
+                    onClick={() =>
+                      onSelectUnit({
+                        path: u.transcriptPath ?? null,
+                        live: u.state === 'running',
+                        label: u.key,
+                      })
+                    }
                   >
-                    {st.glyph}
-                  </span>
-                  <span className="truncate font-mono text-ink" title={u.key}>
-                    {u.key}
-                  </span>
-                  <span
-                    className="ml-auto shrink-0 text-[10px] font-medium uppercase tracking-wide"
-                    style={{ color: st.color }}
-                  >
-                    {st.label}
-                  </span>
+                    <span
+                      className="inline-flex h-[13px] w-[13px] shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"
+                      style={{ background: glyphBg(u.state) }}
+                      aria-hidden
+                    >
+                      {st.glyph}
+                    </span>
+                    <span className="truncate font-mono text-ink" title={u.key}>
+                      {u.key}
+                    </span>
+                    <span
+                      className="ml-auto shrink-0 text-[10px] font-medium uppercase tracking-wide"
+                      style={{ color: st.color }}
+                    >
+                      {st.label}
+                    </span>
+                  </button>
                 </li>
               );
             })}
@@ -119,22 +136,6 @@ export default function FanoutDrill({
         )}
         {overflow > 0 && (
           <div className="py-2 text-center text-[11px] text-ink-mute">+{overflow} more</div>
-        )}
-        {shown.some((u) => u.transcriptPath) && (
-          <div className="mt-3 border-t border-dashed border-border pt-2">
-            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-ink-mute">
-              Transcript paths
-            </div>
-            <ul className="space-y-0.5">
-              {shown
-                .filter((u) => u.transcriptPath)
-                .map((u) => (
-                  <li key={u.index} className="truncate font-mono text-[10px] text-ink-dim" title={u.transcriptPath}>
-                    {u.transcriptPath}
-                  </li>
-                ))}
-            </ul>
-          </div>
         )}
       </div>
     </div>
