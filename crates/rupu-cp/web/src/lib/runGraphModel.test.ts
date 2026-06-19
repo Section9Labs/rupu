@@ -391,3 +391,50 @@ describe('gate field', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// 8. panel_round events set node.round
+// ---------------------------------------------------------------------------
+
+describe('panel_round events', () => {
+  const PANEL_STEP: StepNodeDto = {
+    id: 'panel', kind: 'panel',
+    gate: { max_iterations: 5, until_severity: 'high', fix_with: 'fixer' },
+  };
+
+  it('panel_round sets round.current and round.max on the node', () => {
+    const g = makeGraph({ steps: [PANEL_STEP] });
+    const events: RunEvent[] = [
+      { type: 'panel_round', run_id: runId(), step_id: 'panel', round: 2, max_iterations: 5 },
+    ];
+    const model = buildRunGraphModel(g, events);
+    const node = model.nodeById('panel')!;
+    expect(node.round).toEqual({ current: 2, max: 5 });
+  });
+
+  it('later panel_round wins — last event overwrites earlier', () => {
+    const g = makeGraph({ steps: [PANEL_STEP] });
+    const events: RunEvent[] = [
+      { type: 'panel_round', run_id: runId(), step_id: 'panel', round: 1, max_iterations: 5 },
+      { type: 'panel_round', run_id: runId(), step_id: 'panel', round: 2, max_iterations: 5 },
+    ];
+    const model = buildRunGraphModel(g, events);
+    expect(model.nodeById('panel')!.round).toEqual({ current: 2, max: 5 });
+  });
+
+  it('panel_round for unknown step_id is a no-op (does not throw)', () => {
+    const g = makeGraph({ steps: [PANEL_STEP] });
+    const events: RunEvent[] = [
+      { type: 'panel_round', run_id: runId(), step_id: 'nonexistent', round: 1, max_iterations: 3 },
+    ];
+    // Should not throw; model is unmodified.
+    const model = buildRunGraphModel(g, events);
+    expect(model.nodeById('panel')!.round).toBeUndefined();
+  });
+
+  it('node has no round property before any panel_round event', () => {
+    const g = makeGraph({ steps: [PANEL_STEP] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('panel')!.round).toBeUndefined();
+  });
+});

@@ -77,6 +77,18 @@ pub enum Event {
         tokens_in: u64,
         tokens_out: u64,
     },
+    /// Emitted at the start of each gate-loop iteration in a panel step.
+    /// Allows the live view to display a live round counter (e.g. "Round 2 / 5").
+    PanelRound {
+        run_id: String,
+        step_id: String,
+        /// 1-based iteration counter.
+        round: u32,
+        max_iterations: u32,
+        /// Highest finding severity remaining at the top of this round,
+        /// if already known (always `None` on round 1 before any results).
+        max_severity_remaining: Option<String>,
+    },
     RunCompleted {
         run_id: String,
         status: RunStatus,
@@ -101,6 +113,7 @@ impl Event {
             | Event::StepSkipped { run_id, .. }
             | Event::UnitStarted { run_id, .. }
             | Event::UnitCompleted { run_id, .. }
+            | Event::PanelRound { run_id, .. }
             | Event::RunCompleted { run_id, .. }
             | Event::RunFailed { run_id, .. } => run_id,
         }
@@ -147,6 +160,58 @@ mod tests {
         let json = serde_json::to_string(&ev).expect("serialize");
         assert!(json.contains(r#""type":"step_completed""#));
         assert!(json.contains(r#""step_id":"classify_input""#));
+    }
+
+    #[test]
+    fn panel_round_round_trips_through_json() {
+        let ev = Event::PanelRound {
+            run_id: "run-abc".into(),
+            step_id: "security-panel".into(),
+            round: 2,
+            max_iterations: 5,
+            max_severity_remaining: Some("high".into()),
+        };
+        let val = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(val["type"], "panel_round");
+        assert_eq!(val["run_id"], "run-abc");
+        assert_eq!(val["step_id"], "security-panel");
+        assert_eq!(val["round"], 2);
+        assert_eq!(val["max_iterations"], 5);
+        assert_eq!(val["max_severity_remaining"], "high");
+
+        let back: Event = serde_json::from_value(val).expect("deserialize");
+        match back {
+            Event::PanelRound {
+                run_id,
+                step_id,
+                round,
+                max_iterations,
+                max_severity_remaining,
+            } => {
+                assert_eq!(run_id, "run-abc");
+                assert_eq!(step_id, "security-panel");
+                assert_eq!(round, 2);
+                assert_eq!(max_iterations, 5);
+                assert_eq!(max_severity_remaining.as_deref(), Some("high"));
+            }
+            other => panic!("expected PanelRound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn panel_round_none_severity_round_trips() {
+        let ev = Event::PanelRound {
+            run_id: "r".into(),
+            step_id: "p".into(),
+            round: 1,
+            max_iterations: 3,
+            max_severity_remaining: None,
+        };
+        let val = serde_json::to_value(&ev).expect("serialize");
+        assert_eq!(val["type"], "panel_round");
+        assert!(val["max_severity_remaining"].is_null());
+        let back: Event = serde_json::from_value(val).expect("deserialize");
+        assert_eq!(back.run_id(), "r");
     }
 
     #[test]

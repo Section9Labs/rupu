@@ -1768,6 +1768,18 @@ async fn run_panel_step(
     let mut iterations = 0u32;
     let (final_pass, resolved) = loop {
         iterations += 1;
+        if let Some(sink) = opts.event_sink.as_ref() {
+            sink.emit(
+                workflow_run_id,
+                &crate::executor::Event::PanelRound {
+                    run_id: workflow_run_id.to_owned(),
+                    step_id: step.id.clone(),
+                    round: iterations,
+                    max_iterations: gate.max_iterations,
+                    max_severity_remaining: None,
+                },
+            );
+        }
         let pass = run_panel_iteration(
             workflow_run_id,
             iterations,

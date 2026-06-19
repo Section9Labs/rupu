@@ -304,6 +304,155 @@ steps:
 }
 
 #[tokio::test]
+async fn panel_gate_emits_panel_round_events() {
+    // A panel with a gate that cannot clear (panelist always emits a `high`
+    // severity finding; threshold is `high` → `high < high` is false →
+    // never clears) and max_iterations=2, so the loop runs exactly 2
+    // rounds, emitting 2 PanelRound events with round=1 and round=2.
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    // CollectSink with scripted panelist that always returns a high-severity
+    // finding so the gate never clears.
+    #[derive(Default)]
+    struct CollectSink2(Mutex<Vec<Event>>);
+    impl EventSink for CollectSink2 {
+        fn emit(&self, _run_id: &str, ev: &Event) {
+            self.0.lock().unwrap().push(ev.clone());
+        }
+    }
+
+    struct GatePanelFactory;
+    #[async_trait::async_trait]
+    impl StepFactory for GatePanelFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: std::path::PathBuf,
+            transcript_path: std::path::PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            // Panelists emit a high-severity finding; fixer echoes the prompt.
+            let text = if agent_name == "fixer-bot" {
+                format!("fixed: {rendered_prompt}")
+            } else {
+                r#"{"findings":[{"severity":"high","title":"oops","body":"details"}]}"#.to_string()
+            };
+            let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text,
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "panel".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: false,
+                suppress_stream_stdout: false,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+            }
+        }
+    }
+
+    let wf_yaml = r#"
+name: gate-panel
+steps:
+  - id: scan
+    panel:
+      subject: "check this"
+      panelists:
+        - reviewer-a
+      gate:
+        max_iterations: 2
+        until_no_findings_at_severity_or_above: high
+        fix_with: fixer-bot
+"#;
+
+    let sink: Arc<CollectSink2> = Arc::new(CollectSink2::default());
+    let wf = Workflow::parse(wf_yaml).unwrap();
+    let opts = OrchestratorRunOpts {
+        workflow: wf,
+        inputs: std::collections::BTreeMap::new(),
+        workspace_id: "ws_gate".into(),
+        workspace_path: tmp.path().to_path_buf(),
+        transcript_dir: tmp.path().to_path_buf(),
+        factory: Arc::new(GatePanelFactory),
+        event: None,
+        run_store: None,
+        workflow_yaml: None,
+        resume_from: None,
+        issue: None,
+        issue_ref: None,
+        run_id_override: None,
+        strict_templates: false,
+        event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+    };
+
+    run_workflow(opts).await.unwrap();
+
+    let events = sink.0.lock().unwrap();
+    let rounds: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::PanelRound { step_id, round, .. } if step_id == "scan" => Some(*round),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rounds,
+        vec![1, 2],
+        "expected PanelRound events with round=1 and round=2, got: {events:?}"
+    );
+    // Verify max_iterations is correctly threaded through.
+    let max_iter: Vec<u32> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::PanelRound { step_id, max_iterations, .. } if step_id == "scan" => {
+                Some(*max_iterations)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(max_iter, vec![2, 2], "max_iterations must be 2 for both rounds");
+}
+
+#[tokio::test]
 async fn no_event_sink_does_not_emit_any_events() {
     // Smoke test: running without an event_sink should not panic and
     // should still return correct results.

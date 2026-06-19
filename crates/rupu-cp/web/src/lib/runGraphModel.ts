@@ -220,8 +220,11 @@ export function buildRunGraphModel(
         }
         break;
       }
-      // panel_round: left as a comment — Task 9 wires this.
-      // case 'panel_round': { ... }
+      case 'panel_round': {
+        const n = nodeMap.get(ev.step_id);
+        if (n) n.round = { current: ev.round, max: ev.max_iterations };
+        break;
+      }
       case 'run_started':
       case 'run_completed':
       case 'run_failed':

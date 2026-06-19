@@ -123,6 +123,7 @@ export type KnownRunEvent =
   | StepSkippedEvent
   | UnitStartedEvent
   | UnitCompletedEvent
+  | PanelRoundEvent
   | RunCompletedEvent
   | RunFailedEvent;
 
@@ -198,6 +199,14 @@ export interface UnitCompletedEvent extends RunEventBase {
   tokens_out: number;
 }
 
+export interface PanelRoundEvent extends RunEventBase {
+  type: 'panel_round';
+  step_id: string;
+  round: number;
+  max_iterations: number;
+  max_severity_remaining?: string | null;
+}
+
 export interface RunCompletedEvent extends RunEventBase {
   type: 'run_completed';
   status: RunStatusStr;
@@ -226,6 +235,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
   'step_skipped',
   'unit_started',
   'unit_completed',
+  'panel_round',
   'run_completed',
   'run_failed',
 ]);
