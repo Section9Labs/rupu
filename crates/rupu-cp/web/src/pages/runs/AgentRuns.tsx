@@ -3,7 +3,7 @@
 // status and started_at are optional (standalone runs may lack them).
 
 import { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AgentRunRow } from '../../lib/api';
 import { ListCard } from '../../components/lists/ListCard';
@@ -130,6 +130,7 @@ function isRunning(status: string | null | undefined): boolean {
 
 function AgentRunEntry({ run }: { run: AgentRunRow }) {
   const live = isRunning(run.status);
+  const navigate = useNavigate();
 
   const transcriptHref = run.transcript_path
     ? `/transcript?path=${encodeURIComponent(run.transcript_path)}&live=${live ? 1 : 0}`
@@ -184,12 +185,20 @@ function AgentRunEntry({ run }: { run: AgentRunRow }) {
 
   if (transcriptHref) {
     return (
-      <Link
-        to={transcriptHref}
-        className="block hover:bg-slate-50 transition-colors"
+      <div
+        role="link"
+        tabIndex={0}
+        onClick={() => navigate(transcriptHref)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            navigate(transcriptHref);
+          }
+        }}
+        className="block hover:bg-slate-50 transition-colors cursor-pointer"
       >
         {inner}
-      </Link>
+      </div>
     );
   }
 
