@@ -13,8 +13,10 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use rupu_orchestrator::{RunStoreError, Workflow};
+use rupu_orchestrator::{executor::Event, RunStoreError, Workflow};
 use serde::Serialize;
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader};
 
 // ── Route ────────────────────────────────────────────────────────────────
 
@@ -44,7 +46,21 @@ async fn run_graph(
 
     // 4. Step results and unit checkpoints — missing files = empty vecs.
     let step_results = s.run_store.read_step_results(&id).unwrap_or_default();
-    let units = s.run_store.read_unit_checkpoints(&id).unwrap_or_default();
+    let checkpoints = s.run_store.read_unit_checkpoints(&id).unwrap_or_default();
+
+    // 5. Merge in units that exist only in the event stream.
+    //
+    // A panel step's panelist + fixer runs are emitted as `UnitStarted`
+    // events carrying their `transcript_path`, but — unlike `for_each`
+    // fan-out units — they are NOT persisted to `unit_checkpoints.jsonl`.
+    // For a completed run the checkpoint file therefore has no panel units,
+    // so their transcripts become unreachable on reload. Fold the
+    // events-derived units into the response so the graph can surface them.
+    //
+    // Precedence: durable checkpoints WIN (they are the terminal record).
+    // We only synthesize units for `(step_id, index)` pairs not already
+    // present in the checkpoints.
+    let units = merge_event_units(&id, &s, checkpoints);
 
     Ok(Json(serde_json::json!({
         "run": run,
@@ -52,6 +68,91 @@ async fn run_graph(
         "step_results": step_results,
         "units": units,
     })))
+}
+
+/// Build the `units` response array: durable checkpoints first (these win),
+/// then any units that exist only in `events.jsonl` (panel panelist/fixer
+/// runs). Each element keeps the [`UnitCheckpoint`] field shape so the
+/// frontend reads them uniformly.
+fn merge_event_units(
+    id: &str,
+    s: &AppState,
+    checkpoints: Vec<rupu_orchestrator::runs::UnitCheckpoint>,
+) -> Vec<serde_json::Value> {
+    // Track every (step_id, index) already covered — checkpoints first.
+    let mut seen: HashSet<(String, usize)> = checkpoints
+        .iter()
+        .map(|c| (c.step_id.clone(), c.index))
+        .collect();
+
+    // Serialize the durable checkpoints (terminal records win).
+    let mut out: Vec<serde_json::Value> = checkpoints
+        .iter()
+        .filter_map(|c| serde_json::to_value(c).ok())
+        .collect();
+
+    // Read and parse the event stream; tolerate a missing/garbled file.
+    let path = s.run_store.events_path(id);
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return out,
+    };
+
+    // Synthesized (events-only) units, keyed by (step_id, index) so a later
+    // `UnitCompleted` can patch the `success` flag of an earlier `UnitStarted`.
+    // `order` preserves first-seen order for a stable response.
+    let mut synthesized: std::collections::HashMap<(String, usize), usize> =
+        std::collections::HashMap::new();
+    let mut events_only: Vec<serde_json::Value> = Vec::new();
+
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<Event>(&line) else {
+            continue;
+        };
+        match event {
+            Event::UnitStarted {
+                step_id,
+                index,
+                unit_key,
+                transcript_path,
+                ..
+            } => {
+                let key = (step_id.clone(), index);
+                if seen.contains(&key) {
+                    continue; // checkpoint or earlier started already covers it
+                }
+                seen.insert(key.clone());
+                synthesized.insert(key, events_only.len());
+                events_only.push(serde_json::json!({
+                    "step_id": step_id,
+                    "index": index,
+                    "item": unit_key,
+                    "transcript_path": transcript_path.to_string_lossy(),
+                    "success": serde_json::Value::Null,
+                }));
+            }
+            Event::UnitCompleted {
+                step_id,
+                index,
+                success,
+                ..
+            } => {
+                if let Some(&pos) = synthesized.get(&(step_id, index)) {
+                    if let Some(obj) = events_only[pos].as_object_mut() {
+                        obj.insert("success".into(), serde_json::Value::Bool(success));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out.extend(events_only);
+    out
 }
 
 // ── DTOs ────────────────────────────────────────────────────────────────
@@ -136,7 +237,10 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
     if let Some(panel) = &step.panel {
         let gate = panel.gate.as_ref().map(|g| GateDto {
             max_iterations: g.max_iterations,
-            until_severity: g.until_no_findings_at_severity_or_above.as_str().to_string(),
+            until_severity: g
+                .until_no_findings_at_severity_or_above
+                .as_str()
+                .to_string(),
             fix_with: g.fix_with.clone(),
         });
         return StepNodeDto {

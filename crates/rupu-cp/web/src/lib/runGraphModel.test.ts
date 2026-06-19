@@ -450,3 +450,43 @@ describe('panel_round events', () => {
     expect(model.nodeById('panel')!.round).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 9. panel units fold onto a panel node's fanout (by step_id, regardless of kind)
+// ---------------------------------------------------------------------------
+
+describe('panel units fold onto fanout', () => {
+  const PANEL_STEP: StepNodeDto = {
+    id: 'panel', kind: 'panel',
+    gate: { max_iterations: 3, until_severity: 'high', fix_with: 'fixer' },
+  };
+
+  // Backend now merges panel panelist/fixer runs (from events.jsonl) into
+  // g.units with the same UnitCheckpoint field shape. The model must fold
+  // them onto the panel node's fanout.units even though kind === 'panel'.
+  const panelistA: UnitCheckpoint = {
+    step_id: 'panel', index: 0, item: 'reviewer-a',
+    run_id: runId(), transcript_path: '/tmp/panel_a.jsonl',
+    output: '', success: true, finished_at: '2026-06-18T00:01:00Z',
+  };
+  const panelistB: UnitCheckpoint = {
+    step_id: 'panel', index: 1, item: 'reviewer-b',
+    run_id: runId(), transcript_path: '/tmp/panel_b.jsonl',
+    output: '', success: false, finished_at: '2026-06-18T00:02:00Z',
+  };
+
+  it('panel node gets fanout.units with their transcriptPath', () => {
+    const g = makeGraph({ steps: [PANEL_STEP], units: [panelistA, panelistB] });
+    const model = buildRunGraphModel(g, []);
+    const node = model.nodeById('panel')!;
+    expect(node.kind).toBe('panel');
+    expect(node.fanout).toBeDefined();
+    expect(node.fanout!.units).toHaveLength(2);
+    expect(node.fanout!.units[0].key).toBe('reviewer-a');
+    expect(node.fanout!.units[0].transcriptPath).toBe('/tmp/panel_a.jsonl');
+    expect(node.fanout!.units[0].state).toBe('done');
+    expect(node.fanout!.units[1].key).toBe('reviewer-b');
+    expect(node.fanout!.units[1].transcriptPath).toBe('/tmp/panel_b.jsonl');
+    expect(node.fanout!.units[1].state).toBe('failed');
+  });
+});
