@@ -47,6 +47,7 @@ async fn require_bearer(
 /// local processes while the browser app loads without a header.
 pub fn router(state: AppState, token: Option<String>) -> Router {
     let api = Router::new()
+        .merge(crate::api::autoflows::routes())
         .merge(crate::api::runs::routes())
         .merge(crate::api::agents::routes())
         .merge(crate::api::workflows::routes())
@@ -54,7 +55,9 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         .merge(crate::api::workers::routes())
         .merge(crate::api::coverage::routes())
         .merge(crate::api::dashboard::routes())
-        .merge(crate::api::events::routes());
+        .merge(crate::api::events::routes())
+        .merge(crate::api::graph::routes())
+        .merge(crate::api::run_streams::routes());
 
     let api = match token {
         Some(t) => api.layer(from_fn_with_state(Arc::new(t), require_bearer)),

@@ -193,3 +193,131 @@ async fn app_state_run_store_path_matches_seed_location() {
     let ids: Vec<&str> = listed.iter().map(|r| r.id.as_str()).collect();
     assert!(ids.contains(&run_id), "run seeded via AppState not visible from explicit path; got {ids:?}");
 }
+
+// ── Trigger-type tests ───────────────────────────────────────────────────────
+
+/// Seed three runs: manual, event-triggered, cron-triggered.
+/// Assert GET /api/runs carries the right `trigger` for each.
+#[tokio::test]
+async fn list_runs_carries_trigger_field() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RunStore::new(tmp.path().join("runs"));
+
+    // manual run — neither event nor source_wake_id
+    let manual = seed_run("run_trigger_manual");
+    store
+        .create(manual, "name: test-workflow\nsteps: []\n")
+        .unwrap();
+
+    // event-triggered run
+    let mut event_run = seed_run("run_trigger_event");
+    event_run.event = Some(serde_json::json!({"x": 1}));
+    store
+        .create(event_run, "name: test-workflow\nsteps: []\n")
+        .unwrap();
+
+    // cron-triggered run
+    let mut cron_run = seed_run("run_trigger_cron");
+    cron_run.source_wake_id = Some("wake_1".into());
+    store
+        .create(cron_run, "name: test-workflow\nsteps: []\n")
+        .unwrap();
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/runs"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("body should be a JSON array");
+    assert_eq!(arr.len(), 3, "expected all three seeded runs; got {}", arr.len());
+
+    let find_trigger = |id: &str| -> &str {
+        arr.iter()
+            .find(|r| r["id"].as_str() == Some(id))
+            .and_then(|r| r["trigger"].as_str())
+            .unwrap_or("MISSING")
+    };
+
+    assert_eq!(find_trigger("run_trigger_manual"), "manual");
+    assert_eq!(find_trigger("run_trigger_event"), "event");
+    assert_eq!(find_trigger("run_trigger_cron"), "cron");
+}
+
+/// GET /api/runs/workflows returns only manual runs.
+#[tokio::test]
+async fn list_workflow_runs_filters_to_manual_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RunStore::new(tmp.path().join("runs"));
+
+    let manual = seed_run("run_wf_manual");
+    store
+        .create(manual, "name: test-workflow\nsteps: []\n")
+        .unwrap();
+
+    let mut event_run = seed_run("run_wf_event");
+    event_run.event = Some(serde_json::json!({"x": 1}));
+    store
+        .create(event_run, "name: test-workflow\nsteps: []\n")
+        .unwrap();
+
+    let mut cron_run = seed_run("run_wf_cron");
+    cron_run.source_wake_id = Some("wake_1".into());
+    store
+        .create(cron_run, "name: test-workflow\nsteps: []\n")
+        .unwrap();
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/runs/workflows"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("body should be a JSON array");
+    assert_eq!(
+        arr.len(),
+        1,
+        "only the manual run should be returned; got {arr:?}"
+    );
+    assert_eq!(
+        arr[0]["id"].as_str(),
+        Some("run_wf_manual"),
+        "manual run id mismatch"
+    );
+    assert_eq!(
+        arr[0]["trigger"].as_str(),
+        Some("manual"),
+        "trigger field should be 'manual'"
+    );
+}
+
+/// GET /api/runs/workflows returns empty array when no manual runs exist.
+#[tokio::test]
+async fn list_workflow_runs_empty_when_no_manual_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RunStore::new(tmp.path().join("runs"));
+
+    let mut event_run = seed_run("run_wf_only_event");
+    event_run.event = Some(serde_json::json!({"type": "push"}));
+    store
+        .create(event_run, "name: test-workflow\nsteps: []\n")
+        .unwrap();
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/runs/workflows"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("body should be a JSON array");
+    assert!(
+        arr.is_empty(),
+        "no manual runs seeded, /api/runs/workflows should be empty; got {arr:?}"
+    );
+}

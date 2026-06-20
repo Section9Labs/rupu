@@ -16,6 +16,7 @@
     "@codemirror/language": "^6.12.3",
     "@codemirror/state": "^6.6.0",
     "@codemirror/view": "^6.41.1",
+    "@dagrejs/dagre": "^3.0.0",
     "@lezer/highlight": "^1.2.3",
     "@xyflow/react": "^12.10.2",
     "clsx": "^2.1.1",

@@ -123,6 +123,7 @@ export type KnownRunEvent =
   | StepSkippedEvent
   | UnitStartedEvent
   | UnitCompletedEvent
+  | PanelRoundEvent
   | RunCompletedEvent
   | RunFailedEvent;
 
@@ -198,6 +199,14 @@ export interface UnitCompletedEvent extends RunEventBase {
   tokens_out: number;
 }
 
+export interface PanelRoundEvent extends RunEventBase {
+  type: 'panel_round';
+  step_id: string;
+  round: number;
+  max_iterations: number;
+  max_severity_remaining?: string | null;
+}
+
 export interface RunCompletedEvent extends RunEventBase {
   type: 'run_completed';
   status: RunStatusStr;
@@ -226,6 +235,7 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
   'step_skipped',
   'unit_started',
   'unit_completed',
+  'panel_round',
   'run_completed',
   'run_failed',
 ]);
@@ -238,6 +248,94 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
  */
 export function isKnownRunEvent(ev: RunEvent): ev is KnownRunEvent {
   return KNOWN_EVENT_TYPES.has(ev.type as KnownRunEvent['type']);
+}
+
+// ---------------------------------------------------------------------------
+// Slim run list row (returned by /api/runs and /api/runs/workflows)
+// ---------------------------------------------------------------------------
+
+export interface RunListRow {
+  id: string;
+  workflow_name: string;
+  status: RunStatusStr;
+  started_at: string;
+  finished_at?: string | null;
+  trigger: 'manual' | 'cron' | 'event';
+}
+
+// ---------------------------------------------------------------------------
+// Run-graph types
+// ---------------------------------------------------------------------------
+
+/** Step-DAG node from /api/runs/:id/graph .workflow.steps */
+export interface StepNodeDto {
+  id: string;
+  kind: 'step' | 'for_each' | 'parallel' | 'panel';
+  agent?: string | null;
+  for_each?: string | null;
+  parallel?: { id: string; agent: string }[] | null;
+  panelists?: string[] | null;
+  gate?: {
+    max_iterations: number;
+    until_severity: 'low' | 'medium' | 'high' | 'critical';
+    fix_with: string;
+  } | null;
+}
+
+/**
+ * Unit checkpoint from /api/runs/:id/graph .units.
+ * Written when a for_each unit's agent run completes (terminal).
+ */
+export interface UnitCheckpoint {
+  step_id: string;
+  index: number;
+  item: unknown;            // serde_json::Value — may be a string, object, or array
+  run_id: string;
+  transcript_path: string;
+  output: string;
+  success: boolean;
+  finished_at: string;      // ISO-8601
+}
+
+export interface RunGraphResponse {
+  run: RunRecord;
+  workflow: { steps: StepNodeDto[] };
+  step_results: StepResultRecord[];
+  units: UnitCheckpoint[];
+}
+
+// ---------------------------------------------------------------------------
+// Autoflow / agent-run list types
+// ---------------------------------------------------------------------------
+
+export interface AutoflowCycleRow {
+  cycle_id: string;
+  mode: string;
+  worker_name?: string | null;
+  started_at: string;
+  finished_at: string;
+  workflow_count: number;
+  ran_cycles: number;
+  skipped_cycles: number;
+  failed_cycles: number;
+  run_ids: string[];
+}
+
+export interface AgentRunRow {
+  run_id: string;
+  source: 'standalone' | 'session';
+  agent?: string | null;
+  session_id?: string | null;
+  trigger_source?: string | null;
+  status?: string | null;
+  started_at?: string | null;
+  transcript_path?: string | null;
+}
+
+export interface AutoflowDefRow {
+  name: string;
+  trigger: string;
+  scope: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,13 +522,28 @@ export const api = {
   },
 
   // --- Runs ---
-  getRuns(): Promise<RunRecord[]> {
-    return request<RunRecord[]>('/api/runs');
+  getRuns(): Promise<RunListRow[]> {
+    return request<RunListRow[]>('/api/runs');
   },
   getRun(id: string): Promise<{ run: RunRecord; steps: StepResultRecord[] }> {
     return request<{ run: RunRecord; steps: StepResultRecord[] }>(
       `/api/runs/${encodeURIComponent(id)}`,
     );
+  },
+  getRunGraph(id: string): Promise<RunGraphResponse> {
+    return request<RunGraphResponse>(`/api/runs/${encodeURIComponent(id)}/graph`);
+  },
+  getWorkflowRuns(): Promise<RunListRow[]> {
+    return request<RunListRow[]>('/api/runs/workflows');
+  },
+  getAutoflowRuns(): Promise<AutoflowCycleRow[]> {
+    return request<AutoflowCycleRow[]>('/api/runs/autoflows');
+  },
+  getAgentRuns(): Promise<AgentRunRow[]> {
+    return request<AgentRunRow[]>('/api/runs/agents');
+  },
+  getAutoflowDefs(): Promise<AutoflowDefRow[]> {
+    return request<AutoflowDefRow[]>('/api/autoflows');
   },
 
   // --- Agents ---

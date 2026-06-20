@@ -87,10 +87,12 @@ impl RunModel {
                 self.run_status = RunStatus::Failed;
                 self.active_step = None;
             }
-            // Per-unit fan-out events drive the CLI live view only; the
-            // app's Graph view renders step-level status, so they're a
-            // no-op here.
-            Event::UnitStarted { .. } | Event::UnitCompleted { .. } => {}
+            // Per-unit fan-out and panel-round events drive the CLI live view
+            // only; the app's Graph view renders step-level status, so they're
+            // a no-op here.
+            Event::UnitStarted { .. }
+            | Event::UnitCompleted { .. }
+            | Event::PanelRound { .. } => {}
         }
         self
     }

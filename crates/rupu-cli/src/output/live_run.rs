@@ -365,6 +365,10 @@ impl LiveRunState {
                 self.status = RunStatus::Failed;
                 self.finished_at = Some(*finished_at);
             }
+            // PanelRound drives the web Control Plane's live round
+            // counter; the CLI live view does not render it, so no
+            // per-step state change is needed here.
+            WfEvent::PanelRound { .. } => {}
         }
     }
 
