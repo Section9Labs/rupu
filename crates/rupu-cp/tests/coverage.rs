@@ -1,8 +1,7 @@
 use std::path::Path;
 
 async fn spawn_server(dir: &Path) -> std::net::SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -36,6 +35,14 @@ fn seed_coverage_target(proj: &Path, target: &str) {
 \"declared_by\":{\"run_id\":\"run_x\",\"model\":\"claude\",\"surface\":\"workflow\"},\
 \"declared_at\":\"2026-06-19T00:00:00Z\"}\n";
     std::fs::write(dir.join("findings.jsonl"), finding).unwrap();
+
+    // Per-file ledger: a Read + an Edit on src/a.rs → one FileView, strongest=edit.
+    let files = "\
+{\"kind\":\"read\",\"path\":\"src/a.rs\",\"line_range\":[1,40],\"tool\":\"read_file\",\
+\"run_id\":\"run_x\",\"model\":\"claude\",\"surface\":\"workflow\",\"at\":\"2026-06-19T00:00:00Z\"}\n\
+{\"kind\":\"edit\",\"path\":\"src/a.rs\",\"line_range\":[10,12],\"lines_changed\":3,\"tool\":\"edit_file\",\
+\"run_id\":\"run_x\",\"model\":\"claude\",\"surface\":\"workflow\",\"at\":\"2026-06-19T00:01:00Z\"}\n";
+    std::fs::write(dir.join("files.jsonl"), files).unwrap();
 }
 
 /// GET /api/coverage aggregates targets across ALL registered workspaces,
@@ -139,6 +146,44 @@ async fn get_coverage_resolves_via_ws_id() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404, "ws_a/tgt should not resolve");
+}
+
+/// GET /api/coverage/:target?ws_id=… returns the per-file heatmap (`files`)
+/// alongside the full finding records (severity/summary preserved).
+#[tokio::test]
+async fn get_coverage_returns_files_and_findings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    let ws_dir = tmp.path().join("workspaces");
+    seed_workspace_toml(&ws_dir, "ws_a", proj.to_str().unwrap());
+    seed_coverage_target(&proj, "tgt");
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/coverage/tgt?ws_id=ws_a"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["ws_id"].as_str(), Some("ws_a"));
+    assert_eq!(body["project"].as_str(), Some("proj"));
+
+    // Per-file heatmap: one FileView for src/a.rs, strongest=edit, 1 edit.
+    let files = body["files"].as_array().expect("files should be an array");
+    assert_eq!(files.len(), 1, "expected one file view; got {files:?}");
+    let f = &files[0];
+    assert_eq!(f["path"].as_str(), Some("src/a.rs"));
+    assert_eq!(f["strongest"].as_str(), Some("edit"));
+    assert_eq!(f["edits"].as_u64(), Some(1));
+
+    // Full finding records (not just a count) carry severity + summary.
+    let findings = body["findings"].as_array().expect("findings array");
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["severity"].as_str(), Some("high"));
+    assert_eq!(findings[0]["summary"].as_str(), Some("thing"));
 }
 
 /// GET /api/dashboard coverage tile counts targets across the registry.

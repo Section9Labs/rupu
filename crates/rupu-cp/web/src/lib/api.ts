@@ -513,6 +513,13 @@ export function sevRank(s: FindingSeverity): number {
   return SEV_ORDER.indexOf(s);
 }
 
+/** Evidence attached to a `FindingRecord`. */
+export interface FindingEvidence {
+  rationale: string;
+  code_excerpt?: string | null;
+  references?: string[];
+}
+
 /** One finding record from the per-target findings JSONL. */
 export interface FindingRecord {
   id: string;
@@ -523,9 +530,29 @@ export interface FindingRecord {
   /** Raw wire value — use `normFindingSeverity` to get a `FindingSeverity`. */
   severity: string;
   concern_id?: string | null;
-  evidence: unknown;
+  evidence: FindingEvidence;
   declared_by: unknown;
   declared_at: string;
+}
+
+/** Touch strength, strongest last — matches rupu-coverage's `TouchStrength`. */
+export type TouchStrength = 'glob' | 'cmd' | 'grep' | 'read' | 'edit';
+
+/**
+ * Aggregated per-file touch record (heatmap row) from `file_views`.
+ * `strongest` is the highest touch seen on this path; `read_lines` is loose
+ * (the wire is `[start,end]` pairs but the UI only counts them).
+ */
+export interface FileView {
+  path: string;
+  strongest: string;
+  touch_modes?: string[];
+  read_lines: number[][];
+  grep_matches: number;
+  edits: number;
+  first_at?: string;
+  last_at: string;
+  touched_by?: unknown[];
 }
 
 export interface CoverageDetail {
@@ -536,6 +563,8 @@ export interface CoverageDetail {
   has_catalog: boolean;
   assertions: ConcernAssertion[];
   findings: FindingRecord[];
+  /** Per-file heatmap; may be absent for targets without a file ledger. */
+  files?: FileView[];
 }
 
 // ---------------------------------------------------------------------------

@@ -8,7 +8,8 @@ use axum::{
     Json, Router,
 };
 use rupu_coverage::{
-    coverage_status, discover_targets, read_findings, CoveragePaths, CoverageStatusInput,
+    coverage_status, discover_targets, file_views, read_file_events, read_findings, CoveragePaths,
+    CoverageStatusInput,
 };
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
@@ -120,8 +121,10 @@ async fn get_coverage(
             let paths = CoveragePaths::new(wp, &target);
             let assertions = coverage_status(&paths, CoverageStatusInput::default())
                 .map_err(|e| ApiError::internal(e.to_string()))?;
-            let findings =
-                read_findings(&paths).map_err(|e| ApiError::internal(e.to_string()))?;
+            let findings = read_findings(&paths).map_err(|e| ApiError::internal(e.to_string()))?;
+            // Per-file heatmap. Tolerate a missing files.jsonl → empty vec so the
+            // detail still renders for targets that predate the file ledger.
+            let files = file_views(&read_file_events(&paths).unwrap_or_default());
 
             return Ok(Json(serde_json::json!({
                 "ws_id": w.id,
@@ -131,6 +134,7 @@ async fn get_coverage(
                 "has_catalog": discovered.has_catalog,
                 "assertions": assertions,
                 "findings": findings,
+                "files": files,
             })));
         }
     }
