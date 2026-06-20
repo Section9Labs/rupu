@@ -8,9 +8,12 @@ import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AgentRunRow } from '../../lib/api';
 import { ListCard } from '../../components/lists/ListCard';
 import { SectionHeader } from '../../components/lists/SectionHeader';
-import UsageChip from '../../components/UsageChip';
+import MetricRow from '../../components/lists/MetricRow';
+import UsageBarChart from '../../components/charts/UsageBarChart';
 import { cn } from '../../lib/cn';
 import { relativeTime } from '../../lib/time';
+import { formatTokens, formatCost } from '../../lib/usage';
+import { formatDuration } from '../../lib/duration';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
@@ -128,6 +131,19 @@ export default function AgentRuns() {
         <AgentRunsEmpty />
       ) : (
         <section>
+          {sorted.length > 0 && (
+            <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
+              <UsageBarChart bars={sorted.map((r) => ({
+                id: r.run_id,
+                label: r.agent ?? r.run_id,
+                to: r.transcript_path
+                  ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}`
+                  : undefined,
+                input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
+                cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
+              }))} />
+            </div>
+          )}
           <SectionHeader tone="muted" label="Agent Runs" count={sorted.length} />
           <ListCard>
             {sorted.map((r) => (
@@ -159,51 +175,43 @@ function AgentRunEntry({ run }: { run: AgentRunRow }) {
     : null;
 
   const inner = (
-    <div className="flex items-start gap-4 px-4 py-3">
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium text-ink">
-            {run.agent ?? '—'}
-          </span>
-          <span className="text-[11px] text-ink-mute font-mono">{shortId(run.run_id)}</span>
-          <SourceChip source={run.source} />
-          {run.status && <StatusBadge status={run.status} />}
-          {transcriptHref && (
-            <span className="ml-auto text-[10px] text-brand-600 font-medium">View transcript →</span>
-          )}
-        </div>
-
-        <div className="text-[11px] text-ink-dim mt-0.5 flex items-center gap-3 flex-wrap">
-          <UsageChip usage={run.usage} className="ml-2" />
-          {run.started_at ? (
-            <span>started {relativeTime(run.started_at)}</span>
-          ) : (
-            <span className="text-ink-mute">no timing</span>
-          )}
-          {run.trigger_source && (
-            <span>via <span className="font-mono">{run.trigger_source}</span></span>
-          )}
-          {run.session_id && (
-            <span>
-              session{' '}
-              <Link
-                to={`/sessions/${encodeURIComponent(run.session_id)}`}
-                className="text-brand-600 hover:underline font-mono"
-                onClick={(e) => e.stopPropagation()}
-              >
-                {shortId(run.session_id)}
-              </Link>
-            </span>
-          )}
-        </div>
-
-        {run.transcript_path && (
-          <div className="mt-1 text-[10px] text-ink-mute font-mono truncate" title={run.transcript_path}>
-            {run.transcript_path}
-          </div>
+    <MetricRow
+      header={<>
+        <span className="text-sm font-medium text-ink">{run.agent ?? '—'}</span>
+        <span className="text-[11px] text-ink-mute font-mono">{shortId(run.run_id)}</span>
+        <SourceChip source={run.source} />
+        {run.status && <StatusBadge status={run.status} />}
+        {run.started_at && (
+          <span className="text-[11px] text-ink-dim">started {relativeTime(run.started_at)}</span>
         )}
-      </div>
-    </div>
+        {run.trigger_source && (
+          <span className="text-[11px] text-ink-dim">via <span className="font-mono">{run.trigger_source}</span></span>
+        )}
+        {run.session_id && (
+          <span className="text-[11px] text-ink-dim">
+            session{' '}
+            <Link
+              to={`/sessions/${encodeURIComponent(run.session_id)}`}
+              className="text-brand-600 hover:underline font-mono"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {shortId(run.session_id)}
+            </Link>
+          </span>
+        )}
+      </>}
+      trailing={transcriptHref
+        ? <span className="text-[10px] text-brand-600 font-medium whitespace-nowrap">View transcript →</span>
+        : undefined}
+      metrics={[
+        { label: 'in', value: formatTokens(run.usage.input_tokens) },
+        { label: 'out', value: formatTokens(run.usage.output_tokens) },
+        { label: 'cached', value: run.usage.cached_tokens ? formatTokens(run.usage.cached_tokens) : null },
+        { label: 'cost', value: formatCost(run.usage.cost_usd) },
+        { label: 'duration', value: run.duration_ms != null ? formatDuration(run.duration_ms) : null },
+        { label: 'turns', value: run.turns ? String(run.turns) : null },
+      ]}
+    />
   );
 
   if (transcriptHref) {

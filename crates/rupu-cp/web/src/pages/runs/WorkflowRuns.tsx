@@ -3,15 +3,17 @@
 // Polls every 5 s. Each row links to the live Run detail graph.
 
 import { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type RunListRow, type RunStatusStr } from '../../lib/api';
 import { StatusPill } from '../../components/StatusPill';
-import UsageChip from '../../components/UsageChip';
+import MetricRow from '../../components/lists/MetricRow';
+import UsageBarChart from '../../components/charts/UsageBarChart';
 import { ListCard } from '../../components/lists/ListCard';
 import { SectionHeader, type SectionTone } from '../../components/lists/SectionHeader';
 import { cn } from '../../lib/cn';
-import { durationBetween, relativeTime } from '../../lib/time';
+import { durationBetween } from '../../lib/time';
+import { formatTokens, formatCost } from '../../lib/usage';
+import { formatDuration } from '../../lib/duration';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
@@ -132,6 +134,15 @@ export default function WorkflowRuns() {
         <WorkflowRunsEmpty hasRuns={runs.length > 0} />
       ) : (
         <div className="space-y-6">
+          {runs.length > 0 && (
+            <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
+              <UsageBarChart bars={runs.map((r) => ({
+                id: r.id, label: r.workflow_name, to: `/runs/${encodeURIComponent(r.id)}`,
+                input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
+                cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
+              }))} />
+            </div>
+          )}
           <WorkflowRunSection tone="progress" label="Active"            runs={active} />
           <WorkflowRunSection tone="good"     label="Completed"         runs={done}   />
           <WorkflowRunSection tone="bad"      label="Failed / Rejected" runs={bad}    />
@@ -170,25 +181,23 @@ function WorkflowRunSection({
 
 function WorkflowRunRow({ run }: { run: RunListRow }) {
   return (
-    <Link
+    <MetricRow
       to={`/runs/${encodeURIComponent(run.id)}`}
-      className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
-    >
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-ink truncate">{run.workflow_name}</span>
-          <span className="text-[11px] text-ink-mute font-mono">{shortId(run.id)}</span>
-          <TriggerChip trigger={run.trigger} />
-        </div>
-        <div className="text-[11px] text-ink-dim mt-0.5">
-          started {relativeTime(run.started_at)}
-          {' · '}
-          {durationBetween(run.started_at, run.finished_at)}
-          <UsageChip usage={run.usage} className="ml-2" />
-        </div>
-      </div>
-      <StatusPill status={run.status} />
-    </Link>
+      header={<>
+        <span className="text-sm font-medium text-ink truncate">{run.workflow_name}</span>
+        <span className="text-[11px] text-ink-mute font-mono">{shortId(run.id)}</span>
+        <TriggerChip trigger={run.trigger} />
+      </>}
+      trailing={<StatusPill status={run.status} />}
+      metrics={[
+        { label: 'in', value: formatTokens(run.usage.input_tokens) },
+        { label: 'out', value: formatTokens(run.usage.output_tokens) },
+        { label: 'cached', value: run.usage.cached_tokens ? formatTokens(run.usage.cached_tokens) : null },
+        { label: 'cost', value: formatCost(run.usage.cost_usd) },
+        { label: 'duration', value: run.duration_ms != null ? formatDuration(run.duration_ms) : durationBetween(run.started_at, run.finished_at) },
+        { label: 'turns', value: run.turns ? String(run.turns) : null },
+      ]}
+    />
   );
 }
 
