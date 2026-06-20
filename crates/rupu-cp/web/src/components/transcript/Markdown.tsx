@@ -12,6 +12,7 @@
  */
 
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import type { Components } from 'react-markdown';
 
@@ -140,6 +141,46 @@ const components: Components = {
       {children}
     </em>
   ),
+
+  // GFM table
+  table: ({ children, ...props }) => (
+    <div className="overflow-x-auto my-2">
+      <table className="w-full text-sm border-collapse" {...props}>
+        {children}
+      </table>
+    </div>
+  ),
+  thead: ({ children, ...props }) => (
+    <thead className="border-b border-border" {...props}>
+      {children}
+    </thead>
+  ),
+  tbody: ({ children, ...props }) => <tbody {...props}>{children}</tbody>,
+  tr: ({ children, ...props }) => (
+    <tr className="border-b border-border last:border-0" {...props}>
+      {children}
+    </tr>
+  ),
+  th: ({ children, ...props }) => (
+    <th className="text-left font-semibold text-ink px-2 py-1 align-top" {...props}>
+      {children}
+    </th>
+  ),
+  td: ({ children, ...props }) => (
+    <td className="text-ink px-2 py-1 align-top" {...props}>
+      {children}
+    </td>
+  ),
+  // GFM strikethrough
+  del: ({ children, ...props }) => (
+    <del className="text-ink-mute line-through" {...props}>
+      {children}
+    </del>
+  ),
+  // GFM task-list checkbox (rendered as a disabled input by remark-gfm)
+  input: ({ ...props }) => (
+    <input className="mr-1 align-middle accent-brand-500" disabled {...props} />
+  ),
 };
 
 // ---------------------------------------------------------------------------
@@ -150,6 +191,7 @@ export default function Markdown({ text }: { text: string }) {
   return (
     <div className="prose-rupu min-w-0">
       <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeHighlight]}
         components={components}
       >
