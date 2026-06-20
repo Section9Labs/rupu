@@ -11,6 +11,7 @@ import {
 } from '../../lib/api';
 import { ListCard } from '../../components/lists/ListCard';
 import { SectionHeader } from '../../components/lists/SectionHeader';
+import UsageChip from '../../components/UsageChip';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 
@@ -193,11 +194,14 @@ function AutoflowEventItem({ event }: { event: AutoflowEventRow }) {
           <KindBadge kind={event.kind} />
           {event.issue_display_ref && <IssueChip displayRef={event.issue_display_ref} />}
         </div>
-        <div className="text-[11px] text-ink-dim mt-0.5">
-          {relativeTime(event.at)}
-          {event.worker_name && <> · {event.worker_name}</>}
-          {event.status && <> · {event.status}</>}
-          {event.run_id && <> · <span className="font-mono">{shortId(event.run_id)}</span></>}
+        <div className="text-[11px] text-ink-dim mt-0.5 flex items-center flex-wrap">
+          <span>
+            {relativeTime(event.at)}
+            {event.worker_name && <> · {event.worker_name}</>}
+            {event.status && <> · {event.status}</>}
+            {event.run_id && <> · <span className="font-mono">{shortId(event.run_id)}</span></>}
+          </span>
+          <UsageChip usage={event.usage} className="ml-2" />
         </div>
       </div>
     </div>
@@ -242,6 +246,7 @@ function AutoflowCycleItem({ cycle }: { cycle: AutoflowCycleRow }) {
           )}
           {' '}
           of {cycle.workflow_count}
+          <UsageChip usage={cycle.usage} className="ml-2" />
         </div>
         {cycle.run_ids.length > 0 && (
           <div className="flex items-center gap-1.5 flex-wrap mt-1.5">

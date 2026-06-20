@@ -8,6 +8,7 @@ import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AgentRunRow } from '../../lib/api';
 import { ListCard } from '../../components/lists/ListCard';
 import { SectionHeader } from '../../components/lists/SectionHeader';
+import UsageChip from '../../components/UsageChip';
 import { cn } from '../../lib/cn';
 import { relativeTime } from '../../lib/time';
 
@@ -152,7 +153,7 @@ function AgentRunEntry({ run }: { run: AgentRunRow }) {
         </div>
 
         <div className="text-[11px] text-ink-dim mt-0.5 flex items-center gap-3 flex-wrap">
-          {/* Per-run token/cost: AgentRunRow has no usage field (different DTO); shown on the run detail page instead. */}
+          <UsageChip usage={run.usage} className="ml-2" />
           {run.started_at ? (
             <span>started {relativeTime(run.started_at)}</span>
           ) : (

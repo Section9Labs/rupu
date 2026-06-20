@@ -23,6 +23,7 @@ import {
 } from 'recharts';
 import { api, type DashboardResponse, type RunStatusStr } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
+import UsageChip from '../components/UsageChip';
 import { ListCard } from '../components/lists/ListCard';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
@@ -194,6 +195,7 @@ function RecentRunRow({
           started {relativeTime(run.started_at)}
         </p>
       </div>
+      <UsageChip usage={run.usage} className="ml-2" />
       <StatusPill status={run.status} />
     </Link>
   );
