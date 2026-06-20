@@ -95,6 +95,19 @@
   transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
+/* Respect prefers-reduced-motion — disable all timeline animations for users
+ * who have requested reduced motion in their OS accessibility settings. */
+@media (prefers-reduced-motion: reduce) {
+  .timeline-item,
+  .timeline-item.is-fresh::before,
+  .timeline-dot.is-live,
+  .timeline-dot-ring,
+  .timeline-list > li {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Run-graph node + edge animation (Task 11)                          */
 /* Faithful to the approved graph-pro / fanout-loop mockups:          */

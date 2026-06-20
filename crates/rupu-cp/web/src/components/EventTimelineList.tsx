@@ -2,6 +2,15 @@
 // timeline (icon/color per event type, connector lines, title + detail).
 // No subscription, no scroll state. Consumed by RunEventFeed (which adds
 // scroll-follow + connection badge) and by the Events page (global stream).
+//
+// Props:
+//   liveIDs — optional Set<number> of seq IDs that are "fresh" (just arrived).
+//             When a row's seq is in this set, is-fresh / is-live CSS classes
+//             apply the tick-in animation + purple stripe.
+//
+// Newest-first ordering is handled by the caller (Events.tsx prepends new
+// events so index 0 is always the latest). EventTimelineList is order-agnostic
+// — it renders whatever it receives, spine connecting each item to the next.
 
 import {
   AlertCircle,
@@ -111,16 +120,38 @@ export function labelFor(ev: RunEvent): string {
   return ev.type.replace(/_/g, ' ');
 }
 
+/** Relative "time ago" string from a RunEvent's timestamp field, if present. */
+function relTs(ev: RunEvent): string | undefined {
+  const raw = ev as Record<string, unknown>;
+  const ts = raw['ts'] ?? raw['timestamp'];
+  if (typeof ts !== 'number' && typeof ts !== 'string') return undefined;
+  const t = typeof ts === 'number' ? ts : Date.parse(ts);
+  if (Number.isNaN(t)) return undefined;
+  const sec = Math.round((Date.now() - t) / 1000);
+  if (sec < 5) return 'just now';
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return `${Math.round(hr / 24)}d ago`;
+}
+
 /**
  * Pure presentational timeline — renders a list of SeqEvents as a vertical
  * icon + text feed. No subscription, no scroll state, no connection badge.
+ *
+ * @param liveIDs  Optional set of seq IDs to mark as "fresh" (tick animation).
+ *                 The Events page passes this; RunEventFeed omits it.
  */
 export default function EventTimelineList({
   events,
   className,
+  liveIDs,
 }: {
   events: SeqEvent[];
   className?: string;
+  liveIDs?: ReadonlySet<number>;
 }) {
   return (
     <ol className={cn('timeline-list relative py-3 pl-5 pr-4', className)}>
@@ -130,13 +161,19 @@ export default function EventTimelineList({
         const Icon = v.icon;
         const detail = known ? detailFor(ev) : undefined;
         const title = known ? titleFor(ev) : ev.type;
+        const rel = relTs(ev);
         const isLast = i === events.length - 1;
+        const isFresh = liveIDs != null && liveIDs.has(seq);
         return (
           <li
             key={seq}
-            className="timeline-item relative flex gap-3 pb-3 last:pb-0"
+            className={cn(
+              'timeline-item relative flex gap-3 pb-3 last:pb-0',
+              isFresh && 'is-fresh',
+            )}
           >
-            {/* connector line */}
+            {/* connector line — below the dot for oldest-first, below for newest-first too
+                (the spine always runs "downward" toward the older/next item) */}
             {!isLast && (
               <span
                 className="absolute left-[11px] top-6 bottom-0 w-px bg-border"
@@ -147,8 +184,15 @@ export default function EventTimelineList({
               className={cn(
                 'timeline-dot relative z-10 flex h-6 w-6 shrink-0 items-center justify-center rounded-full ring-1',
                 v.ring,
+                isFresh && 'is-live',
               )}
             >
+              {isFresh && (
+                <span
+                  className={cn('timeline-dot-ring absolute inline-block w-6 h-6 rounded-full', v.ring)}
+                  aria-hidden
+                />
+              )}
               <Icon size={12} className={cn(v.iconColor, v.spin && 'animate-spin')} />
             </span>
             <div className="min-w-0 flex-1 pt-0.5">
@@ -159,6 +203,11 @@ export default function EventTimelineList({
                 <span className="text-[10px] uppercase tracking-wide text-ink-mute shrink-0">
                   {labelFor(ev)}
                 </span>
+                {rel && (
+                  <span className="ml-auto text-[10px] text-ink-mute tabular-nums shrink-0">
+                    {rel}
+                  </span>
+                )}
               </div>
               {detail && (
                 <div className="text-[11px] text-ink-dim mt-0.5 break-words">
