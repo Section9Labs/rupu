@@ -19,7 +19,7 @@ export default defineConfig({
           charts: ['recharts'],
           // Markdown rendering (react-markdown + rehype-highlight + highlight.js)
           // — only loaded by the transcript route, isolated from the main entry.
-          markdown: ['react-markdown', 'rehype-highlight', 'highlight.js'],
+          markdown: ['react-markdown', 'remark-gfm', 'rehype-highlight', 'highlight.js'],
         },
       },
     },
