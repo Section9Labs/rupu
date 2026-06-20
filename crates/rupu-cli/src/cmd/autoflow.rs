@@ -6981,7 +6981,7 @@ fn summarize_transcript_path(
                 out.usage.input_tokens += u64::from(input_tokens);
                 out.usage.output_tokens += u64::from(output_tokens);
                 out.usage.cached_tokens += u64::from(cached_tokens);
-                let cost = crate::pricing::lookup(pricing, &provider, &model, &transcript_agent)
+                let cost = rupu_config::pricing::lookup(pricing, &provider, &model, &transcript_agent)
                     .map(|price| {
                         price.cost_usd(
                             u64::from(input_tokens),

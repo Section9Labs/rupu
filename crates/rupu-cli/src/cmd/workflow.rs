@@ -1749,7 +1749,7 @@ fn run_cost_usd(
     let mut total = 0.0f64;
     let mut any = false;
     for r in rows {
-        if let Some(p) = crate::pricing::lookup(pricing, &r.provider, &r.model, &r.agent) {
+        if let Some(p) = rupu_config::pricing::lookup(pricing, &r.provider, &r.model, &r.agent) {
             total += p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens);
             any = true;
         }
@@ -1801,7 +1801,7 @@ async fn show_run(
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
             cached_tokens: r.cached_tokens,
-            cost_usd: crate::pricing::lookup(&cfg.pricing, &r.provider, &r.model, &r.agent)
+            cost_usd: rupu_config::pricing::lookup(&cfg.pricing, &r.provider, &r.model, &r.agent)
                 .map(|p| p.cost_usd(r.input_tokens, r.output_tokens, r.cached_tokens)),
         })
         .collect::<Vec<_>>();
