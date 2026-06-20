@@ -440,6 +440,19 @@ export interface WorkflowDetail {
 // Sessions
 // ---------------------------------------------------------------------------
 
+/**
+ * One point on the aggregated per-turn usage timeline.
+ * `turn` is a 1-based global index across all of a run's steps (or a session's
+ * runs); `label` is the step_id (runs) / run_id (sessions) the turn belongs to.
+ */
+export interface UsageTimelinePoint {
+  turn: number;
+  label: string;
+  tokens_in: number;
+  tokens_out: number;
+  tokens_cached: number;
+}
+
 export interface SessionSummary {
   session_id: string;
   agent_name: string;
@@ -689,6 +702,12 @@ export const api = {
   },
   getRunGraph(id: string): Promise<RunGraphResponse> {
     return request<RunGraphResponse>(`/api/runs/${encodeURIComponent(id)}/graph`);
+  },
+  getRunUsageTimeline(id: string): Promise<UsageTimelinePoint[]> {
+    return request<UsageTimelinePoint[]>(`/api/runs/${encodeURIComponent(id)}/usage-timeline`);
+  },
+  getSessionUsageTimeline(id: string): Promise<UsageTimelinePoint[]> {
+    return request<UsageTimelinePoint[]>(`/api/sessions/${encodeURIComponent(id)}/usage-timeline`);
   },
   getWorkflowRuns(params?: ListParams): Promise<RunListRow[]> {
     return request<RunListRow[]>(`/api/runs/workflows${listQuery(params)}`);

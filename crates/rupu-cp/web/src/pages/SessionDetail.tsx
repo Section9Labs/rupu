@@ -6,11 +6,12 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft, RefreshCw } from 'lucide-react';
-import { api, type SessionSummary, type AgentRunRow } from '../lib/api';
+import { api, type SessionSummary, type AgentRunRow, type UsageTimelinePoint } from '../lib/api';
 import { cn } from '../lib/cn';
 import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
 import UsageChip from '../components/UsageChip';
+import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -56,6 +57,10 @@ export default function SessionDetailPage() {
   const [runsError, setRunsError] = useState<string | null>(null);
   const [runsRefreshing, setRunsRefreshing] = useState(false);
 
+  // Aggregated per-turn token series across this session's runs (no step
+  // boundaries → no separators).
+  const [series, setSeries] = useState<UsageTimelinePoint[]>([]);
+
   // Fetch session identity
   useEffect(() => {
     if (!id) return;
@@ -71,6 +76,26 @@ export default function SessionDetailPage() {
       .catch((e: unknown) => {
         if (cancelled) return;
         setSessionError(e instanceof Error ? e.message : 'Failed to load session');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
+
+  // Aggregated per-turn usage timeline for this session.
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    setSeries([]);
+    api
+      .getSessionUsageTimeline(id)
+      .then((pts) => {
+        if (cancelled) return;
+        setSeries(pts);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSeries([]);
       });
     return () => {
       cancelled = true;
@@ -148,6 +173,14 @@ export default function SessionDetailPage() {
           {session.usage && <UsageChip usage={session.usage} className="ml-2" />}
         </div>
       </header>
+
+      {/* Aggregated per-turn token usage across this session's runs */}
+      <section className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mt-3">
+        <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
+          Token usage by turn
+        </h2>
+        <RunUsageTimeline series={series} />
+      </section>
 
       {/* Identity fields */}
       <section className="mt-6">

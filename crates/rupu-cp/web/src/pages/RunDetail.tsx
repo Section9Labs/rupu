@@ -12,6 +12,7 @@ import {
   type RunEvent,
   type RunGraphResponse,
   type RunRecord,
+  type UsageTimelinePoint,
 } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
 import { TabBar, TabButton } from '../components/TabBar';
@@ -20,7 +21,6 @@ import FanoutDrill from '../components/FanoutDrill';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
 import TranscriptPanel from '../components/TranscriptPanel';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
-import { buildTurnSeries, type TurnUsagePoint } from '../components/transcript/turnSeries';
 import { buildRunGraphModel, type RunGraphModel, type UnitView } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
@@ -67,9 +67,9 @@ export default function RunDetail() {
   // Fan-out drill-in: which step's units are open, or null.
   const [drillStepId, setDrillStepId] = useState<string | null>(null);
 
-  // Per-turn token series for the "Token usage by turn" timeline. Sourced from
-  // the run's primary transcript (see effect below).
-  const [series, setSeries] = useState<TurnUsagePoint[]>([]);
+  // Aggregated per-turn token series for the "Token usage by turn" timeline —
+  // a global index across all of the run's steps (see effect below).
+  const [series, setSeries] = useState<UsageTimelinePoint[]>([]);
 
   // Selected transcript for the bottom split pane. Null until a node is clicked
   // or the default is seeded once the model first becomes available.
@@ -100,22 +100,17 @@ export default function RunDetail() {
     };
   }, [id]);
 
-  // Per-turn usage series. The graph response has no transcript events, so we
-  // fetch the run's PRIMARY transcript once and build the series from it.
-  // v1 limitation: "primary" = the first step result that recorded a transcript
-  // path. For a single-agent run that's the whole run; for a multi-step workflow
-  // it's only the first step's turns. A future iteration could merge all steps'
-  // series into one timeline.
+  // Aggregated per-turn usage series across all of the run's steps, served by
+  // the backend's usage-timeline endpoint. One fetch per run id.
   useEffect(() => {
+    if (!id) return;
     let cancelled = false;
     setSeries([]);
-    const path = graph?.step_results.find((s) => s.transcript_path)?.transcript_path;
-    if (!path) return;
     api
-      .getTranscript(path)
-      .then((r) => {
+      .getRunUsageTimeline(id)
+      .then((pts) => {
         if (cancelled) return;
-        setSeries(buildTurnSeries(r.events));
+        setSeries(pts);
       })
       .catch(() => {
         if (cancelled) return;
@@ -124,7 +119,7 @@ export default function RunDetail() {
     return () => {
       cancelled = true;
     };
-  }, [graph]);
+  }, [id]);
 
   // ONE SSE subscription per open run — shared by graph + feed.
   useEffect(() => {
@@ -294,7 +289,7 @@ export default function RunDetail() {
           <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
             Token usage by turn
           </h2>
-          <RunUsageTimeline series={series} />
+          <RunUsageTimeline series={series} separators />
         </section>
       </div>
 

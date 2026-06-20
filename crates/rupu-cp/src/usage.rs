@@ -301,6 +301,49 @@ pub fn breakdown(
     out
 }
 
+/// One per-turn point for the usage timeline. `turn` is a 1-based global index
+/// across all contributing transcripts (in order); `label` is the grouping key
+/// (step id for a run, run id for a session).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct TurnPoint {
+    pub turn: u64,
+    pub label: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub tokens_cached: u64,
+}
+
+/// Build an ordered per-turn token series from labeled transcripts. Each
+/// `Usage` event becomes one point; transcripts are read in the given order
+/// and the `turn` counter is global across all of them. Unreadable/partial
+/// files are skipped.
+pub fn turn_series(labeled_paths: &[(String, PathBuf)]) -> Vec<TurnPoint> {
+    let mut out: Vec<TurnPoint> = Vec::new();
+    for (label, path) in labeled_paths {
+        let Ok(iter) = JsonlReader::iter(path) else {
+            continue;
+        };
+        for ev in iter.flatten() {
+            if let Event::Usage {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                ..
+            } = ev
+            {
+                out.push(TurnPoint {
+                    turn: out.len() as u64 + 1,
+                    label: label.clone(),
+                    tokens_in: u64::from(input_tokens),
+                    tokens_out: u64::from(output_tokens),
+                    tokens_cached: u64::from(cached_tokens),
+                });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +510,30 @@ mod tests {
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].provider, "anthropic");
         assert_eq!(b[0].input_tokens, 2000);
+    }
+
+    #[test]
+    fn turn_series_aggregates_labeled_transcripts_in_order() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("rupu-cp-turnseries-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str, n: usize| {
+            let p = dir.join(name);
+            let mut f = std::fs::File::create(&p).unwrap();
+            for i in 0..n {
+                writeln!(f, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"m","input_tokens":{},"output_tokens":1,"cached_tokens":0}}}}"#, 100 + i).unwrap();
+            }
+            p
+        };
+        let a = mk("a.jsonl", 2);
+        let b = mk("b.jsonl", 1);
+        let series = turn_series(&[("step1".into(), a), ("step2".into(), b)]);
+        assert_eq!(series.len(), 3);
+        assert_eq!(series[0].turn, 1);
+        assert_eq!(series[0].label, "step1");
+        assert_eq!(series[0].tokens_in, 100);
+        assert_eq!(series[2].turn, 3);
+        assert_eq!(series[2].label, "step2");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

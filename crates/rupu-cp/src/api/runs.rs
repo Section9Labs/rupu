@@ -16,6 +16,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/workflows", get(list_workflow_runs))
         .route("/api/runs/:id", get(get_run))
         .route("/api/runs/:id/log", get(get_run_log))
+        .route("/api/runs/:id/usage-timeline", get(get_run_usage_timeline))
 }
 
 /// Derive a trigger label from a [`RunRecord`].
@@ -165,6 +166,28 @@ async fn get_run_log(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(sse.into_response())
+}
+
+/// `GET /api/runs/:id/usage-timeline` — ordered per-turn token series across
+/// every transcript the run produced (step results + fan-out items), labeled
+/// by step id.
+async fn get_run_usage_timeline(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<crate::usage::TurnPoint>>> {
+    s.run_store.load(&id).map_err(|e| match e {
+        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        other => ApiError::internal(other.to_string()),
+    })?;
+    let steps = s.run_store.read_step_results(&id).unwrap_or_default();
+    let mut labeled: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for st in &steps {
+        labeled.push((st.step_id.clone(), st.transcript_path.clone()));
+        for item in &st.items {
+            labeled.push((st.step_id.clone(), item.transcript_path.clone()));
+        }
+    }
+    Ok(Json(crate::usage::turn_series(&labeled)))
 }
 
 #[cfg(test)]
