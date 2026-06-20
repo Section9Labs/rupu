@@ -8,6 +8,18 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // Core React runtime — shared by every route; cached after first visit.
+          react: ['react', 'react-dom', 'react-router-dom'],
+          // Heavy graph deps — only loaded when a run-detail route is visited.
+          xyflow: ['@xyflow/react', '@dagrejs/dagre'],
+          // Charting — only loaded on Dashboard.
+          charts: ['recharts'],
+        },
+      },
+    },
   },
   server: {
     port: 5173,
