@@ -27,6 +27,9 @@ pub struct ProjectRow {
     pub branch: Option<String>,
     pub created_at: String,
     pub last_run_at: Option<String>,
+    pub usage: crate::usage::UsageSummary,
+    pub run_count: u64,
+    pub last_active: Option<String>,
 }
 
 /// Project rollup returned by `GET /api/projects/:ws_id`. The nested
@@ -62,6 +65,9 @@ fn project_row(w: &rupu_workspace::Workspace) -> ProjectRow {
         branch: w.initial_branch.clone(),
         created_at: w.created_at.clone(),
         last_run_at: w.last_run_at.clone(),
+        usage: crate::usage::UsageSummary::default(),
+        run_count: 0,
+        last_active: None,
     }
 }
 
@@ -85,12 +91,20 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn list_projects(State(s): State<AppState>) -> ApiResult<Json<Vec<ProjectRow>>> {
-    let mut rows: Vec<ProjectRow> = store(&s)
-        .list()
-        .unwrap_or_default()
-        .iter()
-        .map(project_row)
-        .collect();
+    let workspaces = store(&s).list().unwrap_or_default();
+    let runs = s.run_store.list().unwrap_or_default();
+    // Single pass over every run, grouped by owning workspace id.
+    let rollups = crate::usage::rollup_by(&s.run_store, &runs, &s.pricing, |r| {
+        Some(r.workspace_id.clone())
+    });
+    let mut rows: Vec<ProjectRow> = workspaces.iter().map(project_row).collect();
+    for row in &mut rows {
+        if let Some(roll) = rollups.get(&row.ws_id) {
+            row.usage = roll.usage.clone();
+            row.run_count = roll.run_count;
+            row.last_active = roll.last_active.clone();
+        }
+    }
     // Newest activity first; `None` sorts last (None < Some(_) in Rust's
     // default Ord, so reversing puts Some(_) before None).
     rows.sort_by(|a, b| b.last_run_at.cmp(&a.last_run_at));
@@ -415,6 +429,9 @@ mod tests {
                 branch: None,
                 created_at: String::new(),
                 last_run_at: None,
+                usage: crate::usage::UsageSummary::default(),
+                run_count: 0,
+                last_active: None,
             },
             runs: json!({}),
             sessions: json!({}),
