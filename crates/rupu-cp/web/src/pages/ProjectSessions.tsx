@@ -9,6 +9,7 @@ import { ListCard } from '../components/lists/ListCard';
 import { relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
 import { cn } from '../lib/cn';
+import UsageChip from '../components/UsageChip';
 
 export default function ProjectSessions() {
   const { wsId } = useParams<{ wsId: string }>();
@@ -80,6 +81,7 @@ export default function ProjectSessions() {
                 <p className="text-[11px] text-ink-dim mt-0.5">
                   {s.total_turns} turn{s.total_turns !== 1 ? 's' : ''} · updated{' '}
                   {relativeTime(s.updated_at)}
+                  {s.usage && <UsageChip usage={s.usage} className="ml-2" />}
                 </p>
               </div>
             </Link>
