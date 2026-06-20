@@ -45,6 +45,7 @@ pub(crate) struct RunListRow {
     pub(crate) started_at: chrono::DateTime<chrono::Utc>,
     pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) trigger: &'static str,
+    pub(crate) usage: crate::usage::UsageSummary,
 }
 
 impl From<&RunRecord> for RunListRow {
@@ -56,7 +57,21 @@ impl From<&RunRecord> for RunListRow {
             started_at: r.started_at,
             finished_at: r.finished_at,
             trigger: trigger_of(r),
+            usage: crate::usage::UsageSummary::default(),
         }
+    }
+}
+
+impl RunListRow {
+    /// Build a row with its usage summary filled from the run's transcripts.
+    pub(crate) fn with_usage(
+        r: &RunRecord,
+        store: &rupu_orchestrator::runs::RunStore,
+        pricing: &rupu_config::PricingConfig,
+    ) -> Self {
+        let mut row = Self::from(r);
+        row.usage = crate::usage::summarize_run(store, &r.id, pricing);
+        row
     }
 }
 
@@ -65,7 +80,11 @@ async fn list_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<RunListRow>>
         .run_store
         .list()
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(runs.iter().map(RunListRow::from).collect()))
+    Ok(Json(
+        runs.iter()
+            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
+            .collect(),
+    ))
 }
 
 /// `GET /api/runs/workflows` — manual/direct runs only (no event or cron wake).
@@ -77,7 +96,7 @@ async fn list_workflow_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<Run
     let rows: Vec<RunListRow> = runs
         .iter()
         .filter(|r| r.event.is_none() && r.source_wake_id.is_none())
-        .map(RunListRow::from)
+        .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
         .collect();
     Ok(Json(rows))
 }
@@ -91,7 +110,10 @@ async fn get_run(
         other => ApiError::internal(other.to_string()),
     })?;
     let steps = s.run_store.read_step_results(&id).unwrap_or_default();
-    Ok(Json(serde_json::json!({ "run": record, "steps": steps })))
+    let usage = crate::usage::summarize_run(&s.run_store, &id, &s.pricing);
+    Ok(Json(
+        serde_json::json!({ "run": record, "steps": steps, "usage": usage }),
+    ))
 }
 
 /// `GET /api/runs/:id/log` — tail the run's `events.jsonl` as a live SSE stream.
@@ -114,4 +136,25 @@ async fn get_run_log(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(sse.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_list_row_serializes_usage() {
+        let row = RunListRow {
+            id: "r1".into(),
+            workflow_name: "wf".into(),
+            status: RunStatus::Completed,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            trigger: "manual",
+            usage: crate::usage::UsageSummary::default(),
+        };
+        let v = serde_json::to_value(&row).unwrap();
+        assert!(v.get("usage").is_some());
+        assert_eq!(v["usage"]["priced"], serde_json::Value::Bool(false));
+    }
 }
