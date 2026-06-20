@@ -10,6 +10,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
 import { STATE_STYLE } from './stepStyle';
+import { PANEL_W, PANEL_H } from '../../lib/nodeSize';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -29,7 +30,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
   return (
     <div
       className={['relative rounded-[12px] border px-2.5 py-2', running ? 'rg-pulse-await' : ''].join(' ')}
-      style={{ borderColor: '#c4b5fd', background: '#faf5ff', minWidth: 168 }}
+      style={{ borderColor: '#c4b5fd', background: '#faf5ff', width: PANEL_W, minHeight: PANEL_H }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 

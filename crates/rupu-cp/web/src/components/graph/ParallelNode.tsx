@@ -7,6 +7,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
 import { STATE_STYLE } from './stepStyle';
+import { nodeSize } from '../../lib/nodeSize';
 
 export interface ParallelNodeData extends Record<string, unknown> {
   node: GraphNode;
@@ -22,11 +23,12 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
   const total = subs.length;
   const done = subs.filter((s) => s.state === 'done').length;
   const running = node.state === 'running';
+  const box = nodeSize(node);
 
   return (
     <div
       className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
-      style={{ borderColor: '#c4b5fd', background: '#faf5ff', minWidth: 150 }}
+      style={{ borderColor: '#c4b5fd', background: '#faf5ff', width: box.width, minHeight: box.height }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
