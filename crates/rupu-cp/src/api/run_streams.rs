@@ -1,5 +1,9 @@
 use crate::{error::ApiResult, state::AppState};
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    extract::{Query, State},
+    routing::get,
+    Json, Router,
+};
 use rupu_runtime::{
     AutoflowCycleEventKind, AutoflowCycleRecord, AutoflowHistoryStore, AutoflowHistoryStoreError,
 };
@@ -119,6 +123,7 @@ struct AgentRunRow {
     status: Option<String>,
     started_at: Option<String>,
     transcript_path: Option<String>,
+    usage: crate::usage::UsageSummary,
 }
 
 /// Stringify whatever serde_json::Value the status field carries.
@@ -197,6 +202,7 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             status: None, // standalone meta does not carry run status
             started_at: None, // standalone meta does not carry a started_at field
             transcript_path,
+            usage: crate::usage::UsageSummary::default(),
         });
     }
     rows
@@ -254,6 +260,7 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                         .and_then(stringify_status),
                     started_at: run.started_at,
                     transcript_path: run.transcript_path,
+                    usage: crate::usage::UsageSummary::default(),
                 });
             }
         }
@@ -263,15 +270,16 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
 /// `GET /api/runs/agents` — returns agent runs from both standalone transcripts
 /// and session invocations, merged and sorted newest-first by `started_at`.
 /// Missing directories return `[]` (no 500).
-async fn list_agent_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentRunRow>>> {
+async fn list_agent_runs(
+    State(s): State<AppState>,
+    Query(page): Query<crate::pagination::PageQuery>,
+) -> ApiResult<Json<Vec<AgentRunRow>>> {
     let mut rows = collect_standalone_runs(&s.global_dir);
-
     collect_session_runs_from_dir(&s.global_dir.join("sessions"), &mut rows);
     collect_session_runs_from_dir(&s.global_dir.join("sessions-archive"), &mut rows);
 
-    // Sort newest-first: rows with a `started_at` string come before those
-    // without. Among rows with timestamps, lexicographic descending order
-    // works correctly for ISO-8601 strings.
+    // Newest-first: rows with a timestamp sort before those without; ISO-8601
+    // strings sort lexicographically.
     rows.sort_by(|a, b| match (&b.started_at, &a.started_at) {
         (Some(bt), Some(at)) => bt.cmp(at),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -279,7 +287,17 @@ async fn list_agent_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentR
         (None, None) => std::cmp::Ordering::Equal,
     });
 
-    Ok(Json(rows))
+    // Slice to the page BEFORE reading transcripts, then fill usage per row.
+    let mut page_rows = crate::pagination::paginate(rows, &page);
+    for row in &mut page_rows {
+        if let Some(tp) = &row.transcript_path {
+            row.usage = crate::usage::summarize_paths(
+                &[std::path::PathBuf::from(tp)],
+                &s.pricing,
+            );
+        }
+    }
+    Ok(Json(page_rows))
 }
 
 // ---------------------------------------------------------------------------
