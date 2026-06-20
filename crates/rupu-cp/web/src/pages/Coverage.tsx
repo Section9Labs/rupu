@@ -32,21 +32,23 @@ export default function Coverage() {
     };
   }, []);
 
-  const sorted = (targets ?? []).slice().sort((a, b) => {
-    if (b.findings !== a.findings) return b.findings - a.findings;
-    return b.assertion_lines - a.assertion_lines;
-  });
+  const all = targets ?? [];
 
-  // Max assertion_lines across visible targets — used to scale comparative bars.
-  const maxLines = sorted.reduce((m, t) => Math.max(m, t.assertion_lines), 1);
+  // Max assertion_lines across all targets — used to scale comparative bars
+  // consistently across every project group.
+  const maxLines = all.reduce((m, t) => Math.max(m, t.assertion_lines), 1);
+
+  // Group targets by their owning project. Within a group, sort by findings ↓
+  // then activity ↓. Groups are ordered by project name asc.
+  const groups = groupByProject(all);
 
   return (
     <div className="p-8 max-w-5xl">
       <header className="mb-6">
         <h1 className="text-2xl font-semibold text-ink">Coverage</h1>
         <p className="mt-1 text-sm text-ink-dim">
-          Assessment activity across targets — how many concern assertions have been recorded per
-          project, and how many findings were raised.
+          Assessment activity across all registered projects — how many concern assertions have
+          been recorded per target, and how many findings were raised.
         </p>
       </header>
 
@@ -58,25 +60,58 @@ export default function Coverage() {
 
       {targets === null ? (
         <div className="text-sm text-ink-dim">Loading coverage…</div>
-      ) : sorted.length === 0 ? (
+      ) : all.length === 0 ? (
         <EmptyState />
       ) : (
-        <section>
-          <SectionHeader
-            tone="muted"
-            label="Targets"
-            count={sorted.length}
-            hint="sorted by findings ↓ then activity ↓"
-          />
-          <ListCard>
-            {sorted.map((t) => (
-              <TargetRow key={t.target_id} target={t} maxLines={maxLines} />
-            ))}
-          </ListCard>
-        </section>
+        <div className="space-y-8">
+          {groups.map((g) => (
+            <section key={g.project}>
+              <SectionHeader
+                tone="muted"
+                label={g.project}
+                count={g.rows.length}
+                hint="sorted by findings ↓ then activity ↓"
+              />
+              <ListCard>
+                {g.rows.map((t) => (
+                  <TargetRow key={`${t.ws_id}/${t.target_id}`} target={t} maxLines={maxLines} />
+                ))}
+              </ListCard>
+            </section>
+          ))}
+        </div>
       )}
     </div>
   );
+}
+
+/** A project group: a project name + its sorted target rows. */
+interface ProjectGroup {
+  project: string;
+  rows: CoverageSummary[];
+}
+
+/**
+ * Bucket targets by `project`, sort each bucket by findings ↓ then activity ↓,
+ * and return the groups ordered by project name asc.
+ */
+function groupByProject(targets: CoverageSummary[]): ProjectGroup[] {
+  const byProject = new Map<string, CoverageSummary[]>();
+  for (const t of targets) {
+    const key = t.project || t.ws_id;
+    const bucket = byProject.get(key);
+    if (bucket) bucket.push(t);
+    else byProject.set(key, [t]);
+  }
+  return Array.from(byProject.entries())
+    .map(([project, rows]) => ({
+      project,
+      rows: rows.slice().sort((a, b) => {
+        if (b.findings !== a.findings) return b.findings - a.findings;
+        return b.assertion_lines - a.assertion_lines;
+      }),
+    }))
+    .sort((a, b) => a.project.localeCompare(b.project));
 }
 
 function TargetRow({
@@ -91,7 +126,7 @@ function TargetRow({
 
   return (
     <Link
-      to={`/coverage/${encodeURIComponent(target.target_id)}`}
+      to={`/coverage/${encodeURIComponent(target.target_id)}?ws_id=${encodeURIComponent(target.ws_id)}`}
       className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
     >
       {/* Target name */}

@@ -1,29 +1,42 @@
+import React, { Suspense } from 'react';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import Layout from './components/Layout';
-import Dashboard from './pages/Dashboard';
-import RunDetail from './pages/RunDetail';
-import Events from './pages/Events';
-import Coverage from './pages/Coverage';
-import CoverageDetail from './pages/CoverageDetail';
-import Workflows from './pages/Workflows';
-import WorkflowDetail from './pages/WorkflowDetail';
-import Agents from './pages/Agents';
-import AgentDetail from './pages/AgentDetail';
-import AutoflowsDefs from './pages/AutoflowsDefs';
-import Sessions from './pages/Sessions';
-import SessionDetail from './pages/SessionDetail';
-import Workers from './pages/Workers';
-import Settings from './pages/Settings';
-import AgentRuns from './pages/runs/AgentRuns';
-import WorkflowRuns from './pages/runs/WorkflowRuns';
-import AutoflowRuns from './pages/runs/AutoflowRuns';
-import Projects from './pages/Projects';
-import ProjectDetail from './pages/ProjectDetail';
-import ProjectRuns from './pages/ProjectRuns';
-import ProjectSessions from './pages/ProjectSessions';
-import ProjectCoverage from './pages/ProjectCoverage';
-import RunTranscript from './pages/RunTranscript';
+
+// All page-level routes are lazy-loaded so each page lands in its own chunk
+// and the main bundle only pays for the shell (Layout + router plumbing).
+const Dashboard         = React.lazy(() => import('./pages/Dashboard'));
+const RunDetail         = React.lazy(() => import('./pages/RunDetail'));
+const Events            = React.lazy(() => import('./pages/Events'));
+const Coverage          = React.lazy(() => import('./pages/Coverage'));
+const CoverageDetail    = React.lazy(() => import('./pages/CoverageDetail'));
+const Workflows         = React.lazy(() => import('./pages/Workflows'));
+const WorkflowDetail    = React.lazy(() => import('./pages/WorkflowDetail'));
+const Agents            = React.lazy(() => import('./pages/Agents'));
+const AgentDetail       = React.lazy(() => import('./pages/AgentDetail'));
+const AutoflowsDefs     = React.lazy(() => import('./pages/AutoflowsDefs'));
+const Sessions          = React.lazy(() => import('./pages/Sessions'));
+const SessionDetail     = React.lazy(() => import('./pages/SessionDetail'));
+const Workers           = React.lazy(() => import('./pages/Workers'));
+const Settings          = React.lazy(() => import('./pages/Settings'));
+const AgentRuns         = React.lazy(() => import('./pages/runs/AgentRuns'));
+const WorkflowRuns      = React.lazy(() => import('./pages/runs/WorkflowRuns'));
+const AutoflowRuns      = React.lazy(() => import('./pages/runs/AutoflowRuns'));
+const Projects          = React.lazy(() => import('./pages/Projects'));
+const ProjectDetail     = React.lazy(() => import('./pages/ProjectDetail'));
+const ProjectRuns       = React.lazy(() => import('./pages/ProjectRuns'));
+const ProjectSessions   = React.lazy(() => import('./pages/ProjectSessions'));
+const ProjectCoverage   = React.lazy(() => import('./pages/ProjectCoverage'));
+const ProjectDefinitions = React.lazy(() => import('./pages/ProjectDefinitions'));
+const RunTranscript     = React.lazy(() => import('./pages/RunTranscript'));
+
+function PageFallback() {
+  return (
+    <div className="flex items-center justify-center h-48 text-ink-dim text-sm">
+      Loading…
+    </div>
+  );
+}
 
 export default function App() {
   return (
@@ -33,37 +46,38 @@ export default function App() {
           <Route element={<Layout />}>
             {/* Index redirect */}
             <Route index element={<Navigate to="/dashboard" replace />} />
-            {/* Pages */}
-            <Route path="/dashboard" element={<Dashboard />} />
+            {/* Pages — wrapped in Suspense so the eager Layout shell paints first */}
+            <Route path="/dashboard" element={<Suspense fallback={<PageFallback />}><Dashboard /></Suspense>} />
             {/* Run-stream pages — static segments MUST precede the :id wildcard */}
-            <Route path="/runs/agents"    element={<AgentRuns />} />
-            <Route path="/runs/workflows" element={<WorkflowRuns />} />
-            <Route path="/runs/autoflows" element={<AutoflowRuns />} />
+            <Route path="/runs/agents"    element={<Suspense fallback={<PageFallback />}><AgentRuns /></Suspense>} />
+            <Route path="/runs/workflows" element={<Suspense fallback={<PageFallback />}><WorkflowRuns /></Suspense>} />
+            <Route path="/runs/autoflows" element={<Suspense fallback={<PageFallback />}><AutoflowRuns /></Suspense>} />
             {/* Bare /runs → redirect to workflow runs (canonical execution list) */}
             <Route path="/runs" element={<Navigate to="/runs/workflows" replace />} />
             {/* Run detail graph — wildcard must come after static /runs/* segments */}
-            <Route path="/runs/:id" element={<RunDetail />} />
-            <Route path="/events" element={<Events />} />
-            <Route path="/coverage" element={<Coverage />} />
-            <Route path="/coverage/:target" element={<CoverageDetail />} />
-            <Route path="/workflows" element={<Workflows />} />
-            <Route path="/workflows/:name" element={<WorkflowDetail />} />
-            <Route path="/agents" element={<Agents />} />
-            <Route path="/agents/:name" element={<AgentDetail />} />
-            <Route path="/autoflows" element={<AutoflowsDefs />} />
-            <Route path="/sessions" element={<Sessions />} />
-            <Route path="/sessions/:id" element={<SessionDetail />} />
-            <Route path="/workers" element={<Workers />} />
-            <Route path="/settings" element={<Settings />} />
+            <Route path="/runs/:id" element={<Suspense fallback={<PageFallback />}><RunDetail /></Suspense>} />
+            <Route path="/events" element={<Suspense fallback={<PageFallback />}><Events /></Suspense>} />
+            <Route path="/coverage" element={<Suspense fallback={<PageFallback />}><Coverage /></Suspense>} />
+            <Route path="/coverage/:target" element={<Suspense fallback={<PageFallback />}><CoverageDetail /></Suspense>} />
+            <Route path="/workflows" element={<Suspense fallback={<PageFallback />}><Workflows /></Suspense>} />
+            <Route path="/workflows/:name" element={<Suspense fallback={<PageFallback />}><WorkflowDetail /></Suspense>} />
+            <Route path="/agents" element={<Suspense fallback={<PageFallback />}><Agents /></Suspense>} />
+            <Route path="/agents/:name" element={<Suspense fallback={<PageFallback />}><AgentDetail /></Suspense>} />
+            <Route path="/autoflows" element={<Suspense fallback={<PageFallback />}><AutoflowsDefs /></Suspense>} />
+            <Route path="/sessions" element={<Suspense fallback={<PageFallback />}><Sessions /></Suspense>} />
+            <Route path="/sessions/:id" element={<Suspense fallback={<PageFallback />}><SessionDetail /></Suspense>} />
+            <Route path="/workers" element={<Suspense fallback={<PageFallback />}><Workers /></Suspense>} />
+            <Route path="/settings" element={<Suspense fallback={<PageFallback />}><Settings /></Suspense>} />
             {/* Transcript-only page (agent/session/standalone runs with no DAG) */}
-            <Route path="/transcript" element={<RunTranscript />} />
+            <Route path="/transcript" element={<Suspense fallback={<PageFallback />}><RunTranscript /></Suspense>} />
             {/* Projects */}
-            <Route path="/projects" element={<Projects />} />
+            <Route path="/projects" element={<Suspense fallback={<PageFallback />}><Projects /></Suspense>} />
             {/* Static scoped sub-pages MUST come before the :wsId wildcard */}
-            <Route path="/projects/:wsId/runs" element={<ProjectRuns />} />
-            <Route path="/projects/:wsId/sessions" element={<ProjectSessions />} />
-            <Route path="/projects/:wsId/coverage" element={<ProjectCoverage />} />
-            <Route path="/projects/:wsId" element={<ProjectDetail />} />
+            <Route path="/projects/:wsId/runs" element={<Suspense fallback={<PageFallback />}><ProjectRuns /></Suspense>} />
+            <Route path="/projects/:wsId/sessions" element={<Suspense fallback={<PageFallback />}><ProjectSessions /></Suspense>} />
+            <Route path="/projects/:wsId/coverage" element={<Suspense fallback={<PageFallback />}><ProjectCoverage /></Suspense>} />
+            <Route path="/projects/:wsId/definitions" element={<Suspense fallback={<PageFallback />}><ProjectDefinitions /></Suspense>} />
+            <Route path="/projects/:wsId" element={<Suspense fallback={<PageFallback />}><ProjectDetail /></Suspense>} />
           </Route>
         </Routes>
       </ErrorBoundary>

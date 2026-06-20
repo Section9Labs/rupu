@@ -95,6 +95,97 @@ async fn list_autoflows_returns_seeded_cycle() {
     );
 }
 
+/// Seed an autoflow `RunLaunched` event (carrying a workflow name + run_id)
+/// into the events store at `<global_dir>/autoflows/history`.
+fn seed_run_launched_event(global_dir: &std::path::Path) -> AutoflowCycleRecord {
+    let store_root = global_dir.join("autoflows").join("history");
+    let store = AutoflowHistoryStore::new(store_root);
+
+    let now = Utc::now();
+    let cycle = AutoflowCycleRecord::new(AutoflowCycleMode::Serve, now);
+    store
+        .append_cycle_event(
+            &cycle,
+            AutoflowCycleEvent {
+                kind: AutoflowCycleEventKind::RunLaunched,
+                workflow: Some("triage-and-fix".into()),
+                issue_display_ref: Some("Section9Labs/rupu#42".into()),
+                run_id: Some("run_autoflow_event_01".into()),
+                ..Default::default()
+            },
+            now,
+        )
+        .unwrap();
+    cycle
+}
+
+#[tokio::test]
+async fn list_autoflow_events_returns_seeded_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cycle = seed_run_launched_event(tmp.path());
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/runs/autoflows/events"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "expected 200 OK");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("body should be a JSON array");
+    assert_eq!(arr.len(), 1, "expected exactly one event; got {}", arr.len());
+
+    let row = &arr[0];
+    assert_eq!(
+        row["kind"].as_str(),
+        Some("run_launched"),
+        "kind should be 'run_launched'"
+    );
+    assert_eq!(
+        row["workflow"].as_str(),
+        Some("triage-and-fix"),
+        "workflow name mismatch"
+    );
+    assert_eq!(
+        row["run_id"].as_str(),
+        Some("run_autoflow_event_01"),
+        "run_id mismatch"
+    );
+    assert_eq!(
+        row["issue_display_ref"].as_str(),
+        Some("Section9Labs/rupu#42"),
+        "issue_display_ref mismatch"
+    );
+    assert_eq!(
+        row["cycle_id"].as_str(),
+        Some(cycle.cycle_id.as_str()),
+        "cycle_id mismatch"
+    );
+}
+
+#[tokio::test]
+async fn list_autoflow_events_empty_when_no_store_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/runs/autoflows/events"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "missing store dir should return 200, not 500"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("body should be a JSON array");
+    assert!(
+        arr.is_empty(),
+        "no events seeded, response should be []; got {arr:?}"
+    );
+}
+
 #[tokio::test]
 async fn list_autoflows_empty_when_no_store_dir() {
     // Spin up a server with a global_dir that has NO autoflows/history subdir.

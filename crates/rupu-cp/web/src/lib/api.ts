@@ -296,7 +296,7 @@ export interface UnitCheckpoint {
   run_id: string;
   transcript_path: string;
   output: string;
-  success: boolean;
+  success: boolean | null;
   finished_at: string;      // ISO-8601
 }
 
@@ -322,6 +322,24 @@ export interface AutoflowCycleRow {
   skipped_cycles: number;
   failed_cycles: number;
   run_ids: string[];
+}
+
+/**
+ * One actionable autoflow *event* — a launched run or an awaiting/failed
+ * signal. `kind` is snake_case (`run_launched` | `awaiting_human` |
+ * `awaiting_external` | `cycle_failed`). When `run_id` is present the row links
+ * to the run graph.
+ */
+export interface AutoflowEventRow {
+  event_id: string;
+  cycle_id: string;
+  at: string;
+  kind: string;
+  workflow?: string | null;
+  issue_display_ref?: string | null;
+  run_id?: string | null;
+  status?: string | null;
+  worker_name?: string | null;
 }
 
 export interface AgentRunRow {
@@ -373,6 +391,12 @@ export interface AgentSummary {
   model?: string | null;
   effort?: string | null;
   max_tokens?: number | null;
+  /**
+   * `"project"` | `"global"` — only populated by the per-project endpoint
+   * (`/api/projects/:wsId/agents`); the global `/api/agents` list always
+   * returns `"global"`.
+   */
+  scope?: string;
 }
 
 export interface AgentDetail extends AgentSummary {
@@ -437,6 +461,10 @@ export interface WorkerRecord {
 // ---------------------------------------------------------------------------
 
 export interface CoverageSummary {
+  /** Owning workspace id — target_ids can collide across workspaces. */
+  ws_id: string;
+  /** Workspace path basename — group/attribution key. */
+  project: string;
   target_id: string;
   assertion_lines: number;
   has_catalog: boolean;
@@ -491,6 +519,13 @@ export function sevRank(s: FindingSeverity): number {
   return SEV_ORDER.indexOf(s);
 }
 
+/** Evidence attached to a `FindingRecord`. */
+export interface FindingEvidence {
+  rationale: string;
+  code_excerpt?: string | null;
+  references?: string[];
+}
+
 /** One finding record from the per-target findings JSONL. */
 export interface FindingRecord {
   id: string;
@@ -501,17 +536,41 @@ export interface FindingRecord {
   /** Raw wire value — use `normFindingSeverity` to get a `FindingSeverity`. */
   severity: string;
   concern_id?: string | null;
-  evidence: unknown;
+  evidence: FindingEvidence;
   declared_by: unknown;
   declared_at: string;
 }
 
+/** Touch strength, strongest last — matches rupu-coverage's `TouchStrength`. */
+export type TouchStrength = 'glob' | 'cmd' | 'grep' | 'read' | 'edit';
+
+/**
+ * Aggregated per-file touch record (heatmap row) from `file_views`.
+ * `strongest` is the highest touch seen on this path; `read_lines` is loose
+ * (the wire is `[start,end]` pairs but the UI only counts them).
+ */
+export interface FileView {
+  path: string;
+  strongest: string;
+  touch_modes?: string[];
+  read_lines: number[][];
+  grep_matches: number;
+  edits: number;
+  first_at?: string;
+  last_at: string;
+  touched_by?: unknown[];
+}
+
 export interface CoverageDetail {
+  ws_id?: string;
+  project?: string;
   target_id: string;
   assertion_lines: number;
   has_catalog: boolean;
   assertions: ConcernAssertion[];
   findings: FindingRecord[];
+  /** Per-file heatmap; may be absent for targets without a file ledger. */
+  files?: FileView[];
 }
 
 // ---------------------------------------------------------------------------
@@ -537,8 +596,15 @@ export interface ProjectDetail {
     by_surface: { workflow: number; autoflow: number };
   };
   sessions: { total: number; active: number };
-  coverage: { targets: number; findings: number; assessed_pct: number | null };
+  /** Cheap rollup — targets count + findings count only.
+   * `assessed_pct` is served lazily by `getProjectAssessedPct`. */
+  coverage: { targets: number; findings: number };
   recent_runs: RunListRow[];
+}
+
+/** Response from the lazy `GET /api/projects/:wsId/coverage/assessed` endpoint. */
+export interface ProjectAssessedPct {
+  assessed_pct: number | null;
 }
 
 export interface ProjectCoverageRow {
@@ -575,6 +641,9 @@ export const api = {
   },
   getAutoflowRuns(): Promise<AutoflowCycleRow[]> {
     return request<AutoflowCycleRow[]>('/api/runs/autoflows');
+  },
+  getAutoflowEvents(): Promise<AutoflowEventRow[]> {
+    return request<AutoflowEventRow[]>('/api/runs/autoflows/events');
   },
   getAgentRuns(): Promise<AgentRunRow[]> {
     return request<AgentRunRow[]>('/api/runs/agents');
@@ -616,8 +685,9 @@ export const api = {
   getCoverage(): Promise<CoverageSummary[]> {
     return request<CoverageSummary[]>('/api/coverage');
   },
-  getCoverageDetail(target: string): Promise<CoverageDetail> {
-    return request<CoverageDetail>(`/api/coverage/${encodeURIComponent(target)}`);
+  getCoverageDetail(target: string, wsId?: string): Promise<CoverageDetail> {
+    const qs = wsId ? `?ws_id=${encodeURIComponent(wsId)}` : '';
+    return request<CoverageDetail>(`/api/coverage/${encodeURIComponent(target)}${qs}`);
   },
 
   /**
@@ -673,6 +743,22 @@ export const api = {
   },
   getProjectCoverage(wsId: string): Promise<ProjectCoverageRow[]> {
     return request<ProjectCoverageRow[]>(`/api/projects/${encodeURIComponent(wsId)}/coverage`);
+  },
+  getProjectAgents(wsId: string): Promise<AgentSummary[]> {
+    return request<AgentSummary[]>(`/api/projects/${encodeURIComponent(wsId)}/agents`);
+  },
+  getProjectWorkflows(wsId: string): Promise<WorkflowSummary[]> {
+    return request<WorkflowSummary[]>(`/api/projects/${encodeURIComponent(wsId)}/workflows`);
+  },
+  getProjectAutoflows(wsId: string): Promise<AutoflowDefRow[]> {
+    return request<AutoflowDefRow[]>(`/api/projects/${encodeURIComponent(wsId)}/autoflows`);
+  },
+  /** Lazy heavy endpoint — runs run_audit per target.  Fetch in parallel with
+   * `getProject` so the overview renders immediately while this resolves. */
+  getProjectAssessedPct(wsId: string): Promise<ProjectAssessedPct> {
+    return request<ProjectAssessedPct>(
+      `/api/projects/${encodeURIComponent(wsId)}/coverage/assessed`,
+    );
   },
 
   // --- Transcripts ---

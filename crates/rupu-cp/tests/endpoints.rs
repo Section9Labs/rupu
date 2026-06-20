@@ -358,6 +358,18 @@ async fn workers_list_empty_when_no_workers_dir() {
 // E. Coverage
 // ---------------------------------------------------------------------------
 
+/// Register a workspace TOML pointing at `path` so registry-driven coverage
+/// aggregation can discover its `.rupu/coverage/`.
+fn seed_workspace_toml(global: &Path, id: &str, path: &Path) {
+    let dir = global.join("workspaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    let toml = format!(
+        "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-06-16T00:00:00Z\"\n",
+        path.to_str().unwrap()
+    );
+    std::fs::write(dir.join(format!("{id}.toml")), toml).unwrap();
+}
+
 fn seed_coverage_target(workspace: &Path, target_id: &str) {
     let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
     paths.ensure_dir().unwrap();
@@ -383,6 +395,7 @@ async fn coverage_list_returns_seeded_target() {
     let workspace = tmp.path(); // same dir is fine for tests
 
     seed_coverage_target(workspace, "tgt1");
+    seed_workspace_toml(global, "ws_e", workspace);
 
     let addr = spawn_server(global, workspace).await;
 
@@ -423,10 +436,11 @@ async fn coverage_detail_returns_target_data() {
     let workspace = tmp.path();
 
     seed_coverage_target(workspace, "tgt2");
+    seed_workspace_toml(global, "ws_e2", workspace);
 
     let addr = spawn_server(global, workspace).await;
 
-    let resp = reqwest::get(format!("http://{addr}/api/coverage/tgt2"))
+    let resp = reqwest::get(format!("http://{addr}/api/coverage/tgt2?ws_id=ws_e2"))
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);

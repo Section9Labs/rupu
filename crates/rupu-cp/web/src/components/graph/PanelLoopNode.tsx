@@ -9,11 +9,13 @@
 import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
-import { STATE_STYLE } from './stepStyle';
+import { STATE_STYLE, glyphBg } from './stepStyle';
 import { PANEL_W, PANEL_H } from '../../lib/nodeSize';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
+  /** Select a panelist/fixer unit's transcript — same callback FanoutNode uses. */
+  onOpenUnit?: (stepId: string, index: number) => void;
 }
 
 type PanelFlowNode = Node<PanelLoopNodeData, 'panel'>;
@@ -21,11 +23,14 @@ type PanelFlowNode = Node<PanelLoopNodeData, 'panel'>;
 const handleStyle = { background: '#c4b5fd', width: 6, height: 6, border: 'none' } as const;
 
 function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
-  const { node } = data;
+  const { node, onOpenUnit } = data;
   const s = STATE_STYLE[node.state];
   const running = node.state === 'running';
   const gate = node.gate;
   const round = node.round;
+  // Panelist/fixer runs surface as fanout units (folded by step_id). Each is a
+  // clickable chip that selects its transcript.
+  const units = node.fanout?.units ?? [];
 
   return (
     <div
@@ -68,6 +73,28 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
           )}
         </span>
       </div>
+
+      {/* panelist / fixer chips — each selects its transcript on click */}
+      {units.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1">
+          {units.map((u) => (
+            <button
+              key={u.index}
+              type="button"
+              title={`${u.key} · ${STATE_STYLE[u.state].label}`}
+              onClick={() => onOpenUnit?.(node.id, u.index)}
+              className="inline-flex items-center gap-1 rounded bg-white/80 px-1.5 py-px text-[10px] text-slate-600 ring-1 ring-brand-100 transition-colors hover:bg-white hover:text-brand-700"
+            >
+              <span
+                className="inline-block h-2 w-2 shrink-0 rounded-[2px]"
+                style={{ background: glyphBg(u.state) }}
+                aria-hidden
+              />
+              <span className="max-w-[88px] truncate">{u.key}</span>
+            </button>
+          ))}
+        </div>
+      )}
 
       <div className="mt-1.5 flex items-center gap-1.5">
         <span className="rounded bg-white/70 px-1.5 py-px text-[10px] text-brand-700 ring-1 ring-brand-100">

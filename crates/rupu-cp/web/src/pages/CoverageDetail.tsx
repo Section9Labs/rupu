@@ -2,8 +2,8 @@
 // assertion grid (what was assessed). Route: /coverage/:target
 
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft, ShieldCheck, ShieldOff } from 'lucide-react';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { ArrowLeft, ChevronDown, ChevronRight, ShieldCheck, ShieldOff } from 'lucide-react';
 import {
   api,
   normAssertionStatus,
@@ -12,18 +12,22 @@ import {
   type AssertionStatus,
   type ConcernAssertion,
   type CoverageDetail,
+  type FileView,
   type FindingRecord,
   type FindingSeverity,
 } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { cn } from '../lib/cn';
+import { relativeTime } from '../lib/time';
 
 // How many assertion rows to render before capping with a "+N more" note.
 const ASSERTION_CAP = 200;
 
 export default function CoverageDetail() {
   const { target = '' } = useParams<{ target: string }>();
+  const [searchParams] = useSearchParams();
+  const wsId = searchParams.get('ws_id') ?? undefined;
 
   const [detail, setDetail] = useState<CoverageDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -34,7 +38,7 @@ export default function CoverageDetail() {
     setDetail(null);
     setError(null);
     api
-      .getCoverageDetail(target)
+      .getCoverageDetail(target, wsId)
       .then((data) => {
         if (cancelled) return;
         setDetail(data);
@@ -46,7 +50,7 @@ export default function CoverageDetail() {
     return () => {
       cancelled = true;
     };
-  }, [target]);
+  }, [target, wsId]);
 
   if (error) {
     return (
@@ -88,6 +92,13 @@ export default function CoverageDetail() {
   const visibleAssertions = detail.assertions.slice(0, ASSERTION_CAP);
   const hiddenCount = detail.assertions.length - visibleAssertions.length;
 
+  // Per-file heatmap — strongest touch last, then most-recently touched.
+  const files = (detail.files ?? []).slice().sort((a, b) => {
+    const r = touchRank(b.strongest) - touchRank(a.strongest);
+    if (r !== 0) return r;
+    return (b.last_at ?? '').localeCompare(a.last_at ?? '');
+  });
+
   return (
     <div className="p-8 max-w-5xl">
       <BackLink />
@@ -102,6 +113,7 @@ export default function CoverageDetail() {
           <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-[12px] text-ink-dim">
             <span>{detail.assertions.length} assertion{detail.assertions.length !== 1 ? 's' : ''}</span>
             <span>{sortedFindings.length} finding{sortedFindings.length !== 1 ? 's' : ''}</span>
+            <span>{files.length} file{files.length !== 1 ? 's' : ''} touched</span>
           </div>
         </div>
       </header>
@@ -120,6 +132,25 @@ export default function CoverageDetail() {
           <ListCard>
             {sortedFindings.map((f) => (
               <FindingRow key={f.id} finding={f} />
+            ))}
+          </ListCard>
+        )}
+      </section>
+
+      {/* ── Files (touch heatmap) ───────────────────────────────── */}
+      <section className="mt-8">
+        <SectionHeader
+          tone="muted"
+          label="Files touched"
+          count={files.length}
+          hint="strongest touch first"
+        />
+        {files.length === 0 ? (
+          <p className="text-sm text-ink-dim pl-1 mt-1">No file activity recorded.</p>
+        ) : (
+          <ListCard>
+            {files.map((f) => (
+              <FileRow key={f.path} file={f} />
             ))}
           </ListCard>
         )}
@@ -182,36 +213,128 @@ const SEV_STYLES: Record<FindingSeverity, { pill: string; label: string }> = {
 function FindingRow({ finding }: { finding: FindingRecord }) {
   const sev = normFindingSeverity(finding.severity);
   const s = SEV_STYLES[sev];
+  const [open, setOpen] = useState(false);
 
   const locationParts: string[] = [];
   if (finding.file_path) locationParts.push(finding.file_path);
   if (finding.line_range) locationParts.push(`${finding.line_range[0]}–${finding.line_range[1]}`);
   const location = locationParts.join(':');
 
-  return (
-    <div className="flex items-start gap-3 px-4 py-3">
-      {/* Severity badge */}
-      <span
-        className={cn(
-          'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ring-1 mt-0.5',
-          s.pill,
-        )}
-      >
-        {s.label}
-      </span>
+  const rationale = finding.evidence?.rationale ?? '';
+  const excerpt = finding.evidence?.code_excerpt ?? '';
+  const references = finding.evidence?.references ?? [];
+  const hasEvidence = Boolean(rationale || excerpt || references.length > 0);
 
-      {/* Body */}
-      <div className="min-w-0 flex-1">
-        <p className="text-sm text-ink leading-snug">{finding.summary}</p>
-        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
-          {location && <span className="font-mono break-all">{location}</span>}
-          {finding.concern_id && (
-            <span>
-              concern <span className="font-mono">{finding.concern_id}</span>
-            </span>
+  return (
+    <div className="px-4 py-3">
+      <div className="flex items-start gap-3">
+        {/* Severity badge */}
+        <span
+          className={cn(
+            'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ring-1 mt-0.5',
+            s.pill,
+          )}
+        >
+          {s.label}
+        </span>
+
+        {/* Body */}
+        <div className="min-w-0 flex-1">
+          <p className="text-sm text-ink leading-snug">{finding.summary}</p>
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
+            {location && <span className="font-mono break-all">{location}</span>}
+            {finding.concern_id && (
+              <span>
+                concern <span className="font-mono">{finding.concern_id}</span>
+              </span>
+            )}
+            {hasEvidence && (
+              <button
+                type="button"
+                onClick={() => setOpen((v) => !v)}
+                className="inline-flex items-center gap-0.5 text-ink-dim hover:text-ink"
+              >
+                {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                evidence
+              </button>
+            )}
+          </div>
+
+          {hasEvidence && open && (
+            <div className="mt-2 space-y-2">
+              {rationale && (
+                <p className="text-[12px] text-ink-dim leading-snug whitespace-pre-wrap">
+                  {rationale}
+                </p>
+              )}
+              {excerpt && (
+                <pre className="overflow-x-auto rounded bg-slate-50 ring-1 ring-slate-200 px-3 py-2 text-[11px] font-mono text-ink leading-snug whitespace-pre">
+                  {excerpt}
+                </pre>
+              )}
+              {references.length > 0 && (
+                <ul className="list-disc pl-4 text-[11px] text-ink-mute space-y-0.5">
+                  {references.map((ref, i) => (
+                    <li key={i} className="break-all font-mono">{ref}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// File heatmap row
+// ---------------------------------------------------------------------------
+
+// Touch strength, strongest last — mirrors rupu-coverage's `TouchStrength`.
+const TOUCH_ORDER = ['glob', 'cmd', 'grep', 'read', 'edit'] as const;
+
+function touchRank(raw: string): number {
+  const i = TOUCH_ORDER.indexOf(raw.toLowerCase() as (typeof TOUCH_ORDER)[number]);
+  return i < 0 ? 0 : i;
+}
+
+// Heatmap palette: hotter (edit) → cooler (glob). STATIC classes only.
+const TOUCH_STYLES: Record<(typeof TOUCH_ORDER)[number], { pill: string; bar: string; label: string }> = {
+  edit: { pill: 'bg-red-50 text-red-700 ring-red-200',       bar: 'bg-red-400',    label: 'edit' },
+  read: { pill: 'bg-orange-50 text-orange-700 ring-orange-200', bar: 'bg-orange-300', label: 'read' },
+  grep: { pill: 'bg-yellow-50 text-yellow-700 ring-yellow-200', bar: 'bg-yellow-300', label: 'grep' },
+  cmd:  { pill: 'bg-blue-50 text-blue-700 ring-blue-200',     bar: 'bg-blue-300',   label: 'cmd' },
+  glob: { pill: 'bg-slate-100 text-ink-mute ring-slate-200',  bar: 'bg-slate-300',  label: 'glob' },
+};
+
+function FileRow({ file }: { file: FileView }) {
+  const key = TOUCH_ORDER[touchRank(file.strongest)];
+  const t = TOUCH_STYLES[key];
+
+  return (
+    <div className="flex items-center gap-3 px-4 py-2.5">
+      {/* heatmap accent bar, colored by strongest touch */}
+      <span className={cn('shrink-0 w-1 self-stretch rounded-full', t.bar)} aria-hidden />
+      <div className="min-w-0 flex-1">
+        <p className="text-[13px] font-mono text-ink truncate">{file.path}</p>
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
+          {file.edits > 0 && <span>{file.edits} edit{file.edits !== 1 ? 's' : ''}</span>}
+          {file.grep_matches > 0 && <span>{file.grep_matches} grep match{file.grep_matches !== 1 ? 'es' : ''}</span>}
+          {file.read_lines.length > 0 && (
+            <span>{file.read_lines.length} read range{file.read_lines.length !== 1 ? 's' : ''}</span>
+          )}
+          <span>{relativeTime(file.last_at)}</span>
+        </div>
+      </div>
+      <span
+        className={cn(
+          'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ring-1',
+          t.pill,
+        )}
+      >
+        {t.label}
+      </span>
     </div>
   );
 }

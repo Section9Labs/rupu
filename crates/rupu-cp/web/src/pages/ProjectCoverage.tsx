@@ -66,7 +66,13 @@ export default function ProjectCoverage() {
       {rows !== null && rows.length > 0 && (
         <ListCard>
           {rows.map((r) => (
-            <div key={r.target_id} className="flex items-center gap-4 px-4 py-3">
+            <Link
+              key={r.target_id}
+              to={`/coverage/${encodeURIComponent(r.target_id)}${
+                wsId ? `?ws_id=${encodeURIComponent(wsId)}` : ''
+              }`}
+              className="flex items-center gap-4 px-4 py-3 hover:bg-panel/60 transition-colors"
+            >
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium text-ink truncate font-mono">{r.target_id}</p>
                 <p className="text-[11px] text-ink-dim mt-0.5">
@@ -79,7 +85,7 @@ export default function ProjectCoverage() {
                   {r.findings} finding{r.findings !== 1 ? 's' : ''}
                 </span>
               )}
-            </div>
+            </Link>
           ))}
         </ListCard>
       )}

@@ -1,5 +1,8 @@
 use crate::{
+    api::agents::AgentDto,
+    api::autoflows::{scan_autoflow_defs, AutoflowDefRow},
     api::runs::{trigger_of, RunListRow},
+    api::workflows::{scan_workflow_names, WorkflowDto},
     error::{ApiError, ApiResult},
     state::AppState,
 };
@@ -71,6 +74,13 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects/:ws_id/runs", get(project_runs))
         .route("/api/projects/:ws_id/sessions", get(project_sessions))
         .route("/api/projects/:ws_id/coverage", get(project_coverage))
+        .route(
+            "/api/projects/:ws_id/coverage/assessed",
+            get(project_coverage_assessed),
+        )
+        .route("/api/projects/:ws_id/agents", get(project_agents))
+        .route("/api/projects/:ws_id/workflows", get(project_workflows))
+        .route("/api/projects/:ws_id/autoflows", get(project_autoflows))
 }
 
 async fn list_projects(State(s): State<AppState>) -> ApiResult<Json<Vec<ProjectRow>>> {
@@ -87,10 +97,7 @@ async fn list_projects(State(s): State<AppState>) -> ApiResult<Json<Vec<ProjectR
 }
 
 /// Load a workspace by id; `Ok(None)` → 404, store error → 500.
-fn load_workspace(
-    s: &AppState,
-    ws_id: &str,
-) -> Result<rupu_workspace::Workspace, ApiError> {
+fn load_workspace(s: &AppState, ws_id: &str) -> Result<rupu_workspace::Workspace, ApiError> {
     match store(s).load(ws_id) {
         Ok(Some(w)) => Ok(w),
         Ok(None) => Err(ApiError::not_found(format!("project {ws_id} not found"))),
@@ -162,30 +169,22 @@ async fn get_project(
     // ── coverage ──────────────────────────────────────────────────────────
     // Coverage lives under the PROJECT's path (`<project>/.rupu/coverage/`),
     // not the CP's launch dir.
+    // Only CHEAP signals are computed here: target count + findings count.
+    // The expensive `run_audit` (assessed_pct) is deferred to
+    // `GET /api/projects/:ws_id/coverage/assessed` which the frontend fetches
+    // in parallel without blocking the overview render.
     let wp = std::path::Path::new(&w.path);
     let targets = discover_targets(wp).unwrap_or_default();
-    let mut findings_sum = 0usize;
-    let mut total_concerns = 0usize;
-    let mut complete_concerns = 0usize;
-    for t in &targets {
-        let paths = CoveragePaths::new(wp, &t.target_id);
-        findings_sum += read_findings(&paths).map(|f| f.len()).unwrap_or(0);
-        // Targets without a catalog (or with a malformed one) error here and
-        // are skipped — they simply don't contribute to the assessed ratio.
-        if let Ok(a) = run_audit(&paths) {
-            total_concerns += a.total_concerns;
-            complete_concerns += a.complete_concerns;
-        }
-    }
-    let assessed_pct = if total_concerns > 0 {
-        Some((complete_concerns as f64 / total_concerns as f64) * 100.0)
-    } else {
-        None
-    };
+    let findings_sum: usize = targets
+        .iter()
+        .map(|t| {
+            let paths = CoveragePaths::new(wp, &t.target_id);
+            read_findings(&paths).map(|f| f.len()).unwrap_or(0)
+        })
+        .sum();
     let coverage_obj = json!({
         "targets": targets.len(),
         "findings": findings_sum,
-        "assessed_pct": assessed_pct,
     });
 
     Ok(Json(ProjectDetail {
@@ -261,4 +260,125 @@ async fn project_coverage(
         }));
     }
     Ok(Json(rows))
+}
+
+/// Response shape for `GET /api/projects/:ws_id/coverage/assessed`.
+#[derive(Serialize)]
+struct AssessedPctResponse {
+    assessed_pct: Option<f64>,
+}
+
+/// `GET /api/projects/:ws_id/coverage/assessed` — heavy per-target audit
+/// aggregated into a single `assessed_pct` value.  This is the expensive
+/// computation that was previously blocking the synchronous project rollup.
+/// The frontend fetches it in parallel after the overview has already rendered.
+async fn project_coverage_assessed(
+    State(s): State<AppState>,
+    Path(ws_id): Path<String>,
+) -> ApiResult<Json<AssessedPctResponse>> {
+    let w = load_workspace(&s, &ws_id)?;
+    let wp = std::path::Path::new(&w.path);
+    let targets = discover_targets(wp).unwrap_or_default();
+    let mut total_concerns = 0usize;
+    let mut complete_concerns = 0usize;
+    for t in &targets {
+        let paths = CoveragePaths::new(wp, &t.target_id);
+        // Targets without a catalog (or with a malformed one) are skipped —
+        // they simply don't contribute to the assessed ratio.
+        if let Ok(a) = run_audit(&paths) {
+            total_concerns += a.total_concerns;
+            complete_concerns += a.complete_concerns;
+        }
+    }
+    let assessed_pct = if total_concerns > 0 {
+        Some((complete_concerns as f64 / total_concerns as f64) * 100.0)
+    } else {
+        None
+    };
+    Ok(Json(AssessedPctResponse { assessed_pct }))
+}
+
+/// `GET /api/projects/:ws_id/agents` — global agents merged with the project's
+/// local `<path>/.rupu/agents/*.md`. Project entries shadow globals by name.
+/// Each row is tagged `scope: "project" | "global"`: a name is `"project"` iff
+/// `<path>/.rupu/agents/<name>.md` exists on disk.
+async fn project_agents(
+    State(s): State<AppState>,
+    Path(ws_id): Path<String>,
+) -> ApiResult<Json<Vec<AgentDto>>> {
+    let w = load_workspace(&s, &ws_id)?;
+    // The loader joins `agents` onto the project arg, so we pass `<path>/.rupu`.
+    let rupu_dir = std::path::Path::new(&w.path).join(".rupu");
+    let specs = rupu_agent::loader::load_agents(&s.global_dir, Some(&rupu_dir))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let project_agents_dir = rupu_dir.join("agents");
+    let dtos = specs
+        .into_iter()
+        .map(|spec| {
+            // Project iff the same-named file exists under the project layer.
+            let local = project_agents_dir.join(format!("{}.md", spec.name));
+            let scope = if local.is_file() { "project" } else { "global" };
+            AgentDto::from_spec(spec, scope)
+        })
+        .collect();
+    Ok(Json(dtos))
+}
+
+/// Merge a project-layer scan over a global-layer scan, where the project
+/// entries shadow globals by `name`. Returns the merged list sorted by name.
+fn merge_workflow_dtos(
+    mut global: Vec<WorkflowDto>,
+    project: Vec<WorkflowDto>,
+) -> Vec<WorkflowDto> {
+    let project_names: std::collections::BTreeSet<String> =
+        project.iter().map(|d| d.name.clone()).collect();
+    global.retain(|d| !project_names.contains(&d.name));
+    global.extend(project);
+    global.sort_by(|a, b| a.name.cmp(&b.name));
+    global
+}
+
+/// `GET /api/projects/:ws_id/workflows` — global workflows merged with the
+/// project's `<path>/.rupu/workflows/*.yaml`; project shadows global by name.
+async fn project_workflows(
+    State(s): State<AppState>,
+    Path(ws_id): Path<String>,
+) -> ApiResult<Json<Vec<WorkflowDto>>> {
+    let w = load_workspace(&s, &ws_id)?;
+    let global = scan_workflow_names(&s.global_dir.join("workflows"), "global");
+    let project_dir = std::path::Path::new(&w.path)
+        .join(".rupu")
+        .join("workflows");
+    let project = scan_workflow_names(&project_dir, "project");
+    Ok(Json(merge_workflow_dtos(global, project)))
+}
+
+/// Merge project autoflow defs over globals (project shadows global by name),
+/// sorted by name.
+fn merge_autoflow_defs(
+    mut global: Vec<AutoflowDefRow>,
+    project: Vec<AutoflowDefRow>,
+) -> Vec<AutoflowDefRow> {
+    let project_names: std::collections::BTreeSet<String> =
+        project.iter().map(|d| d.name.clone()).collect();
+    global.retain(|d| !project_names.contains(&d.name));
+    global.extend(project);
+    global.sort_by(|a, b| a.name.cmp(&b.name));
+    global
+}
+
+/// `GET /api/projects/:ws_id/autoflows` — autoflow-enabled workflows from the
+/// global layer merged with the project's `<path>/.rupu/workflows`; project
+/// shadows global by name.
+async fn project_autoflows(
+    State(s): State<AppState>,
+    Path(ws_id): Path<String>,
+) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
+    let w = load_workspace(&s, &ws_id)?;
+    let global = scan_autoflow_defs(&s.global_dir.join("workflows"), "global");
+    let project_dir = std::path::Path::new(&w.path)
+        .join(".rupu")
+        .join("workflows");
+    let project = scan_autoflow_defs(&project_dir, "project");
+    Ok(Json(merge_autoflow_defs(global, project)))
 }

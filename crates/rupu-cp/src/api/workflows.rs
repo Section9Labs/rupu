@@ -17,23 +17,28 @@ pub fn routes() -> Router<AppState> {
 }
 
 #[derive(Serialize)]
-struct WorkflowDto {
-    name: String,
-    scope: String,
+pub(crate) struct WorkflowDto {
+    pub(crate) name: String,
+    pub(crate) scope: String,
 }
 
-async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<WorkflowDto>>> {
-    let dir = s.global_dir.join("workflows");
+/// Scan `<dir>/*.yaml` and return one [`WorkflowDto`] per file stem, tagged
+/// with `scope`, sorted by name. A missing/unreadable directory yields an
+/// empty vec (tolerated, not an error) so the caller can merge layers freely.
+pub(crate) fn scan_workflow_names(dir: &std::path::Path, scope: &'static str) -> Vec<WorkflowDto> {
     if !dir.is_dir() {
-        return Ok(Json(vec![]));
+        return vec![];
     }
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!("workflows: could not read {}: {err}", dir.display());
+            return vec![];
+        }
+    };
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().and_then(|s| s.to_str()) == Some("yaml")
-        })
+        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("yaml"))
         .filter_map(|e| {
             e.path()
                 .file_stem()
@@ -42,11 +47,18 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
         })
         .collect();
     names.sort();
-    let dtos = names
+    names
         .into_iter()
-        .map(|name| WorkflowDto { name, scope: "global".to_string() })
-        .collect();
-    Ok(Json(dtos))
+        .map(|name| WorkflowDto {
+            name,
+            scope: scope.to_string(),
+        })
+        .collect()
+}
+
+async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<WorkflowDto>>> {
+    let dir = s.global_dir.join("workflows");
+    Ok(Json(scan_workflow_names(&dir, "global")))
 }
 
 async fn get_workflow(
@@ -57,9 +69,9 @@ async fn get_workflow(
     if !path.exists() {
         return Err(ApiError::not_found(format!("workflow {name} not found")));
     }
-    let yaml = std::fs::read_to_string(&path)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let workflow = Workflow::parse(&yaml)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({ "workflow": workflow, "yaml": yaml })))
+    let yaml = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
+    let workflow = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(
+        serde_json::json!({ "workflow": workflow, "yaml": yaml }),
+    ))
 }

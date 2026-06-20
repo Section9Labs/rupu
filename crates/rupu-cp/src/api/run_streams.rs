@@ -1,11 +1,14 @@
 use crate::{error::ApiResult, state::AppState};
 use axum::{extract::State, routing::get, Json, Router};
-use rupu_runtime::{AutoflowCycleRecord, AutoflowHistoryStore, AutoflowHistoryStoreError};
+use rupu_runtime::{
+    AutoflowCycleEventKind, AutoflowCycleRecord, AutoflowHistoryStore, AutoflowHistoryStoreError,
+};
 use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/runs/autoflows", get(list_autoflow_runs))
+        .route("/api/runs/autoflows/events", get(list_autoflow_events))
         .route("/api/runs/agents", get(list_agent_runs))
 }
 
@@ -304,4 +307,88 @@ async fn list_autoflow_runs(
     };
 
     Ok(Json(records.into_iter().map(AutoflowCycleRow::from).collect()))
+}
+
+// ---------------------------------------------------------------------------
+// Autoflow events — /api/runs/autoflows/events
+// ---------------------------------------------------------------------------
+
+/// One actionable autoflow *event* — a single launched run or awaiting/failed
+/// signal, as opposed to a batch cycle tick.
+///
+/// This is the per-launch surface the Autoflows page leads with: each row maps
+/// to a concrete `RunLaunched` / `AwaitingHuman` / `AwaitingExternal` /
+/// `CycleFailed` event, carrying the workflow name, issue, and (when present)
+/// the `run_id` that links straight to the run graph.
+#[derive(Serialize)]
+struct AutoflowEventRow {
+    event_id: String,
+    cycle_id: String,
+    at: String,
+    kind: String,
+    workflow: Option<String>,
+    issue_display_ref: Option<String>,
+    run_id: Option<String>,
+    status: Option<String>,
+    worker_name: Option<String>,
+}
+
+/// Stringify an `AutoflowCycleEventKind` into its serde snake_case tag.
+fn kind_to_snake_case(kind: AutoflowCycleEventKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{kind:?}").to_lowercase())
+}
+
+/// Only these event kinds represent actionable per-launch activity worth
+/// surfacing as a row on the Autoflows page.
+fn is_actionable_kind(kind: AutoflowCycleEventKind) -> bool {
+    matches!(
+        kind,
+        AutoflowCycleEventKind::RunLaunched
+            | AutoflowCycleEventKind::AwaitingHuman
+            | AutoflowCycleEventKind::AwaitingExternal
+            | AutoflowCycleEventKind::CycleFailed
+    )
+}
+
+/// `GET /api/runs/autoflows/events` — returns the most-recent actionable
+/// autoflow events (launched runs + awaiting/failed signals), newest-first.
+///
+/// The store root matches `/api/runs/autoflows`: `<global_dir>/autoflows/history`.
+/// A missing store directory is treated as "no events yet" and returns `[]`.
+async fn list_autoflow_events(
+    State(s): State<AppState>,
+) -> ApiResult<Json<Vec<AutoflowEventRow>>> {
+    let store_root = s.global_dir.join("autoflows").join("history");
+    let store = AutoflowHistoryStore::new(store_root);
+
+    let records = match store.list_recent_events(200) {
+        Ok(r) => r,
+        Err(AutoflowHistoryStoreError::Io(e))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Vec::new()
+        }
+        Err(e) => return Err(crate::error::ApiError::internal(e.to_string())),
+    };
+
+    let rows = records
+        .into_iter()
+        .filter(|rec| is_actionable_kind(rec.event.kind))
+        .map(|rec| AutoflowEventRow {
+            event_id: rec.event_id,
+            cycle_id: rec.cycle_id,
+            at: rec.at,
+            kind: kind_to_snake_case(rec.event.kind),
+            workflow: rec.event.workflow,
+            issue_display_ref: rec.event.issue_display_ref,
+            run_id: rec.event.run_id,
+            status: rec.event.status,
+            worker_name: rec.worker_name,
+        })
+        .collect();
+
+    Ok(Json(rows))
 }

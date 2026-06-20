@@ -322,6 +322,53 @@ describe('units from checkpoints', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 4b. Unit checkpoint success: null → running (started, not completed)
+// ---------------------------------------------------------------------------
+
+describe('unit checkpoint with success: null', () => {
+  function makeNullUnit(success: boolean | null): UnitCheckpoint {
+    return {
+      step_id: 'b', index: 0, item: 'file-a.ts',
+      run_id: runId(), transcript_path: '/tmp/t0.jsonl',
+      output: '', success, finished_at: '2026-06-18T00:01:00Z',
+    };
+  }
+
+  it('success: null → unit state is running', () => {
+    const g = makeGraph({ units: [makeNullUnit(null)] });
+    const model = buildRunGraphModel(g, []);
+    const unit = model.nodeById('b')!.fanout!.units[0];
+    expect(unit.state).toBe('running');
+  });
+
+  it('success: true → unit state is done', () => {
+    const g = makeGraph({ units: [makeNullUnit(true)] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('b')!.fanout!.units[0].state).toBe('done');
+  });
+
+  it('success: false → unit state is failed', () => {
+    const g = makeGraph({ units: [makeNullUnit(false)] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('b')!.fanout!.units[0].state).toBe('failed');
+  });
+
+  it('success: null unit counts as running in fanout.byState', () => {
+    const g = makeGraph({ units: [makeNullUnit(null)] });
+    const model = buildRunGraphModel(g, []);
+    const { byState } = model.nodeById('b')!.fanout!;
+    expect(byState.running).toBe(1);
+    expect(byState.failed).toBe(0);
+  });
+
+  it('success: null unit flips parent step from pending to running', () => {
+    const g = makeGraph({ units: [makeNullUnit(null)] });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('b')!.state).toBe('running');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. coerceItem: object item → JSON string key
 // ---------------------------------------------------------------------------
 
@@ -448,5 +495,45 @@ describe('panel_round events', () => {
     const g = makeGraph({ steps: [PANEL_STEP] });
     const model = buildRunGraphModel(g, []);
     expect(model.nodeById('panel')!.round).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. panel units fold onto a panel node's fanout (by step_id, regardless of kind)
+// ---------------------------------------------------------------------------
+
+describe('panel units fold onto fanout', () => {
+  const PANEL_STEP: StepNodeDto = {
+    id: 'panel', kind: 'panel',
+    gate: { max_iterations: 3, until_severity: 'high', fix_with: 'fixer' },
+  };
+
+  // Backend now merges panel panelist/fixer runs (from events.jsonl) into
+  // g.units with the same UnitCheckpoint field shape. The model must fold
+  // them onto the panel node's fanout.units even though kind === 'panel'.
+  const panelistA: UnitCheckpoint = {
+    step_id: 'panel', index: 0, item: 'reviewer-a',
+    run_id: runId(), transcript_path: '/tmp/panel_a.jsonl',
+    output: '', success: true, finished_at: '2026-06-18T00:01:00Z',
+  };
+  const panelistB: UnitCheckpoint = {
+    step_id: 'panel', index: 1, item: 'reviewer-b',
+    run_id: runId(), transcript_path: '/tmp/panel_b.jsonl',
+    output: '', success: false, finished_at: '2026-06-18T00:02:00Z',
+  };
+
+  it('panel node gets fanout.units with their transcriptPath', () => {
+    const g = makeGraph({ steps: [PANEL_STEP], units: [panelistA, panelistB] });
+    const model = buildRunGraphModel(g, []);
+    const node = model.nodeById('panel')!;
+    expect(node.kind).toBe('panel');
+    expect(node.fanout).toBeDefined();
+    expect(node.fanout!.units).toHaveLength(2);
+    expect(node.fanout!.units[0].key).toBe('reviewer-a');
+    expect(node.fanout!.units[0].transcriptPath).toBe('/tmp/panel_a.jsonl');
+    expect(node.fanout!.units[0].state).toBe('done');
+    expect(node.fanout!.units[1].key).toBe('reviewer-b');
+    expect(node.fanout!.units[1].transcriptPath).toBe('/tmp/panel_b.jsonl');
+    expect(node.fanout!.units[1].state).toBe('failed');
   });
 });

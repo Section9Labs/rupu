@@ -113,9 +113,11 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
     (_evt, flowNode) => {
       if (!onSelectNode) return;
       const node = flowNode.data.node;
-      // for_each nodes select via their unit squares (handleOpenUnit), not the
-      // node body — skip to avoid clobbering a unit selection.
-      if (node.kind === 'for_each') return;
+      // for_each and panel nodes select via their unit squares / chips
+      // (handleOpenUnit), not the node body — skip so a chip click isn't
+      // clobbered by the bubbled node-body selection (and panel nodes carry
+      // no own transcript).
+      if (node.kind === 'for_each' || node.kind === 'panel') return;
       onSelectNode({
         path: node.transcriptPath ?? null,
         live: node.state === 'running',
