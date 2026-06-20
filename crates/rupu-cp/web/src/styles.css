@@ -1,0 +1,96 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body {
+    @apply bg-bg text-ink antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+}
+
+@layer components {
+  .severity-badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium uppercase tracking-wide;
+  }
+  /* CRITICAL purple → HIGH red → MEDIUM orange → LOW yellow → INFO slate */
+  .severity-critical { @apply bg-purple-50 text-sev-critical ring-1 ring-purple-200; }
+  .severity-high     { @apply bg-red-50    text-sev-high     ring-1 ring-red-200;    }
+  .severity-medium   { @apply bg-orange-50 text-sev-medium   ring-1 ring-orange-200; }
+  .severity-low      { @apply bg-yellow-50 text-sev-low      ring-1 ring-yellow-200; }
+  .severity-info     { @apply bg-slate-50  text-sev-info     ring-1 ring-slate-200;  }
+}
+
+/* Timeline animations — used by the Live Events page when new items arrive.
+ *
+ * Goal: an "item slides in from above and gently settles" feel. The item
+ * fades + translates + has a barely-perceptible scale and a soft highlight
+ * on the row that fades out. Cubic-bezier curve mimics a spring decelerating.
+ */
+@keyframes timeline-enter {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -10px, 0) scale(0.985);
+  }
+  60% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+@keyframes timeline-row-glow {
+  0%   { background-color: rgb(124 58 237 / 0.06); }
+  100% { background-color: transparent; }
+}
+@keyframes dot-pulse {
+  0%, 100% { transform: scale(1);    opacity: 1; }
+  50%      { transform: scale(1.18); opacity: 0.85; }
+}
+@keyframes ring-expand {
+  0%   { transform: scale(1);   opacity: 0.55; }
+  100% { transform: scale(3.2); opacity: 0; }
+}
+
+.timeline-item {
+  animation:
+    timeline-enter 380ms cubic-bezier(0.16, 1, 0.3, 1) both,
+    timeline-row-glow 1400ms ease-out both;
+  will-change: transform, opacity;
+}
+
+/* Brand-purple left stripe on freshly-arrived rows — fades to nothing
+ * over ~2.5s, matching the lifetime of `liveIDs` on the row's React
+ * state. Gives the page a "raindrop hitting the surface" feel as new
+ * events land, even when many events are arriving at once. */
+.timeline-item.is-fresh::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  border-radius: 2px;
+  background: linear-gradient(to bottom, #a78bfa, #7c3aed);
+  animation: fresh-stripe 2400ms ease-out both;
+}
+@keyframes fresh-stripe {
+  0%   { opacity: 1; }
+  70%  { opacity: 0.6; }
+  100% { opacity: 0; }
+}
+.timeline-dot.is-live {
+  animation: dot-pulse 1.4s cubic-bezier(0.45, 0, 0.55, 1) 2;
+}
+.timeline-dot-ring {
+  animation: ring-expand 1100ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Smooth list reflow when an item is inserted at the top — uses the
+ * `transition` shim that's effective for hover/state changes; full layout
+ * animation needs framer-motion which we deliberately skipped. */
+.timeline-list > li {
+  transition: transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}

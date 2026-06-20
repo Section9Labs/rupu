@@ -17,6 +17,7 @@ members = [
     "crates/rupu-mcp",
     "crates/rupu-webhook",
     "crates/rupu-keychain-acl",
+    "crates/rupu-cp",
     "crates/rupu-cli",
 ]
 
@@ -105,8 +106,11 @@ rand = "0.8"
 sha2 = "0.10"
 url = "2"
 
-# Webhook receiver (axum chosen for async-native + tower middleware)
+# Webhook receiver / control-plane (axum chosen for async-native + tower middleware)
 axum = "0.7"
+tower-http = { version = "0.6", features = ["trace"] }
+rust-embed = "8"
+mime_guess = "2"
 hmac = "0.12"
 hex = "0.4"
 subtle = "2"
