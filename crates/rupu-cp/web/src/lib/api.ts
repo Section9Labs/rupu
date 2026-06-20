@@ -266,6 +266,8 @@ export interface RunListRow {
   started_at: string;
   finished_at?: string | null;
   trigger: 'manual' | 'cron' | 'event';
+  turns: number;
+  duration_ms?: number | null;
   usage: UsageSummary;
 }
 
@@ -357,6 +359,8 @@ export interface AgentRunRow {
   status?: string | null;
   started_at?: string | null;
   transcript_path?: string | null;
+  turns: number;
+  duration_ms?: number | null;
   usage: UsageSummary;
 }
 
