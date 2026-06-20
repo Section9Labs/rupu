@@ -14,12 +14,12 @@ import {
   type CoverageDetail,
   type FileView,
   type FindingRecord,
-  type FindingSeverity,
 } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
+import { SEVERITY_STYLE } from '../lib/severity';
 
 // How many assertion rows to render before capping with a "+N more" note.
 const ASSERTION_CAP = 200;
@@ -202,17 +202,9 @@ export default function CoverageDetail() {
 // Findings row
 // ---------------------------------------------------------------------------
 
-const SEV_STYLES: Record<FindingSeverity, { pill: string; label: string }> = {
-  critical: { pill: 'bg-purple-50 text-sev-critical ring-purple-200', label: 'critical' },
-  high:     { pill: 'bg-red-50 text-sev-high ring-red-200',           label: 'high' },
-  medium:   { pill: 'bg-orange-50 text-sev-medium ring-orange-200',   label: 'medium' },
-  low:      { pill: 'bg-yellow-50 text-sev-low ring-yellow-200',      label: 'low' },
-  info:     { pill: 'bg-slate-100 text-sev-info ring-slate-200',      label: 'info' },
-};
-
 function FindingRow({ finding }: { finding: FindingRecord }) {
   const sev = normFindingSeverity(finding.severity);
-  const s = SEV_STYLES[sev];
+  const s = SEVERITY_STYLE[sev];
   const [open, setOpen] = useState(false);
 
   const locationParts: string[] = [];
