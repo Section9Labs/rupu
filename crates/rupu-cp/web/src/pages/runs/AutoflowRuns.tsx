@@ -60,10 +60,10 @@ function KindBadge({ kind }: { kind: string }) {
   );
 }
 
-function IssueChip({ ref }: { ref: string }) {
+function IssueChip({ displayRef }: { displayRef: string }) {
   return (
     <span className="inline-flex items-center rounded bg-slate-100 text-slate-600 ring-1 ring-slate-200 text-[10px] font-medium px-1.5 py-0.5">
-      {ref}
+      {displayRef}
     </span>
   );
 }
@@ -191,7 +191,7 @@ function AutoflowEventItem({ event }: { event: AutoflowEventRow }) {
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-sm font-medium text-ink truncate">{headline}</span>
           <KindBadge kind={event.kind} />
-          {event.issue_display_ref && <IssueChip ref={event.issue_display_ref} />}
+          {event.issue_display_ref && <IssueChip displayRef={event.issue_display_ref} />}
         </div>
         <div className="text-[11px] text-ink-dim mt-0.5">
           {relativeTime(event.at)}
