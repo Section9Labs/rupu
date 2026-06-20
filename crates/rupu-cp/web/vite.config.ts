@@ -17,6 +17,9 @@ export default defineConfig({
           xyflow: ['@xyflow/react', '@dagrejs/dagre'],
           // Charting — only loaded on Dashboard.
           charts: ['recharts'],
+          // Markdown rendering (react-markdown + rehype-highlight + highlight.js)
+          // — only loaded by the transcript route, isolated from the main entry.
+          markdown: ['react-markdown', 'rehype-highlight', 'highlight.js'],
         },
       },
     },
