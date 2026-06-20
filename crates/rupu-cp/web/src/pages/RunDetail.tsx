@@ -182,7 +182,7 @@ export default function RunDetail() {
     return model.nodes
       .map((n) => n.id)
       .sort()
-      .join(' ');
+      .join('\u0000');
   }, [model]);
 
   // Keyed on the node-id SET, NOT the model, so dagre only re-runs when nodes
