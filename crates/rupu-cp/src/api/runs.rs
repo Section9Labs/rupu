@@ -3,7 +3,7 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::{IntoResponse as _, Response},
     routing::get,
     Json, Router,
@@ -75,30 +75,44 @@ impl RunListRow {
     }
 }
 
-async fn list_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<RunListRow>>> {
-    let runs = s
+async fn list_runs(
+    State(s): State<AppState>,
+    Query(page): Query<crate::pagination::PageQuery>,
+) -> ApiResult<Json<Vec<RunListRow>>> {
+    let mut runs = s
         .run_store
         .list()
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    let page_runs = crate::pagination::paginate(runs, &page);
     Ok(Json(
-        runs.iter()
+        page_runs
+            .iter()
             .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
             .collect(),
     ))
 }
 
 /// `GET /api/runs/workflows` — manual/direct runs only (no event or cron wake).
-async fn list_workflow_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<RunListRow>>> {
-    let runs = s
+async fn list_workflow_runs(
+    State(s): State<AppState>,
+    Query(page): Query<crate::pagination::PageQuery>,
+) -> ApiResult<Json<Vec<RunListRow>>> {
+    let mut runs: Vec<RunRecord> = s
         .run_store
         .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    let rows: Vec<RunListRow> = runs
-        .iter()
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .into_iter()
         .filter(|r| r.event.is_none() && r.source_wake_id.is_none())
-        .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
         .collect();
-    Ok(Json(rows))
+    runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    let page_runs = crate::pagination::paginate(runs, &page);
+    Ok(Json(
+        page_runs
+            .iter()
+            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
+            .collect(),
+    ))
 }
 
 async fn get_run(
