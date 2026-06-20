@@ -46,6 +46,8 @@ pub(crate) struct RunListRow {
     pub(crate) finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) trigger: &'static str,
     pub(crate) usage: crate::usage::UsageSummary,
+    pub(crate) turns: u64,
+    pub(crate) duration_ms: Option<u64>,
 }
 
 impl From<&RunRecord> for RunListRow {
@@ -58,19 +60,32 @@ impl From<&RunRecord> for RunListRow {
             finished_at: r.finished_at,
             trigger: trigger_of(r),
             usage: crate::usage::UsageSummary::default(),
+            turns: 0,
+            duration_ms: None,
         }
     }
 }
 
 impl RunListRow {
-    /// Build a row with its usage summary filled from the run's transcripts.
+    /// Build a row with its usage summary, turn count, and duration filled from
+    /// the run's transcripts (and the run record's wall-clock when available).
     pub(crate) fn with_usage(
         r: &RunRecord,
         store: &rupu_orchestrator::runs::RunStore,
         pricing: &rupu_config::PricingConfig,
     ) -> Self {
         let mut row = Self::from(r);
-        row.usage = crate::usage::summarize_run(store, &r.id, pricing);
+        let m = crate::usage::run_metrics(store, &r.id, pricing);
+        row.usage = m.usage;
+        row.turns = m.turns;
+        // Prefer the run record's wall-clock when finished; else the transcript duration.
+        row.duration_ms = match r.finished_at {
+            Some(fin) => {
+                let ms = (fin - r.started_at).num_milliseconds().max(0);
+                Some(ms as u64)
+            }
+            None => m.duration_ms,
+        };
         row
     }
 }
@@ -166,9 +181,13 @@ mod tests {
             finished_at: None,
             trigger: "manual",
             usage: crate::usage::UsageSummary::default(),
+            turns: 0,
+            duration_ms: None,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert!(v.get("usage").is_some());
         assert_eq!(v["usage"]["priced"], serde_json::Value::Bool(false));
+        assert!(v.get("turns").is_some());
+        assert!(v.get("duration_ms").is_some());
     }
 }

@@ -3,16 +3,18 @@
 // is `unknown` on the wire, so it's coerced via lib/sessionStatus.
 
 import { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { MessageSquare } from 'lucide-react';
 import { api, type SessionSummary } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader, type SectionTone } from '../components/lists/SectionHeader';
+import MetricRow from '../components/lists/MetricRow';
+import UsageBarChart from '../components/charts/UsageBarChart';
 import { cn } from '../lib/cn';
-import { relativeTime } from '../lib/time';
+import { durationBetween } from '../lib/time';
+import { formatTokens, formatCost } from '../lib/usage';
 import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
-import UsageChip from '../components/UsageChip';
 
 const PAGE = 20;
 
@@ -102,6 +104,16 @@ export default function Sessions() {
         <EmptyState />
       ) : (
         <div className="space-y-6">
+          {sessions.some((s) => s.usage) && (
+            <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
+              <UsageBarChart bars={sessions.filter((s) => s.usage).map((s) => ({
+                id: s.session_id, label: s.agent_name,
+                to: `/sessions/${encodeURIComponent(s.session_id)}`,
+                input_tokens: s.usage?.input_tokens ?? 0, output_tokens: s.usage?.output_tokens ?? 0,
+                cached_tokens: s.usage?.cached_tokens ?? 0, cost_usd: s.usage?.cost_usd ?? null,
+              }))} />
+            </div>
+          )}
           {orderedScopes.map((scope) => {
             const rows = groups.get(scope) ?? [];
             return (
@@ -126,38 +138,38 @@ export default function Sessions() {
 }
 
 function SessionRow({ session }: { session: SessionSummary }) {
-  // The active-run badge is a sibling Link, not nested inside the row Link
-  // (anchor-in-anchor is invalid HTML). The row Link fills the available width.
+  const navigate = useNavigate();
+  const u = session.usage;
   return (
-    <div className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 transition-colors">
-      <Link to={`/sessions/${encodeURIComponent(session.session_id)}`} className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="flex items-center gap-1.5">
-            <span className={cn('inline-block w-2 h-2 rounded-full', sessionStatusDot(session.status))} />
-            <span className="text-[11px] text-ink-dim">{sessionStatusLabel(session.status)}</span>
-          </span>
-          <span className="text-sm font-medium text-ink truncate">{session.agent_name}</span>
-          <span className="text-[11px] text-ink-mute font-mono">{shortId(session.session_id)}</span>
-        </div>
-        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
-          <span className="font-mono">{session.model}</span>
-          <span className="tabular-nums">
-            {session.total_turns} turn{session.total_turns !== 1 ? 's' : ''}
-          </span>
-          <span>updated {relativeTime(session.updated_at)}</span>
-          {session.usage && <UsageChip usage={session.usage} className="ml-2" />}
-        </div>
-      </Link>
-
-      {session.active_run_id && (
-        <Link
-          to={`/runs/${encodeURIComponent(session.active_run_id)}`}
+    <MetricRow
+      to={`/sessions/${encodeURIComponent(session.session_id)}`}
+      header={<>
+        <span className="flex items-center gap-1.5">
+          <span className={cn('inline-block w-2 h-2 rounded-full', sessionStatusDot(session.status))} />
+          <span className="text-[11px] text-ink-dim">{sessionStatusLabel(session.status)}</span>
+        </span>
+        <span className="text-sm font-medium text-ink truncate">{session.agent_name}</span>
+        <span className="text-[11px] text-ink-mute font-mono">{shortId(session.session_id)}</span>
+        <span className="text-[11px] text-ink-mute font-mono">{session.model}</span>
+      </>}
+      trailing={session.active_run_id ? (
+        <button
+          type="button"
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); navigate(`/runs/${encodeURIComponent(session.active_run_id ?? '')}`); }}
           className="shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
         >
           active run
-        </Link>
-      )}
-    </div>
+        </button>
+      ) : undefined}
+      metrics={[
+        { label: 'in', value: u ? formatTokens(u.input_tokens) : null },
+        { label: 'out', value: u ? formatTokens(u.output_tokens) : null },
+        { label: 'cached', value: u && u.cached_tokens ? formatTokens(u.cached_tokens) : null },
+        { label: 'cost', value: u ? formatCost(u.cost_usd) : null },
+        { label: 'turns', value: session.total_turns ? String(session.total_turns) : null },
+        { label: 'duration', value: durationBetween(session.created_at, session.updated_at) },
+      ]}
+    />
   );
 }
 

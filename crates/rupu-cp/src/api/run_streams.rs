@@ -126,6 +126,8 @@ struct AgentRunRow {
     started_at: Option<String>,
     transcript_path: Option<String>,
     usage: crate::usage::UsageSummary,
+    turns: u64,
+    duration_ms: Option<u64>,
 }
 
 /// Stringify whatever serde_json::Value the status field carries.
@@ -205,6 +207,8 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             started_at: None, // standalone meta does not carry a started_at field
             transcript_path,
             usage: crate::usage::UsageSummary::default(),
+            turns: 0,
+            duration_ms: None,
         });
     }
     rows
@@ -263,6 +267,8 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                     started_at: run.started_at,
                     transcript_path: run.transcript_path,
                     usage: crate::usage::UsageSummary::default(),
+                    turns: 0,
+                    duration_ms: None,
                 });
             }
         }
@@ -293,10 +299,10 @@ async fn list_agent_runs(
     let mut page_rows = crate::pagination::paginate(rows, &page);
     for row in &mut page_rows {
         if let Some(tp) = &row.transcript_path {
-            row.usage = crate::usage::summarize_paths(
-                &[std::path::PathBuf::from(tp)],
-                &s.pricing,
-            );
+            let m = crate::usage::run_metrics_paths(&[std::path::PathBuf::from(tp)], &s.pricing);
+            row.usage = m.usage;
+            row.turns = m.turns;
+            row.duration_ms = m.duration_ms;
         }
     }
     Ok(Json(page_rows))

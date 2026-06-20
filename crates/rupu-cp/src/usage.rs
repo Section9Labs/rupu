@@ -10,6 +10,7 @@ use rupu_config::PricingConfig;
 use rupu_orchestrator::runs::RunStore;
 use rupu_transcript::TimeWindow;
 use rupu_transcript::UsageRow;
+use rupu_transcript::{Event, JsonlReader};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -80,6 +81,54 @@ pub fn run_transcript_paths(store: &RunStore, run_id: &str) -> Vec<PathBuf> {
 /// Token + cost summary for a single run.
 pub fn summarize_run(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> UsageSummary {
     summarize_paths(&run_transcript_paths(store, run_id), pricing)
+}
+
+/// Token usage + turn count + duration for one run.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RunMetrics {
+    pub usage: UsageSummary,
+    /// Number of LLM turns (counted from `Usage` events).
+    pub turns: u64,
+    /// Wall-clock duration from the transcript's `RunComplete`, if present.
+    pub duration_ms: Option<u64>,
+}
+
+/// Count turns (one per `Usage` event) and capture `RunComplete.duration_ms`
+/// across the given transcripts. Tolerates unreadable/partial files.
+fn turns_and_duration(paths: &[PathBuf]) -> (u64, Option<u64>) {
+    let mut turns = 0u64;
+    let mut duration_ms = None;
+    for path in paths {
+        let Ok(iter) = JsonlReader::iter(path) else {
+            continue;
+        };
+        for ev in iter.flatten() {
+            match ev {
+                Event::Usage { .. } => turns += 1,
+                Event::RunComplete {
+                    duration_ms: d, ..
+                } => duration_ms = Some(d),
+                _ => {}
+            }
+        }
+    }
+    (turns, duration_ms)
+}
+
+/// Full per-run metrics (usage + turns + duration) from transcript paths.
+pub fn run_metrics_paths(paths: &[PathBuf], pricing: &PricingConfig) -> RunMetrics {
+    let usage = summarize_paths(paths, pricing);
+    let (turns, duration_ms) = turns_and_duration(paths);
+    RunMetrics {
+        usage,
+        turns,
+        duration_ms,
+    }
+}
+
+/// Full per-run metrics for a run in the store.
+pub fn run_metrics(store: &RunStore, run_id: &str, pricing: &PricingConfig) -> RunMetrics {
+    run_metrics_paths(&run_transcript_paths(store, run_id), pricing)
 }
 
 /// Combine many summaries into one. Token fields add; `priced` ANDs across
@@ -332,6 +381,26 @@ mod tests {
         assert_eq!(b[1].model, "llama-3-70b");
         assert!(!b[1].priced);
         assert_eq!(b[1].cost_usd, None);
+    }
+
+    #[test]
+    fn run_metrics_counts_turns_and_duration() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("rupu-cp-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tpath = dir.join("t.jsonl");
+        let mut f = std::fs::File::create(&tpath).unwrap();
+        writeln!(f, r#"{{"type":"run_start","data":{{"run_id":"r1","workspace_id":"w","agent":"a","provider":"anthropic","model":"claude-sonnet-4-6","started_at":"2026-01-01T00:00:00Z","mode":"ask"}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":1000,"output_tokens":200,"cached_tokens":0}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"usage","data":{{"provider":"anthropic","model":"claude-sonnet-4-6","input_tokens":800,"output_tokens":150,"cached_tokens":50}}}}"#).unwrap();
+        writeln!(f, r#"{{"type":"run_complete","data":{{"run_id":"r1","status":"ok","total_tokens":2150,"duration_ms":38000}}}}"#).unwrap();
+        drop(f);
+        let m = run_metrics_paths(&[tpath], &PricingConfig::default());
+        assert_eq!(m.turns, 2);
+        assert_eq!(m.duration_ms, Some(38000));
+        assert_eq!(m.usage.input_tokens, 1800);
+        assert_eq!(m.usage.output_tokens, 350);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
