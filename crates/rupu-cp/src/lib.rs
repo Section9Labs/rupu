@@ -14,7 +14,8 @@ pub mod usage;
 
 use anyhow::Context as _;
 use rupu_config::PricingConfig;
-use std::net::SocketAddr;
+use std::io::IsTerminal as _;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -23,6 +24,35 @@ pub struct ServeOpts {
     /// If set, require `Authorization: Bearer <token>` on `/api/*` routes.
     pub token: Option<String>,
     pub global_dir: PathBuf,
+    /// Open the served URL in the default browser on startup (best-effort, and
+    /// only when stdout is a terminal). The URL is always printed regardless.
+    pub open_browser: bool,
+}
+
+/// The browser-clickable URL for a bound address. An unspecified bind host
+/// (`0.0.0.0` / `::`) is rewritten to loopback so the printed link works.
+fn click_url(addr: SocketAddr) -> String {
+    let host = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+        IpAddr::V4(ip) => ip.to_string(),
+    };
+    format!("http://{host}:{}", addr.port())
+}
+
+/// Best-effort browser launch (macOS `open`, other Unix `xdg-open`). Never
+/// fails the server — a missing opener or headless session is silently skipped.
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opener: Option<&str> = Some("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener: Option<&str> = Some("xdg-open");
+    #[cfg(not(unix))]
+    let opener: Option<&str> = None;
+    if let Some(opener) = opener {
+        let _ = std::process::Command::new(opener).arg(url).spawn();
+    }
 }
 
 /// Load the user's `[pricing]` overrides from `<global_dir>/config.toml`.
@@ -46,6 +76,7 @@ fn load_pricing(global_dir: &Path) -> PricingConfig {
 }
 
 pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
+    let open_browser = opts.open_browser;
     let pricing = load_pricing(&opts.global_dir);
     let app_state = state::AppState::new(opts.global_dir, pricing);
     let app = server::router(app_state, opts.token);
@@ -55,7 +86,16 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind to {}", opts.bind))?;
 
     let addr = listener.local_addr()?;
-    info!("rupu cp serving on http://{addr}");
+    let url = click_url(addr);
+    // Always surface the URL prominently — independent of RUST_LOG / tracing.
+    println!("\n  ➜  rupu Control Plane  →  {url}\n");
+    info!("rupu cp serving on {url}");
+
+    // Auto-open only when interactive (a real terminal), so headless / scripted
+    // / supervised runs don't spawn a surprise browser. `--no-open` forces off.
+    if open_browser && std::io::stdout().is_terminal() {
+        open_in_browser(&url);
+    }
 
     axum::serve(listener, app)
         .await
@@ -67,6 +107,15 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn click_url_rewrites_unspecified_to_loopback() {
+        let p = |s: &str| click_url(s.parse::<SocketAddr>().unwrap());
+        assert_eq!(p("0.0.0.0:7878"), "http://127.0.0.1:7878");
+        assert_eq!(p("127.0.0.1:7878"), "http://127.0.0.1:7878");
+        assert_eq!(p("192.168.1.5:9000"), "http://192.168.1.5:9000");
+        assert_eq!(p("[::]:7878"), "http://[::1]:7878");
+    }
 
     #[test]
     fn load_pricing_empty_when_no_config_file() {

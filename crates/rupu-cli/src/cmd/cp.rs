@@ -17,12 +17,21 @@ pub enum Action {
         /// open on localhost).
         #[arg(long)]
         token: Option<String>,
+        /// Do not open the served URL in a browser on startup. By default the
+        /// URL is opened when running interactively (a terminal); the URL is
+        /// always printed regardless.
+        #[arg(long)]
+        no_open: bool,
     },
 }
 
 pub async fn handle(action: Action) -> ExitCode {
     let result = match action {
-        Action::Serve { bind, token } => {
+        Action::Serve {
+            bind,
+            token,
+            no_open,
+        } => {
             let global_dir = match paths::global_dir() {
                 Ok(d) => d,
                 Err(e) => {
@@ -34,6 +43,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 bind,
                 token,
                 global_dir,
+                open_browser: !no_open,
             })
             .await
         }
