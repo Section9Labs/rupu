@@ -9,6 +9,7 @@ pub mod server;
 pub mod sse;
 pub mod state;
 pub mod transcript_tail;
+pub mod usage;
 
 use anyhow::Context as _;
 use rupu_config::PricingConfig;
