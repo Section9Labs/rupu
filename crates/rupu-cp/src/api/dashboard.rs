@@ -33,6 +33,7 @@ struct RecentRun {
     status: &'static str,
     started_at: DateTime<Utc>,
     finished_at: Option<DateTime<Utc>>,
+    usage: crate::usage::UsageSummary,
 }
 
 #[derive(Serialize)]
@@ -108,6 +109,7 @@ async fn get_dashboard(State(s): State<AppState>) -> ApiResult<Json<DashboardRes
             status: r.status.as_str(),
             started_at: r.started_at,
             finished_at: r.finished_at,
+            usage: crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing),
         })
         .collect();
 
