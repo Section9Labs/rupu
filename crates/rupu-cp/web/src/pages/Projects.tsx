@@ -7,10 +7,14 @@ import { FolderGit2, GitBranch, GitFork } from 'lucide-react';
 import { api, type ProjectRow } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { relativeTime } from '../lib/time';
+import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+
+const STEP = 20;
 
 export default function Projects() {
   const [projects, setProjects] = useState<ProjectRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [visible, setVisible] = useState(STEP);
 
   useEffect(() => {
     let cancelled = false;
@@ -19,6 +23,7 @@ export default function Projects() {
       .then((data) => {
         if (cancelled) return;
         setProjects(data);
+        setVisible(STEP);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -28,6 +33,13 @@ export default function Projects() {
       cancelled = true;
     };
   }, []);
+
+  const all = projects ?? [];
+  const shown = all.slice(0, visible);
+  const { sentinelRef } = useInfiniteScroll({
+    hasMore: visible < all.length,
+    loadMore: () => setVisible((v) => v + STEP),
+  });
 
   return (
     <div className="p-8 max-w-5xl">
@@ -52,11 +64,18 @@ export default function Projects() {
       {projects !== null && projects.length === 0 && <ProjectsEmpty />}
 
       {projects !== null && projects.length > 0 && (
-        <ListCard>
-          {projects.map((p) => (
-            <ProjectRow key={p.ws_id} project={p} />
-          ))}
-        </ListCard>
+        <>
+          <ListCard>
+            {shown.map((p) => (
+              <ProjectRow key={p.ws_id} project={p} />
+            ))}
+          </ListCard>
+          {all.length > visible && (
+            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+              scroll for more
+            </div>
+          )}
+        </>
       )}
     </div>
   );

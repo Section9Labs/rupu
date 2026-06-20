@@ -8,8 +8,12 @@ import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AgentRunRow } from '../../lib/api';
 import { ListCard } from '../../components/lists/ListCard';
 import { SectionHeader } from '../../components/lists/SectionHeader';
+import UsageChip from '../../components/UsageChip';
 import { cn } from '../../lib/cn';
 import { relativeTime } from '../../lib/time';
+import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
+
+const PAGE = 20;
 
 function shortId(id: string): string {
   return id.length > 10 ? `${id.slice(0, 8)}…` : id;
@@ -52,14 +56,17 @@ function StatusBadge({ status }: { status: string }) {
 
 export default function AgentRuns() {
   const [agentRuns, setAgentRuns] = useState<AgentRunRow[] | null>(null);
+  const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
-  const load = useCallback(async () => {
+  // Page-0 fetch (mount + 5 s refresh) — resets pagination.
+  const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const data = await api.getAgentRuns();
+      const data = await api.getAgentRuns({ limit: PAGE });
       setAgentRuns(data);
+      setHasMore(data.length >= PAGE);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load agent runs');
@@ -69,10 +76,20 @@ export default function AgentRuns() {
   }, []);
 
   useEffect(() => {
-    void load();
-    const t = window.setInterval(() => void load(), 5000);
+    void refresh();
+    const t = window.setInterval(() => void refresh(), 5000);
     return () => window.clearInterval(t);
-  }, [load]);
+  }, [refresh]);
+
+  const loadMore = async () => {
+    const current = agentRuns ?? [];
+    const next = await api.getAgentRuns({ offset: current.length, limit: PAGE });
+    if (next.length === 0) { setHasMore(false); return; }
+    setAgentRuns([...current, ...next]);
+    if (next.length < PAGE) setHasMore(false);
+  };
+
+  const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
 
   // Sort newest-first where started_at is available; runs without it sink to
   // the bottom so that active/recent runs remain prominent.
@@ -91,7 +108,7 @@ export default function AgentRuns() {
           <p className="mt-1 text-sm text-ink-dim">Standalone and session-bound agent invocations.</p>
         </div>
         <button
-          onClick={() => void load()}
+          onClick={() => void refresh()}
           className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-border bg-panel text-ink hover:bg-slate-100"
         >
           <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
@@ -117,6 +134,11 @@ export default function AgentRuns() {
               <AgentRunEntry key={r.run_id} run={r} />
             ))}
           </ListCard>
+          {sorted.length > 0 && (
+            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${sorted.length} —`}
+            </div>
+          )}
         </section>
       )}
     </div>
@@ -152,7 +174,7 @@ function AgentRunEntry({ run }: { run: AgentRunRow }) {
         </div>
 
         <div className="text-[11px] text-ink-dim mt-0.5 flex items-center gap-3 flex-wrap">
-          {/* Per-run token/cost: AgentRunRow has no usage field (different DTO); shown on the run detail page instead. */}
+          <UsageChip usage={run.usage} className="ml-2" />
           {run.started_at ? (
             <span>started {relativeTime(run.started_at)}</span>
           ) : (

@@ -2,7 +2,7 @@
 // scope (active first, then archived). Each row links to /sessions/:id. Status
 // is `unknown` on the wire, so it's coerced via lib/sessionStatus.
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { MessageSquare } from 'lucide-react';
 import { api, type SessionSummary } from '../lib/api';
@@ -11,7 +11,10 @@ import { SectionHeader, type SectionTone } from '../components/lists/SectionHead
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
+import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import UsageChip from '../components/UsageChip';
+
+const PAGE = 20;
 
 function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 10)}…` : id;
@@ -34,24 +37,37 @@ function scopeTone(scope: string): SectionTone {
 
 export default function Sessions() {
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
+  const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getSessions()
-      .then((data) => {
-        if (cancelled) return;
-        setSessions(data);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load sessions');
-      });
-    return () => {
-      cancelled = true;
-    };
+  const refresh = useCallback(async () => {
+    try {
+      const pageData = await api.getSessions({ limit: PAGE });
+      setSessions(pageData);
+      setHasMore(pageData.length >= PAGE);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load sessions');
+    }
   }, []);
+
+  useEffect(() => {
+    void refresh();
+    return () => {};
+  }, [refresh]);
+
+  const loadMore = async () => {
+    const current = sessions ?? [];
+    const next = await api.getSessions({ offset: current.length, limit: PAGE });
+    if (next.length === 0) {
+      setHasMore(false);
+      return;
+    }
+    setSessions([...current, ...next]);
+    if (next.length < PAGE) setHasMore(false);
+  };
+
+  const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
 
   // Group by scope.
   const groups = new Map<string, SessionSummary[]>();
@@ -99,6 +115,10 @@ export default function Sessions() {
               </section>
             );
           })}
+
+          <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+            {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${sessions.length} —`}
+          </div>
         </div>
       )}
     </div>

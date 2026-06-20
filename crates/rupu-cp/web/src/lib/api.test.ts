@@ -64,6 +64,16 @@ describe('api.getRuns', () => {
   });
 });
 
+describe('api.getRuns pagination', () => {
+  it('requests /api/runs?offset=20&limit=20 when given list params', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getRuns({ offset: 20, limit: 20 });
+    const calledUrl = (fetchSpy.mock.calls[0][0] as string);
+    expect(calledUrl).toBe('/api/runs?offset=20&limit=20');
+  });
+});
+
 describe('api.getRun', () => {
   it('resolves run + steps on 200', async () => {
     const payload = {

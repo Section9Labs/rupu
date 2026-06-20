@@ -7,7 +7,7 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -228,12 +228,15 @@ fn session_is_active(v: &Value) -> bool {
 async fn project_runs(
     State(s): State<AppState>,
     Path(ws_id): Path<String>,
+    Query(page): Query<crate::pagination::PageQuery>,
 ) -> ApiResult<Json<Vec<RunListRow>>> {
     // 404 when the project is unknown, mirroring the rollup endpoint.
     load_workspace(&s, &ws_id)?;
-    let runs = scoped_runs(&s, &ws_id)?;
+    let runs = scoped_runs(&s, &ws_id)?; // already sorted newest-first
+    let page_runs = crate::pagination::paginate(runs, &page);
     Ok(Json(
-        runs.iter()
+        page_runs
+            .iter()
             .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
             .collect(),
     ))
@@ -243,13 +246,14 @@ async fn project_runs(
 async fn project_sessions(
     State(s): State<AppState>,
     Path(ws_id): Path<String>,
+    Query(page): Query<crate::pagination::PageQuery>,
 ) -> ApiResult<Json<Vec<Value>>> {
     load_workspace(&s, &ws_id)?;
     let scoped: Vec<Value> = crate::api::sessions::collect_sessions(&s.global_dir, &s.pricing)
         .into_iter()
         .filter(|v| v["workspace_id"].as_str() == Some(ws_id.as_str()))
         .collect();
-    Ok(Json(scoped))
+    Ok(Json(crate::pagination::paginate(scoped, &page)))
 }
 
 /// `GET /api/projects/:ws_id/coverage` — per-target coverage summary rows,

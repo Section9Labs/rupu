@@ -1,7 +1,7 @@
 // Project-scoped sessions list — minimal placeholder so "see all" links resolve.
 // Task 9 will deepen this into a full scoped list.
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 import { api, type SessionSummary } from '../lib/api';
@@ -10,29 +10,46 @@ import { relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
 import { cn } from '../lib/cn';
 import UsageChip from '../components/UsageChip';
+import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+
+const PAGE = 20;
 
 export default function ProjectSessions() {
   const { wsId } = useParams<{ wsId: string }>();
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
+  const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const refresh = useCallback(async () => {
     if (!wsId) return;
-    let cancelled = false;
-    api
-      .getProjectSessions(wsId)
-      .then((data) => {
-        if (cancelled) return;
-        setSessions(data);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load sessions');
-      });
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const pageData = await api.getProjectSessions(wsId, { limit: PAGE });
+      setSessions(pageData);
+      setHasMore(pageData.length >= PAGE);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load sessions');
+    }
   }, [wsId]);
+
+  useEffect(() => {
+    void refresh();
+    return () => {};
+  }, [refresh]);
+
+  const loadMore = async () => {
+    if (!wsId) return;
+    const current = sessions ?? [];
+    const next = await api.getProjectSessions(wsId, { offset: current.length, limit: PAGE });
+    if (next.length === 0) {
+      setHasMore(false);
+      return;
+    }
+    setSessions([...current, ...next]);
+    if (next.length < PAGE) setHasMore(false);
+  };
+
+  const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
 
   return (
     <div className="p-8 max-w-5xl">
@@ -87,6 +104,12 @@ export default function ProjectSessions() {
             </Link>
           ))}
         </ListCard>
+      )}
+
+      {sessions !== null && sessions.length > 0 && (
+        <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+          {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${sessions.length} —`}
+        </div>
       )}
     </div>
   );

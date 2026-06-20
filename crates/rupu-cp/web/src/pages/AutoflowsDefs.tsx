@@ -7,6 +7,9 @@ import { api, type AutoflowDefRow } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { cn } from '../lib/cn';
+import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+
+const STEP = 20;
 
 const TRIGGER_CLS: Record<string, string> = {
   cron:  'bg-violet-50 text-violet-700 ring-violet-200',
@@ -41,12 +44,14 @@ export default function AutoflowsDefs() {
   const [defs, setDefs] = useState<AutoflowDefRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [visible, setVisible] = useState(STEP);
 
   const load = useCallback(async () => {
     setRefreshing(true);
     try {
       const data = await api.getAutoflowDefs();
       setDefs(data);
+      setVisible(STEP);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load autoflow definitions');
@@ -58,6 +63,12 @@ export default function AutoflowsDefs() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const shown = (defs ?? []).slice(0, visible);
+  const { sentinelRef } = useInfiniteScroll({
+    hasMore: visible < (defs?.length ?? 0),
+    loadMore: () => setVisible((v) => v + STEP),
+  });
 
   return (
     <div className="p-8 max-w-5xl">
@@ -89,10 +100,15 @@ export default function AutoflowsDefs() {
         <section>
           <SectionHeader tone="muted" label="Autoflow Workflows" count={defs.length} />
           <ListCard>
-            {defs.map((d) => (
+            {shown.map((d) => (
               <AutoflowDefEntry key={d.name} def={d} />
             ))}
           </ListCard>
+          {defs.length > visible && (
+            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+              scroll for more
+            </div>
+          )}
         </section>
       )}
     </div>

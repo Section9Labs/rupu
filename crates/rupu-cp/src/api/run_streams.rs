@@ -1,5 +1,9 @@
 use crate::{error::ApiResult, state::AppState};
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    extract::{Query, State},
+    routing::get,
+    Json, Router,
+};
 use rupu_runtime::{
     AutoflowCycleEventKind, AutoflowCycleRecord, AutoflowHistoryStore, AutoflowHistoryStoreError,
 };
@@ -29,6 +33,7 @@ struct AutoflowCycleRow {
     skipped_cycles: usize,
     failed_cycles: usize,
     run_ids: Vec<String>,
+    usage: crate::usage::UsageSummary,
 }
 
 impl From<AutoflowCycleRecord> for AutoflowCycleRow {
@@ -60,6 +65,7 @@ impl From<AutoflowCycleRecord> for AutoflowCycleRow {
             skipped_cycles: r.skipped_cycles,
             failed_cycles: r.failed_cycles,
             run_ids,
+            usage: crate::usage::UsageSummary::default(),
         }
     }
 }
@@ -119,6 +125,7 @@ struct AgentRunRow {
     status: Option<String>,
     started_at: Option<String>,
     transcript_path: Option<String>,
+    usage: crate::usage::UsageSummary,
 }
 
 /// Stringify whatever serde_json::Value the status field carries.
@@ -197,6 +204,7 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             status: None, // standalone meta does not carry run status
             started_at: None, // standalone meta does not carry a started_at field
             transcript_path,
+            usage: crate::usage::UsageSummary::default(),
         });
     }
     rows
@@ -254,6 +262,7 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                         .and_then(stringify_status),
                     started_at: run.started_at,
                     transcript_path: run.transcript_path,
+                    usage: crate::usage::UsageSummary::default(),
                 });
             }
         }
@@ -263,15 +272,16 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
 /// `GET /api/runs/agents` — returns agent runs from both standalone transcripts
 /// and session invocations, merged and sorted newest-first by `started_at`.
 /// Missing directories return `[]` (no 500).
-async fn list_agent_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentRunRow>>> {
+async fn list_agent_runs(
+    State(s): State<AppState>,
+    Query(page): Query<crate::pagination::PageQuery>,
+) -> ApiResult<Json<Vec<AgentRunRow>>> {
     let mut rows = collect_standalone_runs(&s.global_dir);
-
     collect_session_runs_from_dir(&s.global_dir.join("sessions"), &mut rows);
     collect_session_runs_from_dir(&s.global_dir.join("sessions-archive"), &mut rows);
 
-    // Sort newest-first: rows with a `started_at` string come before those
-    // without. Among rows with timestamps, lexicographic descending order
-    // works correctly for ISO-8601 strings.
+    // Newest-first: rows with a timestamp sort before those without; ISO-8601
+    // strings sort lexicographically.
     rows.sort_by(|a, b| match (&b.started_at, &a.started_at) {
         (Some(bt), Some(at)) => bt.cmp(at),
         (Some(_), None) => std::cmp::Ordering::Less,
@@ -279,7 +289,17 @@ async fn list_agent_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentR
         (None, None) => std::cmp::Ordering::Equal,
     });
 
-    Ok(Json(rows))
+    // Slice to the page BEFORE reading transcripts, then fill usage per row.
+    let mut page_rows = crate::pagination::paginate(rows, &page);
+    for row in &mut page_rows {
+        if let Some(tp) = &row.transcript_path {
+            row.usage = crate::usage::summarize_paths(
+                &[std::path::PathBuf::from(tp)],
+                &s.pricing,
+            );
+        }
+    }
+    Ok(Json(page_rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -292,21 +312,31 @@ async fn list_agent_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentR
 /// A missing store directory is treated as "no cycles yet" and returns `[]`.
 async fn list_autoflow_runs(
     State(s): State<AppState>,
+    Query(page): Query<crate::pagination::PageQuery>,
 ) -> ApiResult<Json<Vec<AutoflowCycleRow>>> {
     let store_root = s.global_dir.join("autoflows").join("history");
     let store = AutoflowHistoryStore::new(store_root);
 
     let records = match store.list_recent(100) {
         Ok(r) => r,
-        Err(AutoflowHistoryStoreError::Io(e))
-            if e.kind() == std::io::ErrorKind::NotFound =>
-        {
+        Err(AutoflowHistoryStoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             Vec::new()
         }
         Err(e) => return Err(crate::error::ApiError::internal(e.to_string())),
     };
 
-    Ok(Json(records.into_iter().map(AutoflowCycleRow::from).collect()))
+    // list_recent already returns newest-first. Convert, paginate, then roll up
+    // usage across each cycle's runs on the page only.
+    let rows: Vec<AutoflowCycleRow> = records.into_iter().map(AutoflowCycleRow::from).collect();
+    let mut page_rows = crate::pagination::paginate(rows, &page);
+    for row in &mut page_rows {
+        row.usage = crate::usage::rollup(
+            row.run_ids
+                .iter()
+                .map(|id| crate::usage::summarize_run(&s.run_store, id, &s.pricing)),
+        );
+    }
+    Ok(Json(page_rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +361,7 @@ struct AutoflowEventRow {
     run_id: Option<String>,
     status: Option<String>,
     worker_name: Option<String>,
+    usage: crate::usage::UsageSummary,
 }
 
 /// Stringify an `AutoflowCycleEventKind` into its serde snake_case tag.
@@ -360,21 +391,20 @@ fn is_actionable_kind(kind: AutoflowCycleEventKind) -> bool {
 /// A missing store directory is treated as "no events yet" and returns `[]`.
 async fn list_autoflow_events(
     State(s): State<AppState>,
+    Query(page): Query<crate::pagination::PageQuery>,
 ) -> ApiResult<Json<Vec<AutoflowEventRow>>> {
     let store_root = s.global_dir.join("autoflows").join("history");
     let store = AutoflowHistoryStore::new(store_root);
 
     let records = match store.list_recent_events(200) {
         Ok(r) => r,
-        Err(AutoflowHistoryStoreError::Io(e))
-            if e.kind() == std::io::ErrorKind::NotFound =>
-        {
+        Err(AutoflowHistoryStoreError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             Vec::new()
         }
         Err(e) => return Err(crate::error::ApiError::internal(e.to_string())),
     };
 
-    let rows = records
+    let rows: Vec<AutoflowEventRow> = records
         .into_iter()
         .filter(|rec| is_actionable_kind(rec.event.kind))
         .map(|rec| AutoflowEventRow {
@@ -387,8 +417,16 @@ async fn list_autoflow_events(
             run_id: rec.event.run_id,
             status: rec.event.status,
             worker_name: rec.worker_name,
+            usage: crate::usage::UsageSummary::default(),
         })
         .collect();
 
-    Ok(Json(rows))
+    // Paginate, then fill usage from each event's run_id (when present).
+    let mut page_rows = crate::pagination::paginate(rows, &page);
+    for row in &mut page_rows {
+        if let Some(id) = &row.run_id {
+            row.usage = crate::usage::summarize_run(&s.run_store, id, &s.pricing);
+        }
+    }
+    Ok(Json(page_rows))
 }

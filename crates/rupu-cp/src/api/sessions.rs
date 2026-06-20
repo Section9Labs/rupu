@@ -3,7 +3,7 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -196,8 +196,10 @@ pub(crate) fn collect_sessions(
 
 async fn list_sessions(
     State(s): State<AppState>,
+    Query(page): Query<crate::pagination::PageQuery>,
 ) -> ApiResult<Json<Vec<serde_json::Value>>> {
-    Ok(Json(collect_sessions(&s.global_dir, &s.pricing)))
+    let sessions = collect_sessions(&s.global_dir, &s.pricing);
+    Ok(Json(crate::pagination::paginate(sessions, &page)))
 }
 
 async fn get_session(

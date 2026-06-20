@@ -8,10 +8,14 @@ import { api, type AgentSummary } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { cn } from '../lib/cn';
+import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+
+const STEP = 20;
 
 export default function Agents() {
   const [agents, setAgents] = useState<AgentSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [visible, setVisible] = useState(STEP);
 
   useEffect(() => {
     let cancelled = false;
@@ -20,6 +24,7 @@ export default function Agents() {
       .then((data) => {
         if (cancelled) return;
         setAgents(data);
+        setVisible(STEP);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -31,6 +36,11 @@ export default function Agents() {
   }, []);
 
   const sorted = (agents ?? []).slice().sort((a, b) => a.name.localeCompare(b.name));
+  const shown = sorted.slice(0, visible);
+  const { sentinelRef } = useInfiniteScroll({
+    hasMore: visible < sorted.length,
+    loadMore: () => setVisible((v) => v + STEP),
+  });
 
   return (
     <div className="p-8 max-w-5xl">
@@ -56,10 +66,15 @@ export default function Agents() {
         <section>
           <SectionHeader tone="muted" label="Agents" count={sorted.length} />
           <ListCard>
-            {sorted.map((a) => (
+            {shown.map((a) => (
               <AgentRow key={a.name} agent={a} />
             ))}
           </ListCard>
+          {sorted.length > visible && (
+            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+              scroll for more
+            </div>
+          )}
         </section>
       )}
     </div>

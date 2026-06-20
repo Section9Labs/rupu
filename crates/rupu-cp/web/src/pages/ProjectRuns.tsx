@@ -1,7 +1,7 @@
 // Project-scoped run list — minimal placeholder so "see all" links resolve.
 // Task 9 will deepen this into a full scoped list with filtering.
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 import { api, type RunListRow } from '../lib/api';
@@ -9,29 +9,46 @@ import { ListCard } from '../components/lists/ListCard';
 import { StatusPill } from '../components/StatusPill';
 import UsageChip from '../components/UsageChip';
 import { relativeTime } from '../lib/time';
+import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+
+const PAGE = 20;
 
 export default function ProjectRuns() {
   const { wsId } = useParams<{ wsId: string }>();
   const [runs, setRuns] = useState<RunListRow[] | null>(null);
+  const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const refresh = useCallback(async () => {
     if (!wsId) return;
-    let cancelled = false;
-    api
-      .getProjectRuns(wsId)
-      .then((data) => {
-        if (cancelled) return;
-        setRuns(data);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setError(e instanceof Error ? e.message : 'Failed to load runs');
-      });
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const pageData = await api.getProjectRuns(wsId, { limit: PAGE });
+      setRuns(pageData);
+      setHasMore(pageData.length >= PAGE);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load runs');
+    }
   }, [wsId]);
+
+  useEffect(() => {
+    void refresh();
+    return () => {};
+  }, [refresh]);
+
+  const loadMore = async () => {
+    if (!wsId) return;
+    const current = runs ?? [];
+    const next = await api.getProjectRuns(wsId, { offset: current.length, limit: PAGE });
+    if (next.length === 0) {
+      setHasMore(false);
+      return;
+    }
+    setRuns([...current, ...next]);
+    if (next.length < PAGE) setHasMore(false);
+  };
+
+  const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
 
   return (
     <div className="p-8 max-w-5xl">
@@ -82,6 +99,12 @@ export default function ProjectRuns() {
             </Link>
           ))}
         </ListCard>
+      )}
+
+      {runs !== null && runs.length > 0 && (
+        <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+          {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${runs.length} —`}
+        </div>
       )}
     </div>
   );

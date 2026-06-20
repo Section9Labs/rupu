@@ -12,6 +12,9 @@ import { ListCard } from '../../components/lists/ListCard';
 import { SectionHeader, type SectionTone } from '../../components/lists/SectionHeader';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
+import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
+
+const PAGE = 20;
 
 const ACTIVE: RunStatusStr[] = ['running', 'pending', 'awaiting_approval'];
 const TERMINAL_OK: RunStatusStr[] = ['completed'];
@@ -40,15 +43,18 @@ function TriggerChip({ trigger }: { trigger: string }) {
 
 export default function WorkflowRuns() {
   const [runs, setRuns] = useState<RunListRow[] | null>(null);
+  const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState<TriggerFilter>('all');
 
-  const load = useCallback(async () => {
+  // Page-0 fetch (mount + 5 s refresh) — resets pagination.
+  const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const data = await api.getWorkflowRuns();
+      const data = await api.getWorkflowRuns({ limit: PAGE });
       setRuns(data);
+      setHasMore(data.length >= PAGE);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load runs');
@@ -58,10 +64,20 @@ export default function WorkflowRuns() {
   }, []);
 
   useEffect(() => {
-    void load();
-    const t = window.setInterval(() => void load(), 5000);
+    void refresh();
+    const t = window.setInterval(() => void refresh(), 5000);
     return () => window.clearInterval(t);
-  }, [load]);
+  }, [refresh]);
+
+  const loadMore = async () => {
+    const current = runs ?? [];
+    const next = await api.getWorkflowRuns({ offset: current.length, limit: PAGE });
+    if (next.length === 0) { setHasMore(false); return; }
+    setRuns([...current, ...next]);
+    if (next.length < PAGE) setHasMore(false);
+  };
+
+  const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
 
   const filtered = (runs ?? []).filter((r) => filter === 'all' || r.trigger === filter);
   const active = filtered.filter((r) => ACTIVE.includes(r.status));
@@ -78,7 +94,7 @@ export default function WorkflowRuns() {
           <p className="mt-1 text-sm text-ink-dim">Workflow executions across this control plane.</p>
         </div>
         <button
-          onClick={() => void load()}
+          onClick={() => void refresh()}
           className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-border bg-panel text-ink hover:bg-slate-100"
         >
           <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
@@ -119,6 +135,11 @@ export default function WorkflowRuns() {
           <WorkflowRunSection tone="progress" label="Active"            runs={active} />
           <WorkflowRunSection tone="good"     label="Completed"         runs={done}   />
           <WorkflowRunSection tone="bad"      label="Failed / Rejected" runs={bad}    />
+          {runs.length > 0 && (
+            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${runs.length} —`}
+            </div>
+          )}
         </div>
       )}
     </div>
