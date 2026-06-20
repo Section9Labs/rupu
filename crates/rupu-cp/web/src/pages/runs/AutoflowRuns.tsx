@@ -14,6 +14,9 @@ import { SectionHeader } from '../../components/lists/SectionHeader';
 import UsageChip from '../../components/UsageChip';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
+import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
+
+const PAGE = 20;
 
 function shortId(id: string): string {
   return id.length > 10 ? `${id.slice(0, 8)}…` : id;
@@ -75,18 +78,23 @@ export default function AutoflowRuns() {
   const [tab, setTab] = useState<Tab>('runs');
   const [events, setEvents] = useState<AutoflowEventRow[] | null>(null);
   const [cycles, setCycles] = useState<AutoflowCycleRow[] | null>(null);
+  const [eventsHasMore, setEventsHasMore] = useState(true);
+  const [cyclesHasMore, setCyclesHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
-  const load = useCallback(async () => {
+  // Page-0 fetch (mount + 5 s refresh) — resets pagination for both lists.
+  const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
       const [ev, cy] = await Promise.all([
-        api.getAutoflowEvents(),
-        api.getAutoflowRuns(),
+        api.getAutoflowEvents({ limit: PAGE }),
+        api.getAutoflowRuns({ limit: PAGE }),
       ]);
       setEvents(ev);
+      setEventsHasMore(ev.length >= PAGE);
       setCycles(cy);
+      setCyclesHasMore(cy.length >= PAGE);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load autoflow activity');
@@ -96,10 +104,33 @@ export default function AutoflowRuns() {
   }, []);
 
   useEffect(() => {
-    void load();
-    const t = window.setInterval(() => void load(), 5000);
+    void refresh();
+    const t = window.setInterval(() => void refresh(), 5000);
     return () => window.clearInterval(t);
-  }, [load]);
+  }, [refresh]);
+
+  // Two independent infinite lists: the "Launched runs" events feed and the
+  // "Cycles" feed each get their own pagination state + sentinel.
+  const loadMoreEvents = async () => {
+    const current = events ?? [];
+    const next = await api.getAutoflowEvents({ offset: current.length, limit: PAGE });
+    if (next.length === 0) { setEventsHasMore(false); return; }
+    setEvents([...current, ...next]);
+    if (next.length < PAGE) setEventsHasMore(false);
+  };
+
+  const loadMoreCycles = async () => {
+    const current = cycles ?? [];
+    const next = await api.getAutoflowRuns({ offset: current.length, limit: PAGE });
+    if (next.length === 0) { setCyclesHasMore(false); return; }
+    setCycles([...current, ...next]);
+    if (next.length < PAGE) setCyclesHasMore(false);
+  };
+
+  const { sentinelRef: eventsSentinelRef, loading: eventsLoading } =
+    useInfiniteScroll({ hasMore: eventsHasMore, loadMore: loadMoreEvents });
+  const { sentinelRef: cyclesSentinelRef, loading: cyclesLoading } =
+    useInfiniteScroll({ hasMore: cyclesHasMore, loadMore: loadMoreCycles });
 
   const sortedEvents = [...(events ?? [])].sort(
     (a, b) => Date.parse(b.at) - Date.parse(a.at),
@@ -116,7 +147,7 @@ export default function AutoflowRuns() {
           <p className="mt-1 text-sm text-ink-dim">Runs launched by the autoflow worker across this control plane.</p>
         </div>
         <button
-          onClick={() => void load()}
+          onClick={() => void refresh()}
           className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-border bg-panel text-ink hover:bg-slate-100"
         >
           <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
@@ -164,6 +195,11 @@ export default function AutoflowRuns() {
                 <AutoflowEventItem key={e.event_id} event={e} />
               ))}
             </ListCard>
+            {sortedEvents.length > 0 && (
+              <div ref={eventsSentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+                {eventsLoading ? 'loading more…' : eventsHasMore ? 'scroll for more' : `— end of ${sortedEvents.length} —`}
+              </div>
+            )}
           </section>
         )
       ) : cycles === null ? (
@@ -178,6 +214,11 @@ export default function AutoflowRuns() {
               <AutoflowCycleItem key={c.cycle_id} cycle={c} />
             ))}
           </ListCard>
+          {sortedCycles.length > 0 && (
+            <div ref={cyclesSentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+              {cyclesLoading ? 'loading more…' : cyclesHasMore ? 'scroll for more' : `— end of ${sortedCycles.length} —`}
+            </div>
+          )}
         </section>
       )}
     </div>
