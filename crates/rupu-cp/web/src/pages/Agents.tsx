@@ -2,11 +2,13 @@
 // plane. Each row links to /agents/:name for the full system prompt.
 
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { Sparkles } from 'lucide-react';
 import { api, type AgentSummary } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
+import MetricRow from '../components/lists/MetricRow';
+import UsageBarChart from '../components/charts/UsageBarChart';
+import { formatTokens, formatCost } from '../lib/usage';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
@@ -64,6 +66,19 @@ export default function Agents() {
         <EmptyState />
       ) : (
         <section>
+          <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
+            <UsageBarChart
+              bars={sorted.map((a) => ({
+                id: a.name,
+                label: a.name,
+                input_tokens: a.usage?.input_tokens ?? 0,
+                output_tokens: a.usage?.output_tokens ?? 0,
+                cached_tokens: a.usage?.cached_tokens ?? 0,
+                cost_usd: a.usage?.cost_usd ?? null,
+                to: `/agents/${encodeURIComponent(a.name)}`,
+              }))}
+            />
+          </div>
           <SectionHeader tone="muted" label="Agents" count={sorted.length} />
           <ListCard>
             {shown.map((a) => (
@@ -81,26 +96,31 @@ export default function Agents() {
   );
 }
 
-function AgentRow({ agent }: { agent: AgentSummary }) {
+function AgentRow({ agent: a }: { agent: AgentSummary }) {
   return (
-    <Link
-      to={`/agents/${encodeURIComponent(agent.name)}`}
-      className="flex items-start gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
-    >
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-medium text-ink truncate">{agent.name}</span>
-          {agent.provider && <MetaChip>{agent.provider}</MetaChip>}
-          {agent.model && <MetaChip>{agent.model}</MetaChip>}
-          {agent.effort && <MetaChip>effort: {agent.effort}</MetaChip>}
+    <MetricRow
+      to={`/agents/${encodeURIComponent(a.name)}`}
+      header={
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium text-ink truncate">{a.name}</span>
+            {a.provider && <MetaChip>{a.provider}</MetaChip>}
+            {a.model && <MetaChip>{a.model}</MetaChip>}
+            {a.effort && <MetaChip>effort: {a.effort}</MetaChip>}
+          </div>
+          {a.description && (
+            <p className="mt-1 text-[12px] text-ink-dim leading-snug line-clamp-2">
+              {a.description}
+            </p>
+          )}
         </div>
-        {agent.description && (
-          <p className="mt-1 text-[12px] text-ink-dim leading-snug line-clamp-2">
-            {agent.description}
-          </p>
-        )}
-      </div>
-    </Link>
+      }
+      metrics={[
+        { label: 'runs', value: a.run_count ? String(a.run_count) : null },
+        { label: 'tokens', value: a.usage ? formatTokens(a.usage.total_tokens) : null },
+        { label: 'cost', value: a.usage ? formatCost(a.usage.cost_usd) : null },
+      ]}
+    />
   );
 }
 

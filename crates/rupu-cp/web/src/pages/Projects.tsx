@@ -2,10 +2,12 @@
 // Each row is a project card that links to /projects/:wsId for the overview.
 
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { FolderGit2, GitBranch, GitFork } from 'lucide-react';
 import { api, type ProjectRow } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
+import MetricRow from '../components/lists/MetricRow';
+import UsageBarChart from '../components/charts/UsageBarChart';
+import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
@@ -65,6 +67,19 @@ export default function Projects() {
 
       {projects !== null && projects.length > 0 && (
         <>
+          <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
+            <UsageBarChart
+              bars={all.map((p) => ({
+                id: p.ws_id,
+                label: p.name,
+                input_tokens: p.usage?.input_tokens ?? 0,
+                output_tokens: p.usage?.output_tokens ?? 0,
+                cached_tokens: p.usage?.cached_tokens ?? 0,
+                cost_usd: p.usage?.cost_usd ?? null,
+                to: `/projects/${encodeURIComponent(p.ws_id)}`,
+              }))}
+            />
+          </div>
           <ListCard>
             {shown.map((p) => (
               <ProjectRow key={p.ws_id} project={p} />
@@ -82,42 +97,39 @@ export default function Projects() {
 }
 
 function ProjectRow({ project: p }: { project: ProjectRow }) {
+  const lastActive = p.last_active ?? p.last_run_at;
   return (
-    <Link
+    <MetricRow
       to={`/projects/${encodeURIComponent(p.ws_id)}`}
-      className="flex items-start gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
-    >
-      <div className="min-w-0 flex-1">
-        {/* Name + path */}
-        <div className="flex items-center gap-2 flex-wrap">
+      header={
+        <>
           <span className="text-sm font-semibold text-ink">{p.name}</span>
           <span className="text-[11px] text-ink-mute font-mono truncate max-w-xs">{p.path}</span>
-        </div>
-
-        {/* Repo chips */}
-        {(p.repo_remote || p.branch) && (
-          <div className="mt-1 flex items-center gap-2 flex-wrap">
-            {p.repo_remote && (
-              <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
-                <GitFork size={10} />
-                {p.repo_remote}
-              </span>
-            )}
-            {p.branch && (
-              <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
-                <GitBranch size={10} />
-                {p.branch}
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Last run time */}
-      <div className="shrink-0 text-[11px] text-ink-mute tabular-nums pt-0.5">
-        {p.last_run_at ? relativeTime(p.last_run_at) : 'no runs'}
-      </div>
-    </Link>
+          {p.repo_remote && (
+            <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
+              <GitFork size={10} />
+              {p.repo_remote}
+            </span>
+          )}
+          {p.branch && (
+            <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
+              <GitBranch size={10} />
+              {p.branch}
+            </span>
+          )}
+        </>
+      }
+      trailing={
+        <span className="shrink-0 text-[11px] text-ink-mute tabular-nums">
+          {lastActive ? relativeTime(lastActive) : 'no runs'}
+        </span>
+      }
+      metrics={[
+        { label: 'runs', value: p.run_count ? String(p.run_count) : null },
+        { label: 'tokens', value: p.usage ? formatTokens(p.usage.total_tokens) : null },
+        { label: 'cost', value: p.usage ? formatCost(p.usage.cost_usd) : null },
+      ]}
+    />
   );
 }
 

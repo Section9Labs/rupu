@@ -20,6 +20,9 @@ pub fn routes() -> Router<AppState> {
 pub(crate) struct WorkflowDto {
     pub(crate) name: String,
     pub(crate) scope: String,
+    pub(crate) usage: crate::usage::UsageSummary,
+    pub(crate) run_count: u64,
+    pub(crate) last_run: Option<String>,
 }
 
 /// Scan `<dir>/*.yaml` and return one [`WorkflowDto`] per file stem, tagged
@@ -52,13 +55,26 @@ pub(crate) fn scan_workflow_names(dir: &std::path::Path, scope: &'static str) ->
         .map(|name| WorkflowDto {
             name,
             scope: scope.to_string(),
+            usage: crate::usage::UsageSummary::default(),
+            run_count: 0,
+            last_run: None,
         })
         .collect()
 }
 
 async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<WorkflowDto>>> {
-    let dir = s.global_dir.join("workflows");
-    Ok(Json(scan_workflow_names(&dir, "global")))
+    let mut rows = scan_workflow_names(&s.global_dir.join("workflows"), "global");
+    let runs = s.run_store.list().unwrap_or_default();
+    let rollups =
+        crate::usage::rollup_by(&s.run_store, &runs, &s.pricing, |r| Some(r.workflow_name.clone()));
+    for row in &mut rows {
+        if let Some(roll) = rollups.get(&row.name) {
+            row.usage = roll.usage.clone();
+            row.run_count = roll.run_count;
+            row.last_run = roll.last_active.clone();
+        }
+    }
+    Ok(Json(rows))
 }
 
 async fn get_workflow(
