@@ -326,6 +326,7 @@ export interface AutoflowCycleRow {
   skipped_cycles: number;
   failed_cycles: number;
   run_ids: string[];
+  usage: UsageSummary;
 }
 
 /**
@@ -344,6 +345,7 @@ export interface AutoflowEventRow {
   run_id?: string | null;
   status?: string | null;
   worker_name?: string | null;
+  usage: UsageSummary;
 }
 
 export interface AgentRunRow {
@@ -355,6 +357,7 @@ export interface AgentRunRow {
   status?: string | null;
   started_at?: string | null;
   transcript_path?: string | null;
+  usage: UsageSummary;
 }
 
 export interface AutoflowDefRow {
@@ -378,6 +381,7 @@ export interface DashboardResponse {
     status: RunStatusStr;
     started_at: string;
     finished_at?: string | null;
+    usage: UsageSummary;
   }>;
   sessions: { total: number; active: number; archived: number };
   workers: { total: number };
@@ -626,6 +630,23 @@ export interface ProjectCoverageRow {
 }
 
 // ---------------------------------------------------------------------------
+// List pagination
+// ---------------------------------------------------------------------------
+
+export interface ListParams {
+  offset?: number;
+  limit?: number;
+}
+
+function listQuery(params?: ListParams): string {
+  const q = new URLSearchParams();
+  if (params?.offset != null) q.set('offset', String(params.offset));
+  if (params?.limit != null) q.set('limit', String(params.limit));
+  const qs = q.toString();
+  return qs ? `?${qs}` : '';
+}
+
+// ---------------------------------------------------------------------------
 // API object
 // ---------------------------------------------------------------------------
 
@@ -646,8 +667,8 @@ export const api = {
   },
 
   // --- Runs ---
-  getRuns(): Promise<RunListRow[]> {
-    return request<RunListRow[]>('/api/runs');
+  getRuns(params?: ListParams): Promise<RunListRow[]> {
+    return request<RunListRow[]>(`/api/runs${listQuery(params)}`);
   },
   getRun(id: string): Promise<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }> {
     return request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
@@ -657,17 +678,17 @@ export const api = {
   getRunGraph(id: string): Promise<RunGraphResponse> {
     return request<RunGraphResponse>(`/api/runs/${encodeURIComponent(id)}/graph`);
   },
-  getWorkflowRuns(): Promise<RunListRow[]> {
-    return request<RunListRow[]>('/api/runs/workflows');
+  getWorkflowRuns(params?: ListParams): Promise<RunListRow[]> {
+    return request<RunListRow[]>(`/api/runs/workflows${listQuery(params)}`);
   },
-  getAutoflowRuns(): Promise<AutoflowCycleRow[]> {
-    return request<AutoflowCycleRow[]>('/api/runs/autoflows');
+  getAutoflowRuns(params?: ListParams): Promise<AutoflowCycleRow[]> {
+    return request<AutoflowCycleRow[]>(`/api/runs/autoflows${listQuery(params)}`);
   },
-  getAutoflowEvents(): Promise<AutoflowEventRow[]> {
-    return request<AutoflowEventRow[]>('/api/runs/autoflows/events');
+  getAutoflowEvents(params?: ListParams): Promise<AutoflowEventRow[]> {
+    return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${listQuery(params)}`);
   },
-  getAgentRuns(): Promise<AgentRunRow[]> {
-    return request<AgentRunRow[]>('/api/runs/agents');
+  getAgentRuns(params?: ListParams): Promise<AgentRunRow[]> {
+    return request<AgentRunRow[]>(`/api/runs/agents${listQuery(params)}`);
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
@@ -690,8 +711,8 @@ export const api = {
   },
 
   // --- Sessions ---
-  getSessions(): Promise<SessionSummary[]> {
-    return request<SessionSummary[]>('/api/sessions');
+  getSessions(params?: ListParams): Promise<SessionSummary[]> {
+    return request<SessionSummary[]>(`/api/sessions${listQuery(params)}`);
   },
   getSession(id: string): Promise<SessionSummary> {
     return request<SessionSummary>(`/api/sessions/${encodeURIComponent(id)}`);
@@ -756,11 +777,11 @@ export const api = {
   getProject(wsId: string): Promise<ProjectDetail> {
     return request<ProjectDetail>(`/api/projects/${encodeURIComponent(wsId)}`);
   },
-  getProjectRuns(wsId: string): Promise<RunListRow[]> {
-    return request<RunListRow[]>(`/api/projects/${encodeURIComponent(wsId)}/runs`);
+  getProjectRuns(wsId: string, params?: ListParams): Promise<RunListRow[]> {
+    return request<RunListRow[]>(`/api/projects/${encodeURIComponent(wsId)}/runs${listQuery(params)}`);
   },
-  getProjectSessions(wsId: string): Promise<SessionSummary[]> {
-    return request<SessionSummary[]>(`/api/projects/${encodeURIComponent(wsId)}/sessions`);
+  getProjectSessions(wsId: string, params?: ListParams): Promise<SessionSummary[]> {
+    return request<SessionSummary[]>(`/api/projects/${encodeURIComponent(wsId)}/sessions${listQuery(params)}`);
   },
   getProjectCoverage(wsId: string): Promise<ProjectCoverageRow[]> {
     return request<ProjectCoverageRow[]>(`/api/projects/${encodeURIComponent(wsId)}/coverage`);
