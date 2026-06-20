@@ -409,6 +409,8 @@ export interface AgentSummary {
    * returns `"global"`.
    */
   scope?: string;
+  usage: UsageSummary;
+  run_count: number;
 }
 
 export interface AgentDetail extends AgentSummary {
@@ -422,6 +424,9 @@ export interface AgentDetail extends AgentSummary {
 export interface WorkflowSummary {
   name: string;
   scope: string;
+  usage: UsageSummary;
+  run_count: number;
+  last_run?: string | null;
 }
 
 export interface WorkflowDetail {
@@ -603,6 +608,9 @@ export interface ProjectRow {
   branch?: string | null;
   created_at: string;
   last_run_at?: string | null;
+  usage: UsageSummary;
+  run_count: number;
+  last_active?: string | null;
 }
 
 export interface ProjectDetail {
