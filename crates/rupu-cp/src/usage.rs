@@ -159,6 +159,47 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
     out
 }
 
+/// Per-entity rollup: summed usage + run count + most-recent activity.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EntityRollup {
+    pub usage: UsageSummary,
+    pub run_count: u64,
+    /// Most-recent contributing run timestamp (ISO-8601), if any.
+    pub last_active: Option<String>,
+}
+
+impl EntityRollup {
+    /// Fold one run's usage + timestamp into the rollup.
+    pub fn add(&mut self, usage: &UsageSummary, at: Option<String>) {
+        self.usage = rollup([self.usage.clone(), usage.clone()].into_iter());
+        self.run_count += 1;
+        if let Some(at) = at {
+            match &self.last_active {
+                Some(cur) if *cur >= at => {}
+                _ => self.last_active = Some(at),
+            }
+        }
+    }
+}
+
+/// Group every run's usage by a caller-chosen key, computing per-key rollups
+/// in a single pass over the store. `key_of` returns `None` to skip a run.
+pub fn rollup_by(
+    store: &RunStore,
+    runs: &[rupu_orchestrator::RunRecord],
+    pricing: &PricingConfig,
+    key_of: impl Fn(&rupu_orchestrator::RunRecord) -> Option<String>,
+) -> BTreeMap<String, EntityRollup> {
+    let mut out: BTreeMap<String, EntityRollup> = BTreeMap::new();
+    for run in runs {
+        let Some(key) = key_of(run) else { continue };
+        let usage = summarize_run(store, &run.id, pricing);
+        let at = Some(run.started_at.to_rfc3339());
+        out.entry(key).or_default().add(&usage, at);
+    }
+    out
+}
+
 /// Dimension for the overview breakdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupBy {
@@ -401,6 +442,18 @@ mod tests {
         assert_eq!(m.usage.input_tokens, 1800);
         assert_eq!(m.usage.output_tokens, 350);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entity_rollup_folds_usage_and_counts() {
+        let mut r = EntityRollup::default();
+        r.add(&UsageSummary { input_tokens: 10, output_tokens: 5, cached_tokens: 0, total_tokens: 15, cost_usd: Some(1.0), priced: true, runs: 1 }, Some("2026-01-02T00:00:00Z".into()));
+        r.add(&UsageSummary { input_tokens: 20, output_tokens: 0, cached_tokens: 0, total_tokens: 20, cost_usd: Some(2.0), priced: true, runs: 1 }, Some("2026-01-01T00:00:00Z".into()));
+        assert_eq!(r.run_count, 2);
+        assert_eq!(r.usage.input_tokens, 30);
+        assert_eq!(r.usage.total_tokens, 35);
+        assert!((r.usage.cost_usd.unwrap() - 3.0).abs() < 1e-9);
+        assert_eq!(r.last_active.as_deref(), Some("2026-01-02T00:00:00Z"));
     }
 
     #[test]
