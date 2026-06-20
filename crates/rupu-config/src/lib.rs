@@ -13,6 +13,8 @@ pub mod config;
 // that the lib re-export shape is stable from skeleton onward.
 pub mod layer;
 
+pub mod pricing;
+
 pub mod pricing_config;
 
 pub mod provider_config;
