@@ -2,11 +2,14 @@
 // control plane. Each row links to /workflows/:name for the steps + raw YAML.
 
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { Workflow as WorkflowIcon } from 'lucide-react';
 import { api, type WorkflowSummary } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
+import MetricRow from '../components/lists/MetricRow';
+import UsageBarChart from '../components/charts/UsageBarChart';
+import { formatTokens, formatCost } from '../lib/usage';
+import { relativeTime } from '../lib/time';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
@@ -64,6 +67,19 @@ export default function Workflows() {
         <EmptyState />
       ) : (
         <section>
+          <div className="mb-4 rounded-xl border border-border bg-panel/50 p-4">
+            <UsageBarChart
+              bars={sorted.map((w) => ({
+                id: `${w.scope}:${w.name}`,
+                label: w.name,
+                input_tokens: w.usage?.input_tokens ?? 0,
+                output_tokens: w.usage?.output_tokens ?? 0,
+                cached_tokens: w.usage?.cached_tokens ?? 0,
+                cost_usd: w.usage?.cost_usd ?? null,
+                to: `/workflows/${encodeURIComponent(w.name)}`,
+              }))}
+            />
+          </div>
           <SectionHeader tone="muted" label="Workflows" count={sorted.length} />
           <ListCard>
             {shown.map((w) => (
@@ -81,17 +97,29 @@ export default function Workflows() {
   );
 }
 
-function WorkflowRow({ workflow }: { workflow: WorkflowSummary }) {
+function WorkflowRow({ workflow: w }: { workflow: WorkflowSummary }) {
   return (
-    <Link
-      to={`/workflows/${encodeURIComponent(workflow.name)}`}
-      className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
-    >
-      <div className="min-w-0 flex-1">
-        <span className="text-sm font-medium text-ink truncate">{workflow.name}</span>
-      </div>
-      <ScopeChip scope={workflow.scope} />
-    </Link>
+    <MetricRow
+      to={`/workflows/${encodeURIComponent(w.name)}`}
+      header={
+        <>
+          <span className="text-sm font-medium text-ink truncate">{w.name}</span>
+          <ScopeChip scope={w.scope} />
+        </>
+      }
+      trailing={
+        w.last_run ? (
+          <span className="shrink-0 text-[11px] text-ink-mute tabular-nums">
+            {relativeTime(w.last_run)}
+          </span>
+        ) : undefined
+      }
+      metrics={[
+        { label: 'runs', value: w.run_count ? String(w.run_count) : null },
+        { label: 'tokens', value: w.usage ? formatTokens(w.usage.total_tokens) : null },
+        { label: 'cost', value: w.usage ? formatCost(w.usage.cost_usd) : null },
+      ]}
+    />
   );
 }
 
