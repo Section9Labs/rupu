@@ -1,8 +1,9 @@
-// Dashboard — stat tiles + run-status donut chart + recent runs list.
+// Dashboard — stat tiles + run-status donut chart + usage panel + recent runs.
 //
 // Data source: GET /api/dashboard  (DashboardResponse — point-in-time counts
-// + last-N recent_runs array). NO time-series or token/cost data is available
-// from the backend; this page shows only what the API truthfully exposes.
+// + last-N recent_runs array). The Usage panel additionally sources
+// GET /api/usage (token + cost rollup over the last 30 days); it hides itself
+// if that endpoint errs.
 //
 // Polls every 15 s; clears the interval on unmount.
 
@@ -10,17 +11,22 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Activity, MessageSquare, RefreshCw, Server, ShieldCheck } from 'lucide-react';
 import {
+  Bar,
+  BarChart,
   Cell,
   Pie,
   PieChart,
   ResponsiveContainer,
   Tooltip,
+  XAxis,
+  YAxis,
 } from 'recharts';
 import { api, type DashboardResponse, type RunStatusStr } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
 import { ListCard } from '../components/lists/ListCard';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
+import { formatCost, formatTokens, type UsageOverview } from '../lib/usage';
 
 // ---------------------------------------------------------------------------
 // Status color map — JS color strings for recharts SVG fills.
@@ -194,6 +200,60 @@ function RecentRunRow({
 }
 
 // ---------------------------------------------------------------------------
+// Usage panel — total spend + tokens + top-models-by-cost bar
+// ---------------------------------------------------------------------------
+
+// Top-models-by-cost bar + total-spend summary for the usage panel.
+function UsagePanel({ overview }: { overview: UsageOverview }) {
+  const { summary, breakdown } = overview;
+  // Top 6 priced models by cost for the bar; ignore unpriced rows in the chart.
+  const bars = breakdown
+    .filter((r) => r.cost_usd !== null)
+    .slice(0, 6)
+    .map((r) => ({ name: r.model || r.provider || r.agent || '—', cost: r.cost_usd ?? 0 }));
+
+  return (
+    <div className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
+      <div className="flex items-baseline gap-4 mb-3">
+        <div>
+          <p className="text-xs text-ink-dim font-medium uppercase tracking-wide">Spend (30d)</p>
+          <p className="mt-1 text-2xl font-semibold text-ink tabular-nums">
+            {formatCost(summary.cost_usd)}{summary.cost_usd !== null && !summary.priced ? '*' : ''}
+          </p>
+        </div>
+        <div>
+          <p className="text-xs text-ink-dim font-medium uppercase tracking-wide">Tokens</p>
+          <p className="mt-1 text-2xl font-semibold text-ink tabular-nums">
+            {formatTokens(summary.total_tokens)}
+          </p>
+        </div>
+      </div>
+      {bars.length === 0 ? (
+        <p className="text-xs text-ink-mute py-6 text-center">No priced usage in the last 30 days</p>
+      ) : (
+        <div style={{ width: '100%', height: 28 * bars.length + 8 }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={bars} layout="vertical" margin={{ left: 8, right: 16, top: 0, bottom: 0 }}>
+              <XAxis type="number" hide />
+              <YAxis type="category" dataKey="name" width={120} tick={{ fontSize: 11, fill: '#64748b' }} />
+              <Tooltip
+                contentStyle={tooltipStyle}
+                formatter={(value) => [formatCost(typeof value === 'number' ? value : 0), 'cost']}
+              />
+              <Bar dataKey="cost" radius={[0, 4, 4, 0]}>
+                {bars.map((b) => (
+                  <Cell key={b.name} fill="#6366f1" />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -201,6 +261,7 @@ const POLL_MS = 15_000;
 
 export default function Dashboard() {
   const [data, setData] = useState<DashboardResponse | null>(null);
+  const [usage, setUsage] = useState<UsageOverview | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -214,6 +275,8 @@ export default function Dashboard() {
     try {
       const d = await api.getDashboard();
       setData(d);
+      const u = await api.getUsage({ groupBy: 'model' }).catch(() => null);
+      setUsage(u);
       setError(null);
       const now = new Date();
       setLastUpdated(now);
@@ -331,6 +394,14 @@ export default function Dashboard() {
               />
             </div>
           </section>
+
+          {/* ── Usage (tokens + cost) ── */}
+          {usage && (
+            <section>
+              <h2 className="text-sm font-semibold text-ink-dim mb-3">Usage — last 30 days</h2>
+              <UsagePanel overview={usage} />
+            </section>
+          )}
 
           {/* ── Recent runs ── */}
           <section>
