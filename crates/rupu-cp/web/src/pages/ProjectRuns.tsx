@@ -7,6 +7,7 @@ import { ArrowLeft } from 'lucide-react';
 import { api, type RunListRow } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { StatusPill } from '../components/StatusPill';
+import UsageChip from '../components/UsageChip';
 import { relativeTime } from '../lib/time';
 
 export default function ProjectRuns() {
@@ -72,7 +73,10 @@ export default function ProjectRuns() {
             >
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium text-ink truncate">{r.workflow_name}</p>
-                <p className="text-[11px] text-ink-dim mt-0.5">{relativeTime(r.started_at)}</p>
+                <p className="text-[11px] text-ink-dim mt-0.5">
+                  {relativeTime(r.started_at)}
+                  <UsageChip usage={r.usage} className="ml-2" />
+                </p>
               </div>
               <StatusPill status={r.status} />
             </Link>

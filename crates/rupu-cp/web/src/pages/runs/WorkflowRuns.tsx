@@ -7,6 +7,7 @@ import { Link } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type RunListRow, type RunStatusStr } from '../../lib/api';
 import { StatusPill } from '../../components/StatusPill';
+import UsageChip from '../../components/UsageChip';
 import { ListCard } from '../../components/lists/ListCard';
 import { SectionHeader, type SectionTone } from '../../components/lists/SectionHeader';
 import { cn } from '../../lib/cn';
@@ -162,6 +163,7 @@ function WorkflowRunRow({ run }: { run: RunListRow }) {
           started {relativeTime(run.started_at)}
           {' · '}
           {durationBetween(run.started_at, run.finished_at)}
+          <UsageChip usage={run.usage} className="ml-2" />
         </div>
       </div>
       <StatusPill status={run.status} />
