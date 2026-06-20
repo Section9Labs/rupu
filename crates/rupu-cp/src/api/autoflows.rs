@@ -9,35 +9,30 @@ pub fn routes() -> Router<AppState> {
 
 /// Slim DTO for a single autoflow-enabled workflow definition.
 #[derive(Serialize)]
-struct AutoflowDefRow {
-    name: String,
+pub(crate) struct AutoflowDefRow {
+    pub(crate) name: String,
     /// `TriggerKind` as a lowercase string: `"manual"`, `"cron"`, or `"event"`.
-    trigger: String,
-    /// Phase-1: always `"global"` (project-local workflows are out of scope).
-    scope: &'static str,
+    pub(crate) trigger: String,
+    /// `"global"` or `"project"` depending on the layer the file came from.
+    pub(crate) scope: &'static str,
 }
 
-/// `GET /api/autoflows`
-///
-/// Scans `<global>/workflows/*.yaml`, parses each with [`Workflow::parse`],
-/// keeps only those where `autoflow.enabled == true` (matching the CLI's
-/// `autoflow list` predicate), and returns them sorted by name.
-///
-/// A missing workflows directory → `[]` (not an error).
-/// An unparseable YAML file is skipped with a `tracing::warn!`.
-async fn list_autoflow_defs(
-    State(s): State<AppState>,
-) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
-    let dir = s.global_dir.join("workflows");
+/// Scan `<dir>/*.{yaml,yml}`, parse each, and keep only those whose
+/// `autoflow.enabled == true` (matching the CLI's `autoflow list` predicate).
+/// Each kept row is tagged with `scope`. A missing/unreadable dir → empty vec
+/// (tolerated). Unparseable files are skipped with a `tracing::warn!`.
+pub(crate) fn scan_autoflow_defs(
+    dir: &std::path::Path,
+    scope: &'static str,
+) -> Vec<AutoflowDefRow> {
     if !dir.is_dir() {
-        return Ok(Json(vec![]));
+        return vec![];
     }
-
-    let entries = match std::fs::read_dir(&dir) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(err) => {
             tracing::warn!("autoflows: could not read workflows dir: {err}");
-            return Ok(Json(vec![]));
+            return vec![];
         }
     };
 
@@ -85,11 +80,24 @@ async fn list_autoflow_defs(
             Some(AutoflowDefRow {
                 name: workflow.name,
                 trigger,
-                scope: "global",
+                scope,
             })
         })
         .collect();
 
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(Json(rows))
+    rows
+}
+
+/// `GET /api/autoflows`
+///
+/// Scans `<global>/workflows/*.yaml`, parses each with [`Workflow::parse`],
+/// keeps only those where `autoflow.enabled == true` (matching the CLI's
+/// `autoflow list` predicate), and returns them sorted by name.
+///
+/// A missing workflows directory → `[]` (not an error).
+/// An unparseable YAML file is skipped with a `tracing::warn!`.
+async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
+    let dir = s.global_dir.join("workflows");
+    Ok(Json(scan_autoflow_defs(&dir, "global")))
 }

@@ -7,6 +7,7 @@ import {
   Activity,
   GitBranch,
   GitFork,
+  Library,
   MessageSquare,
   ShieldAlert,
   ShieldCheck,
@@ -333,6 +334,24 @@ export default function ProjectDetail() {
           </div>
         </section>
       </div>
+
+      {/* ── Definitions ── */}
+      <section>
+        <SectionTitle title="Definitions" href={`/projects/${encodedId}/definitions`} />
+        <Link
+          to={`/projects/${encodedId}/definitions`}
+          className="block bg-panel border border-border rounded-xl shadow-card px-4 py-3 hover:bg-slate-50 transition-colors"
+        >
+          <div className="flex items-center gap-2.5 text-[12px] text-ink-dim">
+            <Library size={14} className="text-ink-mute" />
+            <span>
+              Agents, workflows &amp; autoflows visible to this project
+              <span className="text-ink-mute"> — global + project-local </span>
+              <span className="font-mono">.rupu/</span>
+            </span>
+          </div>
+        </Link>
+      </section>
     </div>
   );
 }

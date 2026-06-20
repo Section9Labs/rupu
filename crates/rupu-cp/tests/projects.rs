@@ -5,8 +5,7 @@ use rupu_orchestrator::runs::{RunRecord, RunStatus, RunStore};
 use std::collections::BTreeMap;
 
 async fn spawn_server(dir: &Path) -> std::net::SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -16,26 +15,26 @@ async fn spawn_server(dir: &Path) -> std::net::SocketAddr {
     addr
 }
 
-fn seed_workspace_toml(dir: &Path, id: &str, path: &str, created_at: &str, last_run_at: Option<&str>) {
+fn seed_workspace_toml(
+    dir: &Path,
+    id: &str,
+    path: &str,
+    created_at: &str,
+    last_run_at: Option<&str>,
+) {
     std::fs::create_dir_all(dir).unwrap();
     let last_run_line = match last_run_at {
         Some(ts) => format!("\nlast_run_at = \"{ts}\""),
         None => String::new(),
     };
-    let toml = format!(
-        "id = \"{id}\"\npath = \"{path}\"\ncreated_at = \"{created_at}\"{last_run_line}\n"
-    );
+    let toml =
+        format!("id = \"{id}\"\npath = \"{path}\"\ncreated_at = \"{created_at}\"{last_run_line}\n");
     std::fs::write(dir.join(format!("{id}.toml")), toml).unwrap();
 }
 
 /// Build a RunRecord scoped to `ws_id` with the given id + status, rooted at
 /// `proj_path` (the project dir the coverage data lives under).
-fn seed_scoped_run(
-    id: &str,
-    ws_id: &str,
-    proj_path: &Path,
-    status: RunStatus,
-) -> RunRecord {
+fn seed_scoped_run(id: &str, ws_id: &str, proj_path: &Path, status: RunStatus) -> RunRecord {
     RunRecord {
         id: id.into(),
         workflow_name: "test-workflow".into(),
@@ -264,10 +263,7 @@ async fn list_projects_returns_seeded_workspace() {
         "name should be the path basename"
     );
     assert_eq!(entry["path"].as_str(), Some("/tmp/proj"));
-    assert_eq!(
-        entry["created_at"].as_str(),
-        Some("2026-06-19T00:00:00Z")
-    );
+    assert_eq!(entry["created_at"].as_str(), Some("2026-06-19T00:00:00Z"));
 }
 
 /// The workspace with a `last_run_at` should sort before the one without.
@@ -318,6 +314,58 @@ async fn list_projects_sorts_by_last_run_at_descending() {
         "workspace without last_run_at should sort last; got {:?}",
         arr[1]["ws_id"]
     );
+}
+
+/// Write a minimal valid agent `.md` (frontmatter + body) at `dir/<name>.md`.
+fn seed_agent_md(dir: &Path, name: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let body = format!(
+        "---\nname: {name}\ndescription: agent {name}\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\n\nYou are {name}.\n"
+    );
+    std::fs::write(dir.join(format!("{name}.md")), body).unwrap();
+}
+
+/// GET /api/projects/:ws_id/agents merges global + project-local agents,
+/// tagging each with the layer it came from.
+#[tokio::test]
+async fn get_project_agents_merges_global_and_project_scoped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    seed_workspace_toml(
+        &tmp.path().join("workspaces"),
+        "ws_test",
+        proj.to_str().unwrap(),
+        "2026-06-19T00:00:00Z",
+        None,
+    );
+
+    // A global agent under <global>/agents and a project-local one under
+    // <proj>/.rupu/agents.
+    seed_agent_md(&tmp.path().join("agents"), "glob");
+    seed_agent_md(&proj.join(".rupu").join("agents"), "local");
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/projects/ws_test/agents"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let arr = body.as_array().expect("body should be a JSON array");
+
+    let glob = arr
+        .iter()
+        .find(|a| a["name"].as_str() == Some("glob"))
+        .expect("global agent should be present");
+    assert_eq!(glob["scope"].as_str(), Some("global"));
+
+    let local = arr
+        .iter()
+        .find(|a| a["name"].as_str() == Some("local"))
+        .expect("project-local agent should be present");
+    assert_eq!(local["scope"].as_str(), Some("project"));
 }
 
 /// When the workspaces directory doesn't exist the endpoint returns an empty array.

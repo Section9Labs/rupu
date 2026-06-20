@@ -23,6 +23,7 @@ import ProjectDetail from './pages/ProjectDetail';
 import ProjectRuns from './pages/ProjectRuns';
 import ProjectSessions from './pages/ProjectSessions';
 import ProjectCoverage from './pages/ProjectCoverage';
+import ProjectDefinitions from './pages/ProjectDefinitions';
 import RunTranscript from './pages/RunTranscript';
 
 export default function App() {
@@ -63,6 +64,7 @@ export default function App() {
             <Route path="/projects/:wsId/runs" element={<ProjectRuns />} />
             <Route path="/projects/:wsId/sessions" element={<ProjectSessions />} />
             <Route path="/projects/:wsId/coverage" element={<ProjectCoverage />} />
+            <Route path="/projects/:wsId/definitions" element={<ProjectDefinitions />} />
             <Route path="/projects/:wsId" element={<ProjectDetail />} />
           </Route>
         </Routes>

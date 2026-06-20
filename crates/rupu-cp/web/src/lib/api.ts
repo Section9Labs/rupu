@@ -391,6 +391,12 @@ export interface AgentSummary {
   model?: string | null;
   effort?: string | null;
   max_tokens?: number | null;
+  /**
+   * `"project"` | `"global"` — only populated by the per-project endpoint
+   * (`/api/projects/:wsId/agents`); the global `/api/agents` list always
+   * returns `"global"`.
+   */
+  scope?: string;
 }
 
 export interface AgentDetail extends AgentSummary {
@@ -730,6 +736,15 @@ export const api = {
   },
   getProjectCoverage(wsId: string): Promise<ProjectCoverageRow[]> {
     return request<ProjectCoverageRow[]>(`/api/projects/${encodeURIComponent(wsId)}/coverage`);
+  },
+  getProjectAgents(wsId: string): Promise<AgentSummary[]> {
+    return request<AgentSummary[]>(`/api/projects/${encodeURIComponent(wsId)}/agents`);
+  },
+  getProjectWorkflows(wsId: string): Promise<WorkflowSummary[]> {
+    return request<WorkflowSummary[]>(`/api/projects/${encodeURIComponent(wsId)}/workflows`);
+  },
+  getProjectAutoflows(wsId: string): Promise<AutoflowDefRow[]> {
+    return request<AutoflowDefRow[]>(`/api/projects/${encodeURIComponent(wsId)}/autoflows`);
   },
 
   // --- Transcripts ---
