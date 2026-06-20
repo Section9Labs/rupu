@@ -10,10 +10,14 @@ import { api, type CoverageSummary } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { cn } from '../lib/cn';
+import { useInfiniteScroll } from '../lib/useInfiniteScroll';
+
+const STEP = 20;
 
 export default function Coverage() {
   const [targets, setTargets] = useState<CoverageSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [visible, setVisible] = useState(STEP);
 
   useEffect(() => {
     let cancelled = false;
@@ -22,6 +26,7 @@ export default function Coverage() {
       .then((data) => {
         if (cancelled) return;
         setTargets(data);
+        setVisible(STEP);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -41,6 +46,24 @@ export default function Coverage() {
   // Group targets by their owning project. Within a group, sort by findings ↓
   // then activity ↓. Groups are ordered by project name asc.
   const groups = groupByProject(all);
+
+  // Window the FLAT sequence of target rows (across all groups) to `visible`,
+  // so the cap applies to the total number of rendered rows. Each group keeps
+  // only the slice of its rows that falls inside the global window; groups that
+  // start past the window render empty and are skipped below.
+  const { sentinelRef } = useInfiniteScroll({
+    hasMore: visible < all.length,
+    loadMore: () => setVisible((v) => v + STEP),
+  });
+
+  let offset = 0;
+  const windowedGroups = groups.map((g) => {
+    const start = offset;
+    offset += g.rows.length;
+    // How many of this group's rows fall inside the global [0, visible) window.
+    const take = Math.max(0, Math.min(g.rows.length, visible - start));
+    return { project: g.project, total: g.rows.length, rows: g.rows.slice(0, take) };
+  });
 
   return (
     <div className="p-8 max-w-5xl">
@@ -64,21 +87,28 @@ export default function Coverage() {
         <EmptyState />
       ) : (
         <div className="space-y-8">
-          {groups.map((g) => (
-            <section key={g.project}>
-              <SectionHeader
-                tone="muted"
-                label={g.project}
-                count={g.rows.length}
-                hint="sorted by findings ↓ then activity ↓"
-              />
-              <ListCard>
-                {g.rows.map((t) => (
-                  <TargetRow key={`${t.ws_id}/${t.target_id}`} target={t} maxLines={maxLines} />
-                ))}
-              </ListCard>
-            </section>
-          ))}
+          {windowedGroups
+            .filter((g) => g.rows.length > 0)
+            .map((g) => (
+              <section key={g.project}>
+                <SectionHeader
+                  tone="muted"
+                  label={g.project}
+                  count={g.total}
+                  hint="sorted by findings ↓ then activity ↓"
+                />
+                <ListCard>
+                  {g.rows.map((t) => (
+                    <TargetRow key={`${t.ws_id}/${t.target_id}`} target={t} maxLines={maxLines} />
+                  ))}
+                </ListCard>
+              </section>
+            ))}
+          {all.length > visible && (
+            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+              scroll for more
+            </div>
+          )}
         </div>
       )}
     </div>
