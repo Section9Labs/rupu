@@ -16,6 +16,7 @@ import { api, type ProjectDetail as ProjectDetailType, type ProjectAssessedPct }
 import { ListCard } from '../components/lists/ListCard';
 import { StatusPill } from '../components/StatusPill';
 import { relativeTime } from '../lib/time';
+import { formatTokens, formatCost } from '../lib/usage';
 
 // ---------------------------------------------------------------------------
 // Rollup tile
@@ -181,7 +182,7 @@ export default function ProjectDetail() {
     );
   }
 
-  const { project: p, runs, sessions, coverage, recent_runs } = detail;
+  const { project: p, runs, sessions, coverage, recent_runs, usage } = detail;
 
   // assessed_pct arrives from the lazy parallel endpoint.
   // `assessedPct === undefined` means still in-flight → show "…".
@@ -223,7 +224,7 @@ export default function ProjectDetail() {
       </header>
 
       {/* ── Rollup tiles ── */}
-      <section className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+      <section className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
         <RollupTile
           label="Runs"
           value={runs.total}
@@ -262,6 +263,13 @@ export default function ProjectDetail() {
             </p>
           )}
         </RollupTile>
+        {usage && (
+          <RollupTile
+            label="Usage"
+            value={formatCost(usage.cost_usd) + (usage.cost_usd !== null && !usage.priced ? '*' : '')}
+            sub={`${formatTokens(usage.total_tokens)} tok`}
+          />
+        )}
       </section>
 
       {/* ── Recent runs ── */}
