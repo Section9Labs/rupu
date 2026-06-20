@@ -308,6 +308,7 @@ export interface RunGraphResponse {
   workflow: { steps: StepNodeDto[] };
   step_results: StepResultRecord[];
   units: UnitCheckpoint[];
+  usage?: UsageSummary;
 }
 
 // ---------------------------------------------------------------------------

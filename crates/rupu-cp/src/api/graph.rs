@@ -62,11 +62,15 @@ async fn run_graph(
     // present in the checkpoints.
     let units = merge_event_units(&id, &s, checkpoints);
 
+    // 6. Token/cost rollup for the run-detail header breakdown.
+    let usage = crate::usage::summarize_run(&s.run_store, &id, &s.pricing);
+
     Ok(Json(serde_json::json!({
         "run": run,
         "workflow": dag,
         "step_results": step_results,
         "units": units,
+        "usage": usage,
     })))
 }
 
