@@ -324,6 +324,24 @@ export interface AutoflowCycleRow {
   run_ids: string[];
 }
 
+/**
+ * One actionable autoflow *event* — a launched run or an awaiting/failed
+ * signal. `kind` is snake_case (`run_launched` | `awaiting_human` |
+ * `awaiting_external` | `cycle_failed`). When `run_id` is present the row links
+ * to the run graph.
+ */
+export interface AutoflowEventRow {
+  event_id: string;
+  cycle_id: string;
+  at: string;
+  kind: string;
+  workflow?: string | null;
+  issue_display_ref?: string | null;
+  run_id?: string | null;
+  status?: string | null;
+  worker_name?: string | null;
+}
+
 export interface AgentRunRow {
   run_id: string;
   source: 'standalone' | 'session';
@@ -581,6 +599,9 @@ export const api = {
   },
   getAutoflowRuns(): Promise<AutoflowCycleRow[]> {
     return request<AutoflowCycleRow[]>('/api/runs/autoflows');
+  },
+  getAutoflowEvents(): Promise<AutoflowEventRow[]> {
+    return request<AutoflowEventRow[]>('/api/runs/autoflows/events');
   },
   getAgentRuns(): Promise<AgentRunRow[]> {
     return request<AgentRunRow[]>('/api/runs/agents');
