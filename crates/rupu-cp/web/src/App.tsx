@@ -18,6 +18,12 @@ import Settings from './pages/Settings';
 import AgentRuns from './pages/runs/AgentRuns';
 import WorkflowRuns from './pages/runs/WorkflowRuns';
 import AutoflowRuns from './pages/runs/AutoflowRuns';
+import Projects from './pages/Projects';
+import ProjectDetail from './pages/ProjectDetail';
+import ProjectRuns from './pages/ProjectRuns';
+import ProjectSessions from './pages/ProjectSessions';
+import ProjectCoverage from './pages/ProjectCoverage';
+import RunTranscript from './pages/RunTranscript';
 
 export default function App() {
   return (
@@ -49,6 +55,15 @@ export default function App() {
             <Route path="/sessions/:id" element={<SessionDetail />} />
             <Route path="/workers" element={<Workers />} />
             <Route path="/settings" element={<Settings />} />
+            {/* Transcript-only page (agent/session/standalone runs with no DAG) */}
+            <Route path="/transcript" element={<RunTranscript />} />
+            {/* Projects */}
+            <Route path="/projects" element={<Projects />} />
+            {/* Static scoped sub-pages MUST come before the :wsId wildcard */}
+            <Route path="/projects/:wsId/runs" element={<ProjectRuns />} />
+            <Route path="/projects/:wsId/sessions" element={<ProjectSessions />} />
+            <Route path="/projects/:wsId/coverage" element={<ProjectCoverage />} />
+            <Route path="/projects/:wsId" element={<ProjectDetail />} />
           </Route>
         </Routes>
       </ErrorBoundary>

@@ -7,6 +7,9 @@
  *   • EventSource-based subscribe helpers (unnamed `data` events → `onmessage`)
  */
 
+import type { TranscriptEvent, TranscriptResponse } from './transcript';
+export type { TranscriptEvent, TranscriptResponse } from './transcript';
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -512,6 +515,40 @@ export interface CoverageDetail {
 }
 
 // ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+export interface ProjectRow {
+  ws_id: string;
+  name: string;
+  path: string;
+  repo_remote?: string | null;
+  branch?: string | null;
+  created_at: string;
+  last_run_at?: string | null;
+}
+
+export interface ProjectDetail {
+  project: ProjectRow;
+  runs: {
+    total: number;
+    running: number;
+    by_status: Record<string, number>;
+    by_surface: { workflow: number; autoflow: number };
+  };
+  sessions: { total: number; active: number };
+  coverage: { targets: number; findings: number; assessed_pct: number | null };
+  recent_runs: RunListRow[];
+}
+
+export interface ProjectCoverageRow {
+  target_id: string;
+  assertion_lines: number;
+  has_catalog: boolean;
+  findings: number;
+}
+
+// ---------------------------------------------------------------------------
 // API object
 // ---------------------------------------------------------------------------
 
@@ -616,6 +653,47 @@ export const api = {
       : '/api/events/stream';
     const es = new EventSource(url);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
+    if (onError) es.onerror = onError;
+    return () => es.close();
+  },
+
+  // --- Projects ---
+
+  getProjects(): Promise<ProjectRow[]> {
+    return request<ProjectRow[]>('/api/projects');
+  },
+  getProject(wsId: string): Promise<ProjectDetail> {
+    return request<ProjectDetail>(`/api/projects/${encodeURIComponent(wsId)}`);
+  },
+  getProjectRuns(wsId: string): Promise<RunListRow[]> {
+    return request<RunListRow[]>(`/api/projects/${encodeURIComponent(wsId)}/runs`);
+  },
+  getProjectSessions(wsId: string): Promise<SessionSummary[]> {
+    return request<SessionSummary[]>(`/api/projects/${encodeURIComponent(wsId)}/sessions`);
+  },
+  getProjectCoverage(wsId: string): Promise<ProjectCoverageRow[]> {
+    return request<ProjectCoverageRow[]>(`/api/projects/${encodeURIComponent(wsId)}/coverage`);
+  },
+
+  // --- Transcripts ---
+
+  getTranscript(path: string): Promise<TranscriptResponse> {
+    return request<TranscriptResponse>(`/api/transcript?path=${encodeURIComponent(path)}`);
+  },
+
+  /**
+   * Subscribe to a live transcript stream for an in-progress agent run.
+   * The backend sends unnamed SSE data events → arrives on `es.onmessage`.
+   *
+   * @returns Unsubscribe function — call it to close the EventSource.
+   */
+  subscribeTranscript(
+    path: string,
+    onEvent: (e: TranscriptEvent) => void,
+    onError?: (e: Event) => void,
+  ): () => void {
+    const es = new EventSource(`/api/transcript/stream?path=${encodeURIComponent(path)}`);
+    es.onmessage = (m) => onEvent(JSON.parse(m.data) as TranscriptEvent);
     if (onError) es.onerror = onError;
     return () => es.close();
   },

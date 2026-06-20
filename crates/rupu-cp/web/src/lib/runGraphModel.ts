@@ -45,6 +45,8 @@ export interface GraphNode {
   kind: StepNodeDto['kind'];
   agent?: string;
   state: StepState;
+  /** Path to this step's agent transcript JSONL, when one was recorded. */
+  transcriptPath?: string;
   fanout?: FanoutState;
   parallel?: { id: string; state: StepState }[];
   /** For panel/gate steps — current iteration / max. Task 9 populates `current`. */
@@ -124,6 +126,8 @@ export function buildRunGraphModel(
   for (const result of g.step_results) {
     const node = nodeMap.get(result.step_id);
     if (!node) continue;
+
+    if (result.transcript_path != null) node.transcriptPath = result.transcript_path;
 
     if (result.skipped === true) {
       node.state = 'skipped';

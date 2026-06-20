@@ -15,6 +15,10 @@ impl ApiError {
     pub fn internal(msg: impl Into<String>) -> Self {
         Self(StatusCode::INTERNAL_SERVER_ERROR, msg.into())
     }
+
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_REQUEST, msg.into())
+    }
 }
 
 impl IntoResponse for ApiError {

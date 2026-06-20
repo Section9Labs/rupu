@@ -40,6 +40,8 @@ struct SessionDto {
     active_run_id: Option<String>,
     #[serde(default)]
     target: Option<String>,
+    #[serde(default)]
+    workspace_id: String,
 }
 
 /// Try to load and parse `session.json` inside `dir`.

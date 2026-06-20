@@ -103,6 +103,18 @@ describe('step_results overlay', () => {
     const model = buildRunGraphModel(g, []);
     expect(model.nodeById('c')!.state).toBe('skipped');
   });
+
+  it('step_result.transcript_path → node.transcriptPath', () => {
+    const g = makeGraph({
+      step_results: [
+        { run_id: runId(), step_id: 'a', success: true, transcript_path: '/tmp/step-a.jsonl' },
+      ],
+    });
+    const model = buildRunGraphModel(g, []);
+    expect(model.nodeById('a')!.transcriptPath).toBe('/tmp/step-a.jsonl');
+    // A step with no result has no transcript path.
+    expect(model.nodeById('c')!.transcriptPath).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------

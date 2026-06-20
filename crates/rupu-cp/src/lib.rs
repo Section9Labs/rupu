@@ -8,6 +8,7 @@ pub mod error;
 pub mod server;
 pub mod sse;
 pub mod state;
+pub mod transcript_tail;
 
 use anyhow::Context as _;
 use rupu_config::PricingConfig;

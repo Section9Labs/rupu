@@ -244,6 +244,156 @@ describe('api.getAutoflowDefs', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+describe('api.getProjects', () => {
+  it('resolves typed ProjectRow[] on 200', async () => {
+    const payload = [
+      {
+        ws_id: 'ws-1', name: 'rupu', path: '/code/rupu',
+        repo_remote: 'git@github.com:org/rupu.git', branch: 'main',
+        created_at: '2026-01-01T00:00:00Z', last_run_at: '2026-06-01T00:00:00Z',
+      },
+    ];
+    mockFetch(200, payload);
+
+    const result = await api.getProjects();
+    expect(result).toHaveLength(1);
+    expect(result[0].ws_id).toBe('ws-1');
+    expect(result[0].name).toBe('rupu');
+    expect(result[0].branch).toBe('main');
+  });
+});
+
+describe('api.getProject', () => {
+  it('resolves typed ProjectDetail on 200', async () => {
+    const payload = {
+      project: {
+        ws_id: 'ws-1', name: 'rupu', path: '/code/rupu',
+        repo_remote: null, branch: null,
+        created_at: '2026-01-01T00:00:00Z', last_run_at: null,
+      },
+      runs: {
+        total: 10, running: 1,
+        by_status: { completed: 8, failed: 1, running: 1 },
+        by_surface: { workflow: 7, autoflow: 3 },
+      },
+      sessions: { total: 5, active: 2 },
+      coverage: { targets: 12, findings: 3, assessed_pct: 0.75 },
+      recent_runs: [
+        { id: 'r1', workflow_name: 'audit', status: 'completed', started_at: '2026-06-01T00:00:00Z', trigger: 'manual' },
+      ],
+    };
+    mockFetch(200, payload);
+
+    const result = await api.getProject('ws-1');
+    expect(result.project.ws_id).toBe('ws-1');
+    expect(result.runs.total).toBe(10);
+    expect(result.runs.by_surface.workflow).toBe(7);
+    expect(result.sessions.active).toBe(2);
+    expect(result.coverage.assessed_pct).toBe(0.75);
+    expect(result.recent_runs[0].id).toBe('r1');
+  });
+
+  it('throws ApiError on 404', async () => {
+    mockFetch(404, 'project not found');
+    await expect(api.getProject('no-such-ws')).rejects.toThrow(ApiError);
+    await expect(api.getProject('no-such-ws')).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+describe('api.getProjectRuns', () => {
+  it('resolves typed RunListRow[] on 200', async () => {
+    const payload = [
+      { id: 'r2', workflow_name: 'nightly', status: 'completed', started_at: '2026-06-02T00:00:00Z', trigger: 'cron' },
+    ];
+    mockFetch(200, payload);
+
+    const result = await api.getProjectRuns('ws-1');
+    expect(result).toHaveLength(1);
+    expect(result[0].trigger).toBe('cron');
+  });
+});
+
+describe('api.getProjectCoverage', () => {
+  it('resolves typed ProjectCoverageRow[] on 200', async () => {
+    const payload = [
+      { target_id: 'auth.rs', assertion_lines: 42, has_catalog: true, findings: 2 },
+    ];
+    mockFetch(200, payload);
+
+    const result = await api.getProjectCoverage('ws-1');
+    expect(result).toHaveLength(1);
+    expect(result[0].target_id).toBe('auth.rs');
+    expect(result[0].has_catalog).toBe(true);
+    expect(result[0].findings).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transcripts
+// ---------------------------------------------------------------------------
+
+describe('api.getTranscript', () => {
+  it('resolves typed TranscriptResponse on 200', async () => {
+    const payload = {
+      events: [
+        { type: 'run_start', data: { run_id: 'r1', agent: 'classifier', provider: 'anthropic', model: 'claude-3', started_at: '2026-01-01T00:00:00Z', mode: 'bypass' } },
+        { type: 'assistant_message', data: { content: 'Hello!', thinking: null } },
+        { type: 'tool_call', data: { call_id: 'c1', tool: 'read_file', input: { path: '/foo.rs' } } },
+        { type: 'tool_result', data: { call_id: 'c1', output: 'fn main() {}', error: null, duration_ms: 5 } },
+        { type: 'run_complete', data: { run_id: 'r1', status: 'completed', total_tokens: 1000, duration_ms: 1234, error: null } },
+      ],
+      summary: {
+        run_id: 'r1', agent: 'classifier', provider: 'anthropic', model: 'claude-3',
+        status: 'completed', total_tokens: 1000, duration_ms: 1234,
+        started_at: '2026-01-01T00:00:00Z', error: null,
+      },
+    };
+    mockFetch(200, payload);
+
+    const result = await api.getTranscript('/tmp/run-1/transcript.jsonl');
+    expect(result.events).toHaveLength(5);
+    expect(result.events[0].type).toBe('run_start');
+    // Narrow to run_start to verify data shape
+    const first = result.events[0];
+    if (first.type === 'run_start') {
+      expect(first.data.run_id).toBe('r1');
+      expect(first.data.agent).toBe('classifier');
+      expect(first.data.mode).toBe('bypass');
+    } else {
+      throw new Error('expected run_start');
+    }
+    // Narrow tool_call
+    const toolCall = result.events[2];
+    if (toolCall.type === 'tool_call') {
+      expect(toolCall.data.call_id).toBe('c1');
+      expect(toolCall.data.tool).toBe('read_file');
+    } else {
+      throw new Error('expected tool_call');
+    }
+    // Summary
+    expect(result.summary).not.toBeNull();
+    expect(result.summary?.run_id).toBe('r1');
+    expect(result.summary?.total_tokens).toBe(1000);
+  });
+
+  it('handles null summary', async () => {
+    mockFetch(200, { events: [], summary: null });
+    const result = await api.getTranscript('/tmp/run-2/transcript.jsonl');
+    expect(result.events).toHaveLength(0);
+    expect(result.summary).toBeNull();
+  });
+
+  it('throws ApiError on 404', async () => {
+    mockFetch(404, 'transcript not found');
+    await expect(api.getTranscript('/no/such/path.jsonl')).rejects.toThrow(ApiError);
+    await expect(api.getTranscript('/no/such/path.jsonl')).rejects.toMatchObject({ status: 404 });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // URL encoding — paths with slashes / special chars
 // ---------------------------------------------------------------------------
 

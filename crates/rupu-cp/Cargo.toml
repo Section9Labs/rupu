@@ -20,6 +20,7 @@ tracing.workspace = true
 subtle.workspace = true
 anyhow.workspace = true
 futures-util = { workspace = true }
+notify = { workspace = true }
 rust-embed.workspace = true
 mime_guess.workspace = true
 
@@ -30,10 +31,13 @@ rupu-agent = { path = "../rupu-agent" }
 rupu-workspace = { path = "../rupu-workspace" }
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-coverage = { path = "../rupu-coverage" }
+rupu-transcript = { path = "../rupu-transcript" }
 
 [dev-dependencies]
 chrono.workspace = true
 tempfile.workspace = true
+rupu-config = { path = "../rupu-config" }
+rupu-transcript = { path = "../rupu-transcript" }
 reqwest = { workspace = true, features = ["json", "stream"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-util = { workspace = true, features = ["io"] }

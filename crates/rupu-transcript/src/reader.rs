@@ -29,7 +29,7 @@ pub enum ReadError {
     MissingRunStart,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct RunSummary {
     pub run_id: String,
