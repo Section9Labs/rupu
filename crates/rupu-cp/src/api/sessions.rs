@@ -13,6 +13,10 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:id", get(get_session))
+        .route(
+            "/api/sessions/:id/usage-timeline",
+            get(get_session_usage_timeline),
+        )
 }
 
 /// Minimal projection of the on-disk `session.json`. All fields are
@@ -238,6 +242,50 @@ async fn get_session(
         }
     }
     Ok(Json(val))
+}
+
+/// Minimal projection of `session.json` for the usage-timeline endpoint:
+/// just the `runs` array, each carrying its run id + transcript path.
+#[derive(Deserialize)]
+struct SessionRunsEnvelope {
+    #[serde(default)]
+    runs: Vec<SessionRunEntry>,
+}
+
+#[derive(Deserialize)]
+struct SessionRunEntry {
+    #[serde(default)]
+    run_id: String,
+    #[serde(default)]
+    transcript_path: Option<String>,
+}
+
+/// `GET /api/sessions/:id/usage-timeline` — ordered per-turn token series across
+/// every run the session recorded (in order), labeled by run id.
+async fn get_session_usage_timeline(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<crate::usage::TurnPoint>>> {
+    let active = s.global_dir.join("sessions").join(&id);
+    let archive = s.global_dir.join("sessions-archive").join(&id);
+    let dir = if active.is_dir() {
+        active
+    } else if archive.is_dir() {
+        archive
+    } else {
+        return Err(ApiError::not_found(format!("session {id} not found")));
+    };
+    let text = std::fs::read_to_string(dir.join("session.json"))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let env: SessionRunsEnvelope =
+        serde_json::from_str(&text).unwrap_or(SessionRunsEnvelope { runs: vec![] });
+    let mut labeled: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for r in &env.runs {
+        if let Some(tp) = &r.transcript_path {
+            labeled.push((r.run_id.clone(), std::path::PathBuf::from(tp)));
+        }
+    }
+    Ok(Json(crate::usage::turn_series(&labeled)))
 }
 
 #[cfg(test)]
