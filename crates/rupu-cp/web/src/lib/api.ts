@@ -9,6 +9,8 @@
 
 import type { TranscriptEvent, TranscriptResponse } from './transcript';
 export type { TranscriptEvent, TranscriptResponse } from './transcript';
+import type { UsageSummary, UsageOverview } from './usage';
+export type { UsageSummary, UsageBreakdownRow, UsageOverview } from './usage';
 
 // ---------------------------------------------------------------------------
 // Error
@@ -264,6 +266,7 @@ export interface RunListRow {
   started_at: string;
   finished_at?: string | null;
   trigger: 'manual' | 'cron' | 'event';
+  usage: UsageSummary;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +419,7 @@ export interface WorkflowDetail {
   /** Parsed Workflow object — typed loosely; the UI inspects what it needs. */
   workflow: Record<string, unknown>;
   yaml: string;
+  usage?: UsageSummary;
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +437,11 @@ export interface SessionSummary {
   active_run_id?: string | null;
   target?: string | null;
   scope: string;
+  provider_name?: string;
+  total_tokens_in?: number;
+  total_tokens_out?: number;
+  total_tokens_cached?: number;
+  usage?: UsageSummary;
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +609,7 @@ export interface ProjectDetail {
    * `assessed_pct` is served lazily by `getProjectAssessedPct`. */
   coverage: { targets: number; findings: number };
   recent_runs: RunListRow[];
+  usage: UsageSummary;
 }
 
 /** Response from the lazy `GET /api/projects/:wsId/coverage/assessed` endpoint. */
@@ -624,12 +634,22 @@ export const api = {
     return request<DashboardResponse>('/api/dashboard');
   },
 
+  // --- Usage ---
+  getUsage(params?: { since?: string; until?: string; groupBy?: 'provider' | 'model' | 'agent' }): Promise<UsageOverview> {
+    const q = new URLSearchParams();
+    if (params?.since) q.set('since', params.since);
+    if (params?.until) q.set('until', params.until);
+    if (params?.groupBy) q.set('group_by', params.groupBy);
+    const qs = q.toString();
+    return request<UsageOverview>(`/api/usage${qs ? `?${qs}` : ''}`);
+  },
+
   // --- Runs ---
   getRuns(): Promise<RunListRow[]> {
     return request<RunListRow[]>('/api/runs');
   },
-  getRun(id: string): Promise<{ run: RunRecord; steps: StepResultRecord[] }> {
-    return request<{ run: RunRecord; steps: StepResultRecord[] }>(
+  getRun(id: string): Promise<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }> {
+    return request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
       `/api/runs/${encodeURIComponent(id)}`,
     );
   },

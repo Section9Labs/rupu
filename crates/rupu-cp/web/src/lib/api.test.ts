@@ -78,6 +78,16 @@ describe('api.getRun', () => {
   });
 });
 
+describe('api.getUsage', () => {
+  it('requests /api/usage?group_by=model when grouped by model', async () => {
+    mockFetch(200, { summary: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: false, runs: 0 }, breakdown: [] });
+    const fetchSpy = vi.mocked(fetch);
+    await api.getUsage({ groupBy: 'model' });
+    const calledUrl = (fetchSpy.mock.calls[0][0] as string);
+    expect(calledUrl).toBe('/api/usage?group_by=model');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // request wrapper — error path
 // ---------------------------------------------------------------------------
