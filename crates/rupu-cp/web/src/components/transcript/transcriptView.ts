@@ -3,12 +3,19 @@
  *
  * Turns the flat `TranscriptEvent[]` stream (adjacently-tagged) into an ordered
  * render model the `TranscriptPanel` component can paint without re-deriving
- * structure. All pairing / attaching logic lives here so it stays testable:
+ * structure. All pairing / classification logic lives here so it stays testable:
  *
- *   • `tool_result` events are paired to their `tool_call` by `call_id`.
- *   • `assistant_message.thinking` rides on the assistant item.
- *   • a header is surfaced from `run_start` (agent / model / provider).
- *   • a footer is surfaced from `run_complete` (status, total tokens, duration),
+ *   • `tool_result` is paired to its `tool_call` by `call_id`
+ *     (output / error / durationMs ride onto the ToolView).
+ *   • the next `file_edit` is paired (by adjacency) onto the preceding
+ *     `write_file` / `edit_file` tool; the next `command_run` onto the
+ *     preceding `bash` tool.
+ *   • findings are built from `report_finding` tool_calls (NOT `action_emitted`).
+ *   • each tool is classified into a `ToolKind` from its tool name.
+ *   • tools are grouped into turns, a new turn starting at each
+ *     `assistant_message` (tools before the first assistant land in a leading
+ *     turn with no assistant).
+ *   • a header is surfaced from `run_start`; a footer from `run_complete`,
  *     falling back to the last `usage` event when the run hasn't completed.
  *
  * No React, no DOM — a deterministic function over the event list.
@@ -36,75 +43,60 @@ export interface TranscriptFooter {
   error: string | null;
 }
 
-export interface ToolResultView {
-  output: string;
-  error: string | null;
-  durationMs: number | null;
+export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical';
+
+export interface FindingView {
+  severity: Severity;
+  summary: string;
+  scope: string;
+  filePath?: string;
+  lineRange?: [number, number];
+  concernId?: string;
+  rationale: string;
+  codeExcerpt?: string;
+  references: string[];
 }
 
-export interface UserItem {
-  kind: 'user';
-  key: string;
-  content: string;
-}
+export type ToolKind =
+  | 'finding'
+  | 'read'
+  | 'grep'
+  | 'glob'
+  | 'diff'
+  | 'terminal'
+  | 'subrun'
+  | 'coverage'
+  | 'generic';
 
-export interface AssistantItem {
-  kind: 'assistant';
-  key: string;
-  content: string;
-  /** Attached `assistant_message.thinking`, if any. */
-  thinking: string | null;
-}
-
-export interface ToolItem {
-  kind: 'tool';
-  key: string;
-  /** call_id linking the call to its result; present even for orphan results. */
-  callId: string;
-  /** Tool name from the `tool_call`; null for an unpaired `tool_result`. */
-  tool: string | null;
-  /** Raw `tool_call.input` (unknown JSON shape). */
+export interface ToolView {
+  callId?: string;
+  tool: string;
   input: unknown;
-  /** Paired result, or null while the call is still in-flight. */
-  result: ToolResultView | null;
+  output?: string;
+  error?: string;
+  durationMs?: number;
+  kind: ToolKind;
+  /** kind === 'finding' */
+  finding?: FindingView;
+  /** kind === 'diff' (from the paired `file_edit`). */
+  diff?: { path: string; editKind: string; diff: string };
+  /** kind === 'terminal' (from the paired `command_run`). */
+  terminal?: { command: string; cwd: string; exitCode: number };
 }
 
-/** A finding surfaced from an `action_emitted`/finding-shaped event. */
-export interface FindingItem {
-  kind: 'finding';
-  key: string;
-  severity: string | null;
-  title: string;
+export interface TurnView {
+  assistant?: { content: string; thinking?: string };
+  tools: ToolView[];
+  summary: {
+    toolCount: number;
+    findingCount: number;
+    result: 'ok' | 'error' | 'running';
+  };
 }
-
-/** A file edit / command-run chip. */
-export interface ChipItem {
-  kind: 'chip';
-  key: string;
-  /** 'file_edit' | 'command_run' | other event type. */
-  variant: string;
-  label: string;
-}
-
-/** Any other event we don't specialise — rendered as a dim meta line. */
-export interface EventItem {
-  kind: 'event';
-  key: string;
-  type: string;
-  label: string;
-}
-
-export type TranscriptItem =
-  | UserItem
-  | AssistantItem
-  | ToolItem
-  | FindingItem
-  | ChipItem
-  | EventItem;
 
 export interface TranscriptView {
   header: TranscriptHeader | null;
-  items: TranscriptItem[];
+  turns: TurnView[];
   footer: TranscriptFooter | null;
 }
 
@@ -120,20 +112,89 @@ function asNumber(v: unknown): number | null {
   return typeof v === 'number' ? v : null;
 }
 
-/** Short, single-line preview of an arbitrary JSON value for chips/labels. */
-function previewValue(v: unknown, max = 120): string {
-  let s: string;
-  if (typeof v === 'string') s = v;
-  else if (v === null || v === undefined) s = '';
-  else {
-    try {
-      s = JSON.stringify(v);
-    } catch {
-      s = String(v);
-    }
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : null;
+}
+
+const SEVERITIES: ReadonlySet<string> = new Set([
+  'info',
+  'low',
+  'medium',
+  'high',
+  'critical',
+]);
+
+function asSeverity(v: unknown): Severity {
+  return typeof v === 'string' && SEVERITIES.has(v) ? (v as Severity) : 'info';
+}
+
+function asLineRange(v: unknown): [number, number] | undefined {
+  if (Array.isArray(v) && v.length === 2 && typeof v[0] === 'number' && typeof v[1] === 'number') {
+    return [v[0], v[1]];
   }
-  s = s.replace(/\s+/g, ' ').trim();
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  return undefined;
+}
+
+function asStringArray(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter((x): x is string => typeof x === 'string');
+}
+
+/**
+ * Parse a `report_finding` tool_call input into a FindingView.
+ * Returns null when the shape isn't a recognisable finding.
+ */
+function asFinding(input: unknown): FindingView | null {
+  const rec = asRecord(input);
+  if (!rec) return null;
+  const evidence = asRecord(rec.evidence) ?? {};
+  const summary = asString(rec.summary);
+  const rationale = asString(evidence.rationale);
+  // A finding must at least carry a summary or a rationale to be meaningful.
+  if (summary === null && rationale === null) return null;
+
+  const finding: FindingView = {
+    severity: asSeverity(rec.severity),
+    summary: summary ?? '',
+    scope: asString(rec.scope) ?? '',
+    rationale: rationale ?? '',
+    references: asStringArray(evidence.references),
+  };
+  const filePath = asString(rec.file_path);
+  if (filePath !== null) finding.filePath = filePath;
+  const lineRange = asLineRange(rec.line_range);
+  if (lineRange !== undefined) finding.lineRange = lineRange;
+  const concernId = asString(rec.concern_id);
+  if (concernId !== null) finding.concernId = concernId;
+  const codeExcerpt = asString(evidence.code_excerpt);
+  if (codeExcerpt !== null) finding.codeExcerpt = codeExcerpt;
+  return finding;
+}
+
+/** Classify a tool by its name. `report_finding` is resolved separately. */
+function classify(tool: string): ToolKind {
+  switch (tool) {
+    case 'report_finding':
+      return 'finding';
+    case 'read_file':
+      return 'read';
+    case 'grep':
+      return 'grep';
+    case 'glob':
+      return 'glob';
+    case 'write_file':
+    case 'edit_file':
+      return 'diff';
+    case 'bash':
+      return 'terminal';
+    case 'dispatch_agent':
+    case 'dispatch_agents_parallel':
+      return 'subrun';
+    default:
+      return tool.startsWith('coverage_') ? 'coverage' : 'generic';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,15 +204,29 @@ function previewValue(v: unknown, max = 120): string {
 export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   let header: TranscriptHeader | null = null;
   let footer: TranscriptFooter | null = null;
+  let sawRunComplete = false;
 
-  const items: TranscriptItem[] = [];
-  // Index of the ToolItem in `items`, keyed by call_id, so a later
-  // `tool_result` can be attached to its earlier `tool_call`.
-  const toolByCall = new Map<string, number>();
+  const turns: TurnView[] = [];
+  // The turn tools currently attach to. Created lazily so a leading turn only
+  // appears when there are tools before the first assistant_message.
+  let current: TurnView | null = null;
+  // Tool lookup by call_id, so a later `tool_result` finds its `tool_call`.
+  const toolByCall = new Map<string, ToolView>();
+  // The most recent diff-/terminal-expecting tools awaiting their paired
+  // `file_edit` / `command_run` (matched by adjacency).
+  let pendingDiff: ToolView | null = null;
+  let pendingTerminal: ToolView | null = null;
 
-  events.forEach((ev, idx) => {
+  function ensureTurn(): TurnView {
+    if (current === null) {
+      current = { tools: [], summary: { toolCount: 0, findingCount: 0, result: 'running' } };
+      turns.push(current);
+    }
+    return current;
+  }
+
+  for (const ev of events) {
     const data = (ev.data ?? {}) as Record<string, unknown>;
-    const key = `${ev.type}-${idx}`;
 
     switch (ev.type) {
       case 'run_start': {
@@ -165,104 +240,84 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
         break;
       }
 
-      case 'user_message': {
-        items.push({ kind: 'user', key, content: asString(data.content) ?? '' });
-        break;
-      }
-
       case 'assistant_message': {
-        items.push({
-          kind: 'assistant',
-          key,
-          content: asString(data.content) ?? '',
-          thinking: asString(data.thinking),
-        });
+        const turn: TurnView = {
+          assistant: {
+            content: asString(data.content) ?? '',
+            ...(asString(data.thinking) !== null
+              ? { thinking: asString(data.thinking) as string }
+              : {}),
+          },
+          tools: [],
+          summary: { toolCount: 0, findingCount: 0, result: 'running' },
+        };
+        turns.push(turn);
+        current = turn;
         break;
       }
 
       case 'tool_call': {
-        const callId = asString(data.call_id) ?? key;
-        const pos = items.length;
-        items.push({
-          kind: 'tool',
-          key,
-          callId,
-          tool: asString(data.tool),
+        const tool = asString(data.tool) ?? '';
+        const kind = classify(tool);
+        const view: ToolView = {
+          tool,
           input: data.input,
-          result: null,
-        });
-        toolByCall.set(callId, pos);
+          kind,
+        };
+        const callId = asString(data.call_id);
+        if (callId !== null) {
+          view.callId = callId;
+          toolByCall.set(callId, view);
+        }
+        if (kind === 'finding') {
+          const finding = asFinding(data.input);
+          if (finding) view.finding = finding;
+        }
+        // Arm adjacency pairing for the next file_edit / command_run.
+        pendingDiff = kind === 'diff' ? view : null;
+        pendingTerminal = kind === 'terminal' ? view : null;
+
+        ensureTurn().tools.push(view);
         break;
       }
 
       case 'tool_result': {
         const callId = asString(data.call_id) ?? '';
-        const result: ToolResultView = {
-          output: asString(data.output) ?? '',
-          error: asString(data.error),
-          durationMs: asNumber(data.duration_ms),
-        };
-        const pos = toolByCall.get(callId);
-        if (pos !== undefined) {
-          const existing = items[pos];
-          if (existing.kind === 'tool') existing.result = result;
-        } else {
-          // Unpaired result — surface it as its own tool item so nothing is lost.
-          items.push({
-            kind: 'tool',
-            key,
-            callId,
-            tool: null,
-            input: undefined,
-            result,
-          });
+        const view = toolByCall.get(callId);
+        if (view) {
+          const output = asString(data.output);
+          if (output !== null) view.output = output;
+          const error = asString(data.error);
+          if (error !== null) view.error = error;
+          const durationMs = asNumber(data.duration_ms);
+          if (durationMs !== null) view.durationMs = durationMs;
         }
+        // An unpaired result carries no tool_call to render against; ignore.
         break;
       }
 
       case 'file_edit': {
-        const path = asString(data.path) ?? asString(data.file) ?? '';
-        items.push({
-          kind: 'chip',
-          key,
-          variant: 'file_edit',
-          label: path || previewValue(data),
-        });
+        if (pendingDiff) {
+          pendingDiff.diff = {
+            path: asString(data.path) ?? '',
+            editKind: asString(data.kind) ?? '',
+            diff: asString(data.diff) ?? '',
+          };
+          pendingDiff = null;
+        }
         break;
       }
 
       case 'command_run': {
-        const cmd = asString(data.command) ?? asString(data.cmd) ?? '';
-        items.push({
-          kind: 'chip',
-          key,
-          variant: 'command_run',
-          label: cmd || previewValue(data),
-        });
-        break;
-      }
-
-      case 'action_emitted': {
-        // Findings ride in on action_emitted (report_finding) — surface those
-        // specially; other actions fall through to a dim event line.
-        const action = asString(data.action) ?? asString(data.name);
-        const isFinding =
-          action === 'report_finding' || 'severity' in data || 'finding' in data;
-        if (isFinding) {
-          items.push({
-            kind: 'finding',
-            key,
-            severity: asString(data.severity),
-            title:
-              asString(data.title) ?? asString(data.summary) ?? previewValue(data),
-          });
-        } else {
-          items.push({
-            kind: 'event',
-            key,
-            type: ev.type,
-            label: action ? `${action} · ${previewValue(data)}` : previewValue(data),
-          });
+        if (pendingTerminal) {
+          const argv = Array.isArray(data.argv) ? data.argv : [];
+          const command = typeof argv[2] === 'string' ? argv[2] : '';
+          pendingTerminal.terminal = {
+            command,
+            cwd: asString(data.cwd) ?? '',
+            exitCode: asNumber(data.exit_code) ?? 0,
+          };
+          pendingTerminal = null;
         }
         break;
       }
@@ -270,14 +325,8 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
       case 'usage': {
         const input = asNumber(data.input_tokens) ?? 0;
         const output = asNumber(data.output_tokens) ?? 0;
-        // Only seed a footer from usage if run_complete hasn't already set one.
         if (!footer) {
-          footer = {
-            status: null,
-            totalTokens: input + output,
-            durationMs: null,
-            error: null,
-          };
+          footer = { status: null, totalTokens: input + output, durationMs: null, error: null };
         } else if (footer.totalTokens === null) {
           footer.totalTokens = input + output;
         }
@@ -285,6 +334,7 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
       }
 
       case 'run_complete': {
+        sawRunComplete = true;
         footer = {
           status: asString(data.status),
           totalTokens: asNumber(data.total_tokens),
@@ -294,21 +344,26 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
         break;
       }
 
-      // turn_start / turn_end / assistant_delta / gate_requested and any
-      // forward-compat variants: skipped (deltas are coalesced into the final
-      // assistant_message; turn markers carry no render payload of their own).
-      case 'turn_start':
-      case 'turn_end':
-      case 'assistant_delta':
-      case 'gate_requested':
+      // user_message and action_emitted are dead/legacy shapes — findings come
+      // from `report_finding` tool_calls now, and there is no user_message in
+      // the live stream. turn_start / turn_end / assistant_delta /
+      // gate_requested carry no render payload. All ignored gracefully.
+      default:
         break;
-
-      default: {
-        items.push({ kind: 'event', key, type: ev.type, label: previewValue(data) });
-        break;
-      }
     }
-  });
+  }
 
-  return { header, items, footer };
+  // Finalize per-turn summaries.
+  for (const turn of turns) {
+    const toolCount = turn.tools.length;
+    const findingCount = turn.tools.filter((t) => t.kind === 'finding').length;
+    const hasError = turn.tools.some((t) => t.error !== undefined);
+    turn.summary = {
+      toolCount,
+      findingCount,
+      result: hasError ? 'error' : sawRunComplete ? 'ok' : 'running',
+    };
+  }
+
+  return { header, turns, footer };
 }

@@ -13,8 +13,7 @@ import type { TranscriptEvent } from '../lib/transcript';
 import { cn } from '../lib/cn';
 import {
   buildTranscriptView,
-  type TranscriptItem,
-  type ToolItem,
+  type ToolView,
 } from './transcript/transcriptView';
 
 type LoadState = 'loading' | 'ready' | 'error';
@@ -100,7 +99,7 @@ export default function TranscriptPanel({ path, live }: { path: string; live: bo
     );
   }
 
-  const isEmpty = !view.header && view.items.length === 0;
+  const isEmpty = !view.header && view.turns.length === 0;
 
   // ---- ready ---------------------------------------------------------------
 
@@ -140,15 +139,42 @@ export default function TranscriptPanel({ path, live }: { path: string; live: bo
         <div className="p-6 text-center text-sm text-ink-mute">No transcript events yet.</div>
       )}
 
-      {/* Conversation */}
+      {/* Conversation. NOTE: temporary shim over the new turn-based view model —
+          fully rewired into Turn / ToolCard dispatcher components in Task 7. */}
       <div className="flex flex-col gap-1.5">
-        {view.items.map((item) => (
-          <ItemView
-            key={item.key}
-            item={item}
-            expanded={!!expanded[item.key]}
-            onToggle={() => toggle(item.key)}
-          />
+        {view.turns.map((turn, ti) => (
+          <div key={`turn-${ti}`} className="flex flex-col gap-1.5">
+            {turn.assistant && (
+              <div>
+                <div className="mb-0.5 text-[9px] font-bold uppercase tracking-wide text-brand-500">
+                  assistant
+                </div>
+                {turn.assistant.thinking && (
+                  <Thinking
+                    text={turn.assistant.thinking}
+                    expanded={!!expanded[`turn-${ti}-think`]}
+                    onToggle={() => toggle(`turn-${ti}-think`)}
+                  />
+                )}
+                {turn.assistant.content && (
+                  <div className="whitespace-pre-wrap rounded-lg border border-border bg-panel px-2.5 py-1.5 text-ink">
+                    {turn.assistant.content}
+                  </div>
+                )}
+              </div>
+            )}
+            {turn.tools.map((tool, tj) => {
+              const key = `turn-${ti}-tool-${tj}`;
+              return (
+                <ToolCard
+                  key={key}
+                  item={tool}
+                  expanded={!!expanded[key]}
+                  onToggle={() => toggle(key)}
+                />
+              );
+            })}
+          </div>
         ))}
       </div>
 
@@ -172,71 +198,6 @@ export default function TranscriptPanel({ path, live }: { path: string; live: bo
 // ---------------------------------------------------------------------------
 // Per-item render
 // ---------------------------------------------------------------------------
-
-function ItemView({
-  item,
-  expanded,
-  onToggle,
-}: {
-  item: TranscriptItem;
-  expanded: boolean;
-  onToggle: () => void;
-}) {
-  switch (item.kind) {
-    case 'user':
-      return (
-        <div>
-          <div className="mb-0.5 text-[9px] font-bold uppercase tracking-wide text-ink-dim">user</div>
-          <div className="whitespace-pre-wrap rounded-lg border border-border bg-bg px-2.5 py-1.5 text-ink">
-            {item.content}
-          </div>
-        </div>
-      );
-
-    case 'assistant':
-      return (
-        <div>
-          <div className="mb-0.5 text-[9px] font-bold uppercase tracking-wide text-brand-500">
-            assistant
-          </div>
-          {item.thinking && <Thinking text={item.thinking} expanded={expanded} onToggle={onToggle} />}
-          {item.content && (
-            <div className="whitespace-pre-wrap rounded-lg border border-border bg-panel px-2.5 py-1.5 text-ink">
-              {item.content}
-            </div>
-          )}
-        </div>
-      );
-
-    case 'tool':
-      return <ToolCard item={item} expanded={expanded} onToggle={onToggle} />;
-
-    case 'finding':
-      return (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-[10px] text-red-700">
-          <span className="font-semibold">
-            ⚑ {item.severity ? `${item.severity.toUpperCase()} · ` : ''}
-          </span>
-          {item.title}
-        </div>
-      );
-
-    case 'chip':
-      return (
-        <div className="inline-flex w-fit items-center gap-1.5 rounded-md border border-border bg-panel px-2 py-0.5 font-mono text-[10px] text-ink-dim">
-          <span className="text-ink-mute">{item.variant === 'command_run' ? '$' : '✎'}</span>
-          <span className="truncate">{item.label}</span>
-        </div>
-      );
-
-    case 'event':
-      return (
-        <div className="px-1 py-0.5 font-mono text-[10px] text-ink-mute">
-          <span className="text-ink-dim">{item.type}</span> {item.label}
-        </div>
-      );
-  }
-}
 
 function Thinking({
   text,
@@ -270,13 +231,14 @@ function ToolCard({
   expanded,
   onToggle,
 }: {
-  item: ToolItem;
+  item: ToolView;
   expanded: boolean;
   onToggle: () => void;
 }) {
   const inputPreview = item.input === undefined ? '' : previewInput(item.input);
-  const inFlight = item.result === null && item.tool !== null;
-  const hasError = !!item.result?.error;
+  const hasResult = item.output !== undefined || item.error !== undefined;
+  const inFlight = !hasResult;
+  const hasError = item.error !== undefined;
 
   return (
     <div
@@ -296,15 +258,15 @@ function ToolCard({
         />
         <Wrench size={11} className={cn('shrink-0', hasError ? 'text-red-600' : 'text-blue-600')} />
         <span className={cn('font-mono font-bold', hasError ? 'text-red-700' : 'text-blue-700')}>
-          {item.tool ?? 'tool_result'}
+          {item.tool || 'tool'}
         </span>
         {inputPreview && (
           <span className="truncate font-mono text-ink-dim">{inputPreview}</span>
         )}
         {inFlight && <Loader2 size={10} className="ml-auto shrink-0 animate-spin text-blue-500" />}
-        {item.result?.durationMs != null && (
+        {item.durationMs != null && (
           <span className="ml-auto shrink-0 tabular-nums text-ink-mute">
-            {item.result.durationMs}ms
+            {item.durationMs}ms
           </span>
         )}
       </button>
@@ -316,14 +278,14 @@ function ToolCard({
               {fullInput(item.input)}
             </pre>
           )}
-          {item.result && (
+          {hasResult && (
             <div
               className={cn(
                 'whitespace-pre-wrap break-words',
                 hasError ? 'text-red-700' : 'text-ink',
               )}
             >
-              {item.result.error ? `✕ ${item.result.error}` : `→ ${item.result.output}`}
+              {item.error ? `✕ ${item.error}` : `→ ${item.output ?? ''}`}
             </div>
           )}
         </div>
