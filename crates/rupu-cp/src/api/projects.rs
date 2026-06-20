@@ -152,7 +152,7 @@ async fn get_project(
     });
 
     // ── sessions ──────────────────────────────────────────────────────────
-    let sessions = crate::api::sessions::collect_sessions(&s.global_dir);
+    let sessions = crate::api::sessions::collect_sessions(&s.global_dir, &s.pricing);
     let scoped_sessions: Vec<&Value> = sessions
         .iter()
         .filter(|v| v["workspace_id"].as_str() == Some(ws_id.as_str()))
@@ -232,7 +232,7 @@ async fn project_sessions(
     Path(ws_id): Path<String>,
 ) -> ApiResult<Json<Vec<Value>>> {
     load_workspace(&s, &ws_id)?;
-    let scoped: Vec<Value> = crate::api::sessions::collect_sessions(&s.global_dir)
+    let scoped: Vec<Value> = crate::api::sessions::collect_sessions(&s.global_dir, &s.pricing)
         .into_iter()
         .filter(|v| v["workspace_id"].as_str() == Some(ws_id.as_str()))
         .collect();

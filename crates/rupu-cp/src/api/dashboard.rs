@@ -112,7 +112,7 @@ async fn get_dashboard(State(s): State<AppState>) -> ApiResult<Json<DashboardRes
         .collect();
 
     // --- sessions ------------------------------------------------------------
-    let sessions = collect_sessions(&s.global_dir);
+    let sessions = collect_sessions(&s.global_dir, &s.pricing);
     let active = sessions
         .iter()
         .filter(|v| v.get("scope").and_then(|s| s.as_str()) == Some("active"))

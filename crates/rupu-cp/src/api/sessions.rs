@@ -27,11 +27,19 @@ struct SessionDto {
     agent_name: String,
     #[serde(default)]
     model: String,
+    #[serde(default)]
+    provider_name: String,
     /// Accepts whatever enum variant the serialiser produces.
     #[serde(default)]
     status: serde_json::Value,
     #[serde(default)]
     total_turns: u32,
+    #[serde(default)]
+    total_tokens_in: u64,
+    #[serde(default)]
+    total_tokens_out: u64,
+    #[serde(default)]
+    total_tokens_cached: u64,
     #[serde(default)]
     created_at: String,
     #[serde(default)]
@@ -91,11 +99,33 @@ fn try_load_session(dir: &std::path::Path) -> Option<SessionDto> {
     }
 }
 
+/// Token + cost summary for a session, derived from its on-disk token totals
+/// (sessions record their own totals; no transcript aggregation needed).
+fn session_usage(
+    dto: &SessionDto,
+    pricing: &rupu_config::PricingConfig,
+) -> crate::usage::UsageSummary {
+    let total_tokens = dto.total_tokens_in + dto.total_tokens_out;
+    let cost_usd =
+        rupu_config::pricing::lookup(pricing, &dto.provider_name, &dto.model, &dto.agent_name)
+            .map(|p| p.cost_usd(dto.total_tokens_in, dto.total_tokens_out, dto.total_tokens_cached));
+    crate::usage::UsageSummary {
+        input_tokens: dto.total_tokens_in,
+        output_tokens: dto.total_tokens_out,
+        cached_tokens: dto.total_tokens_cached,
+        total_tokens,
+        priced: cost_usd.is_some(),
+        cost_usd,
+        runs: 1,
+    }
+}
+
 /// Scan `<root>` for `<id>/session.json` entries. Assigns `scope` to
 /// each successfully parsed session and pushes it onto `out`.
 fn scan_session_dir(
     root: &std::path::Path,
     scope: &str,
+    pricing: &rupu_config::PricingConfig,
     out: &mut Vec<serde_json::Value>,
 ) {
     if !root.is_dir() {
@@ -114,13 +144,17 @@ fn scan_session_dir(
             continue;
         }
         if let Some(dto) = try_load_session(&dir) {
-            match serde_json::to_value(dto) {
+            let usage = session_usage(&dto, pricing);
+            match serde_json::to_value(&dto) {
                 Ok(mut val) => {
                     if let serde_json::Value::Object(ref mut map) = val {
                         map.insert(
                             "scope".to_string(),
                             serde_json::Value::String(scope.to_string()),
                         );
+                        if let Ok(u) = serde_json::to_value(&usage) {
+                            map.insert("usage".to_string(), u);
+                        }
                     }
                     out.push(val);
                 }
@@ -140,12 +174,21 @@ fn scan_session_dir(
 /// injected `"scope"` key (`"active"` or `"archived"`). Exposed as
 /// `pub(crate)` so that the dashboard aggregate can reuse the scan without
 /// duplicating logic.
-pub(crate) fn collect_sessions(global_dir: &std::path::Path) -> Vec<serde_json::Value> {
+pub(crate) fn collect_sessions(
+    global_dir: &std::path::Path,
+    pricing: &rupu_config::PricingConfig,
+) -> Vec<serde_json::Value> {
     let mut sessions = Vec::new();
-    scan_session_dir(&global_dir.join("sessions"), "active", &mut sessions);
+    scan_session_dir(
+        &global_dir.join("sessions"),
+        "active",
+        pricing,
+        &mut sessions,
+    );
     scan_session_dir(
         &global_dir.join("sessions-archive"),
         "archived",
+        pricing,
         &mut sessions,
     );
     sessions
@@ -154,7 +197,7 @@ pub(crate) fn collect_sessions(global_dir: &std::path::Path) -> Vec<serde_json::
 async fn list_sessions(
     State(s): State<AppState>,
 ) -> ApiResult<Json<Vec<serde_json::Value>>> {
-    Ok(Json(collect_sessions(&s.global_dir)))
+    Ok(Json(collect_sessions(&s.global_dir, &s.pricing)))
 }
 
 async fn get_session(
@@ -180,13 +223,46 @@ async fn get_session(
         None => return Err(ApiError::not_found(format!("session {id} not found"))),
     };
 
+    let usage = session_usage(&dto, &s.pricing);
     let mut val =
-        serde_json::to_value(dto).map_err(|e| ApiError::internal(e.to_string()))?;
+        serde_json::to_value(&dto).map_err(|e| ApiError::internal(e.to_string()))?;
     if let serde_json::Value::Object(ref mut map) = val {
         map.insert(
             "scope".to_string(),
             serde_json::Value::String(scope.to_string()),
         );
+        if let Ok(u) = serde_json::to_value(&usage) {
+            map.insert("usage".to_string(), u);
+        }
     }
     Ok(Json(val))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_usage_from_dto_prices_known_model() {
+        let dto = SessionDto {
+            session_id: "s1".into(),
+            agent_name: "a".into(),
+            model: "claude-sonnet-4-6".into(),
+            provider_name: "anthropic".into(),
+            status: serde_json::Value::String("active".into()),
+            total_turns: 3,
+            total_tokens_in: 1_000_000,
+            total_tokens_out: 0,
+            total_tokens_cached: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            active_run_id: None,
+            target: None,
+            workspace_id: "w".into(),
+        };
+        let u = session_usage(&dto, &rupu_config::PricingConfig::default());
+        assert_eq!(u.input_tokens, 1_000_000);
+        assert!(u.priced);
+        assert!((u.cost_usd.unwrap() - 3.0).abs() < 1e-9);
+    }
 }
