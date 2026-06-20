@@ -11,6 +11,7 @@ use rupu_orchestrator::runs::RunStore;
 use rupu_transcript::TimeWindow;
 use rupu_transcript::UsageRow;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Token + cost summary for a run, or any rollup of runs.
@@ -106,6 +107,107 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
     }
     out.total_tokens = out.input_tokens + out.output_tokens;
     out.cost_usd = if any_cost { Some(cost_acc) } else { None };
+    out
+}
+
+/// Dimension for the overview breakdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupBy {
+    Provider,
+    Model,
+    Agent,
+}
+
+impl GroupBy {
+    /// Parse the `group_by` query param; defaults to `Model` on anything else.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "provider" => GroupBy::Provider,
+            "agent" => GroupBy::Agent,
+            _ => GroupBy::Model,
+        }
+    }
+}
+
+/// One grouped line for the overview breakdown.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageBreakdownRow {
+    pub provider: String,
+    pub model: String,
+    pub agent: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub priced: bool,
+    pub runs: u64,
+}
+
+/// Group token rows by the chosen dimension, price each group, and return
+/// rows sorted by total tokens descending. The non-grouped identity fields
+/// carry the first row's value (or an empty string) — the UI labels by the
+/// grouped dimension.
+pub fn breakdown(
+    rows: &[UsageRow],
+    pricing: &PricingConfig,
+    group_by: GroupBy,
+) -> Vec<UsageBreakdownRow> {
+    let mut groups: BTreeMap<String, UsageBreakdownRow> = BTreeMap::new();
+    for row in rows {
+        let key = match group_by {
+            GroupBy::Provider => row.provider.clone(),
+            GroupBy::Model => row.model.clone(),
+            GroupBy::Agent => row.agent.clone(),
+        };
+        let entry = groups.entry(key).or_insert_with(|| UsageBreakdownRow {
+            provider: if group_by == GroupBy::Provider {
+                row.provider.clone()
+            } else {
+                String::new()
+            },
+            model: if group_by == GroupBy::Model {
+                row.model.clone()
+            } else {
+                String::new()
+            },
+            agent: if group_by == GroupBy::Agent {
+                row.agent.clone()
+            } else {
+                String::new()
+            },
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            total_tokens: 0,
+            cost_usd: None,
+            priced: true,
+            runs: 0,
+        });
+        entry.input_tokens += row.input_tokens;
+        entry.output_tokens += row.output_tokens;
+        entry.cached_tokens += row.cached_tokens;
+        entry.runs += row.runs;
+        match rupu_config::pricing::lookup(pricing, &row.provider, &row.model, &row.agent) {
+            Some(price) => {
+                let c = price.cost_usd(row.input_tokens, row.output_tokens, row.cached_tokens);
+                entry.cost_usd = Some(entry.cost_usd.unwrap_or(0.0) + c);
+            }
+            None => entry.priced = false,
+        }
+    }
+    let mut out: Vec<UsageBreakdownRow> = groups
+        .into_values()
+        .map(|mut r| {
+            r.total_tokens = r.input_tokens + r.output_tokens;
+            r
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then_with(|| a.model.cmp(&b.model))
+    });
     out
 }
 
@@ -210,5 +312,38 @@ mod tests {
         assert_eq!(r.runs, 2);
         assert!(!r.priced);
         assert!((r.cost_usd.unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn breakdown_groups_by_model_and_prices() {
+        let pricing = PricingConfig::default();
+        let rows = vec![
+            row("anthropic", "claude-sonnet-4-6", 1_000_000, 0, 0),
+            row("anthropic", "claude-sonnet-4-6", 1_000_000, 0, 0),
+            row("internal-vllm", "llama-3-70b", 5, 5, 0),
+        ];
+        let b = breakdown(&rows, &pricing, GroupBy::Model);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].model, "claude-sonnet-4-6");
+        assert_eq!(b[0].input_tokens, 2_000_000);
+        assert!(b[0].priced);
+        assert!((b[0].cost_usd.unwrap() - 6.0).abs() < 1e-9); // 2M * 3.0
+        assert_eq!(b[0].runs, 2);
+        assert_eq!(b[1].model, "llama-3-70b");
+        assert!(!b[1].priced);
+        assert_eq!(b[1].cost_usd, None);
+    }
+
+    #[test]
+    fn breakdown_group_by_provider_merges_models() {
+        let pricing = PricingConfig::default();
+        let rows = vec![
+            row("anthropic", "claude-sonnet-4-6", 1000, 0, 0),
+            row("anthropic", "claude-haiku-4-5", 1000, 0, 0),
+        ];
+        let b = breakdown(&rows, &pricing, GroupBy::Provider);
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].provider, "anthropic");
+        assert_eq!(b[0].input_tokens, 2000);
     }
 }
