@@ -11,6 +11,7 @@ import { SectionHeader, type SectionTone } from '../components/lists/SectionHead
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
+import UsageChip from '../components/UsageChip';
 
 function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 10)}…` : id;
@@ -124,6 +125,7 @@ function SessionRow({ session }: { session: SessionSummary }) {
             {session.total_turns} turn{session.total_turns !== 1 ? 's' : ''}
           </span>
           <span>updated {relativeTime(session.updated_at)}</span>
+          {session.usage && <UsageChip usage={session.usage} className="ml-2" />}
         </div>
       </Link>
 

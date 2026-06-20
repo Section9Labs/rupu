@@ -17,7 +17,7 @@
 //! `Event::RunStart` (`anthropic`, `openai-codex`, `google-gemini-cli`,
 //! `google-antigravity`, `github-copilot`).
 
-use rupu_config::{ModelPricing, PricingConfig};
+use crate::{ModelPricing, PricingConfig};
 
 /// Built-in USD-per-million-tokens defaults for the major models.
 /// Last reviewed: 2026-05-07. Pricing drifts over time — users with

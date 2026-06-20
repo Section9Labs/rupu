@@ -5724,7 +5724,7 @@ fn session_total_cost_detail(
     session: &SessionRecord,
     state: &SessionInteractiveState,
 ) -> Option<String> {
-    let pricing = crate::pricing::lookup(
+    let pricing = rupu_config::pricing::lookup(
         &state.pricing,
         &session.provider_name,
         &session.model,

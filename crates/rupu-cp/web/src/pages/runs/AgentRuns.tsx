@@ -152,6 +152,7 @@ function AgentRunEntry({ run }: { run: AgentRunRow }) {
         </div>
 
         <div className="text-[11px] text-ink-dim mt-0.5 flex items-center gap-3 flex-wrap">
+          {/* Per-run token/cost: AgentRunRow has no usage field (different DTO); shown on the run detail page instead. */}
           {run.started_at ? (
             <span>started {relativeTime(run.started_at)}</span>
           ) : (

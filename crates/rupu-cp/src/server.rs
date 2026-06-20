@@ -54,6 +54,7 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         .merge(crate::api::workflows::routes())
         .merge(crate::api::sessions::routes())
         .merge(crate::api::transcript::routes())
+        .merge(crate::api::usage::routes())
         .merge(crate::api::workers::routes())
         .merge(crate::api::coverage::routes())
         .merge(crate::api::dashboard::routes())

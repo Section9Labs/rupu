@@ -71,7 +71,15 @@ async fn get_workflow(
     }
     let yaml = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
     let workflow = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let runs = s.run_store.list().unwrap_or_default();
+    let usage = crate::usage::rollup(
+        runs.iter()
+            .filter(|r| r.workflow_name == name)
+            .map(|r| crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing)),
+    );
+
     Ok(Json(
-        serde_json::json!({ "workflow": workflow, "yaml": yaml }),
+        serde_json::json!({ "workflow": workflow, "yaml": yaml, "usage": usage }),
     ))
 }

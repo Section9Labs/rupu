@@ -10,6 +10,7 @@ import { api, type SessionSummary, type AgentRunRow } from '../lib/api';
 import { cn } from '../lib/cn';
 import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
+import UsageChip from '../components/UsageChip';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -144,6 +145,7 @@ export default function SessionDetailPage() {
             />
             <span className="text-[12px] text-ink-dim">{sessionStatusLabel(session.status)}</span>
           </span>
+          {session.usage && <UsageChip usage={session.usage} className="ml-2" />}
         </div>
       </header>
 

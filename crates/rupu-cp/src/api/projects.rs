@@ -40,6 +40,7 @@ struct ProjectDetail {
     sessions: Value,
     coverage: Value,
     recent_runs: Vec<RunListRow>,
+    usage: crate::usage::UsageSummary,
 }
 
 fn store(s: &AppState) -> WorkspaceStore {
@@ -152,7 +153,7 @@ async fn get_project(
     });
 
     // ── sessions ──────────────────────────────────────────────────────────
-    let sessions = crate::api::sessions::collect_sessions(&s.global_dir);
+    let sessions = crate::api::sessions::collect_sessions(&s.global_dir, &s.pricing);
     let scoped_sessions: Vec<&Value> = sessions
         .iter()
         .filter(|v| v["workspace_id"].as_str() == Some(ws_id.as_str()))
@@ -187,12 +188,20 @@ async fn get_project(
         "findings": findings_sum,
     });
 
+    // ── usage ─────────────────────────────────────────────────────────────
+    // Project-level token/cost rollup across every scoped run.
+    let usage = crate::usage::rollup(
+        runs.iter()
+            .map(|r| crate::usage::summarize_run(&s.run_store, &r.id, &s.pricing)),
+    );
+
     Ok(Json(ProjectDetail {
         project: project_row(&w),
         runs: runs_obj,
         sessions: sessions_obj,
         coverage: coverage_obj,
         recent_runs,
+        usage,
     }))
 }
 
@@ -223,7 +232,11 @@ async fn project_runs(
     // 404 when the project is unknown, mirroring the rollup endpoint.
     load_workspace(&s, &ws_id)?;
     let runs = scoped_runs(&s, &ws_id)?;
-    Ok(Json(runs.iter().map(RunListRow::from).collect()))
+    Ok(Json(
+        runs.iter()
+            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
+            .collect(),
+    ))
 }
 
 /// `GET /api/projects/:ws_id/sessions` — session DTOs scoped to the project.
@@ -232,7 +245,7 @@ async fn project_sessions(
     Path(ws_id): Path<String>,
 ) -> ApiResult<Json<Vec<Value>>> {
     load_workspace(&s, &ws_id)?;
-    let scoped: Vec<Value> = crate::api::sessions::collect_sessions(&s.global_dir)
+    let scoped: Vec<Value> = crate::api::sessions::collect_sessions(&s.global_dir, &s.pricing)
         .into_iter()
         .filter(|v| v["workspace_id"].as_str() == Some(ws_id.as_str()))
         .collect();
@@ -381,4 +394,31 @@ async fn project_autoflows(
         .join("workflows");
     let project = scan_autoflow_defs(&project_dir, "project");
     Ok(Json(merge_autoflow_defs(global, project)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_detail_serializes_usage() {
+        let detail = ProjectDetail {
+            project: ProjectRow {
+                ws_id: "w".into(),
+                name: "n".into(),
+                path: "/p".into(),
+                repo_remote: None,
+                branch: None,
+                created_at: String::new(),
+                last_run_at: None,
+            },
+            runs: json!({}),
+            sessions: json!({}),
+            coverage: json!({}),
+            recent_runs: vec![],
+            usage: crate::usage::UsageSummary::default(),
+        };
+        let v = serde_json::to_value(&detail).unwrap();
+        assert!(v.get("usage").is_some());
+    }
 }

@@ -453,7 +453,7 @@ impl LiveRunState {
         output_tokens: u64,
         cached_tokens: u64,
     ) {
-        if let Some(p) = crate::pricing::lookup(pricing, provider, model, agent) {
+        if let Some(p) = rupu_config::pricing::lookup(pricing, provider, model, agent) {
             let delta = p.cost_usd(input_tokens, output_tokens, cached_tokens);
             self.cost = Some(self.cost.unwrap_or(0.0) + delta);
         }
