@@ -5,6 +5,7 @@
 pub mod api;
 pub mod embed;
 pub mod error;
+pub mod pagination;
 pub mod server;
 pub mod sse;
 pub mod state;
