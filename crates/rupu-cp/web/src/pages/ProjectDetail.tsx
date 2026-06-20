@@ -12,7 +12,7 @@ import {
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react';
-import { api, type ProjectDetail as ProjectDetailType } from '../lib/api';
+import { api, type ProjectDetail as ProjectDetailType, type ProjectAssessedPct } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { StatusPill } from '../components/StatusPill';
 import { relativeTime } from '../lib/time';
@@ -92,6 +92,9 @@ export default function ProjectDetail() {
   const [detail, setDetail] = useState<ProjectDetailType | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
+  /** assessed_pct fetched lazily in parallel — undefined = still loading,
+   * null = no catalog / backend returned null. */
+  const [assessedPct, setAssessedPct] = useState<ProjectAssessedPct | undefined>(undefined);
 
   useEffect(() => {
     if (!wsId) return;
@@ -109,6 +112,25 @@ export default function ProjectDetail() {
         } else {
           setError(e instanceof Error ? e.message : 'Failed to load project');
         }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [wsId]);
+
+  // Parallel effect: fetch assessed_pct without blocking the overview render.
+  useEffect(() => {
+    if (!wsId) return;
+    let cancelled = false;
+    api
+      .getProjectAssessedPct(wsId)
+      .then((data) => {
+        if (cancelled) return;
+        setAssessedPct(data);
+      })
+      .catch(() => {
+        // Swallow errors — assessed % is non-critical; tile stays in "…" state.
+        if (!cancelled) setAssessedPct({ assessed_pct: null });
       });
     return () => {
       cancelled = true;
@@ -161,9 +183,15 @@ export default function ProjectDetail() {
 
   const { project: p, runs, sessions, coverage, recent_runs } = detail;
 
-  // Coverage bar width — clamp to [0,100] for safety, fallback to 0.
-  const pct = coverage.assessed_pct !== null ? Math.min(100, Math.max(0, coverage.assessed_pct)) : null;
-  const pctLabel = pct !== null ? `${Math.round(pct)}%` : '—';
+  // assessed_pct arrives from the lazy parallel endpoint.
+  // `assessedPct === undefined` means still in-flight → show "…".
+  const rawPct =
+    assessedPct !== undefined ? assessedPct.assessed_pct : undefined;
+  const pct =
+    rawPct != null ? Math.min(100, Math.max(0, rawPct)) : null;
+  // "…" while loading, "—" when loaded but null (no catalog).
+  const pctLabel =
+    assessedPct === undefined ? '…' : pct !== null ? `${Math.round(pct)}%` : '—';
 
   const encodedId = encodeURIComponent(p.ws_id);
 
@@ -288,11 +316,9 @@ export default function ProjectDetail() {
               <>
                 <span className="font-medium text-ink">{coverage.targets}</span>{' '}
                 target{coverage.targets !== 1 ? 's' : ''} ·{' '}
-                {pct !== null ? (
-                  <span className="font-medium text-ink">{Math.round(pct)}%</span>
-                ) : (
-                  <span className="text-ink-mute">—</span>
-                )}{' '}
+                <span className={pct !== null ? 'font-medium text-ink' : 'text-ink-mute'}>
+                  {pctLabel}
+                </span>{' '}
                 assessed ·{' '}
                 <span className={coverage.findings > 0 ? 'font-medium text-red-600' : 'font-medium text-ink'}>
                   {coverage.findings}

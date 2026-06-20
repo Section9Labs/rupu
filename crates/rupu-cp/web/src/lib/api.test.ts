@@ -267,7 +267,9 @@ describe('api.getProjects', () => {
 });
 
 describe('api.getProject', () => {
-  it('resolves typed ProjectDetail on 200', async () => {
+  it('resolves typed ProjectDetail on 200 (no assessed_pct in coverage rollup)', async () => {
+    // The synchronous rollup no longer carries assessed_pct — only targets +
+    // findings.  assessed_pct is fetched lazily via getProjectAssessedPct.
     const payload = {
       project: {
         ws_id: 'ws-1', name: 'rupu', path: '/code/rupu',
@@ -280,7 +282,7 @@ describe('api.getProject', () => {
         by_surface: { workflow: 7, autoflow: 3 },
       },
       sessions: { total: 5, active: 2 },
-      coverage: { targets: 12, findings: 3, assessed_pct: 0.75 },
+      coverage: { targets: 12, findings: 3 },
       recent_runs: [
         { id: 'r1', workflow_name: 'audit', status: 'completed', started_at: '2026-06-01T00:00:00Z', trigger: 'manual' },
       ],
@@ -292,7 +294,8 @@ describe('api.getProject', () => {
     expect(result.runs.total).toBe(10);
     expect(result.runs.by_surface.workflow).toBe(7);
     expect(result.sessions.active).toBe(2);
-    expect(result.coverage.assessed_pct).toBe(0.75);
+    expect(result.coverage.targets).toBe(12);
+    expect(result.coverage.findings).toBe(3);
     expect(result.recent_runs[0].id).toBe('r1');
   });
 
@@ -328,6 +331,28 @@ describe('api.getProjectCoverage', () => {
     expect(result[0].target_id).toBe('auth.rs');
     expect(result[0].has_catalog).toBe(true);
     expect(result[0].findings).toBe(2);
+  });
+});
+
+describe('api.getProjectAssessedPct', () => {
+  it('resolves { assessed_pct: number } when catalog is present', async () => {
+    mockFetch(200, { assessed_pct: 87.5 });
+
+    const result = await api.getProjectAssessedPct('ws-1');
+    expect(result.assessed_pct).toBe(87.5);
+  });
+
+  it('resolves { assessed_pct: null } when no catalog is present', async () => {
+    mockFetch(200, { assessed_pct: null });
+
+    const result = await api.getProjectAssessedPct('ws-1');
+    expect(result.assessed_pct).toBeNull();
+  });
+
+  it('throws ApiError on 404 (unknown project)', async () => {
+    mockFetch(404, 'project not found');
+    await expect(api.getProjectAssessedPct('no-such-ws')).rejects.toThrow(ApiError);
+    await expect(api.getProjectAssessedPct('no-such-ws')).rejects.toMatchObject({ status: 404 });
   });
 });
 

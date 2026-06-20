@@ -596,8 +596,15 @@ export interface ProjectDetail {
     by_surface: { workflow: number; autoflow: number };
   };
   sessions: { total: number; active: number };
-  coverage: { targets: number; findings: number; assessed_pct: number | null };
+  /** Cheap rollup — targets count + findings count only.
+   * `assessed_pct` is served lazily by `getProjectAssessedPct`. */
+  coverage: { targets: number; findings: number };
   recent_runs: RunListRow[];
+}
+
+/** Response from the lazy `GET /api/projects/:wsId/coverage/assessed` endpoint. */
+export interface ProjectAssessedPct {
+  assessed_pct: number | null;
 }
 
 export interface ProjectCoverageRow {
@@ -745,6 +752,13 @@ export const api = {
   },
   getProjectAutoflows(wsId: string): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>(`/api/projects/${encodeURIComponent(wsId)}/autoflows`);
+  },
+  /** Lazy heavy endpoint — runs run_audit per target.  Fetch in parallel with
+   * `getProject` so the overview renders immediately while this resolves. */
+  getProjectAssessedPct(wsId: string): Promise<ProjectAssessedPct> {
+    return request<ProjectAssessedPct>(
+      `/api/projects/${encodeURIComponent(wsId)}/coverage/assessed`,
+    );
   },
 
   // --- Transcripts ---

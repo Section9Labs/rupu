@@ -153,10 +153,12 @@ async fn get_project_rollup_aggregates_runs_and_coverage() {
         "expected at least one finding; got {:?}",
         body["coverage"]["findings"]
     );
-    // No catalog seeded → assessed_pct is null. (Documenting the contract.)
+    // assessed_pct is no longer part of the synchronous rollup — it is served
+    // by the lazy `/coverage/assessed` endpoint instead.
     assert!(
-        body["coverage"]["assessed_pct"].is_null(),
-        "no-catalog target should leave assessed_pct null; got {:?}",
+        body["coverage"].get("assessed_pct").is_none()
+            || body["coverage"]["assessed_pct"] == serde_json::Value::Null,
+        "rollup should NOT carry assessed_pct (field removed from hot path); got {:?}",
         body["coverage"]["assessed_pct"]
     );
 
@@ -387,4 +389,64 @@ async fn list_projects_returns_empty_when_no_registry_dir() {
         arr.is_empty(),
         "missing workspaces dir should yield empty array; got {arr:?}"
     );
+}
+
+/// GET /api/projects/:ws_id/coverage/assessed returns { assessed_pct: null }
+/// when the coverage target has no catalog (no audit is possible).
+#[tokio::test]
+async fn get_project_coverage_assessed_no_catalog_returns_null() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    seed_workspace_toml(
+        &tmp.path().join("workspaces"),
+        "ws_assessed",
+        proj.to_str().unwrap(),
+        "2026-06-19T00:00:00Z",
+        None,
+    );
+
+    // A coverage target with findings but NO catalog.yaml — audit cannot run,
+    // so assessed_pct must come back null.
+    seed_coverage_target(&proj, "tgt_no_catalog");
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/projects/ws_assessed/coverage/assessed"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "lazy assessed endpoint should return 200"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.is_object(),
+        "response should be a JSON object; got {:?}",
+        body
+    );
+    assert!(
+        body["assessed_pct"].is_null(),
+        "no-catalog target → assessed_pct must be null; got {:?}",
+        body["assessed_pct"]
+    );
+}
+
+/// GET /api/projects/:ws_id/coverage/assessed → 404 for unknown project.
+#[tokio::test]
+async fn get_project_coverage_assessed_unknown_project_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/projects/no_such_ws/coverage/assessed"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 404);
 }

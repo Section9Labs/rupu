@@ -74,6 +74,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects/:ws_id/runs", get(project_runs))
         .route("/api/projects/:ws_id/sessions", get(project_sessions))
         .route("/api/projects/:ws_id/coverage", get(project_coverage))
+        .route(
+            "/api/projects/:ws_id/coverage/assessed",
+            get(project_coverage_assessed),
+        )
         .route("/api/projects/:ws_id/agents", get(project_agents))
         .route("/api/projects/:ws_id/workflows", get(project_workflows))
         .route("/api/projects/:ws_id/autoflows", get(project_autoflows))
@@ -165,30 +169,22 @@ async fn get_project(
     // ── coverage ──────────────────────────────────────────────────────────
     // Coverage lives under the PROJECT's path (`<project>/.rupu/coverage/`),
     // not the CP's launch dir.
+    // Only CHEAP signals are computed here: target count + findings count.
+    // The expensive `run_audit` (assessed_pct) is deferred to
+    // `GET /api/projects/:ws_id/coverage/assessed` which the frontend fetches
+    // in parallel without blocking the overview render.
     let wp = std::path::Path::new(&w.path);
     let targets = discover_targets(wp).unwrap_or_default();
-    let mut findings_sum = 0usize;
-    let mut total_concerns = 0usize;
-    let mut complete_concerns = 0usize;
-    for t in &targets {
-        let paths = CoveragePaths::new(wp, &t.target_id);
-        findings_sum += read_findings(&paths).map(|f| f.len()).unwrap_or(0);
-        // Targets without a catalog (or with a malformed one) error here and
-        // are skipped — they simply don't contribute to the assessed ratio.
-        if let Ok(a) = run_audit(&paths) {
-            total_concerns += a.total_concerns;
-            complete_concerns += a.complete_concerns;
-        }
-    }
-    let assessed_pct = if total_concerns > 0 {
-        Some((complete_concerns as f64 / total_concerns as f64) * 100.0)
-    } else {
-        None
-    };
+    let findings_sum: usize = targets
+        .iter()
+        .map(|t| {
+            let paths = CoveragePaths::new(wp, &t.target_id);
+            read_findings(&paths).map(|f| f.len()).unwrap_or(0)
+        })
+        .sum();
     let coverage_obj = json!({
         "targets": targets.len(),
         "findings": findings_sum,
-        "assessed_pct": assessed_pct,
     });
 
     Ok(Json(ProjectDetail {
@@ -264,6 +260,42 @@ async fn project_coverage(
         }));
     }
     Ok(Json(rows))
+}
+
+/// Response shape for `GET /api/projects/:ws_id/coverage/assessed`.
+#[derive(Serialize)]
+struct AssessedPctResponse {
+    assessed_pct: Option<f64>,
+}
+
+/// `GET /api/projects/:ws_id/coverage/assessed` — heavy per-target audit
+/// aggregated into a single `assessed_pct` value.  This is the expensive
+/// computation that was previously blocking the synchronous project rollup.
+/// The frontend fetches it in parallel after the overview has already rendered.
+async fn project_coverage_assessed(
+    State(s): State<AppState>,
+    Path(ws_id): Path<String>,
+) -> ApiResult<Json<AssessedPctResponse>> {
+    let w = load_workspace(&s, &ws_id)?;
+    let wp = std::path::Path::new(&w.path);
+    let targets = discover_targets(wp).unwrap_or_default();
+    let mut total_concerns = 0usize;
+    let mut complete_concerns = 0usize;
+    for t in &targets {
+        let paths = CoveragePaths::new(wp, &t.target_id);
+        // Targets without a catalog (or with a malformed one) are skipped —
+        // they simply don't contribute to the assessed ratio.
+        if let Ok(a) = run_audit(&paths) {
+            total_concerns += a.total_concerns;
+            complete_concerns += a.complete_concerns;
+        }
+    }
+    let assessed_pct = if total_concerns > 0 {
+        Some((complete_concerns as f64 / total_concerns as f64) * 100.0)
+    } else {
+        None
+    };
+    Ok(Json(AssessedPctResponse { assessed_pct }))
 }
 
 /// `GET /api/projects/:ws_id/agents` — global agents merged with the project's
