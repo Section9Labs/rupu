@@ -275,12 +275,36 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
     }
 }
 
+#[derive(Deserialize)]
+struct AgentRunsQuery {
+    #[serde(flatten)]
+    page: crate::pagination::PageQuery,
+    lifecycle: Option<String>,
+}
+
+/// Classify an agent-run status string into a lifecycle group.
+/// `active`: still in progress. `failed`: errored/aborted/rejected.
+/// `completed`: everything else (ok/completed/None standalone runs).
+fn agent_in_lifecycle(status: Option<&str>, group: Option<&str>) -> bool {
+    match group {
+        None => true,
+        Some("active") => matches!(status, Some("running") | Some("awaiting_approval") | Some("pending")),
+        Some("failed") => matches!(status, Some("error") | Some("failed") | Some("rejected") | Some("aborted")),
+        Some("completed") => !matches!(
+            status,
+            Some("running") | Some("awaiting_approval") | Some("pending")
+                | Some("error") | Some("failed") | Some("rejected") | Some("aborted")
+        ),
+        _ => true, // unknown group → no filter
+    }
+}
+
 /// `GET /api/runs/agents` — returns agent runs from both standalone transcripts
 /// and session invocations, merged and sorted newest-first by `started_at`.
 /// Missing directories return `[]` (no 500).
 async fn list_agent_runs(
     State(s): State<AppState>,
-    Query(page): Query<crate::pagination::PageQuery>,
+    Query(q): Query<AgentRunsQuery>,
 ) -> ApiResult<Json<Vec<AgentRunRow>>> {
     let mut rows = collect_standalone_runs(&s.global_dir);
     collect_session_runs_from_dir(&s.global_dir.join("sessions"), &mut rows);
@@ -295,8 +319,13 @@ async fn list_agent_runs(
         (None, None) => std::cmp::Ordering::Equal,
     });
 
+    // Filter by lifecycle AFTER sorting and BEFORE pagination, so each tab
+    // paginates a pure set.
+    let lifecycle = q.lifecycle.clone();
+    rows.retain(|r| agent_in_lifecycle(r.status.as_deref(), lifecycle.as_deref()));
+
     // Slice to the page BEFORE reading transcripts, then fill usage per row.
-    let mut page_rows = crate::pagination::paginate(rows, &page);
+    let mut page_rows = crate::pagination::paginate(rows, &q.page);
     for row in &mut page_rows {
         if let Some(tp) = &row.transcript_path {
             let m = crate::usage::run_metrics_paths(&[std::path::PathBuf::from(tp)], &s.pricing);
@@ -435,4 +464,20 @@ async fn list_autoflow_events(
         }
     }
     Ok(Json(page_rows))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_lifecycle_classifies() {
+        assert!(agent_in_lifecycle(Some("running"), Some("active")));
+        assert!(agent_in_lifecycle(Some("error"), Some("failed")));
+        assert!(agent_in_lifecycle(Some("aborted"), Some("failed")));
+        assert!(agent_in_lifecycle(Some("ok"), Some("completed")));
+        assert!(agent_in_lifecycle(None, Some("completed"))); // standalone, no status → completed
+        assert!(!agent_in_lifecycle(Some("running"), Some("completed")));
+        assert!(agent_in_lifecycle(Some("running"), None)); // no filter → all
+    }
 }

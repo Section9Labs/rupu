@@ -723,8 +723,13 @@ export const api = {
   getAutoflowEvents(params?: ListParams): Promise<AutoflowEventRow[]> {
     return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${listQuery(params)}`);
   },
-  getAgentRuns(params?: ListParams): Promise<AgentRunRow[]> {
-    return request<AgentRunRow[]>(`/api/runs/agents${listQuery(params)}`);
+  getAgentRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed' }): Promise<AgentRunRow[]> {
+    const q = new URLSearchParams();
+    if (params?.offset != null) q.set('offset', String(params.offset));
+    if (params?.limit != null) q.set('limit', String(params.limit));
+    if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
+    const qs = q.toString();
+    return request<AgentRunRow[]>(`/api/runs/agents${qs ? `?${qs}` : ''}`);
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
@@ -747,8 +752,13 @@ export const api = {
   },
 
   // --- Sessions ---
-  getSessions(params?: ListParams): Promise<SessionSummary[]> {
-    return request<SessionSummary[]>(`/api/sessions${listQuery(params)}`);
+  getSessions(params?: ListParams & { scope?: 'active' | 'archived' }): Promise<SessionSummary[]> {
+    const q = new URLSearchParams();
+    if (params?.offset != null) q.set('offset', String(params.offset));
+    if (params?.limit != null) q.set('limit', String(params.limit));
+    if (params?.scope) q.set('scope', params.scope);
+    const qs = q.toString();
+    return request<SessionSummary[]>(`/api/sessions${qs ? `?${qs}` : ''}`);
   },
   getSession(id: string): Promise<SessionSummary> {
     return request<SessionSummary>(`/api/sessions/${encodeURIComponent(id)}`);
