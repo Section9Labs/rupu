@@ -709,8 +709,13 @@ export const api = {
   getSessionUsageTimeline(id: string): Promise<UsageTimelinePoint[]> {
     return request<UsageTimelinePoint[]>(`/api/sessions/${encodeURIComponent(id)}/usage-timeline`);
   },
-  getWorkflowRuns(params?: ListParams): Promise<RunListRow[]> {
-    return request<RunListRow[]>(`/api/runs/workflows${listQuery(params)}`);
+  getWorkflowRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed' }): Promise<RunListRow[]> {
+    const q = new URLSearchParams();
+    if (params?.offset != null) q.set('offset', String(params.offset));
+    if (params?.limit != null) q.set('limit', String(params.limit));
+    if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
+    const qs = q.toString();
+    return request<RunListRow[]>(`/api/runs/workflows${qs ? `?${qs}` : ''}`);
   },
   getAutoflowRuns(params?: ListParams): Promise<AutoflowCycleRow[]> {
     return request<AutoflowCycleRow[]>(`/api/runs/autoflows${listQuery(params)}`);
