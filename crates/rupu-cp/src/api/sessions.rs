@@ -200,8 +200,10 @@ pub(crate) fn collect_sessions(
 
 #[derive(Deserialize)]
 struct SessionsQuery {
-    #[serde(flatten)]
-    page: crate::pagination::PageQuery,
+    // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
+    // `Query`) cannot deserialize integers through a flattened struct.
+    offset: Option<usize>,
+    limit: Option<usize>,
     scope: Option<String>,
 }
 
@@ -213,7 +215,11 @@ async fn list_sessions(
     if let Some(scope) = q.scope.as_deref() {
         sessions.retain(|v| v.get("scope").and_then(|x| x.as_str()) == Some(scope));
     }
-    Ok(Json(crate::pagination::paginate(sessions, &q.page)))
+    let page = crate::pagination::PageQuery {
+        offset: q.offset,
+        limit: q.limit,
+    };
+    Ok(Json(crate::pagination::paginate(sessions, &page)))
 }
 
 async fn get_session(

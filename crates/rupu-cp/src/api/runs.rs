@@ -111,10 +111,22 @@ async fn list_runs(
 
 #[derive(serde::Deserialize)]
 struct WorkflowRunsQuery {
-    #[serde(flatten)]
-    page: crate::pagination::PageQuery,
+    // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
+    // `Query`) cannot deserialize integers through a flattened struct
+    // ("invalid type: string, expected usize"), so offset/limit are inlined.
+    offset: Option<usize>,
+    limit: Option<usize>,
     /// Optional lifecycle group: `active` | `completed` | `failed`.
     lifecycle: Option<String>,
+}
+
+impl WorkflowRunsQuery {
+    fn page(&self) -> crate::pagination::PageQuery {
+        crate::pagination::PageQuery {
+            offset: self.offset,
+            limit: self.limit,
+        }
+    }
 }
 
 /// Does this run's status fall in the given lifecycle group? `None` group → all.
@@ -145,7 +157,7 @@ async fn list_workflow_runs(
         .filter(|r| in_lifecycle(r.status, lifecycle))
         .collect();
     runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-    let page_runs = crate::pagination::paginate(runs, &q.page);
+    let page_runs = crate::pagination::paginate(runs, &q.page());
     Ok(Json(
         page_runs
             .iter()
@@ -245,5 +257,22 @@ mod tests {
         assert!(in_lifecycle(RunStatus::Rejected, Some("failed")));
         assert!(!in_lifecycle(RunStatus::Completed, Some("active")));
         assert!(in_lifecycle(RunStatus::Completed, None)); // no filter → all
+    }
+
+    // Regression: `#[serde(flatten)]` on a `PageQuery` made axum's `Query`
+    // (serde_urlencoded) reject numeric `limit`/`offset` with
+    // "invalid type: string, expected usize". Flat fields fix it.
+    #[test]
+    fn workflow_runs_query_deserializes_numeric_params() {
+        let uri: axum::http::Uri = "http://x/?limit=200&lifecycle=active".parse().unwrap();
+        let Query(q) = Query::<WorkflowRunsQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.limit, Some(200));
+        assert_eq!(q.offset, None);
+        assert_eq!(q.lifecycle.as_deref(), Some("active"));
+
+        let uri2: axum::http::Uri = "http://x/?offset=20&limit=20".parse().unwrap();
+        let Query(q2) = Query::<WorkflowRunsQuery>::try_from_uri(&uri2).unwrap();
+        assert_eq!(q2.offset, Some(20));
+        assert_eq!(q2.limit, Some(20));
     }
 }

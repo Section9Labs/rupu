@@ -277,9 +277,20 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
 
 #[derive(Deserialize)]
 struct AgentRunsQuery {
-    #[serde(flatten)]
-    page: crate::pagination::PageQuery,
+    // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
+    // `Query`) cannot deserialize integers through a flattened struct.
+    offset: Option<usize>,
+    limit: Option<usize>,
     lifecycle: Option<String>,
+}
+
+impl AgentRunsQuery {
+    fn page(&self) -> crate::pagination::PageQuery {
+        crate::pagination::PageQuery {
+            offset: self.offset,
+            limit: self.limit,
+        }
+    }
 }
 
 /// Classify an agent-run status string into a lifecycle group.
@@ -325,7 +336,7 @@ async fn list_agent_runs(
     rows.retain(|r| agent_in_lifecycle(r.status.as_deref(), lifecycle.as_deref()));
 
     // Slice to the page BEFORE reading transcripts, then fill usage per row.
-    let mut page_rows = crate::pagination::paginate(rows, &q.page);
+    let mut page_rows = crate::pagination::paginate(rows, &q.page());
     for row in &mut page_rows {
         if let Some(tp) = &row.transcript_path {
             let m = crate::usage::run_metrics_paths(&[std::path::PathBuf::from(tp)], &s.pricing);
