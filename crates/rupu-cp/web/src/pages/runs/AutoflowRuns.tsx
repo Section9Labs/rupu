@@ -83,7 +83,9 @@ export default function AutoflowRuns() {
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
-  // Page-0 fetch (mount + 5 s refresh) — resets pagination for both lists.
+  // Page-0 fetch (mount + 5 s refresh). Only replaces a list when the user
+  // hasn't scroll-extended past page 0 — otherwise the poll would discard
+  // accumulated pages and cause the reset/regrow flicker.
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
@@ -91,10 +93,22 @@ export default function AutoflowRuns() {
         api.getAutoflowEvents({ limit: PAGE }),
         api.getAutoflowRuns({ limit: PAGE }),
       ]);
-      setEvents(ev);
-      setEventsHasMore(ev.length >= PAGE);
-      setCycles(cy);
-      setCyclesHasMore(cy.length >= PAGE);
+      // Functional setState so the guard reads the CURRENT length, not a
+      // stale closure (refresh is memoised with [] deps).
+      setEvents((prev) => {
+        if (prev == null || prev.length <= PAGE) {
+          setEventsHasMore(ev.length >= PAGE);
+          return ev;
+        }
+        return prev;
+      });
+      setCycles((prev) => {
+        if (prev == null || prev.length <= PAGE) {
+          setCyclesHasMore(cy.length >= PAGE);
+          return cy;
+        }
+        return prev;
+      });
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load autoflow activity');

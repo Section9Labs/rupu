@@ -198,12 +198,22 @@ pub(crate) fn collect_sessions(
     sessions
 }
 
+#[derive(Deserialize)]
+struct SessionsQuery {
+    #[serde(flatten)]
+    page: crate::pagination::PageQuery,
+    scope: Option<String>,
+}
+
 async fn list_sessions(
     State(s): State<AppState>,
-    Query(page): Query<crate::pagination::PageQuery>,
+    Query(q): Query<SessionsQuery>,
 ) -> ApiResult<Json<Vec<serde_json::Value>>> {
-    let sessions = collect_sessions(&s.global_dir, &s.pricing);
-    Ok(Json(crate::pagination::paginate(sessions, &page)))
+    let mut sessions = collect_sessions(&s.global_dir, &s.pricing);
+    if let Some(scope) = q.scope.as_deref() {
+        sessions.retain(|v| v.get("scope").and_then(|x| x.as_str()) == Some(scope));
+    }
+    Ok(Json(crate::pagination::paginate(sessions, &q.page)))
 }
 
 async fn get_session(

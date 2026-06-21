@@ -1,13 +1,15 @@
 // Agent run-stream page — standalone and session-bound agent runs.
 // No DAG graph (agent runs have no workflow DAG); shows transcript_path as text.
 // status and started_at are optional (standalone runs may lack them).
+// Three tabs (Running / Completed / Failed-Rejected) with independent fetches.
+// Running polls every 5 s (unpaginated); Completed/Failed paginate (no poll) —
+// keeping paginated history off the poll loop avoids the scroll-reset flicker.
 
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AgentRunRow } from '../../lib/api';
 import { ListCard } from '../../components/lists/ListCard';
-import { SectionHeader } from '../../components/lists/SectionHeader';
 import MetricRow from '../../components/lists/MetricRow';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { cn } from '../../lib/cn';
@@ -17,6 +19,14 @@ import { formatDuration } from '../../lib/duration';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
+
+type Tab = 'active' | 'completed' | 'failed';
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'active', label: 'Running' },
+  { id: 'completed', label: 'Completed' },
+  { id: 'failed', label: 'Failed / Rejected' },
+];
 
 function shortId(id: string): string {
   return id.length > 10 ? `${id.slice(0, 8)}…` : id;
@@ -58,35 +68,44 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 export default function AgentRuns() {
+  const [tab, setTab] = useState<Tab>('active');
   const [agentRuns, setAgentRuns] = useState<AgentRunRow[] | null>(null);
-  const [hasMore, setHasMore] = useState(true);
+  const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
-  // Page-0 fetch (mount + 5 s refresh) — resets pagination.
+  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab change.
+  // Active: fetch ALL in one call (unpaginated) → poll never resets a scrolled
+  // list. Completed/Failed: page-0 only; loadMore appends.
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const data = await api.getAgentRuns({ limit: PAGE });
+      const limit = tab === 'active' ? 200 : PAGE;
+      const data = await api.getAgentRuns({ lifecycle: tab, limit });
       setAgentRuns(data);
-      setHasMore(data.length >= PAGE);
+      setHasMore(tab !== 'active' && data.length >= PAGE);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load agent runs');
     } finally {
       setRefreshing(false);
     }
-  }, []);
+  }, [tab]);
 
   useEffect(() => {
+    setAgentRuns(null); // show loading on tab switch
     void refresh();
-    const t = window.setInterval(() => void refresh(), 5000);
-    return () => window.clearInterval(t);
-  }, [refresh]);
+    if (tab === 'active') {
+      const t = window.setInterval(() => void refresh(), 5000);
+      return () => window.clearInterval(t);
+    }
+    return () => {};
+  }, [tab, refresh]);
 
   const loadMore = async () => {
+    if (tab === 'active') return; // active is unpaginated
     const current = agentRuns ?? [];
-    const next = await api.getAgentRuns({ offset: current.length, limit: PAGE });
+    const next = await api.getAgentRuns({ lifecycle: tab, offset: current.length, limit: PAGE });
     if (next.length === 0) { setHasMore(false); return; }
     setAgentRuns([...current, ...next]);
     if (next.length < PAGE) setHasMore(false);
@@ -119,6 +138,24 @@ export default function AgentRuns() {
         </button>
       </header>
 
+      {/* Lifecycle tabs */}
+      <div className="flex items-center gap-2 mb-5">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={cn(
+              'text-xs font-medium px-3 py-1.5 rounded-md border transition-colors',
+              tab === t.id
+                ? 'bg-brand-600 text-white border-brand-600'
+                : 'bg-panel text-ink-dim border-border hover:bg-slate-100',
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
       {error && (
         <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           {error}
@@ -127,32 +164,29 @@ export default function AgentRuns() {
 
       {agentRuns === null ? (
         <div className="text-sm text-ink-dim">Loading agent runs…</div>
-      ) : agentRuns.length === 0 ? (
+      ) : sorted.length === 0 ? (
         <AgentRunsEmpty />
       ) : (
         <section>
-          {sorted.length > 0 && (
-            <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
-              <UsageBarChart bars={sorted.map((r) => ({
-                id: r.run_id,
-                label: r.agent ?? r.run_id,
-                to: r.transcript_path
-                  ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}`
-                  : undefined,
-                input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
-                cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
-              }))} />
-            </div>
-          )}
-          <SectionHeader tone="muted" label="Agent Runs" count={sorted.length} />
+          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
+            <UsageBarChart bars={sorted.map((r) => ({
+              id: r.run_id,
+              label: r.agent ?? r.run_id,
+              to: r.transcript_path
+                ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}`
+                : undefined,
+              input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
+              cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
+            }))} />
+          </div>
           <ListCard>
             {sorted.map((r) => (
               <AgentRunEntry key={r.run_id} run={r} />
             ))}
           </ListCard>
-          {sorted.length > 0 && (
+          {tab !== 'active' && hasMore && (
             <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
-              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${sorted.length} —`}
+              {loading ? 'loading more…' : 'scroll for more'}
             </div>
           )}
         </section>

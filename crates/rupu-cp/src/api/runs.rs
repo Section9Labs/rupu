@@ -109,20 +109,43 @@ async fn list_runs(
     ))
 }
 
+#[derive(serde::Deserialize)]
+struct WorkflowRunsQuery {
+    #[serde(flatten)]
+    page: crate::pagination::PageQuery,
+    /// Optional lifecycle group: `active` | `completed` | `failed`.
+    lifecycle: Option<String>,
+}
+
+/// Does this run's status fall in the given lifecycle group? `None` group → all.
+fn in_lifecycle(status: RunStatus, group: Option<&str>) -> bool {
+    match group {
+        Some("active") => matches!(
+            status,
+            RunStatus::Running | RunStatus::Pending | RunStatus::AwaitingApproval
+        ),
+        Some("completed") => matches!(status, RunStatus::Completed),
+        Some("failed") => matches!(status, RunStatus::Failed | RunStatus::Rejected),
+        _ => true,
+    }
+}
+
 /// `GET /api/runs/workflows` — manual/direct runs only (no event or cron wake).
 async fn list_workflow_runs(
     State(s): State<AppState>,
-    Query(page): Query<crate::pagination::PageQuery>,
+    Query(q): Query<WorkflowRunsQuery>,
 ) -> ApiResult<Json<Vec<RunListRow>>> {
+    let lifecycle = q.lifecycle.as_deref();
     let mut runs: Vec<RunRecord> = s
         .run_store
         .list()
         .map_err(|e| ApiError::internal(e.to_string()))?
         .into_iter()
         .filter(|r| r.event.is_none() && r.source_wake_id.is_none())
+        .filter(|r| in_lifecycle(r.status, lifecycle))
         .collect();
     runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-    let page_runs = crate::pagination::paginate(runs, &page);
+    let page_runs = crate::pagination::paginate(runs, &q.page);
     Ok(Json(
         page_runs
             .iter()
@@ -212,5 +235,15 @@ mod tests {
         assert_eq!(v["usage"]["priced"], serde_json::Value::Bool(false));
         assert!(v.get("turns").is_some());
         assert!(v.get("duration_ms").is_some());
+    }
+
+    #[test]
+    fn in_lifecycle_groups_statuses() {
+        assert!(in_lifecycle(RunStatus::Running, Some("active")));
+        assert!(in_lifecycle(RunStatus::Completed, Some("completed")));
+        assert!(in_lifecycle(RunStatus::Failed, Some("failed")));
+        assert!(in_lifecycle(RunStatus::Rejected, Some("failed")));
+        assert!(!in_lifecycle(RunStatus::Completed, Some("active")));
+        assert!(in_lifecycle(RunStatus::Completed, None)); // no filter → all
     }
 }

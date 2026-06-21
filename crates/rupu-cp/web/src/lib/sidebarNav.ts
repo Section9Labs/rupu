@@ -46,9 +46,10 @@ export const sidebarNav: NavSection[] = [
   { kind: 'divider' },
   { kind: 'group', group: {
     id: 'runs', label: 'Runs', items: [
-      { to: '/runs/agents',    label: 'Agents',    icon: Sparkles,  enabled: true },
-      { to: '/runs/workflows', label: 'Workflows', icon: Workflow,  enabled: true },
-      { to: '/runs/autoflows', label: 'Autoflows', icon: Repeat,    enabled: true },
+      { to: '/runs/agents',    label: 'Agents',    icon: Sparkles,      enabled: true },
+      { to: '/runs/workflows', label: 'Workflows', icon: Workflow,      enabled: true },
+      { to: '/runs/autoflows', label: 'Autoflows', icon: Repeat,        enabled: true },
+      { to: '/sessions',       label: 'Sessions',  icon: MessageSquare, enabled: true },
     ],
   }},
   { kind: 'group', group: {
@@ -66,7 +67,6 @@ export const sidebarNav: NavSection[] = [
   }},
   { kind: 'group', group: {
     id: 'fleet', label: 'Fleet', items: [
-      { to: '/sessions', label: 'Sessions', icon: MessageSquare, enabled: true },
       { to: '/workers',  label: 'Workers',  icon: Server,        enabled: true },
     ],
   }},
