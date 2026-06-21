@@ -1,15 +1,15 @@
 // Workflow run-stream page — execution history for workflow runs.
-// Grouped by lifecycle (Active / Completed / Failed-Rejected).
-// Polls every 5 s. Each row links to the live Run detail graph.
+// Three tabs (Running / Completed / Failed-Rejected) with independent fetches.
+// Running polls every 5 s (unpaginated); Completed/Failed paginate (no poll) —
+// keeping paginated history off the poll loop avoids the scroll-reset flicker.
 
 import { useCallback, useEffect, useState } from 'react';
 import { Inbox, RefreshCw } from 'lucide-react';
-import { api, type RunListRow, type RunStatusStr } from '../../lib/api';
+import { api, type RunListRow } from '../../lib/api';
 import { StatusPill } from '../../components/StatusPill';
 import MetricRow from '../../components/lists/MetricRow';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { ListCard } from '../../components/lists/ListCard';
-import { SectionHeader, type SectionTone } from '../../components/lists/SectionHeader';
 import { cn } from '../../lib/cn';
 import { durationBetween } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
@@ -18,11 +18,17 @@ import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
 
-const ACTIVE: RunStatusStr[] = ['running', 'pending', 'awaiting_approval'];
-const TERMINAL_OK: RunStatusStr[] = ['completed'];
-const TERMINAL_BAD: RunStatusStr[] = ['failed', 'rejected'];
+type Tab = 'active' | 'completed' | 'failed';
+
+const TABS: { id: Tab; label: string }[] = [
+  { id: 'active', label: 'Running' },
+  { id: 'completed', label: 'Completed' },
+  { id: 'failed', label: 'Failed / Rejected' },
+];
 
 type TriggerFilter = 'all' | 'manual' | 'cron' | 'event';
+
+const FILTERS: TriggerFilter[] = ['all', 'manual', 'cron', 'event'];
 
 function shortId(id: string): string {
   return id.length > 10 ? `${id.slice(0, 8)}…` : id;
@@ -44,36 +50,45 @@ function TriggerChip({ trigger }: { trigger: string }) {
 }
 
 export default function WorkflowRuns() {
+  const [tab, setTab] = useState<Tab>('active');
   const [runs, setRuns] = useState<RunListRow[] | null>(null);
-  const [hasMore, setHasMore] = useState(true);
+  const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState<TriggerFilter>('all');
 
-  // Page-0 fetch (mount + 5 s refresh) — resets pagination.
+  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab change.
+  // Active: fetch ALL in one call (unpaginated) → poll never resets a scrolled
+  // list. Completed/Failed: page-0 only; loadMore appends.
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const data = await api.getWorkflowRuns({ limit: PAGE });
+      const limit = tab === 'active' ? 200 : PAGE;
+      const data = await api.getWorkflowRuns({ lifecycle: tab, limit });
       setRuns(data);
-      setHasMore(data.length >= PAGE);
+      setHasMore(tab !== 'active' && data.length >= PAGE);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load runs');
     } finally {
       setRefreshing(false);
     }
-  }, []);
+  }, [tab]);
 
   useEffect(() => {
+    setRuns(null); // show loading on tab switch
     void refresh();
-    const t = window.setInterval(() => void refresh(), 5000);
-    return () => window.clearInterval(t);
-  }, [refresh]);
+    if (tab === 'active') {
+      const t = window.setInterval(() => void refresh(), 5000);
+      return () => window.clearInterval(t);
+    }
+    return () => {};
+  }, [tab, refresh]);
 
   const loadMore = async () => {
+    if (tab === 'active') return; // active is unpaginated
     const current = runs ?? [];
-    const next = await api.getWorkflowRuns({ offset: current.length, limit: PAGE });
+    const next = await api.getWorkflowRuns({ lifecycle: tab, offset: current.length, limit: PAGE });
     if (next.length === 0) { setHasMore(false); return; }
     setRuns([...current, ...next]);
     if (next.length < PAGE) setHasMore(false);
@@ -82,11 +97,6 @@ export default function WorkflowRuns() {
   const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
 
   const filtered = (runs ?? []).filter((r) => filter === 'all' || r.trigger === filter);
-  const active = filtered.filter((r) => ACTIVE.includes(r.status));
-  const done   = filtered.filter((r) => TERMINAL_OK.includes(r.status));
-  const bad    = filtered.filter((r) => TERMINAL_BAD.includes(r.status));
-
-  const FILTERS: TriggerFilter[] = ['all', 'manual', 'cron', 'event'];
 
   return (
     <div className="p-8 max-w-5xl">
@@ -103,6 +113,24 @@ export default function WorkflowRuns() {
           Refresh
         </button>
       </header>
+
+      {/* Lifecycle tabs */}
+      <div className="flex items-center gap-2 mb-4">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            className={cn(
+              'text-xs font-medium px-3 py-1.5 rounded-md border transition-colors',
+              tab === t.id
+                ? 'bg-brand-600 text-white border-brand-600'
+                : 'bg-panel text-ink-dim border-border hover:bg-slate-100',
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
 
       {/* Trigger filter chips */}
       <div className="flex items-center gap-2 mb-5">
@@ -134,48 +162,26 @@ export default function WorkflowRuns() {
         <WorkflowRunsEmpty hasRuns={runs.length > 0} />
       ) : (
         <div className="space-y-6">
-          {runs.length > 0 && (
-            <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
-              <UsageBarChart bars={runs.map((r) => ({
-                id: r.id, label: r.workflow_name, to: `/runs/${encodeURIComponent(r.id)}`,
-                input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
-                cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
-              }))} />
-            </div>
-          )}
-          <WorkflowRunSection tone="progress" label="Active"            runs={active} />
-          <WorkflowRunSection tone="good"     label="Completed"         runs={done}   />
-          <WorkflowRunSection tone="bad"      label="Failed / Rejected" runs={bad}    />
-          {runs.length > 0 && (
+          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
+            <UsageBarChart bars={filtered.map((r) => ({
+              id: r.id, label: r.workflow_name, to: `/runs/${encodeURIComponent(r.id)}`,
+              input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
+              cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
+            }))} />
+          </div>
+          <ListCard>
+            {filtered.map((r) => (
+              <WorkflowRunRow key={r.id} run={r} />
+            ))}
+          </ListCard>
+          {tab !== 'active' && hasMore && (
             <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
-              {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${runs.length} —`}
+              {loading ? 'loading more…' : 'scroll for more'}
             </div>
           )}
         </div>
       )}
     </div>
-  );
-}
-
-function WorkflowRunSection({
-  tone,
-  label,
-  runs,
-}: {
-  tone: SectionTone;
-  label: string;
-  runs: RunListRow[];
-}) {
-  if (runs.length === 0) return null;
-  return (
-    <section>
-      <SectionHeader tone={tone} label={label} count={runs.length} />
-      <ListCard>
-        {runs.map((r) => (
-          <WorkflowRunRow key={r.id} run={r} />
-        ))}
-      </ListCard>
-    </section>
   );
 }
 
