@@ -7,6 +7,7 @@ import {
   Repeat,
   Server,
   Settings,
+  ShieldAlert,
   ShieldCheck,
   Sparkles,
   Workflow,
@@ -56,6 +57,7 @@ export const sidebarNav: NavSection[] = [
     id: 'observe', label: 'Observe', items: [
       { to: '/events',   label: 'Live Events', icon: Radio,       enabled: true },
       { to: '/coverage', label: 'Coverage',    icon: ShieldCheck, enabled: true },
+      { to: '/findings', label: 'Findings',    icon: ShieldAlert, enabled: true },
     ],
   }},
   { kind: 'group', group: {
