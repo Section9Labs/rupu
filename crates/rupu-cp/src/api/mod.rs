@@ -3,6 +3,7 @@ pub mod autoflows;
 pub mod coverage;
 pub mod dashboard;
 pub mod events;
+pub mod findings;
 pub mod graph;
 pub mod projects;
 pub mod run_streams;

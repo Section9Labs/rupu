@@ -577,6 +577,32 @@ export interface FindingRecord {
   declared_at: string;
 }
 
+/** Severity rollup for a set of findings — matches the `GET /api/findings`
+ *  summary block. `total` is the count across every severity. */
+export interface FindingsSummary {
+  total: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  info: number;
+}
+
+/** One finding row from `GET /api/findings` — a `FindingRecord` flattened with
+ *  its provenance keys (`ws_id` / `project` / `target_id`) at the top level. */
+export interface FindingOut extends FindingRecord {
+  ws_id: string;
+  project: string;
+  target_id: string;
+}
+
+/** Response from `GET /api/findings` — the severity-sorted cross-project
+ *  findings list plus the severity rollup. */
+export interface FindingsResponse {
+  findings: FindingOut[];
+  summary: FindingsSummary;
+}
+
 /** Touch strength, strongest last — matches rupu-coverage's `TouchStrength`. */
 export type TouchStrength = 'glob' | 'cmd' | 'grep' | 'read' | 'edit';
 
@@ -776,6 +802,11 @@ export const api = {
   getCoverageDetail(target: string, wsId?: string): Promise<CoverageDetail> {
     const qs = wsId ? `?ws_id=${encodeURIComponent(wsId)}` : '';
     return request<CoverageDetail>(`/api/coverage/${encodeURIComponent(target)}${qs}`);
+  },
+
+  // --- Findings ---
+  getFindings(): Promise<FindingsResponse> {
+    return request<FindingsResponse>('/api/findings');
   },
 
   /**
