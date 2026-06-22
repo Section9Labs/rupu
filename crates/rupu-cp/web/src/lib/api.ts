@@ -577,6 +577,17 @@ export interface FindingRecord {
   declared_at: string;
 }
 
+/** Severity rollup for a set of findings — matches the `GET /api/findings`
+ *  summary block. `total` is the count across every severity. */
+export interface FindingsSummary {
+  total: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  info: number;
+}
+
 /** Touch strength, strongest last — matches rupu-coverage's `TouchStrength`. */
 export type TouchStrength = 'glob' | 'cmd' | 'grep' | 'read' | 'edit';
 
