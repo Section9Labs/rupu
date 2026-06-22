@@ -270,6 +270,50 @@ export function buildRunGraphModel(
   }
 
   // ------------------------------------------------------------------
+  // Phase 5b: Reconcile lingering in-flight state against a terminally
+  // successful run.
+  //
+  // A unit checkpoint with `success: null` (no terminal checkpoint / an
+  // unmatched `unit_completed`) folds to a non-terminal state in Phases 3-5,
+  // which surfaces as "awaiting" in the graph. On a run that has already
+  // completed successfully, nothing else reconciles those leftovers — so a
+  // finished run can still display in-flight units. Promote them to 'done'.
+  //
+  // This ONLY runs for a successfully completed run (`status === 'completed'`).
+  // Failed / rejected / still-running / pending runs are left untouched so
+  // genuine failures and genuine in-flight work keep rendering truthfully.
+  if (g.run.status === 'completed') {
+    for (const node of nodeMap.values()) {
+      if (
+        node.state === 'pending' ||
+        node.state === 'running' ||
+        node.state === 'awaiting_approval'
+      ) {
+        node.state = 'done';
+      }
+
+      if (node.fanout) {
+        let changed = false;
+        for (const unit of node.fanout.units) {
+          if (unit.state === 'running' || unit.state === 'awaiting_approval') {
+            unit.state = 'done';
+            changed = true;
+          }
+        }
+        // Recompute byState from the (possibly promoted) units so the
+        // fan-out badges stay consistent with the unit list.
+        if (changed) {
+          const byState = emptyByState();
+          for (const u of node.fanout.units) {
+            byState[u.state] += 1;
+          }
+          node.fanout.byState = byState;
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
   // Phase 6: Build edges — linear chain.
   // ------------------------------------------------------------------
   const nodes = g.workflow.steps

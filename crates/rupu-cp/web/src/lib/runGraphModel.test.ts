@@ -369,6 +369,42 @@ describe('unit checkpoint with success: null', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 4c. Phase 5b: completed run reconciles lingering in-flight units to done
+// ---------------------------------------------------------------------------
+
+describe('completed run reconciliation (Phase 5b)', () => {
+  function makeNullUnit(): UnitCheckpoint {
+    return {
+      step_id: 'b', index: 0, item: 'file-a.ts',
+      run_id: runId(), transcript_path: '/tmp/t0.jsonl',
+      output: '', success: null, finished_at: '2026-06-18T00:01:00Z',
+    };
+  }
+
+  it('completed run: success:null unit and parent node both promote to done', () => {
+    const g = makeGraph({ steps: [STEP_B], units: [makeNullUnit()] });
+    g.run.status = 'completed';
+    const model = buildRunGraphModel(g, []);
+    const b = model.nodeById('b')!;
+    expect(b.state).toBe('done');
+    expect(b.fanout!.units[0].state).toBe('done');
+    // byState badges recomputed to match the promoted units.
+    expect(b.fanout!.byState.done).toBe(1);
+    expect(b.fanout!.byState.running).toBe(0);
+  });
+
+  it('failed run: success:null unit stays running (NOT silently marked done)', () => {
+    const g = makeGraph({ steps: [STEP_B], units: [makeNullUnit()] });
+    g.run.status = 'failed';
+    const model = buildRunGraphModel(g, []);
+    const b = model.nodeById('b')!;
+    expect(b.fanout!.units[0].state).toBe('running');
+    expect(b.fanout!.byState.running).toBe(1);
+    expect(b.fanout!.byState.done).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. coerceItem: object item → JSON string key
 // ---------------------------------------------------------------------------
 
