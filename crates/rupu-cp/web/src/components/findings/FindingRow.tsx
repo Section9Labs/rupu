@@ -7,6 +7,7 @@ import { useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { normFindingSeverity, type FindingRecord } from '../../lib/api';
 import { cn } from '../../lib/cn';
+import { cweFromFinding } from '../../lib/cwe';
 import { SEVERITY_STYLE } from '../../lib/severity';
 
 export interface FindingRowProps {
@@ -33,6 +34,8 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
   const references = finding.evidence?.references ?? [];
   const hasEvidence = Boolean(rationale || excerpt || references.length > 0);
 
+  const cwe = cweFromFinding(finding);
+
   // Provenance chip text — `project · target`, omitting empty halves.
   const provParts: string[] = [];
   if (project) provParts.push(project);
@@ -45,7 +48,7 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
         {/* Severity badge */}
         <span
           className={cn(
-            'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ring-1 mt-0.5',
+            'shrink-0 inline-flex items-center justify-center text-center min-w-[72px] rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ring-1 mt-0.5',
             s.pill,
           )}
         >
@@ -66,6 +69,16 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
           )}
           <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
             {location && <span className="font-mono break-all">{location}</span>}
+            {cwe && (
+              <a
+                href={cwe.url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200"
+              >
+                {cwe.id}
+              </a>
+            )}
             {finding.concern_id && (
               <span>
                 concern <span className="font-mono">{finding.concern_id}</span>

@@ -594,6 +594,7 @@ export interface FindingOut extends FindingRecord {
   ws_id: string;
   project: string;
   target_id: string;
+  workflow_name?: string | null;
 }
 
 /** Response from `GET /api/findings` — the severity-sorted cross-project
@@ -805,8 +806,12 @@ export const api = {
   },
 
   // --- Findings ---
-  getFindings(): Promise<FindingsResponse> {
-    return request<FindingsResponse>('/api/findings');
+  getFindings(opts?: { wsId?: string; workflow?: string }): Promise<FindingsResponse> {
+    const q = new URLSearchParams();
+    if (opts?.wsId) q.set('ws_id', opts.wsId);
+    if (opts?.workflow) q.set('workflow', opts.workflow);
+    const qs = q.toString();
+    return request<FindingsResponse>(`/api/findings${qs ? `?${qs}` : ''}`);
   },
 
   /**
