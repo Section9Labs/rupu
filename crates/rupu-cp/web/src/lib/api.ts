@@ -806,10 +806,11 @@ export const api = {
   },
 
   // --- Findings ---
-  getFindings(opts?: { wsId?: string; workflow?: string }): Promise<FindingsResponse> {
+  getFindings(opts?: { wsId?: string; workflow?: string; runId?: string }): Promise<FindingsResponse> {
     const q = new URLSearchParams();
     if (opts?.wsId) q.set('ws_id', opts.wsId);
     if (opts?.workflow) q.set('workflow', opts.workflow);
+    if (opts?.runId) q.set('run_id', opts.runId);
     const qs = q.toString();
     return request<FindingsResponse>(`/api/findings${qs ? `?${qs}` : ''}`);
   },

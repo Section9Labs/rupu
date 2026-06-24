@@ -5,10 +5,11 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft, GitBranch, ListOrdered, Pause } from 'lucide-react';
+import { ArrowLeft, GitBranch, ListOrdered, Pause, ShieldAlert } from 'lucide-react';
 import {
   api,
   isKnownRunEvent,
+  type FindingsResponse,
   type RunEvent,
   type RunGraphResponse,
   type RunRecord,
@@ -16,6 +17,9 @@ import {
 } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
 import { TabBar, TabButton } from '../components/TabBar';
+import { ListCard } from '../components/lists/ListCard';
+import { FindingMetrics } from '../components/findings/FindingMetrics';
+import { FindingRow } from '../components/findings/FindingRow';
 import RunGraph, { type NodeSelection } from '../components/RunGraph';
 import FanoutDrill from '../components/FanoutDrill';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
@@ -28,7 +32,7 @@ import { formatTokens, formatCost } from '../lib/usage';
 
 const MAX_EVENTS = 2000;
 
-type Tab = 'graph' | 'events';
+type Tab = 'graph' | 'events' | 'findings';
 
 /**
  * Default transcript selection on (re)load: prefer a running node's transcript,
@@ -71,6 +75,12 @@ export default function RunDetail() {
   // a global index across all of the run's steps (see effect below).
   const [series, setSeries] = useState<UsageTimelinePoint[]>([]);
 
+  // Scoped findings for THIS run — lazy-loaded when the Findings tab is first
+  // opened. `null` = not yet loaded / loading.
+  const [findings, setFindings] = useState<FindingsResponse | null>(null);
+  const [findingsError, setFindingsError] = useState<string | null>(null);
+  const findingsRequestedRef = useRef(false);
+
   // Selected transcript for the bottom split pane. Null until a node is clicked
   // or the default is seeded once the model first becomes available.
   const [sel, setSel] = useState<NodeSelection | null>(null);
@@ -85,6 +95,9 @@ export default function RunDetail() {
     setLoadError(null);
     setSel(null);
     seededSelRef.current = false;
+    setFindings(null);
+    setFindingsError(null);
+    findingsRequestedRef.current = false;
     api
       .getRunGraph(id)
       .then((res) => {
@@ -120,6 +133,29 @@ export default function RunDetail() {
       cancelled = true;
     };
   }, [id]);
+
+  // Lazy-load this run's findings the first time the Findings tab is opened.
+  // Keyed on (id, tab); the ref guard ensures a single fetch per run id.
+  useEffect(() => {
+    if (!id || tab !== 'findings' || findingsRequestedRef.current) return;
+    findingsRequestedRef.current = true;
+    let cancelled = false;
+    setFindings(null);
+    setFindingsError(null);
+    api
+      .getFindings({ runId: id })
+      .then((res) => {
+        if (cancelled) return;
+        setFindings(res);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setFindingsError(e instanceof Error ? e.message : 'Failed to load findings');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, tab]);
 
   // ONE SSE subscription per open run — shared by graph + feed.
   useEffect(() => {
@@ -297,11 +333,12 @@ export default function RunDetail() {
         <TabBar>
           <TabButton active={tab === 'graph'} onClick={() => setTab('graph')} icon={GitBranch} label="Graph" />
           <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={ListOrdered} label="Events" />
+          <TabButton active={tab === 'findings'} onClick={() => setTab('findings')} icon={ShieldAlert} label="Findings" />
         </TabBar>
       </div>
 
       <div className="min-h-0 flex-1 px-8 py-6">
-        {tab === 'graph' ? (
+        {tab === 'graph' && (
           <div className="flex h-full min-h-0 flex-col gap-4">
             {/* Top pane: the run graph (~55%). */}
             <div className="min-h-0 flex-[55] overflow-auto">
@@ -326,9 +363,37 @@ export default function RunDetail() {
               )}
             </div>
           </div>
-        ) : (
+        )}
+        {tab === 'events' && (
           <div className="h-full min-h-0">
             <RunEventFeed events={events} connection={connection} />
+          </div>
+        )}
+        {tab === 'findings' && (
+          <div className="h-full min-h-0 overflow-auto">
+            {findingsError ? (
+              <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                {findingsError}
+              </div>
+            ) : findings === null ? (
+              <p className="text-sm text-ink-dim">Loading findings…</p>
+            ) : findings.findings.length === 0 ? (
+              <p className="text-sm text-ink-mute">No findings for this run.</p>
+            ) : (
+              <div className="space-y-4">
+                <FindingMetrics summary={findings.summary} />
+                <ListCard>
+                  {findings.findings.map((f) => (
+                    <FindingRow
+                      key={`${f.target_id}/${f.id}`}
+                      finding={f}
+                      project={f.project}
+                      targetId={f.target_id}
+                    />
+                  ))}
+                </ListCard>
+              </div>
+            )}
           </div>
         )}
       </div>
