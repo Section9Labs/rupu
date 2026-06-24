@@ -12,8 +12,15 @@ import {
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react';
-import { api, type ProjectDetail as ProjectDetailType, type ProjectAssessedPct } from '../lib/api';
+import {
+  api,
+  type ProjectDetail as ProjectDetailType,
+  type ProjectAssessedPct,
+  type FindingsResponse,
+} from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
+import { FindingMetrics } from '../components/findings/FindingMetrics';
+import { FindingRow } from '../components/findings/FindingRow';
 import { StatusPill } from '../components/StatusPill';
 import { relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -96,6 +103,9 @@ export default function ProjectDetail() {
   /** assessed_pct fetched lazily in parallel — undefined = still loading,
    * null = no catalog / backend returned null. */
   const [assessedPct, setAssessedPct] = useState<ProjectAssessedPct | undefined>(undefined);
+  /** Scoped findings for this project — null = still loading. */
+  const [findings, setFindings] = useState<FindingsResponse | null>(null);
+  const [findingsError, setFindingsError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!wsId) return;
@@ -132,6 +142,27 @@ export default function ProjectDetail() {
       .catch(() => {
         // Swallow errors — assessed % is non-critical; tile stays in "…" state.
         if (!cancelled) setAssessedPct({ assessed_pct: null });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [wsId]);
+
+  // Scoped findings for this project, fetched independently of the overview.
+  useEffect(() => {
+    if (!wsId) return;
+    let cancelled = false;
+    setFindings(null);
+    setFindingsError(null);
+    api
+      .getFindings({ wsId })
+      .then((data) => {
+        if (cancelled) return;
+        setFindings(data);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setFindingsError(e instanceof Error ? e.message : 'Failed to load findings');
       });
     return () => {
       cancelled = true;
@@ -300,6 +331,40 @@ export default function ProjectDetail() {
               </Link>
             ))}
           </ListCard>
+        )}
+      </section>
+
+      {/* ── Findings ── */}
+      <section>
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-sm font-semibold text-ink">Findings</h2>
+        </div>
+        {findingsError ? (
+          <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {findingsError}
+          </div>
+        ) : findings === null ? (
+          <div className="rounded-xl border border-border bg-panel/50 px-4 py-3 text-xs text-ink-dim">
+            Loading findings…
+          </div>
+        ) : findings.findings.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-border bg-panel/50 px-4 py-3 text-xs text-ink-mute">
+            No findings for this project.
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <FindingMetrics summary={findings.summary} />
+            <ListCard>
+              {findings.findings.map((f) => (
+                <FindingRow
+                  key={`${f.ws_id}/${f.target_id}/${f.id}`}
+                  finding={f}
+                  project={f.project}
+                  targetId={f.target_id}
+                />
+              ))}
+            </ListCard>
+          </div>
         )}
       </section>
 

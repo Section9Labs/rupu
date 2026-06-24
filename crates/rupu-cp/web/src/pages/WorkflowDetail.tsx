@@ -6,9 +6,12 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
-import { api, type WorkflowDetail } from '../lib/api';
+import { api, type WorkflowDetail, type FindingsResponse } from '../lib/api';
 import { cn } from '../lib/cn';
 import { ScopeChip } from './Workflows';
+import { ListCard } from '../components/lists/ListCard';
+import { FindingMetrics } from '../components/findings/FindingMetrics';
+import { FindingRow } from '../components/findings/FindingRow';
 
 // ── Loose narrowing helpers ──────────────────────────────────────────────
 // The backend hands back `workflow: Record<string, unknown>`; we read only the
@@ -50,6 +53,9 @@ export default function WorkflowDetailPage() {
 
   const [detail, setDetail] = useState<WorkflowDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Scoped findings for this workflow — null = still loading. */
+  const [findings, setFindings] = useState<FindingsResponse | null>(null);
+  const [findingsError, setFindingsError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!name) return;
@@ -65,6 +71,27 @@ export default function WorkflowDetailPage() {
       .catch((e: unknown) => {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : 'Failed to load workflow');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [name]);
+
+  // Scoped findings for this workflow.
+  useEffect(() => {
+    if (!name) return;
+    let cancelled = false;
+    setFindings(null);
+    setFindingsError(null);
+    api
+      .getFindings({ workflow: name })
+      .then((data) => {
+        if (cancelled) return;
+        setFindings(data);
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setFindingsError(e instanceof Error ? e.message : 'Failed to load findings');
       });
     return () => {
       cancelled = true;
@@ -123,6 +150,34 @@ export default function WorkflowDetailPage() {
               <StepRow key={`${s.id ?? 'step'}-${i}`} step={s} index={i} last={i === steps.length - 1} />
             ))}
           </ol>
+        )}
+      </section>
+
+      {/* ── Findings ────────────────────────────────────────────── */}
+      <section className="mt-8">
+        <h2 className="text-sm font-semibold text-ink mb-3 pl-1">Findings</h2>
+        {findingsError ? (
+          <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {findingsError}
+          </div>
+        ) : findings === null ? (
+          <p className="text-sm text-ink-dim pl-1">Loading findings…</p>
+        ) : findings.findings.length === 0 ? (
+          <p className="text-sm text-ink-mute pl-1">No findings for this workflow.</p>
+        ) : (
+          <div className="space-y-4">
+            <FindingMetrics summary={findings.summary} />
+            <ListCard>
+              {findings.findings.map((f) => (
+                <FindingRow
+                  key={`${f.ws_id}/${f.target_id}/${f.id}`}
+                  finding={f}
+                  project={f.project}
+                  targetId={f.target_id}
+                />
+              ))}
+            </ListCard>
+          </div>
         )}
       </section>
 
