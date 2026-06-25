@@ -1,13 +1,16 @@
-// Project overview dashboard — layout A from the approved mockup.
-// Identity header + 4 rollup tiles + Recent runs / Coverage / Sessions sections.
+// Project detail — tabbed shell. Loads the project bundle once, paints the
+// persistent identity header + 5 rollup tiles, then a TabBar that routes
+// between five tab bodies (Overview / Runs / Findings / Sessions / Coverage).
+// The active tab is driven by the `tab` prop, set per-route in App.tsx.
 
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
 import {
   Activity,
   GitBranch,
   GitFork,
-  Library,
+  LayoutDashboard,
+  ListOrdered,
   MessageSquare,
   ShieldAlert,
   ShieldCheck,
@@ -16,14 +19,17 @@ import {
   api,
   type ProjectDetail as ProjectDetailType,
   type ProjectAssessedPct,
-  type FindingsResponse,
 } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
-import { FindingMetrics } from '../components/findings/FindingMetrics';
-import { FindingRow } from '../components/findings/FindingRow';
-import { StatusPill } from '../components/StatusPill';
+import { TabBar, TabButton } from '../components/TabBar';
+import ProjectOverviewTab from '../components/project/ProjectOverviewTab';
+import ProjectRunsTab from '../components/project/ProjectRunsTab';
+import ProjectFindingsTab from '../components/project/ProjectFindingsTab';
+import ProjectSessionsTab from '../components/project/ProjectSessionsTab';
+import ProjectCoverageTab from '../components/project/ProjectCoverageTab';
 import { relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
+
+export type ProjectTab = 'overview' | 'runs' | 'findings' | 'sessions' | 'coverage';
 
 // ---------------------------------------------------------------------------
 // Rollup tile
@@ -53,59 +59,18 @@ function RollupTile({
 }
 
 // ---------------------------------------------------------------------------
-// Section header with "see all" link
+// Page (shell)
 // ---------------------------------------------------------------------------
 
-function SectionTitle({ title, href }: { title: string; href: string }) {
-  return (
-    <div className="flex items-center justify-between mb-2">
-      <h2 className="text-sm font-semibold text-ink">{title}</h2>
-      <Link
-        to={href}
-        className="text-[11px] font-medium text-brand-600 hover:text-brand-700 transition-colors"
-      >
-        see all →
-      </Link>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Trigger chip (reuse the pattern from WorkflowRuns)
-// ---------------------------------------------------------------------------
-
-const TRIGGER_CHIP_CLS: Record<string, string> = {
-  manual: 'bg-slate-100 text-slate-600',
-  cron: 'bg-violet-50 text-violet-700',
-  event: 'bg-sky-50 text-sky-700',
-};
-
-function TriggerChip({ trigger }: { trigger: string }) {
-  const cls = TRIGGER_CHIP_CLS[trigger] ?? 'bg-slate-100 text-slate-600';
-  return (
-    <span
-      className={`inline-flex items-center rounded text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5 ${cls}`}
-    >
-      {trigger}
-    </span>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Page
-// ---------------------------------------------------------------------------
-
-export default function ProjectDetail() {
+export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }) {
   const { wsId } = useParams<{ wsId: string }>();
+  const navigate = useNavigate();
   const [detail, setDetail] = useState<ProjectDetailType | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
   /** assessed_pct fetched lazily in parallel — undefined = still loading,
    * null = no catalog / backend returned null. */
   const [assessedPct, setAssessedPct] = useState<ProjectAssessedPct | undefined>(undefined);
-  /** Scoped findings for this project — null = still loading. */
-  const [findings, setFindings] = useState<FindingsResponse | null>(null);
-  const [findingsError, setFindingsError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!wsId) return;
@@ -142,27 +107,6 @@ export default function ProjectDetail() {
       .catch(() => {
         // Swallow errors — assessed % is non-critical; tile stays in "…" state.
         if (!cancelled) setAssessedPct({ assessed_pct: null });
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [wsId]);
-
-  // Scoped findings for this project, fetched independently of the overview.
-  useEffect(() => {
-    if (!wsId) return;
-    let cancelled = false;
-    setFindings(null);
-    setFindingsError(null);
-    api
-      .getFindings({ wsId })
-      .then((data) => {
-        if (cancelled) return;
-        setFindings(data);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setFindingsError(e instanceof Error ? e.message : 'Failed to load findings');
       });
     return () => {
       cancelled = true;
@@ -213,14 +157,12 @@ export default function ProjectDetail() {
     );
   }
 
-  const { project: p, runs, sessions, coverage, recent_runs, usage } = detail;
+  const { project: p, runs, sessions, coverage, usage } = detail;
 
   // assessed_pct arrives from the lazy parallel endpoint.
   // `assessedPct === undefined` means still in-flight → show "…".
-  const rawPct =
-    assessedPct !== undefined ? assessedPct.assessed_pct : undefined;
-  const pct =
-    rawPct != null ? Math.min(100, Math.max(0, rawPct)) : null;
+  const rawPct = assessedPct !== undefined ? assessedPct.assessed_pct : undefined;
+  const pct = rawPct != null ? Math.min(100, Math.max(0, rawPct)) : null;
   // "…" while loading, "—" when loaded but null (no catalog).
   const pctLabel =
     assessedPct === undefined ? '…' : pct !== null ? `${Math.round(pct)}%` : '—';
@@ -229,7 +171,6 @@ export default function ProjectDetail() {
 
   return (
     <div className="p-8 max-w-5xl space-y-6">
-
       {/* ── Identity header ── */}
       <header className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
         <h1 className="text-lg font-bold text-ink">{p.name}</h1>
@@ -247,9 +188,7 @@ export default function ProjectDetail() {
               {p.branch}
             </span>
           )}
-          {p.last_run_at && (
-            <span>last run {relativeTime(p.last_run_at)}</span>
-          )}
+          {p.last_run_at && <span>last run {relativeTime(p.last_run_at)}</span>}
           <span className="font-mono text-ink-mute">{p.ws_id}</span>
         </div>
       </header>
@@ -277,10 +216,7 @@ export default function ProjectDetail() {
             ) : null}
           </div>
         </RollupTile>
-        <RollupTile
-          label="Findings"
-          value={coverage.findings}
-        >
+        <RollupTile label="Findings" value={coverage.findings}>
           {coverage.findings > 0 && (
             <p className="mt-1 text-[11px] text-red-600 font-medium flex items-center gap-1">
               <ShieldAlert size={11} />
@@ -297,160 +233,59 @@ export default function ProjectDetail() {
         {usage && (
           <RollupTile
             label="Usage"
-            value={formatCost(usage.cost_usd) + (usage.cost_usd !== null && !usage.priced ? '*' : '')}
+            value={
+              formatCost(usage.cost_usd) +
+              (usage.cost_usd !== null && !usage.priced ? '*' : '')
+            }
             sub={`${formatTokens(usage.total_tokens)} tok`}
           />
         )}
       </section>
 
-      {/* ── Recent runs ── */}
-      <section>
-        <SectionTitle title="Recent runs" href={`/projects/${encodedId}/runs`} />
-        {recent_runs.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-border bg-panel/50 py-8 flex items-center justify-center">
-            <p className="text-xs text-ink-mute">No runs yet</p>
-          </div>
-        ) : (
-          <ListCard>
-            {recent_runs.map((r) => (
-              <Link
-                key={r.id}
-                to={`/runs/${encodeURIComponent(r.id)}`}
-                className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-ink truncate">{r.workflow_name}</span>
-                    <TriggerChip trigger={r.trigger} />
-                  </div>
-                  <p className="text-[11px] text-ink-dim mt-0.5">
-                    {relativeTime(r.started_at)}
-                  </p>
-                </div>
-                <StatusPill status={r.status} />
-              </Link>
-            ))}
-          </ListCard>
-        )}
-      </section>
-
-      {/* ── Findings ── */}
-      <section>
-        <div className="flex items-center justify-between mb-2">
-          <h2 className="text-sm font-semibold text-ink">Findings</h2>
-        </div>
-        {findingsError ? (
-          <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-            {findingsError}
-          </div>
-        ) : findings === null ? (
-          <div className="rounded-xl border border-border bg-panel/50 px-4 py-3 text-xs text-ink-dim">
-            Loading findings…
-          </div>
-        ) : findings.findings.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-border bg-panel/50 px-4 py-3 text-xs text-ink-mute">
-            No findings for this project.
-          </div>
-        ) : (
-          <div className="space-y-4">
-            <FindingMetrics summary={findings.summary} />
-            <ListCard>
-              {findings.findings.map((f) => (
-                <FindingRow
-                  key={`${f.ws_id}/${f.target_id}/${f.id}`}
-                  finding={f}
-                  project={f.project}
-                  targetId={f.target_id}
-                />
-              ))}
-            </ListCard>
-          </div>
-        )}
-      </section>
-
-      {/* ── Bottom split: Coverage + Sessions ── */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-
-        {/* Coverage summary */}
-        <section>
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-sm font-semibold text-ink">Coverage</h2>
-            <Link
-              to={`/projects/${encodedId}/coverage`}
-              className="text-[11px] font-medium text-brand-600 hover:text-brand-700 transition-colors"
-            >
-              open →
-            </Link>
-          </div>
-          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 text-[12px] text-ink-dim">
-            {coverage.targets === 0 ? (
-              <span className="text-ink-mute">No coverage targets yet</span>
-            ) : (
-              <>
-                <span className="font-medium text-ink">{coverage.targets}</span>{' '}
-                target{coverage.targets !== 1 ? 's' : ''} ·{' '}
-                <span className={pct !== null ? 'font-medium text-ink' : 'text-ink-mute'}>
-                  {pctLabel}
-                </span>{' '}
-                assessed ·{' '}
-                <span className={coverage.findings > 0 ? 'font-medium text-red-600' : 'font-medium text-ink'}>
-                  {coverage.findings}
-                </span>{' '}
-                finding{coverage.findings !== 1 ? 's' : ''}
-              </>
-            )}
-          </div>
-        </section>
-
-        {/* Sessions summary */}
-        <section>
-          <div className="flex items-center justify-between mb-2">
-            <h2 className="text-sm font-semibold text-ink">Sessions</h2>
-            <Link
-              to={`/projects/${encodedId}/sessions`}
-              className="text-[11px] font-medium text-brand-600 hover:text-brand-700 transition-colors"
-            >
-              see all →
-            </Link>
-          </div>
-          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
-            {sessions.total === 0 ? (
-              <p className="text-[12px] text-ink-mute">No sessions yet</p>
-            ) : (
-              <div className="flex items-center gap-3 text-[12px] text-ink-dim">
-                <span className="inline-flex items-center gap-1.5">
-                  <MessageSquare size={12} className="text-ink-mute" />
-                  <span className="font-medium text-ink">{sessions.total}</span> total
-                </span>
-                {sessions.active > 0 && (
-                  <span className="inline-flex items-center gap-1.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
-                    <span className="font-medium text-ink">{sessions.active}</span> active
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
-        </section>
+      {/* ── Tab bar ── */}
+      <div className="-mx-8">
+        <TabBar>
+          <TabButton
+            active={tab === 'overview'}
+            onClick={() => navigate(`/projects/${encodedId}`)}
+            icon={LayoutDashboard}
+            label="Overview"
+          />
+          <TabButton
+            active={tab === 'runs'}
+            onClick={() => navigate(`/projects/${encodedId}/runs`)}
+            icon={ListOrdered}
+            label="Runs"
+          />
+          <TabButton
+            active={tab === 'findings'}
+            onClick={() => navigate(`/projects/${encodedId}/findings`)}
+            icon={ShieldAlert}
+            label="Findings"
+          />
+          <TabButton
+            active={tab === 'sessions'}
+            onClick={() => navigate(`/projects/${encodedId}/sessions`)}
+            icon={MessageSquare}
+            label="Sessions"
+          />
+          <TabButton
+            active={tab === 'coverage'}
+            onClick={() => navigate(`/projects/${encodedId}/coverage`)}
+            icon={ShieldCheck}
+            label="Coverage"
+          />
+        </TabBar>
       </div>
 
-      {/* ── Definitions ── */}
-      <section>
-        <SectionTitle title="Definitions" href={`/projects/${encodedId}/definitions`} />
-        <Link
-          to={`/projects/${encodedId}/definitions`}
-          className="block bg-panel border border-border rounded-xl shadow-card px-4 py-3 hover:bg-slate-50 transition-colors"
-        >
-          <div className="flex items-center gap-2.5 text-[12px] text-ink-dim">
-            <Library size={14} className="text-ink-mute" />
-            <span>
-              Agents, workflows &amp; autoflows visible to this project
-              <span className="text-ink-mute"> — global + project-local </span>
-              <span className="font-mono">.rupu/</span>
-            </span>
-          </div>
-        </Link>
-      </section>
+      {/* ── Active tab body ── */}
+      {tab === 'overview' && (
+        <ProjectOverviewTab detail={detail} wsId={p.ws_id} pctLabel={pctLabel} pct={pct} />
+      )}
+      {tab === 'runs' && <ProjectRunsTab wsId={p.ws_id} />}
+      {tab === 'findings' && <ProjectFindingsTab wsId={p.ws_id} />}
+      {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
+      {tab === 'coverage' && <ProjectCoverageTab wsId={p.ws_id} />}
     </div>
   );
 }

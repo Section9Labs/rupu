@@ -1,20 +1,22 @@
-// Project-scoped coverage list — minimal placeholder so "open →" links resolve.
-// Task 9 will deepen this into a full scoped coverage view.
+// Project Coverage tab body — coverage-target list scoped to one project.
+// Ported from pages/ProjectCoverage.tsx; self-fetches on the `wsId` prop.
+// No filter chips.
 
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft, ShieldCheck } from 'lucide-react';
-import { api, type ProjectCoverageRow } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
+import { Link } from 'react-router-dom';
+import { ShieldCheck } from 'lucide-react';
+import { api, type ProjectCoverageRow } from '../../lib/api';
+import { ListCard } from '../lists/ListCard';
 
-export default function ProjectCoverage() {
-  const { wsId } = useParams<{ wsId: string }>();
+export default function ProjectCoverageTab({ wsId }: { wsId: string }) {
   const [rows, setRows] = useState<ProjectCoverageRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!wsId) return;
     let cancelled = false;
+    setRows(null);
+    setError(null);
     api
       .getProjectCoverage(wsId)
       .then((data) => {
@@ -31,28 +33,14 @@ export default function ProjectCoverage() {
   }, [wsId]);
 
   return (
-    <div className="p-8 max-w-5xl">
-      <header className="mb-6">
-        <Link
-          to={`/projects/${wsId ? encodeURIComponent(wsId) : ''}`}
-          className="inline-flex items-center gap-1 text-xs text-ink-dim hover:text-ink mb-2"
-        >
-          <ArrowLeft size={12} />
-          Back to project
-        </Link>
-        <h1 className="text-2xl font-semibold text-ink">Project Coverage</h1>
-        <p className="mt-1 text-sm text-ink-mute font-mono">{wsId}</p>
-      </header>
-
+    <div className="space-y-4">
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           {error}
         </div>
       )}
 
-      {rows === null && !error && (
-        <div className="text-sm text-ink-dim">Loading coverage…</div>
-      )}
+      {rows === null && !error && <div className="text-sm text-ink-dim">Loading coverage…</div>}
 
       {rows !== null && rows.length === 0 && (
         <div className="rounded-xl border border-dashed border-border bg-panel/50 py-12 flex flex-col items-center justify-center text-center">
