@@ -2,35 +2,31 @@
 import '@testing-library/jest-dom/vitest';
 import { describe, it, expect } from 'vitest';
 import { render } from '@testing-library/react';
-import RunUsageTimeline, { formatAbsTick, toChartPoint } from './RunUsageTimeline';
+import RunUsageTimeline, { formatTokenTick, toChartPoint } from './RunUsageTimeline';
 import type { UsageTimelinePoint } from '../../lib/api';
 
-describe('formatAbsTick', () => {
-  it('strips the sign', () => {
-    expect(formatAbsTick(-1500)).toBe('1.5k');
-    expect(formatAbsTick(-500)).toBe('500');
-  });
+describe('formatTokenTick', () => {
   it('k-abbreviates thousands, trimming a trailing .0', () => {
-    expect(formatAbsTick(2000)).toBe('2k');
-    expect(formatAbsTick(1500)).toBe('1.5k');
-    expect(formatAbsTick(500)).toBe('500');
-    expect(formatAbsTick(0)).toBe('0');
+    expect(formatTokenTick(2000)).toBe('2k');
+    expect(formatTokenTick(1500)).toBe('1.5k');
+    expect(formatTokenTick(500)).toBe('500');
+    expect(formatTokenTick(0)).toBe('0');
   });
   it('abbreviates millions and billions', () => {
-    expect(formatAbsTick(1_200_000)).toBe('1.2M');
-    expect(formatAbsTick(-3_000_000_000)).toBe('3B');
+    expect(formatTokenTick(1_200_000)).toBe('1.2M');
+    expect(formatTokenTick(3_000_000_000)).toBe('3B');
   });
 });
 
 describe('toChartPoint', () => {
   const p: UsageTimelinePoint = { turn: 1, label: 'step', tokens_in: 800, tokens_out: 120, tokens_cached: 40 };
-  it('negates out while leaving in/cached positive', () => {
+  it('keeps all three series positive (axis split, not negation)', () => {
     const d = toChartPoint(p);
-    expect(d.out).toBe(-p.tokens_out);
     expect(d.in).toBe(p.tokens_in);
+    expect(d.out).toBe(p.tokens_out);
     expect(d.cached).toBe(p.tokens_cached);
   });
-  it('preserves the original positive values for the tooltip', () => {
+  it('preserves the original values and metadata', () => {
     const d = toChartPoint(p);
     expect(d.tokens_out).toBe(120);
     expect(d.tokens_in).toBe(800);

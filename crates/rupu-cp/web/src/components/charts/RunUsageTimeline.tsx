@@ -10,18 +10,18 @@ const COLOR_IN = '#1860f2';
 const COLOR_OUT = '#22c55e';
 const COLOR_CACHED = '#f59e0b';
 
-/** Chart datum for the diverging timeline. `out` is NEGATED for display (renders
- *  below the zero baseline); the original positive `tokens_out` is kept for the
- *  tooltip. `in` and `cached` stay positive. */
+/** Chart datum — all three series positive. `in` is drawn on the LEFT axis (its
+ *  own large scale); `out` and `cached` share a RIGHT axis scaled to their own
+ *  (much smaller) range, so they stay legible instead of being flattened by input. */
 export interface UsageChartPoint extends UsageTimelinePoint {
   in: number;
   out: number;
   cached: number;
 }
 
-/** Abbreviated ABSOLUTE magnitude tick label (sign stripped): `-1500 → "1.5k"`,
- *  `2000 → "2k"`, `500 → "500"`, `0 → "0"`. */
-export function formatAbsTick(v: number): string {
+/** Abbreviated token-count tick label: `2000 → "2k"`, `1_200_000 → "1.2M"`,
+ *  `500 → "500"`, `0 → "0"`. */
+export function formatTokenTick(v: number): string {
   const n = Math.abs(v);
   if (n >= 1_000_000_000) return `${trimZero(n / 1_000_000_000)}B`;
   if (n >= 1_000_000) return `${trimZero(n / 1_000_000)}M`;
@@ -34,16 +34,16 @@ function trimZero(x: number): string {
   return x.toFixed(1).replace(/\.0$/, '');
 }
 
-/** Map a timeline point to its chart datum, negating `out` for the diverging
- *  layout while keeping `in`/`cached` positive (and the originals for tooltips). */
+/** Map a timeline point to its chart datum. All three series stay positive; the
+ *  left/right axis split (not negation) is what keeps them readable. */
 export function toChartPoint(p: UsageTimelinePoint): UsageChartPoint {
-  return { ...p, in: p.tokens_in, out: -p.tokens_out, cached: p.tokens_cached };
+  return { ...p, in: p.tokens_in, out: p.tokens_out, cached: p.tokens_cached };
 }
 
-/** Per-turn token timeline across a run's steps (or a session's runs), drawn as a
- *  diverging chart: input above the zero baseline, output mirrored below it (same
- *  left axis, magnitudes compare directly), and cached as a line on its own right
- *  axis. With `separators`, a dashed line marks each step boundary. */
+/** Per-turn token timeline across a run's steps (or a session's runs). Input is an
+ *  area on the LEFT axis; output and cached are lines on a RIGHT axis scaled to
+ *  their own (smaller) range — so output/cached are legible even when input dwarfs
+ *  them. With `separators`, a dashed line marks each step boundary. */
 export default function RunUsageTimeline({
   series,
   separators = false,
@@ -64,28 +64,28 @@ export default function RunUsageTimeline({
       <ResponsiveContainer width="100%" height="100%">
         <ComposedChart data={data} margin={{ top: 12, right: 8, bottom: 0, left: 0 }}>
           <XAxis dataKey="turn" tick={{ fontSize: 10, fill: '#94a3b8' }} />
-          <YAxis yAxisId="io" tick={{ fontSize: 10, fill: '#94a3b8' }} width={36}
-            tickFormatter={(v) => formatAbsTick(typeof v === 'number' ? v : 0)} />
-          <YAxis yAxisId="cache" orientation="right" tick={{ fontSize: 10, fill: COLOR_CACHED }} width={36}
-            tickFormatter={(v) => formatAbsTick(typeof v === 'number' ? v : 0)} />
+          {/* Left axis: input only (its own large scale). */}
+          <YAxis yAxisId="in" tick={{ fontSize: 10, fill: COLOR_IN }} width={40}
+            tickFormatter={(v) => formatTokenTick(typeof v === 'number' ? v : 0)} />
+          {/* Right axis: output + cached, scaled to their own range. */}
+          <YAxis yAxisId="oc" orientation="right" tick={{ fontSize: 10, fill: '#94a3b8' }} width={40}
+            tickFormatter={(v) => formatTokenTick(typeof v === 'number' ? v : 0)} />
           <Tooltip contentStyle={tooltipStyle}
             formatter={(v, name) => {
               const raw = typeof v === 'number' ? v : 0;
-              // `out` is negated for display — show its true magnitude.
-              return [formatTokens(Math.abs(raw)), String(name)];
+              return [formatTokens(raw), String(name)];
             }}
             labelFormatter={(l, payload) => {
               const p = payload?.[0]?.payload as UsageChartPoint | undefined;
               return p?.label ? `turn ${l} · ${p.label}` : `turn ${l}`;
             }} />
-          <ReferenceLine yAxisId="io" y={0} stroke="#94a3b8" />
           {boundaries.map((b) => (
-            <ReferenceLine key={`${b.label}-${b.turn}`} yAxisId="io" x={b.turn} stroke="#cbd5e1" strokeDasharray="3 3"
+            <ReferenceLine key={`${b.label}-${b.turn}`} yAxisId="in" x={b.turn} stroke="#cbd5e1" strokeDasharray="3 3"
               label={{ value: b.label, position: 'top', fontSize: 9, fill: '#94a3b8' }} />
           ))}
-          <Area yAxisId="io" type="monotone" dataKey="in" name="In" stroke={COLOR_IN} fill={COLOR_IN} fillOpacity={0.18} />
-          <Area yAxisId="io" type="monotone" dataKey="out" name="Out" stroke={COLOR_OUT} fill={COLOR_OUT} fillOpacity={0.18} />
-          <Line yAxisId="cache" type="monotone" dataKey="cached" name="Cached" stroke={COLOR_CACHED} dot={false} strokeWidth={1.5} />
+          <Area yAxisId="in" type="monotone" dataKey="in" name="In" stroke={COLOR_IN} fill={COLOR_IN} fillOpacity={0.18} />
+          <Line yAxisId="oc" type="monotone" dataKey="out" name="Out" stroke={COLOR_OUT} dot={false} strokeWidth={1.5} />
+          <Line yAxisId="oc" type="monotone" dataKey="cached" name="Cached" stroke={COLOR_CACHED} dot={false} strokeWidth={1.5} />
         </ComposedChart>
       </ResponsiveContainer>
     </div>
