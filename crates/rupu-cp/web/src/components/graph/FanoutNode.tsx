@@ -5,7 +5,7 @@
 //   N > 12 : a collapsed card leading with `{done}/{total}` + a single
 //            % bar, `{failed} failed` in red when any failed, a small
 //            density-preview grid, and an "expand" affordance that opens
-//            the full <FanoutDrill> via onExpandFanout.
+//            the step's unit file-browser via onExpandFanout.
 //
 // Faithful to the fanout-loop mockup: big X / N, blue→green % bar, failures
 // broken out in red, density grid of colored squares.

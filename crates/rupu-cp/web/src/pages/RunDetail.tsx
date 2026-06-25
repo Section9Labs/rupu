@@ -230,7 +230,7 @@ export default function RunDetail() {
     return model.nodes
       .map((n) => n.id)
       .sort()
-      .join(' ');
+      .join('\0');
   }, [model]);
 
   // Keyed on the node-id SET, NOT the model, so dagre only re-runs when nodes
@@ -281,7 +281,13 @@ export default function RunDetail() {
   // RunGraph wiring → selection cursor. A normal step's NodeSelection.label is
   // its node id (== step id); for_each expand/open-unit pass the step id (and
   // optionally a unit index) directly.
+  //
+  // A unit-square click fires BOTH onOpenUnit(stepId, index) and a spurious
+  // onSelectNode({ label: unit.key }) from RunGraph. Guard against the latter:
+  // ignore any label that does not resolve to a real graph node, so the unit
+  // key (e.g. 'a.rs') is a no-op and onOpenUnit's correct cursor stands.
   function selectFromNode(sel: NodeSelection) {
+    if (!model || !model.nodeById(sel.label)) return;
     setSelection({ stepId: sel.label });
   }
   function selectStep(stepId: string) {
@@ -405,7 +411,11 @@ export default function RunDetail() {
         {tab === 'transcript' && (
           <div className="flex h-full min-h-0 flex-col overflow-auto">
             {selection && selectedFanout ? (
-              <StepTranscriptBrowser stepId={selection.stepId} units={selectedFanout.units} />
+              <StepTranscriptBrowser
+                stepId={selection.stepId}
+                units={selectedFanout.units}
+                initialUnitIndex={selection.unitIndex}
+              />
             ) : selection && selectedTranscriptPath ? (
               <TranscriptPanel key={selectedTranscriptPath} path={selectedTranscriptPath} live={isRunning} />
             ) : selection ? (

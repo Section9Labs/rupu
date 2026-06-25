@@ -1,9 +1,8 @@
 // StepTranscriptBrowser — file-browser layout for a `for_each` fan-out step.
 //
-// Replaces the right-side FanoutDrill slide-over: the fan-out's units list on
-// the LEFT (state-filter pills + capped, scrollable unit rows), the selected
-// unit's transcript on the RIGHT. Reuses FanoutDrill's filter pills, STATE_STYLE
-// glyph map, ROW_CAP "+N more" cap, and unit-row rendering.
+// The fan-out's units list on the LEFT (state-filter pills + capped, scrollable
+// unit rows), the selected unit's transcript on the RIGHT: filter pills, the
+// STATE_STYLE glyph map, the ROW_CAP "+N more" cap, and unit-row rendering.
 
 import { useEffect, useMemo, useState } from 'react';
 import type { StepState, UnitView } from '../../lib/runGraphModel';
@@ -29,12 +28,21 @@ function matches(filter: Filter, state: StepState): boolean {
 export default function StepTranscriptBrowser({
   stepId,
   units,
+  initialUnitIndex,
 }: {
   stepId: string;
   units: UnitView[];
+  /**
+   * Seed the initially-selected unit (e.g. the unit-square the user clicked in
+   * the graph). Falls back to the first visible unit if this index isn't in the
+   * filtered set. When undefined, keeps the default auto-select-first behavior.
+   */
+  initialUnitIndex?: number;
 }) {
   const [filter, setFilter] = useState<Filter>('all');
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(
+    initialUnitIndex ?? null,
+  );
 
   const counts = useMemo(() => {
     const c: Record<Filter, number> = { all: units.length, running: 0, done: 0, failed: 0 };

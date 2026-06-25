@@ -29,12 +29,23 @@ vi.mock('../components/RunGraph', () => ({
   default: (props: {
     onSelectNode?: (sel: NodeSelection) => void;
     onExpandFanout?: (stepId: string) => void;
+    onOpenUnit?: (stepId: string, index: number) => void;
   }) => (
     <div data-testid="run-graph-mock">
       <button onClick={() => props.onSelectNode?.({ path: '/t/step-a.jsonl', live: false, label: 'step_a' })}>
         select-step-a
       </button>
       <button onClick={() => props.onExpandFanout?.('fan_out')}>select-fanout</button>
+      {/* A real unit-square click fires onOpenUnit FIRST, then a spurious
+          onSelectNode({ label: unit.key }) — replicate that exact order. */}
+      <button
+        onClick={() => {
+          props.onOpenUnit?.('fan_out', 0);
+          props.onSelectNode?.({ path: '/t/unit-0.jsonl', live: false, label: 'a.rs' });
+        }}
+      >
+        open-unit
+      </button>
     </div>
   ),
 }));
@@ -46,8 +57,10 @@ vi.mock('../components/TranscriptPanel', () => ({
 
 vi.mock('../components/run/StepTranscriptBrowser', () => ({
   __esModule: true,
-  default: ({ stepId }: { stepId: string }) => (
-    <div data-testid="step-transcript-browser">file-browser:{stepId}</div>
+  default: ({ stepId, initialUnitIndex }: { stepId: string; initialUnitIndex?: number }) => (
+    <div data-testid="step-transcript-browser" data-initial-unit={String(initialUnitIndex ?? '')}>
+      file-browser:{stepId}
+    </div>
   ),
 }));
 
@@ -168,6 +181,24 @@ describe('RunDetail shell', () => {
 
     expect(screen.getByTestId('step-transcript-browser')).toHaveTextContent('file-browser:fan_out');
     expect(screen.queryByTestId('transcript-panel')).not.toBeInTheDocument();
+  });
+
+  it('opens the file-browser (not the empty state) when a unit square is clicked', async () => {
+    stubApi();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+
+    // Drive the REAL unit-square path: onOpenUnit(stepId, index) FIRST, then
+    // the spurious onSelectNode({ label: unit.key }) — same order RunGraph fires.
+    fireEvent.click(screen.getByText('open-unit'));
+
+    // The for_each file-browser renders for the step (NOT the unit key), and we
+    // never fall through to the "No transcript" empty-state.
+    const browser = screen.getByTestId('step-transcript-browser');
+    expect(browser).toHaveTextContent('file-browser:fan_out');
+    expect(browser).toHaveAttribute('data-initial-unit', '0');
+    expect(screen.queryByText(/No transcript yet/)).not.toBeInTheDocument();
   });
 
   it('shows the transcript panel when a normal step is selected', async () => {
