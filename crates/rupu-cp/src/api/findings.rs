@@ -7,7 +7,7 @@ use axum::{
 use rupu_coverage::{discover_targets, read_findings, CoveragePaths, FindingRecord, Severity};
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/api/findings", get(list_findings))
@@ -77,25 +77,36 @@ fn severity_rank(sev: Severity) -> u8 {
 }
 
 /// Pure filter + sort + summarize step over findings that already carry their
-/// joined `workflow_name`. Applies the optional `ws_id` / `workflow` / `run_id`
-/// scope (a finding must pass every provided filter),
-/// then sorts (severity critical→info, then `declared_at` DESC) and tallies the
+/// joined `workflow_name`. Applies the optional `ws_id` / `workflow` scope plus
+/// an optional run-id SET (a finding must pass every provided filter), then
+/// sorts (severity critical→info, then `declared_at` DESC) and tallies the
 /// per-severity summary over the FILTERED set. Server-free so it can be
-/// unit-tested directly. The run_id→workflow join (which needs `RunStore`)
-/// stays in the handler.
-fn scope_and_summarize(findings: Vec<FindingOut>, q: &FindingsQuery) -> FindingsResponse {
+/// unit-tested directly.
+///
+/// `run_ids` is the resolved match set — the parent run id UNIONED with every
+/// `for_each` unit sub-run id of that parent (each fan-out unit is its own
+/// sub-run). A finding whose `declared_by.run_id` is in the set is kept, which
+/// is why fan-out findings (attributed to the unit's sub-run, not the parent)
+/// survive the per-run view. Resolving that set needs `RunStore`, so the handler
+/// builds it and passes it in here.
+fn scope_by_run_set(
+    findings: Vec<FindingOut>,
+    run_ids: &Option<HashSet<String>>,
+    ws_id: &Option<String>,
+    workflow: &Option<String>,
+) -> FindingsResponse {
     let filtered: Vec<FindingOut> = findings
         .into_iter()
-        .filter(|f| match &q.ws_id {
+        .filter(|f| match ws_id {
             Some(ws) => &f.ws_id == ws,
             None => true,
         })
-        .filter(|f| match &q.workflow {
+        .filter(|f| match workflow {
             Some(wf) => f.workflow_name.as_deref() == Some(wf.as_str()),
             None => true,
         })
-        .filter(|f| match &q.run_id {
-            Some(rid) => &f.record.declared_by.run_id == rid,
+        .filter(|f| match run_ids {
+            Some(ids) => ids.contains(&f.record.declared_by.run_id),
             None => true,
         })
         .collect();
@@ -203,7 +214,23 @@ async fn list_findings(
         f.workflow_name = wf_by_run.get(&f.record.declared_by.run_id).cloned();
     }
 
-    Ok(Json(scope_and_summarize(out, &q)))
+    // Resolve the run-id match SET when filtering by run. A `for_each` step's
+    // fan-out findings are attributed to the UNIT's sub-run id (each unit is its
+    // own sub-run), NOT the parent run id, so a bare parent-id match would drop
+    // them. The set is the parent id UNIONED with every unit-checkpoint sub-run
+    // id for that parent (read the same way `graph.rs` does; missing file →
+    // empty). NOTE: only ONE level of fan-out is resolved here — a unit that
+    // itself fans out is not followed. Acceptable for now.
+    let run_ids: Option<HashSet<String>> = q.run_id.as_ref().map(|parent| {
+        let mut set = HashSet::new();
+        set.insert(parent.clone());
+        for cp in s.run_store.read_unit_checkpoints(parent).unwrap_or_default() {
+            set.insert(cp.run_id);
+        }
+        set
+    });
+
+    Ok(Json(scope_by_run_set(out, &run_ids, &q.ws_id, &q.workflow)))
 }
 
 #[cfg(test)]
@@ -353,10 +380,15 @@ mod tests {
         ]
     }
 
+    /// Build the run-id match set the handler would resolve from a parent run
+    /// id plus its fan-out unit sub-run ids.
+    fn run_set(ids: &[&str]) -> Option<HashSet<String>> {
+        Some(ids.iter().map(|s| s.to_string()).collect())
+    }
+
     #[test]
     fn no_filter_keeps_all() {
-        let q = FindingsQuery::default();
-        let resp = scope_and_summarize(mixed_findings(), &q);
+        let resp = scope_by_run_set(mixed_findings(), &None, &None, &None);
         assert_eq!(resp.findings.len(), 4);
         assert_eq!(resp.summary.total, 4);
         assert_eq!(resp.summary.critical, 1);
@@ -367,12 +399,8 @@ mod tests {
 
     #[test]
     fn ws_id_filter_scopes_findings_and_summary() {
-        let q = FindingsQuery {
-            ws_id: Some("ws2".to_string()),
-            workflow: None,
-            run_id: None,
-        };
-        let resp = scope_and_summarize(mixed_findings(), &q);
+        let resp =
+            scope_by_run_set(mixed_findings(), &None, &Some("ws2".to_string()), &None);
         let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
         assert_eq!(ids, vec!["c", "d"]);
         assert!(resp.findings.iter().all(|f| f.ws_id == "ws2"));
@@ -386,12 +414,8 @@ mod tests {
 
     #[test]
     fn workflow_filter_matches_attached_name_and_excludes_none() {
-        let q = FindingsQuery {
-            ws_id: None,
-            workflow: Some("wfA".to_string()),
-            run_id: None,
-        };
-        let resp = scope_and_summarize(mixed_findings(), &q);
+        let resp =
+            scope_by_run_set(mixed_findings(), &None, &None, &Some("wfA".to_string()));
         let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
         // "a" (ws1/wfA) + "c" (ws2/wfA); "b" is wfB, "d" is None — both excluded.
         assert_eq!(ids, vec!["a", "c"]);
@@ -415,12 +439,8 @@ mod tests {
             Severity::Info,
             "2026-01-01T00:00:00Z",
         )];
-        let q = FindingsQuery {
-            ws_id: None,
-            workflow: Some("anything".to_string()),
-            run_id: None,
-        };
-        let resp = scope_and_summarize(input, &q);
+        let resp =
+            scope_by_run_set(input, &None, &None, &Some("anything".to_string()));
         assert!(resp.findings.is_empty());
         assert_eq!(resp.summary.total, 0);
     }
@@ -436,12 +456,9 @@ mod tests {
 
     #[test]
     fn run_id_filter_scopes_findings_and_summary() {
-        let q = FindingsQuery {
-            ws_id: None,
-            workflow: None,
-            run_id: Some("runA".to_string()),
-        };
-        let resp = scope_and_summarize(run_findings(), &q);
+        // A set of one parent id still matches top-level findings.
+        let resp =
+            scope_by_run_set(run_findings(), &run_set(&["runA"]), &None, &None);
         let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b"]);
         assert!(resp
@@ -457,15 +474,39 @@ mod tests {
 
     #[test]
     fn run_id_filter_with_no_match_is_empty() {
-        let q = FindingsQuery {
-            ws_id: None,
-            workflow: None,
-            run_id: Some("nope".to_string()),
-        };
-        let resp = scope_and_summarize(run_findings(), &q);
+        let resp =
+            scope_by_run_set(run_findings(), &run_set(&["nope"]), &None, &None);
         assert!(resp.findings.is_empty());
         assert_eq!(resp.summary, FindingsSummary::default());
         assert_eq!(resp.summary.total, 0);
+    }
+
+    /// The core fan-out fix: a finding attributed to a `for_each` unit's sub-run
+    /// id is included when filtering by the PARENT run id, because the handler
+    /// resolves the parent into a set that contains the sub-run id.
+    #[test]
+    fn run_set_includes_for_each_sub_run_findings() {
+        let findings = vec![
+            // Declared at the top level under the parent run.
+            finding_run("parent", "top", Severity::High, "2026-01-01T00:00:00Z"),
+            // Declared inside a for_each unit → attributed to the unit sub-run.
+            finding_run("unit-1", "fanA", Severity::Critical, "2026-01-02T00:00:00Z"),
+            finding_run("unit-2", "fanB", Severity::Medium, "2026-01-03T00:00:00Z"),
+            // An unrelated run's finding must NOT leak in.
+            finding_run("other", "nope", Severity::Low, "2026-01-04T00:00:00Z"),
+        ];
+        // Set the handler would build: parent ∪ {unit-1, unit-2}.
+        let set = run_set(&["parent", "unit-1", "unit-2"]);
+        let resp = scope_by_run_set(findings, &set, &None, &None);
+        let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
+        // Severity-sorted: critical(fanA), high(top), medium(fanB). "nope" excluded.
+        assert_eq!(ids, vec!["fanA", "top", "fanB"]);
+        // Summary reflects the matched union, not the parent id alone.
+        assert_eq!(resp.summary.total, 3);
+        assert_eq!(resp.summary.critical, 1);
+        assert_eq!(resp.summary.high, 1);
+        assert_eq!(resp.summary.medium, 1);
+        assert_eq!(resp.summary.low, 0);
     }
 
     #[test]

@@ -1,0 +1,231 @@
+// @vitest-environment jsdom
+// RunDetail shell — the graph + "Token usage by turn" chart are PERSISTENT
+// chrome (always rendered, regardless of the active tab). Below them a tab
+// panel (Transcript · Events · Findings) FOLLOWS the step selected in the
+// graph: selecting a for_each step shows the units file-browser; a normal step
+// shows its transcript; the Events tab filters the feed to the selected step.
+//
+// Heavy children (RunGraph, TranscriptPanel, RunEventFeed, StepTranscriptBrowser,
+// RunUsageTimeline) are mocked so the test drives selection through the graph's
+// callback props without pulling in xyflow / recharts.
+
+import '@testing-library/jest-dom/vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import {
+  api,
+  type RunGraphResponse,
+  type FindingsResponse,
+} from '../lib/api';
+import type { NodeSelection } from '../components/RunGraph';
+import type { SeqEvent } from '../components/RunEventFeed';
+
+// ---- Mocks for heavy children -------------------------------------------
+
+// RunGraph: expose buttons that fire the selection callbacks the page wires up.
+vi.mock('../components/RunGraph', () => ({
+  __esModule: true,
+  default: (props: {
+    onSelectNode?: (sel: NodeSelection) => void;
+    onExpandFanout?: (stepId: string) => void;
+    onOpenUnit?: (stepId: string, index: number) => void;
+  }) => (
+    <div data-testid="run-graph-mock">
+      <button onClick={() => props.onSelectNode?.({ path: '/t/step-a.jsonl', live: false, label: 'step_a' })}>
+        select-step-a
+      </button>
+      <button onClick={() => props.onExpandFanout?.('fan_out')}>select-fanout</button>
+      {/* A real unit-square click fires onOpenUnit FIRST, then a spurious
+          onSelectNode({ label: unit.key }) — replicate that exact order. */}
+      <button
+        onClick={() => {
+          props.onOpenUnit?.('fan_out', 0);
+          props.onSelectNode?.({ path: '/t/unit-0.jsonl', live: false, label: 'a.rs' });
+        }}
+      >
+        open-unit
+      </button>
+    </div>
+  ),
+}));
+
+vi.mock('../components/TranscriptPanel', () => ({
+  __esModule: true,
+  default: ({ path }: { path: string }) => <div data-testid="transcript-panel">transcript:{path}</div>,
+}));
+
+vi.mock('../components/run/StepTranscriptBrowser', () => ({
+  __esModule: true,
+  default: ({ stepId, initialUnitIndex }: { stepId: string; initialUnitIndex?: number }) => (
+    <div data-testid="step-transcript-browser" data-initial-unit={String(initialUnitIndex ?? '')}>
+      file-browser:{stepId}
+    </div>
+  ),
+}));
+
+// RunEventFeed: render one line per event so we can assert filtering.
+vi.mock('../components/RunEventFeed', () => ({
+  __esModule: true,
+  default: ({ events }: { events: SeqEvent[] }) => (
+    <div data-testid="event-feed">
+      {events.map((e) => (
+        <div key={e.seq}>evt:{String((e.event as { step_id?: string }).step_id ?? 'run')}</div>
+      ))}
+    </div>
+  ),
+}));
+
+vi.mock('../components/charts/RunUsageTimeline', () => ({
+  __esModule: true,
+  default: () => <div data-testid="usage-timeline-mock">chart</div>,
+}));
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
+
+// ---- Fixtures ------------------------------------------------------------
+
+const GRAPH: RunGraphResponse = {
+  run: {
+    id: 'run-1',
+    workflow_name: 'nightly-scan',
+    status: 'completed',
+    started_at: '2026-06-01T00:00:00Z',
+    finished_at: '2026-06-01T00:05:00Z',
+  } as RunGraphResponse['run'],
+  workflow: {
+    steps: [
+      { id: 'step_a', kind: 'step', agent: 'reviewer' },
+      { id: 'fan_out', kind: 'for_each', for_each: 'files' },
+    ],
+  },
+  step_results: [
+    { step_id: 'step_a', success: true, transcript_path: '/t/step-a.jsonl' } as RunGraphResponse['step_results'][number],
+  ],
+  units: [
+    {
+      step_id: 'fan_out',
+      index: 0,
+      item: 'a.rs',
+      run_id: 'run-1',
+      transcript_path: '/t/unit-0.jsonl',
+      output: '',
+      success: true,
+      finished_at: '2026-06-01T00:04:00Z',
+    },
+  ],
+};
+
+const FINDINGS: FindingsResponse = {
+  findings: [],
+  summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
+};
+
+function renderPage() {
+  return render(
+    <MemoryRouter initialEntries={['/runs/run-1']}>
+      <Routes>
+        <Route path="/runs/:id" element={<RunDetailLoaded />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+// Imported here so the vi.mock factories above are hoisted before the module
+// graph resolves RunDetail's child imports.
+import RunDetailLoaded from './RunDetail';
+
+describe('RunDetail shell', () => {
+  function stubApi() {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    // Stub the SSE subscription: emit one step-scoped + one run-level event,
+    // then return a no-op unsubscribe.
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation((_id, onEvent) => {
+      onEvent({ type: 'step_completed', run_id: 'run-1', step_id: 'step_a', success: true, duration_ms: 1 });
+      onEvent({ type: 'run_started', run_id: 'run-1', event_version: 1, workflow_path: 'wf.yaml', started_at: 'x' });
+      return () => {};
+    });
+  }
+
+  it('renders the graph AND the usage chart as persistent chrome on every tab', async () => {
+    stubApi();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    // Both present on the default (Transcript) tab.
+    expect(screen.getByTestId('usage-timeline-mock')).toBeInTheDocument();
+
+    // Switch to Events — chrome stays mounted.
+    fireEvent.click(screen.getByText('Events'));
+    expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument();
+    expect(screen.getByTestId('usage-timeline-mock')).toBeInTheDocument();
+
+    // Switch to Findings — chrome still present.
+    fireEvent.click(screen.getByText(/Findings/));
+    expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument();
+    expect(screen.getByTestId('usage-timeline-mock')).toBeInTheDocument();
+  });
+
+  it('shows the file-browser in Transcript when a for_each step is selected', async () => {
+    stubApi();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('select-fanout'));
+
+    expect(screen.getByTestId('step-transcript-browser')).toHaveTextContent('file-browser:fan_out');
+    expect(screen.queryByTestId('transcript-panel')).not.toBeInTheDocument();
+  });
+
+  it('opens the file-browser (not the empty state) when a unit square is clicked', async () => {
+    stubApi();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+
+    // Drive the REAL unit-square path: onOpenUnit(stepId, index) FIRST, then
+    // the spurious onSelectNode({ label: unit.key }) — same order RunGraph fires.
+    fireEvent.click(screen.getByText('open-unit'));
+
+    // The for_each file-browser renders for the step (NOT the unit key), and we
+    // never fall through to the "No transcript" empty-state.
+    const browser = screen.getByTestId('step-transcript-browser');
+    expect(browser).toHaveTextContent('file-browser:fan_out');
+    expect(browser).toHaveAttribute('data-initial-unit', '0');
+    expect(screen.queryByText(/No transcript yet/)).not.toBeInTheDocument();
+  });
+
+  it('shows the transcript panel when a normal step is selected', async () => {
+    stubApi();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('select-step-a'));
+
+    expect(screen.getByTestId('transcript-panel')).toHaveTextContent('transcript:/t/step-a.jsonl');
+    expect(screen.queryByTestId('step-transcript-browser')).not.toBeInTheDocument();
+  });
+
+  it('filters the Events feed to the selected step', async () => {
+    stubApi();
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+
+    // Select the normal step, then open the Events tab.
+    fireEvent.click(screen.getByText('select-step-a'));
+    fireEvent.click(screen.getByText('Events'));
+
+    const feed = screen.getByTestId('event-feed');
+    // The step-scoped event survives; the run-level event is filtered out.
+    expect(feed).toHaveTextContent('evt:step_a');
+    expect(feed).not.toHaveTextContent('evt:run');
+  });
+});

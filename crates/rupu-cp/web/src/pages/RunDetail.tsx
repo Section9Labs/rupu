@@ -2,10 +2,15 @@
 // fans the event stream down to both the RunGraph (live step status, derived
 // via buildRunGraphModel) and the RunEventFeed (scrolling timeline). The
 // browser twin of rupu's live TUI run view.
+//
+// Layout: a persistent header + an always-on graph + "Token usage by turn"
+// chart (chrome that never hides), then a tab panel — Transcript · Events ·
+// Findings — that FOLLOWS the step selected in the graph. Selecting a for_each
+// step swaps the Transcript body for the units/transcript file-browser.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft, GitBranch, ListOrdered, Pause, ShieldAlert } from 'lucide-react';
+import { ArrowLeft, FileText, ListOrdered, Pause, ShieldAlert } from 'lucide-react';
 import {
   api,
   isKnownRunEvent,
@@ -21,36 +26,52 @@ import { ListCard } from '../components/lists/ListCard';
 import { FindingMetrics } from '../components/findings/FindingMetrics';
 import { FindingRow } from '../components/findings/FindingRow';
 import RunGraph, { type NodeSelection } from '../components/RunGraph';
-import FanoutDrill from '../components/FanoutDrill';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
 import TranscriptPanel from '../components/TranscriptPanel';
+import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
-import { buildRunGraphModel, type RunGraphModel, type UnitView } from '../lib/runGraphModel';
+import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 
 const MAX_EVENTS = 2000;
 
-type Tab = 'graph' | 'events' | 'findings';
+type Tab = 'transcript' | 'events' | 'findings';
 
 /**
- * Default transcript selection on (re)load: prefer a running node's transcript,
- * else the last completed step that recorded one. Returns null when nothing
- * with a transcript exists yet.
+ * A single selection cursor that the whole tab panel follows. `unitIndex` is an
+ * optional hint for a for_each unit (the file-browser owns its own unit
+ * selection, so this is informational); `null` means "whole run".
  */
-function defaultSelection(model: RunGraphModel): NodeSelection | null {
+type Selection = { stepId: string; unitIndex?: number } | null;
+
+/** A for_each node with a populated fan-out (units list). */
+function fanoutOf(node: GraphNode | undefined): GraphNode['fanout'] | null {
+  if (!node) return null;
+  if (node.kind === 'for_each' || node.fanout) return node.fanout ?? null;
+  return null;
+}
+
+/**
+ * Default step selection on (re)load: prefer a running node, else the last
+ * completed step that recorded a transcript. Returns null when nothing
+ * selectable exists yet (→ "whole run").
+ */
+function defaultSelection(model: RunGraphModel): Selection {
   const running = model.nodes.find((n) => n.state === 'running' && n.transcriptPath);
-  if (running) {
-    return { path: running.transcriptPath ?? null, live: true, label: running.id };
-  }
+  if (running) return { stepId: running.id };
   for (let i = model.nodes.length - 1; i >= 0; i--) {
     const n = model.nodes[i];
-    if (n.transcriptPath) {
-      return { path: n.transcriptPath, live: false, label: n.id };
-    }
+    if (n.transcriptPath || n.fanout) return { stepId: n.id };
   }
   return null;
+}
+
+/** Typed accessor for an event's `step_id` (run-level events carry none). */
+function eventStepId(ev: RunEvent): string | undefined {
+  const v = (ev as { step_id?: unknown }).step_id;
+  return typeof v === 'string' ? v : undefined;
 }
 
 export default function RunDetail() {
@@ -58,7 +79,7 @@ export default function RunDetail() {
 
   const [graph, setGraph] = useState<RunGraphResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('graph');
+  const [tab, setTab] = useState<Tab>('transcript');
 
   // Live state, fed by the single SSE subscription below.
   const [events, setEvents] = useState<SeqEvent[]>([]);
@@ -67,9 +88,6 @@ export default function RunDetail() {
   const [liveRunStatus, setLiveRunStatus] = useState<RunRecord['status'] | null>(null);
   // Monotonically-increasing sequence counter — stable key source for SeqEvent.
   const seqRef = useRef<number>(0);
-
-  // Fan-out drill-in: which step's units are open, or null.
-  const [drillStepId, setDrillStepId] = useState<string | null>(null);
 
   // Aggregated per-turn token series for the "Token usage by turn" timeline —
   // a global index across all of the run's steps (see effect below).
@@ -81,9 +99,8 @@ export default function RunDetail() {
   const [findingsError, setFindingsError] = useState<string | null>(null);
   const findingsRequestedRef = useRef(false);
 
-  // Selected transcript for the bottom split pane. Null until a node is clicked
-  // or the default is seeded once the model first becomes available.
-  const [sel, setSel] = useState<NodeSelection | null>(null);
+  // The ONE selection cursor that the tab panel follows. Null = whole run.
+  const [selection, setSelection] = useState<Selection>(null);
   // Guards the one-time default seed so live model rebuilds don't override the
   // user's manual selection on every SSE event.
   const seededSelRef = useRef(false);
@@ -93,7 +110,7 @@ export default function RunDetail() {
     let cancelled = false;
     setGraph(null);
     setLoadError(null);
-    setSel(null);
+    setSelection(null);
     seededSelRef.current = false;
     setFindings(null);
     setFindingsError(null);
@@ -194,14 +211,14 @@ export default function RunDetail() {
     [graph, rawEvents],
   );
 
-  // Seed the default transcript selection ONCE, the first time the model
-  // resolves a node that has a transcript. After that the user (or a click)
-  // owns the selection — we never auto-override it on later live rebuilds.
+  // Seed the default selection ONCE, the first time the model resolves a
+  // selectable node. After that the user (or a click) owns the selection — we
+  // never auto-override it on later live rebuilds.
   useEffect(() => {
     if (seededSelRef.current || !model) return;
     const initial = defaultSelection(model);
     if (initial) {
-      setSel(initial);
+      setSelection(initial);
       seededSelRef.current = true;
     }
   }, [model]);
@@ -213,7 +230,7 @@ export default function RunDetail() {
     return model.nodes
       .map((n) => n.id)
       .sort()
-      .join('\u0000');
+      .join('\0');
   }, [model]);
 
   // Keyed on the node-id SET, NOT the model, so dagre only re-runs when nodes
@@ -242,12 +259,43 @@ export default function RunDetail() {
   }, [model, run]);
 
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
+  const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
 
-  // Units for the open drill, pulled live from the model.
-  const drillUnits = useMemo<UnitView[]>(() => {
-    if (!model || !drillStepId) return [];
-    return model.nodeById(drillStepId)?.fanout?.units ?? [];
-  }, [model, drillStepId]);
+  // ---- Selection-driven derivations (safe when model is null) --------------
+
+  // The selected node, its fan-out (if any), and its resolved transcript path.
+  const selectedNode = useMemo<GraphNode | null>(
+    () => (model && selection ? model.nodeById(selection.stepId) ?? null : null),
+    [model, selection],
+  );
+  const selectedFanout = useMemo(() => fanoutOf(selectedNode ?? undefined), [selectedNode]);
+  const selectedTranscriptPath = selectedNode?.transcriptPath ?? null;
+
+  // Events filtered to the selected step (run-level events, which carry no
+  // step_id, drop out naturally); the whole feed when nothing is selected.
+  const feedEvents = useMemo<SeqEvent[]>(() => {
+    if (!selection) return events;
+    return events.filter((e) => eventStepId(e.event) === selection.stepId);
+  }, [events, selection]);
+
+  // RunGraph wiring → selection cursor. A normal step's NodeSelection.label is
+  // its node id (== step id); for_each expand/open-unit pass the step id (and
+  // optionally a unit index) directly.
+  //
+  // A unit-square click fires BOTH onOpenUnit(stepId, index) and a spurious
+  // onSelectNode({ label: unit.key }) from RunGraph. Guard against the latter:
+  // ignore any label that does not resolve to a real graph node, so the unit
+  // key (e.g. 'a.rs') is a no-op and onOpenUnit's correct cursor stands.
+  function selectFromNode(sel: NodeSelection) {
+    if (!model || !model.nodeById(sel.label)) return;
+    setSelection({ stepId: sel.label });
+  }
+  function selectStep(stepId: string) {
+    setSelection({ stepId });
+  }
+  function selectUnit(stepId: string, index: number) {
+    setSelection({ stepId, unitIndex: index });
+  }
 
   if (loadError) {
     return (
@@ -268,6 +316,9 @@ export default function RunDetail() {
       </div>
     );
   }
+
+  const findingsCount = findings?.findings.length ?? 0;
+  const selectedLabel = selection ? selection.stepId : 'whole run';
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -321,7 +372,22 @@ export default function RunDetail() {
           </div>
         )}
 
-        <section className="mt-3 bg-panel border border-border rounded-xl shadow-card px-4 py-3">
+        {/* Persistent chrome: the run graph — always visible, drives selection. */}
+        <section className="mt-3" data-testid="run-graph-chrome">
+          <RunGraph
+            model={model}
+            positions={positions}
+            onSelectNode={selectFromNode}
+            onExpandFanout={selectStep}
+            onOpenUnit={selectUnit}
+          />
+        </section>
+
+        {/* Persistent chrome: per-turn usage chart — always visible. */}
+        <section
+          className="mt-3 bg-panel border border-border rounded-xl shadow-card px-4 py-3"
+          data-testid="usage-timeline-chrome"
+        >
           <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
             Token usage by turn
           </h2>
@@ -331,42 +397,41 @@ export default function RunDetail() {
 
       <div className="mt-4">
         <TabBar>
-          <TabButton active={tab === 'graph'} onClick={() => setTab('graph')} icon={GitBranch} label="Graph" />
+          <TabButton active={tab === 'transcript'} onClick={() => setTab('transcript')} icon={FileText} label="Transcript" />
           <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={ListOrdered} label="Events" />
-          <TabButton active={tab === 'findings'} onClick={() => setTab('findings')} icon={ShieldAlert} label="Findings" />
+          <TabButton active={tab === 'findings'} onClick={() => setTab('findings')} icon={ShieldAlert} label={findingsCount > 0 ? `Findings (${findingsCount})` : 'Findings'} />
         </TabBar>
       </div>
 
-      <div className="min-h-0 flex-1 px-8 py-6">
-        {tab === 'graph' && (
-          <div className="flex h-full min-h-0 flex-col gap-4">
-            {/* Top pane: the run graph (~55%). */}
-            <div className="min-h-0 flex-[55] overflow-auto">
-              <RunGraph
-                model={model}
-                positions={positions}
-                onOpenUnit={(stepId) => setDrillStepId(stepId)}
-                onExpandFanout={(stepId) => setDrillStepId(stepId)}
-                onSelectNode={setSel}
+      <div className="px-8 pt-2 text-[11px] text-ink-dim">
+        selected: <span className="font-mono text-ink-mute">{selectedLabel}</span>
+      </div>
+
+      <div className="min-h-0 flex-1 px-8 pb-6 pt-3">
+        {tab === 'transcript' && (
+          <div className="flex h-full min-h-0 flex-col overflow-auto">
+            {selection && selectedFanout ? (
+              <StepTranscriptBrowser
+                stepId={selection.stepId}
+                units={selectedFanout.units}
+                initialUnitIndex={selection.unitIndex}
               />
-            </div>
-            {/* Bottom pane: the selected node's transcript (~45%, scrolls). */}
-            <div className="min-h-0 flex-[45] overflow-auto">
-              {sel?.path ? (
-                <TranscriptPanel key={sel.path} path={sel.path} live={sel.live} />
-              ) : (
-                <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
-                  {sel
-                    ? `No transcript yet for ${sel.label}.`
-                    : 'Select a step or unit to view its transcript.'}
-                </div>
-              )}
-            </div>
+            ) : selection && selectedTranscriptPath ? (
+              <TranscriptPanel key={selectedTranscriptPath} path={selectedTranscriptPath} live={isRunning} />
+            ) : selection ? (
+              <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
+                No transcript yet for {selection.stepId}.
+              </div>
+            ) : (
+              <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
+                Select a step in the graph to view its transcript.
+              </div>
+            )}
           </div>
         )}
         {tab === 'events' && (
           <div className="h-full min-h-0">
-            <RunEventFeed events={events} connection={connection} />
+            <RunEventFeed events={feedEvents} connection={connection} />
           </div>
         )}
         {tab === 'findings' && (
@@ -378,7 +443,12 @@ export default function RunDetail() {
             ) : findings === null ? (
               <p className="text-sm text-ink-dim">Loading findings…</p>
             ) : findings.findings.length === 0 ? (
-              <p className="text-sm text-ink-mute">No findings for this run.</p>
+              <div className="space-y-1">
+                <p className="text-sm text-ink-mute">No findings recorded for this run.</p>
+                <p className="text-[11px] text-ink-mute">
+                  (findings require a workflow with a coverage target)
+                </p>
+              </div>
             ) : (
               <div className="space-y-4">
                 <FindingMetrics summary={findings.summary} />
@@ -397,15 +467,6 @@ export default function RunDetail() {
           </div>
         )}
       </div>
-
-      {drillStepId && (
-        <FanoutDrill
-          stepId={drillStepId}
-          units={drillUnits}
-          onClose={() => setDrillStepId(null)}
-          onSelectUnit={setSel}
-        />
-      )}
     </div>
   );
 }
