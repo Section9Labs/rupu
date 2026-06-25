@@ -44,6 +44,8 @@ pub struct FindingsQuery {
     pub ws_id: Option<String>,
     /// Keep only findings whose joined `workflow_name` matches.
     pub workflow: Option<String>,
+    /// Keep only findings whose `declared_by.run_id` matches.
+    pub run_id: Option<String>,
 }
 
 /// Per-severity counts plus the grand total.
@@ -75,7 +77,8 @@ fn severity_rank(sev: Severity) -> u8 {
 }
 
 /// Pure filter + sort + summarize step over findings that already carry their
-/// joined `workflow_name`. Applies the optional `ws_id` / `workflow` scope,
+/// joined `workflow_name`. Applies the optional `ws_id` / `workflow` / `run_id`
+/// scope (a finding must pass every provided filter),
 /// then sorts (severity critical→info, then `declared_at` DESC) and tallies the
 /// per-severity summary over the FILTERED set. Server-free so it can be
 /// unit-tested directly. The run_id→workflow join (which needs `RunStore`)
@@ -89,6 +92,10 @@ fn scope_and_summarize(findings: Vec<FindingOut>, q: &FindingsQuery) -> Findings
         })
         .filter(|f| match &q.workflow {
             Some(wf) => f.workflow_name.as_deref() == Some(wf.as_str()),
+            None => true,
+        })
+        .filter(|f| match &q.run_id {
+            Some(rid) => &f.record.declared_by.run_id == rid,
             None => true,
         })
         .collect();
@@ -206,8 +213,12 @@ mod tests {
     use rupu_coverage::{Attribution, FindingEvidence, FindingScope, Surface};
 
     fn attribution() -> Attribution {
+        attribution_run("run_01KS19A4MQXP")
+    }
+
+    fn attribution_run(run_id: &str) -> Attribution {
         Attribution {
-            run_id: "run_01KS19A4MQXP".to_string(),
+            run_id: run_id.to_string(),
             model: "claude-sonnet-4-6".to_string(),
             surface: Surface::Workflow,
         }
@@ -254,6 +265,14 @@ mod tests {
                 declared_at: at(declared_at),
             },
         }
+    }
+
+    /// Like `finding`, but pins the `declared_by.run_id` so the run_id filter
+    /// can be exercised.
+    fn finding_run(run_id: &str, id: &str, severity: Severity, declared_at: &str) -> FindingOut {
+        let mut f = finding(id, severity, declared_at);
+        f.record.declared_by = attribution_run(run_id);
+        f
     }
 
     #[test]
@@ -351,6 +370,7 @@ mod tests {
         let q = FindingsQuery {
             ws_id: Some("ws2".to_string()),
             workflow: None,
+            run_id: None,
         };
         let resp = scope_and_summarize(mixed_findings(), &q);
         let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
@@ -369,6 +389,7 @@ mod tests {
         let q = FindingsQuery {
             ws_id: None,
             workflow: Some("wfA".to_string()),
+            run_id: None,
         };
         let resp = scope_and_summarize(mixed_findings(), &q);
         let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
@@ -397,22 +418,70 @@ mod tests {
         let q = FindingsQuery {
             ws_id: None,
             workflow: Some("anything".to_string()),
+            run_id: None,
         };
         let resp = scope_and_summarize(input, &q);
         assert!(resp.findings.is_empty());
         assert_eq!(resp.summary.total, 0);
     }
 
+    /// Two runs' worth of findings so the run_id filter has something to scope.
+    fn run_findings() -> Vec<FindingOut> {
+        vec![
+            finding_run("runA", "a", Severity::Critical, "2026-01-01T00:00:00Z"),
+            finding_run("runA", "b", Severity::High, "2026-01-02T00:00:00Z"),
+            finding_run("runB", "c", Severity::Medium, "2026-01-03T00:00:00Z"),
+        ]
+    }
+
+    #[test]
+    fn run_id_filter_scopes_findings_and_summary() {
+        let q = FindingsQuery {
+            ws_id: None,
+            workflow: None,
+            run_id: Some("runA".to_string()),
+        };
+        let resp = scope_and_summarize(run_findings(), &q);
+        let ids: Vec<&str> = resp.findings.iter().map(|f| f.record.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert!(resp
+            .findings
+            .iter()
+            .all(|f| f.record.declared_by.run_id == "runA"));
+        // Summary reflects only the runA subset: 1 critical + 1 high.
+        assert_eq!(resp.summary.total, 2);
+        assert_eq!(resp.summary.critical, 1);
+        assert_eq!(resp.summary.high, 1);
+        assert_eq!(resp.summary.medium, 0);
+    }
+
+    #[test]
+    fn run_id_filter_with_no_match_is_empty() {
+        let q = FindingsQuery {
+            ws_id: None,
+            workflow: None,
+            run_id: Some("nope".to_string()),
+        };
+        let resp = scope_and_summarize(run_findings(), &q);
+        assert!(resp.findings.is_empty());
+        assert_eq!(resp.summary, FindingsSummary::default());
+        assert_eq!(resp.summary.total, 0);
+    }
+
     #[test]
     fn findings_query_deserializes_from_uri() {
-        let uri: axum::http::Uri = "http://x/?ws_id=ws9&workflow=wfZ".parse().unwrap();
+        let uri: axum::http::Uri = "http://x/?ws_id=ws9&workflow=wfZ&run_id=run7"
+            .parse()
+            .unwrap();
         let Query(q) = Query::<FindingsQuery>::try_from_uri(&uri).unwrap();
         assert_eq!(q.ws_id.as_deref(), Some("ws9"));
         assert_eq!(q.workflow.as_deref(), Some("wfZ"));
+        assert_eq!(q.run_id.as_deref(), Some("run7"));
 
         let empty: axum::http::Uri = "http://x/".parse().unwrap();
         let Query(q2) = Query::<FindingsQuery>::try_from_uri(&empty).unwrap();
         assert_eq!(q2.ws_id, None);
         assert_eq!(q2.workflow, None);
+        assert_eq!(q2.run_id, None);
     }
 }
