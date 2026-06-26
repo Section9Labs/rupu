@@ -722,6 +722,49 @@ export interface AuditReport {
   total_gap_files: number;
 }
 
+// ── Coverage: runs + diff ─────────────────────────────────────────────────
+
+export interface RunListEntry {
+  run_id: string;
+  started_at: string;
+  model: string;
+  surface: string; // lowercase: workflow|agent|autoflow|session
+  cells_asserted: number;
+  findings: number;
+  files_touched: number;
+}
+
+export interface CellRef {
+  concern_id: string;
+  file_path: string;
+  status: string; // snake_case: clean|finding|examined|not_applicable
+}
+
+export interface VerdictFlip {
+  concern_id: string;
+  file_path: string;
+  base_status: string;
+  compare_status: string;
+  high_signal: boolean;
+}
+
+export interface FindingThemeRef {
+  concern_id: string | null;
+  theme: string;
+}
+
+export interface RunDiff {
+  base_runs: string[];
+  compare_runs: string[];
+  newly_asserted: CellRef[];
+  no_longer_asserted: CellRef[];
+  verdict_flips: VerdictFlip[];
+  findings_appeared: FindingThemeRef[];
+  findings_disappeared: FindingThemeRef[];
+  newly_touched: string[];
+  no_longer_touched: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
@@ -918,6 +961,21 @@ export const api = {
   getCoverageAudit(target: string, wsId?: string): Promise<AuditReport> {
     const qs = wsId ? `?ws_id=${encodeURIComponent(wsId)}` : '';
     return request<AuditReport>(`/api/coverage/${encodeURIComponent(target)}/audit${qs}`);
+  },
+  getCoverageRuns(target: string, wsId?: string): Promise<RunListEntry[]> {
+    const qs = wsId ? `?ws_id=${encodeURIComponent(wsId)}` : '';
+    return request<RunListEntry[]>(`/api/coverage/${encodeURIComponent(target)}/runs${qs}`);
+  },
+  getCoverageDiff(
+    target: string,
+    opts?: { wsId?: string; base?: string; compare?: string },
+  ): Promise<RunDiff> {
+    const p = new URLSearchParams();
+    if (opts?.wsId) p.set('ws_id', opts.wsId);
+    if (opts?.base) p.set('base', opts.base);
+    if (opts?.compare) p.set('compare', opts.compare);
+    const qs = p.toString() ? `?${p.toString()}` : '';
+    return request<RunDiff>(`/api/coverage/${encodeURIComponent(target)}/diff${qs}`);
   },
 
   // --- Findings ---
