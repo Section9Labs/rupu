@@ -119,6 +119,21 @@ const GRAPH: RunGraphResponse = {
   ],
 };
 
+// An awaiting-approval run: gated on `step_a`, no approval recorded yet.
+const AWAITING_GRAPH: RunGraphResponse = {
+  run: {
+    id: 'run-1',
+    workflow_name: 'nightly-scan',
+    status: 'awaiting_approval',
+    started_at: '2026-06-01T00:00:00Z',
+    awaiting_step_id: 'step_a',
+    approval_prompt: 'Approve the plan before applying?',
+  } as RunGraphResponse['run'],
+  workflow: { steps: [{ id: 'step_a', kind: 'step', agent: 'reviewer' }] },
+  step_results: [],
+  units: [],
+};
+
 const FINDINGS: FindingsResponse = {
   findings: [],
   summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
@@ -227,5 +242,36 @@ describe('RunDetail shell', () => {
     // The step-scoped event survives; the run-level event is filtered out.
     expect(feed).toHaveTextContent('evt:step_a');
     expect(feed).not.toHaveTextContent('evt:run');
+  });
+
+  it('approves and rejects an awaiting run via the approval-gate controls', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(AWAITING_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    const approveSpy = vi.spyOn(api, 'approveRun').mockResolvedValue(undefined);
+    const rejectSpy = vi.spyOn(api, 'rejectRun').mockResolvedValue(undefined);
+
+    renderPage();
+
+    // Wait for the awaiting banner's Approve button to render.
+    const approveBtn = await screen.findByRole('button', { name: 'Approve run' });
+
+    // Approving records the decision → "Approved — resuming…".
+    fireEvent.click(approveBtn);
+    await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('run-1'));
+    await screen.findByText(/Approved — resuming/);
+
+    // Re-render fresh to drive the reject path independently.
+    cleanup();
+    renderPage();
+    const rejectBtn = await screen.findByRole('button', { name: 'Reject run' });
+    fireEvent.click(rejectBtn);
+
+    const reasonInput = await screen.findByLabelText('Rejection reason');
+    fireEvent.change(reasonInput, { target: { value: 'not safe' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm rejection' }));
+
+    await waitFor(() => expect(rejectSpy).toHaveBeenCalledWith('run-1', 'not safe'));
   });
 });

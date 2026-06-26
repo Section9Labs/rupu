@@ -99,6 +99,15 @@ export default function RunDetail() {
   const [findingsError, setFindingsError] = useState<string | null>(null);
   const findingsRequestedRef = useRef(false);
 
+  // Approval-gate local state. `gateDecision` reflects an optimistic local
+  // decision (the live stream / next poll catches up); `gatePending` disables
+  // the controls mid-request; `gateError` surfaces a failed approve/reject.
+  const [gateDecision, setGateDecision] = useState<'approved' | 'rejected' | null>(null);
+  const [gatePending, setGatePending] = useState(false);
+  const [gateError, setGateError] = useState<string | null>(null);
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [rejectReason, setRejectReason] = useState('');
+
   // The ONE selection cursor that the tab panel follows. Null = whole run.
   const [selection, setSelection] = useState<Selection>(null);
   // Guards the one-time default seed so live model rebuilds don't override the
@@ -111,6 +120,11 @@ export default function RunDetail() {
     setGraph(null);
     setLoadError(null);
     setSelection(null);
+    setGateDecision(null);
+    setGatePending(false);
+    setGateError(null);
+    setRejectOpen(false);
+    setRejectReason('');
     seededSelRef.current = false;
     setFindings(null);
     setFindingsError(null);
@@ -261,6 +275,39 @@ export default function RunDetail() {
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
 
+  // Approval recorded — either persisted (resume_requested_at) or optimistic.
+  const resumeRequested = Boolean(run?.resume_requested_at) || gateDecision === 'approved';
+  const rejected = gateDecision === 'rejected';
+
+  async function onApprove() {
+    if (!run || gatePending) return;
+    setGatePending(true);
+    setGateError(null);
+    try {
+      await api.approveRun(run.id);
+      setGateDecision('approved');
+    } catch (e: unknown) {
+      setGateError(e instanceof Error ? e.message : 'Failed to approve run');
+    } finally {
+      setGatePending(false);
+    }
+  }
+
+  async function onReject() {
+    if (!run || gatePending) return;
+    setGatePending(true);
+    setGateError(null);
+    try {
+      await api.rejectRun(run.id, rejectReason);
+      setGateDecision('rejected');
+      setRejectOpen(false);
+    } catch (e: unknown) {
+      setGateError(e instanceof Error ? e.message : 'Failed to reject run');
+    } finally {
+      setGatePending(false);
+    }
+  }
+
   // ---- Selection-driven derivations (safe when model is null) --------------
 
   // The selected node, its fan-out (if any), and its resolved transcript path.
@@ -365,9 +412,72 @@ export default function RunDetail() {
                 Awaiting approval · <span className="font-mono">{awaiting.stepId}</span>
               </div>
               <p className="mt-0.5 break-words text-[12px] text-amber-700">{awaiting.reason}</p>
-              <p className="mt-1 text-[11px] text-amber-600/80">
-                Approve / Reject controls arrive in a later phase — view only for now.
-              </p>
+
+              {resumeRequested ? (
+                <div className="mt-2 flex items-center gap-2 text-[12px] font-medium text-emerald-700">
+                  <span
+                    className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500"
+                    aria-hidden="true"
+                  />
+                  Approved — resuming…
+                </div>
+              ) : rejected ? (
+                <div className="mt-2 text-[12px] font-medium text-red-700">Rejected.</div>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={onApprove}
+                      disabled={gatePending}
+                      aria-label="Approve run"
+                      className="inline-flex items-center rounded-md bg-emerald-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {gatePending ? 'Working…' : 'Approve'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRejectOpen((v) => !v);
+                        setGateError(null);
+                      }}
+                      disabled={gatePending}
+                      aria-label="Reject run"
+                      className="inline-flex items-center rounded-md border border-red-300 bg-white px-3 py-1.5 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      Reject
+                    </button>
+                  </div>
+
+                  {rejectOpen && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        type="text"
+                        value={rejectReason}
+                        onChange={(e) => setRejectReason(e.target.value)}
+                        placeholder="Reason (optional)"
+                        aria-label="Rejection reason"
+                        className="min-w-0 flex-1 rounded-md border border-red-200 bg-white px-2 py-1 text-[12px] text-ink placeholder:text-ink-mute focus:border-red-400 focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        onClick={onReject}
+                        disabled={gatePending}
+                        aria-label="Confirm rejection"
+                        className="inline-flex items-center rounded-md bg-red-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {gatePending ? 'Working…' : 'Confirm reject'}
+                      </button>
+                    </div>
+                  )}
+
+                  {gateError && (
+                    <p className="text-[11px] font-medium text-red-700" role="alert">
+                      {gateError}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         )}

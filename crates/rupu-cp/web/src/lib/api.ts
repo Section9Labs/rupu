@@ -74,6 +74,7 @@ export interface RunRecord {
   awaiting_step_id?: string | null;
   approval_prompt?: string | null;
   awaiting_since?: string | null;
+  resume_requested_at?: string | null;
   expires_at?: string | null;
   issue_ref?: string | null;
   [k: string]: unknown;
@@ -729,6 +730,21 @@ export const api = {
   },
   getRunGraph(id: string): Promise<RunGraphResponse> {
     return request<RunGraphResponse>(`/api/runs/${encodeURIComponent(id)}/graph`);
+  },
+  /** Record approval for an awaiting run. The run stays `awaiting_approval`
+   *  but gains `resume_requested_at`; a worker then resumes it. */
+  async approveRun(id: string): Promise<void> {
+    await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
+      `/api/runs/${encodeURIComponent(id)}/approve`,
+      { method: 'POST' },
+    );
+  },
+  /** Reject an awaiting run (terminal → `rejected`). */
+  async rejectRun(id: string, reason: string): Promise<void> {
+    await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
+      `/api/runs/${encodeURIComponent(id)}/reject`,
+      { method: 'POST', body: JSON.stringify({ reason }) },
+    );
   },
   getRunUsageTimeline(id: string): Promise<UsageTimelinePoint[]> {
     return request<UsageTimelinePoint[]>(`/api/runs/${encodeURIComponent(id)}/usage-timeline`);
