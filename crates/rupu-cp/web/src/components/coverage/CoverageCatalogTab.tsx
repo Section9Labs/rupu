@@ -1,12 +1,18 @@
-// Catalog tab — the effective concern catalog snapshot for a target.
-import { useEffect, useState } from 'react';
+// Catalog tab — the effective concern catalog snapshot, as collapsed rows.
+import { useEffect, useMemo, useState } from 'react';
 import { api, type FlatCatalog } from '../../lib/api';
+import { filterConcerns } from '../../lib/coverageFilter';
 import { SectionHeader } from '../lists/SectionHeader';
 import { ListCard } from '../lists/ListCard';
+import CollapsibleRow from './CollapsibleRow';
+import SeverityChip from './SeverityChip';
+import ConcernControls from './ConcernControls';
 
 export default function CoverageCatalogTab({ target, wsId }: { target: string; wsId?: string }) {
   const [cat, setCat] = useState<FlatCatalog | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [severity, setSeverity] = useState('all');
+  const [open, setOpen] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -25,6 +31,17 @@ export default function CoverageCatalogTab({ target, wsId }: { target: string; w
     };
   }, [target, wsId]);
 
+  const concerns = useMemo(() => (cat ? filterConcerns(cat.concerns, severity) : []), [cat, severity]);
+
+  function toggle(id: string) {
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   if (error) return <p className="mt-4 text-sm text-red-700">{error}</p>;
   if (!cat) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
   if (cat.concerns.length === 0)
@@ -32,25 +49,47 @@ export default function CoverageCatalogTab({ target, wsId }: { target: string; w
 
   return (
     <section className="mt-6">
-      <SectionHeader tone="muted" label="Catalog concerns" count={cat.concerns.length} />
+      <SectionHeader tone="muted" label="Catalog concerns" count={concerns.length} />
+      <ConcernControls
+        severity={severity}
+        onSeverity={setSeverity}
+        onExpandAll={() => setOpen(new Set(concerns.map((c) => c.id)))}
+        onCollapseAll={() => setOpen(new Set())}
+        total={concerns.length}
+      />
       <ListCard>
-        {cat.concerns.map((c) => (
-          <div key={c.id} className="px-4 py-3">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-sm font-medium text-ink">{c.name}</span>
-              <span className="text-[11px] font-mono text-ink-mute">{c.id}</span>
-              <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200">
-                {c.severity}
+        {concerns.map((c) => (
+          <CollapsibleRow
+            key={c.id}
+            open={open.has(c.id)}
+            onToggle={() => toggle(c.id)}
+            header={
+              <span className="flex items-center gap-2 flex-wrap">
+                <span className="text-sm font-medium text-ink">{c.name}</span>
+                <span className="text-[11px] font-mono text-ink-mute">{c.id}</span>
+                <SeverityChip severity={c.severity} />
+                <span className="text-[10px] text-ink-mute">{cat.sources[c.id] ?? 'inline'}</span>
               </span>
-              <span className="text-[10px] text-ink-mute">{cat.sources[c.id] ?? 'inline'}</span>
-            </div>
-            {c.description && (
-              <p className="mt-1 text-xs text-ink-dim leading-snug">{c.description}</p>
-            )}
+            }
+          >
+            {c.description && <p className="text-xs text-ink-dim leading-snug">{c.description}</p>}
             <p className="mt-1 text-[11px] text-ink-mute font-mono break-all">
-              {c.applicable_globs.join(', ')}
+              globs: {c.applicable_globs.join(', ')}
             </p>
-          </div>
+            <p className="mt-1 text-[11px] text-ink-mute">min strength: {c.min_strength}</p>
+            {c.tags.length > 0 && (
+              <p className="mt-1 text-[11px] text-ink-mute">tags: {c.tags.join(', ')}</p>
+            )}
+            {c.references.length > 0 && (
+              <ul className="mt-1 space-y-0.5">
+                {c.references.map((ref) => (
+                  <li key={ref} className="text-[11px] text-ink-mute break-all">
+                    {ref}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </CollapsibleRow>
         ))}
       </ListCard>
     </section>

@@ -1,14 +1,22 @@
-// Gap tab — concerns whose in-scope files weren't all assessed. Derived from
-// the same audit report the Audit tab uses.
+// Gap tab — concerns whose in-scope files weren't all assessed. Collapsed
+// accordion rows with severity + file filters and expand/collapse-all.
 import { useEffect, useMemo, useState } from 'react';
 import { api, type AuditReport } from '../../lib/api';
 import { gapRows } from '../../lib/coverageGap';
+import { filterGapRows } from '../../lib/coverageFilter';
 import { SectionHeader } from '../lists/SectionHeader';
 import { ListCard } from '../lists/ListCard';
+import CollapsibleRow from './CollapsibleRow';
+import SeverityChip from './SeverityChip';
+import CappedList from './CappedList';
+import ConcernControls from './ConcernControls';
 
 export default function CoverageGapTab({ target, wsId }: { target: string; wsId?: string }) {
   const [report, setReport] = useState<AuditReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [severity, setSeverity] = useState('all');
+  const [fileQuery, setFileQuery] = useState('');
+  const [open, setOpen] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -27,11 +35,23 @@ export default function CoverageGapTab({ target, wsId }: { target: string; wsId?
     };
   }, [target, wsId]);
 
-  const rows = useMemo(() => (report ? gapRows(report) : []), [report]);
+  const rows = useMemo(
+    () => (report ? filterGapRows(gapRows(report), { severity, fileQuery }) : []),
+    [report, severity, fileQuery],
+  );
+
+  function toggle(id: string) {
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
 
   if (error) return <p className="mt-4 text-sm text-red-700">{error}</p>;
   if (!report) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
-  if (rows.length === 0)
+  if (gapRows(report).length === 0)
     return <p className="mt-4 text-sm text-ink-dim">No gaps — every in-scope file assessed.</p>;
 
   return (
@@ -42,29 +62,40 @@ export default function CoverageGapTab({ target, wsId }: { target: string; wsId?
         count={rows.length}
         hint="concerns with unassessed files"
       />
-      <ListCard>
-        {rows.map((r) => (
-          <div key={r.concern_id} className="px-4 py-3">
-            <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-sm font-medium text-ink">{r.name}</span>
-              <span className="text-[11px] font-mono text-ink-mute">{r.concern_id}</span>
-              <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200">
-                {r.severity}
-              </span>
-              <span className="text-[10px] text-amber-700 font-medium tabular-nums">
-                {r.gap_files.length} files
-              </span>
-            </div>
-            <ul className="mt-1 space-y-0.5">
-              {r.gap_files.map((f) => (
-                <li key={f} className="text-[11px] font-mono text-ink-mute break-all">
-                  {f}
-                </li>
-              ))}
-            </ul>
-          </div>
-        ))}
-      </ListCard>
+      <ConcernControls
+        severity={severity}
+        onSeverity={setSeverity}
+        fileQuery={fileQuery}
+        onFileQuery={setFileQuery}
+        onExpandAll={() => setOpen(new Set(rows.map((r) => r.concern_id)))}
+        onCollapseAll={() => setOpen(new Set())}
+        total={rows.length}
+      />
+      {rows.length === 0 ? (
+        <p className="text-sm text-ink-dim pl-1">No concerns match the current filters.</p>
+      ) : (
+        <ListCard>
+          {rows.map((r) => (
+            <CollapsibleRow
+              key={r.concern_id}
+              open={open.has(r.concern_id)}
+              onToggle={() => toggle(r.concern_id)}
+              header={
+                <span className="flex items-center gap-2 flex-wrap">
+                  <span className="text-sm font-medium text-ink">{r.name}</span>
+                  <span className="text-[11px] font-mono text-ink-mute">{r.concern_id}</span>
+                  <SeverityChip severity={r.severity} />
+                  <span className="text-[10px] text-amber-700 font-medium tabular-nums">
+                    {r.gap_files.length} files
+                  </span>
+                </span>
+              }
+            >
+              <CappedList items={r.gap_files} />
+            </CollapsibleRow>
+          ))}
+        </ListCard>
+      )}
     </section>
   );
 }
