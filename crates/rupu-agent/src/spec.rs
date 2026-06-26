@@ -156,6 +156,12 @@ pub struct AgentSpec {
     /// Compact-at percentage threshold. See `compactAtPercent` frontmatter.
     pub compact_at_percent: Option<u8>,
     pub system_prompt: String,
+    /// The full original file text (frontmatter + body) verbatim. Lets the CP
+    /// render the definition source with syntax highlighting; agents are
+    /// matched by parsed `name` (not file stem), so the source path is not
+    /// cleanly recoverable downstream — keeping the raw text here is the clean
+    /// home for it.
+    pub raw: String,
 }
 
 impl AgentSpec {
@@ -163,6 +169,7 @@ impl AgentSpec {
     /// body). The frontmatter must be delimited by `---` lines at the
     /// very start; everything after the second `---` is the body.
     pub fn parse(s: &str) -> Result<Self, AgentSpecParseError> {
+        let raw = s.to_string();
         let s = s
             .strip_prefix("---\n")
             .ok_or(AgentSpecParseError::MissingFrontmatter)?;
@@ -198,6 +205,7 @@ impl AgentSpec {
             context_window_tokens: fm.context_window_tokens,
             compact_at_percent: fm.compact_at_percent,
             system_prompt: body.to_string(),
+            raw,
         })
     }
 
@@ -236,5 +244,19 @@ You are a test agent.
         let spec = AgentSpec::parse(src).expect("parse ok");
         assert_eq!(spec.context_window_tokens, None);
         assert_eq!(spec.compact_at_percent, None);
+    }
+
+    #[test]
+    fn parse_preserves_raw_file_text() {
+        let src = "---
+name: test
+model: opus
+---
+You are a test agent.
+";
+        let spec = AgentSpec::parse(src).expect("parse ok");
+        // `raw` holds the full original file text verbatim (frontmatter + body),
+        // so the CP can show the definition source with syntax highlighting.
+        assert_eq!(spec.raw, src);
     }
 }

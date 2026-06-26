@@ -2,6 +2,7 @@
 // Shows the static list of workflows that have autoflow triggers configured.
 
 import { useCallback, useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AutoflowDefRow } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
@@ -116,8 +117,13 @@ export default function AutoflowsDefs() {
 }
 
 function AutoflowDefEntry({ def }: { def: AutoflowDefRow }) {
+  // Autoflows are workflows with `autoflow.enabled`, so they reuse the workflow
+  // detail page — keyed by file stem (`slug`), not the parsed display name.
   return (
-    <div className="flex items-center gap-4 px-4 py-3">
+    <Link
+      to={`/workflows/${encodeURIComponent(def.slug)}`}
+      className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50"
+    >
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-sm font-medium text-ink">{def.name}</span>
@@ -125,7 +131,7 @@ function AutoflowDefEntry({ def }: { def: AutoflowDefRow }) {
           <ScopeChip scope={def.scope} />
         </div>
       </div>
-    </div>
+    </Link>
   );
 }
 
