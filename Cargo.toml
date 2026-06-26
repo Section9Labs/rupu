@@ -89,7 +89,7 @@ crossterm = { version = "0.28", default-features = false, features = ["events"] 
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 insta = { version = "1", features = ["yaml"] }
 
-minijinja = "2"
+minijinja = { version = "2", features = ["json"] }
 dirs = "5"
 unicode-segmentation = "1.10"
 walkdir = "2"
