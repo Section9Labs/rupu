@@ -1,4 +1,6 @@
 // Audit tab — per-concern coverage matrix + cross-model + serendipitous.
+// Per-concern rows are collapsed accordions: the header is the coverage summary
+// (bar + counts); expanding reveals the asserted / gap file lists.
 import { useEffect, useMemo, useState } from 'react';
 import {
   api,
@@ -7,12 +9,19 @@ import {
   type AuditReport,
   type ConcernCoverage,
 } from '../../lib/api';
+import { filterConcerns } from '../../lib/coverageFilter';
 import { SectionHeader } from '../lists/SectionHeader';
 import { ListCard } from '../lists/ListCard';
+import CollapsibleRow from './CollapsibleRow';
+import SeverityChip from './SeverityChip';
+import CappedList from './CappedList';
+import ConcernControls from './ConcernControls';
 
 export default function CoverageAuditTab({ target, wsId }: { target: string; wsId?: string }) {
   const [report, setReport] = useState<AuditReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [severity, setSeverity] = useState('all');
+  const [open, setOpen] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -33,13 +42,25 @@ export default function CoverageAuditTab({ target, wsId }: { target: string; wsI
 
   const concerns = useMemo(
     () =>
-      // SEV_ORDER puts critical at index 0, so ascending rank = critical→info.
-      [...(report?.concerns ?? [])].sort(
-        (a, b) =>
-          sevRank(normFindingSeverity(a.severity)) - sevRank(normFindingSeverity(b.severity)),
+      filterConcerns(
+        // SEV_ORDER puts critical at index 0, so ascending rank = critical→info.
+        [...(report?.concerns ?? [])].sort(
+          (a, b) =>
+            sevRank(normFindingSeverity(a.severity)) - sevRank(normFindingSeverity(b.severity)),
+        ),
+        severity,
       ),
-    [report],
+    [report, severity],
   );
+
+  function toggle(id: string) {
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
 
   if (error) return <p className="mt-4 text-sm text-red-700">{error}</p>;
   if (!report) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
@@ -59,11 +80,25 @@ export default function CoverageAuditTab({ target, wsId }: { target: string; wsI
         {concerns.length === 0 ? (
           <p className="text-sm text-ink-dim pl-1 mt-1">No catalog → no audit matrix.</p>
         ) : (
-          <ListCard>
-            {concerns.map((c) => (
-              <ConcernRow key={c.concern_id} c={c} />
-            ))}
-          </ListCard>
+          <>
+            <ConcernControls
+              severity={severity}
+              onSeverity={setSeverity}
+              onExpandAll={() => setOpen(new Set(concerns.map((c) => c.concern_id)))}
+              onCollapseAll={() => setOpen(new Set())}
+              total={concerns.length}
+            />
+            <ListCard>
+              {concerns.map((c) => (
+                <ConcernRow
+                  key={c.concern_id}
+                  c={c}
+                  open={open.has(c.concern_id)}
+                  onToggle={() => toggle(c.concern_id)}
+                />
+              ))}
+            </ListCard>
+          </>
         )}
       </section>
 
@@ -120,33 +155,63 @@ function Stat({ label, value }: { label: string; value: string | number }) {
   );
 }
 
-function ConcernRow({ c }: { c: ConcernCoverage }) {
+function ConcernRow({
+  c,
+  open,
+  onToggle,
+}: {
+  c: ConcernCoverage;
+  open: boolean;
+  onToggle: () => void;
+}) {
   const assessed = c.asserted_files.length;
   const inScope = c.in_scope_files.length;
   const pct = inScope === 0 ? 0 : Math.round((assessed / inScope) * 100);
   return (
-    <div className="px-4 py-3">
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-sm font-medium text-ink">{c.name}</span>
-        <span className="text-[11px] font-mono text-ink-mute">{c.concern_id}</span>
-        <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200">
-          {c.severity}
+    <CollapsibleRow
+      open={open}
+      onToggle={onToggle}
+      header={
+        <span className="block">
+          <span className="flex items-center gap-2 flex-wrap">
+            <span className="text-sm font-medium text-ink">{c.name}</span>
+            <span className="text-[11px] font-mono text-ink-mute">{c.concern_id}</span>
+            <SeverityChip severity={c.severity} />
+            {c.gap_files.length > 0 && (
+              <span className="text-[10px] text-amber-700 font-medium">
+                {c.gap_files.length} gap
+              </span>
+            )}
+          </span>
+          <span className="mt-1.5 flex items-center gap-2">
+            <span className="h-1.5 flex-1 rounded bg-slate-100 overflow-hidden">
+              <span className="block h-full bg-brand-500" style={{ width: `${pct}%` }} />
+            </span>
+            <span className="text-[11px] text-ink-mute tabular-nums w-24 text-right">
+              {assessed}/{inScope} files
+            </span>
+          </span>
+          <span className="mt-1 block text-[11px] text-ink-mute tabular-nums">
+            clean {c.clean} · finding {c.findings} · examined {c.examined} · n/a {c.not_applicable}
+          </span>
         </span>
-        {c.gap_files.length > 0 && (
-          <span className="text-[10px] text-amber-700 font-medium">{c.gap_files.length} gap</span>
-        )}
-      </div>
-      <div className="mt-1.5 flex items-center gap-2">
-        <div className="h-1.5 flex-1 rounded bg-slate-100 overflow-hidden">
-          <div className="h-full bg-brand-500" style={{ width: `${pct}%` }} />
+      }
+    >
+      {c.asserted_files.length > 0 && (
+        <div className="mb-2">
+          <p className="text-[11px] font-medium text-ink-dim mb-0.5">Asserted</p>
+          <CappedList items={c.asserted_files} />
         </div>
-        <span className="text-[11px] text-ink-mute tabular-nums w-24 text-right">
-          {assessed}/{inScope} files
-        </span>
-      </div>
-      <div className="mt-1 text-[11px] text-ink-mute tabular-nums">
-        clean {c.clean} · finding {c.findings} · examined {c.examined} · n/a {c.not_applicable}
-      </div>
-    </div>
+      )}
+      {c.gap_files.length > 0 && (
+        <div>
+          <p className="text-[11px] font-medium text-amber-700 mb-0.5">Gap</p>
+          <CappedList items={c.gap_files} />
+        </div>
+      )}
+      {c.asserted_files.length === 0 && c.gap_files.length === 0 && (
+        <p className="text-[11px] text-ink-mute">No in-scope files.</p>
+      )}
+    </CollapsibleRow>
   );
 }
