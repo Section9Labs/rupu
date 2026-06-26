@@ -246,6 +246,9 @@ impl WorkflowExecutor for InProcessExecutor {
                             active_step_kind: None,
                             active_step_agent: None,
                             active_step_transcript_path: None,
+                            resume_requested_at: None,
+                            resume_claimed_at: None,
+                            resume_claimed_by: None,
                         },
                     );
                 }

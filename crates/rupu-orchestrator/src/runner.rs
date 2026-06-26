@@ -397,6 +397,9 @@ pub async fn run_workflow(
                 active_step_kind: None,
                 active_step_agent: None,
                 active_step_transcript_path: None,
+                resume_requested_at: None,
+                resume_claimed_at: None,
+                resume_claimed_by: None,
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {
