@@ -5,6 +5,7 @@ use axum::{
 };
 use serde_json::json;
 
+#[derive(Debug)]
 pub struct ApiError(pub StatusCode, pub String);
 
 impl ApiError {
@@ -18,6 +19,12 @@ impl ApiError {
 
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self(StatusCode::BAD_REQUEST, msg.into())
+    }
+
+    /// 409 — the request conflicts with the run's current state (e.g.
+    /// approving/rejecting a run that is no longer `awaiting_approval`).
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self(StatusCode::CONFLICT, msg.into())
     }
 }
 
