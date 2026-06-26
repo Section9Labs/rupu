@@ -578,3 +578,22 @@ mod read_file_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tojson_tests {
+    use super::*;
+    use serde_json::json;
+
+    // Regression: the `tojson` filter is gated behind minijinja's `json`
+    // feature. Without it, a workflow step using `{{ x | tojson }}` fails at
+    // render with "unknown filter: tojson" — which only surfaced once a step
+    // past an approval gate was reached (e.g. on resume). The dep now enables
+    // the `json` feature so the built-in filter is registered.
+    #[test]
+    fn tojson_filter_serializes_a_value() {
+        let ctx = StepContext::new().with_event(json!({ "name": "rupu" }));
+        let out = render_step_prompt("{{ event | tojson }}", &ctx, RenderMode::Permissive)
+            .expect("tojson should be a registered filter");
+        assert_eq!(out, "{\"name\":\"rupu\"}");
+    }
+}
