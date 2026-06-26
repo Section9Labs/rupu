@@ -1089,9 +1089,18 @@ impl RunStore {
     ///   cancelled by rejecting it with `reason` — status flips to
     ///   `Rejected`; returns [`CancelOutcome::RejectedAwaitingApproval`].
     /// - A `Pending`/`Running` run is marked `Cancelled`: if its
-    ///   recorded `runner_pid` is live it is sent SIGTERM, the pause and
-    ///   active-step fields are cleared, `finished_at`/`error_message`
-    ///   are set, and [`CancelOutcome::MarkedCancelled`] is returned.
+    ///   recorded `runner_pid` is live AND is not our own process it is
+    ///   sent SIGTERM, the pause and active-step fields are cleared,
+    ///   `finished_at`/`error_message` are set, and
+    ///   [`CancelOutcome::MarkedCancelled`] is returned.
+    ///
+    /// # Limitation
+    ///
+    /// Cancelling a run that is being resumed in-process by `cp serve`
+    /// marks it `Cancelled` but cannot interrupt the in-flight resume
+    /// task (no cooperative cancellation yet); the resume may run to
+    /// completion. Cancelling a run owned by a *separate* process (e.g.
+    /// `rupu run`) sends SIGTERM and stops it.
     pub fn cancel(
         &self,
         run_id: &str,
@@ -1118,7 +1127,17 @@ impl RunStore {
             RunStatus::Pending | RunStatus::Running => {
                 let pid = record.runner_pid;
                 let was_running = pid.is_some_and(pid_is_running);
-                if let Some(pid) = pid.filter(|pid| pid_is_running(*pid)) {
+                // Only signal a pid that is live AND is NOT our own
+                // process. A web-approved gate is resumed in-process
+                // inside `cp serve`, so the run's `runner_pid` can be the
+                // cp-serve PID itself — SIGTERMing it would kill the whole
+                // control plane (web server + resume worker + every
+                // in-flight resume). The run is still marked `Cancelled`
+                // below; we just cannot interrupt an in-process resume via
+                // signal (see the limitation note on `cancel`).
+                if let Some(pid) =
+                    pid.filter(|pid| pid_is_running(*pid) && *pid != std::process::id())
+                {
                     let _ = terminate_pid(pid);
                 }
                 record.status = RunStatus::Cancelled;
@@ -1908,6 +1927,41 @@ mod tests {
         assert!(reloaded.active_step_agent.is_none());
         assert!(reloaded.awaiting_step_id.is_none());
         assert!(reloaded.approval_prompt.is_none());
+    }
+
+    #[test]
+    fn cancel_running_does_not_signal_self() {
+        // Regression: a web-approved gate is resumed in-process inside
+        // `cp serve`, so the run's `runner_pid` can be the cp-serve PID
+        // (== this process). Cancel must mark it `Cancelled` WITHOUT
+        // SIGTERMing itself — otherwise it would kill the control plane.
+        // Proof: if the guard were missing, SIGTERM to this test process
+        // would terminate the test run; instead the assertions below run.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_cancel_self_pid");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = Some(std::process::id());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let outcome = store.cancel(&rec.id, "matt", "stop it", now).unwrap();
+        // The self pid is live, so `was_running` reflects that; the
+        // `pid` echoed back is the recorded runner_pid (pre-clear).
+        assert_eq!(
+            outcome,
+            CancelOutcome::MarkedCancelled {
+                pid: Some(std::process::id()),
+                was_running: true,
+            }
+        );
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert!(reloaded.runner_pid.is_none());
+
+        // Critically: we reached this line, which means the test process
+        // was NOT terminated by a self-directed SIGTERM.
     }
 
     #[test]
