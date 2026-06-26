@@ -1,24 +1,25 @@
-//! `TranscriptTail` — notify-driven consumer of a transcript JSONL file,
-//! yielding parsed [`rupu_transcript::Event`] values as a [`Stream`].
+//! `TranscriptTail` — polling consumer of a transcript JSONL file, yielding
+//! parsed [`rupu_transcript::Event`] values as a [`Stream`].
 //!
 //! This mirrors [`rupu_orchestrator::executor::FileTailRunSource`] but parses
 //! the transcript Event type (`rupu_transcript::Event`) rather than the
 //! orchestrator's step-level event. The transcript file and the orchestrator's
 //! `events.jsonl` are different JSONL schemas, so they need separate tailers.
 //!
-//! On macOS kqueue the `notify` backend may not reliably deliver `Modify`
-//! events for appends on some kernel/volume configurations. A polling fallback
-//! (250 ms interval) runs alongside the watcher and covers those gaps. Both
-//! paths share an `Arc<AtomicU64>` byte offset so events are never duplicated.
+//! Tailing is poll-based: an initial-drain task reads any pre-existing backlog,
+//! then a 250 ms poll loop emits newly-appended lines. Both share an
+//! `Arc<AtomicU64>` byte offset so events are never duplicated. (We deliberately
+//! do NOT use a `notify` filesystem watcher — the macOS kqueue backend it's
+//! pinned to panics a background thread on teardown when the stream is dropped,
+//! and the 250 ms poll already covers append-tailing reliably.)
 //!
 //! ## Double-emit prevention
 //!
-//! Three drain paths (initial-drain task, notify callback, 250 ms poll) used to
-//! each do: load offset → read file → emit lines in `bytes[off..]` → store new
-//! offset. If two drains raced on the same `off` they would both emit the same
-//! range. The fix: each drainer atomically *claims* the byte range via
-//! `compare_exchange` **before** emitting. Only the drainer that wins the CAS
-//! emits; all others return immediately.
+//! Two drain paths (initial-drain task, 250 ms poll) each do: load offset → read
+//! file → emit lines in `bytes[off..]` → store new offset. If they raced on the
+//! same `off` they would both emit the same range. The fix: each drainer
+//! atomically *claims* the byte range via `compare_exchange` **before** emitting.
+//! Only the drainer that wins the CAS emits; all others return immediately.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -27,7 +28,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::Stream;
-use notify::{RecursiveMode, Watcher};
 use rupu_transcript::Event;
 use tokio::sync::mpsc;
 
@@ -36,20 +36,15 @@ use tokio::sync::mpsc;
 /// (they don't terminate the stream).
 pub struct TranscriptTail {
     rx: mpsc::Receiver<Event>,
-    _watcher: notify::RecommendedWatcher,
 }
 
 impl TranscriptTail {
     pub async fn open(path: &Path) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel::<Event>(64);
         let path_buf: PathBuf = path.to_path_buf();
-        let parent = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
 
-        // Shared offset between the initial-drain task, the notify watcher
-        // callback, and the polling fallback.
+        // Shared offset between the initial-drain task and the polling loop,
+        // so the two never emit the same byte range twice.
         let offset = Arc::new(AtomicU64::new(0));
 
         // --- initial-drain task ---
@@ -63,34 +58,9 @@ impl TranscriptTail {
             drain_and_emit_async(&path_for_drain, &offset_for_drain, &tx_for_drain).await;
         });
 
-        // --- notify watcher ---
-        let tx_for_watcher = tx.clone();
-        let path_for_watcher = path_buf.clone();
-        let offset_for_watcher = offset.clone();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(evt) = res {
-                if matches!(
-                    evt.kind,
-                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
-                ) {
-                    let touches_target = evt.paths.iter().any(|p| p == &path_for_watcher);
-                    if !touches_target {
-                        return;
-                    }
-                    // Safe to call blocking_send here: notify's callback runs on
-                    // its own dedicated OS thread, not inside a tokio task.
-                    drain_and_emit_sync(&path_for_watcher, &offset_for_watcher, &tx_for_watcher);
-                }
-            }
-        })
-        .map_err(std::io::Error::other)?;
-
-        watcher
-            .watch(&parent, RecursiveMode::NonRecursive)
-            .map_err(std::io::Error::other)?;
-
-        // --- polling fallback (250 ms) ---
-        // Covers kqueue gaps where notify doesn't fire for appends.
+        // --- polling loop (250 ms) ---
+        // Emits newly-appended lines. This is the sole tailing mechanism
+        // (no notify watcher — see the module docs).
         let tx_for_poll = tx.clone();
         let path_for_poll = path_buf.clone();
         let offset_for_poll = offset.clone();
@@ -106,44 +76,16 @@ impl TranscriptTail {
 
         Ok(Self {
             rx,
-            _watcher: watcher,
         })
     }
 }
 
-/// Synchronous drain called from the notify callback (runs on notify's dedicated
-/// OS thread — not a tokio task, so `blocking_send` is safe here).
-///
-/// Atomically claims the new byte range via `compare_exchange` before emitting,
-/// so if another drainer has already advanced the offset past `old_off`, this
-/// call is a no-op. This prevents double-emission when multiple drain paths fire
-/// concurrently.
-fn drain_and_emit_sync(path: &Path, offset: &Arc<AtomicU64>, tx: &mpsc::Sender<Event>) {
-    let Ok(bytes) = std::fs::read(path) else {
-        return;
-    };
-    let new_len = bytes.len() as u64;
-    let old_off = offset.load(Ordering::SeqCst);
-    if new_len <= old_off {
-        return;
-    }
-    // Claim [old_off, new_len): only the winner of this CAS emits.
-    if offset
-        .compare_exchange(old_off, new_len, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return; // another drainer already claimed this range
-    }
-    emit_lines(&bytes[old_off as usize..], |ev| {
-        let _ = tx.blocking_send(ev);
-    });
-}
-
-/// Async drain called from the initial-drain task and the polling fallback.
+/// Async drain called from the initial-drain task and the 250 ms polling loop.
 ///
 /// Uses `tokio::fs::read` to avoid blocking the runtime. Atomically claims the
-/// new byte range via `compare_exchange` before emitting — same race-prevention
-/// guarantee as [`drain_and_emit_sync`].
+/// new byte range via `compare_exchange` before emitting, so if the other
+/// drainer has already advanced the offset past `old_off` this call is a no-op
+/// — preventing double-emission when both drain paths fire concurrently.
 async fn drain_and_emit_async(path: &Path, offset: &Arc<AtomicU64>, tx: &mpsc::Sender<Event>) {
     let Ok(bytes) = tokio::fs::read(path).await else {
         return;
@@ -171,25 +113,6 @@ async fn drain_and_emit_async(path: &Path, offset: &Arc<AtomicU64>, tx: &mpsc::S
             if tx.send(ev).await.is_err() {
                 return;
             }
-        }
-    }
-}
-
-/// Emit parsed lines from `slice` using the provided send closure.
-///
-/// Extracted to share line-splitting logic between the sync and async paths
-/// without requiring a generic async closure (which Rust doesn't support
-/// cleanly). The async path inlines the send loop so it can `.await`.
-fn emit_lines<F>(slice: &[u8], mut send: F)
-where
-    F: FnMut(Event),
-{
-    for line in std::str::from_utf8(slice).unwrap_or("").lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(ev) = serde_json::from_str::<Event>(line) {
-            send(ev);
         }
     }
 }
