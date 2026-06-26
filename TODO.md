@@ -196,7 +196,7 @@ Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (P
 - ✅ **2a — run lifecycle**: web Approve/Reject (v0.15.0), Cancel + approve-with-mode + `RunStatus::Cancelled` (PR #360).
 - 🚧 **2b — launch a run from the web**: subprocess execution model (`cp serve` spawns `rupu workflow run/approve` children), `RunLauncher` port + `SubprocessLauncher`, launch endpoint, **resume retrofit** (in-process → subprocess, makes resumed runs cancellable). Spec: `…-phase2b-launch-design.md`.
 - ⬜ **2c — interactive sessions**: send a message to a live session (queue write + worker), session start/stop/archive/delete. Needs session control logic lifted out of the `rupu-cli` binary into a library (it's all private free-fns in `cmd/session.rs` today).
-- ⬜ **2d — autoflow control**: requeue an issue's autoflow (`WakeStore::enqueue`) + release a stuck claim (`AutoflowClaimStore::delete`) — pure-state, library-reusable.
+- 🚧 **2d — autoflow control**: requeue an issue's autoflow (`WakeStore::enqueue`) + release a stuck claim (`AutoflowClaimStore::delete`) — pure-state, library-reusable. v1 **defers git-worktree cleanup** on release: `delete()` unblocks the autoflow but may leave an orphaned worktree under `<global>/autoflows/worktrees/` (the CLI's `cleanup_claim_artifacts` needs `RepoRegistryStore` + a CLI-private fn and bails on untracked repos). Follow-up: best-effort worktree teardown in the CP release path.
 
 **Deferred from 2b (tracked per matt 2026-06-26):**
 - **Richer launch target picker** — v1 ships an optional target *text field* (`github:owner/repo` / PR / issue ref, which `workflow run` already clones/fetches). A rupu-app-style target picker (this-workspace / directory browser / RepoRef clone with status) is deferred.
