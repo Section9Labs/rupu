@@ -268,6 +268,9 @@ fn sample_run_record(id: &str, issue_ref: &str) -> rupu_orchestrator::RunRecord 
         active_step_id: None,
         active_step_kind: None,
         active_step_agent: None,
+        resume_requested_at: None,
+        resume_claimed_at: None,
+        resume_claimed_by: None,
         active_step_transcript_path: None,
     }
 }

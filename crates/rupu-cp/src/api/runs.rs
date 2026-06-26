@@ -5,10 +5,10 @@ use crate::{
 use axum::{
     extract::{Path, Query, State},
     response::{IntoResponse as _, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
-use rupu_orchestrator::{RunRecord, RunStatus, RunStoreError};
+use rupu_orchestrator::{ApprovalError, RunRecord, RunStatus, RunStoreError};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -17,6 +17,74 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id", get(get_run))
         .route("/api/runs/:id/log", get(get_run_log))
         .route("/api/runs/:id/usage-timeline", get(get_run_usage_timeline))
+        .route("/api/runs/:id/approve", post(approve_run))
+        .route("/api/runs/:id/reject", post(reject_run))
+}
+
+/// Map an [`ApprovalError`] from the store's approve/reject flow to an
+/// [`ApiError`]:
+/// - `NotFound` → 404
+/// - `NotAwaiting` / `Expired` / `NoAwaitingStep` → 409 (the run isn't in a
+///   state where the decision can be recorded)
+/// - everything else → 500
+fn map_approval_err(id: &str, e: ApprovalError) -> ApiError {
+    match e {
+        ApprovalError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        ApprovalError::NotAwaiting(_)
+        | ApprovalError::Expired(_)
+        | ApprovalError::NoAwaitingStep => ApiError::conflict(e.to_string()),
+        ApprovalError::Store(other) => ApiError::internal(other.to_string()),
+    }
+}
+
+/// Reload a run and serialize it in the same shape as `GET /api/runs/:id`
+/// so the UI can refresh from an approve/reject response.
+fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Value>> {
+    let record = s.run_store.load(id).map_err(|e| match e {
+        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        other => ApiError::internal(other.to_string()),
+    })?;
+    let steps = s.run_store.read_step_results(id).unwrap_or_default();
+    let usage = crate::usage::summarize_run(&s.run_store, id, &s.pricing);
+    Ok(Json(
+        serde_json::json!({ "run": record, "steps": steps, "usage": usage }),
+    ))
+}
+
+/// `POST /api/runs/:id/approve` — record a web approval decision for a paused
+/// (awaiting-approval) run. Flips the run back to `Running` and sets the
+/// `resume_requested_at` marker that a background worker picks up to re-enter
+/// the workflow; this endpoint does NOT execute the run itself.
+async fn approve_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let now = chrono::Utc::now();
+    s.run_store
+        .request_resume_approval(&id, "web", now)
+        .map_err(|e| map_approval_err(&id, e))?;
+    run_response(&s, &id)
+}
+
+#[derive(serde::Deserialize)]
+struct RejectBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /api/runs/:id/reject` — record a web rejection decision for a paused
+/// run, transitioning it to the terminal `Rejected` state.
+async fn reject_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RejectBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let now = chrono::Utc::now();
+    let reason = body.reason.unwrap_or_default();
+    s.run_store
+        .reject(&id, "web", &reason, now)
+        .map_err(|e| map_approval_err(&id, e))?;
+    run_response(&s, &id)
 }
 
 /// Derive a trigger label from a [`RunRecord`].
@@ -228,6 +296,134 @@ async fn get_run_usage_timeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rupu_orchestrator::RunStore;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// Build an `AppState` backed by a fresh tempdir run store.
+    fn test_state(tmp: &tempfile::TempDir) -> AppState {
+        let store = RunStore::new(tmp.path().join("runs"));
+        AppState {
+            global_dir: tmp.path().to_path_buf(),
+            workspace_dir: tmp.path().to_path_buf(),
+            run_store: Arc::new(store),
+            pricing: rupu_config::PricingConfig::default(),
+        }
+    }
+
+    /// An `awaiting_approval` run record paused at `step_id`.
+    fn awaiting_record(id: &str, step_id: &str) -> RunRecord {
+        RunRecord {
+            id: id.into(),
+            workflow_name: "wf".into(),
+            status: RunStatus::AwaitingApproval,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: PathBuf::from("/tmp/proj"),
+            transcript_dir: PathBuf::from("/tmp/proj/.rupu/transcripts"),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting_step_id: Some(step_id.into()),
+            approval_prompt: Some("approve?".into()),
+            awaiting_since: Some(chrono::Utc::now()),
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn approve_awaiting_run_sets_resume_marker_and_stays_awaiting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(awaiting_record("run_app", "gate"), "name: x\n")
+            .unwrap();
+
+        let resp = approve_run(State(s.clone()), Path("run_app".into()))
+            .await
+            .expect("approve should succeed");
+        // Marker-only: the endpoint records the approval but leaves the
+        // run AwaitingApproval for the background worker to approve+resume.
+        let body = resp.0;
+        assert_eq!(body["run"]["status"], serde_json::json!("awaiting_approval"));
+
+        let loaded = s.run_store.load("run_app").unwrap();
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert!(loaded.resume_requested_at.is_some());
+        // Awaited gate stays intact so the worker can recover which gate
+        // to resume.
+        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate"));
+    }
+
+    #[tokio::test]
+    async fn reject_awaiting_run_sets_rejected_with_reason() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(awaiting_record("run_rej", "gate"), "name: x\n")
+            .unwrap();
+
+        let body = RejectBody {
+            reason: Some("not safe".into()),
+        };
+        let resp = reject_run(State(s.clone()), Path("run_rej".into()), Json(body))
+            .await
+            .expect("reject should succeed");
+        assert_eq!(resp.0["run"]["status"], serde_json::json!("rejected"));
+
+        let loaded = s.run_store.load("run_rej").unwrap();
+        assert_eq!(loaded.status, RunStatus::Rejected);
+        assert_eq!(
+            loaded.error_message.as_deref(),
+            Some("rejected: not safe")
+        );
+        assert!(loaded.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn approve_non_awaiting_run_is_conflict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let mut rec = awaiting_record("run_done", "gate");
+        rec.status = RunStatus::Completed;
+        rec.awaiting_step_id = None;
+        s.run_store.create(rec, "name: x\n").unwrap();
+
+        let err = approve_run(State(s), Path("run_done".into()))
+            .await
+            .expect_err("approve on completed run should fail");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn reject_unknown_run_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let err = reject_run(
+            State(s),
+            Path("nope".into()),
+            Json(RejectBody { reason: None }),
+        )
+        .await
+        .expect_err("reject on missing run should 404");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
 
     #[test]
     fn run_list_row_serializes_usage() {

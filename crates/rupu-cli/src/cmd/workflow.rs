@@ -1914,109 +1914,13 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
         Err(e) => return Err(anyhow::anyhow!("approve: {e}")),
         Ok(other) => anyhow::bail!("unexpected decision: {other:?}"),
     };
-    // Reload the record from disk to get inputs, event, workspace path
-    // for the run_workflow re-entry. The library call already persisted
-    // the status flip to Running, so the record is coherent.
-    let record = store
-        .load(run_id)
-        .map_err(|e| anyhow::anyhow!("reload run record: {e}"))?;
-
-    // Rebuild context from disk: workflow YAML snapshot + prior
-    // step results.
-    let body = store
-        .read_workflow_snapshot(run_id)
-        .map_err(|e| anyhow::anyhow!("read workflow snapshot: {e}"))?;
-    let workflow = Workflow::parse(&body)?;
-    let prior_records = store
-        .read_step_results(run_id)
-        .map_err(|e| anyhow::anyhow!("read step results: {e}"))?;
-    let prior_step_results: Vec<rupu_orchestrator::StepResult> = prior_records
-        .iter()
-        .map(rupu_orchestrator::StepResult::from)
-        .collect();
-
-    // Restore inputs, event, issue, workspace path from the record.
-    let inputs_map: BTreeMap<String, String> = record.inputs.clone();
-    let event = record.event.clone();
-    let issue_payload = record.issue.clone();
-    let issue_ref_text = record.issue_ref.clone();
-    let workspace_path = record.workspace_path.clone();
-    let transcripts = record.transcript_dir.clone();
-    paths::ensure_dir(&transcripts)?;
-
-    // Resolve project_root from the persisted workspace path so
-    // agent/config discovery picks up the same `.rupu/` dir the
-    // original run used.
-    let project_root = paths::project_root_for(&workspace_path)?;
-
-    // Standard wiring (mirrors `run` above; refactor candidate but
-    // keeping inline for now to avoid spreading the resume path
-    // across the CLI surface).
-    let resolver = Arc::new(rupu_auth::KeychainResolver::new());
-    let global_cfg_path = global.join("config.toml");
-    let project_cfg_path = project_root.as_ref().map(|p| p.join(".rupu/config.toml"));
-    let cfg = rupu_config::layer_files(Some(&global_cfg_path), project_cfg_path.as_deref())?;
-    let mcp_registry = Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg).await);
-
-    let mode_str = mode.unwrap_or("ask").to_string();
-    let dispatcher = crate::cmd::dispatch::CliAgentDispatcher::new(
-        global.clone(),
-        project_root.clone(),
-        record.workspace_id.clone(),
-        workspace_path.clone(),
-        Arc::clone(&resolver),
-        mode_str.clone(),
-        Arc::clone(&mcp_registry),
-        Arc::clone(&store),
-    );
-    let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
-    let factory = Arc::new(DefaultStepFactory {
-        workflow: workflow.clone(),
-        global: global.clone(),
-        project_root: project_root.clone(),
-        resolver,
-        mode_str,
-        mcp_registry,
-        system_prompt_suffix: None,
-        dispatcher: Some(dispatcher_dyn),
-    });
-
-    let resume = rupu_orchestrator::ResumeState::from_approval(
-        run_id.to_string(),
-        prior_step_results,
-        awaited_step_id.clone(),
-    );
-    let event_sink_for_resume = {
-        let runs_dir = global.join("runs");
-        let events_path = runs_dir.join(run_id).join("events.jsonl");
-        match rupu_orchestrator::executor::JsonlSink::create(&events_path) {
-            Ok(sink) => Some(Arc::new(sink) as Arc<dyn rupu_orchestrator::executor::EventSink>),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to open events.jsonl for resume; continuing without event sink");
-                None
-            }
-        }
-    };
-
-    let opts = OrchestratorRunOpts {
-        workflow,
-        inputs: inputs_map,
-        workspace_id: record.workspace_id.clone(),
-        workspace_path,
-        transcript_dir: transcripts,
-        factory,
-        event,
-        issue: issue_payload,
-        issue_ref: issue_ref_text,
-        run_store: Some(store),
-        workflow_yaml: Some(body),
-        resume_from: Some(resume),
-        run_id_override: None,
-        strict_templates: false,
-        event_sink: event_sink_for_resume,
-    };
-
-    let result = run_workflow(opts).await?;
+    // Phase 2 — the resume — lives in `crate::resume::resume_run` so the
+    // background session worker can resume an approved gate identically.
+    // `awaited_step_id` is threaded in because `approve` clears the
+    // record's `awaiting_step_id`, so it can't be recovered post-flip.
+    let outcome = crate::resume::resume_run(&store, run_id, &awaited_step_id, mode).await?;
+    let awaited_step_id = outcome.awaited_step_id;
+    let result = outcome.result;
     println!(
         "rupu: resumed run {} from step `{}`",
         result.run_id, awaited_step_id
@@ -3744,6 +3648,9 @@ mod tests {
             approval_prompt: Some("approve?".into()),
             awaiting_since: Some(Utc::now()),
             expires_at: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
             issue_ref: None,
             issue: None,
             parent_run_id: None,

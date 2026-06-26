@@ -186,6 +186,20 @@ pub struct RunRecord {
     /// transcript stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_step_transcript_path: Option<PathBuf>,
+    /// When a web/delegated approval flipped the run back to `Running`
+    /// and asked a background worker (not the approving request) to
+    /// resume it. Acts as the "pending resume" marker that
+    /// [`RunStore::list_pending_resume`] scans for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_requested_at: Option<DateTime<Utc>>,
+    /// When a worker most recently claimed this run for resume. Paired
+    /// with `resume_claimed_by` to form a time-bounded lease
+    /// ([`RunStore::RESUME_LEASE`]); a stale lease is reclaimable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_claimed_at: Option<DateTime<Utc>>,
+    /// Identity of the worker holding the current resume lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_claimed_by: Option<String>,
 }
 
 /// Workflow-step shape, persisted alongside the result so the
@@ -885,6 +899,135 @@ impl RunStore {
             reason: reason.to_string(),
         })
     }
+
+    /// How long a resume claim stays valid before it can be reclaimed
+    /// by another worker. A worker that picks up a run via
+    /// [`claim_resume`](Self::claim_resume) is expected to finish
+    /// (re-enter `run_workflow`) and call
+    /// [`clear_resume`](Self::clear_resume) within this window;
+    /// otherwise the run becomes eligible for re-claim so a crashed
+    /// worker doesn't strand the resume.
+    pub const RESUME_LEASE: chrono::Duration = chrono::Duration::minutes(5);
+
+    /// Web/delegated approve flow — **marker-only**. Validates the run
+    /// is still `AwaitingApproval` (same expire-check + `NotAwaiting`
+    /// error as [`approve`](Self::approve)), then records the
+    /// `resume_requested_at` marker and persists. It does **not** flip
+    /// the status or clear any pause fields: the run stays
+    /// `AwaitingApproval` so a background worker — not the approving
+    /// HTTP request — picks it up via
+    /// [`list_pending_resume`](Self::list_pending_resume), calls
+    /// [`approve`](Self::approve) (which yields the awaited step id),
+    /// and re-enters `run_workflow`. Leaving the run in
+    /// `AwaitingApproval` with `awaiting_step_id` intact is what lets
+    /// the worker recover which gate to resume.
+    ///
+    /// Returns `Approved { step_id }` with the still-present
+    /// `awaiting_step_id` so the web endpoint can report which gate the
+    /// operator approved.
+    pub fn request_resume_approval(
+        &self,
+        run_id: &str,
+        approver: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ApprovalDecision, ApprovalError> {
+        let mut record = self.load(run_id).map_err(|e| match e {
+            RunStoreError::NotFound(s) => ApprovalError::NotFound(s),
+            other => ApprovalError::Store(other),
+        })?;
+        if self.expire_if_overdue(&mut record, now)? {
+            return Err(ApprovalError::Expired(
+                record
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "paused run timed out".into()),
+            ));
+        }
+        if record.status != RunStatus::AwaitingApproval {
+            return Err(ApprovalError::NotAwaiting(
+                record.status.as_str().to_string(),
+            ));
+        }
+        let step_id = record
+            .awaiting_step_id
+            .clone()
+            .ok_or(ApprovalError::NoAwaitingStep)?;
+        let _ = approver; // identity recorded in transcript via runner re-entry
+        // Marker-only: leave status AwaitingApproval and keep
+        // awaiting_step_id / approval_prompt / awaiting_since /
+        // expires_at intact for the worker to approve+resume.
+        record.resume_requested_at = Some(now);
+        self.update(&record)?;
+        Ok(ApprovalDecision::Approved {
+            run_id: run_id.to_string(),
+            step_id,
+        })
+    }
+
+    /// Runs that a web/delegated approval marked for resume and that no
+    /// worker currently holds a live lease on. A run is pending when it
+    /// is still `AwaitingApproval`, has a `resume_requested_at` marker,
+    /// AND either has no claim or a claim older than
+    /// [`RESUME_LEASE`](Self::RESUME_LEASE).
+    ///
+    /// The `AwaitingApproval` requirement guards against a
+    /// reject-after-approve race: if the run was rejected (or otherwise
+    /// finished) after the marker was set, its status is no longer
+    /// `AwaitingApproval` and the stale marker must not cause the worker
+    /// to resume a terminal run.
+    pub fn list_pending_resume(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<RunRecord>, RunStoreError> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|r| r.status == RunStatus::AwaitingApproval)
+            .filter(|r| r.resume_requested_at.is_some())
+            .filter(|r| match r.resume_claimed_at {
+                None => true,
+                Some(claimed) => now - claimed > Self::RESUME_LEASE,
+            })
+            .collect())
+    }
+
+    /// Try to claim a pending-resume run for `worker_id`. Returns
+    /// `Ok(true)` when the claim was taken (lease was free or stale),
+    /// `Ok(false)` when another worker holds a live lease.
+    pub fn claim_resume(
+        &self,
+        run_id: &str,
+        worker_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, RunStoreError> {
+        let mut record = self.load(run_id)?;
+        if let Some(claimed) = record.resume_claimed_at {
+            if now - claimed <= Self::RESUME_LEASE {
+                return Ok(false);
+            }
+        }
+        record.resume_claimed_at = Some(now);
+        record.resume_claimed_by = Some(worker_id.to_string());
+        self.update(&record)?;
+        Ok(true)
+    }
+
+    /// Clear the pending-resume marker + claim after a worker finishes
+    /// (or abandons) a resume. `now` is accepted for signature symmetry
+    /// with the other resume methods even though it isn't used.
+    pub fn clear_resume(
+        &self,
+        run_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), RunStoreError> {
+        let _ = now;
+        let mut record = self.load(run_id)?;
+        record.resume_requested_at = None;
+        record.resume_claimed_at = None;
+        record.resume_claimed_by = None;
+        self.update(&record)?;
+        Ok(())
+    }
 }
 
 /// Atomic write: write to `path.tmp`, then rename. POSIX rename is
@@ -938,6 +1081,9 @@ mod tests {
             active_step_kind: None,
             active_step_agent: None,
             active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
         }
     }
 
@@ -1397,5 +1543,146 @@ mod tests {
         let reloaded = store.load(&rec.id).unwrap();
         assert_eq!(reloaded.status, RunStatus::Rejected);
         assert!(reloaded.error_message.unwrap().contains("looks risky"));
+    }
+
+    fn awaiting_record(id: &str) -> RunRecord {
+        let mut rec = sample_record(id);
+        rec.status = RunStatus::AwaitingApproval;
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.approval_prompt = Some("ok?".into());
+        rec.awaiting_since = Some(Utc::now());
+        rec
+    }
+
+    #[test]
+    fn request_resume_approval_is_marker_only_and_stays_awaiting() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_resume_appr");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let now = Utc::now();
+        let decision = store
+            .request_resume_approval(&rec.id, "matt", now)
+            .unwrap();
+        // The decision reports the still-present awaited step id.
+        assert_eq!(
+            decision,
+            ApprovalDecision::Approved {
+                run_id: rec.id.clone(),
+                step_id: "deploy".into(),
+            }
+        );
+
+        let reloaded = store.load(&rec.id).unwrap();
+        // Marker-only: the run stays AwaitingApproval with all pause
+        // fields intact; only resume_requested_at is added.
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("deploy"));
+        assert!(reloaded.approval_prompt.is_some());
+        assert!(reloaded.awaiting_since.is_some());
+        assert_eq!(reloaded.resume_requested_at, Some(now));
+    }
+
+    #[test]
+    fn request_resume_approval_on_non_awaiting_run_errors() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_resume_running");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store
+            .request_resume_approval(&rec.id, "matt", Utc::now())
+            .unwrap_err();
+        assert!(matches!(err, ApprovalError::NotAwaiting(_)));
+    }
+
+    #[test]
+    fn list_pending_resume_filters_on_marker_and_lease() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+
+        // No marker, awaiting → never listed (marker absent).
+        let mut plain = sample_record("run_plain");
+        plain.status = RunStatus::AwaitingApproval;
+        store.create(plain, SAMPLE_YAML).unwrap();
+
+        // Awaiting + marked, never claimed → listed.
+        let mut marked = sample_record("run_marked");
+        marked.status = RunStatus::AwaitingApproval;
+        marked.resume_requested_at = Some(now);
+        store.create(marked, SAMPLE_YAML).unwrap();
+
+        // Awaiting + marked + freshly claimed (within TTL) → excluded.
+        let mut fresh = sample_record("run_fresh_claim");
+        fresh.status = RunStatus::AwaitingApproval;
+        fresh.resume_requested_at = Some(now);
+        fresh.resume_claimed_at = Some(now);
+        fresh.resume_claimed_by = Some("w1".into());
+        store.create(fresh, SAMPLE_YAML).unwrap();
+
+        // Marked but already Rejected (reject-after-approve race): the
+        // stale marker must NOT cause it to be picked up for resume.
+        let mut rejected = sample_record("run_rejected_marker");
+        rejected.status = RunStatus::Rejected;
+        rejected.resume_requested_at = Some(now);
+        store.create(rejected, SAMPLE_YAML).unwrap();
+
+        let pending = store.list_pending_resume(now).unwrap();
+        let ids: Vec<&str> = pending.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["run_marked"]);
+
+        // Advance well past the lease → the stale claim is re-included,
+        // but the Rejected run is still excluded (status gates it out).
+        let later = now + RunStore::RESUME_LEASE + chrono::Duration::seconds(1);
+        let pending_later = store.list_pending_resume(later).unwrap();
+        let mut ids_later: Vec<&str> = pending_later.iter().map(|r| r.id.as_str()).collect();
+        ids_later.sort();
+        assert_eq!(ids_later, vec!["run_fresh_claim", "run_marked"]);
+    }
+
+    #[test]
+    fn claim_resume_respects_live_lease_then_reclaims_after_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_claim");
+        rec.resume_requested_at = Some(now);
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        // First claim succeeds.
+        assert!(store.claim_resume(&rec.id, "w1", now).unwrap());
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.resume_claimed_by.as_deref(), Some("w1"));
+
+        // Second claim within the lease window is refused.
+        let within = now + chrono::Duration::seconds(10);
+        assert!(!store.claim_resume(&rec.id, "w2", within).unwrap());
+
+        // After the lease elapses, the run is reclaimable.
+        let after = now + RunStore::RESUME_LEASE + chrono::Duration::seconds(1);
+        assert!(store.claim_resume(&rec.id, "w2", after).unwrap());
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.resume_claimed_by.as_deref(), Some("w2"));
+    }
+
+    #[test]
+    fn clear_resume_drops_marker_and_claim() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_clear");
+        rec.resume_requested_at = Some(now);
+        rec.resume_claimed_at = Some(now);
+        rec.resume_claimed_by = Some("w1".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        store.clear_resume(&rec.id, now).unwrap();
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_requested_at.is_none());
+        assert!(reloaded.resume_claimed_at.is_none());
+        assert!(reloaded.resume_claimed_by.is_none());
     }
 }
