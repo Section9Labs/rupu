@@ -6,6 +6,7 @@ import { Link } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
 import {
   api,
+  type AutoflowClaim,
   type AutoflowCycleRow,
   type AutoflowEventRow,
 } from '../../lib/api';
@@ -72,7 +73,34 @@ function IssueChip({ displayRef }: { displayRef: string }) {
   );
 }
 
-type Tab = 'runs' | 'cycles';
+// Title-case a snake_case status (e.g. `await_human` → `Await Human`).
+function titleCase(s: string): string {
+  return s
+    .split('_')
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+// Per-status badge styling for the claim lifecycle.
+const CLAIM_STATUS_CLS: Record<string, string> = {
+  await_human: 'bg-amber-50 text-amber-700 ring-amber-200',
+  running:     'bg-blue-50 text-blue-700 ring-blue-200',
+  blocked:     'bg-red-50 text-red-700 ring-red-200',
+  complete:    'bg-green-50 text-green-700 ring-green-200',
+  released:    'bg-slate-100 text-slate-600 ring-slate-200',
+};
+
+function ClaimStatusBadge({ status }: { status: string }) {
+  const cls = CLAIM_STATUS_CLS[status] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  return (
+    <span className={cn('inline-flex items-center rounded ring-1 text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
+      {titleCase(status)}
+    </span>
+  );
+}
+
+type Tab = 'runs' | 'cycles' | 'claims';
 
 export default function AutoflowRuns() {
   const [tab, setTab] = useState<Tab>('runs');
@@ -82,6 +110,41 @@ export default function AutoflowRuns() {
   const [cyclesHasMore, setCyclesHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+
+  // Claims tab: lazily fetched on selection (cancel-guarded). `null` = loading.
+  const [claims, setClaims] = useState<AutoflowClaim[] | null>(null);
+  const [claimsError, setClaimsError] = useState<string | null>(null);
+
+  // Manual refetch after a row action mutates the claim set.
+  const refetchClaims = useCallback(async () => {
+    try {
+      const rows = await api.getAutoflowClaims();
+      setClaims(rows);
+      setClaimsError(null);
+    } catch (e) {
+      setClaimsError(e instanceof Error ? e.message : 'Failed to load autoflow claims');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab !== 'claims') return;
+    let cancelled = false;
+    setClaims(null);
+    setClaimsError(null);
+    void (async () => {
+      try {
+        const rows = await api.getAutoflowClaims();
+        if (!cancelled) setClaims(rows);
+      } catch (e) {
+        if (!cancelled) {
+          setClaimsError(e instanceof Error ? e.message : 'Failed to load autoflow claims');
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [tab]);
 
   // Page-0 fetch (mount + 5 s refresh). Only replaces a list when the user
   // hasn't scroll-extended past page 0 — otherwise the poll would discard
@@ -188,6 +251,15 @@ export default function AutoflowRuns() {
         >
           Cycles
         </button>
+        <button
+          onClick={() => setTab('claims')}
+          className={cn(
+            'px-3 py-1 rounded',
+            tab === 'claims' ? 'bg-slate-100 text-ink' : 'text-ink-dim hover:text-ink',
+          )}
+        >
+          Claims
+        </button>
       </div>
 
       {error && (
@@ -216,25 +288,177 @@ export default function AutoflowRuns() {
             )}
           </section>
         )
-      ) : cycles === null ? (
-        <div className="text-sm text-ink-dim">Loading autoflow cycles…</div>
-      ) : sortedCycles.length === 0 ? (
-        <AutoflowCyclesEmpty />
+      ) : tab === 'cycles' ? (
+        cycles === null ? (
+          <div className="text-sm text-ink-dim">Loading autoflow cycles…</div>
+        ) : sortedCycles.length === 0 ? (
+          <AutoflowCyclesEmpty />
+        ) : (
+          <section>
+            <SectionHeader tone="muted" label="Cycles" count={sortedCycles.length} />
+            <ListCard>
+              {sortedCycles.map((c) => (
+                <AutoflowCycleItem key={c.cycle_id} cycle={c} />
+              ))}
+            </ListCard>
+            {sortedCycles.length > 0 && (
+              <div ref={cyclesSentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+                {cyclesLoading ? 'loading more…' : cyclesHasMore ? 'scroll for more' : `— end of ${sortedCycles.length} —`}
+              </div>
+            )}
+          </section>
+        )
+      ) : claimsError ? (
+        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          {claimsError}
+        </div>
+      ) : claims === null ? (
+        <div className="text-sm text-ink-dim">Loading autoflow claims…</div>
+      ) : claims.length === 0 ? (
+        <AutoflowClaimsEmpty />
       ) : (
         <section>
-          <SectionHeader tone="muted" label="Cycles" count={sortedCycles.length} />
+          <SectionHeader tone="muted" label="Claims" count={claims.length} />
           <ListCard>
-            {sortedCycles.map((c) => (
-              <AutoflowCycleItem key={c.cycle_id} cycle={c} />
+            {claims.map((c) => (
+              <AutoflowClaimItem
+                key={c.issue_ref}
+                claim={c}
+                onChanged={() => void refetchClaims()}
+              />
             ))}
           </ListCard>
-          {sortedCycles.length > 0 && (
-            <div ref={cyclesSentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
-              {cyclesLoading ? 'loading more…' : cyclesHasMore ? 'scroll for more' : `— end of ${sortedCycles.length} —`}
-            </div>
-          )}
         </section>
       )}
+    </div>
+  );
+}
+
+function AutoflowClaimItem({
+  claim,
+  onChanged,
+}: {
+  claim: AutoflowClaim;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState<'requeue' | 'release' | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [requeued, setRequeued] = useState(false);
+
+  const label = claim.issue_display_ref ?? claim.issue_ref;
+
+  const onRequeue = async () => {
+    if (busy) return;
+    if (!window.confirm('Requeue this autoflow?')) return;
+    setBusy('requeue');
+    setActionError(null);
+    try {
+      await api.requeueClaim(claim.issue_ref);
+      setRequeued(true);
+      onChanged();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Failed to requeue claim');
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const onRelease = async () => {
+    if (busy) return;
+    if (!window.confirm('Release this claim?')) return;
+    setBusy('release');
+    setActionError(null);
+    try {
+      await api.releaseClaim(claim.issue_ref);
+      onChanged();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Failed to release claim');
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="flex items-start gap-4 px-4 py-3">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 flex-wrap">
+          {claim.issue_url ? (
+            <a
+              href={claim.issue_url}
+              target="_blank"
+              rel="noreferrer"
+              className="text-sm font-medium text-brand-600 hover:underline truncate"
+            >
+              {label}
+            </a>
+          ) : (
+            <span className="text-sm font-medium text-ink truncate">{label}</span>
+          )}
+          <ClaimStatusBadge status={claim.status} />
+          <IssueChip displayRef={claim.workflow} />
+          {requeued && (
+            <span className="text-[10px] font-medium text-green-700">requeued</span>
+          )}
+        </div>
+        {claim.issue_title && (
+          <div className="text-[11px] text-ink-dim mt-0.5 truncate">{claim.issue_title}</div>
+        )}
+        <div className="text-[11px] text-ink-dim mt-0.5">
+          {claim.repo_ref}
+          {' · '}updated {relativeTime(claim.updated_at)}
+          {claim.claim_owner && <> · {claim.claim_owner}</>}
+        </div>
+        {claim.last_error && (
+          <div className="text-[11px] text-red-600 mt-1">{claim.last_error}</div>
+        )}
+        {!claim.last_error && claim.last_summary && (
+          <div className="text-[11px] text-ink-dim mt-1">{claim.last_summary}</div>
+        )}
+        {claim.pr_url && (
+          <a
+            href={claim.pr_url}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-block text-[11px] text-brand-600 hover:underline mt-1"
+          >
+            View PR
+          </a>
+        )}
+        {actionError && (
+          <div role="alert" className="text-[11px] text-red-600 mt-1">
+            {actionError}
+          </div>
+        )}
+      </div>
+      <div className="flex items-center gap-2 shrink-0">
+        <button
+          onClick={() => void onRequeue()}
+          disabled={busy !== null}
+          className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-md border border-border bg-panel text-ink hover:bg-slate-100 disabled:opacity-50"
+        >
+          {busy === 'requeue' ? 'Requeuing…' : 'Requeue'}
+        </button>
+        <button
+          onClick={() => void onRelease()}
+          disabled={busy !== null}
+          className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-md border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-50"
+        >
+          {busy === 'release' ? 'Releasing…' : 'Release'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function AutoflowClaimsEmpty() {
+  return (
+    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
+      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+        <Inbox size={20} className="text-ink-mute" />
+      </div>
+      <h2 className="text-sm font-medium text-ink">No active claims</h2>
+      <p className="mt-1 text-xs text-ink-dim max-w-xs">
+        Issues the autoflow worker has leased will appear here, each with requeue and release controls.
+      </p>
     </div>
   );
 }

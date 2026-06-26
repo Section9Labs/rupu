@@ -353,6 +353,28 @@ export interface AutoflowEventRow {
   usage: UsageSummary;
 }
 
+/**
+ * One active autoflow *claim* — an issue the autoflow worker has leased and is
+ * (or was) driving through a workflow. `status` is lowercase snake_case
+ * (`await_human` | `running` | `blocked` | `complete` | `released`).
+ */
+export interface AutoflowClaim {
+  issue_ref: string;
+  issue_display_ref?: string | null;
+  repo_ref: string;
+  issue_title?: string | null;
+  issue_url?: string | null;
+  workflow: string;
+  status: string;
+  last_run_id?: string | null;
+  last_error?: string | null;
+  last_summary?: string | null;
+  pr_url?: string | null;
+  claim_owner?: string | null;
+  lease_expires_at?: string | null;
+  updated_at: string;
+}
+
 export interface AgentRunRow {
   run_id: string;
   source: 'standalone' | 'session';
@@ -911,6 +933,24 @@ export const api = {
   },
   getAutoflowEvents(params?: ListParams): Promise<AutoflowEventRow[]> {
     return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${listQuery(params)}`);
+  },
+  /** Active autoflow claims — leased issues the worker is (or was) driving. */
+  getAutoflowClaims(): Promise<AutoflowClaim[]> {
+    return request<AutoflowClaim[]>('/api/autoflows/claims');
+  },
+  /** Release a claim — frees the issue for re-claim on the next cycle. */
+  releaseClaim(issueRef: string): Promise<{ released: boolean }> {
+    return request<{ released: boolean }>('/api/autoflows/claims/release', {
+      method: 'POST',
+      body: JSON.stringify({ issue_ref: issueRef }),
+    });
+  },
+  /** Requeue a claim — wakes the autoflow worker to re-drive the issue now. */
+  requeueClaim(issueRef: string): Promise<{ wake_id: string }> {
+    return request<{ wake_id: string }>('/api/autoflows/claims/requeue', {
+      method: 'POST',
+      body: JSON.stringify({ issue_ref: issueRef }),
+    });
   },
   getAgentRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed' }): Promise<AgentRunRow[]> {
     const q = new URLSearchParams();
