@@ -9921,7 +9921,7 @@ pub(crate) fn reconcile_claim_from_last_run(
         RunStatus::Completed => {
             apply_terminal_run_to_claim(global, resolved, &run_id, claim)?;
         }
-        RunStatus::Failed | RunStatus::Rejected => {
+        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => {
             claim.status = ClaimStatus::Blocked;
             claim.last_error = run
                 .error_message
@@ -9949,7 +9949,7 @@ fn apply_terminal_run_to_claim(
             claim.updated_at = chrono::Utc::now().to_rfc3339();
             return Ok(());
         }
-        RunStatus::Failed | RunStatus::Rejected => {
+        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => {
             claim.status = ClaimStatus::Blocked;
             claim.last_error = run
                 .error_message
@@ -12476,6 +12476,7 @@ steps:
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -12620,6 +12621,7 @@ steps:
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -12749,6 +12751,7 @@ steps:
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -12893,6 +12896,7 @@ steps:
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -13027,6 +13031,7 @@ steps:
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -13153,6 +13158,7 @@ steps:
                     resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             active_step_transcript_path: None,
                 },
                 "name: controller\nsteps: []\n",
@@ -13294,6 +13300,7 @@ steps:
                     resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             active_step_transcript_path: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
@@ -13460,6 +13467,7 @@ steps:
                     resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             active_step_transcript_path: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",

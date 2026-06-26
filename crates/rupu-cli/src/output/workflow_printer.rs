@@ -1898,9 +1898,9 @@ fn workflow_status_ui(record: &RunRecord) -> UiStatus {
         rupu_orchestrator::RunStatus::Running => UiStatus::Working,
         rupu_orchestrator::RunStatus::AwaitingApproval => UiStatus::Awaiting,
         rupu_orchestrator::RunStatus::Completed => UiStatus::Complete,
-        rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
-            UiStatus::Failed
-        }
+        rupu_orchestrator::RunStatus::Failed
+        | rupu_orchestrator::RunStatus::Rejected
+        | rupu_orchestrator::RunStatus::Cancelled => UiStatus::Failed,
     }
 }
 
@@ -3455,6 +3455,9 @@ fn workflow_ticker_message(workflow_name: &str, record: Option<&RunRecord>) -> S
         rupu_orchestrator::RunStatus::Completed => format!("workflow {workflow_name}  ·  complete"),
         rupu_orchestrator::RunStatus::Failed => format!("workflow {workflow_name}  ·  failed"),
         rupu_orchestrator::RunStatus::Rejected => format!("workflow {workflow_name}  ·  rejected"),
+        rupu_orchestrator::RunStatus::Cancelled => {
+            format!("workflow {workflow_name}  ·  cancelled")
+        }
         rupu_orchestrator::RunStatus::AwaitingApproval => {
             let step = record.awaiting_step_id.as_deref().unwrap_or("approval");
             format!("workflow {workflow_name}  ·  awaiting {step}")
@@ -3666,6 +3669,7 @@ mod tests {
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             issue_ref: None,
             issue: None,
             parent_run_id: None,

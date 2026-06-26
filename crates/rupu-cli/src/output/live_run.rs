@@ -473,6 +473,7 @@ impl LiveRunState {
             RunStatus::Failed => ("failed", FAILED),
             RunStatus::AwaitingApproval => ("awaiting", palette::AWAITING),
             RunStatus::Rejected => ("rejected", FAILED),
+            RunStatus::Cancelled => ("cancelled", FAILED),
             RunStatus::Pending => ("pending", DIM),
         }
     }

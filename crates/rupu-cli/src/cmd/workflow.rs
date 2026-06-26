@@ -2008,7 +2008,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
             );
         }
         // Resume applies to terminal failure states.
-        RunStatus::Failed | RunStatus::Rejected => {}
+        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => {}
     }
 
     // Rebuild context from disk: workflow YAML snapshot + prior step
@@ -2306,7 +2306,8 @@ fn cancel_with_store(
     match record.status {
         rupu_orchestrator::RunStatus::Completed
         | rupu_orchestrator::RunStatus::Failed
-        | rupu_orchestrator::RunStatus::Rejected => {
+        | rupu_orchestrator::RunStatus::Rejected
+        | rupu_orchestrator::RunStatus::Cancelled => {
             anyhow::bail!(
                 "run {run_id} is already terminal ({})",
                 record.status.as_str()
@@ -3119,9 +3120,9 @@ fn build_artifact_manifest(
 fn run_result_status(status: rupu_orchestrator::RunStatus) -> RunResultStatus {
     match status {
         rupu_orchestrator::RunStatus::AwaitingApproval => RunResultStatus::AwaitingApproval,
-        rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
-            RunResultStatus::Failed
-        }
+        rupu_orchestrator::RunStatus::Failed
+        | rupu_orchestrator::RunStatus::Rejected
+        | rupu_orchestrator::RunStatus::Cancelled => RunResultStatus::Failed,
         rupu_orchestrator::RunStatus::Pending
         | rupu_orchestrator::RunStatus::Running
         | rupu_orchestrator::RunStatus::Completed => RunResultStatus::Completed,
@@ -3651,6 +3652,7 @@ mod tests {
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             issue_ref: None,
             issue: None,
             parent_run_id: None,

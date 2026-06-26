@@ -61,7 +61,7 @@ async fn approve_run(
 ) -> ApiResult<Json<serde_json::Value>> {
     let now = chrono::Utc::now();
     s.run_store
-        .request_resume_approval(&id, "web", now)
+        .request_resume_approval(&id, "web", None, now)
         .map_err(|e| map_approval_err(&id, e))?;
     run_response(&s, &id)
 }
@@ -344,6 +344,7 @@ mod tests {
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
         }
     }
 
