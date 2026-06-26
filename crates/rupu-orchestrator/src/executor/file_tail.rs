@@ -1,12 +1,14 @@
-//! FileTailRunSource — notify-driven consumer of events.jsonl for
-//! runs the executor didn't start (CLI / cron / MCP). Yields parsed
-//! Event values as a Stream.
+//! FileTailRunSource — polling consumer of events.jsonl for runs the
+//! executor didn't start (CLI / cron / MCP). Yields parsed Event values
+//! as a Stream.
 //!
-//! On macOS kqueue the `notify` backend may not reliably deliver
-//! `Modify` events for appends on some kernel/volume configurations.
-//! A polling fallback (250 ms interval) runs alongside the watcher
-//! and covers those gaps. Both paths share an `Arc<AtomicU64>` byte
-//! offset so events are never duplicated.
+//! Tailing is poll-based: an initial-drain task reads any pre-existing
+//! backlog, then a 250 ms poll loop emits newly-appended lines. Both
+//! share an `Arc<AtomicU64>` byte offset so events are never duplicated.
+//! (We deliberately do NOT use a `notify` filesystem watcher here — the
+//! macOS kqueue backend it's pinned to panics a background thread on
+//! teardown when the stream is dropped, and the 250 ms poll already
+//! covers append-tailing reliably without that fragility.)
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -15,27 +17,21 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::Stream;
-use notify::{RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
 use crate::executor::Event;
 
 pub struct FileTailRunSource {
     rx: mpsc::Receiver<Event>,
-    _watcher: notify::RecommendedWatcher,
 }
 
 impl FileTailRunSource {
     pub async fn open(path: &Path) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel::<Event>(64);
         let path_buf: PathBuf = path.to_path_buf();
-        let parent = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
 
-        // Shared offset between the initial-drain task, the notify
-        // watcher callback, and the polling fallback.
+        // Shared offset between the initial-drain task and the polling
+        // loop, so the two never emit the same byte range twice.
         let offset = Arc::new(AtomicU64::new(0));
 
         // --- initial-drain task ---
@@ -58,33 +54,9 @@ impl FileTailRunSource {
             }
         });
 
-        // --- notify watcher ---
-        let tx_for_watcher = tx.clone();
-        let path_for_watcher = path_buf.clone();
-        let offset_for_watcher = offset.clone();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(evt) = res {
-                if matches!(
-                    evt.kind,
-                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
-                ) {
-                    // Only react if the changed path is our file
-                    let touches_target = evt.paths.iter().any(|p| p == &path_for_watcher);
-                    if !touches_target {
-                        return;
-                    }
-                    drain_new_bytes(&path_for_watcher, &offset_for_watcher, &tx_for_watcher);
-                }
-            }
-        })
-        .map_err(std::io::Error::other)?;
-
-        watcher
-            .watch(&parent, RecursiveMode::NonRecursive)
-            .map_err(std::io::Error::other)?;
-
-        // --- polling fallback (250 ms) ---
-        // Covers kqueue gaps where notify doesn't fire for appends.
+        // --- polling loop (250 ms) ---
+        // Emits newly-appended lines. This is the sole tailing mechanism
+        // (no notify watcher — see the module docs).
         let tx_for_poll = tx.clone();
         let path_for_poll = path_buf.clone();
         let offset_for_poll = offset.clone();
@@ -98,32 +70,11 @@ impl FileTailRunSource {
             }
         });
 
-        Ok(Self {
-            rx,
-            _watcher: watcher,
-        })
+        Ok(Self { rx })
     }
 }
 
-/// Synchronous drain called from the notify callback thread.
-fn drain_new_bytes(path: &Path, offset: &Arc<AtomicU64>, tx: &mpsc::Sender<Event>) {
-    let Ok(bytes) = std::fs::read(path) else {
-        return;
-    };
-    let off = offset.load(Ordering::SeqCst);
-    if (bytes.len() as u64) <= off {
-        return;
-    }
-    let new = &bytes[off as usize..];
-    for line in std::str::from_utf8(new).unwrap_or("").lines() {
-        if let Ok(ev) = serde_json::from_str::<Event>(line) {
-            let _ = tx.blocking_send(ev);
-        }
-    }
-    offset.store(bytes.len() as u64, Ordering::SeqCst);
-}
-
-/// Async drain called from the polling fallback task.
+/// Async drain called from the polling loop.
 async fn drain_new_bytes_async(path: &Path, offset: &Arc<AtomicU64>, tx: &mpsc::Sender<Event>) {
     let Ok(bytes) = std::fs::read(path) else {
         return;
