@@ -107,6 +107,13 @@ export default function RunDetail() {
   const [gateError, setGateError] = useState<string | null>(null);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState('');
+  // Permission mode the run resumes in once approved (worker honours it).
+  const [approveMode, setApproveMode] = useState<'ask' | 'bypass' | 'readonly'>('ask');
+
+  // Cancel local state — `cancelPending` disables the controls mid-request;
+  // `cancelError` surfaces a failed cancel.
+  const [cancelPending, setCancelPending] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
 
   // The ONE selection cursor that the tab panel follows. Null = whole run.
   const [selection, setSelection] = useState<Selection>(null);
@@ -125,6 +132,9 @@ export default function RunDetail() {
     setGateError(null);
     setRejectOpen(false);
     setRejectReason('');
+    setApproveMode('ask');
+    setCancelPending(false);
+    setCancelError(null);
     seededSelRef.current = false;
     setFindings(null);
     setFindingsError(null);
@@ -274,6 +284,12 @@ export default function RunDetail() {
 
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
+  // Cancel is offered on any non-terminal run.
+  const cancellable =
+    effectiveStatus === 'running' ||
+    effectiveStatus === 'pending' ||
+    effectiveStatus === 'awaiting_approval';
+  const cancelled = effectiveStatus === 'cancelled';
 
   // Approval recorded — either persisted (resume_requested_at) or optimistic.
   const resumeRequested = Boolean(run?.resume_requested_at) || gateDecision === 'approved';
@@ -284,12 +300,28 @@ export default function RunDetail() {
     setGatePending(true);
     setGateError(null);
     try {
-      await api.approveRun(run.id);
+      await api.approveRun(run.id, approveMode);
       setGateDecision('approved');
     } catch (e: unknown) {
       setGateError(e instanceof Error ? e.message : 'Failed to approve run');
     } finally {
       setGatePending(false);
+    }
+  }
+
+  async function onCancel() {
+    if (!run || cancelPending) return;
+    if (!window.confirm('Cancel this run?')) return;
+    setCancelPending(true);
+    setCancelError(null);
+    try {
+      await api.cancelRun(run.id);
+      // Optimistic — the live stream / next poll reconciles the terminal status.
+      setLiveRunStatus('cancelled');
+    } catch (e: unknown) {
+      setCancelError(e instanceof Error ? e.message : 'Failed to cancel run');
+    } finally {
+      setCancelPending(false);
     }
   }
 
@@ -396,6 +428,25 @@ export default function RunDetail() {
               </div>
             )}
           </div>
+
+          {isRunning && (
+            <div className="flex shrink-0 flex-col items-end gap-1">
+              <button
+                type="button"
+                onClick={onCancel}
+                disabled={cancelPending}
+                aria-label="Cancel run"
+                className="inline-flex items-center rounded-md border border-red-300 bg-white px-3 py-1.5 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {cancelPending ? 'Cancelling…' : 'Cancel'}
+              </button>
+              {cancelError && (
+                <p className="text-[11px] font-medium text-red-700" role="alert">
+                  {cancelError}
+                </p>
+              )}
+            </div>
+          )}
         </header>
 
         {run.error_message && (
@@ -413,7 +464,9 @@ export default function RunDetail() {
               </div>
               <p className="mt-0.5 break-words text-[12px] text-amber-700">{awaiting.reason}</p>
 
-              {resumeRequested ? (
+              {cancelled ? (
+                <div className="mt-2 text-[12px] font-medium text-slate-600">Cancelled.</div>
+              ) : resumeRequested ? (
                 <div className="mt-2 flex items-center gap-2 text-[12px] font-medium text-emerald-700">
                   <span
                     className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500"
@@ -426,6 +479,23 @@ export default function RunDetail() {
               ) : (
                 <div className="mt-2 space-y-2">
                   <div className="flex flex-wrap items-center gap-2">
+                    <label htmlFor="approve-mode" className="text-[12px] font-medium text-amber-800">
+                      Resume mode
+                    </label>
+                    <select
+                      id="approve-mode"
+                      value={approveMode}
+                      onChange={(e) =>
+                        setApproveMode(e.target.value as 'ask' | 'bypass' | 'readonly')
+                      }
+                      disabled={gatePending}
+                      aria-label="Resume mode"
+                      className="rounded-md border border-amber-300 bg-white px-2 py-1.5 text-[12px] font-medium text-ink focus:border-amber-400 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      <option value="ask">Ask</option>
+                      <option value="bypass">Bypass</option>
+                      <option value="readonly">Read-only</option>
+                    </select>
                     <button
                       type="button"
                       onClick={onApprove}
@@ -447,7 +517,24 @@ export default function RunDetail() {
                     >
                       Reject
                     </button>
+                    {cancellable && (
+                      <button
+                        type="button"
+                        onClick={onCancel}
+                        disabled={cancelPending}
+                        aria-label="Cancel run"
+                        className="inline-flex items-center rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[12px] font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {cancelPending ? 'Cancelling…' : 'Cancel'}
+                      </button>
+                    )}
                   </div>
+
+                  {cancelError && (
+                    <p className="text-[11px] font-medium text-red-700" role="alert">
+                      {cancelError}
+                    </p>
+                  )}
 
                   {rejectOpen && (
                     <div className="flex flex-wrap items-center gap-2">

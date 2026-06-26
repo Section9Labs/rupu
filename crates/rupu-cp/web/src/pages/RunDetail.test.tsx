@@ -134,6 +134,19 @@ const AWAITING_GRAPH: RunGraphResponse = {
   units: [],
 };
 
+// A non-terminal (running) run — eligible for cancel from the header.
+const RUNNING_GRAPH: RunGraphResponse = {
+  run: {
+    id: 'run-1',
+    workflow_name: 'nightly-scan',
+    status: 'running',
+    started_at: '2026-06-01T00:00:00Z',
+  } as RunGraphResponse['run'],
+  workflow: { steps: [{ id: 'step_a', kind: 'step', agent: 'reviewer' }] },
+  step_results: [],
+  units: [],
+};
+
 const FINDINGS: FindingsResponse = {
   findings: [],
   summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
@@ -257,9 +270,9 @@ describe('RunDetail shell', () => {
     // Wait for the awaiting banner's Approve button to render.
     const approveBtn = await screen.findByRole('button', { name: 'Approve run' });
 
-    // Approving records the decision → "Approved — resuming…".
+    // Approving (default mode = Ask) records the decision → "Approved — resuming…".
     fireEvent.click(approveBtn);
-    await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('run-1'));
+    await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('run-1', 'ask'));
     await screen.findByText(/Approved — resuming/);
 
     // Re-render fresh to drive the reject path independently.
@@ -273,5 +286,39 @@ describe('RunDetail shell', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Confirm rejection' }));
 
     await waitFor(() => expect(rejectSpy).toHaveBeenCalledWith('run-1', 'not safe'));
+  });
+
+  it('cancels a running run via the header Cancel button (after confirm)', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(RUNNING_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    const cancelSpy = vi.spyOn(api, 'cancelRun').mockResolvedValue(undefined);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    renderPage();
+
+    const cancelBtn = await screen.findByRole('button', { name: 'Cancel run' });
+    fireEvent.click(cancelBtn);
+
+    expect(confirmSpy).toHaveBeenCalled();
+    await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith('run-1'));
+  });
+
+  it('approves an awaiting run in the selected (Bypass) mode', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(AWAITING_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    const approveSpy = vi.spyOn(api, 'approveRun').mockResolvedValue(undefined);
+
+    renderPage();
+
+    const approveBtn = await screen.findByRole('button', { name: 'Approve run' });
+    // Pick Bypass in the mode picker, then approve.
+    fireEvent.change(screen.getByLabelText('Resume mode'), { target: { value: 'bypass' } });
+    fireEvent.click(approveBtn);
+
+    await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('run-1', 'bypass'));
   });
 });

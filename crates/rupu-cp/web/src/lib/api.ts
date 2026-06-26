@@ -57,7 +57,8 @@ export type RunStatusStr =
   | 'completed'
   | 'failed'
   | 'awaiting_approval'
-  | 'rejected';
+  | 'rejected'
+  | 'cancelled';
 
 /** Mirrors rupu-orchestrator's persisted `run.json` record. */
 export interface RunRecord {
@@ -75,6 +76,7 @@ export interface RunRecord {
   approval_prompt?: string | null;
   awaiting_since?: string | null;
   resume_requested_at?: string | null;
+  resume_mode?: string | null;
   expires_at?: string | null;
   issue_ref?: string | null;
   [k: string]: unknown;
@@ -860,11 +862,12 @@ export const api = {
     return request<RunGraphResponse>(`/api/runs/${encodeURIComponent(id)}/graph`);
   },
   /** Record approval for an awaiting run. The run stays `awaiting_approval`
-   *  but gains `resume_requested_at`; a worker then resumes it. */
-  async approveRun(id: string): Promise<void> {
+   *  but gains `resume_requested_at` (+ `resume_mode`); a worker then resumes
+   *  it in the chosen permission mode (defaults to `ask`). */
+  async approveRun(id: string, mode?: 'ask' | 'bypass' | 'readonly'): Promise<void> {
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
       `/api/runs/${encodeURIComponent(id)}/approve`,
-      { method: 'POST' },
+      { method: 'POST', body: mode ? JSON.stringify({ mode }) : undefined },
     );
   },
   /** Reject an awaiting run (terminal → `rejected`). */
@@ -872,6 +875,13 @@ export const api = {
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
       `/api/runs/${encodeURIComponent(id)}/reject`,
       { method: 'POST', body: JSON.stringify({ reason }) },
+    );
+  },
+  /** Cancel a non-terminal run (terminal → `cancelled`). */
+  async cancelRun(id: string, reason?: string): Promise<void> {
+    await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
+      `/api/runs/${encodeURIComponent(id)}/cancel`,
+      { method: 'POST', body: reason ? JSON.stringify({ reason }) : undefined },
     );
   },
   getRunUsageTimeline(id: string): Promise<UsageTimelinePoint[]> {
