@@ -187,3 +187,28 @@ All sites in `crates/rupu-providers/src/github_copilot.rs` agree on `"claude-son
 ## ProviderError truncate-helper test gap (deferred from Plan 1 Task 11)
 
 `crates/rupu-providers/src/classify.rs::truncate` uses `s.is_char_boundary` walk-back, but the regression test in `crates/rupu-providers/tests/classify.rs::classify_handles_multibyte_utf8_body_without_panic` uses a 4-byte-aligned input (`"🦀".repeat(N)` with `N % 4 == 0`), so the walk-back loop is never actually exercised. A truly adversarial test should use a 3-byte char (e.g. `"€".repeat(N)`) where `(max % 3 != 0)` to exercise the walk-back path. Plan 2/3 polish.
+
+## Control Plane — Phase 2 (Control) + Phase 3 (Authoring)
+
+Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (Phase 1 "Observe" is complete). Surface analysis lives in this session's transcript; the per-slice specs are under `docs/superpowers/specs/2026-06-26-rupu-cp-phase2*`.
+
+**Phase 2 (Control) — status:**
+- ✅ **2a — run lifecycle**: web Approve/Reject (v0.15.0), Cancel + approve-with-mode + `RunStatus::Cancelled` (PR #360).
+- 🚧 **2b — launch a run from the web**: subprocess execution model (`cp serve` spawns `rupu workflow run/approve` children), `RunLauncher` port + `SubprocessLauncher`, launch endpoint, **resume retrofit** (in-process → subprocess, makes resumed runs cancellable). Spec: `…-phase2b-launch-design.md`.
+- ⬜ **2c — interactive sessions**: send a message to a live session (queue write + worker), session start/stop/archive/delete. Needs session control logic lifted out of the `rupu-cli` binary into a library (it's all private free-fns in `cmd/session.rs` today).
+- ⬜ **2d — autoflow control**: requeue an issue's autoflow (`WakeStore::enqueue`) + release a stuck claim (`AutoflowClaimStore::delete`) — pure-state, library-reusable.
+
+**Deferred from 2b (tracked per matt 2026-06-26):**
+- **Richer launch target picker** — v1 ships an optional target *text field* (`github:owner/repo` / PR / issue ref, which `workflow run` already clones/fetches). A rupu-app-style target picker (this-workspace / directory browser / RepoRef clone with status) is deferred.
+- **Retry / re-run a finished run** from the web — a launch with the same inputs, or `workflow resume` for a Failed run. Not in 2b.
+- **Launch concurrency caps** — v1 spawns immediately with no queue/limit.
+- **Subprocess hygiene (`cp serve`)** — launched/resumed runs are spawned detached (`Command::spawn()` without reaping), so on Unix finished children become zombies until reaped (PID-table pressure over a long-lived server). Follow-up: a reaper task or double-fork/`setsid` detach. Also: children inherit cp-serve's stdout/stderr (run output interleaves into the server console) and the process group (a foreground Ctrl-C signals in-flight children) — consider `setsid`/redirecting child stdio.
+- **Stale `RunStore::cancel` doc** — its comment still describes the old in-process-resume model + self-PID guard; now that resumes are subprocesses, the guard is merely defensive. Update the comment when the in-process resume path is fully retired.
+
+**Phase 2 actions that need NEW engine work before the CP can expose them (no fn exists today):**
+- Run **delete / archive / prune** — `RunStore` has no delete; `cleanup.rs` prunes only sessions/transcripts.
+- **Cron / trigger enable-disable toggle** — no `enabled` flag; toggling means rewriting workflow YAML `trigger:` or `[triggers].poll_sources` in config.toml.
+- **Nested/array config writes** — `rupu config set` handles top-level scalars only; no library `save` for nested config.
+- **Agent / workflow definition delete** — no subcommand, no engine fn.
+
+**Phase 3 (Authoring) — not started:** in-browser edit of agent `.md` (CodeMirror) and workflow `.yaml` (incl. the `@xyflow/react` DAG editor → same YAML the CLI runs), gated by `Workflow::parse` / `AgentSpec::parse` validation. Phase 4 = auth/RBAC for beyond-localhost.

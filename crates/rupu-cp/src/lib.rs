@@ -5,6 +5,7 @@
 pub mod api;
 pub mod embed;
 pub mod error;
+pub mod launcher;
 pub mod pagination;
 pub mod server;
 pub mod sse;
@@ -27,6 +28,9 @@ pub struct ServeOpts {
     /// Open the served URL in the default browser on startup (best-effort, and
     /// only when stdout is a terminal). The URL is always printed regardless.
     pub open_browser: bool,
+    /// Optional run-launcher adapter. rupu-cli's `cp serve` provides the
+    /// subprocess-spawning impl; `None` disables launching from the web UI.
+    pub launcher: Option<std::sync::Arc<dyn crate::launcher::RunLauncher>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -78,7 +82,7 @@ fn load_pricing(global_dir: &Path) -> PricingConfig {
 pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let open_browser = opts.open_browser;
     let pricing = load_pricing(&opts.global_dir);
-    let app_state = state::AppState::new(opts.global_dir, pricing);
+    let app_state = state::AppState::new(opts.global_dir, pricing).with_launcher(opts.launcher);
     let app = server::router(app_state, opts.token);
 
     let listener = tokio::net::TcpListener::bind(opts.bind)

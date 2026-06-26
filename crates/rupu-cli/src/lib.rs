@@ -6,6 +6,7 @@
 //! one-line wrapper that calls into here.
 
 pub mod cmd;
+pub mod cp_launcher;
 pub mod crash;
 pub mod logging;
 pub mod output;
