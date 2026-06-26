@@ -10,6 +10,7 @@ import { api, type WorkflowDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import { ScopeChip } from './Workflows';
 import CodeHighlight from '../components/CodeHighlight';
+import LauncherSheet from '../components/LauncherSheet';
 
 // ── Loose narrowing helpers ──────────────────────────────────────────────
 // The backend hands back `workflow: Record<string, unknown>`; we read only the
@@ -44,6 +45,14 @@ function readSteps(workflow: Record<string, unknown>): ParsedStep[] {
   const raw = workflow.steps;
   if (!Array.isArray(raw)) return [];
   return raw.map(parseStep);
+}
+
+/** Declared input names from the workflow's `inputs:` block (keys of the
+ *  serialized `inputs` map). Empty when none are declared. */
+function readInputNames(workflow: Record<string, unknown>): string[] {
+  const raw = workflow.inputs;
+  if (typeof raw !== 'object' || raw === null) return [];
+  return Object.keys(raw as Record<string, unknown>);
 }
 
 interface AutoflowInfo {
@@ -83,6 +92,7 @@ export default function WorkflowDetailPage() {
 
   const [detail, setDetail] = useState<WorkflowDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [launcherOpen, setLauncherOpen] = useState(false);
 
   useEffect(() => {
     if (!name) return;
@@ -129,13 +139,14 @@ export default function WorkflowDetailPage() {
   const description = asString(detail.workflow.description);
   const steps = readSteps(detail.workflow);
   const autoflow = readAutoflow(detail.workflow);
+  const inputNames = readInputNames(detail.workflow);
 
   return (
     <div className="p-8 max-w-5xl">
       <BackLink />
 
       <header className="mt-3">
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-start gap-2">
           <h1 className="text-2xl font-semibold text-ink break-all">{wfName}</h1>
           {scope && <ScopeChip scope={scope} />}
           {autoflow && (
@@ -143,6 +154,14 @@ export default function WorkflowDetailPage() {
               Autoflow
             </span>
           )}
+          <button
+            type="button"
+            onClick={() => setLauncherOpen(true)}
+            aria-label={`Run ${wfName}`}
+            className="ml-auto inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
+          >
+            Run
+          </button>
         </div>
         {description && (
           <p className="mt-2 text-sm text-ink-dim leading-snug">{description}</p>
@@ -173,6 +192,14 @@ export default function WorkflowDetailPage() {
         <h2 className="text-sm font-semibold text-ink mb-2 pl-1">YAML</h2>
         <CodeHighlight code={detail.yaml} language="yaml" />
       </section>
+
+      {launcherOpen && (
+        <LauncherSheet
+          workflow={wfName}
+          declaredInputs={inputNames}
+          onClose={() => setLauncherOpen(false)}
+        />
+      )}
     </div>
   );
 }

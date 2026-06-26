@@ -444,6 +444,14 @@ export interface WorkflowDetail {
   usage?: UsageSummary;
 }
 
+/** Permission mode a launched run starts in. */
+export type LaunchMode = 'ask' | 'bypass' | 'readonly';
+
+/** Response from `POST /api/workflows/:name/run`. */
+export interface LaunchResult {
+  run_id: string;
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
@@ -930,6 +938,21 @@ export const api = {
   },
   getWorkflow(name: string): Promise<WorkflowDetail> {
     return request<WorkflowDetail>(`/api/workflows/${encodeURIComponent(name)}`);
+  },
+  /**
+   * Launch a fresh run of `workflow` via the configured launcher.
+   * All options are optional — a bare call launches with no inputs in the
+   * deployment's default mode. Resolves to the new run id; the run record
+   * (and SSE) appears shortly after as the spawned child writes `run.json`.
+   */
+  launchRun(
+    workflow: string,
+    opts: { inputs?: Record<string, string>; mode?: LaunchMode; target?: string } = {},
+  ): Promise<LaunchResult> {
+    return request<LaunchResult>(`/api/workflows/${encodeURIComponent(workflow)}/run`, {
+      method: 'POST',
+      body: JSON.stringify({ inputs: opts.inputs, mode: opts.mode, target: opts.target }),
+    });
   },
 
   // --- Sessions ---

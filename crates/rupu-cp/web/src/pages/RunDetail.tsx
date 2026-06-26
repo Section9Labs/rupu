@@ -13,6 +13,7 @@ import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft, FileText, ListOrdered, Pause, ShieldAlert } from 'lucide-react';
 import {
   api,
+  ApiError,
   isKnownRunEvent,
   type FindingsResponse,
   type RunEvent,
@@ -66,6 +67,29 @@ function defaultSelection(model: RunGraphModel): Selection {
     if (n.transcriptPath || n.fanout) return { stepId: n.id };
   }
   return null;
+}
+
+/**
+ * Fetch the run-graph, tolerating a transient 404 right after a launch — the
+ * spawned child writes `run.json` asynchronously, so a freshly-navigated run id
+ * may briefly 404 before its record lands. Retries a few times on 404 only;
+ * any other error (or a final 404) propagates to the caller.
+ */
+async function fetchRunGraphWithRetry(
+  id: string,
+  isCancelled: () => boolean,
+): Promise<RunGraphResponse> {
+  const delaysMs = [300, 600, 1000, 1500];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await api.getRunGraph(id);
+    } catch (e: unknown) {
+      const is404 = e instanceof ApiError && e.status === 404;
+      if (!is404 || attempt >= delaysMs.length || isCancelled()) throw e;
+      await new Promise((r) => setTimeout(r, delaysMs[attempt]));
+      if (isCancelled()) throw e;
+    }
+  }
 }
 
 /** Typed accessor for an event's `step_id` (run-level events carry none). */
@@ -139,8 +163,7 @@ export default function RunDetail() {
     setFindings(null);
     setFindingsError(null);
     findingsRequestedRef.current = false;
-    api
-      .getRunGraph(id)
+    fetchRunGraphWithRetry(id, () => cancelled)
       .then((res) => {
         if (cancelled) return;
         setGraph(res);
