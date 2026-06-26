@@ -57,11 +57,26 @@ pub async fn handle(action: Action) -> ExitCode {
             let worker_handle =
                 tokio::spawn(run_resume_worker(Arc::clone(&store), worker_id, shutdown_rx));
 
+            // Adapter for rupu-cp's RunLauncher port: spawns detached
+            // `rupu workflow run …` children using this same binary.
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("error: cannot resolve current executable for run launcher: {e}");
+                    let _ = shutdown_tx.send(true);
+                    let _ = worker_handle.await;
+                    return ExitCode::FAILURE;
+                }
+            };
+            let launcher: Arc<dyn rupu_cp::launcher::RunLauncher> =
+                Arc::new(crate::cp_launcher::SubprocessLauncher { exe });
+
             let serve_result = rupu_cp::serve(rupu_cp::ServeOpts {
                 bind,
                 token,
                 global_dir,
                 open_browser: !no_open,
+                launcher: Some(launcher),
             })
             .await;
 
