@@ -68,7 +68,15 @@ export default function Coverage() {
   return (
     <div className="p-8 max-w-5xl">
       <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-ink">Coverage</h1>
+        <div className="flex items-center justify-between gap-4">
+          <h1 className="text-2xl font-semibold text-ink">Coverage</h1>
+          <Link
+            to="/coverage/templates"
+            className="text-xs font-medium text-brand-700 hover:text-brand-500"
+          >
+            Templates →
+          </Link>
+        </div>
         <p className="mt-1 text-sm text-ink-dim">
           Assessment activity across all registered projects — how many concern assertions have
           been recorded per target, and how many findings were raised.
