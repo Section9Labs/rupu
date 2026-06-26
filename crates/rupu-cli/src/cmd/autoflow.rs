@@ -12473,6 +12473,9 @@ steps:
             active_step_id: None,
             active_step_kind: None,
             active_step_agent: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -12614,6 +12617,9 @@ steps:
             active_step_id: None,
             active_step_kind: None,
             active_step_agent: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -12740,6 +12746,9 @@ steps:
             active_step_id: None,
             active_step_kind: None,
             active_step_agent: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -12881,6 +12890,9 @@ steps:
             active_step_id: None,
             active_step_kind: None,
             active_step_agent: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -13012,6 +13024,9 @@ steps:
             active_step_id: None,
             active_step_kind: None,
             active_step_agent: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
             active_step_transcript_path: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
@@ -13135,7 +13150,10 @@ steps:
                     active_step_id: None,
                     active_step_kind: None,
                     active_step_agent: None,
-                    active_step_transcript_path: None,
+                    resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            active_step_transcript_path: None,
                 },
                 "name: controller\nsteps: []\n",
             )
@@ -13273,7 +13291,10 @@ steps:
                     active_step_id: None,
                     active_step_kind: None,
                     active_step_agent: None,
-                    active_step_transcript_path: None,
+                    resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            active_step_transcript_path: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -13436,7 +13457,10 @@ steps:
                     active_step_id: None,
                     active_step_kind: None,
                     active_step_agent: None,
-                    active_step_transcript_path: None,
+                    resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            active_step_transcript_path: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
