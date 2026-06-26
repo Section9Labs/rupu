@@ -189,6 +189,9 @@ pub enum Action {
         /// Use the plain line printer instead of the live graph view.
         #[arg(long)]
         plain: bool,
+        /// Pre-assign the run id (e.g. so a caller can reference the run before it starts).
+        #[arg(long)]
+        run_id: Option<String>,
     },
     /// List recent workflow runs from the persistent run-store
     /// (`<global>/runs/`). Newest first.
@@ -323,6 +326,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             mode,
             view,
             plain,
+            run_id,
         } => {
             run(
                 &name,
@@ -332,6 +336,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
                 None,
                 view,
                 plain,
+                run_id,
             )
             .await
         }
@@ -2491,7 +2496,7 @@ pub async fn run_by_path(
 /// (interactive line-stream by default) so the issue-targeted run
 /// looks identical to the user.
 pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyhow::Result<()> {
-    run(name, Some(target), Vec::new(), mode, None, None, false).await
+    run(name, Some(target), Vec::new(), mode, None, None, false, None).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2503,8 +2508,9 @@ async fn run(
     event: Option<serde_json::Value>,
     view: Option<LiveViewMode>,
     plain: bool,
+    run_id: Option<String>,
 ) -> anyhow::Result<()> {
-    run_with_outcome(name, target, inputs, mode, event, true, None, view, plain)
+    run_with_outcome(name, target, inputs, mode, event, true, run_id, view, plain)
         .await
         .map(|_| ())
 }
