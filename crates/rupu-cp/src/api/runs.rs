@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_awaiting_run_sets_running_and_resume_marker() {
+    async fn approve_awaiting_run_sets_resume_marker_and_stays_awaiting() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
         s.run_store
@@ -358,14 +358,17 @@ mod tests {
         let resp = approve_run(State(s.clone()), Path("run_app".into()))
             .await
             .expect("approve should succeed");
-        // Response carries the reloaded run.
+        // Marker-only: the endpoint records the approval but leaves the
+        // run AwaitingApproval for the background worker to approve+resume.
         let body = resp.0;
-        assert_eq!(body["run"]["status"], serde_json::json!("running"));
+        assert_eq!(body["run"]["status"], serde_json::json!("awaiting_approval"));
 
         let loaded = s.run_store.load("run_app").unwrap();
-        assert_eq!(loaded.status, RunStatus::Running);
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
         assert!(loaded.resume_requested_at.is_some());
-        assert!(loaded.awaiting_step_id.is_none());
+        // Awaited gate stays intact so the worker can recover which gate
+        // to resume.
+        assert_eq!(loaded.awaiting_step_id.as_deref(), Some("gate"));
     }
 
     #[tokio::test]
