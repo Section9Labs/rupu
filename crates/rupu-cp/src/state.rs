@@ -11,6 +11,9 @@ pub struct AppState {
     pub workspace_dir: PathBuf,
     pub run_store: Arc<RunStore>,
     pub pricing: rupu_config::PricingConfig,
+    /// Optional run-launcher port. Defaults to `None`; rupu-cli's `cp serve`
+    /// installs a subprocess-spawning adapter via [`AppState::with_launcher`].
+    pub launcher: Option<Arc<dyn crate::launcher::RunLauncher>>,
 }
 
 impl AppState {
@@ -23,7 +26,17 @@ impl AppState {
             workspace_dir,
             run_store,
             pricing,
+            launcher: None,
         }
+    }
+
+    /// Install a run-launcher adapter (or clear it with `None`).
+    pub fn with_launcher(
+        mut self,
+        launcher: Option<Arc<dyn crate::launcher::RunLauncher>>,
+    ) -> Self {
+        self.launcher = launcher;
+        self
     }
 
     /// Override the workspace dir. Useful in tests and when the CP is

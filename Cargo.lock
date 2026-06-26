@@ -6276,6 +6276,7 @@ name = "rupu-cp"
 version = "0.16.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "futures-util",
@@ -6293,6 +6294,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tower-http",

@@ -369,6 +369,7 @@ mod tests {
             workspace_dir: tmp.path().to_path_buf(),
             run_store: Arc::new(store),
             pricing: rupu_config::PricingConfig::default(),
+            launcher: None,
         }
     }
 
