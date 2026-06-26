@@ -202,6 +202,8 @@ Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (P
 - **Richer launch target picker** — v1 ships an optional target *text field* (`github:owner/repo` / PR / issue ref, which `workflow run` already clones/fetches). A rupu-app-style target picker (this-workspace / directory browser / RepoRef clone with status) is deferred.
 - **Retry / re-run a finished run** from the web — a launch with the same inputs, or `workflow resume` for a Failed run. Not in 2b.
 - **Launch concurrency caps** — v1 spawns immediately with no queue/limit.
+- **Subprocess hygiene (`cp serve`)** — launched/resumed runs are spawned detached (`Command::spawn()` without reaping), so on Unix finished children become zombies until reaped (PID-table pressure over a long-lived server). Follow-up: a reaper task or double-fork/`setsid` detach. Also: children inherit cp-serve's stdout/stderr (run output interleaves into the server console) and the process group (a foreground Ctrl-C signals in-flight children) — consider `setsid`/redirecting child stdio.
+- **Stale `RunStore::cancel` doc** — its comment still describes the old in-process-resume model + self-PID guard; now that resumes are subprocesses, the guard is merely defensive. Update the comment when the in-process resume path is fully retired.
 
 **Phase 2 actions that need NEW engine work before the CP can expose them (no fn exists today):**
 - Run **delete / archive / prune** — `RunStore` has no delete; `cleanup.rs` prunes only sessions/transcripts.
