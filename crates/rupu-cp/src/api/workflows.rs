@@ -1,19 +1,21 @@
 use crate::{
     error::{ApiError, ApiResult},
+    launcher::LaunchError,
     state::AppState,
 };
 use axum::{
     extract::{Path, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use rupu_orchestrator::Workflow;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/workflows", get(list_workflows))
         .route("/api/workflows/:name", get(get_workflow))
+        .route("/api/workflows/:name/run", post(launch_run))
 }
 
 #[derive(Serialize)]
@@ -98,4 +100,116 @@ async fn get_workflow(
     Ok(Json(
         serde_json::json!({ "workflow": workflow, "yaml": yaml, "usage": usage }),
     ))
+}
+
+/// Request body for `POST /api/workflows/:name/run`. All fields optional; a
+/// bodyless POST launches the workflow with no inputs in its default mode.
+#[derive(Deserialize, Default)]
+struct LaunchBody {
+    #[serde(default)]
+    inputs: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+}
+
+/// Start a fresh run of `:name` via the configured [`RunLauncher`]. Returns the
+/// new run id. 501 when no launcher is installed (read-only deploy).
+///
+/// [`RunLauncher`]: crate::launcher::RunLauncher
+async fn launch_run(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<LaunchBody>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let b = body.map(|j| j.0).unwrap_or_default();
+    let launcher = s
+        .launcher
+        .as_ref()
+        .ok_or_else(|| ApiError::not_available("launching runs requires `rupu cp serve`"))?;
+    let req = crate::launcher::LaunchRequest {
+        workflow: name,
+        inputs: b.inputs,
+        mode: b.mode,
+        target: b.target,
+    };
+    match launcher.launch(req).await {
+        Ok(run_id) => Ok(Json(serde_json::json!({ "run_id": run_id }))),
+        Err(LaunchError::Invalid(m)) => Err(ApiError::bad_request(m)),
+        Err(LaunchError::Spawn(m)) => Err(ApiError::internal(m)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::launcher::{LaunchError, LaunchRequest, RunLauncher};
+    use rupu_orchestrator::RunStore;
+    use std::sync::{Arc, Mutex};
+
+    /// Captures the last `LaunchRequest` and returns a canned run id.
+    struct MockLauncher {
+        last: Mutex<Option<LaunchRequest>>,
+        run_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl RunLauncher for MockLauncher {
+        async fn launch(&self, req: LaunchRequest) -> Result<String, LaunchError> {
+            *self.last.lock().unwrap() = Some(req);
+            Ok(self.run_id.clone())
+        }
+    }
+
+    fn test_state(tmp: &tempfile::TempDir) -> AppState {
+        let store = RunStore::new(tmp.path().join("runs"));
+        AppState {
+            global_dir: tmp.path().to_path_buf(),
+            workspace_dir: tmp.path().to_path_buf(),
+            run_store: Arc::new(store),
+            pricing: rupu_config::PricingConfig::default(),
+            launcher: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_run_invokes_launcher_and_returns_run_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "run_xyz".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+
+        let mut inputs = std::collections::BTreeMap::new();
+        inputs.insert("repo".to_string(), "acme/widgets".to_string());
+        let body = LaunchBody {
+            inputs: inputs.clone(),
+            mode: Some("bypass".into()),
+            target: None,
+        };
+
+        let resp = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
+            .await
+            .expect("launch should succeed");
+        assert_eq!(resp.0["run_id"], "run_xyz");
+
+        let captured = mock.last.lock().unwrap().clone().expect("request captured");
+        assert_eq!(captured.workflow, "nightly");
+        assert_eq!(captured.inputs, inputs);
+        assert_eq!(captured.mode.as_deref(), Some("bypass"));
+        assert_eq!(captured.target, None);
+    }
+
+    #[tokio::test]
+    async fn launch_run_without_launcher_is_not_implemented() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // launcher: None
+
+        let err = launch_run(State(s), Path("nightly".into()), None)
+            .await
+            .expect_err("no launcher should error");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
 }

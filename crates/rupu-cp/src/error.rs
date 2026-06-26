@@ -26,6 +26,13 @@ impl ApiError {
     pub fn conflict(msg: impl Into<String>) -> Self {
         Self(StatusCode::CONFLICT, msg.into())
     }
+
+    /// 501 — this deployment cannot service the request because an optional
+    /// adapter is not installed (e.g. launching runs from a read-only deploy
+    /// with no `RunLauncher`).
+    pub fn not_available(msg: impl Into<String>) -> Self {
+        Self(StatusCode::NOT_IMPLEMENTED, msg.into())
+    }
 }
 
 impl IntoResponse for ApiError {
