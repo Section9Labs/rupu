@@ -8,7 +8,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rupu_orchestrator::{ApprovalError, RunRecord, RunStatus, RunStoreError};
+use rupu_orchestrator::{
+    runs::{CancelError, CancelOutcome},
+    ApprovalError, RunRecord, RunStatus, RunStoreError,
+};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -19,6 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id/usage-timeline", get(get_run_usage_timeline))
         .route("/api/runs/:id/approve", post(approve_run))
         .route("/api/runs/:id/reject", post(reject_run))
+        .route("/api/runs/:id/cancel", post(cancel_run))
 }
 
 /// Map an [`ApprovalError`] from the store's approve/reject flow to an
@@ -51,17 +55,32 @@ fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Value>> {
     ))
 }
 
+/// Optional body for `POST /api/runs/:id/approve`. `mode` selects the
+/// permission mode (`ask` / `bypass` / `readonly`) the resumed run runs
+/// under; an absent/empty body leaves it `None` (worker default).
+#[derive(serde::Deserialize, Default)]
+struct ApproveBody {
+    #[serde(default)]
+    mode: Option<String>,
+}
+
 /// `POST /api/runs/:id/approve` — record a web approval decision for a paused
-/// (awaiting-approval) run. Flips the run back to `Running` and sets the
-/// `resume_requested_at` marker that a background worker picks up to re-enter
-/// the workflow; this endpoint does NOT execute the run itself.
+/// (awaiting-approval) run. Sets the `resume_requested_at` marker (and the
+/// optional `resume_mode`) that a background worker picks up to re-enter the
+/// workflow; this endpoint does NOT execute the run itself. The run stays
+/// `AwaitingApproval` until the worker approves+resumes it.
+///
+/// The JSON body is optional — a bodyless POST is accepted and treated as
+/// `mode = None`.
 async fn approve_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<ApproveBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let now = chrono::Utc::now();
+    let mode = body.and_then(|b| b.0.mode);
     s.run_store
-        .request_resume_approval(&id, "web", None, now)
+        .request_resume_approval(&id, "web", mode.as_deref(), now)
         .map_err(|e| map_approval_err(&id, e))?;
     run_response(&s, &id)
 }
@@ -84,6 +103,45 @@ async fn reject_run(
     s.run_store
         .reject(&id, "web", &reason, now)
         .map_err(|e| map_approval_err(&id, e))?;
+    run_response(&s, &id)
+}
+
+/// Optional body for `POST /api/runs/:id/cancel`.
+#[derive(serde::Deserialize, Default)]
+struct CancelBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Map a [`CancelError`] to an [`ApiError`]:
+/// - `AlreadyTerminal` → 409 (the run is already finished)
+/// - `NotFound` → 404
+/// - `Store` → 500
+fn map_cancel_err(id: &str, e: CancelError) -> ApiError {
+    match e {
+        CancelError::AlreadyTerminal(_) => ApiError::conflict(e.to_string()),
+        CancelError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        CancelError::Store(other) => ApiError::internal(other),
+    }
+}
+
+/// `POST /api/runs/:id/cancel` — cancel an in-flight run. A `Pending`/`Running`
+/// run is marked `Cancelled` (and its live runner TERM'd); a run paused at an
+/// approval gate is rejected. Terminal runs yield 409. The JSON body is
+/// optional — a bodyless POST uses the default reason.
+async fn cancel_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    body: Option<Json<CancelBody>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let now = chrono::Utc::now();
+    let reason = body
+        .and_then(|b| b.0.reason)
+        .unwrap_or_else(|| "Cancelled from control plane".to_string());
+    let _outcome: CancelOutcome = s
+        .run_store
+        .cancel(&id, "web", &reason, now)
+        .map_err(|e| map_cancel_err(&id, e))?;
     run_response(&s, &id)
 }
 
@@ -205,7 +263,10 @@ fn in_lifecycle(status: RunStatus, group: Option<&str>) -> bool {
             RunStatus::Running | RunStatus::Pending | RunStatus::AwaitingApproval
         ),
         Some("completed") => matches!(status, RunStatus::Completed),
-        Some("failed") => matches!(status, RunStatus::Failed | RunStatus::Rejected),
+        Some("failed") => matches!(
+            status,
+            RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled
+        ),
         _ => true,
     }
 }
@@ -356,7 +417,7 @@ mod tests {
             .create(awaiting_record("run_app", "gate"), "name: x\n")
             .unwrap();
 
-        let resp = approve_run(State(s.clone()), Path("run_app".into()))
+        let resp = approve_run(State(s.clone()), Path("run_app".into()), None)
             .await
             .expect("approve should succeed");
         // Marker-only: the endpoint records the approval but leaves the
@@ -406,7 +467,7 @@ mod tests {
         rec.awaiting_step_id = None;
         s.run_store.create(rec, "name: x\n").unwrap();
 
-        let err = approve_run(State(s), Path("run_done".into()))
+        let err = approve_run(State(s), Path("run_done".into()), None)
             .await
             .expect_err("approve on completed run should fail");
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
@@ -424,6 +485,105 @@ mod tests {
         .await
         .expect_err("reject on missing run should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn approve_with_bypass_mode_stashes_resume_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(awaiting_record("run_mode", "gate"), "name: x\n")
+            .unwrap();
+
+        let body = ApproveBody {
+            mode: Some("bypass".into()),
+        };
+        let _ = approve_run(State(s.clone()), Path("run_mode".into()), Some(Json(body)))
+            .await
+            .expect("approve should succeed");
+
+        let loaded = s.run_store.load("run_mode").unwrap();
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(loaded.resume_mode.as_deref(), Some("bypass"));
+        assert!(loaded.resume_requested_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn approve_with_no_body_leaves_resume_mode_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(awaiting_record("run_nobody", "gate"), "name: x\n")
+            .unwrap();
+
+        let _ = approve_run(State(s.clone()), Path("run_nobody".into()), None)
+            .await
+            .expect("bodyless approve should succeed");
+
+        let loaded = s.run_store.load("run_nobody").unwrap();
+        assert_eq!(loaded.status, RunStatus::AwaitingApproval);
+        assert_eq!(loaded.resume_mode, None);
+        assert!(loaded.resume_requested_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_running_run_marks_cancelled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let mut rec = awaiting_record("run_cancel", "gate");
+        rec.status = RunStatus::Running;
+        rec.awaiting_step_id = None;
+        rec.approval_prompt = None;
+        rec.awaiting_since = None;
+        rec.runner_pid = None;
+        s.run_store.create(rec, "name: x\n").unwrap();
+
+        let resp = cancel_run(State(s.clone()), Path("run_cancel".into()), None)
+            .await
+            .expect("cancel should succeed");
+        assert_eq!(resp.0["run"]["status"], serde_json::json!("cancelled"));
+
+        let loaded = s.run_store.load("run_cancel").unwrap();
+        assert_eq!(loaded.status, RunStatus::Cancelled);
+        assert_eq!(
+            loaded.error_message.as_deref(),
+            Some("Cancelled from control plane")
+        );
+        assert!(loaded.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_terminal_run_is_conflict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let mut rec = awaiting_record("run_term", "gate");
+        rec.status = RunStatus::Completed;
+        rec.awaiting_step_id = None;
+        s.run_store.create(rec, "name: x\n").unwrap();
+
+        let body = CancelBody {
+            reason: Some("too late".into()),
+        };
+        let err = cancel_run(State(s), Path("run_term".into()), Some(Json(body)))
+            .await
+            .expect_err("cancel on completed run should fail");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_run_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let err = cancel_run(State(s), Path("ghost".into()), None)
+            .await
+            .expect_err("cancel on missing run should 404");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn in_lifecycle_groups_cancelled_with_failed() {
+        assert!(in_lifecycle(RunStatus::Cancelled, Some("failed")));
+        assert!(!in_lifecycle(RunStatus::Cancelled, Some("active")));
     }
 
     #[test]
