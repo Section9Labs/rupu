@@ -10,6 +10,7 @@ import { ArrowLeft, ShieldCheck, ShieldOff } from 'lucide-react';
 import CoverageCatalogTab from '../components/coverage/CoverageCatalogTab';
 import CoverageAuditTab from '../components/coverage/CoverageAuditTab';
 import CoverageGapTab from '../components/coverage/CoverageGapTab';
+import CoverageDiffTab from '../components/coverage/CoverageDiffTab';
 import {
   api,
   normAssertionStatus,
@@ -31,7 +32,7 @@ import { relativeTime } from '../lib/time';
 // How many assertion rows to render before capping with a "+N more" note.
 const ASSERTION_CAP = 200;
 
-export type CoverageTab = 'overview' | 'catalog' | 'audit' | 'gap';
+export type CoverageTab = 'overview' | 'catalog' | 'audit' | 'gap' | 'diff';
 
 export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab }) {
   const { target = '' } = useParams<{ target: string }>();
@@ -151,6 +152,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
             { id: 'catalog', label: 'Catalog', path: `/coverage/${enc}/catalog${qs}` },
             { id: 'audit', label: 'Audit', path: `/coverage/${enc}/audit${qs}` },
             { id: 'gap', label: 'Gap', path: `/coverage/${enc}/gap${qs}` },
+            { id: 'diff', label: 'Diff', path: `/coverage/${enc}/diff${qs}` },
           ] as { id: CoverageTab; label: string; path: string }[]
         ).map((t) => (
           <button
@@ -171,6 +173,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
       {tab === 'catalog' && <CoverageCatalogTab target={target} wsId={wsId} />}
       {tab === 'audit' && <CoverageAuditTab target={target} wsId={wsId} />}
       {tab === 'gap' && <CoverageGapTab target={target} wsId={wsId} />}
+      {tab === 'diff' && <CoverageDiffTab target={target} wsId={wsId} />}
 
       {tab === 'overview' && (
       <>

@@ -61,6 +61,7 @@ export default function App() {
             <Route path="/coverage/:target/catalog" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="catalog" /></Suspense>} />
             <Route path="/coverage/:target/audit" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="audit" /></Suspense>} />
             <Route path="/coverage/:target/gap" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="gap" /></Suspense>} />
+            <Route path="/coverage/:target/diff" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="diff" /></Suspense>} />
             <Route path="/coverage/:target" element={<Suspense fallback={<PageFallback />}><CoverageDetail /></Suspense>} />
             <Route path="/findings" element={<Suspense fallback={<PageFallback />}><Findings /></Suspense>} />
             <Route path="/workflows" element={<Suspense fallback={<PageFallback />}><Workflows /></Suspense>} />

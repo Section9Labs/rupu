@@ -8,8 +8,9 @@ use axum::{
     Json, Router,
 };
 use rupu_coverage::{
-    builtin_names, coverage_status, discover_targets, file_views, read_file_events, read_findings,
-    read_snapshot, resolve_builtin, run_audit, CoveragePaths, CoverageStatusInput,
+    builtin_names, coverage_status, discover_targets, file_views, list_runs, read_file_events,
+    read_findings, read_snapshot, resolve_builtin, run_audit, run_diff, CoveragePaths,
+    CoverageStatusInput, DiffError, RunSelector,
 };
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/coverage/:target", get(get_coverage))
         .route("/api/coverage/:target/catalog", get(get_catalog))
         .route("/api/coverage/:target/audit", get(get_audit))
+        .route("/api/coverage/:target/runs", get(get_runs))
+        .route("/api/coverage/:target/diff", get(get_diff))
 }
 
 #[derive(Serialize)]
@@ -289,6 +292,103 @@ async fn get_audit(
     )))
 }
 
+// ── Runs + Diff (per-target) ──────────────────────────────────────────────
+
+/// List runs for a target under one workspace path. `Ok(None)` when the target
+/// isn't present under this workspace.
+fn list_target_runs(
+    wp: &std::path::Path,
+    target: &str,
+) -> Result<Option<Vec<rupu_coverage::RunListEntry>>, String> {
+    let exists = discover_targets(wp)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|t| t.target_id == target);
+    if !exists {
+        return Ok(None);
+    }
+    let paths = CoveragePaths::new(wp, target);
+    list_runs(&paths).map(Some).map_err(|e| e.to_string())
+}
+
+async fn get_runs(
+    State(s): State<AppState>,
+    Path(target): Path<String>,
+    Query(q): Query<GetCoverageQuery>,
+) -> ApiResult<Json<Vec<rupu_coverage::RunListEntry>>> {
+    for w in scoped_workspaces(&s, &q.ws_id) {
+        let wp = std::path::Path::new(&w.path);
+        match list_target_runs(wp, &target) {
+            Ok(Some(runs)) => return Ok(Json(runs)),
+            Ok(None) => continue,
+            Err(e) => return Err(ApiError::internal(e)),
+        }
+    }
+    Err(ApiError::not_found(format!(
+        "coverage target {target} not found"
+    )))
+}
+
+#[derive(Deserialize)]
+struct DiffQuery {
+    ws_id: Option<String>,
+    base: Option<String>,
+    compare: Option<String>,
+}
+
+/// Parse an optional selector string, falling back to `default` when absent.
+/// `RunSelector::from_str` is infallible (`latest`/`previous`/explicit id).
+fn parse_selector(raw: &Option<String>, default: RunSelector) -> RunSelector {
+    match raw {
+        Some(s) => s.parse().unwrap_or(default),
+        None => default,
+    }
+}
+
+/// Run a diff for a target under one workspace path. `Ok(None)` when the target
+/// isn't present; `Err(DiffError)` when selectors can't resolve.
+fn run_target_diff(
+    wp: &std::path::Path,
+    target: &str,
+    base: &RunSelector,
+    compare: &RunSelector,
+) -> Result<Option<rupu_coverage::RunDiff>, DiffError> {
+    let exists = discover_targets(wp)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|t| t.target_id == target);
+    if !exists {
+        return Ok(None);
+    }
+    let paths = CoveragePaths::new(wp, target);
+    run_diff(&paths, base, compare).map(Some)
+}
+
+async fn get_diff(
+    State(s): State<AppState>,
+    Path(target): Path<String>,
+    Query(q): Query<DiffQuery>,
+) -> ApiResult<Json<rupu_coverage::RunDiff>> {
+    let base = parse_selector(&q.base, RunSelector::Previous);
+    let compare = parse_selector(&q.compare, RunSelector::Latest);
+    for w in scoped_workspaces(&s, &q.ws_id) {
+        let wp = std::path::Path::new(&w.path);
+        match run_target_diff(wp, &target, &base, &compare) {
+            Ok(Some(diff)) => return Ok(Json(diff)),
+            Ok(None) => continue,
+            // A selector that can't resolve (too few runs / bad id) is a client
+            // condition, not a server fault.
+            Err(DiffError::Io(e)) => return Err(ApiError::internal(e.to_string())),
+            Err(e @ (DiffError::UnknownRun(_) | DiffError::NoRunMatches(_))) => {
+                return Err(ApiError::bad_request(e.to_string()))
+            }
+        }
+    }
+    Err(ApiError::not_found(format!(
+        "coverage target {target} not found"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +442,40 @@ mod tests {
 
         assert!(run_target_audit(wp, "tgt-9").expect("ok").is_some());
         assert!(run_target_audit(wp, "nope").expect("ok").is_none());
+    }
+
+    #[test]
+    fn list_runs_for_existing_target_only() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wp = dir.path();
+        let paths = CoveragePaths::new(wp, "tgt-runs");
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // Empty concerns ledger → target discovered, zero runs.
+        std::fs::File::create(&paths.concerns)
+            .unwrap()
+            .write_all(b"")
+            .unwrap();
+
+        let got = list_target_runs(wp, "tgt-runs").expect("ok");
+        assert!(got.is_some(), "existing target resolves");
+        assert_eq!(got.unwrap().len(), 0, "no runs recorded");
+        assert!(list_target_runs(wp, "missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn diff_query_selectors_default_and_parse() {
+        assert_eq!(
+            parse_selector(&None, RunSelector::Latest),
+            RunSelector::Latest
+        );
+        assert_eq!(
+            parse_selector(&Some("previous".to_string()), RunSelector::Latest),
+            RunSelector::Previous
+        );
+        assert_eq!(
+            parse_selector(&Some("run_123".to_string()), RunSelector::Latest),
+            RunSelector::RunId("run_123".to_string())
+        );
     }
 }
