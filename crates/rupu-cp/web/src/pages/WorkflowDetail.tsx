@@ -9,6 +9,7 @@ import { ArrowLeft } from 'lucide-react';
 import { api, type WorkflowDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import { ScopeChip } from './Workflows';
+import CodeHighlight from '../components/CodeHighlight';
 
 // ── Loose narrowing helpers ──────────────────────────────────────────────
 // The backend hands back `workflow: Record<string, unknown>`; we read only the
@@ -43,6 +44,38 @@ function readSteps(workflow: Record<string, unknown>): ParsedStep[] {
   const raw = workflow.steps;
   if (!Array.isArray(raw)) return [];
   return raw.map(parseStep);
+}
+
+interface AutoflowInfo {
+  /** Human-readable trigger summary, e.g. a cron expression, `event: …`, or
+   *  `wakes on: github.issue.opened, …`. Undefined when nothing to show. */
+  trigger?: string;
+}
+
+/**
+ * When the workflow has `autoflow.enabled: true`, return a small descriptor so
+ * the header can mark it as an autoflow and summarize what triggers it. Returns
+ * null for plain (manually-launched) workflows. Reads the parsed `workflow`
+ * object defensively — every field is optional on the wire.
+ */
+function readAutoflow(workflow: Record<string, unknown>): AutoflowInfo | null {
+  const af = workflow.autoflow;
+  if (typeof af !== 'object' || af === null) return null;
+  const afo = af as Record<string, unknown>;
+  if (afo.enabled !== true) return null;
+
+  const trig = workflow.trigger;
+  const trigo = typeof trig === 'object' && trig !== null ? (trig as Record<string, unknown>) : {};
+  const on = asString(trigo.on);
+  if (on === 'cron' && asString(trigo.cron)) return { trigger: `cron: ${asString(trigo.cron)}` };
+  if (on === 'event' && asString(trigo.event)) return { trigger: `event: ${asString(trigo.event)}` };
+
+  const wake = afo.wake_on;
+  if (Array.isArray(wake)) {
+    const events = wake.filter((e): e is string => typeof e === 'string');
+    if (events.length > 0) return { trigger: `wakes on: ${events.join(', ')}` };
+  }
+  return {};
 }
 
 export default function WorkflowDetailPage() {
@@ -95,6 +128,7 @@ export default function WorkflowDetailPage() {
   const scope = asString(detail.workflow.scope);
   const description = asString(detail.workflow.description);
   const steps = readSteps(detail.workflow);
+  const autoflow = readAutoflow(detail.workflow);
 
   return (
     <div className="p-8 max-w-5xl">
@@ -104,9 +138,17 @@ export default function WorkflowDetailPage() {
         <div className="flex flex-wrap items-center gap-2">
           <h1 className="text-2xl font-semibold text-ink break-all">{wfName}</h1>
           {scope && <ScopeChip scope={scope} />}
+          {autoflow && (
+            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-violet-50 text-violet-700 ring-violet-200">
+              Autoflow
+            </span>
+          )}
         </div>
         {description && (
           <p className="mt-2 text-sm text-ink-dim leading-snug">{description}</p>
+        )}
+        {autoflow?.trigger && (
+          <p className="mt-1 text-xs text-ink-mute font-mono break-all">{autoflow.trigger}</p>
         )}
       </header>
 
@@ -129,9 +171,7 @@ export default function WorkflowDetailPage() {
       {/* ── Raw YAML ────────────────────────────────────────────── */}
       <section className="mt-8">
         <h2 className="text-sm font-semibold text-ink mb-2 pl-1">YAML</h2>
-        <pre className="whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-ink bg-panel border border-border rounded-xl shadow-card p-4 overflow-x-auto">
-          {detail.yaml}
-        </pre>
+        <CodeHighlight code={detail.yaml} language="yaml" />
       </section>
     </div>
   );

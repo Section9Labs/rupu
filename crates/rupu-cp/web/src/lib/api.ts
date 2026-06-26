@@ -367,6 +367,9 @@ export interface AgentRunRow {
 
 export interface AutoflowDefRow {
   name: string;
+  /** File stem — the identifier the workflow detail route (`/workflows/:name`)
+   *  is keyed by. May differ from `name` (the parsed display name). */
+  slug: string;
   trigger: string;
   scope: string;
 }
@@ -416,6 +419,8 @@ export interface AgentSummary {
 
 export interface AgentDetail extends AgentSummary {
   system_prompt: string;
+  /** Full raw agent definition file (`.md` frontmatter + body). */
+  raw: string;
 }
 
 // ---------------------------------------------------------------------------

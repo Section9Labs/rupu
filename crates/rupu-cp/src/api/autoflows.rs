@@ -11,6 +11,10 @@ pub fn routes() -> Router<AppState> {
 #[derive(Serialize)]
 pub(crate) struct AutoflowDefRow {
     pub(crate) name: String,
+    /// File stem (e.g. `my-workflow` for `my-workflow.yaml`). The workflow
+    /// detail route is keyed by file stem, not parsed `name`, so the frontend
+    /// links to `/workflows/{slug}`.
+    pub(crate) slug: String,
     /// `TriggerKind` as a lowercase string: `"manual"`, `"cron"`, or `"event"`.
     pub(crate) trigger: String,
     /// `"global"` or `"project"` depending on the layer the file came from.
@@ -47,6 +51,10 @@ pub(crate) fn scan_autoflow_defs(
         })
         .filter_map(|e| {
             let path = e.path();
+            let slug = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())?;
             let body = match std::fs::read_to_string(&path) {
                 Ok(b) => b,
                 Err(err) => {
@@ -79,6 +87,7 @@ pub(crate) fn scan_autoflow_defs(
             .to_string();
             Some(AutoflowDefRow {
                 name: workflow.name,
+                slug,
                 trigger,
                 scope,
             })
@@ -100,4 +109,30 @@ pub(crate) fn scan_autoflow_defs(
 async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
     let dir = s.global_dir.join("workflows");
     Ok(Json(scan_autoflow_defs(&dir, "global")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn slug_is_file_stem_distinct_from_parsed_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // File stem (`my-file-stem`) deliberately differs from the workflow's
+        // parsed `name` (`parsed-name`), because the workflow detail route is
+        // keyed by file stem while the autoflow's display name is the parsed
+        // name. The row must carry both.
+        let path = dir.path().join("my-file-stem.yaml");
+        let mut f = std::fs::File::create(&path).expect("create");
+        f.write_all(
+            b"name: parsed-name\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n",
+        )
+        .expect("write");
+
+        let rows = scan_autoflow_defs(dir.path(), "global");
+        assert_eq!(rows.len(), 1, "the enabled autoflow should be returned");
+        assert_eq!(rows[0].name, "parsed-name");
+        assert_eq!(rows[0].slug, "my-file-stem");
+    }
 }

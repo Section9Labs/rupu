@@ -1,11 +1,13 @@
 // Agent detail — header meta (provider/model/effort/max_tokens) plus the full
-// system prompt rendered as readable wrapped monospace. Route: /agents/:name
+// raw definition file (YAML frontmatter + markdown body) shown with syntax
+// highlighting. Route: /agents/:name
 
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 import { api, type AgentDetail } from '../lib/api';
 import { cn } from '../lib/cn';
+import CodeHighlight from '../components/CodeHighlight';
 
 export default function AgentDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
@@ -73,13 +75,11 @@ export default function AgentDetailPage() {
       </header>
 
       <section className="mt-8">
-        <h2 className="text-sm font-semibold text-ink mb-2 pl-1">System prompt</h2>
-        {agent.system_prompt ? (
-          <pre className="whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-ink bg-panel border border-border rounded-xl shadow-card p-4 overflow-x-auto">
-            {agent.system_prompt}
-          </pre>
+        <h2 className="text-sm font-semibold text-ink mb-2 pl-1">Definition</h2>
+        {agent.raw ? (
+          <CodeHighlight code={agent.raw} frontmatter />
         ) : (
-          <p className="text-sm text-ink-dim pl-1">No system prompt.</p>
+          <p className="text-sm text-ink-dim pl-1">No definition.</p>
         )}
       </section>
     </div>

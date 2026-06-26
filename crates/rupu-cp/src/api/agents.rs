@@ -62,6 +62,9 @@ struct AgentDetailDto {
     #[serde(flatten)]
     summary: AgentDto,
     system_prompt: String,
+    /// Full raw agent definition file (`.md` frontmatter + body), served so the
+    /// CP can render it with syntax highlighting.
+    raw: String,
 }
 
 async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>> {
@@ -108,8 +111,10 @@ async fn get_agent(
         other => ApiError::internal(other.to_string()),
     })?;
     let system_prompt = spec.system_prompt.clone();
+    let raw = spec.raw.clone();
     Ok(Json(AgentDetailDto {
         system_prompt,
+        raw,
         summary: AgentDto::from_spec(spec, "global"),
     }))
 }

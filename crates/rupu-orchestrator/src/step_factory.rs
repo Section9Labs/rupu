@@ -116,6 +116,7 @@ impl StepFactory for DefaultStepFactory {
                         context_window_tokens: None,
                         compact_at_percent: None,
                         system_prompt: rendered_prompt.clone(),
+                        raw: rendered_prompt.clone(),
                     }
                 });
 
