@@ -1,9 +1,15 @@
-// Per-target coverage detail — findings first (high-value), then the full
-// assertion grid (what was assessed). Route: /coverage/:target
+// Per-target coverage detail — a tabbed shell (Overview | Catalog | Audit |
+// Gap). Overview shows findings, files touched, and the assertion grid; the
+// other tabs lazily fetch their own endpoints. Routes: /coverage/:target and
+// /coverage/:target/{catalog,audit,gap}. The ?ws_id= scope is preserved across
+// tabs.
 
 import { useEffect, useState } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ShieldCheck, ShieldOff } from 'lucide-react';
+import CoverageCatalogTab from '../components/coverage/CoverageCatalogTab';
+import CoverageAuditTab from '../components/coverage/CoverageAuditTab';
+import CoverageGapTab from '../components/coverage/CoverageGapTab';
 import {
   api,
   normAssertionStatus,
@@ -25,10 +31,15 @@ import { relativeTime } from '../lib/time';
 // How many assertion rows to render before capping with a "+N more" note.
 const ASSERTION_CAP = 200;
 
-export default function CoverageDetail() {
+export type CoverageTab = 'overview' | 'catalog' | 'audit' | 'gap';
+
+export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab }) {
   const { target = '' } = useParams<{ target: string }>();
   const [searchParams] = useSearchParams();
   const wsId = searchParams.get('ws_id') ?? undefined;
+  const navigate = useNavigate();
+  const enc = encodeURIComponent(target);
+  const qs = wsId ? `?ws_id=${encodeURIComponent(wsId)}` : '';
 
   const [detail, setDetail] = useState<CoverageDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -132,6 +143,37 @@ export default function CoverageDetail() {
         </div>
       </header>
 
+      {/* Tab bar */}
+      <nav className="mt-4 flex gap-1 border-b border-border">
+        {(
+          [
+            { id: 'overview', label: 'Overview', path: `/coverage/${enc}${qs}` },
+            { id: 'catalog', label: 'Catalog', path: `/coverage/${enc}/catalog${qs}` },
+            { id: 'audit', label: 'Audit', path: `/coverage/${enc}/audit${qs}` },
+            { id: 'gap', label: 'Gap', path: `/coverage/${enc}/gap${qs}` },
+          ] as { id: CoverageTab; label: string; path: string }[]
+        ).map((t) => (
+          <button
+            key={t.id}
+            onClick={() => navigate(t.path)}
+            className={cn(
+              'px-3 py-1.5 text-sm font-medium border-b-2 -mb-px',
+              tab === t.id
+                ? 'border-brand-500 text-ink'
+                : 'border-transparent text-ink-dim hover:text-ink',
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
+
+      {tab === 'catalog' && <CoverageCatalogTab target={target} wsId={wsId} />}
+      {tab === 'audit' && <CoverageAuditTab target={target} wsId={wsId} />}
+      {tab === 'gap' && <CoverageGapTab target={target} wsId={wsId} />}
+
+      {tab === 'overview' && (
+      <>
       {/* ── Findings ────────────────────────────────────────────── */}
       <section className="mt-8">
         <SectionHeader
@@ -213,6 +255,8 @@ export default function CoverageDetail() {
           </>
         )}
       </section>
+      </>
+      )}
     </div>
   );
 }

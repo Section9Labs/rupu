@@ -10,6 +10,7 @@ const RunDetail         = React.lazy(() => import('./pages/RunDetail'));
 const Events            = React.lazy(() => import('./pages/Events'));
 const Coverage          = React.lazy(() => import('./pages/Coverage'));
 const CoverageDetail    = React.lazy(() => import('./pages/CoverageDetail'));
+const CoverageTemplates = React.lazy(() => import('./pages/CoverageTemplates'));
 const Findings          = React.lazy(() => import('./pages/Findings'));
 const Workflows         = React.lazy(() => import('./pages/Workflows'));
 const WorkflowDetail    = React.lazy(() => import('./pages/WorkflowDetail'));
@@ -56,6 +57,10 @@ export default function App() {
             <Route path="/runs/:id" element={<Suspense fallback={<PageFallback />}><RunDetail /></Suspense>} />
             <Route path="/events" element={<Suspense fallback={<PageFallback />}><Events /></Suspense>} />
             <Route path="/coverage" element={<Suspense fallback={<PageFallback />}><Coverage /></Suspense>} />
+            <Route path="/coverage/templates" element={<Suspense fallback={<PageFallback />}><CoverageTemplates /></Suspense>} />
+            <Route path="/coverage/:target/catalog" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="catalog" /></Suspense>} />
+            <Route path="/coverage/:target/audit" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="audit" /></Suspense>} />
+            <Route path="/coverage/:target/gap" element={<Suspense fallback={<PageFallback />}><CoverageDetail tab="gap" /></Suspense>} />
             <Route path="/coverage/:target" element={<Suspense fallback={<PageFallback />}><CoverageDetail /></Suspense>} />
             <Route path="/findings" element={<Suspense fallback={<PageFallback />}><Findings /></Suspense>} />
             <Route path="/workflows" element={<Suspense fallback={<PageFallback />}><Workflows /></Suspense>} />

@@ -642,6 +642,86 @@ export interface CoverageDetail {
   files?: FileView[];
 }
 
+// ── Coverage: concerns / catalog / audit / templates ──────────────────────
+
+export interface CoverageConcern {
+  id: string;
+  name: string;
+  description: string;
+  severity: string; // lowercase: info|low|medium|high|critical
+  applicable_globs: string[];
+  min_strength: string;
+  references: string[];
+  tags: string[];
+}
+
+export interface TemplateSummary {
+  name: string;
+  version: number;
+  description: string;
+  concern_count: number;
+  severity_breakdown: Record<string, number>;
+}
+
+export interface TemplateDetail {
+  name: string;
+  version: number;
+  description: string;
+  references: string[];
+  concerns: CoverageConcern[];
+  includes: string[];
+}
+
+export interface FlatCatalog {
+  concerns: CoverageConcern[];
+  sources: Record<string, string>;     // concern_id → template name / "inline"
+  render_modes: Record<string, string>; // concern_id → full|index|auto
+}
+
+export interface ConcernCoverage {
+  concern_id: string;
+  name: string;
+  severity: string;
+  in_scope_files: string[];
+  asserted_files: string[];
+  gap_files: string[];
+  clean: number;
+  findings: number;
+  examined: number;
+  not_applicable: number;
+}
+
+export interface FileCoverage {
+  path: string;
+  strongest_touch: string;
+  asserted_concerns: string[];
+  missing_concerns: string[];
+}
+
+export interface CrossModelEntry {
+  concern_id: string;
+  file_path: string;
+  model_statuses: [string, string][];
+  disagreement: boolean;
+}
+
+export interface SerendipitousCluster {
+  theme: string;
+  finding_ids: string[];
+  count: number;
+}
+
+export interface AuditReport {
+  target_id: string;
+  concerns: ConcernCoverage[];
+  files: FileCoverage[];
+  cross_model: CrossModelEntry[];
+  serendipitous: SerendipitousCluster[];
+  total_concerns: number;
+  complete_concerns: number;
+  total_gap_files: number;
+}
+
 // ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
@@ -824,6 +904,20 @@ export const api = {
   getCoverageDetail(target: string, wsId?: string): Promise<CoverageDetail> {
     const qs = wsId ? `?ws_id=${encodeURIComponent(wsId)}` : '';
     return request<CoverageDetail>(`/api/coverage/${encodeURIComponent(target)}${qs}`);
+  },
+  getCoverageTemplates(): Promise<TemplateSummary[]> {
+    return request<TemplateSummary[]>('/api/coverage/templates');
+  },
+  getCoverageTemplate(name: string): Promise<TemplateDetail> {
+    return request<TemplateDetail>(`/api/coverage/templates/${encodeURIComponent(name)}`);
+  },
+  getCoverageCatalog(target: string, wsId?: string): Promise<FlatCatalog> {
+    const qs = wsId ? `?ws_id=${encodeURIComponent(wsId)}` : '';
+    return request<FlatCatalog>(`/api/coverage/${encodeURIComponent(target)}/catalog${qs}`);
+  },
+  getCoverageAudit(target: string, wsId?: string): Promise<AuditReport> {
+    const qs = wsId ? `?ws_id=${encodeURIComponent(wsId)}` : '';
+    return request<AuditReport>(`/api/coverage/${encodeURIComponent(target)}/audit${qs}`);
   },
 
   // --- Findings ---
