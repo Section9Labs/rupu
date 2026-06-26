@@ -38,6 +38,7 @@ fn seed_run(id: &str, status: RunStatus, started_offset_secs: i64) -> RunRecord 
         resume_requested_at: None,
         resume_claimed_at: None,
         resume_claimed_by: None,
+        resume_mode: None,
         issue_ref: None,
         issue: None,
         parent_run_id: None,

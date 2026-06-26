@@ -22,6 +22,7 @@ use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
 use rupu_app_canvas::{render_rows as render_graph_rows, GraphCell, NodeStatus};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts};
+use rupu_orchestrator::runs::{CancelError, CancelOutcome};
 use rupu_orchestrator::{DefaultStepFactory, RunWorkflowError};
 use rupu_runtime::{
     ArtifactKind, ArtifactManifest, ArtifactRef, AutoflowEnvelope, ExecutionBackend,
@@ -2008,7 +2009,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
             );
         }
         // Resume applies to terminal failure states.
-        RunStatus::Failed | RunStatus::Rejected => {}
+        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => {}
     }
 
     // Rebuild context from disk: workflow YAML snapshot + prior step
@@ -2289,78 +2290,25 @@ async fn cancel(run_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CancelOutcome {
-    RejectedAwaitingApproval,
-    MarkedCancelled { pid: Option<u32>, was_running: bool },
-}
-
+/// Delegates to the canonical [`rupu_orchestrator::RunStore::cancel`]
+/// (Pending/Running → `Cancelled` with a SIGTERM to a live runner pid;
+/// AwaitingApproval → reject; terminal → error). Maps the library's
+/// [`CancelError`] onto an `anyhow::Error` with the same user-facing
+/// message shape the CLI printed before.
 fn cancel_with_store(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
     reason: &str,
 ) -> anyhow::Result<CancelOutcome> {
-    let mut record = store
-        .load(run_id)
-        .map_err(|e| anyhow::anyhow!("load run record: {e}"))?;
-    match record.status {
-        rupu_orchestrator::RunStatus::Completed
-        | rupu_orchestrator::RunStatus::Failed
-        | rupu_orchestrator::RunStatus::Rejected => {
-            anyhow::bail!(
-                "run {run_id} is already terminal ({})",
-                record.status.as_str()
-            );
-        }
-        rupu_orchestrator::RunStatus::AwaitingApproval => {
-            let approver = whoami::username();
-            store
-                .reject(run_id, &approver, reason, chrono::Utc::now())
-                .map_err(|e| anyhow::anyhow!("cancel awaiting run: {e}"))?;
-            Ok(CancelOutcome::RejectedAwaitingApproval)
-        }
-        rupu_orchestrator::RunStatus::Pending | rupu_orchestrator::RunStatus::Running => {
-            let pid = record.runner_pid;
-            let was_running = pid.is_some_and(pid_is_running);
-            if let Some(pid) = pid.filter(|pid| pid_is_running(*pid)) {
-                let _ = terminate_pid(pid);
+    store
+        .cancel(run_id, &whoami::username(), reason, chrono::Utc::now())
+        .map_err(|e| match e {
+            CancelError::AlreadyTerminal(status) => {
+                anyhow::anyhow!("run {run_id} is already terminal ({})", status.as_str())
             }
-            record.status = rupu_orchestrator::RunStatus::Failed;
-            record.finished_at = Some(chrono::Utc::now());
-            record.error_message = Some(reason.to_string());
-            record.awaiting_step_id = None;
-            record.approval_prompt = None;
-            record.awaiting_since = None;
-            record.expires_at = None;
-            record.runner_pid = None;
-            record.active_step_id = None;
-            record.active_step_kind = None;
-            record.active_step_agent = None;
-            record.active_step_transcript_path = None;
-            store
-                .update(&record)
-                .map_err(|e| anyhow::anyhow!("persist cancelled run: {e}"))?;
-            Ok(CancelOutcome::MarkedCancelled { pid, was_running })
-        }
-    }
-}
-
-fn pid_is_running(pid: u32) -> bool {
-    std::process::Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn terminate_pid(pid: u32) -> bool {
-    std::process::Command::new("/bin/kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+            CancelError::NotFound(_) => anyhow::anyhow!("load run record: {e}"),
+            CancelError::Store(_) => anyhow::anyhow!("cancel run: {e}"),
+        })
 }
 
 pub(crate) fn locate_workflow_in(
@@ -3119,9 +3067,9 @@ fn build_artifact_manifest(
 fn run_result_status(status: rupu_orchestrator::RunStatus) -> RunResultStatus {
     match status {
         rupu_orchestrator::RunStatus::AwaitingApproval => RunResultStatus::AwaitingApproval,
-        rupu_orchestrator::RunStatus::Failed | rupu_orchestrator::RunStatus::Rejected => {
-            RunResultStatus::Failed
-        }
+        rupu_orchestrator::RunStatus::Failed
+        | rupu_orchestrator::RunStatus::Rejected
+        | rupu_orchestrator::RunStatus::Cancelled => RunResultStatus::Failed,
         rupu_orchestrator::RunStatus::Pending
         | rupu_orchestrator::RunStatus::Running
         | rupu_orchestrator::RunStatus::Completed => RunResultStatus::Completed,
@@ -3651,6 +3599,7 @@ mod tests {
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
             issue_ref: None,
             issue: None,
             parent_run_id: None,
@@ -3684,7 +3633,7 @@ mod tests {
         );
 
         let persisted = store.load("run_test_cancel").unwrap();
-        assert_eq!(persisted.status, RunStatus::Failed);
+        assert_eq!(persisted.status, RunStatus::Cancelled);
         assert_eq!(
             persisted.error_message.as_deref(),
             Some("cancelled by operator")

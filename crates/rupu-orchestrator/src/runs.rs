@@ -45,6 +45,9 @@ use thiserror::Error;
 ///   an `approval: required` step.
 /// - `AwaitingApproval` → `Running` (PR 2) on `rupu workflow approve`.
 /// - `AwaitingApproval` → `Rejected` (PR 2) on `rupu workflow reject`.
+/// - `Pending`/`Running` → `Cancelled` on `rupu workflow cancel` (or
+///   the web/CP cancel control): a deliberate operator stop, distinct
+///   from `Failed` (a run that errored on its own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -55,6 +58,7 @@ pub enum RunStatus {
     Failed,
     AwaitingApproval,
     Rejected,
+    Cancelled,
 }
 
 impl RunStatus {
@@ -66,13 +70,17 @@ impl RunStatus {
             Self::Failed => "failed",
             Self::AwaitingApproval => "awaiting_approval",
             Self::Rejected => "rejected",
+            Self::Cancelled => "cancelled",
         }
     }
 
     /// True when no further state transitions are expected. Used by
     /// `rupu workflow runs` to bucket terminal vs in-flight rows.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Rejected)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Rejected | Self::Cancelled
+        )
     }
 }
 
@@ -200,6 +208,15 @@ pub struct RunRecord {
     /// Identity of the worker holding the current resume lease.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_claimed_by: Option<String>,
+    /// Permission mode the operator chose when approving a delegated
+    /// resume (`ask` / `bypass` / `readonly`). Set alongside
+    /// `resume_requested_at` by [`RunStore::request_resume_approval`];
+    /// the worker that picks the run up reads this to re-enter
+    /// `run_workflow` in the requested mode. `None` when no mode was
+    /// specified (or an invalid one was supplied). Cleared by
+    /// [`RunStore::clear_resume`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_mode: Option<String>,
 }
 
 /// Workflow-step shape, persisted alongside the result so the
@@ -811,6 +828,30 @@ pub enum ApprovalError {
     Store(#[from] RunStoreError),
 }
 
+/// Outcome of [`RunStore::cancel`]. Returned so callers (CLI / CP web)
+/// can phrase the right message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The run was paused at an approval gate; cancellation was
+    /// implemented as a reject (status flips to `Rejected`).
+    RejectedAwaitingApproval,
+    /// The run was `Pending`/`Running`; status flipped to `Cancelled`.
+    /// `pid` is the recorded runner pid (if any) and `was_running`
+    /// indicates whether that pid was live (and got a TERM signal).
+    MarkedCancelled { pid: Option<u32>, was_running: bool },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CancelError {
+    /// The run is already in a terminal state and cannot be cancelled.
+    #[error("run is already terminal (`{}`)", .0.as_str())]
+    AlreadyTerminal(RunStatus),
+    #[error("run not found: {0}")]
+    NotFound(String),
+    #[error("store: {0}")]
+    Store(String),
+}
+
 impl RunStore {
     /// Library-level approve flow: load → expire-check → mutate
     /// status → persist. Caller is responsible for re-entering
@@ -925,10 +966,16 @@ impl RunStore {
     /// Returns `Approved { step_id }` with the still-present
     /// `awaiting_step_id` so the web endpoint can report which gate the
     /// operator approved.
+    ///
+    /// `mode` is the permission mode the operator chose for the resumed
+    /// run (`ask` / `bypass` / `readonly`). It is validated and stored on
+    /// `resume_mode`; anything outside the three known modes (or `None`)
+    /// stores `None`, leaving the worker to fall back to its default.
     pub fn request_resume_approval(
         &self,
         run_id: &str,
         approver: &str,
+        mode: Option<&str>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<ApprovalDecision, ApprovalError> {
         let mut record = self.load(run_id).map_err(|e| match e {
@@ -957,6 +1004,9 @@ impl RunStore {
         // awaiting_step_id / approval_prompt / awaiting_since /
         // expires_at intact for the worker to approve+resume.
         record.resume_requested_at = Some(now);
+        record.resume_mode = mode
+            .filter(|m| matches!(*m, "ask" | "bypass" | "readonly"))
+            .map(str::to_string);
         self.update(&record)?;
         Ok(ApprovalDecision::Approved {
             run_id: run_id.to_string(),
@@ -1025,9 +1075,111 @@ impl RunStore {
         record.resume_requested_at = None;
         record.resume_claimed_at = None;
         record.resume_claimed_by = None;
+        record.resume_mode = None;
         self.update(&record)?;
         Ok(())
     }
+
+    /// Cancel a run. This is the shared backend for `rupu workflow
+    /// cancel` and the CP web cancel control.
+    ///
+    /// - Terminal runs (`Completed`/`Failed`/`Rejected`/`Cancelled`)
+    ///   yield [`CancelError::AlreadyTerminal`].
+    /// - A run paused at an approval gate (`AwaitingApproval`) is
+    ///   cancelled by rejecting it with `reason` — status flips to
+    ///   `Rejected`; returns [`CancelOutcome::RejectedAwaitingApproval`].
+    /// - A `Pending`/`Running` run is marked `Cancelled`: if its
+    ///   recorded `runner_pid` is live AND is not our own process it is
+    ///   sent SIGTERM, the pause and active-step fields are cleared,
+    ///   `finished_at`/`error_message` are set, and
+    ///   [`CancelOutcome::MarkedCancelled`] is returned.
+    ///
+    /// # Limitation
+    ///
+    /// Cancelling a run that is being resumed in-process by `cp serve`
+    /// marks it `Cancelled` but cannot interrupt the in-flight resume
+    /// task (no cooperative cancellation yet); the resume may run to
+    /// completion. Cancelling a run owned by a *separate* process (e.g.
+    /// `rupu run`) sends SIGTERM and stops it.
+    pub fn cancel(
+        &self,
+        run_id: &str,
+        approver: &str,
+        reason: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<CancelOutcome, CancelError> {
+        let mut record = self.load(run_id).map_err(|e| match e {
+            RunStoreError::NotFound(s) => CancelError::NotFound(s),
+            other => CancelError::Store(other.to_string()),
+        })?;
+        match record.status {
+            RunStatus::Completed
+            | RunStatus::Failed
+            | RunStatus::Rejected
+            | RunStatus::Cancelled => Err(CancelError::AlreadyTerminal(record.status)),
+            RunStatus::AwaitingApproval => {
+                self.reject(run_id, approver, reason, now).map_err(|e| match e {
+                    ApprovalError::NotFound(s) => CancelError::NotFound(s),
+                    other => CancelError::Store(other.to_string()),
+                })?;
+                Ok(CancelOutcome::RejectedAwaitingApproval)
+            }
+            RunStatus::Pending | RunStatus::Running => {
+                let pid = record.runner_pid;
+                let was_running = pid.is_some_and(pid_is_running);
+                // Only signal a pid that is live AND is NOT our own
+                // process. A web-approved gate is resumed in-process
+                // inside `cp serve`, so the run's `runner_pid` can be the
+                // cp-serve PID itself — SIGTERMing it would kill the whole
+                // control plane (web server + resume worker + every
+                // in-flight resume). The run is still marked `Cancelled`
+                // below; we just cannot interrupt an in-process resume via
+                // signal (see the limitation note on `cancel`).
+                if let Some(pid) =
+                    pid.filter(|pid| pid_is_running(*pid) && *pid != std::process::id())
+                {
+                    let _ = terminate_pid(pid);
+                }
+                record.status = RunStatus::Cancelled;
+                record.finished_at = Some(now);
+                record.error_message = Some(reason.to_string());
+                record.awaiting_step_id = None;
+                record.approval_prompt = None;
+                record.awaiting_since = None;
+                record.expires_at = None;
+                record.runner_pid = None;
+                record.active_step_id = None;
+                record.active_step_kind = None;
+                record.active_step_agent = None;
+                record.active_step_transcript_path = None;
+                self.update(&record)
+                    .map_err(|e| CancelError::Store(e.to_string()))?;
+                Ok(CancelOutcome::MarkedCancelled { pid, was_running })
+            }
+        }
+    }
+}
+
+/// True when `pid` names a live process on this machine. Shells out to
+/// `/bin/kill -0` (the no-op signal): exit 0 means the process exists.
+fn pid_is_running(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Send SIGTERM to `pid` via `/bin/kill -TERM`. Returns whether the
+/// signal was delivered successfully.
+fn terminate_pid(pid: u32) -> bool {
+    std::process::Command::new("/bin/kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Atomic write: write to `path.tmp`, then rename. POSIX rename is
@@ -1084,6 +1236,7 @@ mod tests {
             resume_requested_at: None,
             resume_claimed_at: None,
             resume_claimed_by: None,
+            resume_mode: None,
         }
     }
 
@@ -1563,7 +1716,7 @@ mod tests {
 
         let now = Utc::now();
         let decision = store
-            .request_resume_approval(&rec.id, "matt", now)
+            .request_resume_approval(&rec.id, "matt", None, now)
             .unwrap();
         // The decision reports the still-present awaited step id.
         assert_eq!(
@@ -1593,7 +1746,7 @@ mod tests {
         store.create(rec.clone(), SAMPLE_YAML).unwrap();
 
         let err = store
-            .request_resume_approval(&rec.id, "matt", Utc::now())
+            .request_resume_approval(&rec.id, "matt", None, Utc::now())
             .unwrap_err();
         assert!(matches!(err, ApprovalError::NotAwaiting(_)));
     }
@@ -1684,5 +1837,165 @@ mod tests {
         assert!(reloaded.resume_requested_at.is_none());
         assert!(reloaded.resume_claimed_at.is_none());
         assert!(reloaded.resume_claimed_by.is_none());
+    }
+
+    #[test]
+    fn clear_resume_nulls_resume_mode() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_clear_mode");
+        rec.resume_requested_at = Some(now);
+        rec.resume_claimed_at = Some(now);
+        rec.resume_claimed_by = Some("w1".into());
+        rec.resume_mode = Some("bypass".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        store.clear_resume(&rec.id, now).unwrap();
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_mode.is_none());
+        assert!(reloaded.resume_requested_at.is_none());
+        assert!(reloaded.resume_claimed_at.is_none());
+        assert!(reloaded.resume_claimed_by.is_none());
+    }
+
+    #[test]
+    fn request_resume_approval_records_valid_mode() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_resume_mode");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        store
+            .request_resume_approval(&rec.id, "matt", Some("bypass"), Utc::now())
+            .unwrap();
+
+        let reloaded = store.load(&rec.id).unwrap();
+        // Marker set, mode stored, run stays paused.
+        assert_eq!(reloaded.resume_mode.as_deref(), Some("bypass"));
+        assert!(reloaded.resume_requested_at.is_some());
+        assert_eq!(reloaded.status, RunStatus::AwaitingApproval);
+    }
+
+    #[test]
+    fn request_resume_approval_drops_invalid_mode() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_resume_bad_mode");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        store
+            .request_resume_approval(&rec.id, "matt", Some("turbo"), Utc::now())
+            .unwrap();
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert!(reloaded.resume_mode.is_none());
+        assert!(reloaded.resume_requested_at.is_some());
+    }
+
+    #[test]
+    fn cancel_running_marks_cancelled_and_clears_fields() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_cancel_running");
+        rec.status = RunStatus::Running;
+        // No live pid: non-live path → was_running false, status Cancelled.
+        rec.runner_pid = None;
+        rec.active_step_id = Some("step_a".into());
+        rec.active_step_agent = Some("agent_a".into());
+        rec.awaiting_step_id = Some("deploy".into());
+        rec.approval_prompt = Some("ok?".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let outcome = store.cancel(&rec.id, "matt", "stop it", now).unwrap();
+        assert_eq!(
+            outcome,
+            CancelOutcome::MarkedCancelled {
+                pid: None,
+                was_running: false,
+            }
+        );
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert!(reloaded.status.is_terminal());
+        assert_eq!(reloaded.finished_at, Some(now));
+        assert_eq!(reloaded.error_message.as_deref(), Some("stop it"));
+        assert!(reloaded.runner_pid.is_none());
+        assert!(reloaded.active_step_id.is_none());
+        assert!(reloaded.active_step_agent.is_none());
+        assert!(reloaded.awaiting_step_id.is_none());
+        assert!(reloaded.approval_prompt.is_none());
+    }
+
+    #[test]
+    fn cancel_running_does_not_signal_self() {
+        // Regression: a web-approved gate is resumed in-process inside
+        // `cp serve`, so the run's `runner_pid` can be the cp-serve PID
+        // (== this process). Cancel must mark it `Cancelled` WITHOUT
+        // SIGTERMing itself — otherwise it would kill the control plane.
+        // Proof: if the guard were missing, SIGTERM to this test process
+        // would terminate the test run; instead the assertions below run.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+        let mut rec = sample_record("run_cancel_self_pid");
+        rec.status = RunStatus::Running;
+        rec.runner_pid = Some(std::process::id());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let outcome = store.cancel(&rec.id, "matt", "stop it", now).unwrap();
+        // The self pid is live, so `was_running` reflects that; the
+        // `pid` echoed back is the recorded runner_pid (pre-clear).
+        assert_eq!(
+            outcome,
+            CancelOutcome::MarkedCancelled {
+                pid: Some(std::process::id()),
+                was_running: true,
+            }
+        );
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Cancelled);
+        assert!(reloaded.runner_pid.is_none());
+
+        // Critically: we reached this line, which means the test process
+        // was NOT terminated by a self-directed SIGTERM.
+    }
+
+    #[test]
+    fn cancel_awaiting_approval_rejects() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = awaiting_record("run_cancel_awaiting");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let outcome = store
+            .cancel(&rec.id, "matt", "not now", Utc::now())
+            .unwrap();
+        assert_eq!(outcome, CancelOutcome::RejectedAwaitingApproval);
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Rejected);
+        assert!(reloaded.error_message.unwrap().contains("not now"));
+    }
+
+    #[test]
+    fn cancel_terminal_run_errors() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_cancel_terminal");
+        rec.status = RunStatus::Completed;
+        rec.finished_at = Some(Utc::now());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store
+            .cancel(&rec.id, "matt", "too late", Utc::now())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            CancelError::AlreadyTerminal(RunStatus::Completed)
+        ));
     }
 }

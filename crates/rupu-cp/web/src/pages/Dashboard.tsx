@@ -41,6 +41,7 @@ const STATUS_FILL: Record<RunStatusStr, string> = {
   awaiting_approval:'#f59e0b', // amber-500   — matches bg-amber-500 dot
   pending:          '#94a3b8', // slate-400   — matches bg-slate-400 dot
   rejected:         '#64748b', // slate-500   — matches bg-red-500 / slate for distinction
+  cancelled:        '#64748b', // slate-500   — matches the Cancelled pill dot
 };
 
 const STATUS_ORDER: RunStatusStr[] = [
@@ -50,6 +51,7 @@ const STATUS_ORDER: RunStatusStr[] = [
   'completed',
   'failed',
   'rejected',
+  'cancelled',
 ];
 
 // Human labels for the chart tooltip (matches StatusPill labels)
@@ -60,6 +62,7 @@ const STATUS_LABEL: Record<RunStatusStr, string> = {
   awaiting_approval: 'Awaiting approval',
   pending:           'Pending',
   rejected:          'Rejected',
+  cancelled:         'Cancelled',
 };
 
 // ---------------------------------------------------------------------------

@@ -130,6 +130,7 @@ fn sample_run_record(
         resume_requested_at: None,
         resume_claimed_at: None,
         resume_claimed_by: None,
+        resume_mode: None,
         issue_ref: Some(issue_ref.into()),
         issue: None,
         parent_run_id: None,

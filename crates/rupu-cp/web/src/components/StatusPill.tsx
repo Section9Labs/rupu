@@ -7,6 +7,7 @@
 
 import {
   AlertCircle,
+  Ban,
   CheckCircle2,
   Clock,
   Loader2,
@@ -72,6 +73,12 @@ export const RUN_STATUS_STYLES: Record<RunStatusStr, StatusStyle> = {
     cls: 'bg-red-50 text-red-700 ring-red-200',
     dot: 'bg-red-500',
     icon: XOctagon,
+  },
+  cancelled: {
+    label: 'Cancelled',
+    cls: 'bg-slate-100 text-slate-700 ring-slate-300',
+    dot: 'bg-slate-500',
+    icon: Ban,
   },
 };
 

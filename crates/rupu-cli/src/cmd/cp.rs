@@ -139,6 +139,10 @@ async fn run_resume_worker(
             let run_id = run.id.clone();
             tokio::spawn(async move {
                 let now2 = chrono::Utc::now();
+                // Capture the requested resume mode while the marker is still
+                // present (approve may not preserve `resume_mode`); fall back
+                // to None if the record can't be reloaded.
+                let mode = store.load(&run_id).ok().and_then(|r| r.resume_mode.clone());
                 let decision = match store.approve(&run_id, &worker_id, now2) {
                     Ok(d) => d,
                     Err(e) => {
@@ -153,7 +157,7 @@ async fn run_resume_worker(
 
                 if let ApprovalDecision::Approved { step_id, .. } = decision {
                     tracing::info!(run_id = %run_id, step_id = %step_id, "resume worker: approved; resuming");
-                    match resume::resume_run(&store, &run_id, &step_id, None).await {
+                    match resume::resume_run(&store, &run_id, &step_id, mode.as_deref()).await {
                         Ok(_) => {
                             tracing::info!(run_id = %run_id, "resume worker: resume completed");
                         }
