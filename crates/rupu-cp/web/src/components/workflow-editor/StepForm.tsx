@@ -7,12 +7,31 @@
 
 import type { AgentSummary } from '../../lib/api';
 import type { GraphNode, PanelCfg, PanelGate, StepKind, StepNodeData, SubStep } from '../../lib/workflowGraph';
+import type { ExprContext } from '../../lib/workflowExpressions';
+import ExpressionField from './ExpressionField';
+
+/** Context for expression fields, minus the per-field gates StepForm derives. */
+type StepExprContext = Omit<ExprContext, 'isForEachPrompt' | 'isPanelField'>;
 
 interface StepFormProps {
   node: GraphNode;
   agents: AgentSummary[];
   onChange: (data: StepNodeData) => void;
   problems: string[];
+  /** Vocabulary context for the expression editors (inputs + prior steps). */
+  exprContext: StepExprContext;
+}
+
+/** Build a full ExprContext for a single field from the shared step context. */
+function fieldCtx(
+  base: StepExprContext,
+  gates: { isForEachPrompt?: boolean; isPanelField?: boolean },
+): ExprContext {
+  return {
+    ...base,
+    isForEachPrompt: gates.isForEachPrompt ?? false,
+    isPanelField: gates.isPanelField ?? false,
+  };
 }
 
 const fieldCls =
@@ -41,7 +60,7 @@ const KIND_LABELS: Record<StepKind, string> = {
   panel: 'Panel',
 };
 
-export default function StepForm({ node, agents, onChange, problems }: StepFormProps) {
+export default function StepForm({ node, agents, onChange, problems, exprContext }: StepFormProps) {
   const d = node.data;
 
   // Generic field patch — spread the old data so raw_passthrough and every
@@ -108,22 +127,21 @@ export default function StepForm({ node, agents, onChange, problems }: StepFormP
       </label>
 
       {(d.kind === 'step' || d.kind === 'for_each') && (
-        <LinearFields d={d} agents={agents} patch={patch} />
+        <LinearFields d={d} agents={agents} patch={patch} exprContext={exprContext} />
       )}
-      {d.kind === 'parallel' && <ParallelFields d={d} agents={agents} patch={patch} />}
-      {d.kind === 'panel' && <PanelFields d={d} agents={agents} patch={patch} />}
+      {d.kind === 'parallel' && <ParallelFields d={d} agents={agents} patch={patch} exprContext={exprContext} />}
+      {d.kind === 'panel' && <PanelFields d={d} agents={agents} patch={patch} exprContext={exprContext} />}
 
       {/* ── common: when / continue_on_error ───────────────────────── */}
       {d.kind !== 'panel' && (
         <>
           <label className="block">
             <span className={labelCls}>When (optional)</span>
-            <input
-              type="text"
+            <ExpressionField
               value={d.when ?? ''}
-              onChange={(e) => patch({ when: e.target.value === '' ? undefined : e.target.value })}
-              aria-label="When condition"
-              className={`${fieldCls} font-mono`}
+              onChange={(v) => patch({ when: v === '' ? undefined : v })}
+              context={fieldCtx(exprContext, {})}
+              ariaLabel="When condition"
             />
           </label>
 
@@ -180,10 +198,12 @@ function LinearFields({
   d,
   agents,
   patch,
+  exprContext,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
+  exprContext: StepExprContext;
 }) {
   return (
     <>
@@ -194,12 +214,12 @@ function LinearFields({
 
       <label className="block">
         <span className={labelCls}>Prompt</span>
-        <textarea
+        <ExpressionField
           value={d.prompt ?? ''}
-          onChange={(e) => patch({ prompt: e.target.value === '' ? undefined : e.target.value })}
-          aria-label="Prompt"
-          rows={4}
-          className={`${fieldCls} resize-y`}
+          onChange={(v) => patch({ prompt: v === '' ? undefined : v })}
+          context={fieldCtx(exprContext, { isForEachPrompt: d.kind === 'for_each' })}
+          multiline
+          ariaLabel="Prompt"
         />
       </label>
 
@@ -207,12 +227,11 @@ function LinearFields({
         <>
           <label className="block">
             <span className={labelCls}>For-each expression</span>
-            <input
-              type="text"
+            <ExpressionField
               value={d.for_each ?? ''}
-              onChange={(e) => patch({ for_each: e.target.value === '' ? undefined : e.target.value })}
-              aria-label="For-each expression"
-              className={`${fieldCls} font-mono`}
+              onChange={(v) => patch({ for_each: v === '' ? undefined : v })}
+              context={fieldCtx(exprContext, {})}
+              ariaLabel="For-each expression"
             />
           </label>
           <label className="block">
@@ -237,10 +256,12 @@ function ParallelFields({
   d,
   agents,
   patch,
+  exprContext,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
+  exprContext: StepExprContext;
 }) {
   const subs = d.parallel ?? [];
 
@@ -297,13 +318,13 @@ function ParallelFields({
               ariaLabel={`Sub-step ${i + 1} agent`}
               onChange={(v) => updateSub(i, { agent: v ?? '' })}
             />
-            <textarea
+            <ExpressionField
               value={s.prompt}
-              onChange={(e) => updateSub(i, { prompt: e.target.value })}
-              aria-label={`Sub-step ${i + 1} prompt`}
-              rows={3}
+              onChange={(v) => updateSub(i, { prompt: v })}
+              context={fieldCtx(exprContext, {})}
+              multiline
+              ariaLabel={`Sub-step ${i + 1} prompt`}
               placeholder="prompt"
-              className={`${fieldCls} resize-y`}
             />
           </div>
         ))}
@@ -326,10 +347,12 @@ function PanelFields({
   d,
   agents,
   patch,
+  exprContext,
 }: {
   d: StepNodeData;
   agents: AgentSummary[];
   patch: (p: Partial<StepNodeData>) => void;
+  exprContext: StepExprContext;
 }) {
   const panel: PanelCfg = d.panel ?? { panelists: [], subject: '' };
 
@@ -374,23 +397,23 @@ function PanelFields({
 
       <label className="block">
         <span className={labelCls}>Subject</span>
-        <textarea
+        <ExpressionField
           value={panel.subject}
-          onChange={(e) => patchPanel({ subject: e.target.value })}
-          aria-label="Panel subject"
-          rows={2}
-          className={`${fieldCls} resize-y`}
+          onChange={(v) => patchPanel({ subject: v })}
+          context={fieldCtx(exprContext, { isPanelField: true })}
+          multiline
+          ariaLabel="Panel subject"
         />
       </label>
 
       <label className="block">
         <span className={labelCls}>Prompt (optional)</span>
-        <textarea
+        <ExpressionField
           value={panel.prompt ?? ''}
-          onChange={(e) => patchPanel({ prompt: e.target.value === '' ? undefined : e.target.value })}
-          aria-label="Panel prompt"
-          rows={3}
-          className={`${fieldCls} resize-y`}
+          onChange={(v) => patchPanel({ prompt: v === '' ? undefined : v })}
+          context={fieldCtx(exprContext, { isPanelField: true })}
+          multiline
+          ariaLabel="Panel prompt"
         />
       </label>
 
