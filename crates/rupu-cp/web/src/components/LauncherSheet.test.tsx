@@ -15,7 +15,7 @@ vi.mock('react-router-dom', async () => {
   return { ...actual, useNavigate: () => navigateMock };
 });
 
-import LauncherSheet, { repoToOption } from './LauncherSheet';
+import LauncherSheet from './LauncherSheet';
 
 afterEach(() => {
   cleanup();
@@ -23,16 +23,10 @@ afterEach(() => {
   navigateMock.mockReset();
 });
 
-describe('repoToOption', () => {
-  it('maps a RepoEntry to a ComboboxOption with platform:repo value', () => {
-    expect(
-      repoToOption({ platform: 'github', repo: 'o/r', default_branch: 'main', private: false }),
-    ).toEqual({ value: 'github:o/r', label: 'o/r' });
-  });
-});
-
 describe('LauncherSheet', () => {
   it('launches with the declared input + chosen mode, then navigates to the run', async () => {
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-xyz' });
 
     render(<LauncherSheet workflow="audit" declaredInputs={['target_dir']} onClose={() => {}} />);
@@ -58,6 +52,8 @@ describe('LauncherSheet', () => {
   });
 
   it('surfaces an error and does not navigate when the launch fails', async () => {
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     vi.spyOn(api, 'launchRun').mockRejectedValue(new Error('no launcher'));
 
     render(<LauncherSheet workflow="audit" declaredInputs={['target_dir']} onClose={() => {}} />);
@@ -67,19 +63,20 @@ describe('LauncherSheet', () => {
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
-  it('calls launchRun with working_dir when Directory mode is selected', async () => {
-    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
-    vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/h', parent: null, dirs: [] });
+  it('renders the TargetPicker and sends working_dir when a directory item is selected', async () => {
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
+    vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/tmp/myproject', parent: null, dirs: [] });
     const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-dir' });
 
     render(<LauncherSheet workflow="deploy" declaredInputs={[]} onClose={() => {}} />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Directory' }));
-
-    fireEvent.change(screen.getByLabelText('Directory path'), {
-      target: { value: '/tmp/myproject' },
-    });
+    // Type a path into the TargetPicker; inferFreeTextItem creates a directory item.
+    const picker = screen.getByPlaceholderText('search projects, repos, or a path…');
+    fireEvent.focus(picker);
+    fireEvent.change(picker, { target: { value: '/tmp/myproject' } });
+    // The directory item is the first (and only matching) result; select it with Enter.
+    fireEvent.keyDown(picker, { key: 'Enter' });
 
     fireEvent.click(screen.getByRole('button', { name: 'Launch' }));
 
@@ -93,17 +90,18 @@ describe('LauncherSheet', () => {
     );
   });
 
-  it('calls launchRun with target when Repository mode is selected', async () => {
+  it('sends target when a repo item is selected via the TargetPicker', async () => {
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-repo' });
 
     render(<LauncherSheet workflow="deploy" declaredInputs={[]} onClose={() => {}} />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Repository' }));
-
-    fireEvent.change(screen.getByLabelText('Target'), {
-      target: { value: 'github:owner/repo' },
-    });
+    // Type a repo ref; inferFreeTextItem creates a repo item.
+    const picker = screen.getByPlaceholderText('search projects, repos, or a path…');
+    fireEvent.focus(picker);
+    fireEvent.change(picker, { target: { value: 'github:owner/repo' } });
+    fireEvent.keyDown(picker, { key: 'Enter' });
 
     fireEvent.click(screen.getByRole('button', { name: 'Launch' }));
 
