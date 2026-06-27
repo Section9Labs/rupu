@@ -4434,6 +4434,7 @@ fn live_run_event_lines(
             input_tokens,
             output_tokens,
             cached_tokens,
+            ..
         } => {
             if !view_mode.shows_full_payloads() {
                 return Vec::new();
@@ -6975,6 +6976,7 @@ fn summarize_transcript_path(
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                ..
             } => {
                 out.providers.insert(provider.clone());
                 out.models.insert(model.clone());

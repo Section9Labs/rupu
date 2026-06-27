@@ -1589,6 +1589,7 @@ fn workflow_transcript_event_lines(
             input_tokens,
             output_tokens,
             cached_tokens,
+            ..
         } => {
             if !view_mode.shows_full_payloads() {
                 return Vec::new();

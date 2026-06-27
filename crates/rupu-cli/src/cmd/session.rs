@@ -2371,6 +2371,7 @@ impl SessionInteractiveState {
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                ..
             } => {
                 self.live_usage.provider = Some(provider.clone());
                 self.live_usage.model = Some(model.clone());
@@ -2749,6 +2750,7 @@ fn rebuild_live_usage_from_transcript(path: &Path) -> (Option<DateTime<Utc>>, Se
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                ..
             } => {
                 usage.provider = Some(provider);
                 usage.model = Some(model);
@@ -4578,6 +4580,7 @@ fn transcript_event_lines(
             input_tokens,
             output_tokens,
             cached_tokens,
+            ..
         } => {
             if view_mode == LiveViewMode::Compact {
                 return Vec::new();
@@ -8169,6 +8172,7 @@ mod tests {
         state.push_transcript_event(&TranscriptEvent::Usage {
             provider: "openai".into(),
             model: "gpt-5".into(),
+            served_model: None,
             input_tokens: 12,
             output_tokens: 5,
             cached_tokens: 2,
@@ -8294,6 +8298,7 @@ mod tests {
         state.push_transcript_event(&TranscriptEvent::Usage {
             provider: "openai".into(),
             model: "gpt-5".into(),
+            served_model: None,
             input_tokens: 10,
             output_tokens: 4,
             cached_tokens: 0,

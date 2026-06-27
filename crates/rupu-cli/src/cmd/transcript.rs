@@ -893,6 +893,7 @@ fn transcript_event_lines(
             input_tokens,
             output_tokens,
             cached_tokens,
+            ..
         } => vec![transcript_event_line(
             Status::Active,
             0,
@@ -1235,6 +1236,7 @@ pub(crate) fn render_pretty_transcript_event(
             input_tokens,
             output_tokens,
             cached_tokens,
+            ..
         } => {
             let detail = format!(
                 "{provider} · {model}  ·  in {input_tokens} out {output_tokens} cached {cached_tokens}"

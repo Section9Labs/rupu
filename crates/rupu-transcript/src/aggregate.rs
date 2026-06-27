@@ -146,6 +146,7 @@ fn aggregate_one(
                 input_tokens,
                 output_tokens,
                 cached_tokens,
+                ..
             }) => {
                 // Anchor on the run-start agent, but let the Usage
                 // event override provider/model when they differ
@@ -240,6 +241,7 @@ mod tests {
         Event::Usage {
             provider: provider.into(),
             model: model.into(),
+            served_model: None,
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
@@ -321,6 +323,59 @@ mod tests {
         assert_eq!(rows[0].runs, 2);
         assert_eq!(rows[1].agent, "fixer");
         assert_eq!(rows[1].runs, 1);
+    }
+
+    #[test]
+    fn distinct_requested_models_do_not_collapse_under_shared_served_model() {
+        // Regression: Anthropic's API echoes ONE served id
+        // (`claude-mythos-preview`) for every Claude request. Usage
+        // must be attributed to the *requested* model so two distinct
+        // requested models stay two rows instead of collapsing to one.
+        let tmp = TempDir::new().unwrap();
+        let opus = Event::Usage {
+            provider: "anthropic".into(),
+            model: "claude-opus-4-8".into(),
+            served_model: Some("claude-mythos-preview".into()),
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 0,
+        };
+        let sonnet = Event::Usage {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            served_model: Some("claude-mythos-preview".into()),
+            input_tokens: 30,
+            output_tokens: 10,
+            cached_tokens: 0,
+        };
+        let p = write_transcript(
+            tmp.path(),
+            "multi.jsonl",
+            &[
+                run_start("reviewer", "anthropic", "claude-opus-4-8"),
+                opus,
+                sonnet,
+                run_complete(),
+            ],
+        );
+        let rows = aggregate(&[p], TimeWindow::default());
+        assert_eq!(
+            rows.len(),
+            2,
+            "two distinct requested models must not collapse under the shared served id"
+        );
+        let opus_row = rows
+            .iter()
+            .find(|r| r.model == "claude-opus-4-8")
+            .expect("opus row keyed by requested model");
+        assert_eq!(opus_row.input_tokens, 100);
+        assert_eq!(opus_row.output_tokens, 50);
+        let sonnet_row = rows
+            .iter()
+            .find(|r| r.model == "claude-sonnet-4-6")
+            .expect("sonnet row keyed by requested model");
+        assert_eq!(sonnet_row.input_tokens, 30);
+        assert_eq!(sonnet_row.output_tokens, 10);
     }
 
     #[test]
