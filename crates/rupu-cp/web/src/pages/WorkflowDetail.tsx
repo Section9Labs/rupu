@@ -361,6 +361,10 @@ export default function WorkflowDetailPage() {
               </p>
             )}
             <div className="flex items-center justify-end gap-2">
+              <p className="mr-auto text-[11px] text-ink-mute">
+                Saving from the graph rewrites the YAML canonically (comments and custom
+                formatting are not preserved). Use the YAML tab to hand-edit with comments.
+              </p>
               <button
                 type="button"
                 onClick={revertDraft}
