@@ -45,8 +45,10 @@ Multiple inputs/outputs (fan-in / fan-out / diamonds) are allowed — they topo-
 - **Live YAML validity:** a small **`POST /api/workflows/validate { raw } → 200 {ok:true} | 400 {error}`** endpoint (reuses `Workflow::parse`, writes nothing) drives a live "valid ✓ / invalid ✕ <reason>" badge in both the Graph and YAML tabs. This is the only backend addition.
 
 ## Layout
-- On load, positions come from **dagre** (already a dependency) — top-to-bottom layered layout.
-- The user's manual arrangement is **persisted in `localStorage`** keyed by workflow name (browser-local; honest — it's not in the file). Cleared positions fall back to dagre. (Persisting layout into the repo is a deferred follow-up; the YAML has no place for it.)
+Node x/y positions are **purely cosmetic** (where a box sits on screen) — they carry no workflow meaning and are never stored in the YAML. The structure comes entirely from the YAML.
+- On load, positions come from **dagre** (already a dependency) — top-to-bottom layered auto-layout.
+- **During an editing session**, dragging a node keeps it (held in React state); auto-layout only runs on initial load. A "Re-layout" button re-runs dagre to tidy up.
+- **On reload/reopen**, the DAG is re-auto-laid-out from the YAML — manual positions are not remembered across reloads (matt: acceptable; auto-render on reload is the expected behavior). No `localStorage`/persistence in v1 (trivial to add later if wanted).
 - Topo-sort tiebreak among ready nodes = vertical-then-horizontal position, so the visual top-to-bottom order matches the emitted step order intuitively.
 
 ## Files
@@ -55,7 +57,7 @@ Multiple inputs/outputs (fan-in / fan-out / diamonds) are allowed — they topo-
 
 **Frontend (the bulk):**
 - `crates/rupu-cp/web/src/lib/workflowGraph.ts` — **pure** core: `yamlToGraph(obj) → {nodes, edges, workflowMeta}`, `graphToWorkflowObject(nodes, edges, meta) → object` (topological sort + per-kind YAML mapping), `canConnect(...)`, forward-ref detection, required-field checks. Heavily unit-tested (no React/DOM).
-- `crates/rupu-cp/web/src/lib/workflowLayout.ts` — dagre auto-layout + localStorage position persistence.
+- `crates/rupu-cp/web/src/lib/workflowLayout.ts` — dagre auto-layout (positions held in React state during a session; re-laid-out on load).
 - `crates/rupu-cp/web/src/components/workflow-editor/WorkflowEditorGraph.tsx` — the editable `@xyflow/react` canvas: palette (add step/for_each/parallel/panel), draw/delete edges via `isValidConnection`, select/delete nodes, node validity badges.
 - `crates/rupu-cp/web/src/components/workflow-editor/nodes/*` — editable node renderers (extend or wrap the existing graph node components).
 - `crates/rupu-cp/web/src/components/workflow-editor/StepForm.tsx` (+ sub-forms) — the side-panel per-kind form.
@@ -72,7 +74,7 @@ Multiple inputs/outputs (fan-in / fan-out / diamonds) are allowed — they topo-
 - **Visual validation by matt** — build a workflow from scratch on the canvas (linear + a parallel container + a for_each), connect them, watch an invalid connection get rejected with a reason, Save, then confirm the YAML tab shows correct YAML and the CLI can run it.
 
 ## Non-goals / deferred (TODO)
-- Persisting node layout into the repo (localStorage only in v1).
+- Persisting node layout anywhere (v1 always auto-lays-out from YAML on load; no localStorage/repo persistence).
 - Editing parallel sub-steps / panelists as first-class draggable canvas nodes (form-managed in v1).
 - Preserving YAML comments/formatting through a Graph-tab save (structural editor rewrites canonically).
 - Project-scoped workflows (global only, matching 3a/3b).
