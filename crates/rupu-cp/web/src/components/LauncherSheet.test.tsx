@@ -51,6 +51,7 @@ describe('LauncherSheet', () => {
         inputs: { target_dir: 'src/lib' },
         mode: 'bypass',
         target: undefined,
+        working_dir: undefined,
       }),
     );
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/runs/run-xyz'));
