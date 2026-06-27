@@ -112,6 +112,8 @@ struct LaunchBody {
     mode: Option<String>,
     #[serde(default)]
     target: Option<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
 }
 
 /// Start a fresh run of `:name` via the configured [`RunLauncher`]. Returns the
@@ -133,6 +135,7 @@ async fn launch_run(
         inputs: b.inputs,
         mode: b.mode,
         target: b.target,
+        working_dir: b.working_dir,
     };
     match launcher.launch(req).await {
         Ok(run_id) => Ok(Json(serde_json::json!({ "run_id": run_id }))),
@@ -190,6 +193,7 @@ mod tests {
             inputs: inputs.clone(),
             mode: Some("bypass".into()),
             target: None,
+            working_dir: None,
         };
 
         let resp = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
@@ -202,6 +206,25 @@ mod tests {
         assert_eq!(captured.inputs, inputs);
         assert_eq!(captured.mode.as_deref(), Some("bypass"));
         assert_eq!(captured.target, None);
+    }
+
+    #[tokio::test]
+    async fn launch_forwards_working_dir() {
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "run_X".into(),
+        });
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+        let body = LaunchBody {
+            inputs: Default::default(),
+            mode: None,
+            target: None,
+            working_dir: Some("/tmp/projX".into()),
+        };
+        let _ = launch_run(State(s), Path("nightly".into()), Some(Json(body))).await;
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(got.working_dir.as_deref(), Some("/tmp/projX"));
     }
 
     #[tokio::test]

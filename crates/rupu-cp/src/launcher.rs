@@ -7,6 +7,9 @@ pub struct LaunchRequest {
     pub inputs: BTreeMap<String, String>,
     pub mode: Option<String>,
     pub target: Option<String>,
+    /// Working directory for the run (project/dir target). When `None` the
+    /// run executes in the cp-serve process's cwd.
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
