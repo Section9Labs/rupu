@@ -9,7 +9,7 @@ import { ArrowLeft, RefreshCw } from 'lucide-react';
 import { api, type SessionSummary, type AgentRunRow, type UsageTimelinePoint } from '../lib/api';
 import { cn } from '../lib/cn';
 import { absoluteTime, relativeTime } from '../lib/time';
-import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
+import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../lib/sessionStatus';
 import UsageChip from '../components/UsageChip';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 
@@ -60,6 +60,12 @@ export default function SessionDetailPage() {
   // Aggregated per-turn token series across this session's runs (no step
   // boundaries → no separators).
   const [series, setSeries] = useState<UsageTimelinePoint[]>([]);
+
+  // Composer state
+  const [prompt, setPrompt] = useState('');
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [sendOk, setSendOk] = useState(false);
 
   // Fetch session identity
   useEffect(() => {
@@ -126,6 +132,26 @@ export default function SessionDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
+  const handleSend = () => {
+    const text = prompt.trim();
+    if (!id || !text || sending) return;
+    setSending(true);
+    setSendError(null);
+    setSendOk(false);
+    api
+      .sendSessionMessage(id, text)
+      .then(() => {
+        setPrompt('');
+        setSendOk(true);
+        // Surface the new turn run immediately rather than waiting for the poll.
+        loadTurnRuns();
+      })
+      .catch((e: unknown) => {
+        setSendError(e instanceof Error ? e.message : 'Failed to send message');
+      })
+      .finally(() => setSending(false));
+  };
+
   if (sessionError) {
     return (
       <div className="p-8">
@@ -145,6 +171,8 @@ export default function SessionDetailPage() {
       </div>
     );
   }
+
+  const stopped = sessionStatusTone(session.status) === 'stopped';
 
   // Sort turn-runs newest-first
   const sortedTurns = [...(turnRuns ?? [])].sort((a, b) => {
@@ -255,6 +283,63 @@ export default function SessionDetailPage() {
             ))}
           </div>
         )}
+      </section>
+
+      {/* Composer: send a message into this live session */}
+      <section className="mt-8">
+        <h2 className="text-base font-semibold text-ink mb-3">Send a message</h2>
+        <div className="rounded-xl border border-border bg-panel shadow-card p-4">
+          <label htmlFor="session-composer" className="sr-only">
+            Message this session
+          </label>
+          <textarea
+            id="session-composer"
+            value={prompt}
+            onChange={(e) => {
+              setPrompt(e.target.value);
+              if (sendOk) setSendOk(false);
+            }}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                e.preventDefault();
+                handleSend();
+              }
+            }}
+            disabled={sending || stopped}
+            rows={3}
+            placeholder="Message this session…"
+            className="w-full resize-y rounded-lg border border-border bg-white px-3 py-2 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-200 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-ink-dim"
+          />
+
+          {sendError && (
+            <div
+              role="alert"
+              className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+            >
+              {sendError}
+            </div>
+          )}
+
+          <div className="mt-3 flex items-center justify-between gap-3">
+            <div className="text-[12px] text-ink-dim">
+              {stopped ? (
+                <span>Session is stopped — sending is disabled.</span>
+              ) : sendOk ? (
+                <span className="text-green-700">Sent — turn queued.</span>
+              ) : (
+                <span className="text-ink-mute">⌘/Ctrl+Enter to send</span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={handleSend}
+              disabled={sending || stopped || prompt.trim().length === 0}
+              className="inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {sending ? 'Sending…' : 'Send'}
+            </button>
+          </div>
+        </div>
       </section>
     </div>
   );
