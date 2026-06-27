@@ -76,6 +76,16 @@ pub async fn handle(action: Action) -> ExitCode {
             let session_sender: Arc<dyn rupu_cp::session_sender::SessionSender> =
                 Arc::new(crate::cp_session_sender::SubprocessSessionSender { exe });
 
+            // Repo lister for the web Run target picker.
+            let repos: Option<Arc<dyn rupu_cp::repos::RepoLister>> = {
+                let resolver = rupu_auth::KeychainResolver::new();
+                let global_cfg = global_dir.join("config.toml");
+                let cfg =
+                    rupu_config::layer_files(Some(&global_cfg), None).unwrap_or_default();
+                let registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
+                Some(Arc::new(crate::cp_repos::CpRepoLister { registry }))
+            };
+
             let serve_result = rupu_cp::serve(rupu_cp::ServeOpts {
                 bind,
                 token,
@@ -83,6 +93,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 open_browser: !no_open,
                 launcher: Some(launcher),
                 session_sender: Some(session_sender),
+                repos,
             })
             .await;
 
