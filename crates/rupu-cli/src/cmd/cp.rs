@@ -70,6 +70,13 @@ pub async fn handle(action: Action) -> ExitCode {
             let launcher: Arc<dyn rupu_cp::launcher::RunLauncher> =
                 Arc::new(crate::cp_launcher::SubprocessLauncher { exe: exe.clone() });
 
+            // Adapter for rupu-cp's AgentLauncher port: spawns detached
+            // `rupu run <agent> …` children using this same binary.
+            let agent_launcher: Option<Arc<dyn rupu_cp::agent_launcher::AgentLauncher>> =
+                Some(Arc::new(crate::cp_agent_launcher::SubprocessAgentLauncher {
+                    exe: exe.clone(),
+                }));
+
             // Adapter for rupu-cp's SessionSender port: shells
             // `rupu session send <id> "<prompt>" --detach` using this same
             // binary, reusing the launcher's resolved exe.
@@ -94,6 +101,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 launcher: Some(launcher),
                 session_sender: Some(session_sender),
                 repos,
+                agent_launcher,
             })
             .await;
 

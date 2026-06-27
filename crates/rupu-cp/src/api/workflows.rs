@@ -175,6 +175,7 @@ mod tests {
             launcher: None,
             session_sender: None,
             repos: None,
+            agent_launcher: None,
         }
     }
 

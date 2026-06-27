@@ -8,12 +8,14 @@ import { ArrowLeft } from 'lucide-react';
 import { api, type AgentDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
+import AgentLauncherSheet from '../components/AgentLauncherSheet';
 
 export default function AgentDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
 
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [runOpen, setRunOpen] = useState(false);
 
   useEffect(() => {
     if (!name) return;
@@ -60,7 +62,17 @@ export default function AgentDetailPage() {
       <BackLink />
 
       <header className="mt-3">
-        <h1 className="text-2xl font-semibold text-ink break-all">{agent.name}</h1>
+        <div className="flex flex-wrap items-start gap-2">
+          <h1 className="text-2xl font-semibold text-ink break-all">{agent.name}</h1>
+          <button
+            type="button"
+            onClick={() => setRunOpen(true)}
+            aria-label={`Run ${agent.name}`}
+            className="ml-auto inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
+          >
+            Run
+          </button>
+        </div>
         <div className="mt-2 flex flex-wrap items-center gap-2">
           {agent.provider && <MetaChip>{agent.provider}</MetaChip>}
           {agent.model && <MetaChip>{agent.model}</MetaChip>}
@@ -82,6 +94,13 @@ export default function AgentDetailPage() {
           <p className="text-sm text-ink-dim pl-1">No definition.</p>
         )}
       </section>
+
+      {runOpen && (
+        <AgentLauncherSheet
+          agent={agent.name}
+          onClose={() => setRunOpen(false)}
+        />
+      )}
     </div>
   );
 }

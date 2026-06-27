@@ -469,7 +469,7 @@ export interface WorkflowDetail {
 /** Permission mode a launched run starts in. */
 export type LaunchMode = 'ask' | 'bypass' | 'readonly';
 
-/** Response from `POST /api/workflows/:name/run`. */
+/** Response from workflow and agent run endpoints. */
 export interface LaunchResult {
   run_id: string;
 }
@@ -1011,6 +1011,15 @@ export const api = {
   },
   getAgent(name: string): Promise<AgentDetail> {
     return request<AgentDetail>(`/api/agents/${encodeURIComponent(name)}`);
+  },
+  launchAgent(
+    agent: string,
+    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string } = {},
+  ): Promise<LaunchResult> {
+    return request<LaunchResult>(`/api/agents/${encodeURIComponent(agent)}/run`, {
+      method: 'POST',
+      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir }),
+    });
   },
 
   // --- Workflows ---

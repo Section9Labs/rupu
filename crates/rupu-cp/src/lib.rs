@@ -2,6 +2,7 @@
 //!
 //! `serve` is the main entrypoint; wire it from `rupu cp serve`.
 
+pub mod agent_launcher;
 pub mod api;
 pub mod embed;
 pub mod error;
@@ -40,6 +41,9 @@ pub struct ServeOpts {
     /// Optional repo-lister adapter. rupu-cli's `cp serve` provides the
     /// registry-backed impl; `None` → `/api/repos` returns 501.
     pub repos: Option<std::sync::Arc<dyn crate::repos::RepoLister>>,
+    /// Optional agent-launcher adapter. rupu-cli's `cp serve` provides the
+    /// subprocess-spawning impl; `None` disables agent launching from the web UI.
+    pub agent_launcher: Option<std::sync::Arc<dyn crate::agent_launcher::AgentLauncher>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -94,7 +98,8 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let app_state = state::AppState::new(opts.global_dir, pricing)
         .with_launcher(opts.launcher)
         .with_session_sender(opts.session_sender)
-        .with_repos(opts.repos);
+        .with_repos(opts.repos)
+        .with_agent_launcher(opts.agent_launcher);
     let app = server::router(app_state, opts.token);
 
     let listener = tokio::net::TcpListener::bind(opts.bind)

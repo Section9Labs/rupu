@@ -21,6 +21,9 @@ pub struct AppState {
     /// Optional repo-lister port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs the registry-backed adapter via [`AppState::with_repos`].
     pub repos: Option<Arc<dyn crate::repos::RepoLister>>,
+    /// Optional agent-launcher port. Defaults to `None`; rupu-cli's `cp serve`
+    /// installs a subprocess-spawning adapter via [`AppState::with_agent_launcher`].
+    pub agent_launcher: Option<Arc<dyn crate::agent_launcher::AgentLauncher>>,
 }
 
 impl AppState {
@@ -36,6 +39,7 @@ impl AppState {
             launcher: None,
             session_sender: None,
             repos: None,
+            agent_launcher: None,
         }
     }
 
@@ -63,6 +67,15 @@ impl AppState {
         repos: Option<Arc<dyn crate::repos::RepoLister>>,
     ) -> Self {
         self.repos = repos;
+        self
+    }
+
+    /// Install an agent-launcher adapter (or clear it with `None`).
+    pub fn with_agent_launcher(
+        mut self,
+        launcher: Option<Arc<dyn crate::agent_launcher::AgentLauncher>>,
+    ) -> Self {
+        self.agent_launcher = launcher;
         self
     }
 
