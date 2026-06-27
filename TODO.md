@@ -212,4 +212,8 @@ Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (P
 - **Nested/array config writes** — `rupu config set` handles top-level scalars only; no library `save` for nested config.
 - **Agent / workflow definition delete** — no subcommand, no engine fn.
 
-**Phase 3 (Authoring) — not started:** in-browser edit of agent `.md` (CodeMirror) and workflow `.yaml` (incl. the `@xyflow/react` DAG editor → same YAML the CLI runs), gated by `Workflow::parse` / `AgentSpec::parse` validation. Phase 4 = auth/RBAC for beyond-localhost.
+**Phase 3 (Authoring) — in progress:** in-browser edit of agent `.md` and workflow `.yaml`, gated by `AgentSpec::parse` / `Workflow::parse` validation. Pure-state file writes (rupu-cp can validate+write directly; no subprocess). Slices:
+- 🚧 **3a — agent `.md` editor**: edit/create/delete global agents (`global_dir/agents/<name>.md`), validated by `AgentSpec::parse`; CodeMirror editor (deps already installed, lazy-chunked). v1 = global agents only (project-agent editing is a follow-up).
+- ⬜ **3b — workflow `.yaml` editor**: same pattern, validated by `Workflow::parse`.
+- ⬜ **3c — visual workflow DAG editor**: `@xyflow/react` canvas → the same YAML the CLI runs. The big one.
+- Phase 4 = auth/RBAC for beyond-localhost.
