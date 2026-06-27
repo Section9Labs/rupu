@@ -507,6 +507,7 @@ export interface SessionSummary {
   total_tokens_out?: number;
   total_tokens_cached?: number;
   usage?: UsageSummary;
+  last_error?: string | null;
 }
 
 /**
@@ -525,6 +526,7 @@ export interface SessionRunRow {
   tokens_out: number;
   tokens_cached: number;
   duration_ms: number;
+  error?: string | null;
 }
 
 // ---------------------------------------------------------------------------
