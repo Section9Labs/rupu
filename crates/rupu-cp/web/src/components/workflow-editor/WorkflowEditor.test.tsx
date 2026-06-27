@@ -8,7 +8,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, act } from '@testing-library/react';
+import { render, screen, cleanup, act, fireEvent } from '@testing-library/react';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 
 vi.mock('./WorkflowEditorGraph', () => ({
@@ -80,6 +80,16 @@ describe('WorkflowEditor live reconcile', () => {
     const g = screen.getByTestId('graph');
     expect(g).toHaveAttribute('data-paused', 'false');
     expect(g.getAttribute('data-ids')!.split(',').sort()).toEqual(['a', 'b']);
+  });
+
+  it('the Reference tab renders the expression reference panel', () => {
+    renderEditor(VALID);
+    fireEvent.click(screen.getByRole('tab', { name: 'Reference' }));
+    const panel = screen.getByRole('tabpanel');
+    expect(panel).toHaveAttribute('id', 'inspector-reference');
+    expect(panel).toHaveAttribute('aria-labelledby', 'inspector-tab-reference');
+    expect(screen.getByRole('searchbox', { name: 'Search expressions' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Inputs' })).toBeInTheDocument();
   });
 
   it('un-pauses once YAML parses again', () => {

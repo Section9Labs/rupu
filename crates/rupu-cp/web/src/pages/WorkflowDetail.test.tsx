@@ -134,6 +134,22 @@ describe('WorkflowDetail', () => {
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
   });
 
+  it('registers a beforeunload guard once the draft is dirty', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    const addSpy = vi.spyOn(window, 'addEventListener');
+    renderPage();
+
+    await screen.findByTestId('stub-editor');
+    // Clean draft → no beforeunload guard yet.
+    expect(addSpy.mock.calls.some(([type]) => type === 'beforeunload')).toBe(false);
+
+    // Diverge the draft → the guard effect registers the listener.
+    fireEvent.click(screen.getByTestId('stub-editor'));
+    await waitFor(() =>
+      expect(addSpy.mock.calls.some(([type]) => type === 'beforeunload')).toBe(true),
+    );
+  });
+
   it('Delete (confirmed) calls deleteWorkflow and navigates to /workflows', async () => {
     vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
     const delSpy = vi.spyOn(api, 'deleteWorkflow').mockResolvedValue();
