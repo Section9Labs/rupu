@@ -17,7 +17,21 @@ import Turn from './transcript/Turn';
 
 type LoadState = 'loading' | 'ready' | 'error';
 
-export default function TranscriptPanel({ path, live }: { path: string; live: boolean }) {
+export default function TranscriptPanel({
+  path,
+  live,
+  embedded = false,
+}: {
+  path: string;
+  live: boolean;
+  /**
+   * When true, hide the run-level header and usage footer chrome — render only
+   * the turn/tool conversation body. Used inside a chat conversation, where each
+   * turn shouldn't repeat a big per-run header/footer. Live SSE streaming and the
+   * Turn / ToolCard rendering are unchanged. Default (false) is the full panel.
+   */
+  embedded?: boolean;
+}) {
   const [events, setEvents] = useState<TranscriptEvent[]>([]);
   const [state, setState] = useState<LoadState>('loading');
   const [errorMsg, setErrorMsg] = useState<string>('');
@@ -106,7 +120,7 @@ export default function TranscriptPanel({ path, live }: { path: string; live: bo
   return (
     <div className="flex flex-col rounded-xl border border-border bg-bg p-3 text-[11px]">
       {/* Header: agent · provider · model · live · status / tokens */}
-      {view.header && (
+      {!embedded && view.header && (
         <div className="mb-2 flex flex-wrap items-center gap-2 border-b border-border pb-1.5 text-[11px] text-ink-dim">
           <b className="text-ink">{view.header.agent || 'agent'}</b>
           {view.header.provider && <span>· {view.header.provider}</span>}
@@ -152,7 +166,7 @@ export default function TranscriptPanel({ path, live }: { path: string; live: bo
       </div>
 
       {/* Footer: status · total tokens · duration */}
-      {view.footer && (
+      {!embedded && view.footer && (
         <div className="mt-2 flex flex-wrap gap-3 border-t border-border pt-1.5 text-[10px] text-ink-dim">
           {view.footer.status && <span>{statusGlyph(view.footer.status)} {view.footer.status}</span>}
           {view.footer.totalTokens != null && (
