@@ -11,6 +11,7 @@ pub mod pagination;
 pub mod repos;
 pub mod server;
 pub mod session_sender;
+pub mod session_starter;
 pub mod sse;
 pub mod state;
 pub mod transcript_tail;
@@ -44,6 +45,9 @@ pub struct ServeOpts {
     /// Optional agent-launcher adapter. rupu-cli's `cp serve` provides the
     /// subprocess-spawning impl; `None` disables agent launching from the web UI.
     pub agent_launcher: Option<std::sync::Arc<dyn crate::agent_launcher::AgentLauncher>>,
+    /// Optional session-starter adapter. rupu-cli's `cp serve` provides the
+    /// subprocess-spawning impl; `None` disables session starting from the web UI.
+    pub session_starter: Option<std::sync::Arc<dyn crate::session_starter::SessionStarter>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -99,7 +103,8 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .with_launcher(opts.launcher)
         .with_session_sender(opts.session_sender)
         .with_repos(opts.repos)
-        .with_agent_launcher(opts.agent_launcher);
+        .with_agent_launcher(opts.agent_launcher)
+        .with_session_starter(opts.session_starter);
     let app = server::router(app_state, opts.token);
 
     let listener = tokio::net::TcpListener::bind(opts.bind)
