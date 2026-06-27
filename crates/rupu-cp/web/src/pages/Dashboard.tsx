@@ -1,60 +1,71 @@
-// Dashboard — stat tiles + run-status donut chart + usage panel + recent runs.
+// Dashboard — "spend-forward operations". A triage ribbon up top, a per-model
+// usage timeline + all-models breakdown as the hero, supporting stat tiles, and
+// a recent-runs + run-status bottom rail.
 //
-// Data source: GET /api/dashboard  (DashboardResponse — point-in-time counts
-// + last-N recent_runs array). The Usage panel additionally sources
-// GET /api/usage (token + cost rollup over the last 30 days); it hides itself
-// if that endpoint errs.
+// Data: GET /api/dashboard (point-in-time counts + recent_runs), GET /api/usage
+// (windowed summary + per-model breakdown), GET /api/usage/timeline (per-bucket
+// per-model series), GET /api/findings (open-findings total), GET /api/runs
+// (failed-in-window count). The global range control drives the windowed calls.
 //
 // Polls every 15 s; clears the interval on unmount.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Activity, MessageSquare, RefreshCw, Server, ShieldCheck } from 'lucide-react';
-import {
-  Bar,
-  BarChart,
-  Cell,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
-import { api, type DashboardResponse, type RunStatusStr } from '../lib/api';
+import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
+import { api, type DashboardResponse, type RunStatusStr, type UsageOverview, type UsageTimelineBucket } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
 import UsageChip from '../components/UsageChip';
 import { ListCard } from '../components/lists/ListCard';
+import TriageRibbon from '../components/dashboard/TriageRibbon';
+import UsageTimelineStacked, { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
+import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
-import { formatCost, formatTokens, type UsageOverview } from '../lib/usage';
+import { formatCost, formatTokens } from '../lib/usage';
 
 // ---------------------------------------------------------------------------
-// Status color map — JS color strings for recharts SVG fills.
-// These are NOT Tailwind classes; they mirror the RUN_STATUS_STYLES dots.
+// Global range control
+// ---------------------------------------------------------------------------
+
+type Range = '7d' | '30d' | 'all';
+
+const RANGES: { key: Range; label: string }[] = [
+  { key: '7d', label: '7d' },
+  { key: '30d', label: '30d' },
+  { key: 'all', label: 'All' },
+];
+
+/** Map a range to the windowed-query params: `since` (RFC-3339) and timeline
+ *  `bucket` granularity. "All" sends the epoch as `since` — the backend defaults
+ *  an absent `since` to now-30d, so we must pass an explicit floor to actually
+ *  span all history (weekly-bucketed). */
+function rangeParams(range: Range): { since: string; bucket: 'day' | 'week' } {
+  const now = Date.now();
+  const day = 86_400_000;
+  if (range === '7d') return { since: new Date(now - 7 * day).toISOString(), bucket: 'day' };
+  if (range === '30d') return { since: new Date(now - 30 * day).toISOString(), bucket: 'day' };
+  return { since: new Date(0).toISOString(), bucket: 'week' };
+}
+
+// ---------------------------------------------------------------------------
+// Run-status donut chart (bottom rail)
 // ---------------------------------------------------------------------------
 
 const STATUS_FILL: Record<RunStatusStr, string> = {
-  running:          '#3b82f6', // blue-500   — matches bg-blue-500 dot
-  completed:        '#10b981', // emerald-500 — matches bg-green-500 dot
-  failed:           '#ef4444', // red-500     — matches bg-red-500 dot
-  awaiting_approval:'#f59e0b', // amber-500   — matches bg-amber-500 dot
-  pending:          '#94a3b8', // slate-400   — matches bg-slate-400 dot
-  rejected:         '#64748b', // slate-500   — matches bg-red-500 / slate for distinction
-  cancelled:        '#64748b', // slate-500   — matches the Cancelled pill dot
+  running:          '#3b82f6',
+  completed:        '#10b981',
+  failed:           '#ef4444',
+  awaiting_approval:'#f59e0b',
+  pending:          '#94a3b8',
+  rejected:         '#64748b',
+  cancelled:        '#64748b',
 };
 
 const STATUS_ORDER: RunStatusStr[] = [
-  'running',
-  'awaiting_approval',
-  'pending',
-  'completed',
-  'failed',
-  'rejected',
-  'cancelled',
+  'running', 'awaiting_approval', 'pending', 'completed', 'failed', 'rejected', 'cancelled',
 ];
 
-// Human labels for the chart tooltip (matches StatusPill labels)
 const STATUS_LABEL: Record<RunStatusStr, string> = {
   running:           'Running',
   completed:         'Completed',
@@ -65,22 +76,58 @@ const STATUS_LABEL: Record<RunStatusStr, string> = {
   cancelled:         'Cancelled',
 };
 
+const tooltipStyle: React.CSSProperties = {
+  background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, fontSize: 11, padding: '6px 10px',
+  boxShadow: '0 2px 6px rgba(0,0,0,0.06)',
+};
+
+function RunStatusChart({ byStatus, total }: { byStatus: Record<RunStatusStr, number>; total: number }) {
+  if (total === 0) {
+    return (
+      <div className="py-12 flex flex-col items-center justify-center text-center">
+        <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center mb-2">
+          <Activity size={18} className="text-slate-400" />
+        </div>
+        <p className="text-xs text-ink-mute">No runs yet</p>
+      </div>
+    );
+  }
+  const data = STATUS_ORDER
+    .map((s) => ({ name: STATUS_LABEL[s], value: byStatus[s] ?? 0, fill: STATUS_FILL[s], key: s }))
+    .filter((d) => d.value > 0);
+  return (
+    <div className="flex items-center gap-6">
+      <div style={{ width: 140, height: 140, flexShrink: 0 }}>
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart>
+            <Pie data={data} cx="50%" cy="50%" innerRadius={42} outerRadius={62} paddingAngle={2} dataKey="value" strokeWidth={0}>
+              {data.map((d) => <Cell key={d.key} fill={d.fill} />)}
+            </Pie>
+            <Tooltip contentStyle={tooltipStyle} formatter={(value, name) => [`${value ?? 0}`, `${name}`]} />
+          </PieChart>
+        </ResponsiveContainer>
+      </div>
+      <ul className="flex-1 min-w-0 space-y-1.5">
+        {data.map((d) => (
+          <li key={d.key} className="flex items-center gap-2 text-xs">
+            <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: d.fill }} />
+            <span className="text-ink-dim flex-1 min-w-0 truncate">{d.name}</span>
+            <span className="text-ink font-medium tabular-nums">{d.value}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
-// Stat tile
+// Secondary stat tile
 // ---------------------------------------------------------------------------
 
 function StatTile({
-  icon: Icon,
-  iconCls,
-  label,
-  value,
-  sub,
+  icon: Icon, iconCls, label, value, sub,
 }: {
-  icon: React.ElementType;
-  iconCls: string;
-  label: string;
-  value: number | string;
-  sub?: string;
+  icon: React.ElementType; iconCls: string; label: string; value: number | string; sub?: string;
 }) {
   return (
     <div className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
@@ -99,89 +146,10 @@ function StatTile({
 }
 
 // ---------------------------------------------------------------------------
-// Run-status donut chart
-// ---------------------------------------------------------------------------
-
-const tooltipStyle: React.CSSProperties = {
-  background: '#fff',
-  border: '1px solid #e2e8f0',
-  borderRadius: 6,
-  fontSize: 11,
-  padding: '6px 10px',
-  boxShadow: '0 2px 6px rgba(0,0,0,0.06)',
-};
-
-function RunStatusChart({ byStatus, total }: { byStatus: Record<RunStatusStr, number>; total: number }) {
-  if (total === 0) {
-    return (
-      <div className="py-12 flex flex-col items-center justify-center text-center">
-        <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center mb-2">
-          <Activity size={18} className="text-slate-400" />
-        </div>
-        <p className="text-xs text-ink-mute">No runs yet</p>
-      </div>
-    );
-  }
-
-  // Build pie slices — skip zero buckets so the chart stays clean.
-  const data = STATUS_ORDER
-    .map((s) => ({ name: STATUS_LABEL[s], value: byStatus[s] ?? 0, fill: STATUS_FILL[s], key: s }))
-    .filter((d) => d.value > 0);
-
-  return (
-    <div className="flex items-center gap-6">
-      {/* Donut — needs an explicit height so ResponsiveContainer doesn't collapse */}
-      <div style={{ width: 140, height: 140, flexShrink: 0 }}>
-        <ResponsiveContainer width="100%" height="100%">
-          <PieChart>
-            <Pie
-              data={data}
-              cx="50%"
-              cy="50%"
-              innerRadius={42}
-              outerRadius={62}
-              paddingAngle={2}
-              dataKey="value"
-              strokeWidth={0}
-            >
-              {data.map((d) => (
-                <Cell key={d.key} fill={d.fill} />
-              ))}
-            </Pie>
-            <Tooltip
-              contentStyle={tooltipStyle}
-              formatter={(value, name) => [`${value ?? 0}`, `${name}`]}
-            />
-          </PieChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Legend */}
-      <ul className="flex-1 min-w-0 space-y-1.5">
-        {data.map((d) => (
-          <li key={d.key} className="flex items-center gap-2 text-xs">
-            <span
-              className="w-2.5 h-2.5 rounded-sm shrink-0"
-              style={{ background: d.fill }}
-            />
-            <span className="text-ink-dim flex-1 min-w-0 truncate">{d.name}</span>
-            <span className="text-ink font-medium tabular-nums">{d.value}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Recent runs
 // ---------------------------------------------------------------------------
 
-function RecentRunRow({
-  run,
-}: {
-  run: DashboardResponse['recent_runs'][number];
-}) {
+function RecentRunRow({ run }: { run: DashboardResponse['recent_runs'][number] }) {
   return (
     <Link
       to={`/runs/${encodeURIComponent(run.id)}`}
@@ -194,67 +162,11 @@ function RecentRunRow({
             {run.id.length > 10 ? `${run.id.slice(0, 8)}…` : run.id}
           </span>
         </div>
-        <p className="text-[11px] text-ink-dim mt-0.5">
-          started {relativeTime(run.started_at)}
-        </p>
+        <p className="text-[11px] text-ink-dim mt-0.5">started {relativeTime(run.started_at)}</p>
       </div>
       <UsageChip usage={run.usage} className="ml-2" />
       <StatusPill status={run.status} />
     </Link>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Usage panel — total spend + tokens + top-models-by-cost bar
-// ---------------------------------------------------------------------------
-
-// Top-models-by-cost bar + total-spend summary for the usage panel.
-function UsagePanel({ overview }: { overview: UsageOverview }) {
-  const { summary, breakdown } = overview;
-  // Top 6 priced models by cost for the bar; ignore unpriced rows in the chart.
-  const bars = breakdown
-    .filter((r) => r.cost_usd !== null)
-    .slice(0, 6)
-    .map((r) => ({ name: r.model || r.provider || r.agent || '—', cost: r.cost_usd ?? 0 }));
-
-  return (
-    <div className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
-      <div className="flex items-baseline gap-4 mb-3">
-        <div>
-          <p className="text-xs text-ink-dim font-medium uppercase tracking-wide">Spend (30d)</p>
-          <p className="mt-1 text-2xl font-semibold text-ink tabular-nums">
-            {formatCost(summary.cost_usd)}{summary.cost_usd !== null && !summary.priced ? '*' : ''}
-          </p>
-        </div>
-        <div>
-          <p className="text-xs text-ink-dim font-medium uppercase tracking-wide">Tokens</p>
-          <p className="mt-1 text-2xl font-semibold text-ink tabular-nums">
-            {formatTokens(summary.total_tokens)}
-          </p>
-        </div>
-      </div>
-      {bars.length === 0 ? (
-        <p className="text-xs text-ink-mute py-6 text-center">No priced usage in the last 30 days</p>
-      ) : (
-        <div style={{ width: '100%', height: 28 * bars.length + 8 }}>
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={bars} layout="vertical" margin={{ left: 8, right: 16, top: 0, bottom: 0 }}>
-              <XAxis type="number" hide />
-              <YAxis type="category" dataKey="name" width={120} tick={{ fontSize: 11, fill: '#64748b' }} />
-              <Tooltip
-                contentStyle={tooltipStyle}
-                formatter={(value) => [formatCost(typeof value === 'number' ? value : 0), 'cost']}
-              />
-              <Bar dataKey="cost" radius={[0, 4, 4, 0]}>
-                {bars.map((b) => (
-                  <Cell key={b.name} fill="#6366f1" />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -265,23 +177,60 @@ function UsagePanel({ overview }: { overview: UsageOverview }) {
 const POLL_MS = 15_000;
 
 export default function Dashboard() {
+  const [range, setRange] = useState<Range>('30d');
+  const [metric, setMetric] = useState<UsageMetric>('cost');
+  const userPickedMetric = useRef(false);
+
   const [data, setData] = useState<DashboardResponse | null>(null);
   const [usage, setUsage] = useState<UsageOverview | null>(null);
+  const [timeline, setTimeline] = useState<UsageTimelineBucket[] | null>(null);
+  const [findingsTotal, setFindingsTotal] = useState<number | null>(null);
+  const [failedInWindow, setFailedInWindow] = useState(0);
+
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
-  // Stable "seconds since last refresh" counter.
   const [ageSec, setAgeSec] = useState(0);
   const lastUpdatedRef = useRef<Date | null>(null);
 
   const load = useCallback(async () => {
     setRefreshing(true);
+    const { since, bucket } = rangeParams(range);
     try {
       const d = await api.getDashboard();
+      const [u, tl, findings, runs] = await Promise.all([
+        api.getUsage({ since, groupBy: 'model' }).catch(() => null),
+        api.getUsageTimeline({ since, bucket }).catch(() => null),
+        api.getFindings().catch(() => null),
+        api.getRuns({ limit: 500 }).catch(() => null),
+      ]);
+
       setData(d);
-      const u = await api.getUsage({ groupBy: 'model' }).catch(() => null);
       setUsage(u);
+      setTimeline(tl);
+      setFindingsTotal(findings ? findings.summary.total : null);
+
+      // Failed-in-window: prefer the runs list (true windowed count); fall back
+      // to the all-time status rollup when /api/runs is unavailable.
+      if (runs) {
+        const sinceMs = since ? Date.parse(since) : 0;
+        setFailedInWindow(
+          runs.filter(
+            (r) => (r.status === 'failed' || r.status === 'rejected') && Date.parse(r.started_at) >= sinceMs,
+          ).length,
+        );
+      } else {
+        setFailedInWindow((d.runs.by_status.failed ?? 0) + (d.runs.by_status.rejected ?? 0));
+      }
+
+      // Default the chart to Tokens when nothing is priced (unless the user
+      // explicitly chose a metric).
+      if (!userPickedMetric.current) {
+        const anyPriced = u?.breakdown.some((r) => r.cost_usd !== null) ?? false;
+        setMetric(anyPriced ? 'cost' : 'tokens');
+      }
+
       setError(null);
       const now = new Date();
       setLastUpdated(now);
@@ -292,16 +241,14 @@ export default function Dashboard() {
     } finally {
       setRefreshing(false);
     }
-  }, []);
+  }, [range]);
 
-  // Initial fetch + polling
   useEffect(() => {
     void load();
     const poll = window.setInterval(() => void load(), POLL_MS);
     return () => window.clearInterval(poll);
   }, [load]);
 
-  // "X s ago" ticker — updates every second while data is loaded.
   useEffect(() => {
     if (!lastUpdated) return;
     const ticker = window.setInterval(() => {
@@ -311,24 +258,46 @@ export default function Dashboard() {
     return () => window.clearInterval(ticker);
   }, [lastUpdated]);
 
+  const pickMetric = (m: UsageMetric) => {
+    userPickedMetric.current = true;
+    setMetric(m);
+  };
+
   const running = data?.runs.by_status.running ?? 0;
+  const awaiting = data?.runs.by_status.awaiting_approval ?? 0;
   const activeSessions = data?.sessions.active ?? 0;
   const totalSessions = data?.sessions.total ?? 0;
   const totalWorkers = data?.workers.total ?? 0;
   const coverageTargets = data?.coverage.targets ?? 0;
   const coverageAssertions = data?.coverage.assertions ?? 0;
 
+  const summary = usage?.summary;
+  const spendPartial = summary != null && summary.cost_usd !== null && !summary.priced;
+
   return (
-    <div className="p-8 max-w-5xl">
-      {/* Page header */}
-      <header className="flex items-center justify-between mb-6">
+    <div className="p-8 max-w-6xl">
+      {/* Header */}
+      <header className="flex items-center justify-between mb-6 gap-4 flex-wrap">
         <div>
           <h1 className="text-2xl font-semibold text-ink">Dashboard</h1>
-          <p className="mt-1 text-sm text-ink-dim">
-            Control plane at a glance.
-          </p>
+          <p className="mt-1 text-sm text-ink-dim">Spend-forward operations at a glance.</p>
         </div>
         <div className="flex items-center gap-3">
+          {/* Range segmented control */}
+          <div className="inline-flex rounded-lg border border-border bg-panel p-0.5">
+            {RANGES.map((r) => (
+              <button
+                key={r.key}
+                onClick={() => setRange(r.key)}
+                className={cn(
+                  'px-3 py-1 text-xs font-medium rounded-md transition-colors',
+                  range === r.key ? 'bg-brand-50 text-brand-700' : 'text-ink-dim hover:text-ink',
+                )}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
           {lastUpdated && !refreshing && (
             <span className="text-[11px] text-ink-mute tabular-nums">
               updated {ageSec < 5 ? 'just now' : `${ageSec}s ago`}
@@ -344,94 +313,113 @@ export default function Dashboard() {
         </div>
       </header>
 
-      {/* Error banner */}
       {error && (
         <div className="mb-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           {error}
         </div>
       )}
 
-      {/* Loading skeleton */}
-      {data === null && !error && (
-        <div className="text-sm text-ink-dim">Loading…</div>
-      )}
+      {data === null && !error && <div className="text-sm text-ink-dim">Loading…</div>}
 
       {data !== null && (
         <div className="space-y-8">
-          {/* ── Stat tiles ── */}
-          <section className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-            <StatTile
-              icon={Activity}
-              iconCls="bg-blue-50 text-blue-600"
-              label="Total runs"
-              value={data.runs.total}
-              sub={running > 0 ? `${running} running` : undefined}
-            />
-            <StatTile
-              icon={MessageSquare}
-              iconCls="bg-brand-50 text-brand-600"
-              label="Sessions"
-              value={activeSessions}
-              sub={`${activeSessions} of ${totalSessions} active`}
-            />
-            <StatTile
-              icon={Server}
-              iconCls="bg-slate-100 text-slate-600"
-              label="Workers"
-              value={totalWorkers}
-            />
-            <StatTile
-              icon={ShieldCheck}
-              iconCls="bg-green-50 text-green-600"
-              label="Coverage targets"
-              value={coverageTargets}
-              sub={coverageAssertions > 0 ? `${coverageAssertions} assertions` : undefined}
-            />
-          </section>
+          {/* ── Triage ribbon ── */}
+          <TriageRibbon
+            running={running}
+            awaiting={awaiting}
+            failed={failedInWindow}
+            findings={findingsTotal}
+          />
 
-          {/* ── Run status distribution ── */}
-          <section>
-            <h2 className="text-sm font-semibold text-ink-dim mb-3">Run status distribution</h2>
-            <div className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
-              <RunStatusChart
-                byStatus={data.runs.by_status}
-                total={data.runs.total}
-              />
-            </div>
-          </section>
-
-          {/* ── Usage (tokens + cost) ── */}
-          {usage && (
-            <section>
-              <h2 className="text-sm font-semibold text-ink-dim mb-3">Usage — last 30 days</h2>
-              <UsagePanel overview={usage} />
-            </section>
-          )}
-
-          {/* ── Recent runs ── */}
-          <section>
-            <div className="flex items-center gap-2 mb-3 pl-1">
-              <span className="w-2 h-2 rounded-full bg-brand-500" />
-              <h2 className="text-sm font-semibold text-brand-700">Recent Runs</h2>
-              <span className="text-xs text-ink-mute tabular-nums">
-                {data.recent_runs.length}
-              </span>
-            </div>
-
-            {data.recent_runs.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-border bg-panel/50 py-10 flex flex-col items-center justify-center text-center">
-                <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center mb-2">
-                  <Activity size={17} className="text-slate-400" />
+          {/* ── Usage hero ── */}
+          <section className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+            {/* Timeline + headline numbers (≈⅔) */}
+            <div className="lg:col-span-2 bg-panel border border-border rounded-xl shadow-card px-5 py-4">
+              <div className="flex items-start justify-between gap-4 mb-4 flex-wrap">
+                <div className="flex items-baseline gap-6">
+                  <div>
+                    <p className="text-xs text-ink-dim font-medium uppercase tracking-wide">Spend</p>
+                    <p className="mt-1 text-3xl font-semibold text-ink tabular-nums">
+                      {formatCost(summary?.cost_usd ?? null)}
+                      {spendPartial && <span className="text-amber-500">*</span>}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-ink-dim font-medium uppercase tracking-wide">Tokens</p>
+                    <p className="mt-1 text-3xl font-semibold text-ink tabular-nums">
+                      {formatTokens(summary?.total_tokens ?? 0)}
+                    </p>
+                  </div>
                 </div>
-                <p className="text-xs text-ink-mute">No runs yet</p>
+                {/* Cost | Tokens toggle */}
+                <div className="inline-flex rounded-lg border border-border p-0.5">
+                  {(['cost', 'tokens'] as const).map((m) => (
+                    <button
+                      key={m}
+                      onClick={() => pickMetric(m)}
+                      className={cn(
+                        'px-3 py-1 text-xs font-medium rounded-md transition-colors capitalize',
+                        metric === m ? 'bg-brand-50 text-brand-700' : 'text-ink-dim hover:text-ink',
+                      )}
+                    >
+                      {m === 'cost' ? 'Cost $' : 'Tokens'}
+                    </button>
+                  ))}
+                </div>
               </div>
-            ) : (
-              <ListCard>
-                {data.recent_runs.map((r) => (
-                  <RecentRunRow key={r.id} run={r} />
-                ))}
-              </ListCard>
-            )}
+              {spendPartial && (
+                <p className="-mt-2 mb-3 text-[11px] text-ink-mute">
+                  <span className="text-amber-500">*</span> partial — some models are unpriced (see breakdown)
+                </p>
+              )}
+              <UsageTimelineStacked buckets={timeline ?? []} metric={metric} />
+            </div>
+
+            {/* All-models breakdown (≈⅓) */}
+            <div className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
+              <h2 className="text-sm font-semibold text-ink-dim mb-3">Models</h2>
+              <ModelBreakdownTable rows={usage?.breakdown ?? []} />
+            </div>
+          </section>
+
+          {/* ── Secondary tiles ── */}
+          <section className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            <StatTile icon={Activity} iconCls="bg-blue-50 text-blue-600" label="Total runs" value={data.runs.total}
+              sub={running > 0 ? `${running} running` : undefined} />
+            <StatTile icon={MessageSquare} iconCls="bg-brand-50 text-brand-600" label="Sessions" value={activeSessions}
+              sub={`${activeSessions} of ${totalSessions} active`} />
+            <StatTile icon={Server} iconCls="bg-slate-100 text-slate-600" label="Workers" value={totalWorkers} />
+            <StatTile icon={ShieldCheck} iconCls="bg-green-50 text-green-600" label="Coverage targets" value={coverageTargets}
+              sub={coverageAssertions > 0 ? `${coverageAssertions} assertions` : undefined} />
+          </section>
+
+          {/* ── Bottom rail: recent runs + run-status donut ── */}
+          <section className="grid grid-cols-1 lg:grid-cols-5 gap-5">
+            <div className="lg:col-span-3">
+              <div className="flex items-center gap-2 mb-3 pl-1">
+                <span className="w-2 h-2 rounded-full bg-brand-500" />
+                <h2 className="text-sm font-semibold text-brand-700">Recent Runs</h2>
+                <span className="text-xs text-ink-mute tabular-nums">{data.recent_runs.length}</span>
+              </div>
+              {data.recent_runs.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-border bg-panel/50 py-10 flex flex-col items-center justify-center text-center">
+                  <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center mb-2">
+                    <Activity size={17} className="text-slate-400" />
+                  </div>
+                  <p className="text-xs text-ink-mute">No runs yet</p>
+                </div>
+              ) : (
+                <ListCard>
+                  {data.recent_runs.map((r) => <RecentRunRow key={r.id} run={r} />)}
+                </ListCard>
+              )}
+            </div>
+            <div className="lg:col-span-2">
+              <h2 className="text-sm font-semibold text-ink-dim mb-3">Run status</h2>
+              <div className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
+                <RunStatusChart byStatus={data.runs.by_status} total={data.runs.total} />
+              </div>
+            </div>
           </section>
         </div>
       )}

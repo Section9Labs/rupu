@@ -56,6 +56,21 @@ pub const BUILTIN_PRICES: &[(&str, &str, ModelPricing)] = &[
             cached_input_per_mtok: Some(0.08),
         },
     ),
+    // Retro-alias: legacy transcripts recorded Anthropic's served-model id
+    // (`claude-mythos-preview`) for EVERY Claude request, collapsing
+    // opus/sonnet/haiku into one unpriced line. New runs record the requested
+    // model (priced correctly); this entry retro-prices the collapsed historical
+    // data at opus-tier rates (the flagship — an approximation for legacy data,
+    // since the underlying requests spanned multiple tiers).
+    (
+        "anthropic",
+        "claude-mythos-preview",
+        ModelPricing {
+            input_per_mtok: 15.0,
+            output_per_mtok: 75.0,
+            cached_input_per_mtok: Some(1.50),
+        },
+    ),
     // ── OpenAI ────────────────────────────────────────────────────
     (
         "openai-codex",

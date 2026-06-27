@@ -32,6 +32,14 @@ export interface UsageOverview {
   breakdown: UsageBreakdownRow[];
 }
 
+/** One time bucket of the usage timeline — a `YYYY-MM-DD` key (the day, or the
+ *  ISO-Monday for week buckets) plus the per-model breakdown of every run whose
+ *  `started_at` fell in that bucket. Mirrors rupu-cp's `UsageTimelineBucket`. */
+export interface UsageTimelineBucket {
+  bucket: string;
+  rows: UsageBreakdownRow[];
+}
+
 /** Compact a token count: `4,210` / `1.2M` / `3.4B`. */
 export function formatTokens(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
