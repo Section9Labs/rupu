@@ -25,28 +25,71 @@ use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Canonicalize `raw`; require a `.jsonl` file whose canonical path is inside
-/// one of `allowed_roots` (themselves canonicalized). Rejects traversal,
-/// symlink-escape, out-of-root absolute paths, and non-`.jsonl`.
+/// Validate a requested transcript `?path=`: require a `.jsonl` file, reject
+/// `..` traversal, and require the path to resolve inside one of `allowed_roots`
+/// (themselves canonicalized). Symlink-escape is defeated by canonicalizing the
+/// deepest existing ancestor before the `starts_with` check.
 ///
-/// Canonicalize-then-prefix-check is what defeats `../` traversal and symlink
-/// escapes: [`std::fs::canonicalize`] resolves them before the `starts_with`
-/// check runs, so a path that *textually* sits under a root but *resolves*
-/// outside it is rejected.
+/// Unlike a plain `canonicalize`, this does NOT require the target file to
+/// exist: a freshly-sent turn's transcript is validated before its worker has
+/// written the `.jsonl`, so the UI can open it and stream it in (the old
+/// canonicalize-the-whole-path approach returned a misleading "cannot resolve
+/// path" for that race).
 pub fn validate_transcript_path(raw: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
     let p = Path::new(raw);
     if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
         return Err("not a .jsonl file".into());
     }
-    let canon = std::fs::canonicalize(p).map_err(|_| "cannot resolve path".to_string())?;
+    // Reject `..` outright — the web only ever passes already-resolved absolute
+    // transcript paths, and forbidding ParentDir removes traversal as a vector
+    // before we touch the filesystem.
+    if p.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err("path must not contain ..".into());
+    }
+    // The transcript file may not exist yet (a freshly-sent turn whose worker
+    // hasn't written the `.jsonl` — that race previously produced a misleading
+    // "cannot resolve path"). Resolve symlinks on the deepest EXISTING ancestor
+    // for the security check, then re-append the not-yet-created remainder. An
+    // existing file is still fully canonicalized (no loss of symlink-escape
+    // protection for real files).
+    let resolved = if p.exists() {
+        std::fs::canonicalize(p).map_err(|_| "cannot resolve path".to_string())?
+    } else {
+        canonicalize_existing_prefix(p).ok_or_else(|| "cannot resolve path".to_string())?
+    };
     for root in allowed_roots {
         if let Ok(rc) = std::fs::canonicalize(root) {
-            if canon.starts_with(&rc) {
-                return Ok(canon);
+            if resolved.starts_with(&rc) {
+                return Ok(resolved);
             }
         }
     }
     Err("path is outside the allowed roots".into())
+}
+
+/// Canonicalize the deepest existing ancestor of `p` (resolving symlinks in the
+/// real prefix) and re-append the remaining, not-yet-created components. Returns
+/// `None` only if no ancestor exists. `p` must be `..`-free (the caller rejects
+/// ParentDir first).
+fn canonicalize_existing_prefix(p: &Path) -> Option<PathBuf> {
+    let mut ancestor = p;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if ancestor.exists() {
+            let mut out = std::fs::canonicalize(ancestor).ok()?;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return Some(out);
+        }
+        match (ancestor.file_name(), ancestor.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                ancestor = parent;
+            }
+            _ => return None,
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -81,12 +124,19 @@ async fn get_transcript(
 ) -> ApiResult<Json<serde_json::Value>> {
     let path =
         validate_transcript_path(&q.path, &allowed_roots(&s)).map_err(ApiError::bad_request)?;
+    // A validated-but-not-yet-written transcript (freshly-sent turn) is an empty
+    // transcript, not an error — the UI opens it and the stream fills it in.
+    if !path.exists() {
+        return Ok(Json(serde_json::json!({ "events": [], "summary": null })));
+    }
     let events: Vec<rupu_transcript::Event> = rupu_transcript::JsonlReader::iter(&path)
         .map_err(|e| ApiError::internal(e.to_string()))?
         .filter_map(Result::ok)
         .collect();
     let summary = rupu_transcript::JsonlReader::summary(&path).ok();
-    Ok(Json(serde_json::json!({ "events": events, "summary": summary })))
+    Ok(Json(
+        serde_json::json!({ "events": events, "summary": summary }),
+    ))
 }
 
 /// `GET /api/transcript/stream?path=` — SSE live-tail of a transcript JSONL.
