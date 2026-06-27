@@ -353,7 +353,12 @@ export default function WorkflowDetailPage() {
             <Suspense
               fallback={<div className="py-12 text-center text-sm text-ink-dim">Loading editor…</div>}
             >
-              <WorkflowEditor initialYaml={draftYaml} agents={agents} onYamlChange={setDraftYaml} />
+              <WorkflowEditor
+                draftYaml={draftYaml}
+                onYamlChange={setDraftYaml}
+                agents={agents}
+                validity={validity}
+              />
             </Suspense>
             {saveError && (
               <p role="alert" className="text-[12px] font-medium text-red-700">
