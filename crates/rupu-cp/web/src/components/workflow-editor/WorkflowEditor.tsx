@@ -151,7 +151,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
       <div className="min-h-0 min-w-0 flex-1">
         <SplitPane
           top={
-            <div className="h-full overflow-auto p-3">
+            <div className="h-full overflow-hidden p-3">
               <WorkflowEditorGraph
                 graph={graph}
                 onChange={commit}
