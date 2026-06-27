@@ -22,6 +22,9 @@ pub fn routes() -> Router<AppState> {
                 .delete(delete_workflow),
         )
         .route("/api/workflows/:name/run", post(launch_run))
+        // axum matches static literal segments before dynamic `:name` captures,
+        // so this route is reachable and is NOT shadowed by `/api/workflows/:name`.
+        .route("/api/workflows/validate", post(validate_workflow))
 }
 
 /// Directory where global workflow `.yaml` definitions live.
@@ -169,6 +172,17 @@ async fn create_workflow(
     fs_safety::write_atomic(&target, body.raw.as_bytes())
         .map_err(|e| ApiError::internal(e.to_string()))?;
     load_detail(&s, &name)
+}
+
+/// `POST /api/workflows/validate` — stateless parse-check of a raw workflow
+/// `.yaml`. Takes no [`State`] and touches no filesystem: it only runs
+/// [`Workflow::parse`] and reports `{ "ok": true }` on success or a 400 with the
+/// parse error message on failure. Backs the editor's live valid/invalid badge.
+async fn validate_workflow(
+    Json(body): Json<WorkflowWriteBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    Workflow::parse(&body.raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// `DELETE /api/workflows/:name` — remove the global workflow definition `:name`.
@@ -418,6 +432,29 @@ mod tests {
         .await
         .expect_err("conflict");
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    // `validate_workflow` is stateless: it takes no `State` and touches no
+    // filesystem — it only parse-checks the raw YAML.
+    #[tokio::test]
+    async fn validate_valid_yaml_is_ok() {
+        let resp = validate_workflow(Json(WorkflowWriteBody {
+            raw: VALID_YAML.into(),
+        }))
+        .await
+        .expect("valid yaml should validate");
+        assert_eq!(resp.0["ok"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn validate_unparseable_is_bad_request() {
+        // An empty/invalid workflow (no steps) fails `Workflow::parse`.
+        let err = validate_workflow(Json(WorkflowWriteBody {
+            raw: "steps: []".into(),
+        }))
+        .await
+        .expect_err("invalid workflow should reject");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

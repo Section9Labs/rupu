@@ -1104,6 +1104,20 @@ export const api = {
       method: 'DELETE',
     });
   },
+  /** Parse-check a workflow YAML server-side (writes nothing). Resolves
+   *  {ok:true} on 200, or {ok:false, error} when the server returns 400. */
+  async validateWorkflow(raw: string): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await request<{ ok: boolean }>('/api/workflows/validate', {
+        method: 'POST',
+        body: JSON.stringify({ raw }),
+      });
+      return { ok: true };
+    } catch (e) {
+      if (e instanceof ApiError) return { ok: false, error: e.message };
+      throw e;
+    }
+  },
   /**
    * Launch a fresh run of `workflow` via the configured launcher.
    * All options are optional — a bare call launches with no inputs in the

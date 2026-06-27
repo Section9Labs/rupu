@@ -3,15 +3,21 @@
 // /workflows/:name. The parsed `workflow` object is typed loosely on the wire,
 // so we narrow each field we read defensively.
 
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Pencil, Trash2 } from 'lucide-react';
-import { api, type WorkflowDetail } from '../lib/api';
+import { api, type AgentSummary, type WorkflowDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import { ScopeChip } from './Workflows';
 import CodeHighlight from '../components/CodeHighlight';
 import CodeEditor from '../components/CodeEditor';
 import LauncherSheet from '../components/LauncherSheet';
+
+// Lazy so the @xyflow/react canvas (and the rest of the visual editor) stays out
+// of the main bundle — only fetched when the operator opens the Graph tab.
+const WorkflowEditor = lazy(() => import('../components/workflow-editor/WorkflowEditor'));
+
+type EditorView = 'graph' | 'yaml';
 
 // ── Loose narrowing helpers ──────────────────────────────────────────────
 // The backend hands back `workflow: Record<string, unknown>`; we read only the
@@ -97,12 +103,22 @@ export default function WorkflowDetailPage() {
   const [launcherOpen, setLauncherOpen] = useState(false);
 
   // ── Edit / delete state ──────────────────────────────────────────────
+  // `draftYaml` is the single editable source shared by BOTH the YAML tab
+  // (CodeEditor) and the Graph tab (the visual editor emits regenerated YAML
+  // into it). It is seeded from the loaded definition and re-synced on save.
+  const [view, setView] = useState<EditorView>('yaml');
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState('');
+  const [draftYaml, setDraftYaml] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // ── Agents (for the visual editor's step/panel pickers) ──────────────
+  const [agents, setAgents] = useState<AgentSummary[]>([]);
+
+  // ── Live server-side validity badge ──────────────────────────────────
+  const [validity, setValidity] = useState<{ ok: boolean; error?: string } | null>(null);
 
   useEffect(() => {
     if (!name) return;
@@ -114,6 +130,7 @@ export default function WorkflowDetailPage() {
       .then((data) => {
         if (cancelled) return;
         setDetail(data);
+        setDraftYaml(data.yaml);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -124,15 +141,58 @@ export default function WorkflowDetailPage() {
     };
   }, [name]);
 
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getAgents()
+      .then((a) => {
+        if (!cancelled) setAgents(a);
+      })
+      .catch(() => {
+        /* agent list is best-effort; the editor still works without it */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Debounced parse-check of the current draft (writes nothing server-side).
+  useEffect(() => {
+    if (!draftYaml) {
+      setValidity(null);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      api
+        .validateWorkflow(draftYaml)
+        .then((r) => {
+          if (!cancelled) setValidity(r);
+        })
+        .catch(() => {
+          /* network failure → leave the badge unset rather than block saving */
+        });
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [draftYaml]);
+
   function startEdit() {
     if (!detail) return;
-    setDraft(detail.yaml);
     setSaveError(null);
     setEditing(true);
   }
 
   function cancelEdit() {
+    if (detail) setDraftYaml(detail.yaml);
     setEditing(false);
+    setSaveError(null);
+  }
+
+  function revertDraft() {
+    if (detail) setDraftYaml(detail.yaml);
     setSaveError(null);
   }
 
@@ -141,9 +201,9 @@ export default function WorkflowDetailPage() {
     setSaving(true);
     setSaveError(null);
     try {
-      const updated = await api.saveWorkflow(name, draft);
+      const updated = await api.saveWorkflow(name, draftYaml);
       setDetail(updated);
-      setDraft(updated.yaml);
+      setDraftYaml(updated.yaml);
       setEditing(false);
     } catch (e: unknown) {
       setSaveError(e instanceof Error ? e.message : 'Failed to save workflow');
@@ -192,6 +252,10 @@ export default function WorkflowDetailPage() {
   const steps = readSteps(detail.workflow);
   const autoflow = readAutoflow(detail.workflow);
   const inputNames = readInputNames(detail.workflow);
+
+  const dirty = draftYaml !== detail.yaml;
+  const invalid = validity?.ok === false;
+  const saveDisabled = saving || !dirty || invalid;
 
   return (
     <div className="p-8 max-w-5xl">
@@ -256,11 +320,22 @@ export default function WorkflowDetailPage() {
         )}
       </section>
 
-      {/* ── Raw YAML ────────────────────────────────────────────── */}
+      {/* ── Definition (Graph ⇄ YAML) ───────────────────────────── */}
       <section className="mt-8">
-        <div className="mb-2 flex items-center justify-between pl-1">
-          <h2 className="text-sm font-semibold text-ink">YAML</h2>
-          {!editing && (
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-2 pl-1">
+          <div className="flex items-center gap-3">
+            <h2 className="text-sm font-semibold text-ink">Definition</h2>
+            <div className="inline-flex rounded-lg border border-border bg-white p-0.5">
+              <ViewTabButton active={view === 'graph'} onClick={() => setView('graph')}>
+                Graph
+              </ViewTabButton>
+              <ViewTabButton active={view === 'yaml'} onClick={() => setView('yaml')}>
+                YAML
+              </ViewTabButton>
+            </div>
+            <ValidityBadge validity={validity} />
+          </div>
+          {view === 'yaml' && !editing && (
             <button
               type="button"
               onClick={startEdit}
@@ -273,11 +348,46 @@ export default function WorkflowDetailPage() {
           )}
         </div>
 
-        {editing ? (
+        {view === 'graph' ? (
+          <div className="space-y-3">
+            <Suspense
+              fallback={<div className="py-12 text-center text-sm text-ink-dim">Loading editor…</div>}
+            >
+              <WorkflowEditor initialYaml={draftYaml} agents={agents} onYamlChange={setDraftYaml} />
+            </Suspense>
+            {saveError && (
+              <p role="alert" className="text-[12px] font-medium text-red-700">
+                {saveError}
+              </p>
+            )}
+            <div className="flex items-center justify-end gap-2">
+              <p className="mr-auto text-[11px] text-ink-mute">
+                Saving from the graph rewrites the YAML canonically (comments and custom
+                formatting are not preserved). Use the YAML tab to hand-edit with comments.
+              </p>
+              <button
+                type="button"
+                onClick={revertDraft}
+                disabled={saving || !dirty}
+                className="inline-flex items-center rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Revert
+              </button>
+              <button
+                type="button"
+                onClick={save}
+                disabled={saveDisabled}
+                className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {saving ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
+        ) : editing ? (
           <div className="space-y-3">
             <CodeEditor
-              value={draft}
-              onChange={setDraft}
+              value={draftYaml}
+              onChange={setDraftYaml}
               language="yaml"
               ariaLabel="Workflow YAML editor"
             />
@@ -298,7 +408,7 @@ export default function WorkflowDetailPage() {
               <button
                 type="button"
                 onClick={save}
-                disabled={saving || draft === detail.yaml}
+                disabled={saveDisabled}
                 className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {saving ? 'Saving…' : 'Save'}
@@ -306,7 +416,7 @@ export default function WorkflowDetailPage() {
             </div>
           </div>
         ) : (
-          <CodeHighlight code={detail.yaml} language="yaml" />
+          <CodeHighlight code={draftYaml} language="yaml" />
         )}
       </section>
 
@@ -351,6 +461,48 @@ function StepRow({ step, index, last }: { step: ParsedStep; index: number; last:
         </div>
       </div>
     </li>
+  );
+}
+
+function ViewTabButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'rounded-md px-3 py-1 text-[12px] font-medium',
+        active ? 'bg-brand-600 text-white' : 'text-ink-dim hover:text-ink',
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ValidityBadge({ validity }: { validity: { ok: boolean; error?: string } | null }) {
+  if (!validity) return null;
+  if (validity.ok) {
+    return (
+      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-green-50 text-green-700 ring-green-200">
+        ✓ valid
+      </span>
+    );
+  }
+  return (
+    <span
+      className="inline-flex max-w-[20rem] items-center truncate rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-red-50 text-red-700 ring-red-200"
+      title={validity.error}
+    >
+      ✕ {validity.error ?? 'invalid'}
+    </span>
   );
 }
 
