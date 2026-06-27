@@ -1,13 +1,14 @@
 // @vitest-environment jsdom
 // WorkflowDetail edit/delete — the operator edits a workflow's `.yaml`
-// definition in the browser, saves it (validated server-side), or deletes the
-// workflow.
+// definition in the browser (YAML tab) or visually (Graph tab), saves it
+// (validated server-side), or deletes the workflow.
 //
 // `CodeEditor` is mocked to a plain <textarea> so the test never pulls in the
-// real (lazy) CodeMirror chunk; `useNavigate` is mocked to assert navigation.
+// real (lazy) CodeMirror chunk; `WorkflowEditor` is mocked to a stub button so
+// @xyflow/react never loads; `useNavigate` is mocked to assert navigation.
 
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api, ApiError, type WorkflowDetail } from '../lib/api';
@@ -31,6 +32,19 @@ vi.mock('../components/CodeEditor', () => ({
   ),
 }));
 
+// Mock the (lazy) visual editor to a stub — keeps @xyflow/react out of the test.
+// The stub button emits a fresh YAML through onYamlChange, exercising the
+// draft-sync + Save wiring without the real canvas.
+const STUB_YAML = 'name: x\nsteps: []\n';
+vi.mock('../components/workflow-editor/WorkflowEditor', () => ({
+  __esModule: true,
+  default: ({ onYamlChange }: { onYamlChange: (y: string) => void }) => (
+    <button type="button" data-testid="stub-editor" onClick={() => onYamlChange(STUB_YAML)}>
+      emit
+    </button>
+  ),
+}));
+
 import WorkflowDetailPage from './WorkflowDetail';
 
 const YAML = `name: nightly\ndescription: Nightly sweep.\nsteps:\n  - id: scan\n    agent: scanner\n    prompt: Scan the repo\n`;
@@ -44,6 +58,13 @@ const DETAIL: WorkflowDetail = {
   },
   yaml: YAML,
 };
+
+beforeEach(() => {
+  // Defaults — individual tests override as needed. getAgents + validateWorkflow
+  // are fired from effects on every render; stub them so they never hit fetch.
+  vi.spyOn(api, 'getAgents').mockResolvedValue([]);
+  vi.spyOn(api, 'validateWorkflow').mockResolvedValue({ ok: true });
+});
 
 afterEach(() => {
   cleanup();
@@ -135,5 +156,53 @@ describe('WorkflowDetail edit/delete', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Delete nightly' }));
     expect(delSpy).not.toHaveBeenCalled();
     expect(navigateMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('WorkflowDetail Graph ⇄ YAML tabs', () => {
+  it('switching to the Graph tab renders the (stubbed) visual editor', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Graph' }));
+    expect(await screen.findByTestId('stub-editor')).toBeInTheDocument();
+  });
+
+  it('an onYamlChange from the editor updates the draft, enabling Save', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    const saveSpy = vi
+      .spyOn(api, 'saveWorkflow')
+      .mockResolvedValue({ ...DETAIL, yaml: STUB_YAML });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Graph' }));
+    const saveBtn = await screen.findByRole('button', { name: 'Save' });
+    // No edits yet → draft matches saved YAML → Save disabled.
+    expect(saveBtn).toBeDisabled();
+
+    // Emit a fresh YAML from the (stub) editor → draft diverges.
+    fireEvent.click(screen.getByTestId('stub-editor'));
+    await waitFor(() => expect(saveBtn).not.toBeDisabled());
+
+    fireEvent.click(saveBtn);
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledWith('nightly', STUB_YAML));
+  });
+
+  it('an invalid validateWorkflow result shows the reason and disables Save', async () => {
+    vi.spyOn(api, 'getWorkflow').mockResolvedValue(DETAIL);
+    vi.spyOn(api, 'validateWorkflow').mockResolvedValue({
+      ok: false,
+      error: 'invalid workflow: unknown agent',
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Graph' }));
+    // Diverge the draft so the only thing keeping Save disabled is invalidity.
+    fireEvent.click(await screen.findByTestId('stub-editor'));
+
+    // The debounced badge surfaces the server's reason…
+    expect(await screen.findByText(/invalid workflow: unknown agent/)).toBeInTheDocument();
+    // …and Save stays disabled while invalid.
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
   });
 });
