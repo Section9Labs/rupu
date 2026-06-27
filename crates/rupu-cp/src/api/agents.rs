@@ -1,19 +1,22 @@
 use crate::{
+    agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
     error::{ApiError, ApiResult},
     state::AppState,
 };
 use axum::{
     extract::{Path, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use rupu_agent::loader::{load_agent, load_agents};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/agents", get(list_agents))
         .route("/api/agents/:name", get(get_agent))
+        .route("/api/agents/:name/run", post(run_agent))
 }
 
 #[derive(Serialize)]
@@ -117,4 +120,120 @@ async fn get_agent(
         raw,
         summary: AgentDto::from_spec(spec, "global"),
     }))
+}
+
+/// Request body for `POST /api/agents/:name/run`. All fields optional; a
+/// bodyless POST launches the agent with no prompt in its default mode.
+#[derive(Deserialize, Default)]
+struct AgentRunBody {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
+}
+
+/// Testable core: map the body + a concrete launcher to a run id.
+async fn run_agent_with(
+    name: &str,
+    body: AgentRunBody,
+    launcher: Arc<dyn AgentLauncher>,
+) -> Result<String, ApiError> {
+    let req = AgentLaunchRequest {
+        agent: name.to_string(),
+        prompt: body.prompt,
+        mode: body.mode,
+        target: body.target,
+        working_dir: body.working_dir,
+    };
+    launcher.launch(req).await.map_err(|e| match e {
+        AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
+        AgentLaunchError::Spawn(m) => ApiError::internal(m),
+    })
+}
+
+/// Start a fresh run of agent `:name` via the configured [`AgentLauncher`].
+/// Returns the new run id. 501 when no launcher is installed (read-only deploy).
+///
+/// [`AgentLauncher`]: crate::agent_launcher::AgentLauncher
+async fn run_agent(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<AgentRunBody>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let launcher = s
+        .agent_launcher
+        .clone()
+        .ok_or_else(|| ApiError::not_available("launching agents requires `rupu cp serve`"))?;
+    let run_id = run_agent_with(&name, body.map(|b| b.0).unwrap_or_default(), launcher).await?;
+    Ok(Json(serde_json::json!({ "run_id": run_id })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher};
+    use rupu_orchestrator::RunStore;
+    use std::sync::{Arc, Mutex};
+
+    struct MockAgent {
+        last: Mutex<Option<AgentLaunchRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentLauncher for MockAgent {
+        async fn launch(&self, req: AgentLaunchRequest) -> Result<String, AgentLaunchError> {
+            *self.last.lock().unwrap() = Some(req);
+            Ok("run_A".into())
+        }
+    }
+
+    fn test_state(tmp: &tempfile::TempDir) -> AppState {
+        let store = RunStore::new(tmp.path().join("runs"));
+        AppState {
+            global_dir: tmp.path().to_path_buf(),
+            workspace_dir: tmp.path().to_path_buf(),
+            run_store: Arc::new(store),
+            pricing: rupu_config::PricingConfig::default(),
+            launcher: None,
+            session_sender: None,
+            repos: None,
+            agent_launcher: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_agent_forwards_request() {
+        let mock = Arc::new(MockAgent {
+            last: Mutex::new(None),
+        });
+        let body = AgentRunBody {
+            prompt: Some("do it".into()),
+            mode: Some("bypass".into()),
+            target: None,
+            working_dir: Some("/tmp/p".into()),
+        };
+        let run_id = run_agent_with("triage", body, mock.clone())
+            .await
+            .expect("ok");
+        assert_eq!(run_id, "run_A");
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(got.agent, "triage");
+        assert_eq!(got.prompt.as_deref(), Some("do it"));
+        assert_eq!(got.working_dir.as_deref(), Some("/tmp/p"));
+    }
+
+    #[tokio::test]
+    async fn missing_launcher_is_not_available() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // agent_launcher: None
+
+        let err = run_agent(State(s), Path("triage".into()), None)
+            .await
+            .expect_err("no launcher should error");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
 }
