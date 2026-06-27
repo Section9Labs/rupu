@@ -1038,6 +1038,7 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         agent: invocation.agent_name.clone(),
         target: None,
         prompt: Some(invocation.user_prompt.clone()),
+        prompt_flag: None,
         mode: Some(invocation.permission_mode.clone()),
         no_stream: false,
         view: None,

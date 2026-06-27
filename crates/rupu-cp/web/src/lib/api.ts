@@ -469,7 +469,7 @@ export interface WorkflowDetail {
 /** Permission mode a launched run starts in. */
 export type LaunchMode = 'ask' | 'bypass' | 'readonly';
 
-/** Response from `POST /api/workflows/:name/run`. */
+/** Response from workflow and agent run endpoints. */
 export interface LaunchResult {
   run_id: string;
 }

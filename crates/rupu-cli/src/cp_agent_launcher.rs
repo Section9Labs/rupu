@@ -12,7 +12,9 @@ pub struct SubprocessAgentLauncher {
 
 /// Build the argv (after the executable) for a `rupu run` invocation.
 ///
-/// Order: `run <agent> [<target>] [<prompt>] --run-id <id> [--mode m] [--tmp]`.
+/// Order: `run <agent> [<target>] --run-id <id> [--mode m] [--prompt <p>] [--tmp]`.
+/// The prompt is always passed via `--prompt` (never positionally) so it cannot
+/// be mis-parsed as a RunTarget when no target is present.
 /// `--tmp` is added when a target is present so a repo/PR clone lands in an
 /// auto-deleted tmpdir instead of polluting / refusing in cwd.
 pub(crate) fn build_agent_argv(req: &AgentLaunchRequest, run_id: &str) -> Vec<String> {
@@ -20,14 +22,15 @@ pub(crate) fn build_agent_argv(req: &AgentLaunchRequest, run_id: &str) -> Vec<St
     if let Some(t) = &req.target {
         argv.push(t.clone());
     }
-    if let Some(p) = &req.prompt {
-        argv.push(p.clone());
-    }
     argv.push("--run-id".to_string());
     argv.push(run_id.to_string());
     if let Some(m) = &req.mode {
         argv.push("--mode".to_string());
         argv.push(m.clone());
+    }
+    if let Some(p) = &req.prompt {
+        argv.push("--prompt".to_string());
+        argv.push(p.clone());
     }
     if req.target.is_some() {
         argv.push("--tmp".to_string());
@@ -79,11 +82,12 @@ mod tests {
                 "run",
                 "triage",
                 "github:o/r",
-                "look at PR",
                 "--run-id",
                 "run_X",
                 "--mode",
                 "bypass",
+                "--prompt",
+                "look at PR",
                 "--tmp",
             ]
         );
@@ -101,6 +105,21 @@ mod tests {
         assert_eq!(
             build_agent_argv(&req, "run_X"),
             vec!["run", "triage", "--run-id", "run_X"]
+        );
+    }
+
+    #[test]
+    fn argv_prompt_no_target() {
+        let req = AgentLaunchRequest {
+            agent: "triage".into(),
+            prompt: Some("do a security audit".into()),
+            mode: None,
+            target: None,
+            working_dir: None,
+        };
+        assert_eq!(
+            build_agent_argv(&req, "run_X"),
+            vec!["run", "triage", "--run-id", "run_X", "--prompt", "do a security audit"]
         );
     }
 }

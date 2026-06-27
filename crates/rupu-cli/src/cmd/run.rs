@@ -32,6 +32,10 @@ pub struct Args {
     pub target: Option<String>,
     /// Optional initial user message. Defaults to "go" if omitted.
     pub prompt: Option<String>,
+    /// Explicit prompt flag (takes precedence over the positional `prompt`).
+    /// Use this when the prompt should not be confused with a target string.
+    #[arg(long = "prompt")]
+    pub prompt_flag: Option<String>,
     /// Override permission mode (`ask` | `bypass` | `readonly`).
     #[arg(long)]
     pub mode: Option<String>,
@@ -168,15 +172,21 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     let bash_timeout = cfg.bash.timeout_secs.unwrap_or(120);
     let bash_allowlist = cfg.bash.env_allowlist.clone().unwrap_or_default();
 
+    // The --prompt flag takes precedence over the positional `prompt` argument.
+    // This avoids the positional prompt being mis-parsed as a RunTarget when
+    // the caller passes a prompt but no target (e.g. `rupu run agent "github:org/repo ..."`
+    // would bind the string to `target` and attempt to parse it as a repo ref).
+    let effective_prompt = args.prompt_flag.clone().or_else(|| args.prompt.clone());
+
     // Disambiguate: if `args.target` parses as a RunTarget, it's a target.
     // Otherwise treat it (plus the remainder) as part of the user prompt.
     let (run_target, user_message) = match args.target.as_deref() {
-        None => (None, args.prompt.clone().unwrap_or_else(|| "go".into())),
+        None => (None, effective_prompt.unwrap_or_else(|| "go".into())),
         Some(s) => match crate::run_target::parse_run_target(s) {
-            Ok(t) => (Some(t), args.prompt.clone().unwrap_or_else(|| "go".into())),
+            Ok(t) => (Some(t), effective_prompt.unwrap_or_else(|| "go".into())),
             Err(_) => {
                 // Not a target → it's the leading word(s) of the prompt.
-                let combined = match args.prompt.as_deref() {
+                let combined = match effective_prompt.as_deref() {
                     Some(p) => format!("{s} {p}"),
                     None => s.to_string(),
                 };
