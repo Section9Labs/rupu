@@ -7,6 +7,7 @@ pub mod embed;
 pub mod error;
 pub mod launcher;
 pub mod pagination;
+pub mod repos;
 pub mod server;
 pub mod session_sender;
 pub mod sse;
@@ -36,6 +37,9 @@ pub struct ServeOpts {
     /// subprocess-spawning impl; `None` disables sending to sessions from the
     /// web UI.
     pub session_sender: Option<std::sync::Arc<dyn crate::session_sender::SessionSender>>,
+    /// Optional repo-lister adapter. rupu-cli's `cp serve` provides the
+    /// registry-backed impl; `None` → `/api/repos` returns 501.
+    pub repos: Option<std::sync::Arc<dyn crate::repos::RepoLister>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -89,7 +93,8 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let pricing = load_pricing(&opts.global_dir);
     let app_state = state::AppState::new(opts.global_dir, pricing)
         .with_launcher(opts.launcher)
-        .with_session_sender(opts.session_sender);
+        .with_session_sender(opts.session_sender)
+        .with_repos(opts.repos);
     let app = server::router(app_state, opts.token);
 
     let listener = tokio::net::TcpListener::bind(opts.bind)
