@@ -53,6 +53,8 @@ struct SessionDto {
     #[serde(default)]
     active_run_id: Option<String>,
     #[serde(default)]
+    last_error: Option<String>,
+    #[serde(default)]
     target: Option<String>,
     #[serde(default)]
     workspace_id: String,
@@ -346,6 +348,8 @@ struct SessionRunChatRecord {
     total_tokens_cached: u64,
     #[serde(default)]
     duration_ms: u64,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 /// One turn in a session's chat view: its user prompt, transcript path, and
@@ -362,6 +366,7 @@ struct SessionRunRow {
     tokens_out: u64,
     tokens_cached: u64,
     duration_ms: u64,
+    error: Option<String>,
 }
 
 impl From<SessionRunChatRecord> for SessionRunRow {
@@ -382,6 +387,7 @@ impl From<SessionRunChatRecord> for SessionRunRow {
             tokens_out: r.total_tokens_out,
             tokens_cached: r.total_tokens_cached,
             duration_ms: r.duration_ms,
+            error: r.error,
         }
     }
 }
@@ -510,6 +516,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             active_run_id: None,
+            last_error: None,
             target: None,
             workspace_id: "w".into(),
         };
@@ -545,14 +552,26 @@ mod tests {
                     "total_tokens_out": 2,
                     "total_tokens_cached": 3,
                     "duration_ms": 9
+                },
+                {
+                    "run_id": "run_3",
+                    "prompt": "third prompt",
+                    "transcript_path": "/t/run_3.jsonl",
+                    "status": "error",
+                    "error": "provider: API error 401",
+                    "total_tokens_in": 0,
+                    "total_tokens_out": 0,
+                    "total_tokens_cached": 0,
+                    "duration_ms": 0
                 }
             ]
         }"#;
         let rows = session_runs_from_json(json).expect("parse");
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         // Order preserved.
         assert_eq!(rows[0].run_id, "run_1");
         assert_eq!(rows[1].run_id, "run_2");
+        assert_eq!(rows[2].run_id, "run_3");
         // Prompt + transcript preserved.
         assert_eq!(rows[0].prompt, "first prompt");
         assert_eq!(rows[0].transcript_path, "/t/run_1.jsonl");
@@ -569,6 +588,9 @@ mod tests {
         assert_eq!(rows[0].completed_at.as_deref(), Some("2026-06-26T00:01:00Z"));
         assert_eq!(rows[1].status.as_deref(), Some("error"));
         assert_eq!(rows[1].started_at, None);
+        // Per-run error is surfaced.
+        assert_eq!(rows[0].error, None);
+        assert_eq!(rows[2].error.as_deref(), Some("provider: API error 401"));
     }
 
     #[test]
