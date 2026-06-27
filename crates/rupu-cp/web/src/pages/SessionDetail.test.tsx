@@ -1,12 +1,13 @@
 // @vitest-environment jsdom
 // SessionDetail composer — an operator types a message and sends it into a
 // live session. The send is fire-and-forget (POST /api/sessions/:id/send) and
-// the new turn run surfaces via an immediate getAgentRuns() refetch.
+// the new turn surfaces via an immediate getSessionRuns() refetch.
 //
-// RunUsageTimeline is mocked so the test never pulls in recharts.
+// RunUsageTimeline (recharts) and TranscriptPanel (the conversation child) are
+// both mocked so the test never pulls in their heavy deps.
 
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeAll, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api, type SessionSummary } from '../lib/api';
@@ -16,7 +17,17 @@ vi.mock('../components/charts/RunUsageTimeline', () => ({
   default: () => <div data-testid="usage-timeline-mock">chart</div>,
 }));
 
+vi.mock('../components/TranscriptPanel', () => ({
+  __esModule: true,
+  default: ({ path }: { path: string }) => <div data-testid="transcript-panel">transcript:{path}</div>,
+}));
+
 import SessionDetailPage from './SessionDetail';
+
+// jsdom doesn't implement scrollIntoView (used by the conversation auto-scroll).
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn();
+});
 
 afterEach(() => {
   cleanup();
@@ -42,7 +53,7 @@ const STOPPED_SESSION: SessionSummary = {
 function stubApi(session: SessionSummary) {
   vi.spyOn(api, 'getSession').mockResolvedValue(session);
   vi.spyOn(api, 'getSessionUsageTimeline').mockResolvedValue([]);
-  vi.spyOn(api, 'getAgentRuns').mockResolvedValue([]);
+  vi.spyOn(api, 'getSessionRuns').mockResolvedValue([]);
 }
 
 function renderPage() {
@@ -56,15 +67,19 @@ function renderPage() {
 }
 
 describe('SessionDetail composer', () => {
-  it('sends a typed message into the session and clears the box', async () => {
+  it('sends a typed message into the session, clears the box, and refetches runs', async () => {
     stubApi(ACTIVE_SESSION);
     const sendSpy = vi.spyOn(api, 'sendSessionMessage').mockResolvedValue({ run_id: 'run-9' });
+    const runsSpy = api.getSessionRuns as unknown as ReturnType<typeof vi.fn>;
 
     renderPage();
 
     const textarea = (await screen.findByLabelText('Message this session')) as HTMLTextAreaElement;
-    fireEvent.change(textarea, { target: { value: '  hello there  ' } });
+    // One initial conversation load on mount.
+    await waitFor(() => expect(runsSpy).toHaveBeenCalled());
+    const callsBeforeSend = runsSpy.mock.calls.length;
 
+    fireEvent.change(textarea, { target: { value: '  hello there  ' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send' }));
 
     // Trimmed prompt is sent with the route's session id.
@@ -72,6 +87,8 @@ describe('SessionDetail composer', () => {
     // On success the textarea is cleared and a confirmation shows.
     await waitFor(() => expect(textarea.value).toBe(''));
     expect(screen.getByText(/Sent — turn queued/)).toBeInTheDocument();
+    // The new turn is surfaced via an immediate getSessionRuns() refetch.
+    await waitFor(() => expect(runsSpy.mock.calls.length).toBeGreaterThan(callsBeforeSend));
   });
 
   it('disables Send when the session is stopped', async () => {
