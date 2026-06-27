@@ -133,6 +133,10 @@ pub struct StartArgs {
     pub target: Option<String>,
     /// Optional initial user message. Defaults to `go` if omitted.
     pub prompt: Option<String>,
+    /// Initial user message via flag (preferred over the positional `prompt`;
+    /// lets a caller pass a prompt without it being parsed as a target).
+    #[arg(long = "prompt")]
+    pub prompt_flag: Option<String>,
     /// Override permission mode (`ask` | `bypass` | `readonly`).
     #[arg(long)]
     pub mode: Option<String>,
@@ -1262,12 +1266,13 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let resolver = rupu_auth::KeychainResolver::new();
     let scm_registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
 
+    let effective_prompt = args.prompt_flag.clone().or_else(|| args.prompt.clone());
     let (run_target, user_message) = match args.target.as_deref() {
-        None => (None, args.prompt.clone().unwrap_or_else(|| "go".into())),
+        None => (None, effective_prompt.clone().unwrap_or_else(|| "go".into())),
         Some(s) => match crate::run_target::parse_run_target(s) {
-            Ok(t) => (Some(t), args.prompt.clone().unwrap_or_else(|| "go".into())),
+            Ok(t) => (Some(t), effective_prompt.clone().unwrap_or_else(|| "go".into())),
             Err(_) => {
-                let combined = match args.prompt.as_deref() {
+                let combined = match effective_prompt.as_deref() {
                     Some(p) => format!("{s} {p}"),
                     None => s.to_string(),
                 };
