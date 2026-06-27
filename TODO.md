@@ -213,7 +213,7 @@ Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (P
 - **Agent / workflow definition delete** — no subcommand, no engine fn.
 
 **Phase 3 (Authoring) — in progress:** in-browser edit of agent `.md` and workflow `.yaml`, gated by `AgentSpec::parse` / `Workflow::parse` validation. Pure-state file writes (rupu-cp can validate+write directly; no subprocess). Slices:
-- 🚧 **3a — agent `.md` editor**: edit/create/delete global agents (`global_dir/agents/<name>.md`), validated by `AgentSpec::parse`; CodeMirror editor (deps already installed, lazy-chunked). v1 = global agents only (project-agent editing is a follow-up).
-- ⬜ **3b — workflow `.yaml` editor**: same pattern, validated by `Workflow::parse`.
+- ✅ **3a — agent `.md` editor** (#377): edit/create/delete global agents (`global_dir/agents/<name>.md`), validated by `AgentSpec::parse`; lazy CodeMirror editor. Path-safety (`validate_name`) + validate-before-write + atomic tmp+rename. v1 = global agents only (project-agent editing is a follow-up).
+- ✅ **3b — workflow `.yaml` editor**: same pattern, validated by `Workflow::parse`; shares the `api::fs_safety` helpers (`validate_name`/`write_atomic`) lifted from 3a. v1 = global workflows only.
 - ⬜ **3c — visual workflow DAG editor**: `@xyflow/react` canvas → the same YAML the CLI runs. The big one.
 - Phase 4 = auth/RBAC for beyond-localhost.
