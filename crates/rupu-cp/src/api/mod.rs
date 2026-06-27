@@ -6,6 +6,7 @@ pub mod coverage;
 pub mod dashboard;
 pub mod events;
 pub mod findings;
+pub mod fs_safety;
 pub mod graph;
 pub mod projects;
 pub mod run_streams;
