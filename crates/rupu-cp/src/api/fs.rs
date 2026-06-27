@@ -65,9 +65,10 @@ fn home_dir() -> String {
 
 async fn browse(Query(q): Query<BrowseQuery>) -> ApiResult<Json<BrowseResult>> {
     let path = q.path.filter(|s| !s.is_empty()).unwrap_or_else(home_dir);
-    browse_dir(&path)
-        .map(Json)
-        .map_err(ApiError::bad_request)
+    let res = tokio::task::spawn_blocking(move || browse_dir(&path))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    res.map(Json).map_err(ApiError::bad_request)
 }
 
 #[cfg(test)]

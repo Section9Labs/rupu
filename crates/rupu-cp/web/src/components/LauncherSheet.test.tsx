@@ -66,4 +66,54 @@ describe('LauncherSheet', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('no launcher');
     expect(navigateMock).not.toHaveBeenCalled();
   });
+
+  it('calls launchRun with working_dir when Directory mode is selected', async () => {
+    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
+    vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/h', parent: null, dirs: [] });
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-dir' });
+
+    render(<LauncherSheet workflow="deploy" declaredInputs={[]} onClose={() => {}} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Directory' }));
+
+    fireEvent.change(screen.getByLabelText('Directory path'), {
+      target: { value: '/tmp/myproject' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Launch' }));
+
+    await waitFor(() =>
+      expect(launchSpy).toHaveBeenCalledWith('deploy', {
+        inputs: undefined,
+        mode: 'ask',
+        target: undefined,
+        working_dir: '/tmp/myproject',
+      }),
+    );
+  });
+
+  it('calls launchRun with target when Repository mode is selected', async () => {
+    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
+    const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-repo' });
+
+    render(<LauncherSheet workflow="deploy" declaredInputs={[]} onClose={() => {}} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Repository' }));
+
+    fireEvent.change(screen.getByLabelText('Target'), {
+      target: { value: 'github:owner/repo' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Launch' }));
+
+    await waitFor(() =>
+      expect(launchSpy).toHaveBeenCalledWith('deploy', {
+        inputs: undefined,
+        mode: 'ask',
+        target: 'github:owner/repo',
+        working_dir: undefined,
+      }),
+    );
+  });
 });
