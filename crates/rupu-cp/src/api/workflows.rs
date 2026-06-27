@@ -259,6 +259,7 @@ mod tests {
             session_sender: None,
             repos: None,
             agent_launcher: None,
+            session_starter: None,
         }
     }
 

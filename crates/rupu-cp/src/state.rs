@@ -24,6 +24,9 @@ pub struct AppState {
     /// Optional agent-launcher port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess-spawning adapter via [`AppState::with_agent_launcher`].
     pub agent_launcher: Option<Arc<dyn crate::agent_launcher::AgentLauncher>>,
+    /// Optional session-starter port. Defaults to `None`; rupu-cli's `cp serve`
+    /// installs a subprocess-spawning adapter via [`AppState::with_session_starter`].
+    pub session_starter: Option<Arc<dyn crate::session_starter::SessionStarter>>,
 }
 
 impl AppState {
@@ -40,6 +43,7 @@ impl AppState {
             session_sender: None,
             repos: None,
             agent_launcher: None,
+            session_starter: None,
         }
     }
 
@@ -76,6 +80,15 @@ impl AppState {
         launcher: Option<Arc<dyn crate::agent_launcher::AgentLauncher>>,
     ) -> Self {
         self.agent_launcher = launcher;
+        self
+    }
+
+    /// Install a session-starter adapter (or clear it with `None`).
+    pub fn with_session_starter(
+        mut self,
+        starter: Option<Arc<dyn crate::session_starter::SessionStarter>>,
+    ) -> Self {
+        self.session_starter = starter;
         self
     }
 

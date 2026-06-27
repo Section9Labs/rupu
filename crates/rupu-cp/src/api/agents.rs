@@ -2,6 +2,7 @@ use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
     api::fs_safety::{validate_name, write_atomic},
     error::{ApiError, ApiResult},
+    session_starter::{SessionStartError, SessionStartRequest, SessionStarter},
     state::AppState,
 };
 use axum::{
@@ -22,6 +23,7 @@ pub fn routes() -> Router<AppState> {
             get(get_agent).put(write_agent).delete(delete_agent),
         )
         .route("/api/agents/:name/run", post(run_agent))
+        .route("/api/agents/:name/session", post(start_session))
 }
 
 /// Directory where global agent `.md` definitions live.
@@ -271,10 +273,62 @@ async fn run_agent(
     Ok(Json(serde_json::json!({ "run_id": run_id })))
 }
 
+/// Request body for `POST /api/agents/:name/session`. All fields optional; a
+/// bodyless POST starts the agent session with no prompt in its default mode.
+#[derive(Deserialize, Default)]
+struct SessionStartBody {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
+}
+
+/// Testable core: map the body + a concrete starter to a session id.
+async fn start_session_with(
+    name: &str,
+    body: SessionStartBody,
+    starter: Arc<dyn SessionStarter>,
+) -> Result<String, ApiError> {
+    let req = SessionStartRequest {
+        agent: name.to_string(),
+        prompt: body.prompt,
+        mode: body.mode,
+        target: body.target,
+        working_dir: body.working_dir,
+    };
+    starter.start(req).await.map_err(|e| match e {
+        SessionStartError::Invalid(m) => ApiError::bad_request(m),
+        SessionStartError::Spawn(m) => ApiError::internal(m),
+    })
+}
+
+/// Start a fresh session of agent `:name` via the configured [`SessionStarter`].
+/// Returns the new session id. 501 when no starter is installed (read-only deploy).
+///
+/// [`SessionStarter`]: crate::session_starter::SessionStarter
+async fn start_session(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    body: Option<Json<SessionStartBody>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let starter = s
+        .session_starter
+        .clone()
+        .ok_or_else(|| ApiError::not_available("starting sessions requires `rupu cp serve`"))?;
+    let session_id =
+        start_session_with(&name, body.map(|b| b.0).unwrap_or_default(), starter).await?;
+    Ok(Json(serde_json::json!({ "session_id": session_id })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher};
+    use crate::session_starter::{SessionStartError, SessionStartRequest, SessionStarter};
     use rupu_orchestrator::RunStore;
     use std::sync::{Arc, Mutex};
 
@@ -301,6 +355,7 @@ mod tests {
             session_sender: None,
             repos: None,
             agent_launcher: None,
+            session_starter: None,
         }
     }
 
@@ -397,5 +452,48 @@ mod tests {
             .block_on(delete_agent(State(s.clone()), Path("code-reviewer".into())))
             .expect_err("absent");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    struct MockStarter {
+        last: Mutex<Option<SessionStartRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStarter for MockStarter {
+        async fn start(&self, req: SessionStartRequest) -> Result<String, SessionStartError> {
+            *self.last.lock().unwrap() = Some(req);
+            Ok("ses_TEST".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn start_session_forwards_request() {
+        let mock = Arc::new(MockStarter {
+            last: Mutex::new(None),
+        });
+        let body = SessionStartBody {
+            prompt: Some("hi".into()),
+            mode: Some("ask".into()),
+            target: None,
+            working_dir: Some("/tmp/p".into()),
+        };
+        let id = start_session_with("triage", body, mock.clone())
+            .await
+            .expect("ok");
+        assert_eq!(id, "ses_TEST");
+        let got = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(got.agent, "triage");
+        assert_eq!(got.prompt.as_deref(), Some("hi"));
+        assert_eq!(got.working_dir.as_deref(), Some("/tmp/p"));
+    }
+
+    #[tokio::test]
+    async fn start_session_without_starter_is_not_available() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // session_starter: None
+        let err = start_session(State(s), Path("triage".into()), None)
+            .await
+            .expect_err("no starter");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 }

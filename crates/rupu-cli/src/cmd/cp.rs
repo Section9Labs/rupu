@@ -81,7 +81,12 @@ pub async fn handle(action: Action) -> ExitCode {
             // `rupu session send <id> "<prompt>" --detach` using this same
             // binary, reusing the launcher's resolved exe.
             let session_sender: Arc<dyn rupu_cp::session_sender::SessionSender> =
-                Arc::new(crate::cp_session_sender::SubprocessSessionSender { exe });
+                Arc::new(crate::cp_session_sender::SubprocessSessionSender { exe: exe.clone() });
+
+            // Adapter for rupu-cp's SessionStarter port: shells
+            // `rupu session start <agent> … --detach` using this same binary.
+            let session_starter: Option<Arc<dyn rupu_cp::session_starter::SessionStarter>> =
+                Some(Arc::new(crate::cp_session_starter::SubprocessSessionStarter { exe }));
 
             // Repo lister for the web Run target picker.
             let repos: Option<Arc<dyn rupu_cp::repos::RepoLister>> = {
@@ -102,6 +107,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 session_sender: Some(session_sender),
                 repos,
                 agent_launcher,
+                session_starter,
             })
             .await;
 
