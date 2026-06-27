@@ -46,90 +46,98 @@ Each phase is its own plan + PR. This spec details A fully and scopes B and C.
 
 ---
 
-## Sub-project A — Run + Cancel (full detail)
+## Already built (discovered during design — do NOT rebuild)
 
-### CLI change (`rupu-cli`)
-- Add a `--run-id <id>` flag to `workflow run` (`crates/rupu-cli/src/cmd/workflow.rs`
-  `Run` clap variant). The plumbing already exists (`run_id_override` flows to
-  the orchestrator); the flag just exposes it so the CP can pre-generate the id
-  and link the web straight to `/runs/<id>`. Default unchanged (generate a ULID
-  when absent).
+The backend launch + cancel machinery already exists:
+- `rupu workflow run` already accepts `--run-id` (`workflow.rs` `Run` variant)
+  and `RunStatus::Cancelled` already exists.
+- `rupu-cp` defines a `RunLauncher` port (`crates/rupu-cp/src/launcher.rs`):
+  `LaunchRequest { workflow, inputs: BTreeMap<String,String>, mode: Option<String>,
+  target: Option<String> }` → `launch() -> Result<String /*run_id*/, LaunchError>`.
+  `AppState.launcher: Option<Arc<dyn RunLauncher>>`; `ApiError::not_available()`
+  (501) is the "no launcher (read-only `rupu cp`)" response.
+- `rupu-cli` provides the adapter `SubprocessLauncher` (`crates/rupu-cli/src/cp_launcher.rs`),
+  installed by `cp serve` (`cmd/cp.rs`). `build_run_argv` →
+  `workflow run <name> [target] --run-id <id> --plain [--input k=v]… [--mode m]`;
+  `launch()` mints `run_<ULID>`, spawns the child, returns the id.
+- Cancel is complete: `POST /api/runs/:id/cancel` → `RunStore::cancel`, which
+  marks `Cancelled`, sets `finished_at`, and SIGTERMs the run's `runner_pid`
+  (guarding against signalling the cp-serve PID itself); awaiting-approval →
+  reject; terminal → 409. The run process records its own `runner_pid`.
 
-### Run status (`rupu-orchestrator`)
-- Add a `RunStatus::Cancelled` variant (today: Pending | Running | Completed |
-  Failed | AwaitingApproval | Rejected). Serializes `"cancelled"`. Treated as a
-  terminal status everywhere status is matched (lists, filters, UI color).
+So the run survives the CP because it's a separate child process the CP only
+launched; cancel works because the run records its pid and the CP signals it.
 
-### Dispatch endpoint (`rupu-cp`)
-- `POST /api/workflows/:name/dispatch` with body
-  `{ inputs: Record<string,string>, mode: "ask"|"bypass"|"readonly", target: Target }`
-  where `Target` is one of:
-  - `{ kind: "project", ws_id }` → working dir = that workspace's path.
-  - `{ kind: "directory", path }` → working dir = that path.
-  - `{ kind: "repo", repo_ref }` → passed as the CLI positional target (the CLI
-    clones it); working dir = a neutral dir (e.g. `<global>`).
-- Handler:
-  1. Validate the workflow exists (stem under `<global>/workflows/`) and the
-     mode is one of the three.
-  2. Generate `run_id = "run_<ULID>"`.
-  3. Build argv: `<current_exe> workflow run <name> [repo_ref] --run-id <id>
-     --mode <m> --input k=v … --plain`.
-  4. Spawn **detached** in a new process group (`setsid` / `process_group(0)`)
-     with `current_dir` set to the resolved working dir, stdout+stderr
-     redirected to `<global>/runs/<id>/launch.log`.
-  5. Write a sidecar `<global>/runs/<id>/launch.json` = `{ pid, pgid,
-     spawned_at }`.
-  6. Return `{ run_id }` immediately.
-- `--plain` is passed so the spawned process doesn't start the interactive TUI.
-- The CP never runs the orchestrator in-process; it only launches + records.
+## Sub-project A — gaps to close
 
-### Cancel endpoint (`rupu-cp`)
-- `POST /api/runs/:id/cancel`:
-  1. Load the run record. If status is terminal (Completed/Failed/Rejected/
-     Cancelled) → no-op, return current state.
-  2. Read `launch.json`; if present and status is `Running`/`Pending`, send
-     `SIGTERM` to the **process group** (`-pgid`), then `SIGKILL` after a short
-     grace window if still alive. (Signal helper via `nix`/`libc`; macOS target.)
-  3. Set the run record status to `Cancelled` (CP marker-write, mirroring how
-     `reject` sets status directly), with `finished_at = now`.
-  4. Return the updated run.
-- Guards: only signal when status is non-terminal (avoids PID-reuse hits on an
-  already-exited run). Works after a CP restart since pid/pgid live on disk.
+### A1. Detach the spawned run (`rupu-cli` `cp_launcher.rs`)
+The current `SubprocessLauncher::launch` spawns the child in the cp-serve
+process group with inherited stdio. A `Ctrl-C`/SIGINT to `cp serve` would then
+also hit the run. To honor "the run survives if the CP closes," harden the spawn:
+- Put the child in its **own process group/session** (`CommandExt::process_group(0)`
+  on Unix) so terminal signals to `cp serve` don't propagate.
+- Redirect the child's stdout/stderr to `Stdio::null()` (it writes its own
+  run.json/events.jsonl/transcripts; nothing useful goes to the inherited TTY).
+- Keep `build_run_argv` and the returned `run_<ULID>` id unchanged.
+
+### A2. Dispatch endpoint (`rupu-cp`)
+Add `POST /api/workflows/:name/dispatch` with body
+`{ inputs: Record<string,string>, mode?: "ask"|"bypass"|"readonly", target?: string }`
+where `target` is the CLI positional target string (basic in A: a repo-ref like
+`github:owner/repo`, or empty for "current"). Handler:
+1. If `s.launcher` is `None` → `ApiError::not_available("run dispatch requires `rupu cp serve`")`.
+2. Validate the workflow exists (stem under `<global>/workflows/`) and `mode`
+   (when present) is one of the three.
+3. Build `LaunchRequest { workflow: name, inputs, mode, target }`, call
+   `s.launcher.launch(req).await`, map `LaunchError::Invalid` → 400 /
+   `LaunchError::Spawn` → 500, and return `{ run_id }`.
+
+Note: A's target is the CLI target string (project/working-dir selection and the
+fuzzy pickers are sub-project B; the existing launcher runs the child in the
+cp-serve cwd, and repo-refs clone themselves). B will extend `LaunchRequest`
+with an explicit working directory.
 
 ### Frontend (`rupu-cp/web`)
-- **api.ts**: `dispatchWorkflow(name, body): Promise<{ run_id }>`,
-  `cancelRun(id): Promise<RunDetail>`, plus `DispatchBody` / `Target` types.
+- **api.ts**: `dispatchWorkflow(name, body): Promise<{ run_id: string }>` and
+  `cancelRun(id): Promise<RunResponse>`, plus a `DispatchBody` type
+  `{ inputs: Record<string,string>; mode?: string; target?: string }`.
 - **Run modal** (new lightweight Tailwind modal component — no new deps) opened
   by a **Run** button on `WorkflowDetail`:
   - Inputs: one field per the workflow's declared `inputs` (string/int/bool),
-    read from `detail.workflow.inputs`.
+    read from `detail.workflow.inputs` (narrowed defensively).
   - Mode: select Ask / Bypass / Read-only.
-  - Target (basic in A): radio — Existing project (dropdown from `getProjects`)
-    / Directory (text path) / Repository (text repo-ref).
-  - A note: "Runs start in the background and continue even if this page closes."
-  - Submit → `dispatchWorkflow` → navigate to `/runs/<run_id>`.
+  - Target (basic in A): a single optional text field — a run-target string
+    (e.g. `github:owner/repo`), blank = run in the cp-serve working dir. (The
+    project/directory pickers come in B once `LaunchRequest` gains a working
+    dir.)
+  - A note: "Runs start in the background and keep running even if this page or
+    the CP is closed."
+  - Submit → `dispatchWorkflow` → navigate to `/runs/<run_id>`. On 501 show
+    "dispatch requires `rupu cp serve`."
 - **Cancel button** on `RunDetail` (and run rows) shown when status is
-  `Running`/`Pending`/`AwaitingApproval` → `cancelRun(id)` → reflect `Cancelled`.
+  `Running`/`Pending`/`AwaitingApproval` → `cancelRun(id)` → reflect the
+  returned status. (Cancel endpoint already exists.)
 
 ### Testing (A)
-- `rupu-cli`: `--run-id` flag parsed and threaded to `run_id_override` (arg-parse
-  test).
-- `rupu-orchestrator`: `RunStatus::Cancelled` serde round-trip + terminal-status
-  treatment.
-- `rupu-cp`: dispatch handler builds the expected argv + writes `launch.json`
-  (factor argv construction into a pure, testable function); cancel handler sets
-  status `Cancelled` and no-ops on terminal runs (use a tempfile run store
-  fixture).
+- `rupu-cli`: extend `cp_launcher` tests if argv changes (it shouldn't); the
+  detach change is behavioural — covered by the existing argv tests staying green
+  plus a manual note.
+- `rupu-cp`: dispatch handler — `launcher: None` → 501; with a mock
+  `RunLauncher`, a valid body → returns the mock's run id and forwards the
+  `LaunchRequest` (workflow/inputs/mode/target) unchanged; unknown workflow →
+  404; bad mode → 400.
 - web (vitest): Run-form renders fields from a workflow-inputs definition and
   builds the correct `DispatchBody`; Cancel button visibility by status.
 
 ### Risks / notes (A)
-- Spawn-failure (bad args, missing binary): validate workflow + mode before
-  spawn; surface spawn errors; `launch.log` captures CLI stderr for debugging.
-- If the spawned CLI fails before writing `run.json`, `/runs/<id>` would 404
-  briefly — mitigated by pre-spawn validation; acceptable for v1.
-- Hard-kill cancel may leave a partially-written transcript; the CP-written
-  `Cancelled` status keeps the UI correct regardless.
+- Spawn-failure (bad args): `LaunchError::Spawn` → 500; the child also captures
+  nothing useful (stdio null) — failures surface via the absent/failed run.
+- If the spawned CLI fails before writing `run.json`, `/runs/<id>` shows
+  "loading/not found" briefly — mitigated by validating the workflow exists
+  before launch; acceptable for v1.
+- Cancel is a hard SIGTERM to `runner_pid` (already implemented); a partially
+  written transcript is possible, but the CP-written `Cancelled` status keeps
+  the UI correct.
 
 ---
 
