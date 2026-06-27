@@ -861,10 +861,14 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             total_out += resp.usage.output_tokens as u64;
             writer.write(&Event::Usage {
                 provider: opts.provider_name.clone(),
-                model: if resp.model.is_empty() {
-                    opts.model.clone()
-                } else {
-                    resp.model.clone()
+                model: opts.model.clone(), // requested model (meaningful attribution; priced)
+                served_model: {
+                    let s = resp.model.trim();
+                    if !s.is_empty() && s != opts.model {
+                        Some(s.to_string())
+                    } else {
+                        None
+                    }
                 },
                 input_tokens: resp.usage.input_tokens,
                 output_tokens: resp.usage.output_tokens,
@@ -1358,6 +1362,88 @@ mod on_tool_call_tests {
         assert_eq!(
             result.turns, 1,
             "must terminate after the single turn, not continue looping"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_records_requested_model_and_served_model_separately() {
+        // The provider echoes a served id ("mock-1") that differs from the
+        // requested model. The Usage event must attribute spend to the
+        // *requested* model and stash the served id in `served_model`.
+        let tmp_dir = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp_dir.path().join("run_usage_model.jsonl");
+
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "done".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 7,
+            output_tokens: 3,
+        }]);
+
+        let opts = AgentRunOpts {
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider: Box::new(provider),
+            provider_name: "anthropic".into(),
+            model: "claude-opus-4-8".into(),
+            run_id: "run_usage_model".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp_dir.path().to_path_buf(),
+            transcript_path: transcript_path.clone(),
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: tmp_dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            user_message: "do the thing".into(),
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            no_stream: true,
+            suppress_stream_stdout: false,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: None,
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
+        };
+
+        run_agent(opts).await.expect("agent run succeeds");
+
+        let body = std::fs::read_to_string(&transcript_path).expect("read transcript");
+        let usage = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Event>(l).ok())
+            .find_map(|ev| match ev {
+                Event::Usage {
+                    model,
+                    served_model,
+                    ..
+                } => Some((model, served_model)),
+                _ => None,
+            })
+            .expect("transcript has a Usage event");
+        assert_eq!(usage.0, "claude-opus-4-8", "model is the requested model");
+        assert_eq!(
+            usage.1.as_deref(),
+            Some("mock-1"),
+            "served_model is the provider-echoed id when it differs"
         );
     }
 }

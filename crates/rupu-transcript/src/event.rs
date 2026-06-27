@@ -80,6 +80,8 @@ pub enum Event {
     Usage {
         provider: String,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
         input_tokens: u32,
         output_tokens: u32,
         #[serde(default)]

@@ -1239,6 +1239,7 @@ pub async fn run_live_view(
                     input_tokens,
                     output_tokens,
                     cached_tokens,
+                    ..
                 } = &ev
                 {
                     state.add_active_tokens(*input_tokens as u64, *output_tokens as u64);

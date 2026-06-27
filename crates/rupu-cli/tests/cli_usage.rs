@@ -57,6 +57,7 @@ fn write_usage_transcript(
         .write(&Event::Usage {
             provider: provider.into(),
             model: model.into(),
+            served_model: None,
             input_tokens,
             output_tokens,
             cached_tokens: 0,
