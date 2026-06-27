@@ -119,7 +119,7 @@ export default function ProjectDefinitions() {
   const encodedId = encodeURIComponent(wsId ?? '');
 
   return (
-    <div className="max-w-5xl">
+    <div>
       <header className="px-8 pt-8 pb-3">
         <Link
           to={`/projects/${encodedId}`}

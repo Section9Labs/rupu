@@ -126,7 +126,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
   });
 
   return (
-    <div className="p-8 max-w-5xl">
+    <div className="p-8">
       <BackLink />
 
       {/* Header */}

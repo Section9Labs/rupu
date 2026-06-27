@@ -275,7 +275,7 @@ export default function Dashboard() {
   const spendPartial = summary != null && summary.cost_usd !== null && !summary.priced;
 
   return (
-    <div className="p-8 max-w-6xl">
+    <div className="p-8">
       {/* Header */}
       <header className="flex items-center justify-between mb-6 gap-4 flex-wrap">
         <div>
