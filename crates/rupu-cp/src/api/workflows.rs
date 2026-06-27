@@ -170,6 +170,7 @@ mod tests {
             run_store: Arc::new(store),
             pricing: rupu_config::PricingConfig::default(),
             launcher: None,
+            session_sender: None,
         }
     }
 

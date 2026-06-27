@@ -8,6 +8,7 @@ pub mod error;
 pub mod launcher;
 pub mod pagination;
 pub mod server;
+pub mod session_sender;
 pub mod sse;
 pub mod state;
 pub mod transcript_tail;
@@ -31,6 +32,10 @@ pub struct ServeOpts {
     /// Optional run-launcher adapter. rupu-cli's `cp serve` provides the
     /// subprocess-spawning impl; `None` disables launching from the web UI.
     pub launcher: Option<std::sync::Arc<dyn crate::launcher::RunLauncher>>,
+    /// Optional session-sender adapter. rupu-cli's `cp serve` provides the
+    /// subprocess-spawning impl; `None` disables sending to sessions from the
+    /// web UI.
+    pub session_sender: Option<std::sync::Arc<dyn crate::session_sender::SessionSender>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -82,7 +87,9 @@ fn load_pricing(global_dir: &Path) -> PricingConfig {
 pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let open_browser = opts.open_browser;
     let pricing = load_pricing(&opts.global_dir);
-    let app_state = state::AppState::new(opts.global_dir, pricing).with_launcher(opts.launcher);
+    let app_state = state::AppState::new(opts.global_dir, pricing)
+        .with_launcher(opts.launcher)
+        .with_session_sender(opts.session_sender);
     let app = server::router(app_state, opts.token);
 
     let listener = tokio::net::TcpListener::bind(opts.bind)
