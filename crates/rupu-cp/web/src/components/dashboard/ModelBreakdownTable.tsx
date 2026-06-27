@@ -104,12 +104,16 @@ export default function ModelBreakdownTable({ rows }: { rows: UsageBreakdownRow[
 
   return (
     <div className="flex flex-col">
-      <table className="w-full text-xs">
+      {/* table-fixed + sized number columns: with auto layout the table grew
+          past `w-full` on the narrow card and the Share bar bled outside the
+          card border. Fixed layout lets the Model name flex + truncate while
+          the numeric/Share columns keep their width — nothing overflows. */}
+      <table className="w-full table-fixed text-xs">
         <thead>
           <tr className="text-ink-mute text-[10px] uppercase tracking-wide">
             <th className="text-left font-medium pb-2">Model</th>
-            <th className="text-right font-medium pb-2">Tokens</th>
-            <th className="text-right font-medium pb-2">Cost</th>
+            <th className="text-right font-medium pb-2 w-14">Tokens</th>
+            <th className="text-right font-medium pb-2 w-20">Cost</th>
             <th className="text-right font-medium pb-2 w-24">Share</th>
           </tr>
         </thead>
@@ -130,8 +134,10 @@ export default function ModelBreakdownTable({ rows }: { rows: UsageBreakdownRow[
                     style={{ background: colorFor(r) }}
                   />
                   <span className="min-w-0">
-                    <span className="text-ink font-medium truncate block max-w-[160px]">{r.label}</span>
-                    {r.provider && <span className="text-ink-mute text-[10px]">{r.provider}</span>}
+                    <span className="text-ink font-medium truncate block">{r.label}</span>
+                    {r.provider && (
+                      <span className="text-ink-mute text-[10px] truncate block">{r.provider}</span>
+                    )}
                   </span>
                 </div>
               </td>
