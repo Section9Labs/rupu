@@ -171,13 +171,17 @@ export default function TargetPicker({ value, onChange, disabled }: TargetPicker
       setDirs([]);
       return;
     }
+    let cancelled = false;
     browseTimer.current = setTimeout(() => {
       api
         .browseDir(query)
-        .then((res) => setDirs(dirItems(res.dirs)))
-        .catch(() => setDirs([]));
+        .then((res) => { if (!cancelled) setDirs(dirItems(res.dirs)); })
+        .catch(() => { if (!cancelled) setDirs([]); });
     }, 150);
-    return () => { if (browseTimer.current) clearTimeout(browseTimer.current); };
+    return () => {
+      cancelled = true;
+      if (browseTimer.current) clearTimeout(browseTimer.current);
+    };
   }, [query]);
 
   // Close on outside click.
@@ -265,6 +269,31 @@ export default function TargetPicker({ value, onChange, disabled }: TargetPicker
         }}
         onFocus={() => setOpen(true)}
         onBlur={() => {
+          // Resolve the current query text and commit to parent synchronously
+          // (before the blur timer, so the parent has the correct value when
+          // e.g. the Launch button's onClick fires immediately after blur).
+          const q = query.trim();
+          if (q === '') {
+            onChange(WORKSPACE_ITEM);
+            setQuery(WORKSPACE_ITEM.label);
+          } else {
+            // Exact case-insensitive label match against base candidates.
+            const matched = baseItems.find(
+              (it) => it.label.toLowerCase() === q.toLowerCase(),
+            );
+            if (matched) {
+              onChange(matched);
+            } else {
+              const free = inferFreeTextItem(q);
+              if (free) {
+                onChange(free);
+              } else {
+                // Unresolvable — revert the visible text to the last committed value.
+                setQuery(value.label);
+              }
+            }
+          }
+          // Schedule dropdown close (delay lets row mousedown fire first).
           blurTimer.current = setTimeout(() => setOpen(false), 150);
         }}
         onKeyDown={onKeyDown}
