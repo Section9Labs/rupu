@@ -6,6 +6,7 @@
 //! one-line wrapper that calls into here.
 
 pub mod cmd;
+pub mod cp_agent_launcher;
 pub mod cp_launcher;
 pub mod cp_repos;
 pub mod cp_session_sender;
