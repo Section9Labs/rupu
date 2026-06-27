@@ -1,16 +1,14 @@
 // AgentLauncherSheet — modal sheet to dispatch an agent run from the browser.
 //
-// Prompt textarea + Mode picker (Ask / Bypass / Read-only) + target-mode
-// selector (Workspace / Directory / Repository). On Launch it POSTs to
-// /api/agents/:name/run and navigates to the new run's detail page.
+// Prompt textarea + Mode picker (Ask / Bypass / Read-only) + TargetPicker.
+// On Launch it POSTs to /api/agents/:name/run and navigates to the new run's
+// detail page.
 
 import { useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type LaunchMode, type RepoEntry } from '../lib/api';
-import Combobox, { type ComboboxOption } from './Combobox';
-import DirectoryPicker from './DirectoryPicker';
-
-export type AgentTargetMode = 'workspace' | 'directory' | 'repo';
+import { api, type LaunchMode } from '../lib/api';
+import TargetPicker from './TargetPicker';
+import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
 
 export interface AgentLaunch {
   prompt?: string;
@@ -19,23 +17,13 @@ export interface AgentLaunch {
   working_dir?: string;
 }
 
-export function buildAgentLaunch(
-  prompt: string,
-  mode: LaunchMode,
-  targetMode: AgentTargetMode,
-  target: string,
-  workingDir: string,
-): AgentLaunch {
+export function buildAgentLaunch(prompt: string, mode: LaunchMode, target: TargetItem): AgentLaunch {
   const out: AgentLaunch = { mode };
   const p = prompt.trim();
   if (p) out.prompt = p;
-  if (targetMode === 'repo') { const t = target.trim(); if (t) out.target = t; }
-  if (targetMode === 'directory') { const d = workingDir.trim(); if (d) out.working_dir = d; }
+  if (target.resolved.target) out.target = target.resolved.target;
+  if (target.resolved.working_dir) out.working_dir = target.resolved.working_dir;
   return out;
-}
-
-function repoToOption(r: RepoEntry): ComboboxOption {
-  return { value: `${r.platform}:${r.repo}`, label: r.repo };
 }
 
 export default function AgentLauncherSheet({
@@ -51,10 +39,7 @@ export default function AgentLauncherSheet({
 
   const [prompt, setPrompt] = useState('');
   const [mode, setMode] = useState<LaunchMode>('ask');
-  const [targetMode, setTargetMode] = useState<AgentTargetMode>('workspace');
-  const [target, setTarget] = useState('');
-  const [workingDir, setWorkingDir] = useState('');
-  const [repoOptions, setRepoOptions] = useState<ComboboxOption[]>([]);
+  const [target, setTarget] = useState<TargetItem>(WORKSPACE_ITEM);
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -68,24 +53,12 @@ export default function AgentLauncherSheet({
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
 
-  // Fetch available repos once on open so Target gets typeahead suggestions.
-  useEffect(() => {
-    let cancelled = false;
-    api.getRepos().then((repos: RepoEntry[]) => {
-      if (cancelled) return;
-      setRepoOptions(repos.map(repoToOption));
-    }).catch(() => {
-      // Non-critical — leave repoOptions empty and fall back to free text.
-    });
-    return () => { cancelled = true; };
-  }, []);
-
   async function onLaunch() {
     if (launching) return;
     setLaunching(true);
     setError(null);
     try {
-      const opts = buildAgentLaunch(prompt, mode, targetMode, target, workingDir);
+      const opts = buildAgentLaunch(prompt, mode, target);
       const res = await api.launchAgent(agent, opts);
       navigate(`/runs/${res.run_id}`);
       onClose();
@@ -157,44 +130,8 @@ export default function AgentLauncherSheet({
 
           {/* ── Target ─────────────────────────────────────────────── */}
           <div>
-            <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">
-              Target
-            </span>
-            <div className="mb-2 flex gap-1">
-              {(['workspace', 'directory', 'repo'] as AgentTargetMode[]).map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => setTargetMode(m)}
-                  disabled={launching}
-                  className={
-                    'rounded-md px-2 py-1 text-[12px] font-medium ' +
-                    (targetMode === m
-                      ? 'bg-brand-600 text-white'
-                      : 'border border-border bg-white text-ink-dim hover:bg-slate-50')
-                  }
-                >
-                  {m === 'workspace' ? 'This workspace' : m === 'directory' ? 'Directory' : 'Repository'}
-                </button>
-              ))}
-            </div>
-            {targetMode === 'workspace' && (
-              <p className="text-[11px] text-ink-mute">Runs in the control-plane working directory.</p>
-            )}
-            {targetMode === 'directory' && (
-              <DirectoryPicker value={workingDir} onChange={setWorkingDir} />
-            )}
-            {targetMode === 'repo' && (
-              <Combobox
-                value={target}
-                onChange={setTarget}
-                options={repoOptions}
-                disabled={launching}
-                aria-label="Target"
-                placeholder="e.g. github:owner/repo"
-                className={fieldCls}
-              />
-            )}
+            <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">Target</span>
+            <TargetPicker value={target} onChange={setTarget} disabled={launching} />
           </div>
 
           {error && (
