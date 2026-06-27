@@ -116,7 +116,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   // --- Not-found state ---
   if (notFound) {
     return (
-      <div className="p-8 max-w-5xl">
+      <div className="p-8">
         <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
           <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
             <Activity size={20} className="text-ink-mute" />
@@ -140,7 +140,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   // --- Error state ---
   if (error) {
     return (
-      <div className="p-8 max-w-5xl">
+      <div className="p-8">
         <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
           {error}
         </div>
@@ -151,7 +151,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   // --- Loading state ---
   if (detail === null) {
     return (
-      <div className="p-8 max-w-5xl">
+      <div className="p-8">
         <div className="text-sm text-ink-dim">Loading project…</div>
       </div>
     );
@@ -170,7 +170,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   const encodedId = encodeURIComponent(p.ws_id);
 
   return (
-    <div className="p-8 max-w-5xl space-y-6">
+    <div className="p-8 space-y-6">
       {/* ── Identity header ── */}
       <header className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
         <h1 className="text-lg font-bold text-ink">{p.name}</h1>

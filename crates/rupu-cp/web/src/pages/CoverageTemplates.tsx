@@ -27,7 +27,7 @@ export default function CoverageTemplates() {
   }, []);
 
   return (
-    <div className="p-8 max-w-5xl">
+    <div className="p-8">
       <Link
         to="/coverage"
         className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"

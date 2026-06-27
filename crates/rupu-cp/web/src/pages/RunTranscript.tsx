@@ -32,7 +32,7 @@ export default function RunTranscript() {
   const label = path.split('/').filter(Boolean).pop() ?? 'Transcript';
 
   return (
-    <div className="flex flex-col p-8 max-w-5xl gap-4">
+    <div className="flex flex-col p-8 max-w-5xl mx-auto gap-4">
       <BackButton navigate={navigate} />
 
       <header>
