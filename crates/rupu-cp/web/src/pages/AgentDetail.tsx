@@ -3,19 +3,28 @@
 // highlighting. Route: /agents/:name
 
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
+import { Link, useNavigate, useParams } from 'react-router-dom';
+import { ArrowLeft, Pencil, Trash2 } from 'lucide-react';
 import { api, type AgentDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
+import CodeEditor from '../components/CodeEditor';
 import AgentLauncherSheet from '../components/AgentLauncherSheet';
 
 export default function AgentDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
+  const navigate = useNavigate();
 
   const [agent, setAgent] = useState<AgentDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [runOpen, setRunOpen] = useState(false);
+
+  // ── Edit / delete state ──────────────────────────────────────────────
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!name) return;
@@ -36,6 +45,46 @@ export default function AgentDetailPage() {
       cancelled = true;
     };
   }, [name]);
+
+  function startEdit() {
+    if (!agent) return;
+    setDraft(agent.raw);
+    setSaveError(null);
+    setEditing(true);
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setSaveError(null);
+  }
+
+  async function save() {
+    if (!agent || saving) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const updated = await api.saveAgent(name, draft);
+      setAgent(updated);
+      setDraft(updated.raw);
+      setEditing(false);
+    } catch (e: unknown) {
+      setSaveError(e instanceof Error ? e.message : 'Failed to save agent');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function remove() {
+    if (!agent) return;
+    if (!window.confirm('Delete this agent?')) return;
+    setDeleteError(null);
+    try {
+      await api.deleteAgent(name);
+      navigate('/agents');
+    } catch (e: unknown) {
+      setDeleteError(e instanceof Error ? e.message : 'Failed to delete agent');
+    }
+  }
 
   if (error) {
     return (
@@ -64,15 +113,31 @@ export default function AgentDetailPage() {
       <header className="mt-3">
         <div className="flex flex-wrap items-start gap-2">
           <h1 className="text-2xl font-semibold text-ink break-all">{agent.name}</h1>
-          <button
-            type="button"
-            onClick={() => setRunOpen(true)}
-            aria-label={`Run ${agent.name}`}
-            className="ml-auto inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
-          >
-            Run
-          </button>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={remove}
+              aria-label={`Delete ${agent.name}`}
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-red-700 hover:bg-red-50"
+            >
+              <Trash2 size={14} />
+              Delete
+            </button>
+            <button
+              type="button"
+              onClick={() => setRunOpen(true)}
+              aria-label={`Run ${agent.name}`}
+              className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
+            >
+              Run
+            </button>
+          </div>
         </div>
+        {deleteError && (
+          <p role="alert" className="mt-2 text-[12px] font-medium text-red-700">
+            {deleteError}
+          </p>
+        )}
         <div className="mt-2 flex flex-wrap items-center gap-2">
           {agent.provider && <MetaChip>{agent.provider}</MetaChip>}
           {agent.model && <MetaChip>{agent.model}</MetaChip>}
@@ -87,8 +152,54 @@ export default function AgentDetailPage() {
       </header>
 
       <section className="mt-8">
-        <h2 className="text-sm font-semibold text-ink mb-2 pl-1">Definition</h2>
-        {agent.raw ? (
+        <div className="mb-2 flex items-center justify-between pl-1">
+          <h2 className="text-sm font-semibold text-ink">Definition</h2>
+          {!editing && (
+            <button
+              type="button"
+              onClick={startEdit}
+              aria-label="Edit definition"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-white px-2.5 py-1 text-[12px] font-medium text-ink-dim hover:bg-slate-50"
+            >
+              <Pencil size={13} />
+              Edit
+            </button>
+          )}
+        </div>
+
+        {editing ? (
+          <div className="space-y-3">
+            <CodeEditor
+              value={draft}
+              onChange={setDraft}
+              language="markdown"
+              ariaLabel="Agent definition"
+            />
+            {saveError && (
+              <p role="alert" className="text-[12px] font-medium text-red-700">
+                {saveError}
+              </p>
+            )}
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={cancelEdit}
+                disabled={saving}
+                className="inline-flex items-center rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={save}
+                disabled={saving || draft === agent.raw}
+                className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {saving ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
+        ) : agent.raw ? (
           <CodeHighlight code={agent.raw} frontmatter />
         ) : (
           <p className="text-sm text-ink-dim pl-1">No definition.</p>

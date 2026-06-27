@@ -1030,6 +1030,34 @@ export const api = {
       body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir }),
     });
   },
+  /**
+   * Overwrite an agent's `.md` definition. The body is validated + reloaded
+   * server-side; nothing is written on error. Throws `ApiError` with the parse
+   * error message (400) — including when the frontmatter `name` mismatches the
+   * route — and resolves to the reloaded `AgentDetail` on success.
+   */
+  saveAgent(name: string, raw: string): Promise<AgentDetail> {
+    return request<AgentDetail>(`/api/agents/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ raw }),
+    });
+  },
+  /**
+   * Create a new agent from a raw `.md` definition. 409 if the agent already
+   * exists, 400 on parse error. Resolves to the reloaded `AgentDetail`.
+   */
+  createAgent(raw: string): Promise<AgentDetail> {
+    return request<AgentDetail>('/api/agents', {
+      method: 'POST',
+      body: JSON.stringify({ raw }),
+    });
+  },
+  /** Delete an agent definition. 404 if absent. */
+  async deleteAgent(name: string): Promise<void> {
+    await request<{ deleted: boolean }>(`/api/agents/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+  },
 
   // --- Workflows ---
   getWorkflows(): Promise<WorkflowSummary[]> {
