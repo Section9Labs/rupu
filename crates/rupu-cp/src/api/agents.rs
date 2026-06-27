@@ -1,5 +1,6 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
+    api::fs_safety::{validate_name, write_atomic},
     error::{ApiError, ApiResult},
     session_starter::{SessionStartError, SessionStartRequest, SessionStarter},
     state::AppState,
@@ -30,37 +31,14 @@ fn agents_dir(s: &AppState) -> PathBuf {
     s.global_dir.join("agents")
 }
 
-/// Reject anything but a bare file stem: must start with an ASCII letter and
-/// contain only `[A-Za-z0-9_-]`. Blocks `/`, `.`, `..`, spaces, and the empty
-/// string so the name can never escape the agents directory.
-fn validate_name(name: &str) -> Result<(), ApiError> {
-    let mut chars = name.chars();
-    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
-    let rest_ok = name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if first_ok && rest_ok {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request("invalid agent name"))
-    }
-}
-
-/// Write `bytes` to a sibling temp file then atomically rename it over `path`,
-/// so a crashed/partial write never leaves a corrupt agent definition.
-fn write_atomic(path: &FsPath, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
-}
-
 /// Pure core of `PUT /api/agents/:name`: validate the url name, parse + validate
 /// the raw `.md` (no write on parse failure), enforce frontmatter-name ==
 /// url-name, then atomically write to `<global_dir>/agents/<name>.md`. Returns
 /// the written path.
 fn save_agent_file(global_dir: &FsPath, url_name: &str, raw: &str) -> Result<PathBuf, ApiError> {
     validate_name(url_name)?;
-    let spec = rupu_agent::AgentSpec::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let spec =
+        rupu_agent::AgentSpec::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
     if spec.name != url_name {
         return Err(ApiError::bad_request(
             "frontmatter name must equal the agent name",
@@ -76,7 +54,8 @@ fn save_agent_file(global_dir: &FsPath, url_name: &str, raw: &str) -> Result<Pat
 /// Pure core of `POST /api/agents`: parse the raw `.md` to derive the name,
 /// validate it, refuse to clobber an existing file, then atomically write.
 fn create_agent_file(global_dir: &FsPath, raw: &str) -> Result<PathBuf, ApiError> {
-    let spec = rupu_agent::AgentSpec::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let spec =
+        rupu_agent::AgentSpec::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let name = spec.name.clone();
     validate_name(&name)?;
     let dir = global_dir.join("agents");
@@ -473,15 +452,6 @@ mod tests {
             .block_on(delete_agent(State(s.clone()), Path("code-reviewer".into())))
             .expect_err("absent");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn validate_name_rejects_traversal_and_accepts_plain() {
-        for bad in ["../evil", "a/b", ".", "", "..", " spaces", "1leading"] {
-            assert!(validate_name(bad).is_err(), "should reject {bad:?}");
-        }
-        assert!(validate_name("code-reviewer").is_ok());
-        assert!(validate_name("Agent_1").is_ok());
     }
 
     struct MockStarter {

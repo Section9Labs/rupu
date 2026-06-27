@@ -1076,6 +1076,35 @@ export const api = {
     return request<WorkflowDetail>(`/api/workflows/${encodeURIComponent(name)}`);
   },
   /**
+   * Overwrite a workflow's `.yaml` definition. The body is validated + reloaded
+   * server-side; nothing is written on error. Throws `ApiError` with the parse
+   * error message (400) — including when the parsed `name` mismatches the route
+   * — and resolves to the reloaded `WorkflowDetail` on success.
+   */
+  saveWorkflow(name: string, raw: string): Promise<WorkflowDetail> {
+    return request<WorkflowDetail>(`/api/workflows/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ raw }),
+    });
+  },
+  /**
+   * Create a new workflow from a raw `.yaml` definition. 409 if a workflow with
+   * the parsed `name` already exists, 400 on parse error. Resolves to the
+   * reloaded `WorkflowDetail`.
+   */
+  createWorkflow(raw: string): Promise<WorkflowDetail> {
+    return request<WorkflowDetail>('/api/workflows', {
+      method: 'POST',
+      body: JSON.stringify({ raw }),
+    });
+  },
+  /** Delete a workflow definition. 404 if absent. */
+  async deleteWorkflow(name: string): Promise<void> {
+    await request<{ deleted: boolean }>(`/api/workflows/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+  },
+  /**
    * Launch a fresh run of `workflow` via the configured launcher.
    * All options are optional — a bare call launches with no inputs in the
    * deployment's default mode. Resolves to the new run id; the run record
