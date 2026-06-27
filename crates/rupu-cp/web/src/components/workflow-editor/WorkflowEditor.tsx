@@ -73,10 +73,14 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
   // True while the YAML is unparseable: the graph is kept but frozen + dimmed.
   const [paused, setPaused] = useState(false);
 
-  // Keep the latest selectedId readable inside the debounce timeout WITHOUT
-  // adding it to the effect deps (which would re-arm the timer on every select).
+  // Keep the latest selectedId + graph readable inside the debounce timeout
+  // WITHOUT adding them to the effect deps (which would re-arm the timer on every
+  // select / graph edit). Reading via refs lets every state write below stay a
+  // top-level, pure call (no setState inside a setGraph updater).
   const selectedIdRef = useRef(selectedId);
   selectedIdRef.current = selectedId;
+  const graphRef = useRef(graph);
+  graphRef.current = graph;
 
   // Live YAML→graph reconcile, debounced 250ms after the last edit.
   //
@@ -92,21 +96,19 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
     if (lastSeenYaml.current === draftYaml) return; // our own echo — ignore.
     const handle = setTimeout(() => {
       lastSeenYaml.current = draftYaml;
-      setGraph((prev) => {
-        const res = reconcileFromYaml(prev, draftYaml);
-        if (res.paused || !res.graph) {
-          setPaused(true);
-          return prev; // keep the last good graph on screen.
-        }
-        setPaused(false);
-        // Selection preservation: drop + notify if the selected id vanished.
-        const sel = selectedIdRef.current;
-        if (sel !== null && !res.graph.nodes.some((n) => n.id === sel)) {
-          setSelectedId(null);
-          setNotice('Selected step changed in YAML.');
-        }
-        return res.graph;
-      });
+      const res = reconcileFromYaml(graphRef.current, draftYaml);
+      if (res.paused || !res.graph) {
+        setPaused(true); // keep the last good graph on screen.
+        return;
+      }
+      setPaused(false);
+      // Selection preservation: drop + notify if the selected id vanished.
+      const sel = selectedIdRef.current;
+      if (sel !== null && !res.graph.nodes.some((n) => n.id === sel)) {
+        setSelectedId(null);
+        setNotice('Selected step changed in YAML.');
+      }
+      setGraph(res.graph);
     }, 250);
     return () => clearTimeout(handle);
   }, [draftYaml]);
