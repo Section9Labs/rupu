@@ -36,14 +36,16 @@ const RANGES: { key: Range; label: string }[] = [
   { key: 'all', label: 'All' },
 ];
 
-/** Map a range to the windowed-query params: `since` (RFC-3339, omitted for All)
- *  and timeline `bucket` granularity. */
-function rangeParams(range: Range): { since?: string; bucket: 'day' | 'week' } {
+/** Map a range to the windowed-query params: `since` (RFC-3339) and timeline
+ *  `bucket` granularity. "All" sends the epoch as `since` — the backend defaults
+ *  an absent `since` to now-30d, so we must pass an explicit floor to actually
+ *  span all history (weekly-bucketed). */
+function rangeParams(range: Range): { since: string; bucket: 'day' | 'week' } {
   const now = Date.now();
   const day = 86_400_000;
   if (range === '7d') return { since: new Date(now - 7 * day).toISOString(), bucket: 'day' };
   if (range === '30d') return { since: new Date(now - 30 * day).toISOString(), bucket: 'day' };
-  return { bucket: 'week' };
+  return { since: new Date(0).toISOString(), bucket: 'week' };
 }
 
 // ---------------------------------------------------------------------------
