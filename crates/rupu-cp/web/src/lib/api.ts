@@ -9,8 +9,8 @@
 
 import type { TranscriptEvent, TranscriptResponse } from './transcript';
 export type { TranscriptEvent, TranscriptResponse } from './transcript';
-import type { UsageSummary, UsageOverview } from './usage';
-export type { UsageSummary, UsageBreakdownRow, UsageOverview } from './usage';
+import type { UsageSummary, UsageOverview, UsageTimelineBucket } from './usage';
+export type { UsageSummary, UsageBreakdownRow, UsageOverview, UsageTimelineBucket } from './usage';
 
 // ---------------------------------------------------------------------------
 // Error
@@ -914,6 +914,15 @@ export const api = {
     if (params?.groupBy) q.set('group_by', params.groupBy);
     const qs = q.toString();
     return request<UsageOverview>(`/api/usage${qs ? `?${qs}` : ''}`);
+  },
+  /** Per-bucket usage timeline (chronological). `bucket` defaults to `day`. */
+  getUsageTimeline(opts?: { since?: string; until?: string; bucket?: 'day' | 'week' }): Promise<UsageTimelineBucket[]> {
+    const q = new URLSearchParams();
+    if (opts?.since) q.set('since', opts.since);
+    if (opts?.until) q.set('until', opts.until);
+    if (opts?.bucket) q.set('bucket', opts.bucket);
+    const qs = q.toString();
+    return request<UsageTimelineBucket[]>(`/api/usage/timeline${qs ? `?${qs}` : ''}`);
   },
 
   // --- Runs ---
