@@ -1030,6 +1030,15 @@ export const api = {
       body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir }),
     });
   },
+  startSession(
+    agent: string,
+    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string } = {},
+  ): Promise<{ session_id: string }> {
+    return request<{ session_id: string }>(`/api/agents/${encodeURIComponent(agent)}/session`, {
+      method: 'POST',
+      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir }),
+    });
+  },
   /**
    * Overwrite an agent's `.md` definition. The body is validated + reloaded
    * server-side; nothing is written on error. Throws `ApiError` with the parse

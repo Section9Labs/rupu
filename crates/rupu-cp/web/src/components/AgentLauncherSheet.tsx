@@ -1,8 +1,8 @@
 // AgentLauncherSheet — modal sheet to dispatch an agent run from the browser.
 //
 // Prompt textarea + Mode picker (Ask / Bypass / Read-only) + TargetPicker.
-// On Launch it POSTs to /api/agents/:name/run and navigates to the new run's
-// detail page.
+// On Launch it POSTs to /api/agents/:name/run (single run) or
+// /api/agents/:name/session (session) and navigates to the result.
 
 import { useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -26,6 +26,8 @@ export function buildAgentLaunch(prompt: string, mode: LaunchMode, target: Targe
   return out;
 }
 
+type LaunchKind = 'run' | 'session';
+
 export default function AgentLauncherSheet({
   agent,
   onClose,
@@ -37,6 +39,7 @@ export default function AgentLauncherSheet({
   const titleId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
 
+  const [launchKind, setLaunchKind] = useState<LaunchKind>('run');
   const [prompt, setPrompt] = useState('');
   const [mode, setMode] = useState<LaunchMode>('ask');
   const [target, setTarget] = useState<TargetItem>(WORKSPACE_ITEM);
@@ -59,8 +62,13 @@ export default function AgentLauncherSheet({
     setError(null);
     try {
       const opts = buildAgentLaunch(prompt, mode, target);
-      const res = await api.launchAgent(agent, opts);
-      navigate(`/runs/${res.run_id}`);
+      if (launchKind === 'session') {
+        const res = await api.startSession(agent, opts);
+        navigate(`/sessions/${res.session_id}`);
+      } else {
+        const res = await api.launchAgent(agent, opts);
+        navigate(`/runs/${res.run_id}`);
+      }
       onClose();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to launch run');
@@ -70,6 +78,10 @@ export default function AgentLauncherSheet({
 
   const fieldCls =
     'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
+
+  const submitLabel = launchKind === 'session'
+    ? (launching ? 'Starting…' : 'Start session')
+    : (launching ? 'Launching…' : 'Run');
 
   return (
     <div
@@ -94,6 +106,45 @@ export default function AgentLauncherSheet({
         </div>
 
         <div className="space-y-4 px-5 py-4">
+          {/* ── Launch kind toggle ────────────────────────────────── */}
+          <div>
+            <div className="inline-flex rounded-md border border-border overflow-hidden">
+              <button
+                type="button"
+                onClick={() => setLaunchKind('run')}
+                disabled={launching}
+                aria-pressed={launchKind === 'run'}
+                className={
+                  'rounded-none px-2 py-1 text-[12px] font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
+                  (launchKind === 'run'
+                    ? 'bg-brand-600 text-white'
+                    : 'bg-white text-ink-dim hover:bg-slate-50')
+                }
+              >
+                Single run
+              </button>
+              <button
+                type="button"
+                onClick={() => setLaunchKind('session')}
+                disabled={launching}
+                aria-pressed={launchKind === 'session'}
+                className={
+                  'rounded-none border-l border-border px-2 py-1 text-[12px] font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
+                  (launchKind === 'session'
+                    ? 'bg-brand-600 text-white'
+                    : 'bg-white text-ink-dim hover:bg-slate-50')
+                }
+              >
+                Session
+              </button>
+            </div>
+            {launchKind === 'session' && (
+              <p className="mt-1 text-[12px] text-ink-mute">
+                Opens a multi-turn chat you can keep messaging.
+              </p>
+            )}
+          </div>
+
           {/* ── Prompt ─────────────────────────────────────────────── */}
           <label className="block">
             <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">
@@ -156,7 +207,7 @@ export default function AgentLauncherSheet({
             disabled={launching}
             className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {launching ? 'Launching…' : 'Launch'}
+            {submitLabel}
           </button>
         </div>
       </div>
