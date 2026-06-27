@@ -100,7 +100,11 @@ describe('yamlToGraph', () => {
           panel: {
             panelists: ['r1', 'r2'],
             subject: 'thing',
-            gate: { until_severity: 'high', max_iterations: 2, fixer: 'f' },
+            gate: {
+              until_no_findings_at_severity_or_above: 'high',
+              fix_with: 'f',
+              max_iterations: 2,
+            },
           },
         },
       ],
@@ -114,7 +118,8 @@ describe('yamlToGraph', () => {
     expect(par.data.parallel?.[0]).toEqual({ id: 'p1', agent: 'a', prompt: 'x' });
     expect(pan.data.kind).toBe('panel');
     expect(pan.data.panel?.panelists).toEqual(['r1', 'r2']);
-    expect(pan.data.panel?.gate?.until_severity).toBe('high');
+    expect(pan.data.panel?.gate?.until_no_findings_at_severity_or_above).toBe('high');
+    expect(pan.data.panel?.gate?.fix_with).toBe('f');
   });
 
   it('reads approvalRequired from approval.required', () => {
@@ -341,8 +346,11 @@ describe('graphToWorkflowObject', () => {
     });
   });
 
-  it('round-trips a panel-with-gate workflow', () => {
-    expectRoundTrip({
+  it('round-trips a panel-with-gate workflow using the REAL gate field names', () => {
+    // The gate keys MUST match the orchestrator schema exactly
+    // (until_no_findings_at_severity_or_above / fix_with / max_iterations) —
+    // Workflow::parse uses deny_unknown_fields, so any other name 400s on save.
+    const input = {
       name: 'wf',
       steps: [
         {
@@ -352,11 +360,28 @@ describe('graphToWorkflowObject', () => {
             subject: 'the code',
             prompt: 'review it',
             max_parallel: 2,
-            gate: { until_severity: 'high', max_iterations: 3, fixer: 'f' },
+            gate: {
+              until_no_findings_at_severity_or_above: 'high',
+              fix_with: 'finding-fixer',
+              max_iterations: 4,
+            },
           },
         },
       ],
-    });
+    };
+    expectRoundTrip(input);
+    // Belt-and-suspenders: the serialized gate carries ONLY the real keys, so
+    // the emitted YAML is parseable by Workflow::parse(deny_unknown_fields).
+    const res = graphToWorkflowObject(yamlToGraph(input));
+    if ('obj' in res) {
+      const step = (res.obj.steps as Record<string, unknown>[])[0];
+      const panel = step.panel as Record<string, unknown>;
+      expect(panel.gate).toEqual({
+        until_no_findings_at_severity_or_above: 'high',
+        fix_with: 'finding-fixer',
+        max_iterations: 4,
+      });
+    }
   });
 
   it('round-trips trigger + inputs + autoflow untouched', () => {
@@ -379,6 +404,44 @@ describe('graphToWorkflowObject', () => {
       expect(res.obj.inputs).toEqual(input.inputs);
       expect(res.obj.autoflow).toEqual(input.autoflow);
     }
+  });
+
+  it('round-trips a step-level contract: block (unmodeled key passthrough)', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        {
+          id: 'a',
+          agent: 'x',
+          prompt: 'p',
+          contract: { outputs: { items: { type: 'array' } }, description: 'emits items' },
+        },
+      ],
+    };
+    // The node captures `contract` into raw_passthrough on load…
+    const g = yamlToGraph(input);
+    expect(g.nodes[0].data.raw_passthrough?.contract).toEqual(input.steps[0].contract);
+    // …and re-emits it untouched on save.
+    expectRoundTrip(input);
+  });
+
+  it('round-trips approval.prompt and approval.timeout_seconds', () => {
+    const input = {
+      name: 'wf',
+      steps: [
+        {
+          id: 'a',
+          agent: 'x',
+          prompt: 'p',
+          approval: { required: true, prompt: 'Ready for human review?', timeout_seconds: 3600 },
+        },
+      ],
+    };
+    const g = yamlToGraph(input);
+    expect(g.nodes[0].data.approvalRequired).toBe(true);
+    expect(g.nodes[0].data.approvalPrompt).toBe('Ready for human review?');
+    expect(g.nodes[0].data.approvalTimeoutSeconds).toBe(3600);
+    expectRoundTrip(input);
   });
 });
 
@@ -475,5 +538,15 @@ describe('validateGraph', () => {
     };
     const v = validateGraph(g);
     expect(v.A.some((m) => m.includes('steps.B') && m.includes('later'))).toBe(true);
+  });
+
+  it('flags a reference to an unknown step', () => {
+    const g: ReturnType<typeof yamlToGraph> = {
+      nodes: [node('a', { agent: 'x', prompt: 'use steps.ghost here' })],
+      edges: [],
+      meta: { name: 'wf', rest: {} },
+    };
+    const v = validateGraph(g);
+    expect(v.a.some((m) => m.includes('unknown step ghost'))).toBe(true);
   });
 });

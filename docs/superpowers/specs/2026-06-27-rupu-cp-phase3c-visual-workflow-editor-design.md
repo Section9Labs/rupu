@@ -28,7 +28,7 @@ Each top-level step is one node. Reuse the existing read-only visuals (`StepNode
 | **step** (linear) | `id, agent, prompt, when?, continue_on_error?, actions?, approval?` | id, agent (dropdown of known agents), prompt (textarea), when, continue_on_error, approval.required |
 | **for_each** | linear + `for_each: <expr>, max_parallel?` | + for_each expression, max_parallel |
 | **parallel** | `id, parallel: [{id, agent, prompt}], max_parallel?` | id, max_parallel, repeatable sub-step rows (id/agent/prompt) |
-| **panel** | `id, panel: {panelists[], subject, prompt?, max_parallel?, gate?}` | id, panelists (multi-select agents), subject, prompt, max_parallel, gate (until_severity / max_iterations / fixer) |
+| **panel** | `id, panel: {panelists[], subject, prompt?, max_parallel?, gate?}` | id, panelists (multi-select agents), subject, prompt, max_parallel, gate (until_no_findings_at_severity_or_above / fix_with / max_iterations) |
 
 The node "kind" is chosen when adding from the palette; switching kind is allowed via the form but warns it will drop kind-specific fields (mutual exclusivity is structural — exactly one kind per node, so the YAML mutual-exclusivity errors can't be produced).
 

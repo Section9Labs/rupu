@@ -22,9 +22,13 @@ export interface SubStep {
 }
 
 export interface PanelGate {
-  until_severity?: string;
+  // Field names mirror the real `PanelGate` schema in
+  // crates/rupu-orchestrator/src/workflow.rs (serde deny_unknown_fields, no
+  // aliases). Using any other names silently drops config on load AND is
+  // rejected by Workflow::parse on save.
+  until_no_findings_at_severity_or_above?: string;
+  fix_with?: string;
   max_iterations?: number;
-  fixer?: string;
 }
 
 export interface PanelCfg {
@@ -48,6 +52,14 @@ export interface StepNodeData {
   parallel?: SubStep[];
   panel?: PanelCfg;
   approvalRequired?: boolean;
+  // Approval.prompt / Approval.timeout_seconds (workflow.rs Approval). Preserved
+  // so they survive a load→save round-trip; `approvalRequired` stays a distinct
+  // boolean because it drives the form checkbox.
+  approvalPrompt?: string;
+  approvalTimeoutSeconds?: number;
+  // Any step-level keys we don't model (e.g. `contract:`) are captured verbatim
+  // here on load and spread back on emit, so unmodeled config is never dropped.
+  raw_passthrough?: Record<string, unknown>;
 }
 
 export interface GraphNode {
@@ -126,12 +138,12 @@ function parsePanel(o: Record<string, unknown>): PanelCfg {
   const gateRaw = asRecord(o.gate);
   if (gateRaw) {
     const gate: PanelGate = {};
-    const us = asString(gateRaw.until_severity);
-    if (us !== undefined) gate.until_severity = us;
+    const us = asString(gateRaw.until_no_findings_at_severity_or_above);
+    if (us !== undefined) gate.until_no_findings_at_severity_or_above = us;
+    const fx = asString(gateRaw.fix_with);
+    if (fx !== undefined) gate.fix_with = fx;
     const mi = asNumber(gateRaw.max_iterations);
     if (mi !== undefined) gate.max_iterations = mi;
-    const fx = asString(gateRaw.fixer);
-    if (fx !== undefined) gate.fixer = fx;
     cfg.gate = gate;
   }
   return cfg;
@@ -168,11 +180,41 @@ function parseStepData(raw: unknown, i: number): StepNodeData {
   if (mp !== undefined) data.max_parallel = mp;
   if (parallelRaw) data.parallel = parallelRaw.map((s, j) => parseSubStep(s, j));
   if (panelRaw) data.panel = parsePanel(panelRaw);
+
   const approval = asRecord(o.approval);
-  if (approval && approval.required === true) data.approvalRequired = true;
+  if (approval) {
+    if (approval.required === true) data.approvalRequired = true;
+    const ap = asString(approval.prompt);
+    if (ap !== undefined) data.approvalPrompt = ap;
+    const ats = asNumber(approval.timeout_seconds);
+    if (ats !== undefined) data.approvalTimeoutSeconds = ats;
+  }
+
+  // Capture any step-level keys we don't model so they survive round-trips.
+  const passthrough: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(o)) {
+    if (!MODELLED_STEP_KEYS.has(k)) passthrough[k] = v;
+  }
+  if (Object.keys(passthrough).length > 0) data.raw_passthrough = passthrough;
 
   return data;
 }
+
+// Step-level keys this module models explicitly. Everything else (e.g.
+// `contract:`) is captured into `raw_passthrough` on load and re-emitted on save.
+const MODELLED_STEP_KEYS = new Set<string>([
+  'id',
+  'agent',
+  'prompt',
+  'when',
+  'continue_on_error',
+  'actions',
+  'for_each',
+  'max_parallel',
+  'parallel',
+  'panel',
+  'approval',
+]);
 
 // ── extractStepRefs ───────────────────────────────────────────────────────────
 
@@ -304,34 +346,49 @@ function nodeToStepObject(d: StepNodeData): Record<string, unknown> {
       return so;
     });
     if (d.max_parallel !== undefined) o.max_parallel = d.max_parallel;
-    return o;
-  }
-
-  if (d.kind === 'panel') {
+  } else if (d.kind === 'panel') {
     const p = d.panel ?? { panelists: [], subject: '' };
     const po: Record<string, unknown> = { panelists: p.panelists, subject: p.subject };
     if (p.prompt) po.prompt = p.prompt;
     if (p.max_parallel !== undefined) po.max_parallel = p.max_parallel;
     if (p.gate) {
       const go: Record<string, unknown> = {};
-      if (p.gate.until_severity !== undefined) go.until_severity = p.gate.until_severity;
+      if (p.gate.until_no_findings_at_severity_or_above !== undefined) {
+        go.until_no_findings_at_severity_or_above = p.gate.until_no_findings_at_severity_or_above;
+      }
+      if (p.gate.fix_with !== undefined) go.fix_with = p.gate.fix_with;
       if (p.gate.max_iterations !== undefined) go.max_iterations = p.gate.max_iterations;
-      if (p.gate.fixer !== undefined) go.fixer = p.gate.fixer;
       po.gate = go;
     }
     o.panel = po;
-    return o;
+  } else {
+    // step / for_each
+    if (d.agent) o.agent = d.agent;
+    if (d.prompt) o.prompt = d.prompt;
+    if (d.when) o.when = d.when;
+    if (d.continue_on_error === true) o.continue_on_error = true;
+    if (d.actions && d.actions.length > 0) o.actions = d.actions;
+    if (d.for_each) o.for_each = d.for_each;
+    if (d.max_parallel !== undefined) o.max_parallel = d.max_parallel;
   }
 
-  // step / for_each
-  if (d.agent) o.agent = d.agent;
-  if (d.prompt) o.prompt = d.prompt;
-  if (d.when) o.when = d.when;
-  if (d.continue_on_error === true) o.continue_on_error = true;
-  if (d.actions && d.actions.length > 0) o.actions = d.actions;
-  if (d.for_each) o.for_each = d.for_each;
-  if (d.max_parallel !== undefined) o.max_parallel = d.max_parallel;
-  if (d.approvalRequired) o.approval = { required: true };
+  // Approval applies to any step kind. Emit only when there's something to say,
+  // preserving the optional prompt/timeout alongside `required`.
+  if (d.approvalRequired || d.approvalPrompt !== undefined || d.approvalTimeoutSeconds !== undefined) {
+    const ap: Record<string, unknown> = {};
+    if (d.approvalRequired) ap.required = true;
+    if (d.approvalPrompt !== undefined) ap.prompt = d.approvalPrompt;
+    if (d.approvalTimeoutSeconds !== undefined) ap.timeout_seconds = d.approvalTimeoutSeconds;
+    o.approval = ap;
+  }
+
+  // Spread unmodeled keys (e.g. `contract:`) back, never clobbering modeled ones.
+  if (d.raw_passthrough) {
+    for (const [k, v] of Object.entries(d.raw_passthrough)) {
+      if (!(k in o)) o[k] = v;
+    }
+  }
+
   return o;
 }
 
@@ -433,15 +490,20 @@ export function validateGraph(g: WorkflowGraph): Record<string, string[]> {
     if ((counts.get(n.id) ?? 0) > 1) add(n.id, 'duplicate step id');
   }
 
-  // Forward references: a node references steps.X where X runs AFTER it.
+  // Reference checks: dangling refs (steps.X where X is not a node) and forward
+  // refs (X runs AFTER the referencing node — only checkable when there's no
+  // cycle, since order is otherwise undefined).
+  const nodeIds = new Set(g.nodes.map((n) => n.id));
   const sorted = topoSort(g.nodes, g.edges);
-  if ('order' in sorted) {
-    const pos = new Map<string, number>();
-    sorted.order.forEach((n, i) => pos.set(n.id, i));
-    for (const n of g.nodes) {
-      const here = pos.get(n.id);
-      if (here === undefined) continue;
-      for (const ref of extractStepRefs(n.data)) {
+  const pos = 'order' in sorted ? new Map(sorted.order.map((n, i) => [n.id, i])) : undefined;
+  for (const n of g.nodes) {
+    const here = pos?.get(n.id);
+    for (const ref of extractStepRefs(n.data)) {
+      if (!nodeIds.has(ref)) {
+        add(n.id, `references unknown step ${ref}`);
+        continue;
+      }
+      if (pos && here !== undefined) {
         const there = pos.get(ref);
         if (there !== undefined && there > here) {
           add(n.id, `references steps.${ref} which runs later`);
