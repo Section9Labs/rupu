@@ -14,6 +14,7 @@ import { api, type SessionSummary, type SessionRunRow, type UsageTimelinePoint }
 import { cn } from '../lib/cn';
 import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../lib/sessionStatus';
+import { isSessionActive, pollIntervalFor } from '../lib/sessionPoll';
 import UsageChip from '../components/UsageChip';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import SessionConversation from '../components/session/SessionConversation';
@@ -81,8 +82,7 @@ export default function SessionDetailPage() {
     };
   }, [id]);
 
-  // Fetch the session's turn-runs (the conversation). Poll every 5s so live
-  // turns surface quickly.
+  // Fetch the session's turn-runs (the conversation).
   const loadRuns = () => {
     if (!id) return;
     api
@@ -96,12 +96,26 @@ export default function SessionDetailPage() {
       });
   };
 
+  // Reload both session identity and runs — used after a send or turn completion
+  // so the new turn / updated active_run_id surfaces immediately.
+  const reload = () => {
+    if (!id) return;
+    api
+      .getSession(id)
+      .then((data) => setSession(data))
+      .catch(() => {/* keep stale session on transient error */});
+    loadRuns();
+  };
+
+  // Adaptive poll: fast (1.5s) while a turn is in flight, slow (5s) otherwise.
+  // Re-arm when the cadence changes (e.g. session goes active → idle).
+  const pollInterval = pollIntervalFor(session);
   useEffect(() => {
     loadRuns();
-    const t = window.setInterval(loadRuns, 5000);
+    const t = window.setInterval(loadRuns, pollInterval);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [id, pollInterval]);
 
   const handleSend = () => {
     const text = prompt.trim();
@@ -116,7 +130,7 @@ export default function SessionDetailPage() {
         setSendOk(true);
         // Surface the new turn immediately rather than waiting for the poll —
         // its TranscriptPanel then streams live.
-        loadRuns();
+        reload();
       })
       .catch((e: unknown) => {
         setSendError(e instanceof Error ? e.message : 'Failed to send message');
@@ -144,6 +158,7 @@ export default function SessionDetailPage() {
     );
   }
 
+  const active = isSessionActive(session);
   const stopped = sessionStatusTone(session.status) === 'stopped';
 
   return (
@@ -166,8 +181,25 @@ export default function SessionDetailPage() {
             />
             <span className="text-[12px] text-ink-dim">{sessionStatusLabel(session.status)}</span>
           </span>
+          {/* "working…" pill — visible while a turn is in flight. */}
+          {active && (
+            <span className="inline-flex items-center gap-1 rounded px-1.5 py-px text-[9px] font-medium bg-blue-100 text-blue-700">
+              <span className="inline-block h-1.5 w-1.5 rounded-full animate-pulse bg-blue-500" />
+              working…
+            </span>
+          )}
           {session.usage && <UsageChip usage={session.usage} className="ml-auto" />}
         </div>
+
+        {/* Session error banner — only shown when idle/terminal, never while a turn is in flight. */}
+        {!active && (session.status === 'failed' || session.last_error) && (
+          <div
+            role="alert"
+            className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700"
+          >
+            {session.last_error ?? 'Session failed.'}
+          </div>
+        )}
 
         {/* Secondary: collapsed details (usage chart + identity fields). */}
         <details className="mt-2 group">
@@ -219,7 +251,7 @@ export default function SessionDetailPage() {
       </header>
 
       {/* Conversation — the growing, scrolling chat body. */}
-      <SessionConversation session={session} runs={runs ?? []} />
+      <SessionConversation session={session} runs={runs ?? []} onTurnComplete={reload} />
 
       {/* Composer — pinned at the bottom. */}
       <div className="shrink-0 border-t border-border bg-panel px-6 py-3">

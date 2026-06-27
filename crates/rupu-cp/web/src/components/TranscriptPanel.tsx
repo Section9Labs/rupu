@@ -21,6 +21,7 @@ export default function TranscriptPanel({
   path,
   live,
   embedded = false,
+  onComplete,
 }: {
   path: string;
   live: boolean;
@@ -31,6 +32,9 @@ export default function TranscriptPanel({
    * Turn / ToolCard rendering are unchanged. Default (false) is the full panel.
    */
   embedded?: boolean;
+  /** Called once when the live SSE stream receives a run_complete or run_failed
+   *  event. Allows the parent to trigger a reload on turn completion. */
+  onComplete?: () => void;
 }) {
   const [events, setEvents] = useState<TranscriptEvent[]>([]);
   const [state, setState] = useState<LoadState>('loading');
@@ -73,12 +77,30 @@ export default function TranscriptPanel({
   // Live tail: append new events; close on unmount / path change. Kept in a ref
   // so the cleanup always closes the EventSource we actually opened.
   const unsubRef = useRef<(() => void) | null>(null);
+  // Guard so onComplete fires at most once per live session (even if duplicate
+  // run_complete / run_failed events arrive).
+  const completedRef = useRef(false);
+  // Keep onComplete stable inside the effect without adding it to the dep array.
+  const onCompleteRef = useRef(onComplete);
   useEffect(() => {
+    onCompleteRef.current = onComplete;
+  });
+  useEffect(() => {
+    completedRef.current = false;
     if (!live) return;
     setConnected(true);
     const unsub = api.subscribeTranscript(
       path,
-      (e) => setEvents((prev) => [...prev, e]),
+      (e) => {
+        setEvents((prev) => [...prev, e]);
+        if (
+          !completedRef.current &&
+          (e.type === 'run_complete' || e.type === 'run_failed')
+        ) {
+          completedRef.current = true;
+          onCompleteRef.current?.();
+        }
+      },
       () => setConnected(false),
     );
     unsubRef.current = unsub;
