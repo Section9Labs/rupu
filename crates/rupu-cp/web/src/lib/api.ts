@@ -1012,6 +1012,15 @@ export const api = {
   getAgent(name: string): Promise<AgentDetail> {
     return request<AgentDetail>(`/api/agents/${encodeURIComponent(name)}`);
   },
+  launchAgent(
+    agent: string,
+    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string } = {},
+  ): Promise<LaunchResult> {
+    return request<LaunchResult>(`/api/agents/${encodeURIComponent(agent)}/run`, {
+      method: 'POST',
+      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir }),
+    });
+  },
 
   // --- Workflows ---
   getWorkflows(): Promise<WorkflowSummary[]> {
