@@ -1,5 +1,12 @@
 import { it, expect } from 'vitest';
-import { autoLayout, reconcileGraph, reconcileFromYaml, NODE_W, NODE_H } from './workflowLayout';
+import {
+  autoLayout,
+  reconcileGraph,
+  reconcileFromYaml,
+  editorNodeSize,
+  NODE_W,
+  NODE_H,
+} from './workflowLayout';
 import type { GraphNode, GraphEdge, WorkflowGraph, StepNodeData } from './workflowGraph';
 
 function node(id: string): GraphNode {
@@ -23,28 +30,56 @@ it('exports sensible node-size constants', () => {
   expect(NODE_H).toBeGreaterThan(0);
 });
 
-it('lays out a linear chain A→B→C with strictly increasing y', () => {
+it('lays out a linear chain A→B→C left-to-right (strictly increasing x)', () => {
   const nodes = [node('a'), node('b'), node('c')];
   const edges = [edge('a', 'b'), edge('b', 'c')];
   const out = autoLayout(nodes, edges);
   const by = new Map(out.map((n) => [n.id, n]));
-  expect(by.get('b')!.position.y).toBeGreaterThan(by.get('a')!.position.y);
-  expect(by.get('c')!.position.y).toBeGreaterThan(by.get('b')!.position.y);
+  expect(by.get('b')!.position.x).toBeGreaterThan(by.get('a')!.position.x);
+  expect(by.get('c')!.position.x).toBeGreaterThan(by.get('b')!.position.x);
 });
 
-it('lays out a diamond so D is below B and C, both below A', () => {
+it('lays out a diamond so D is right of B and C, both right of A (LR)', () => {
   const nodes = [node('a'), node('b'), node('c'), node('d')];
   const edges = [edge('a', 'b'), edge('a', 'c'), edge('b', 'd'), edge('c', 'd')];
   const out = autoLayout(nodes, edges);
   const by = new Map(out.map((n) => [n.id, n]));
-  const a = by.get('a')!.position.y;
-  const b = by.get('b')!.position.y;
-  const c = by.get('c')!.position.y;
-  const d = by.get('d')!.position.y;
+  const a = by.get('a')!.position.x;
+  const b = by.get('b')!.position.x;
+  const c = by.get('c')!.position.x;
+  const d = by.get('d')!.position.x;
   expect(b).toBeGreaterThan(a);
   expect(c).toBeGreaterThan(a);
   expect(d).toBeGreaterThan(b);
   expect(d).toBeGreaterThan(c);
+});
+
+it('editorNodeSize reserves a taller box for a parallel node per sub-step', () => {
+  const one: StepNodeData = {
+    id: 'p',
+    kind: 'parallel',
+    parallel: [{ id: 's1', agent: 'a', prompt: 'p' }],
+  };
+  const three: StepNodeData = {
+    id: 'p',
+    kind: 'parallel',
+    parallel: [
+      { id: 's1', agent: 'a', prompt: 'p' },
+      { id: 's2', agent: 'a', prompt: 'p' },
+      { id: 's3', agent: 'a', prompt: 'p' },
+    ],
+  };
+  expect(editorNodeSize(three).height).toBeGreaterThan(editorNodeSize(one).height);
+  // A plain step is the base box; a panel with a gate is taller than without.
+  const step: StepNodeData = { id: 's', kind: 'step' };
+  expect(editorNodeSize(step)).toEqual({ width: NODE_W, height: NODE_H });
+  const panelNoGate: StepNodeData = { id: 'g', kind: 'panel', panel: { panelists: [], subject: '' } };
+  const panelGate: StepNodeData = {
+    id: 'g',
+    kind: 'panel',
+    panel: { panelists: [], subject: '', gate: { until_no_findings_at_severity_or_above: 'high' } },
+  };
+  expect(editorNodeSize(panelGate).height).toBeGreaterThan(editorNodeSize(panelNoGate).height);
 });
 
 it('returns [] for an empty node list without throwing', () => {

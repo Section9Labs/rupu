@@ -144,6 +144,7 @@ function WorkflowEditorGraphInner({
         id: e.id,
         source: e.source,
         target: e.target,
+        type: 'smoothstep',
         markerEnd: { type: MarkerType.ArrowClosed },
       })),
     [graph.edges],

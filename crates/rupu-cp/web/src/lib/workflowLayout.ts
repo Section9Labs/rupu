@@ -1,38 +1,92 @@
 // workflowLayout — pure dagre auto-layout for the visual workflow editor.
 //
-// Positions graph nodes top-to-bottom from the {nodes, edges} model produced by
-// workflowGraph.ts. Framework-free: no DOM, no React, no side effects. Mirrors
-// the dagre usage in graphLayout.ts (graphlib Graph + dagre `layout`).
+// Positions graph nodes left-to-right from the {nodes, edges} model produced by
+// workflowGraph.ts — mirroring the Runs graph (graphLayout.ts: rankdir 'LR',
+// nodesep 36, ranksep 72). Framework-free: no DOM, no React, no side effects.
+//
+// Each node reserves a per-KIND box (editorNodeSize) so big container nodes
+// (parallel / panel) never get packed tightly enough to overlap. The editor
+// node components consume the SAME constants/function (applied as
+// `style={{ width, minHeight }}`) so render == reservation by construction —
+// the same discipline nodeSize.ts brings to the read-only Runs graph.
 
 import { Graph } from '@dagrejs/graphlib';
 import { layout } from '@dagrejs/dagre';
 import type { GraphLabel, NodeLabel } from '@dagrejs/dagre';
 import yaml from 'js-yaml';
 import { yamlToGraph } from './workflowGraph';
-import type { GraphNode, GraphEdge, WorkflowGraph } from './workflowGraph';
+import type { GraphNode, GraphEdge, StepNodeData, WorkflowGraph } from './workflowGraph';
 
-// Node box reserved in the layout — exported so the canvas renderer can match.
-export const NODE_W = 220;
+// ── Per-kind size constants (shared with EditableStepNode) ───────────────────
+// Exported so the node components apply the identical width/minHeight, keeping
+// the rendered box ≥ dagre's reserved box (no overlap). NODE_W/NODE_H are kept
+// as the base step box for backwards-compat with existing importers.
+
+/** Base step card box (also the back-compat NODE_W/NODE_H export). */
+export const NODE_W = 210;
 export const NODE_H = 80;
 
-/** Position workflow nodes top-to-bottom. Returns a NEW array; inputs are never
+/** for_each carries an extra `for_each: <expr>` line. */
+export const FOR_EACH_H = 100;
+
+/** parallel container: header + N stacked sub-step rows. */
+export const PARALLEL_W = 220;
+export const PARALLEL_HEADER_H = 54;
+export const PARALLEL_SUBROW_H = 26;
+export const PARALLEL_PAD_V = 18;
+
+/** panel container: header + panelists row + optional gate block. */
+export const PANEL_W = 220;
+export const PANEL_BASE_H = 84;
+export const PANEL_GATE_H = 34;
+
+export interface NodeBox {
+  width: number;
+  height: number;
+}
+
+/** Per-kind box for an editor node — used by dagre AND applied to the rendered
+ *  root (`style={{ width, minHeight: height }}`). Mirrors the spirit of
+ *  lib/nodeSize.ts for the editor's run-state-free nodes. */
+export function editorNodeSize(d: StepNodeData): NodeBox {
+  switch (d.kind) {
+    case 'parallel': {
+      const rows = Math.max(d.parallel?.length ?? 0, 1);
+      return { width: PARALLEL_W, height: PARALLEL_HEADER_H + rows * PARALLEL_SUBROW_H + PARALLEL_PAD_V };
+    }
+    case 'panel':
+      return { width: PANEL_W, height: PANEL_BASE_H + (d.panel?.gate ? PANEL_GATE_H : 0) };
+    case 'for_each':
+      return { width: NODE_W, height: FOR_EACH_H };
+    default:
+      return { width: NODE_W, height: NODE_H };
+  }
+}
+
+/** Position workflow nodes left-to-right. Returns a NEW array; inputs are never
  *  mutated. dagre centers nodes; we convert to the top-left corner the canvas
  *  expects. */
 export function autoLayout(nodes: GraphNode[], edges: GraphEdge[]): GraphNode[] {
   if (nodes.length === 0) return [];
 
   const g = new Graph<GraphLabel, NodeLabel, Record<string, never>>();
-  g.setGraph({ rankdir: 'TB', nodesep: 40, ranksep: 70 });
+  g.setGraph({ rankdir: 'LR', nodesep: 36, ranksep: 72 });
   g.setDefaultEdgeLabel(() => ({}));
 
-  for (const n of nodes) g.setNode(n.id, { width: NODE_W, height: NODE_H });
+  const sizes = new Map<string, NodeBox>();
+  for (const n of nodes) {
+    const size = editorNodeSize(n.data);
+    sizes.set(n.id, size);
+    g.setNode(n.id, { width: size.width, height: size.height });
+  }
   for (const e of edges) g.setEdge(e.source, e.target);
 
   layout(g);
 
   return nodes.map((n) => {
     const d = g.node(n.id);
-    return { ...n, position: { x: d.x! - NODE_W / 2, y: d.y! - NODE_H / 2 } };
+    const { width, height } = sizes.get(n.id)!;
+    return { ...n, position: { x: d.x! - width / 2, y: d.y! - height / 2 } };
   });
 }
 
