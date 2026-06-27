@@ -47,6 +47,55 @@ fn validator_accepts_in_root_jsonl_rejects_escape() {
     let txt = global.join("transcripts/run_x.txt");
     std::fs::write(&txt, "").unwrap();
     assert!(v(txt.to_str().unwrap(), &roots).is_err());
+
+    // not-yet-created in-root .jsonl → ACCEPTED (a turn's transcript before the
+    // worker has written it). Previously this failed with "cannot resolve path".
+    let pending = global.join("transcripts").join("run_pending.jsonl");
+    assert!(!pending.exists());
+    assert!(
+        v(pending.to_str().unwrap(), &roots).is_ok(),
+        "a non-existent in-root .jsonl must validate"
+    );
+
+    // a not-yet-created path OUTSIDE the roots is still rejected.
+    let outside = std::env::temp_dir().join("rupu_outside_run.jsonl");
+    assert!(v(outside.to_str().unwrap(), &roots).is_err());
+
+    // a `..` component is rejected even when it points back inside the root.
+    let dotdot = format!("{}/transcripts/../transcripts/run_x.jsonl", global.display());
+    assert!(v(&dotdot, &roots).is_err());
+}
+
+/// A valid in-root transcript that does not exist yet → 200 with empty events
+/// (not an error), so the UI can open a freshly-sent turn before its worker has
+/// written the `.jsonl`.
+#[tokio::test]
+async fn get_transcript_empty_when_file_absent() {
+    use axum::http::StatusCode;
+
+    let root = tempfile::tempdir().unwrap();
+    let global = root.path().to_path_buf();
+    // The parent dir exists (canonicalizable); the file does not.
+    std::fs::create_dir_all(global.join("transcripts")).unwrap();
+    let pending = global.join("transcripts").join("run_pending.jsonl");
+
+    let state = rupu_cp::state::AppState::new(global.clone(), rupu_config::PricingConfig::default());
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{addr}/api/transcript"))
+        .query(&[("path", pending.to_str().unwrap())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["events"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
