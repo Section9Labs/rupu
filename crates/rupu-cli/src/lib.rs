@@ -10,6 +10,7 @@ pub mod cp_agent_launcher;
 pub mod cp_launcher;
 pub mod cp_repos;
 pub mod cp_session_sender;
+pub mod cp_session_starter;
 pub mod crash;
 pub mod logging;
 pub mod output;
