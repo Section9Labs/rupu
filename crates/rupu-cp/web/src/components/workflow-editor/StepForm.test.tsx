@@ -7,10 +7,33 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { useState } from 'react';
+
+// Mock the CodeMirror-backed ExpressionField to a plain textarea so the form
+// tests stay stable (CodeMirror in jsdom is brittle). The mock preserves the
+// ariaLabel + value/onChange contract StepForm relies on.
+vi.mock('./ExpressionField', () => ({
+  default: ({
+    value,
+    onChange,
+    ariaLabel,
+  }: {
+    value: string;
+    onChange: (v: string) => void;
+    ariaLabel?: string;
+  }) => <textarea aria-label={ariaLabel} value={value} onChange={(e) => onChange(e.target.value)} />,
+}));
+
 import StepForm from './StepForm';
 import WorkflowSettingsForm from './WorkflowSettingsForm';
 import type { GraphNode, StepNodeData, WorkflowMeta } from '../../lib/workflowGraph';
+import type { ExprContext } from '../../lib/workflowExpressions';
 import type { AgentSummary } from '../../lib/api';
+
+const EXPR: Omit<ExprContext, 'isForEachPrompt' | 'isPanelField'> = {
+  nodeKind: 'step',
+  inputNames: [],
+  priorSteps: [],
+};
 
 const AGENTS: AgentSummary[] = [
   { name: 'planner', usage: { tokens_in: 0, tokens_out: 0, tokens_cached: 0, cost_usd: 0 }, run_count: 0 },
@@ -30,6 +53,7 @@ function Harness({ initial, spy }: { initial: GraphNode; spy: (d: StepNodeData) 
       node={node}
       agents={AGENTS}
       problems={[]}
+      exprContext={EXPR}
       onChange={(d) => {
         spy(d);
         setNode((n) => ({ ...n, id: d.id, data: d }));
@@ -46,7 +70,9 @@ afterEach(() => {
 describe('StepForm', () => {
   it('editing the agent select on a linear step emits the new agent', () => {
     const spy = vi.fn();
-    render(<StepForm node={nodeWith({ kind: 'step', agent: 'planner' })} agents={AGENTS} problems={[]} onChange={spy} />);
+    render(
+      <StepForm node={nodeWith({ kind: 'step', agent: 'planner' })} agents={AGENTS} problems={[]} exprContext={EXPR} onChange={spy} />,
+    );
     fireEvent.change(screen.getByLabelText('Agent'), { target: { value: 'coder' } });
     expect(spy).toHaveBeenCalledWith(expect.objectContaining({ agent: 'coder', kind: 'step' }));
   });
@@ -87,6 +113,7 @@ describe('StepForm', () => {
         node={nodeWith({ kind: 'step', agent: 'planner', raw_passthrough: pass })}
         agents={AGENTS}
         problems={[]}
+        exprContext={EXPR}
         onChange={spy}
       />,
     );
@@ -94,9 +121,22 @@ describe('StepForm', () => {
     expect(spy).toHaveBeenCalledWith(expect.objectContaining({ raw_passthrough: pass }));
   });
 
+  it('editing the prompt via the ExpressionField emits the new prompt', () => {
+    const spy = vi.fn();
+    render(<Harness initial={nodeWith({ kind: 'step', agent: 'planner' })} spy={spy} />);
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'review {{ inputs.repo }}' } });
+    expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ prompt: 'review {{ inputs.repo }}' }));
+  });
+
   it('renders problems in an alert block', () => {
     render(
-      <StepForm node={nodeWith({ kind: 'step' })} agents={AGENTS} problems={['needs an agent']} onChange={() => {}} />,
+      <StepForm
+        node={nodeWith({ kind: 'step' })}
+        agents={AGENTS}
+        problems={['needs an agent']}
+        exprContext={EXPR}
+        onChange={() => {}}
+      />,
     );
     expect(screen.getByRole('alert')).toHaveTextContent('needs an agent');
   });

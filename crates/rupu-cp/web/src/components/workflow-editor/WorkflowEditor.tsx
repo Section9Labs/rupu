@@ -21,8 +21,10 @@ import yaml from 'js-yaml';
 import type { AgentSummary } from '../../lib/api';
 import {
   graphToWorkflowObject,
+  topoSort,
   validateGraph,
   yamlToGraph,
+  type StepKind,
   type StepNodeData,
   type WorkflowGraph,
   type WorkflowMeta,
@@ -166,6 +168,35 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
 
   const selectedNode = selectedId ? graph.nodes.find((n) => n.id === selectedId) ?? null : null;
 
+  // Expression-editor vocabulary for the selected node: declared input names +
+  // the steps that topologically PRECEDE it (so completions never offer a step
+  // that runs later). Recomputed on graph / selection change.
+  const exprContext = useMemo<{
+    nodeKind: StepKind;
+    inputNames: string[];
+    priorSteps: { id: string; kind: StepKind }[];
+  }>(() => {
+    const inputsRaw = graph.meta.rest.inputs;
+    const inputNames =
+      typeof inputsRaw === 'object' && inputsRaw !== null && !Array.isArray(inputsRaw)
+        ? Object.keys(inputsRaw as Record<string, unknown>)
+        : [];
+
+    let nodeKind: StepKind = selectedNode?.data.kind ?? 'step';
+    let priorSteps: { id: string; kind: StepKind }[] = [];
+    if (selectedId) {
+      const sorted = topoSort(graph.nodes, graph.edges);
+      if ('order' in sorted) {
+        const idx = sorted.order.findIndex((n) => n.id === selectedId);
+        if (idx >= 0) {
+          nodeKind = sorted.order[idx].data.kind;
+          priorSteps = sorted.order.slice(0, idx).map((n) => ({ id: n.id, kind: n.data.kind }));
+        }
+      }
+    }
+    return { nodeKind, inputNames, priorSteps };
+  }, [graph, selectedId, selectedNode]);
+
   return (
     <div className="relative flex h-[52rem] min-h-[40rem] flex-col overflow-hidden rounded-xl border border-border bg-panel lg:flex-row">
       {connError && (
@@ -261,6 +292,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
                   agents={agents}
                   onChange={onStepChange}
                   problems={problemsById[selectedNode.id] ?? []}
+                  exprContext={exprContext}
                 />
               ) : (
                 <p className="text-[13px] text-ink-dim">Select a node to edit its step.</p>

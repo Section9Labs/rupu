@@ -20,6 +20,19 @@ export default defineConfig({
           // Markdown rendering (react-markdown + rehype-highlight + highlight.js)
           // — only loaded by the transcript route, isolated from the main entry.
           markdown: ['react-markdown', 'remark-gfm', 'rehype-highlight', 'highlight.js'],
+          // CodeMirror 6 — shared by the lazy code/expression editors. Named so
+          // the shared core lands in `codemirror-*.js` (never the main entry)
+          // instead of an auto-named `index-*` chunk.
+          codemirror: [
+            '@codemirror/state',
+            '@codemirror/view',
+            '@codemirror/commands',
+            '@codemirror/language',
+            '@codemirror/autocomplete',
+            '@codemirror/lang-markdown',
+            '@codemirror/lang-yaml',
+            '@lezer/highlight',
+          ],
         },
       },
     },
