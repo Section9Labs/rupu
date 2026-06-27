@@ -371,6 +371,7 @@ mod tests {
             pricing: rupu_config::PricingConfig::default(),
             launcher: None,
             session_sender: None,
+            repos: None,
         }
     }
 

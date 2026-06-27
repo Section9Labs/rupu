@@ -18,6 +18,9 @@ pub struct AppState {
     /// installs a subprocess-spawning adapter via
     /// [`AppState::with_session_sender`].
     pub session_sender: Option<Arc<dyn crate::session_sender::SessionSender>>,
+    /// Optional repo-lister port. Defaults to `None`; rupu-cli's `cp serve`
+    /// installs the registry-backed adapter via [`AppState::with_repos`].
+    pub repos: Option<Arc<dyn crate::repos::RepoLister>>,
 }
 
 impl AppState {
@@ -32,6 +35,7 @@ impl AppState {
             pricing,
             launcher: None,
             session_sender: None,
+            repos: None,
         }
     }
 
@@ -50,6 +54,15 @@ impl AppState {
         sender: Option<Arc<dyn crate::session_sender::SessionSender>>,
     ) -> Self {
         self.session_sender = sender;
+        self
+    }
+
+    /// Install a repo-lister adapter (or clear it with `None`).
+    pub fn with_repos(
+        mut self,
+        repos: Option<Arc<dyn crate::repos::RepoLister>>,
+    ) -> Self {
+        self.repos = repos;
         self
     }
 

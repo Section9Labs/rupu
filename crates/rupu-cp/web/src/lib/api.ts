@@ -816,6 +816,18 @@ export interface RunDiff {
 }
 
 // ---------------------------------------------------------------------------
+// Repos
+// ---------------------------------------------------------------------------
+
+/** One repository entry from `GET /api/repos`. */
+export interface RepoEntry {
+  platform: string;
+  repo: string; // "owner/name"
+  default_branch: string;
+  private: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Projects
 // ---------------------------------------------------------------------------
 
@@ -1165,6 +1177,19 @@ export const api = {
     return request<ProjectAssessedPct>(
       `/api/projects/${encodeURIComponent(wsId)}/coverage/assessed`,
     );
+  },
+
+  // --- Repos ---
+
+  /** List repositories visible to this rupu deployment.
+   *  Returns `[]` when the backend has no SCM connectors configured (501). */
+  async getRepos(): Promise<RepoEntry[]> {
+    try {
+      return await request<RepoEntry[]>('/api/repos');
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 501) return [];
+      throw e;
+    }
   },
 
   // --- Transcripts ---

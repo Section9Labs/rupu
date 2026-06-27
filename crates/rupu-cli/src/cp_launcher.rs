@@ -6,6 +6,9 @@
 
 use rupu_cp::launcher::{LaunchError, LaunchRequest, RunLauncher};
 use std::path::PathBuf;
+use std::process::Stdio;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// Spawns `rupu workflow run …` children. `exe` is the path to the running
 /// `rupu` binary (resolved via `std::env::current_exe()` in `cp serve`).
@@ -46,12 +49,17 @@ impl RunLauncher for SubprocessLauncher {
     async fn launch(&self, req: LaunchRequest) -> Result<String, LaunchError> {
         let run_id = format!("run_{}", ulid::Ulid::new());
         let argv = build_run_argv(&req, &run_id);
-        // Detached: spawn and drop the handle. The child writes its own
-        // run.json / events.jsonl; we must not block on it.
-        std::process::Command::new(&self.exe)
-            .args(&argv)
-            .spawn()
-            .map_err(|e| LaunchError::Spawn(e.to_string()))?;
+        // Detached: its own process group + null stdio, so a Ctrl-C / SIGINT to
+        // `cp serve` (or the CP exiting) does not take the run down. The child
+        // writes its own run.json / events.jsonl / transcripts.
+        let mut cmd = std::process::Command::new(&self.exe);
+        cmd.args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        cmd.process_group(0); // own process group (not a full session/setsid); detaches from cp-serve's
+        cmd.spawn().map_err(|e| LaunchError::Spawn(e.to_string()))?;
         Ok(run_id)
     }
 }

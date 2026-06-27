@@ -8,6 +8,7 @@ pub mod findings;
 pub mod graph;
 pub mod projects;
 pub mod run_streams;
+pub mod repos;
 pub mod runs;
 pub mod sessions;
 pub mod transcript;
