@@ -509,6 +509,24 @@ export interface SessionSummary {
   usage?: UsageSummary;
 }
 
+/**
+ * One turn-run row in a session's conversation — returned by
+ * `GET /api/sessions/:id/runs`. `status` is `null`/absent while the run is
+ * in-flight; terminal values are `"ok"` | `"error"` | `"aborted"`.
+ */
+export interface SessionRunRow {
+  run_id: string;
+  prompt: string;
+  transcript_path: string;
+  status?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  tokens_in: number;
+  tokens_out: number;
+  tokens_cached: number;
+  duration_ms: number;
+}
+
 // ---------------------------------------------------------------------------
 // Workers
 // ---------------------------------------------------------------------------
@@ -919,6 +937,10 @@ export const api = {
   },
   getSessionUsageTimeline(id: string): Promise<UsageTimelinePoint[]> {
     return request<UsageTimelinePoint[]>(`/api/sessions/${encodeURIComponent(id)}/usage-timeline`);
+  },
+  /** Turn-runs of a session, oldest-first — one row per `send` (chat turn). */
+  getSessionRuns(id: string): Promise<SessionRunRow[]> {
+    return request<SessionRunRow[]>(`/api/sessions/${encodeURIComponent(id)}/runs`);
   },
   getWorkflowRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed' }): Promise<RunListRow[]> {
     const q = new URLSearchParams();
