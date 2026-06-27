@@ -7,7 +7,8 @@
 
 import { useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type LaunchMode } from '../lib/api';
+import { api, type LaunchMode, type RepoEntry } from '../lib/api';
+import Combobox, { type ComboboxOption } from './Combobox';
 
 interface KvRow {
   key: string;
@@ -58,6 +59,7 @@ export default function LauncherSheet({
 
   const [mode, setMode] = useState<LaunchMode>('ask');
   const [target, setTarget] = useState('');
+  const [repoOptions, setRepoOptions] = useState<ComboboxOption[]>([]);
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -70,6 +72,23 @@ export default function LauncherSheet({
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
+
+  // Fetch available repos once on open so Target gets typeahead suggestions.
+  useEffect(() => {
+    let cancelled = false;
+    api.getRepos().then((repos: RepoEntry[]) => {
+      if (cancelled) return;
+      setRepoOptions(
+        repos.map((r) => ({
+          value: r.ref,
+          label: r.name ?? r.ref,
+        })),
+      );
+    }).catch(() => {
+      // Non-critical — leave repoOptions empty and fall back to free text.
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   async function onLaunch() {
     if (launching) return;
@@ -198,14 +217,14 @@ export default function LauncherSheet({
           </label>
 
           {/* ── Target ─────────────────────────────────────────────── */}
-          <label className="block">
+          <div className="block">
             <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">
               Target <span className="font-normal normal-case text-ink-mute">(optional)</span>
             </span>
-            <input
-              type="text"
+            <Combobox
               value={target}
-              onChange={(e) => setTarget(e.target.value)}
+              onChange={setTarget}
+              options={repoOptions}
               disabled={launching}
               placeholder="e.g. github:owner/repo"
               aria-label="Target"
@@ -214,7 +233,7 @@ export default function LauncherSheet({
             <span className="mt-1 block text-[11px] text-ink-mute">
               leave blank to run in this workspace
             </span>
-          </label>
+          </div>
 
           {error && (
             <p role="alert" className="text-[12px] font-medium text-red-700">
