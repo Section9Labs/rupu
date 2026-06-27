@@ -93,10 +93,28 @@ describe('AgentLauncherSheet toggle', () => {
 
     await waitFor(() => expect(sessionSpy).toHaveBeenCalledWith('triage', {
       prompt: 'hello session',
-      mode: 'ask',
+      mode: 'bypass',
     }));
     expect(launchSpy).not.toHaveBeenCalled();
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/sessions/ses-001'));
+  });
+
+  it('switching to session resets ask mode to bypass and never submits ask', async () => {
+    stubTargetPickerDeps();
+    const sessionSpy = vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-bypass' });
+    vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-abc' });
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+
+    // Default mode is 'ask'; switch to session without touching the mode select.
+    fireEvent.click(screen.getByRole('button', { name: 'Session' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start session' }));
+
+    await waitFor(() => expect(sessionSpy).toHaveBeenCalled());
+    const calledMode = (sessionSpy.mock.calls[0][1] as { mode: string }).mode;
+    expect(calledMode).not.toBe('ask');
+    expect(calledMode).toBe('bypass');
   });
 
   it('shows the session hint only in session mode', () => {

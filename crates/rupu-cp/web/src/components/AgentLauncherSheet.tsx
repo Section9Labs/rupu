@@ -71,7 +71,7 @@ export default function AgentLauncherSheet({
       }
       onClose();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Failed to launch run');
+      setError(e instanceof Error ? e.message : (launchKind === 'session' ? 'Failed to start session' : 'Failed to launch run'));
       setLaunching(false);
     }
   }
@@ -125,7 +125,10 @@ export default function AgentLauncherSheet({
               </button>
               <button
                 type="button"
-                onClick={() => setLaunchKind('session')}
+                onClick={() => {
+                  if (mode === 'ask') setMode('bypass');
+                  setLaunchKind('session');
+                }}
                 disabled={launching}
                 aria-pressed={launchKind === 'session'}
                 className={
@@ -173,7 +176,7 @@ export default function AgentLauncherSheet({
               aria-label="Permission mode"
               className={fieldCls}
             >
-              <option value="ask">Ask</option>
+              {launchKind !== 'session' && <option value="ask">Ask</option>}
               <option value="bypass">Bypass</option>
               <option value="readonly">Read-only</option>
             </select>
