@@ -1,13 +1,20 @@
-// WorkflowEditor — the lazy-loaded visual workflow editor.
+// WorkflowEditor — the unified, lazy-loaded visual workflow editor shell.
 //
-// Composes the editable @xyflow/react canvas (WorkflowEditorGraph) with the
-// per-step form (StepForm) and the workflow-settings form (WorkflowSettingsForm)
-// built in earlier tasks, round-tripping the whole thing through YAML:
-//   initialYaml → yamlToGraph → (edit) → graphToWorkflowObject → yaml.dump
+// One screen (no tabs): an editable @xyflow/react canvas (WorkflowEditorGraph) on
+// top, the live YAML editor (CodeEditor) below — separated by a resizable
+// SplitPane — and an inspector rail on the right that switches between the
+// workflow Settings form and the selected step's form.
+//
+// The whole thing round-trips through YAML:
+//   draftYaml → yamlToGraph → (edit) → graphToWorkflowObject → yaml.dump
+// `draftYaml` is owned by the PAGE (single source of truth); graph edits emit
+// regenerated YAML back via `onYamlChange`. YAML→graph reseeds only on a FOREIGN
+// change (parent swapped the document) — guarded by `lastSeenYaml`. Live per-
+// keystroke YAML→graph reconcile is a LATER phase; behavior here matches today.
 //
 // The PAGE lazy-loads this module so the @xyflow/react dependency (pulled in
 // transitively via the canvas) stays out of the main bundle. We may therefore
-// import the canvas statically here.
+// import the canvas (and CodeEditor) statically here.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import yaml from 'js-yaml';
@@ -21,23 +28,28 @@ import {
   type WorkflowMeta,
 } from '../../lib/workflowGraph';
 import { autoLayout } from '../../lib/workflowLayout';
+import CodeEditor from '../CodeEditor';
 import WorkflowEditorGraph from './WorkflowEditorGraph';
 import StepForm from './StepForm';
 import WorkflowSettingsForm from './WorkflowSettingsForm';
+import SplitPane from './SplitPane';
 
 interface WorkflowEditorProps {
-  initialYaml: string;
-  agents: AgentSummary[];
+  /** The shared editable YAML draft (owned by the page — single source of truth). */
+  draftYaml: string;
   /** Emit serialized YAML whenever the graph/meta changes. */
   onYamlChange: (yaml: string) => void;
+  agents: AgentSummary[];
+  /** Live-validate result from the page (server-side parse check). */
+  validity: { ok: boolean; error?: string } | null;
 }
 
-/** Parse `initialYaml` into a laid-out graph. A non-object document (or a parse
+/** Parse `draftYaml` into a laid-out graph. A non-object document (or a parse
  *  error) degrades to an empty workflow rather than throwing. */
-function seedGraph(initialYaml: string): WorkflowGraph {
+function seedGraph(draftYaml: string): WorkflowGraph {
   let obj: Record<string, unknown> = {};
   try {
-    const loaded = yaml.load(initialYaml);
+    const loaded = yaml.load(draftYaml);
     if (typeof loaded === 'object' && loaded !== null && !Array.isArray(loaded)) {
       obj = loaded as Record<string, unknown>;
     }
@@ -51,23 +63,24 @@ function seedGraph(initialYaml: string): WorkflowGraph {
 
 type PanelTab = 'step' | 'settings';
 
-export default function WorkflowEditor({ initialYaml, agents, onYamlChange }: WorkflowEditorProps) {
-  const [graph, setGraph] = useState<WorkflowGraph>(() => seedGraph(initialYaml));
+export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validity }: WorkflowEditorProps) {
+  const [graph, setGraph] = useState<WorkflowGraph>(() => seedGraph(draftYaml));
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [panelTab, setPanelTab] = useState<PanelTab>('settings');
   const [connError, setConnError] = useState<string | null>(null);
 
-  // We re-seed only when `initialYaml` IDENTITY changes from a *foreign* source
+  // We re-seed only when `draftYaml` IDENTITY changes from a *foreign* source
   // (the parent swapped the document). When WE emit YAML via onYamlChange the
-  // parent feeds it straight back as the next `initialYaml`; recording our own
+  // parent feeds it straight back as the next `draftYaml`; recording our own
   // emission here lets the effect skip that echo and avoid clobbering edits.
-  const lastSeenYaml = useRef(initialYaml);
+  // (Live per-keystroke YAML→graph reconcile is a later phase — unchanged here.)
+  const lastSeenYaml = useRef(draftYaml);
   useEffect(() => {
-    if (lastSeenYaml.current === initialYaml) return;
-    lastSeenYaml.current = initialYaml;
-    setGraph(seedGraph(initialYaml));
+    if (lastSeenYaml.current === draftYaml) return;
+    lastSeenYaml.current = draftYaml;
+    setGraph(seedGraph(draftYaml));
     setSelectedId(null);
-  }, [initialYaml]);
+  }, [draftYaml]);
 
   const problemsById = useMemo(() => validateGraph(graph), [graph]);
 
@@ -116,11 +129,11 @@ export default function WorkflowEditor({ initialYaml, agents, onYamlChange }: Wo
   const selectedNode = selectedId ? graph.nodes.find((n) => n.id === selectedId) ?? null : null;
 
   return (
-    <div className="space-y-3">
+    <div className="relative flex h-[52rem] min-h-[40rem] flex-col overflow-hidden rounded-xl border border-border bg-panel lg:flex-row">
       {connError && (
         <div
           role="alert"
-          className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800"
+          className="absolute left-3 right-3 top-3 z-20 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800 shadow-card lg:right-[21rem]"
         >
           <span className="flex-1">{connError}</span>
           <button
@@ -134,62 +147,124 @@ export default function WorkflowEditor({ initialYaml, agents, onYamlChange }: Wo
         </div>
       )}
 
-      <div className="flex flex-col gap-4 lg:flex-row">
-        <div className="min-w-0 flex-1">
-          <WorkflowEditorGraph
-            graph={graph}
-            onChange={commit}
-            selectedId={selectedId}
-            onSelect={handleSelect}
-            problemsById={problemsById}
-            onInvalidConnection={setConnError}
-          />
-        </div>
+      {/* ── LEFT / MAIN: graph over YAML, resizable ───────────────────────── */}
+      <div className="min-h-0 min-w-0 flex-1">
+        <SplitPane
+          top={
+            <div className="h-full overflow-hidden p-3">
+              <WorkflowEditorGraph
+                graph={graph}
+                onChange={commit}
+                selectedId={selectedId}
+                onSelect={handleSelect}
+                problemsById={problemsById}
+                onInvalidConnection={setConnError}
+              />
+            </div>
+          }
+          bottom={
+            <div className="flex h-full min-h-0 flex-col">
+              <div className="min-h-0 flex-1 overflow-auto p-3">
+                <CodeEditor
+                  value={draftYaml}
+                  onChange={onYamlChange}
+                  language="yaml"
+                  ariaLabel="Workflow YAML editor"
+                />
+              </div>
+              <div className="flex items-center gap-2 border-t border-border bg-white px-3 py-1.5">
+                <span className="text-[11px] text-ink-mute">⟳ synced from graph</span>
+                <span className="ml-auto">
+                  <ValidityBadge validity={validity} />
+                </span>
+              </div>
+            </div>
+          }
+        />
+      </div>
 
-        <aside className="w-full shrink-0 rounded-xl border border-border bg-panel p-4 lg:w-96">
-          <div className="mb-3 inline-flex rounded-lg border border-border bg-white p-0.5">
-            <PanelTabButton active={panelTab === 'step'} onClick={() => setPanelTab('step')}>
-              Step
-            </PanelTabButton>
-            <PanelTabButton active={panelTab === 'settings'} onClick={() => setPanelTab('settings')}>
+      {/* ── RIGHT: inspector rail ─────────────────────────────────────────── */}
+      <aside className="flex w-full shrink-0 flex-col border-t border-border bg-panel lg:w-80 lg:border-l lg:border-t-0">
+        <div className="border-b border-border p-3">
+          <div role="tablist" aria-label="Inspector" className="inline-flex rounded-lg border border-border bg-white p-0.5">
+            <PanelTabButton
+              active={panelTab === 'settings'}
+              onClick={() => setPanelTab('settings')}
+              controls="inspector-settings"
+            >
               Settings
             </PanelTabButton>
+            <PanelTabButton
+              active={panelTab === 'step'}
+              onClick={() => setPanelTab('step')}
+              controls="inspector-step"
+            >
+              Step
+            </PanelTabButton>
           </div>
+        </div>
 
+        <div className="min-h-0 flex-1 overflow-y-auto p-4">
           {panelTab === 'step' ? (
-            selectedNode ? (
-              <StepForm
-                node={selectedNode}
-                agents={agents}
-                onChange={onStepChange}
-                problems={problemsById[selectedNode.id] ?? []}
-              />
-            ) : (
-              <p className="text-[13px] text-ink-dim">
-                Select a step in the canvas to edit it, or add one from the palette.
-              </p>
-            )
+            <div role="tabpanel" id="inspector-step">
+              {selectedNode ? (
+                <StepForm
+                  node={selectedNode}
+                  agents={agents}
+                  onChange={onStepChange}
+                  problems={problemsById[selectedNode.id] ?? []}
+                />
+              ) : (
+                <p className="text-[13px] text-ink-dim">Select a node to edit its step.</p>
+              )}
+            </div>
           ) : (
-            <WorkflowSettingsForm meta={graph.meta} onChange={onMetaChange} />
+            <div role="tabpanel" id="inspector-settings">
+              <WorkflowSettingsForm meta={graph.meta} onChange={onMetaChange} />
+            </div>
           )}
-        </aside>
-      </div>
+        </div>
+      </aside>
     </div>
+  );
+}
+
+function ValidityBadge({ validity }: { validity: { ok: boolean; error?: string } | null }) {
+  if (!validity) return null;
+  if (validity.ok) {
+    return (
+      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-green-50 text-green-700 ring-green-200">
+        ✓ valid
+      </span>
+    );
+  }
+  return (
+    <span
+      className="inline-flex max-w-[16rem] items-center truncate rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-red-50 text-red-700 ring-red-200"
+      title={validity.error}
+    >
+      ✕ {validity.error ?? 'invalid'}
+    </span>
   );
 }
 
 function PanelTabButton({
   active,
   onClick,
+  controls,
   children,
 }: {
   active: boolean;
   onClick: () => void;
+  controls: string;
   children: React.ReactNode;
 }) {
   return (
     <button
       type="button"
+      role="tab"
+      aria-selected={active}
+      aria-controls={controls}
       onClick={onClick}
       className={
         active

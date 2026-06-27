@@ -213,7 +213,7 @@ function WorkflowEditorGraphInner({
   }, [graph, onChange]);
 
   return (
-    <div className="relative h-[32rem] w-full overflow-hidden rounded-xl border border-border shadow-card">
+    <div className="relative h-full min-h-[16rem] w-full overflow-hidden rounded-xl border border-border shadow-card">
       {/* palette + toolbar — static DOM floated over the canvas */}
       <div className="absolute left-3 top-3 z-10 flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-white/95 px-2 py-1.5 shadow-card">
         <span className="pr-1 text-[10px] font-semibold uppercase tracking-wide text-ink-mute">Add</span>
