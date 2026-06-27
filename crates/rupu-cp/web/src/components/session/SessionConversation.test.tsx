@@ -13,8 +13,13 @@ import type { SessionSummary, SessionRunRow } from '../../lib/api';
 
 vi.mock('../TranscriptPanel', () => ({
   __esModule: true,
-  default: ({ path, live }: { path: string; live: boolean }) => (
-    <div data-testid="transcript-panel" data-path={path} data-live={String(live)}>
+  default: ({ path, live, onComplete }: { path: string; live: boolean; onComplete?: () => void }) => (
+    <div
+      data-testid="transcript-panel"
+      data-path={path}
+      data-live={String(live)}
+      data-has-on-complete={onComplete != null ? 'true' : 'false'}
+    >
       transcript:{path}
     </div>
   ),
@@ -112,5 +117,35 @@ describe('SessionConversation', () => {
     render(<SessionConversation session={SESSION} runs={[]} />);
     expect(screen.getByText(/No messages yet/)).toBeInTheDocument();
     expect(panels()).toHaveLength(0);
+  });
+
+  it('renders a per-turn error line when a run has an error field', () => {
+    const runs: SessionRunRow[] = [
+      {
+        run_id: 'run-1',
+        prompt: 'do something',
+        transcript_path: '/t/run-1.jsonl',
+        status: 'error',
+        error: 'provider: API error 401',
+        tokens_in: 0,
+        tokens_out: 0,
+        tokens_cached: 0,
+        duration_ms: 0,
+      },
+    ];
+    render(<SessionConversation session={SESSION} runs={runs} />);
+    expect(screen.getByText('provider: API error 401')).toBeInTheDocument();
+  });
+
+  it('passes onComplete to the active turn panel and not to terminal turns', () => {
+    const onTurnComplete = vi.fn();
+    const runs = makeRuns(2); // run-2 has null status → active
+    render(<SessionConversation session={SESSION} runs={runs} onTurnComplete={onTurnComplete} />);
+
+    const byPath = (p: string) => panels().find((el) => el.dataset.path === p)!;
+    // Active turn (null status) gets onComplete wired up.
+    expect(byPath('/t/run-2.jsonl').dataset.hasOnComplete).toBe('true');
+    // Terminal turn does not.
+    expect(byPath('/t/run-1.jsonl').dataset.hasOnComplete).toBe('false');
   });
 });

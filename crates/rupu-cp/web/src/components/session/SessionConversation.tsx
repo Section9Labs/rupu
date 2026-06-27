@@ -24,10 +24,14 @@ function isActive(run: SessionRunRow, session: SessionSummary): boolean {
 export default function SessionConversation({
   session,
   runs,
+  onTurnComplete,
 }: {
   session: SessionSummary;
   /** Turn-runs in stored order (oldest→newest). */
   runs: SessionRunRow[];
+  /** Called when the active turn's transcript stream fires run_complete/run_failed.
+   *  Allows the parent (SessionDetail) to reload session + runs immediately. */
+  onTurnComplete?: () => void;
 }) {
   const [visible, setVisible] = useState(PAGE);
 
@@ -98,7 +102,17 @@ export default function SessionConversation({
             </div>
 
             {/* Agent response — embedded transcript, live while in flight. */}
-            <TranscriptPanel path={run.transcript_path} live={isActive(run, session)} embedded />
+            <TranscriptPanel
+              path={run.transcript_path}
+              live={isActive(run, session)}
+              embedded
+              onComplete={isActive(run, session) ? onTurnComplete : undefined}
+            />
+
+            {/* Per-turn error line (shown when the run terminated with an error). */}
+            {run.error && (
+              <p className="text-[11px] text-red-600">{run.error}</p>
+            )}
           </div>
         ))}
       </div>

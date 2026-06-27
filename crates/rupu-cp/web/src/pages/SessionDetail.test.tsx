@@ -104,4 +104,19 @@ describe('SessionDetail composer', () => {
     fireEvent.click(sendBtn);
     expect(sendSpy).not.toHaveBeenCalled();
   });
+
+  it('renders a session error banner when the session has last_error', async () => {
+    const failedSession: SessionSummary = {
+      ...ACTIVE_SESSION,
+      status: 'failed',
+      last_error: 'provider: API error 401',
+    };
+    stubApi(failedSession);
+
+    renderPage();
+
+    // Wait for the session to load then check the banner appears.
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    expect(screen.getByText('provider: API error 401')).toBeInTheDocument();
+  });
 });
