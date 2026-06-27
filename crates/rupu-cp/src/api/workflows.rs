@@ -1,4 +1,5 @@
 use crate::{
+    api::fs_safety,
     error::{ApiError, ApiResult},
     launcher::LaunchError,
     state::AppState,
@@ -13,9 +14,19 @@ use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/workflows", get(list_workflows))
-        .route("/api/workflows/:name", get(get_workflow))
+        .route("/api/workflows", get(list_workflows).post(create_workflow))
+        .route(
+            "/api/workflows/:name",
+            get(get_workflow)
+                .put(write_workflow)
+                .delete(delete_workflow),
+        )
         .route("/api/workflows/:name/run", post(launch_run))
+}
+
+/// Directory where global workflow `.yaml` definitions live.
+fn workflows_dir(s: &AppState) -> std::path::PathBuf {
+    s.global_dir.join("workflows")
 }
 
 #[derive(Serialize)]
@@ -67,8 +78,9 @@ pub(crate) fn scan_workflow_names(dir: &std::path::Path, scope: &'static str) ->
 async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<WorkflowDto>>> {
     let mut rows = scan_workflow_names(&s.global_dir.join("workflows"), "global");
     let runs = s.run_store.list().unwrap_or_default();
-    let rollups =
-        crate::usage::rollup_by(&s.run_store, &runs, &s.pricing, |r| Some(r.workflow_name.clone()));
+    let rollups = crate::usage::rollup_by(&s.run_store, &runs, &s.pricing, |r| {
+        Some(r.workflow_name.clone())
+    });
     for row in &mut rows {
         if let Some(roll) = rollups.get(&row.name) {
             row.usage = roll.usage.clone();
@@ -79,11 +91,10 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
     Ok(Json(rows))
 }
 
-async fn get_workflow(
-    State(s): State<AppState>,
-    Path(name): Path<String>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let path = s.global_dir.join("workflows").join(format!("{name}.yaml"));
+/// Load workflow `name` and build the full detail DTO (`workflow` + raw `yaml` +
+/// aggregate `usage`). Shared by GET / PUT / POST.
+fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Value>> {
+    let path = workflows_dir(s).join(format!("{name}.yaml"));
     if !path.exists() {
         return Err(ApiError::not_found(format!("workflow {name} not found")));
     }
@@ -100,6 +111,78 @@ async fn get_workflow(
     Ok(Json(
         serde_json::json!({ "workflow": workflow, "yaml": yaml, "usage": usage }),
     ))
+}
+
+async fn get_workflow(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    load_detail(&s, &name)
+}
+
+/// Request body for `PUT /api/workflows/:name` and `POST /api/workflows`: the
+/// full raw `.yaml` to validate and persist.
+#[derive(Deserialize)]
+struct WorkflowWriteBody {
+    raw: String,
+}
+
+/// `PUT /api/workflows/:name` — overwrite (or create) the global workflow
+/// definition `:name`. The raw `.yaml` is validated by [`Workflow::parse`]
+/// before any write; the parsed `name:` must equal `:name`. Returns the
+/// reloaded detail DTO.
+async fn write_workflow(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<WorkflowWriteBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    fs_safety::validate_name(&name)?;
+    let wf = Workflow::parse(&body.raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if wf.name != name {
+        return Err(ApiError::bad_request(
+            "workflow name must equal the workflow file name",
+        ));
+    }
+    let dir = workflows_dir(&s);
+    std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    fs_safety::write_atomic(&dir.join(format!("{name}.yaml")), body.raw.as_bytes())
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    load_detail(&s, &name)
+}
+
+/// `POST /api/workflows` — create a new global workflow. The name is taken from
+/// the parsed `name:`; fails with 409 if a definition with that name already
+/// exists. Returns the reloaded detail DTO.
+async fn create_workflow(
+    State(s): State<AppState>,
+    Json(body): Json<WorkflowWriteBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let wf = Workflow::parse(&body.raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let name = wf.name;
+    fs_safety::validate_name(&name)?;
+    let dir = workflows_dir(&s);
+    let target = dir.join(format!("{name}.yaml"));
+    if target.exists() {
+        return Err(ApiError::conflict("workflow already exists"));
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    fs_safety::write_atomic(&target, body.raw.as_bytes())
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    load_detail(&s, &name)
+}
+
+/// `DELETE /api/workflows/:name` — remove the global workflow definition `:name`.
+async fn delete_workflow(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    fs_safety::validate_name(&name)?;
+    let target = workflows_dir(&s).join(format!("{name}.yaml"));
+    if !target.exists() {
+        return Err(ApiError::not_found(format!("workflow {name} not found")));
+    }
+    std::fs::remove_file(&target).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
 /// Request body for `POST /api/workflows/:name/run`. All fields optional; a
@@ -237,5 +320,121 @@ mod tests {
             .await
             .expect_err("no launcher should error");
         assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    const VALID_YAML: &str = "name: demo\nsteps:\n  - id: one\n    agent: x\n    prompt: hi\n";
+
+    fn wf_path(s: &AppState, name: &str) -> std::path::PathBuf {
+        workflows_dir(s).join(format!("{name}.yaml"))
+    }
+
+    #[tokio::test]
+    async fn put_valid_writes_and_reloads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let resp = write_workflow(
+            State(s.clone()),
+            Path("demo".into()),
+            Json(WorkflowWriteBody {
+                raw: VALID_YAML.into(),
+            }),
+        )
+        .await
+        .expect("put ok");
+        assert_eq!(resp.0["yaml"], serde_json::json!(VALID_YAML));
+        assert_eq!(
+            std::fs::read_to_string(wf_path(&s, "demo")).unwrap(),
+            VALID_YAML
+        );
+
+        // Re-reading via get_workflow returns the new yaml.
+        let got = get_workflow(State(s.clone()), Path("demo".into()))
+            .await
+            .expect("get ok");
+        assert_eq!(got.0["yaml"], serde_json::json!(VALID_YAML));
+    }
+
+    #[tokio::test]
+    async fn put_unparseable_is_bad_request_and_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let err = write_workflow(
+            State(s.clone()),
+            Path("demo".into()),
+            Json(WorkflowWriteBody { raw: "".into() }),
+        )
+        .await
+        .expect_err("should reject");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(!wf_path(&s, "demo").exists());
+    }
+
+    #[tokio::test]
+    async fn put_name_mismatch_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let err = write_workflow(
+            State(s.clone()),
+            Path("other".into()),
+            Json(WorkflowWriteBody {
+                raw: VALID_YAML.into(),
+            }),
+        )
+        .await
+        .expect_err("mismatch");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(!wf_path(&s, "other").exists());
+    }
+
+    #[tokio::test]
+    async fn post_creates_then_conflicts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let resp = create_workflow(
+            State(s.clone()),
+            Json(WorkflowWriteBody {
+                raw: VALID_YAML.into(),
+            }),
+        )
+        .await
+        .expect("create ok");
+        assert_eq!(resp.0["yaml"], serde_json::json!(VALID_YAML));
+        assert_eq!(
+            std::fs::read_to_string(wf_path(&s, "demo")).unwrap(),
+            VALID_YAML
+        );
+
+        let err = create_workflow(
+            State(s.clone()),
+            Json(WorkflowWriteBody {
+                raw: VALID_YAML.into(),
+            }),
+        )
+        .await
+        .expect_err("conflict");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn delete_present_then_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(wf_path(&s, "demo"), VALID_YAML).unwrap();
+
+        let resp = delete_workflow(State(s.clone()), Path("demo".into()))
+            .await
+            .expect("delete ok");
+        assert_eq!(resp.0["deleted"], serde_json::json!(true));
+        assert!(!wf_path(&s, "demo").exists());
+
+        let err = delete_workflow(State(s.clone()), Path("demo".into()))
+            .await
+            .expect_err("absent");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 }

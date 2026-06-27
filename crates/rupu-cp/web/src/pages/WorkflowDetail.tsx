@@ -4,12 +4,13 @@
 // so we narrow each field we read defensively.
 
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
+import { Link, useNavigate, useParams } from 'react-router-dom';
+import { ArrowLeft, Pencil, Trash2 } from 'lucide-react';
 import { api, type WorkflowDetail } from '../lib/api';
 import { cn } from '../lib/cn';
 import { ScopeChip } from './Workflows';
 import CodeHighlight from '../components/CodeHighlight';
+import CodeEditor from '../components/CodeEditor';
 import LauncherSheet from '../components/LauncherSheet';
 
 // ── Loose narrowing helpers ──────────────────────────────────────────────
@@ -89,10 +90,19 @@ function readAutoflow(workflow: Record<string, unknown>): AutoflowInfo | null {
 
 export default function WorkflowDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
+  const navigate = useNavigate();
 
   const [detail, setDetail] = useState<WorkflowDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [launcherOpen, setLauncherOpen] = useState(false);
+
+  // ── Edit / delete state ──────────────────────────────────────────────
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!name) return;
@@ -113,6 +123,48 @@ export default function WorkflowDetailPage() {
       cancelled = true;
     };
   }, [name]);
+
+  function startEdit() {
+    if (!detail) return;
+    setDraft(detail.yaml);
+    setSaveError(null);
+    setEditing(true);
+  }
+
+  function cancelEdit() {
+    setEditing(false);
+    setSaveError(null);
+  }
+
+  async function save() {
+    if (!detail || saving) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const updated = await api.saveWorkflow(name, draft);
+      setDetail(updated);
+      setDraft(updated.yaml);
+      setEditing(false);
+    } catch (e: unknown) {
+      setSaveError(e instanceof Error ? e.message : 'Failed to save workflow');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function remove() {
+    if (!detail || deleting) return;
+    if (!window.confirm('Delete this workflow?')) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await api.deleteWorkflow(name);
+      navigate('/workflows');
+    } catch (e: unknown) {
+      setDeleteError(e instanceof Error ? e.message : 'Failed to delete workflow');
+      setDeleting(false);
+    }
+  }
 
   if (error) {
     return (
@@ -154,15 +206,32 @@ export default function WorkflowDetailPage() {
               Autoflow
             </span>
           )}
-          <button
-            type="button"
-            onClick={() => setLauncherOpen(true)}
-            aria-label={`Run ${wfName}`}
-            className="ml-auto inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
-          >
-            Run
-          </button>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={remove}
+              disabled={deleting}
+              aria-label={`Delete ${wfName}`}
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Trash2 size={14} />
+              Delete
+            </button>
+            <button
+              type="button"
+              onClick={() => setLauncherOpen(true)}
+              aria-label={`Run ${wfName}`}
+              className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
+            >
+              Run
+            </button>
+          </div>
         </div>
+        {deleteError && (
+          <p role="alert" className="mt-2 text-[12px] font-medium text-red-700">
+            {deleteError}
+          </p>
+        )}
         {description && (
           <p className="mt-2 text-sm text-ink-dim leading-snug">{description}</p>
         )}
@@ -189,8 +258,56 @@ export default function WorkflowDetailPage() {
 
       {/* ── Raw YAML ────────────────────────────────────────────── */}
       <section className="mt-8">
-        <h2 className="text-sm font-semibold text-ink mb-2 pl-1">YAML</h2>
-        <CodeHighlight code={detail.yaml} language="yaml" />
+        <div className="mb-2 flex items-center justify-between pl-1">
+          <h2 className="text-sm font-semibold text-ink">YAML</h2>
+          {!editing && (
+            <button
+              type="button"
+              onClick={startEdit}
+              aria-label="Edit YAML"
+              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-white px-2.5 py-1 text-[12px] font-medium text-ink-dim hover:bg-slate-50"
+            >
+              <Pencil size={13} />
+              Edit
+            </button>
+          )}
+        </div>
+
+        {editing ? (
+          <div className="space-y-3">
+            <CodeEditor
+              value={draft}
+              onChange={setDraft}
+              language="yaml"
+              ariaLabel="Workflow YAML editor"
+            />
+            {saveError && (
+              <p role="alert" className="text-[12px] font-medium text-red-700">
+                {saveError}
+              </p>
+            )}
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={cancelEdit}
+                disabled={saving}
+                className="inline-flex items-center rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={save}
+                disabled={saving || draft === detail.yaml}
+                className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {saving ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <CodeHighlight code={detail.yaml} language="yaml" />
+        )}
       </section>
 
       {launcherOpen && (
