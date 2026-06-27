@@ -1,23 +1,36 @@
 // Agents library — read-only list of agent files discovered by the control
 // plane. Each row links to /agents/:name for the full system prompt.
 
-import { useEffect, useState } from 'react';
-import { Sparkles } from 'lucide-react';
+import { useEffect, useId, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Plus, Sparkles } from 'lucide-react';
 import { api, type AgentSummary } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import MetricRow from '../components/lists/MetricRow';
 import UsageBarChart from '../components/charts/UsageBarChart';
+import CodeEditor from '../components/CodeEditor';
 import { formatTokens, formatCost } from '../lib/usage';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
 const STEP = 20;
 
+const NEW_AGENT_TEMPLATE = `---
+name: my-agent
+description: A short description.
+provider: anthropic
+model: claude-sonnet-4-6
+---
+
+You are a helpful agent. ...
+`;
+
 export default function Agents() {
   const [agents, setAgents] = useState<AgentSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [visible, setVisible] = useState(STEP);
+  const [createOpen, setCreateOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -46,12 +59,22 @@ export default function Agents() {
 
   return (
     <div className="p-8 max-w-5xl">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-ink">Agents</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Agent files discovered across this control plane — provider, model, and the system prompt
-          each one runs with.
-        </p>
+      <header className="mb-6 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold text-ink">Agents</h1>
+          <p className="mt-1 text-sm text-ink-dim">
+            Agent files discovered across this control plane — provider, model, and the system prompt
+            each one runs with.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setCreateOpen(true)}
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
+        >
+          <Plus size={14} />
+          New agent
+        </button>
       </header>
 
       {error && (
@@ -92,6 +115,97 @@ export default function Agents() {
           )}
         </section>
       )}
+
+      {createOpen && <NewAgentModal onClose={() => setCreateOpen(false)} />}
+    </div>
+  );
+}
+
+function NewAgentModal({ onClose }: { onClose: () => void }) {
+  const navigate = useNavigate();
+  const titleId = useId();
+  const [raw, setRaw] = useState(NEW_AGENT_TEMPLATE);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose();
+    }
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  async function create() {
+    if (creating) return;
+    setCreating(true);
+    setError(null);
+    try {
+      const created = await api.createAgent(raw);
+      navigate(`/agents/${encodeURIComponent(created.name)}`);
+      onClose();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to create agent');
+      setCreating(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4 pt-[8vh]"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        className="w-full max-w-2xl rounded-xl border border-border bg-panel shadow-card"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="border-b border-border px-5 py-4">
+          <h2 id={titleId} className="text-base font-semibold text-ink">
+            New agent
+          </h2>
+          <p className="mt-1 text-[12px] text-ink-dim">
+            Edit the definition below. It is validated server-side before it is saved.
+          </p>
+        </div>
+
+        <div className="space-y-3 px-5 py-4">
+          <CodeEditor
+            value={raw}
+            onChange={setRaw}
+            language="markdown"
+            ariaLabel="New agent definition"
+          />
+          {error && (
+            <p role="alert" className="text-[12px] font-medium text-red-700">
+              {error}
+            </p>
+          )}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={creating}
+            className="inline-flex items-center rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={create}
+            disabled={creating}
+            className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {creating ? 'Creating…' : 'Create'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
