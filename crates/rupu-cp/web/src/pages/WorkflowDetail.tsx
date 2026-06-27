@@ -146,6 +146,21 @@ export default function WorkflowDetailPage() {
     };
   }, [draftYaml]);
 
+  // Unsaved-changes guard. The app mounts a plain <BrowserRouter> (not a data
+  // router), so react-router's `useBlocker` is unavailable — we rely on the
+  // native `beforeunload` prompt for browser close / refresh / external nav while
+  // the draft diverges from the saved YAML. In-app route changes are not blocked.
+  const dirty = detail !== null && draftYaml !== detail.yaml;
+  useEffect(() => {
+    if (!dirty) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [dirty]);
+
   function revertDraft() {
     if (detail) setDraftYaml(detail.yaml);
     setSaveError(null);
@@ -206,7 +221,6 @@ export default function WorkflowDetailPage() {
   const autoflow = readAutoflow(detail.workflow);
   const inputNames = readInputNames(detail.workflow);
 
-  const dirty = draftYaml !== detail.yaml;
   const saveDisabled = saving || !dirty || validity?.ok === false;
   const revertDisabled = saving || !dirty;
 

@@ -35,6 +35,7 @@ import WorkflowEditorGraph from './WorkflowEditorGraph';
 import StepForm from './StepForm';
 import WorkflowSettingsForm from './WorkflowSettingsForm';
 import SplitPane from './SplitPane';
+import ExpressionReference from './ExpressionReference';
 
 interface WorkflowEditorProps {
   /** The shared editable YAML draft (owned by the page — single source of truth). */
@@ -63,7 +64,21 @@ function seedGraph(draftYaml: string): WorkflowGraph {
   return g;
 }
 
-type PanelTab = 'step' | 'settings';
+type PanelTab = 'step' | 'settings' | 'reference';
+
+/** localStorage flag: the canonical-rewrite notice has been shown once. */
+const REFORMAT_NOTICE_KEY = 'rupu.editor.reformatNoticeSeen';
+
+/** True if `text` contains a YAML comment — a line whose first non-space char is
+ *  `#`, or an inline ` #`. A heuristic (may flag `#` inside a quoted scalar);
+ *  used only to gate a one-time, dismissible notice, so over-warning is benign. */
+function hasYamlComments(text: string): boolean {
+  for (const line of text.split('\n')) {
+    if (line.trimStart().startsWith('#')) return true;
+    if (/\s#/.test(line)) return true;
+  }
+  return false;
+}
 
 export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validity }: WorkflowEditorProps) {
   const [graph, setGraph] = useState<WorkflowGraph>(() => seedGraph(draftYaml));
@@ -74,6 +89,9 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
   const [notice, setNotice] = useState<string | null>(null);
   // True while the YAML is unparseable: the graph is kept but frozen + dimmed.
   const [paused, setPaused] = useState(false);
+  // One-time banner: a graph edit on a commented document reformats the YAML
+  // (canonical rewrite) and drops comments. Shown at most once per browser.
+  const [reformatNotice, setReformatNotice] = useState(false);
 
   // Keep the latest selectedId + graph readable inside the debounce timeout
   // WITHOUT adding them to the effect deps (which would re-arm the timer on every
@@ -94,6 +112,10 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
   // position, new ids get a dagre slot, removed ids drop. Unparseable YAML pauses
   // (keeps the last good graph) instead of nuking the canvas.
   const lastSeenYaml = useRef(draftYaml);
+  // Latest draftYaml readable inside `commit` (which intentionally excludes
+  // draftYaml from its deps) so we can sniff the pre-rewrite text for comments.
+  const draftYamlRef = useRef(draftYaml);
+  draftYamlRef.current = draftYaml;
   useEffect(() => {
     if (lastSeenYaml.current === draftYaml) return; // our own echo — ignore.
     const handle = setTimeout(() => {
@@ -132,6 +154,20 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
       setGraph(next);
       const res = graphToWorkflowObject(next);
       if ('obj' in res) {
+        // First graph edit on a commented document: warn (once per browser) that
+        // editing the graph reformats the YAML canonically and removes comments.
+        try {
+          if (
+            typeof localStorage !== 'undefined' &&
+            !localStorage.getItem(REFORMAT_NOTICE_KEY) &&
+            hasYamlComments(draftYamlRef.current)
+          ) {
+            localStorage.setItem(REFORMAT_NOTICE_KEY, '1');
+            setReformatNotice(true);
+          }
+        } catch {
+          /* localStorage unavailable (private mode / SSR) — skip the notice */
+        }
         const dumped = yaml.dump(res.obj);
         lastSeenYaml.current = dumped;
         onYamlChange(dumped);
@@ -225,6 +261,26 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
         </div>
       )}
 
+      {reformatNotice && (
+        <div
+          role="status"
+          className="absolute left-3 right-3 top-3 z-20 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800 shadow-card lg:right-[21rem]"
+        >
+          <span className="flex-1">
+            Editing the graph reformats the YAML and removes comments. Edit the YAML directly to keep
+            comments intact.
+          </span>
+          <button
+            type="button"
+            onClick={() => setReformatNotice(false)}
+            aria-label="Dismiss"
+            className="shrink-0 font-semibold text-amber-700 hover:text-amber-900"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* ── LEFT / MAIN: graph over YAML, resizable ───────────────────────── */}
       <div className="min-h-0 min-w-0 flex-1">
         <SplitPane
@@ -269,6 +325,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
             <PanelTabButton
               active={panelTab === 'settings'}
               onClick={() => setPanelTab('settings')}
+              tabId="inspector-tab-settings"
               controls="inspector-settings"
             >
               Settings
@@ -276,16 +333,25 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
             <PanelTabButton
               active={panelTab === 'step'}
               onClick={() => setPanelTab('step')}
+              tabId="inspector-tab-step"
               controls="inspector-step"
             >
               Step
+            </PanelTabButton>
+            <PanelTabButton
+              active={panelTab === 'reference'}
+              onClick={() => setPanelTab('reference')}
+              tabId="inspector-tab-reference"
+              controls="inspector-reference"
+            >
+              Reference
             </PanelTabButton>
           </div>
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
-          {panelTab === 'step' ? (
-            <div role="tabpanel" id="inspector-step">
+          {panelTab === 'step' && (
+            <div role="tabpanel" id="inspector-step" aria-labelledby="inspector-tab-step">
               {selectedNode ? (
                 <StepForm
                   node={selectedNode}
@@ -298,9 +364,20 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
                 <p className="text-[13px] text-ink-dim">Select a node to edit its step.</p>
               )}
             </div>
-          ) : (
-            <div role="tabpanel" id="inspector-settings">
+          )}
+          {panelTab === 'settings' && (
+            <div role="tabpanel" id="inspector-settings" aria-labelledby="inspector-tab-settings">
               <WorkflowSettingsForm meta={graph.meta} onChange={onMetaChange} />
+            </div>
+          )}
+          {panelTab === 'reference' && (
+            <div
+              role="tabpanel"
+              id="inspector-reference"
+              aria-labelledby="inspector-tab-reference"
+              className="h-full"
+            >
+              <ExpressionReference />
             </div>
           )}
         </div>
@@ -331,11 +408,13 @@ function ValidityBadge({ validity }: { validity: { ok: boolean; error?: string }
 function PanelTabButton({
   active,
   onClick,
+  tabId,
   controls,
   children,
 }: {
   active: boolean;
   onClick: () => void;
+  tabId: string;
   controls: string;
   children: React.ReactNode;
 }) {
@@ -343,6 +422,7 @@ function PanelTabButton({
     <button
       type="button"
       role="tab"
+      id={tabId}
       aria-selected={active}
       aria-controls={controls}
       onClick={onClick}
