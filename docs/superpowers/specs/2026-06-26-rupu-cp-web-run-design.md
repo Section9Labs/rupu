@@ -1,170 +1,141 @@
-# rupu CP web — Run (dispatch) + Cancel, with smart target pickers
+# rupu CP web — smart Run target pickers + agent Run
 
-Date: 2026-06-26
+Date: 2026-06-26 (corrected 2026-06-27)
 Status: approved (design)
 
-## Problem
+## Reality check (corrected)
 
-The CP web UI is read-only: you can view workflow/agent definitions and watch
-runs, but you cannot **start** a run from the browser, nor cancel one. We want a
-"Run" experience in the web CP for workflows and agents, with a smart target
-picker (existing project / directory with browse + fuzzy-complete / repository
-with fuzzy-complete from the logged-in repo list), and the ability to cancel an
-in-flight run.
+The CP web UI **already has workflow Run** (this was missed in the first
+exploration). On `main` (v0.18.0):
+- `WorkflowDetail` has a Run button → `LauncherSheet` modal
+  (`crates/rupu-cp/web/src/components/LauncherSheet.tsx`): declared/free-form
+  inputs, a Mode picker (Ask/Bypass/Read-only), and a single free-text
+  **Target** field.
+- `api.launchRun(workflow, body)` → `POST /api/workflows/:name/run` →
+  `launch_run` handler → the `RunLauncher` port. `rupu-cli`'s `cp serve`
+  installs `SubprocessLauncher`, which spawns `rupu workflow run …
+  --run-id … --plain` and returns the new run id.
+- Cancel is also fully built: `POST /api/runs/:id/cancel` → `RunStore::cancel`
+  (marks `Cancelled`, SIGTERMs the run's `runner_pid`) + Cancel buttons on
+  `RunDetail`.
 
-## Approach (decided in brainstorming)
+So "build Run" is done. The actual asks are improvements to this surface:
 
-**Spawn the existing CLI as a detached process** — the CP backend launches
-`rupu workflow run …` (or `rupu run <agent> …`) as its own OS process, exactly
-like a user typing the command. The run writes `run.json` / `events.jsonl` to
-`<global>/runs/<id>/`, which the CP already tails for the graph / transcript /
-approval UI. Rationale:
+1. **Repository fuzzy-complete** in the Target field, from the logged-in repo
+   list.
+2. **Directory picker** — browse + fuzzy-complete from previous projects/paths —
+   as a target (run in that directory).
+3. **Agent Run** — the same Run experience on `AgentDetail` (none exists today).
 
-- Reuses the entire battle-tested run path — no embedded executor, no dispatch
-  queue, no new worker loop. (Supersedes an earlier marker+worker idea.)
-- The run is an independent process: **if the CP is closed or crashes, the run
-  keeps going**; the CP reads its on-disk state when it returns.
-- The CLI already clones `repo` / `PR` / `issue` targets to a tmpdir itself, so
-  the repository target needs **no clone logic on the CP side**.
-- The CP stays a thin launcher/viewer — it never runs the orchestrator
-  in-process, preserving the read-only-runtime principle.
+The one already-kept change from the initial detour: `SubprocessLauncher` now
+spawns the run **detached** (own process group + null stdio) so a run survives
+`cp serve` being closed (commit on this branch).
 
-The CP serve resume worker (approvals) is unchanged and unrelated.
+## Architecture pattern
 
-## Phasing
+The runtime-dependent backend work follows the existing **port** pattern
+(`RunLauncher`, `session_sender`): `rupu-cp` defines a thin trait + HTTP handler;
+`rupu-cli`'s `cp serve` installs the adapter that has the full runtime (SCM
+registry, keychain). Read-only `rupu cp` (no adapter) returns 501 / empty. This
+keeps `rupu-cp` free of `rupu-scm`/`rupu-auth` deps.
 
-- **A — Run + Cancel foundation (this implements first).** Workflow Run from the
-  web with a *basic* target (existing project / directory path / repo-ref text),
-  plus Cancel. End-to-end working.
-- **B — Smart target pickers.** Directory browse endpoint + directory
-  fuzzy-complete from past projects; repository fuzzy-complete from the
-  logged-in repo list. Layered onto A's form.
-- **C — Agent Run.** Same spawn+cancel path for `rupu run <agent>` from
-  AgentDetail (prompt + mode + target). Cancel comes for free.
+## Phasing (3 PRs)
 
-Each phase is its own plan + PR. This spec details A fully and scopes B and C.
+- **PR1 — Repo picker** (+ the detach fix). `RepoLister` port + `GET /api/repos`
+  + `cp serve` adapter (wires `rupu-scm` `Registry::discover` → `list_repos`);
+  frontend repo fuzzy-complete in `LauncherSheet`'s Target.
+- **PR2 — Directory picker.** `GET /api/fs/browse` + a `working_dir` field on
+  `LaunchRequest` (and `--dir`/`current_dir` plumbing through the launcher);
+  frontend directory browse + fuzzy-complete (sourced from `getProjects()` +
+  browse).
+- **PR3 — Agent Run.** Agent launch port/endpoint + `cp serve` adapter spawning
+  `rupu run <agent> …`; a Run modal on `AgentDetail` reusing the pickers; cancel
+  works unchanged.
 
----
-
-## Already built (discovered during design — do NOT rebuild)
-
-The backend launch + cancel machinery already exists:
-- `rupu workflow run` already accepts `--run-id` (`workflow.rs` `Run` variant)
-  and `RunStatus::Cancelled` already exists.
-- `rupu-cp` defines a `RunLauncher` port (`crates/rupu-cp/src/launcher.rs`):
-  `LaunchRequest { workflow, inputs: BTreeMap<String,String>, mode: Option<String>,
-  target: Option<String> }` → `launch() -> Result<String /*run_id*/, LaunchError>`.
-  `AppState.launcher: Option<Arc<dyn RunLauncher>>`; `ApiError::not_available()`
-  (501) is the "no launcher (read-only `rupu cp`)" response.
-- `rupu-cli` provides the adapter `SubprocessLauncher` (`crates/rupu-cli/src/cp_launcher.rs`),
-  installed by `cp serve` (`cmd/cp.rs`). `build_run_argv` →
-  `workflow run <name> [target] --run-id <id> --plain [--input k=v]… [--mode m]`;
-  `launch()` mints `run_<ULID>`, spawns the child, returns the id.
-- Cancel is complete: `POST /api/runs/:id/cancel` → `RunStore::cancel`, which
-  marks `Cancelled`, sets `finished_at`, and SIGTERMs the run's `runner_pid`
-  (guarding against signalling the cp-serve PID itself); awaiting-approval →
-  reject; terminal → 409. The run process records its own `runner_pid`.
-
-So the run survives the CP because it's a separate child process the CP only
-launched; cancel works because the run records its pid and the CP signals it.
-
-## Sub-project A — gaps to close
-
-### A1. Detach the spawned run (`rupu-cli` `cp_launcher.rs`)
-The current `SubprocessLauncher::launch` spawns the child in the cp-serve
-process group with inherited stdio. A `Ctrl-C`/SIGINT to `cp serve` would then
-also hit the run. To honor "the run survives if the CP closes," harden the spawn:
-- Put the child in its **own process group/session** (`CommandExt::process_group(0)`
-  on Unix) so terminal signals to `cp serve` don't propagate.
-- Redirect the child's stdout/stderr to `Stdio::null()` (it writes its own
-  run.json/events.jsonl/transcripts; nothing useful goes to the inherited TTY).
-- Keep `build_run_argv` and the returned `run_<ULID>` id unchanged.
-
-### A2. Dispatch endpoint (`rupu-cp`)
-Add `POST /api/workflows/:name/dispatch` with body
-`{ inputs: Record<string,string>, mode?: "ask"|"bypass"|"readonly", target?: string }`
-where `target` is the CLI positional target string (basic in A: a repo-ref like
-`github:owner/repo`, or empty for "current"). Handler:
-1. If `s.launcher` is `None` → `ApiError::not_available("run dispatch requires `rupu cp serve`")`.
-2. Validate the workflow exists (stem under `<global>/workflows/`) and `mode`
-   (when present) is one of the three.
-3. Build `LaunchRequest { workflow: name, inputs, mode, target }`, call
-   `s.launcher.launch(req).await`, map `LaunchError::Invalid` → 400 /
-   `LaunchError::Spawn` → 500, and return `{ run_id }`.
-
-Note: A's target is the CLI target string (project/working-dir selection and the
-fuzzy pickers are sub-project B; the existing launcher runs the child in the
-cp-serve cwd, and repo-refs clone themselves). B will extend `LaunchRequest`
-with an explicit working directory.
-
-### Frontend (`rupu-cp/web`)
-- **api.ts**: `dispatchWorkflow(name, body): Promise<{ run_id: string }>` and
-  `cancelRun(id): Promise<RunResponse>`, plus a `DispatchBody` type
-  `{ inputs: Record<string,string>; mode?: string; target?: string }`.
-- **Run modal** (new lightweight Tailwind modal component — no new deps) opened
-  by a **Run** button on `WorkflowDetail`:
-  - Inputs: one field per the workflow's declared `inputs` (string/int/bool),
-    read from `detail.workflow.inputs` (narrowed defensively).
-  - Mode: select Ask / Bypass / Read-only.
-  - Target (basic in A): a single optional text field — a run-target string
-    (e.g. `github:owner/repo`), blank = run in the cp-serve working dir. (The
-    project/directory pickers come in B once `LaunchRequest` gains a working
-    dir.)
-  - A note: "Runs start in the background and keep running even if this page or
-    the CP is closed."
-  - Submit → `dispatchWorkflow` → navigate to `/runs/<run_id>`. On 501 show
-    "dispatch requires `rupu cp serve`."
-- **Cancel button** on `RunDetail` (and run rows) shown when status is
-  `Running`/`Pending`/`AwaitingApproval` → `cancelRun(id)` → reflect the
-  returned status. (Cancel endpoint already exists.)
-
-### Testing (A)
-- `rupu-cli`: extend `cp_launcher` tests if argv changes (it shouldn't); the
-  detach change is behavioural — covered by the existing argv tests staying green
-  plus a manual note.
-- `rupu-cp`: dispatch handler — `launcher: None` → 501; with a mock
-  `RunLauncher`, a valid body → returns the mock's run id and forwards the
-  `LaunchRequest` (workflow/inputs/mode/target) unchanged; unknown workflow →
-  404; bad mode → 400.
-- web (vitest): Run-form renders fields from a workflow-inputs definition and
-  builds the correct `DispatchBody`; Cancel button visibility by status.
-
-### Risks / notes (A)
-- Spawn-failure (bad args): `LaunchError::Spawn` → 500; the child also captures
-  nothing useful (stdio null) — failures surface via the absent/failed run.
-- If the spawned CLI fails before writing `run.json`, `/runs/<id>` shows
-  "loading/not found" briefly — mitigated by validating the workflow exists
-  before launch; acceptable for v1.
-- Cancel is a hard SIGTERM to `runner_pid` (already implemented); a partially
-  written transcript is possible, but the CP-written `Cancelled` status keeps
-  the UI correct.
+Each PR is independently shippable. This spec details PR1; PR2/PR3 are scoped.
 
 ---
 
-## Sub-project B — smart target pickers (scoped)
+## PR1 — Repository fuzzy-complete
 
-- **Directory browse**: `GET /api/fs/browse?path=<dir>` lists immediate
-  subdirectories (name, is_dir), canonicalized, tolerant of unreadable dirs;
-  starts at `$HOME` when no path. A directory picker component walks the tree;
-  a fuzzy-complete input suggests paths from `getProjects()` (past projects)
-  and the browse results.
-- **Repository picker**: `GET /api/repos` wires `rupu-scm`'s
-  `Registry::discover` → `list_repos()` across logged-in platforms (cached in
-  memory with a short TTL since it's a live API call), returning
-  `{ platform, repo (owner/name), default_branch, private }`. A fuzzy-complete
-  input filters this list; the chosen `platform:owner/repo` becomes the repo
-  target string.
-- Both drop into A's Run modal target section, replacing the plain text inputs.
+### Backend
+- **`rupu-cp` `RepoLister` port** (`crates/rupu-cp/src/repos.rs`, mirroring
+  `launcher.rs`):
+  ```rust
+  pub struct RepoEntry { platform: String, repo: String /*owner/name*/,
+                         default_branch: String, private: bool }
+  #[async_trait] pub trait RepoLister: Send + Sync {
+      async fn list(&self) -> Result<Vec<RepoEntry>, RepoListError>;
+  }
+  ```
+  Add `AppState.repos: Option<Arc<dyn RepoLister>>` + `with_repos(...)`
+  (mirroring `with_launcher`).
+- **`GET /api/repos`** (`crates/rupu-cp/src/api/repos.rs`): if `repos` port is
+  `None` → `ApiError::not_available`; else return `port.list().await` (map
+  errors to 500). Registered in the router.
+- **`rupu-cli` adapter** (`crates/rupu-cli/src/cp_repos.rs`), installed in
+  `cmd/cp.rs` `serve` alongside the launcher: builds the SCM registry the same
+  way the CLI `rupu repos list` does (`Registry::discover(resolver, &cfg)` →
+  for each configured platform `registry.repo(p).list_repos()`), maps
+  `rupu_scm::Repo` → `RepoEntry` (`platform`, `"{owner}/{repo}"`,
+  `default_branch`, `private`). Cache the result in the adapter with a short TTL
+  (e.g. 60s) since it's a live API call; on error return what it can + log.
 
-## Sub-project C — agent Run (scoped)
+### Frontend
+- **api.ts**: `RepoEntry` type + `getRepos(): Promise<RepoEntry[]>`
+  (`GET /api/repos`). Tolerate 501 (no adapter) → treat as empty list.
+- **`LauncherSheet` Target → fuzzy-complete combobox.** Replace the plain Target
+  `<input>` with a small typeahead: as the user types, fetch-once the repo list
+  and filter (substring on `platform:owner/repo`), show a suggestion dropdown;
+  selecting sets the target to `"{platform}:{repo}"`. Keep free-text fallback
+  (so PR/issue refs and arbitrary targets still work). The combobox is a new
+  reusable component `components/Combobox.tsx` (no new deps; input + filtered
+  listbox + keyboard up/down/enter/esc).
 
-- `POST /api/agents/:name/dispatch` spawns `rupu run <agent> [target] [prompt]
-  --run-id <id> --mode <m>` detached, same `launch.json` + cancel path. Add
-  `--run-id` to `rupu run` too.
-- **Run modal on `AgentDetail`**: a prompt textarea + mode + the same target
-  picker (reuses B). Navigate to `/runs/<id>`. Cancel works unchanged.
+### Testing (PR1)
+- `rupu-cp`: `GET /api/repos` → 501 when no port; with a mock `RepoLister`,
+  returns its entries (handler test).
+- `rupu-cli`: `rupu_scm::Repo` → `RepoEntry` mapping (pure fn) — platform string,
+  `owner/repo` join, private flag.
+- web (vitest): `Combobox` filtering (substring match, keyboard select) and that
+  selecting a repo sets the launch `target` to `platform:owner/repo`; free-text
+  still passes through.
+
+### Notes / risks
+- Repo listing is a live network call → the adapter caches (TTL) so reopening
+  the sheet is instant; the endpoint may be slow on first call (frontend shows a
+  loading state in the dropdown).
+- No logged-in platforms / read-only `rupu cp` → empty suggestions; the Target
+  field still accepts free text.
+
+---
+
+## PR2 — Directory picker (scoped)
+
+- **`GET /api/fs/browse?path=<dir>`** (`rupu-cp`): list immediate
+  subdirectories (`{ name, path, is_dir }`), canonicalized; default to `$HOME`
+  when no path; tolerant of unreadable dirs. (Pure filesystem read on the CP
+  host — fine for a local tool; clamp to existing readable dirs, no symlink
+  escape surprises.)
+- **`LaunchRequest.working_dir: Option<String>`** + launcher adapter spawns the
+  child with `current_dir(working_dir)` (so "run in this directory" works);
+  `launch_run` body gains `working_dir`. Mutually-informative with `target`
+  (a repo target clones itself; a working_dir runs in place).
+- **Frontend**: a directory target mode in `LauncherSheet` — a browse tree
+  (drill via `/api/fs/browse`) + a fuzzy-complete input seeded from
+  `getProjects()` paths and browse results. Reuses the `Combobox`.
+
+## PR3 — Agent Run (scoped)
+
+- **Agent launch port/endpoint**: `POST /api/agents/:name/run` → an
+  `AgentLauncher` port (or extend `RunLauncher` with an agent variant);
+  `cp serve` adapter spawns `rupu run <agent> [target] [prompt] --run-id <id>
+  --mode <m>` detached. Requires `--run-id` on `rupu run` (the agent run CLI) —
+  add if absent (the workflow one already exists).
+- **Frontend**: a Run button + modal on `AgentDetail` — a prompt textarea +
+  Mode + the same target picker (repo + directory). Navigate to `/runs/<id>`.
+  Cancel works unchanged.
 
 ## Out of scope
-- Embedding an executor in the CP server (we spawn the CLI instead).
-- Graceful between-steps cancellation (hard-kill the process group for v1).
-- Non-macOS signal handling specifics (macOS is the target platform).
+- Re-building workflow Run / Cancel (already exist).
+- Notarization, non-macOS signal specifics.
