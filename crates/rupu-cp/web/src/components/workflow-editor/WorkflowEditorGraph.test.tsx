@@ -24,9 +24,20 @@ vi.mock('@xyflow/react', () => ({
   MarkerType: { ArrowClosed: 'arrowclosed' },
   BackgroundVariant: { Dots: 'dots' },
   applyNodeChanges: (_changes: unknown, nodes: unknown) => nodes,
+  useReactFlow: () => ({
+    screenToFlowPosition: (p: { x: number; y: number }) => p,
+    fitView: () => {},
+  }),
 }));
 
-import WorkflowEditorGraph, { applyConnect, applyDelete, applyAddNode } from './WorkflowEditorGraph';
+import WorkflowEditorGraph, {
+  applyConnect,
+  applyDelete,
+  applyAddNode,
+  applyAddNodeAt,
+  applyAddConnectedNext,
+  applyInsertOnEdge,
+} from './WorkflowEditorGraph';
 import type { WorkflowGraph } from '../../lib/workflowGraph';
 
 afterEach(cleanup);
@@ -43,7 +54,7 @@ function makeGraph(): WorkflowGraph {
 }
 
 describe('palette', () => {
-  it('Step button adds one node and selects the new id', () => {
+  it('clicking a palette card adds one node and selects the new id', () => {
     const onChange = vi.fn();
     const onSelect = vi.fn();
     render(
@@ -57,13 +68,39 @@ describe('palette', () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Step' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add step node' }));
 
     expect(onChange).toHaveBeenCalledTimes(1);
     const next = onChange.mock.calls[0][0] as WorkflowGraph;
     expect(next.nodes).toHaveLength(3);
     const newId = next.nodes[2].id;
     expect(onSelect).toHaveBeenCalledWith(newId);
+  });
+
+  it('⊕ next is disabled with no selection and enabled with one', () => {
+    const { rerender } = render(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    expect(screen.getByRole('button', { name: '⊕ next' })).toBeDisabled();
+
+    rerender(
+      <WorkflowEditorGraph
+        graph={makeGraph()}
+        onChange={() => {}}
+        selectedId="a"
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    expect(screen.getByRole('button', { name: '⊕ next' })).toBeEnabled();
   });
 });
 
@@ -144,5 +181,65 @@ describe('applyAddNode', () => {
     g.nodes.push({ id: 'step-1', data: { id: 'step-1', kind: 'step' }, position: { x: 0, y: 0 } });
     const { id } = applyAddNode(g, 'step');
     expect(id).toBe('step-2');
+  });
+});
+
+describe('applyAddNodeAt', () => {
+  it('places the new node at the given position', () => {
+    const { graph, id } = applyAddNodeAt(makeGraph(), 'step', { x: 321, y: 654 });
+    const added = graph.nodes.find((n) => n.id === id);
+    expect(added?.position).toEqual({ x: 321, y: 654 });
+    expect(graph.nodes).toHaveLength(3);
+  });
+
+  it('seeds container shapes for parallel/panel kinds', () => {
+    const par = applyAddNodeAt(makeGraph(), 'parallel', { x: 0, y: 0 });
+    expect(par.graph.nodes.find((n) => n.id === par.id)?.data.parallel).toEqual([]);
+    const pan = applyAddNodeAt(makeGraph(), 'panel', { x: 0, y: 0 });
+    expect(pan.graph.nodes.find((n) => n.id === pan.id)?.data.panel).toEqual({
+      panelists: [],
+      subject: '',
+    });
+  });
+});
+
+describe('applyAddConnectedNext', () => {
+  it('adds a step node + an edge source->new and places it to the right', () => {
+    const g = makeGraph(); // a at {0,0}, b at {0,100}
+    const { graph, id } = applyAddConnectedNext(g, 'a');
+    const added = graph.nodes.find((n) => n.id === id);
+    expect(added?.data.kind).toBe('step');
+    expect(added?.position.x).toBeGreaterThan(g.nodes[0].position.x);
+    expect(added?.position.y).toBe(g.nodes[0].position.y);
+    expect(graph.edges).toContainEqual({ id: `a->${id}`, source: 'a', target: id });
+  });
+
+  it('honors an explicit kind', () => {
+    const { graph, id } = applyAddConnectedNext(makeGraph(), 'b', 'panel');
+    expect(graph.nodes.find((n) => n.id === id)?.data.kind).toBe('panel');
+  });
+
+  it('adds the node but no edge when the source is unknown', () => {
+    const g = makeGraph();
+    const { graph } = applyAddConnectedNext(g, 'does-not-exist');
+    expect(graph.nodes).toHaveLength(3);
+    expect(graph.edges).toHaveLength(g.edges.length);
+  });
+});
+
+describe('applyInsertOnEdge', () => {
+  it('splits A->B into A->new and new->B', () => {
+    const { graph, id } = applyInsertOnEdge(makeGraph(), 'a->b', 'step', { x: 5, y: 5 });
+    expect(graph.edges.some((e) => e.id === 'a->b')).toBe(false);
+    expect(graph.edges).toContainEqual({ id: `a->${id}`, source: 'a', target: id });
+    expect(graph.edges).toContainEqual({ id: `${id}->b`, source: id, target: 'b' });
+    expect(graph.nodes.find((n) => n.id === id)?.position).toEqual({ x: 5, y: 5 });
+  });
+
+  it('falls back to a plain add when the edge is unknown', () => {
+    const g = makeGraph();
+    const { graph, id } = applyInsertOnEdge(g, 'no->such', 'step', { x: 1, y: 2 });
+    expect(graph.edges).toHaveLength(g.edges.length);
+    expect(graph.nodes.find((n) => n.id === id)?.position).toEqual({ x: 1, y: 2 });
   });
 });
