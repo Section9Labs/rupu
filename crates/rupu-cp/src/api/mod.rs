@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod fs;
 pub mod autoflow_claims;
 pub mod autoflows;
 pub mod coverage;

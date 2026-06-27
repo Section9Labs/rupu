@@ -57,6 +57,9 @@ impl RunLauncher for SubprocessLauncher {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(dir) = req.working_dir.as_deref() {
+            cmd.current_dir(dir);
+        }
         #[cfg(unix)]
         cmd.process_group(0); // own process group (not a full session/setsid); detaches from cp-serve's
         cmd.spawn().map_err(|e| LaunchError::Spawn(e.to_string()))?;
@@ -79,6 +82,7 @@ mod tests {
             inputs,
             mode: Some("bypass".to_string()),
             target: Some("github:o/r".to_string()),
+            working_dir: None,
         };
         let argv = build_run_argv(&req, "run_X");
         assert_eq!(
@@ -109,6 +113,7 @@ mod tests {
             inputs: BTreeMap::new(),
             mode: None,
             target: None,
+            working_dir: None,
         };
         let argv = build_run_argv(&req, "run_X");
         assert_eq!(

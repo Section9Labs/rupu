@@ -9,6 +9,9 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, type LaunchMode, type RepoEntry } from '../lib/api';
 import Combobox, { type ComboboxOption } from './Combobox';
+import DirectoryPicker from './DirectoryPicker';
+
+type TargetMode = 'workspace' | 'directory' | 'repo';
 
 export function repoToOption(r: RepoEntry): ComboboxOption {
   return { value: `${r.platform}:${r.repo}`, label: r.repo };
@@ -64,6 +67,8 @@ export default function LauncherSheet({
   const [mode, setMode] = useState<LaunchMode>('ask');
   const [target, setTarget] = useState('');
   const [repoOptions, setRepoOptions] = useState<ComboboxOption[]>([]);
+  const [targetMode, setTargetMode] = useState<TargetMode>('workspace');
+  const [workingDir, setWorkingDir] = useState('');
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -98,7 +103,8 @@ export default function LauncherSheet({
       const res = await api.launchRun(workflow, {
         inputs: Object.keys(inputs).length > 0 ? inputs : undefined,
         mode,
-        target: target.trim() || undefined,
+        target: targetMode === 'repo' ? target.trim() || undefined : undefined,
+        working_dir: targetMode === 'directory' ? workingDir.trim() || undefined : undefined,
       });
       navigate(`/runs/${res.run_id}`);
       onClose();
@@ -216,22 +222,45 @@ export default function LauncherSheet({
           </label>
 
           {/* ── Target ─────────────────────────────────────────────── */}
-          <div className="block">
+          <div>
             <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">
-              Target <span className="font-normal normal-case text-ink-mute">(optional)</span>
+              Target
             </span>
-            <Combobox
-              value={target}
-              onChange={setTarget}
-              options={repoOptions}
-              disabled={launching}
-              placeholder="e.g. github:owner/repo"
-              aria-label="Target"
-              className={fieldCls}
-            />
-            <span className="mt-1 block text-[11px] text-ink-mute">
-              leave blank to run in this workspace
-            </span>
+            <div className="mb-2 flex gap-1">
+              {(['workspace', 'directory', 'repo'] as TargetMode[]).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setTargetMode(m)}
+                  disabled={launching}
+                  className={
+                    'rounded-md px-2 py-1 text-[12px] font-medium ' +
+                    (targetMode === m
+                      ? 'bg-brand-600 text-white'
+                      : 'border border-border bg-white text-ink-dim hover:bg-slate-50')
+                  }
+                >
+                  {m === 'workspace' ? 'This workspace' : m === 'directory' ? 'Directory' : 'Repository'}
+                </button>
+              ))}
+            </div>
+            {targetMode === 'workspace' && (
+              <p className="text-[11px] text-ink-mute">Runs in the control-plane working directory.</p>
+            )}
+            {targetMode === 'directory' && (
+              <DirectoryPicker value={workingDir} onChange={setWorkingDir} />
+            )}
+            {targetMode === 'repo' && (
+              <Combobox
+                value={target}
+                onChange={setTarget}
+                options={repoOptions}
+                disabled={launching}
+                aria-label="Target"
+                placeholder="e.g. github:owner/repo"
+                className={fieldCls}
+              />
+            )}
           </div>
 
           {error && (

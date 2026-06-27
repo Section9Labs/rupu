@@ -816,6 +816,13 @@ export interface RunDiff {
 }
 
 // ---------------------------------------------------------------------------
+// Filesystem browse
+// ---------------------------------------------------------------------------
+
+export interface FsEntry { name: string; path: string; }
+export interface BrowseResult { path: string; parent: string | null; dirs: FsEntry[]; }
+
+// ---------------------------------------------------------------------------
 // Repos
 // ---------------------------------------------------------------------------
 
@@ -1021,12 +1028,17 @@ export const api = {
    */
   launchRun(
     workflow: string,
-    opts: { inputs?: Record<string, string>; mode?: LaunchMode; target?: string } = {},
+    opts: { inputs?: Record<string, string>; mode?: LaunchMode; target?: string; working_dir?: string } = {},
   ): Promise<LaunchResult> {
     return request<LaunchResult>(`/api/workflows/${encodeURIComponent(workflow)}/run`, {
       method: 'POST',
-      body: JSON.stringify({ inputs: opts.inputs, mode: opts.mode, target: opts.target }),
+      body: JSON.stringify({ inputs: opts.inputs, mode: opts.mode, target: opts.target, working_dir: opts.working_dir }),
     });
+  },
+
+  browseDir(path?: string): Promise<BrowseResult> {
+    const qs = path ? `?path=${encodeURIComponent(path)}` : '';
+    return request<BrowseResult>(`/api/fs/browse${qs}`);
   },
 
   // --- Sessions ---
