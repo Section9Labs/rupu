@@ -4,7 +4,7 @@ use crate::{
 };
 use axum::{
     extract::{Path, Query, State},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ pub fn routes() -> Router<AppState> {
             "/api/sessions/:id/usage-timeline",
             get(get_session_usage_timeline),
         )
+        .route("/api/sessions/:id/send", post(send_session))
 }
 
 /// Minimal projection of the on-disk `session.json`. All fields are
@@ -304,6 +305,67 @@ async fn get_session_usage_timeline(
     Ok(Json(crate::usage::turn_series(&labeled)))
 }
 
+/// Request body for `POST /api/sessions/:id/send`.
+#[derive(Deserialize)]
+struct SendBody {
+    prompt: String,
+}
+
+/// `POST /api/sessions/:id/send` — send a message to a live session via the
+/// configured [`SessionSender`]. Returns the new run id. 501 when no sender is
+/// installed (read-only deploy); 400 on an empty prompt; 404 when the session
+/// is missing; 409 when the session is stopped.
+///
+/// [`SessionSender`]: crate::session_sender::SessionSender
+async fn send_session(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SendBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let prompt = body.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err(ApiError::bad_request("prompt is empty"));
+    }
+
+    let sender = s
+        .session_sender
+        .as_ref()
+        .ok_or_else(|| ApiError::not_available("sending requires `rupu cp serve`"))?;
+
+    // Best-effort pre-check: 404 for a missing session, 409 for a stopped one.
+    let active_dir = s.global_dir.join("sessions").join(&id);
+    let archive_dir = s.global_dir.join("sessions-archive").join(&id);
+    let dir = if active_dir.is_dir() {
+        Some(active_dir)
+    } else if archive_dir.is_dir() {
+        Some(archive_dir)
+    } else {
+        None
+    };
+    if let Some(dir) = dir {
+        match load_session_file(&dir)? {
+            Some(dto) => {
+                if dto.status.as_str() == Some("stopped") {
+                    return Err(ApiError::conflict(format!("session {id} is stopped")));
+                }
+            }
+            None => return Err(ApiError::not_found(format!("session {id} not found"))),
+        }
+    } else {
+        return Err(ApiError::not_found(format!("session {id} not found")));
+    }
+
+    let req = crate::session_sender::SendMessageRequest {
+        session_id: id,
+        prompt,
+    };
+    match sender.send(req).await {
+        Ok(run_id) => Ok(Json(serde_json::json!({ "run_id": run_id }))),
+        Err(crate::session_sender::SendError::Invalid(m)) => Err(ApiError::bad_request(m)),
+        Err(crate::session_sender::SendError::Spawn(m)) => Err(ApiError::internal(m)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +392,108 @@ mod tests {
         assert_eq!(u.input_tokens, 1_000_000);
         assert!(u.priced);
         assert!((u.cost_usd.unwrap() - 3.0).abs() < 1e-9);
+    }
+
+    use crate::session_sender::{SendError, SendMessageRequest, SessionSender};
+    use std::sync::{Arc, Mutex};
+
+    /// Captures the last `SendMessageRequest` and returns a canned run id.
+    struct MockSender {
+        last: Mutex<Option<SendMessageRequest>>,
+        run_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionSender for MockSender {
+        async fn send(&self, req: SendMessageRequest) -> Result<String, SendError> {
+            *self.last.lock().unwrap() = Some(req);
+            Ok(self.run_id.clone())
+        }
+    }
+
+    /// Write a minimal active `session.json` for `id` under `global_dir`.
+    fn write_active_session(global_dir: &std::path::Path, id: &str, status: &str) {
+        let dir = global_dir.join("sessions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("session.json"),
+            format!(r#"{{"session_id":"{id}","status":"{status}"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_session_invokes_sender_and_returns_run_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_active_session(tmp.path(), "sess1", "active");
+        let mock = Arc::new(MockSender {
+            last: Mutex::new(None),
+            run_id: "run_abc".into(),
+        });
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_session_sender(Some(mock.clone()));
+
+        let resp = send_session(
+            State(s),
+            Path("sess1".into()),
+            Json(SendBody {
+                prompt: "hi".into(),
+            }),
+        )
+        .await
+        .expect("send should succeed");
+        assert_eq!(resp.0["run_id"], "run_abc");
+
+        let captured = mock.last.lock().unwrap().clone().expect("request captured");
+        assert_eq!(captured.session_id, "sess1");
+        assert_eq!(captured.prompt, "hi");
+    }
+
+    #[tokio::test]
+    async fn send_session_without_sender_is_not_implemented() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        ); // session_sender: None
+
+        let err = send_session(
+            State(s),
+            Path("sess1".into()),
+            Json(SendBody {
+                prompt: "hi".into(),
+            }),
+        )
+        .await
+        .expect_err("no sender should error");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn send_session_empty_prompt_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = Arc::new(MockSender {
+            last: Mutex::new(None),
+            run_id: "run_abc".into(),
+        });
+        let s = crate::state::AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_session_sender(Some(mock));
+
+        let err = send_session(
+            State(s),
+            Path("sess1".into()),
+            Json(SendBody {
+                prompt: "   ".into(),
+            }),
+        )
+        .await
+        .expect_err("empty prompt should error");
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 }

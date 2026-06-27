@@ -1007,6 +1007,19 @@ export const api = {
   getSession(id: string): Promise<SessionSummary> {
     return request<SessionSummary>(`/api/sessions/${encodeURIComponent(id)}`);
   },
+  /**
+   * Send a message into a live session. Fire-and-forget — the session's worker
+   * processes the turn asynchronously and a fresh run appears in the session's
+   * turn-runs list shortly after. Resolves to the new run id.
+   * Errors: 400 (empty prompt) · 404 (no such session) · 409 (session stopped)
+   * · 501 (read-only deploy).
+   */
+  sendSessionMessage(id: string, prompt: string): Promise<{ run_id: string }> {
+    return request<{ run_id: string }>(`/api/sessions/${encodeURIComponent(id)}/send`, {
+      method: 'POST',
+      body: JSON.stringify({ prompt }),
+    });
+  },
 
   // --- Workers ---
   getWorkers(): Promise<WorkerRecord[]> {

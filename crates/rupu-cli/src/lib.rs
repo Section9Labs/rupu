@@ -7,6 +7,7 @@
 
 pub mod cmd;
 pub mod cp_launcher;
+pub mod cp_session_sender;
 pub mod crash;
 pub mod logging;
 pub mod output;

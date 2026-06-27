@@ -14,6 +14,10 @@ pub struct AppState {
     /// Optional run-launcher port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess-spawning adapter via [`AppState::with_launcher`].
     pub launcher: Option<Arc<dyn crate::launcher::RunLauncher>>,
+    /// Optional session-sender port. Defaults to `None`; rupu-cli's `cp serve`
+    /// installs a subprocess-spawning adapter via
+    /// [`AppState::with_session_sender`].
+    pub session_sender: Option<Arc<dyn crate::session_sender::SessionSender>>,
 }
 
 impl AppState {
@@ -27,6 +31,7 @@ impl AppState {
             run_store,
             pricing,
             launcher: None,
+            session_sender: None,
         }
     }
 
@@ -36,6 +41,15 @@ impl AppState {
         launcher: Option<Arc<dyn crate::launcher::RunLauncher>>,
     ) -> Self {
         self.launcher = launcher;
+        self
+    }
+
+    /// Install a session-sender adapter (or clear it with `None`).
+    pub fn with_session_sender(
+        mut self,
+        sender: Option<Arc<dyn crate::session_sender::SessionSender>>,
+    ) -> Self {
+        self.session_sender = sender;
         self
     }
 

@@ -68,7 +68,13 @@ pub async fn handle(action: Action) -> ExitCode {
                 }
             };
             let launcher: Arc<dyn rupu_cp::launcher::RunLauncher> =
-                Arc::new(crate::cp_launcher::SubprocessLauncher { exe });
+                Arc::new(crate::cp_launcher::SubprocessLauncher { exe: exe.clone() });
+
+            // Adapter for rupu-cp's SessionSender port: shells
+            // `rupu session send <id> "<prompt>" --detach` using this same
+            // binary, reusing the launcher's resolved exe.
+            let session_sender: Arc<dyn rupu_cp::session_sender::SessionSender> =
+                Arc::new(crate::cp_session_sender::SubprocessSessionSender { exe });
 
             let serve_result = rupu_cp::serve(rupu_cp::ServeOpts {
                 bind,
@@ -76,6 +82,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 global_dir,
                 open_browser: !no_open,
                 launcher: Some(launcher),
+                session_sender: Some(session_sender),
             })
             .await;
 
