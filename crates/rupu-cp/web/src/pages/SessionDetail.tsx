@@ -14,7 +14,7 @@ import { api, type SessionSummary, type SessionRunRow, type UsageTimelinePoint }
 import { cn } from '../lib/cn';
 import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../lib/sessionStatus';
-import { pollIntervalFor } from '../lib/sessionPoll';
+import { isSessionActive, pollIntervalFor } from '../lib/sessionPoll';
 import UsageChip from '../components/UsageChip';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import SessionConversation from '../components/session/SessionConversation';
@@ -158,6 +158,7 @@ export default function SessionDetailPage() {
     );
   }
 
+  const active = isSessionActive(session);
   const stopped = sessionStatusTone(session.status) === 'stopped';
 
   return (
@@ -181,7 +182,7 @@ export default function SessionDetailPage() {
             <span className="text-[12px] text-ink-dim">{sessionStatusLabel(session.status)}</span>
           </span>
           {/* "working…" pill — visible while a turn is in flight. */}
-          {pollInterval === 1500 && (
+          {active && (
             <span className="inline-flex items-center gap-1 rounded px-1.5 py-px text-[9px] font-medium bg-blue-100 text-blue-700">
               <span className="inline-block h-1.5 w-1.5 rounded-full animate-pulse bg-blue-500" />
               working…
@@ -190,8 +191,8 @@ export default function SessionDetailPage() {
           {session.usage && <UsageChip usage={session.usage} className="ml-auto" />}
         </div>
 
-        {/* Session error banner — shown when the session has failed or carries a last_error. */}
-        {(session.status === 'failed' || session.last_error) && (
+        {/* Session error banner — only shown when idle/terminal, never while a turn is in flight. */}
+        {!active && (session.status === 'failed' || session.last_error) && (
           <div
             role="alert"
             className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700"
