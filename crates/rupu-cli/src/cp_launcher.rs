@@ -58,7 +58,7 @@ impl RunLauncher for SubprocessLauncher {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         #[cfg(unix)]
-        cmd.process_group(0); // new session/group; detaches from cp-serve's
+        cmd.process_group(0); // own process group (not a full session/setsid); detaches from cp-serve's
         cmd.spawn().map_err(|e| LaunchError::Spawn(e.to_string()))?;
         Ok(run_id)
     }

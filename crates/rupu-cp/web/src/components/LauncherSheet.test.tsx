@@ -15,12 +15,20 @@ vi.mock('react-router-dom', async () => {
   return { ...actual, useNavigate: () => navigateMock };
 });
 
-import LauncherSheet from './LauncherSheet';
+import LauncherSheet, { repoToOption } from './LauncherSheet';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   navigateMock.mockReset();
+});
+
+describe('repoToOption', () => {
+  it('maps a RepoEntry to a ComboboxOption with platform:repo value', () => {
+    expect(
+      repoToOption({ platform: 'github', repo: 'o/r', default_branch: 'main', private: false }),
+    ).toEqual({ value: 'github:o/r', label: 'o/r' });
+  });
 });
 
 describe('LauncherSheet', () => {

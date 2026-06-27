@@ -10,6 +10,10 @@ import { useNavigate } from 'react-router-dom';
 import { api, type LaunchMode, type RepoEntry } from '../lib/api';
 import Combobox, { type ComboboxOption } from './Combobox';
 
+export function repoToOption(r: RepoEntry): ComboboxOption {
+  return { value: `${r.platform}:${r.repo}`, label: r.repo };
+}
+
 interface KvRow {
   key: string;
   value: string;
@@ -78,12 +82,7 @@ export default function LauncherSheet({
     let cancelled = false;
     api.getRepos().then((repos: RepoEntry[]) => {
       if (cancelled) return;
-      setRepoOptions(
-        repos.map((r) => ({
-          value: r.ref,
-          label: r.name ?? r.ref,
-        })),
-      );
+      setRepoOptions(repos.map(repoToOption));
     }).catch(() => {
       // Non-critical — leave repoOptions empty and fall back to free text.
     });

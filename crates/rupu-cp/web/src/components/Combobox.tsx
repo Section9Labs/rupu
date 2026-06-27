@@ -49,6 +49,12 @@ export default function Combobox({
   const uid = useId();
   const listId = `${uid}-list`;
   const containerRef = useRef<HTMLDivElement>(null);
+  const blurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Clear any pending blur timer on unmount to avoid setState-after-unmount.
+  useEffect(() => () => {
+    if (blurTimerRef.current !== null) clearTimeout(blurTimerRef.current);
+  }, []);
 
   // Internal text tracks what the user is typing; syncs from `value` prop.
   const [query, setQuery] = useState(value);
@@ -78,7 +84,7 @@ export default function Combobox({
         role="combobox"
         aria-autocomplete="list"
         aria-expanded={open}
-        aria-controls={open ? listId : undefined}
+        aria-controls={open && filtered.length > 0 ? listId : undefined}
         aria-label={ariaLabel}
         value={query}
         placeholder={placeholder}
@@ -93,7 +99,7 @@ export default function Combobox({
         onFocus={() => setOpen(true)}
         onBlur={() => {
           // Delay so an option's onMouseDown fires before we close.
-          setTimeout(() => setOpen(false), 150);
+          blurTimerRef.current = setTimeout(() => setOpen(false), 150);
         }}
       />
       {open && filtered.length > 0 && (

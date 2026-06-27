@@ -821,10 +821,10 @@ export interface RunDiff {
 
 /** One repository entry from `GET /api/repos`. */
 export interface RepoEntry {
-  /** Fully-qualified ref — e.g. `"github:owner/repo"`. Passed as `target` to `launchRun`. */
-  ref: string;
-  /** Optional human-readable name — e.g. `"owner/repo"`. Falls back to `ref` if absent. */
-  name?: string | null;
+  platform: string;
+  repo: string; // "owner/name"
+  default_branch: string;
+  private: boolean;
 }
 
 // ---------------------------------------------------------------------------
