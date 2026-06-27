@@ -104,6 +104,9 @@ interface Props {
   onSelect: (id: string | null) => void;
   problemsById: Record<string, string[]>;
   onInvalidConnection: (reason: string) => void;
+  /** When true the YAML is currently unparseable: keep the last good graph on
+   *  screen but dim it, freeze interactions, and show a "graph paused" chip. */
+  paused?: boolean;
 }
 
 export default function WorkflowEditorGraph(props: Props) {
@@ -121,6 +124,7 @@ function WorkflowEditorGraphInner({
   onSelect,
   problemsById,
   onInvalidConnection,
+  paused = false,
 }: Props) {
   const nodes = useMemo<Node<NodeData>[]>(
     () =>
@@ -214,47 +218,63 @@ function WorkflowEditorGraphInner({
 
   return (
     <div className="relative h-full min-h-[16rem] w-full overflow-hidden rounded-xl border border-border shadow-card">
+      {/* "graph paused" chip — top-center, shown while YAML is unparseable */}
+      {paused && (
+        <div
+          role="status"
+          className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-[11px] font-medium text-amber-800 shadow-card"
+        >
+          YAML not parseable — graph paused
+        </div>
+      )}
+
       {/* palette + toolbar — static DOM floated over the canvas */}
       <div className="absolute left-3 top-3 z-10 flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-white/95 px-2 py-1.5 shadow-card">
         <span className="pr-1 text-[10px] font-semibold uppercase tracking-wide text-ink-mute">Add</span>
         <button
           type="button"
+          disabled={paused}
           onClick={() => addNode('step')}
-          className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-[11px] font-medium text-blue-700 hover:bg-blue-100"
+          className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-[11px] font-medium text-blue-700 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
         >
           Step
         </button>
         <button
           type="button"
+          disabled={paused}
           onClick={() => addNode('for_each')}
-          className="rounded-md border border-violet-200 bg-violet-50 px-2 py-1 text-[11px] font-medium text-violet-700 hover:bg-violet-100"
+          className="rounded-md border border-violet-200 bg-violet-50 px-2 py-1 text-[11px] font-medium text-violet-700 hover:bg-violet-100 disabled:cursor-not-allowed disabled:opacity-50"
         >
           For-each
         </button>
         <button
           type="button"
+          disabled={paused}
           onClick={() => addNode('parallel')}
-          className="rounded-md border border-purple-200 bg-purple-50 px-2 py-1 text-[11px] font-medium text-purple-700 hover:bg-purple-100"
+          className="rounded-md border border-purple-200 bg-purple-50 px-2 py-1 text-[11px] font-medium text-purple-700 hover:bg-purple-100 disabled:cursor-not-allowed disabled:opacity-50"
         >
           Parallel
         </button>
         <button
           type="button"
+          disabled={paused}
           onClick={() => addNode('panel')}
-          className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-100"
+          className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50"
         >
           Panel
         </button>
         <span className="mx-1 h-4 w-px bg-border" aria-hidden />
         <button
           type="button"
+          disabled={paused}
           onClick={relayout}
-          className="rounded-md border border-border bg-white px-2 py-1 text-[11px] font-medium text-ink-dim hover:bg-slate-50"
+          className="rounded-md border border-border bg-white px-2 py-1 text-[11px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
         >
           Re-layout
         </button>
       </div>
 
+      <div className={paused ? 'h-full w-full opacity-60 pointer-events-none' : 'h-full w-full'}>
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -265,8 +285,8 @@ function WorkflowEditorGraphInner({
         isValidConnection={isValidConnection}
         onNodeClick={onNodeClick}
         onPaneClick={onPaneClick}
-        nodesDraggable
-        nodesConnectable
+        nodesDraggable={!paused}
+        nodesConnectable={!paused}
         elementsSelectable
         fitView
         fitViewOptions={{ padding: 0.2, maxZoom: 1.0 }}
@@ -277,6 +297,7 @@ function WorkflowEditorGraphInner({
         <MiniMap pannable zoomable className="!border-border !bg-panel" />
         <Controls className="!border-border !bg-panel !shadow-card" showInteractive={false} />
       </ReactFlow>
+      </div>
     </div>
   );
 }

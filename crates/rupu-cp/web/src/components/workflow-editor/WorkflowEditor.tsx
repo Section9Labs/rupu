@@ -27,7 +27,7 @@ import {
   type WorkflowGraph,
   type WorkflowMeta,
 } from '../../lib/workflowGraph';
-import { autoLayout } from '../../lib/workflowLayout';
+import { autoLayout, reconcileFromYaml } from '../../lib/workflowLayout';
 import CodeEditor from '../CodeEditor';
 import WorkflowEditorGraph from './WorkflowEditorGraph';
 import StepForm from './StepForm';
@@ -68,19 +68,55 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [panelTab, setPanelTab] = useState<PanelTab>('settings');
   const [connError, setConnError] = useState<string | null>(null);
+  // Transient notice (e.g. selection lost on rename), auto-dismissed.
+  const [notice, setNotice] = useState<string | null>(null);
+  // True while the YAML is unparseable: the graph is kept but frozen + dimmed.
+  const [paused, setPaused] = useState(false);
 
-  // We re-seed only when `draftYaml` IDENTITY changes from a *foreign* source
-  // (the parent swapped the document). When WE emit YAML via onYamlChange the
-  // parent feeds it straight back as the next `draftYaml`; recording our own
-  // emission here lets the effect skip that echo and avoid clobbering edits.
-  // (Live per-keystroke YAML→graph reconcile is a later phase — unchanged here.)
+  // Keep the latest selectedId readable inside the debounce timeout WITHOUT
+  // adding it to the effect deps (which would re-arm the timer on every select).
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
+
+  // Live YAML→graph reconcile, debounced 250ms after the last edit.
+  //
+  // `lastSeenYaml` is the echo guard: when WE emit YAML via onYamlChange the
+  // parent feeds it straight back as the next `draftYaml`, and `commit` records
+  // that emission here first — so the effect skips our own echo and never fights
+  // the user / clobbers positions. A genuine user edit reconciles BY NODE ID
+  // (reconcileFromYaml → reconcileGraph): survivors keep their on-screen
+  // position, new ids get a dagre slot, removed ids drop. Unparseable YAML pauses
+  // (keeps the last good graph) instead of nuking the canvas.
   const lastSeenYaml = useRef(draftYaml);
   useEffect(() => {
-    if (lastSeenYaml.current === draftYaml) return;
-    lastSeenYaml.current = draftYaml;
-    setGraph(seedGraph(draftYaml));
-    setSelectedId(null);
+    if (lastSeenYaml.current === draftYaml) return; // our own echo — ignore.
+    const handle = setTimeout(() => {
+      lastSeenYaml.current = draftYaml;
+      setGraph((prev) => {
+        const res = reconcileFromYaml(prev, draftYaml);
+        if (res.paused || !res.graph) {
+          setPaused(true);
+          return prev; // keep the last good graph on screen.
+        }
+        setPaused(false);
+        // Selection preservation: drop + notify if the selected id vanished.
+        const sel = selectedIdRef.current;
+        if (sel !== null && !res.graph.nodes.some((n) => n.id === sel)) {
+          setSelectedId(null);
+          setNotice('Selected step changed in YAML.');
+        }
+        return res.graph;
+      });
+    }, 250);
+    return () => clearTimeout(handle);
   }, [draftYaml]);
+
+  // Auto-dismiss the transient notice.
+  useEffect(() => {
+    if (notice === null) return;
+    const t = setTimeout(() => setNotice(null), 4000);
+    return () => clearTimeout(t);
+  }, [notice]);
 
   const problemsById = useMemo(() => validateGraph(graph), [graph]);
 
@@ -147,6 +183,15 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
         </div>
       )}
 
+      {notice && (
+        <div
+          role="status"
+          className="absolute left-1/2 top-3 z-30 -translate-x-1/2 rounded-md border border-slate-300 bg-slate-800 px-3 py-1.5 text-[12px] font-medium text-white shadow-card"
+        >
+          {notice}
+        </div>
+      )}
+
       {/* ── LEFT / MAIN: graph over YAML, resizable ───────────────────────── */}
       <div className="min-h-0 min-w-0 flex-1">
         <SplitPane
@@ -159,6 +204,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
                 onSelect={handleSelect}
                 problemsById={problemsById}
                 onInvalidConnection={setConnError}
+                paused={paused}
               />
             </div>
           }
