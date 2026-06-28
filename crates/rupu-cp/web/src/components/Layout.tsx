@@ -1,5 +1,6 @@
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import { cn } from '../lib/cn';
+import Brand from './Brand';
 import CommandPalette from './CommandPalette';
 import { sidebarNav, type NavLeaf, type NavGroup } from '../lib/sidebarNav';
 import SidebarGroup from './SidebarGroup';
@@ -26,14 +27,8 @@ export default function Layout() {
     <div className="flex h-screen overflow-hidden">
       <aside className="w-60 shrink-0 border-r border-border bg-panel flex flex-col">
         {/* Logo / brand header */}
-        <Link to="/" className="px-5 py-5 flex items-center gap-2 border-b border-border">
-          <div className="w-7 h-7 rounded-md bg-brand-500 flex items-center justify-center">
-            <div className="w-3 h-3 rounded-full bg-white" />
-          </div>
-          <div>
-            <div className="font-semibold text-sm leading-tight">rupu</div>
-            <div className="text-note text-ink-mute leading-tight">Control Plane</div>
-          </div>
+        <Link to="/" className="px-5 py-5 flex items-center border-b border-border">
+          <Brand />
         </Link>
 
         {/* Nav */}
