@@ -282,6 +282,11 @@ export default function Hosts() {
               required
               className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
             />
+            {form.base_url.startsWith('http://') && (
+              <p className="text-note text-amber-600">
+                Use https for remote hosts — http is unencrypted.
+              </p>
+            )}
           </div>
 
           <div className="flex flex-col gap-1">

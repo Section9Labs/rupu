@@ -3,9 +3,9 @@
 // Running polls every 5 s (unpaginated); Completed/Failed paginate (no poll) —
 // keeping paginated history off the poll loop avoids the scroll-reset flicker.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Inbox, RefreshCw } from 'lucide-react';
-import { api, type RunListRow } from '../../lib/api';
+import { api, type HostView, type RunListRow } from '../../lib/api';
 import { StatusPill } from '../../components/StatusPill';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
@@ -18,6 +18,8 @@ import { shortId } from '../../lib/shortId';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
+/** Sentinel select value meaning "fetch all hosts" (fan-out / no ?host= param). */
+const ALL_HOSTS = '__all__';
 
 type Tab = 'active' | 'completed' | 'failed';
 
@@ -62,16 +64,25 @@ export default function WorkflowRuns() {
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState<TriggerFilter>('all');
-  const [hostFilter, setHostFilter] = useState<string>('all');
+  // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
+  const [hostFilter, setHostFilter] = useState<string>('local');
+  const [hosts, setHosts] = useState<HostView[] | null>(null);
 
-  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab change.
+  useEffect(() => {
+    let cancelled = false;
+    api.getHosts().then((hs) => { if (!cancelled) setHosts(hs); }).catch(() => { if (!cancelled) setHosts([]); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab/host change.
   // Active: fetch ALL in one call (unpaginated) → poll never resets a scrolled
   // list. Completed/Failed: page-0 only; loadMore appends.
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
       const limit = tab === 'active' ? 200 : PAGE;
-      const data = await api.getWorkflowRuns({ lifecycle: tab, limit });
+      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+      const data = await api.getWorkflowRuns({ lifecycle: tab, limit, host });
       setRuns(data);
       setHasMore(tab !== 'active' && data.length >= PAGE);
       setError(null);
@@ -80,22 +91,23 @@ export default function WorkflowRuns() {
     } finally {
       setRefreshing(false);
     }
-  }, [tab]);
+  }, [tab, hostFilter]);
 
   useEffect(() => {
-    setRuns(null); // show loading on tab switch
+    setRuns(null); // show loading on tab/host switch
     void refresh();
     if (tab === 'active') {
       const t = window.setInterval(() => void refresh(), 5000);
       return () => window.clearInterval(t);
     }
     return () => {};
-  }, [tab, refresh]);
+  }, [tab, hostFilter, refresh]);
 
   const loadMore = async () => {
     if (tab === 'active') return; // active is unpaginated
     const current = runs ?? [];
-    const next = await api.getWorkflowRuns({ lifecycle: tab, offset: current.length, limit: PAGE });
+    const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+    const next = await api.getWorkflowRuns({ lifecycle: tab, offset: current.length, limit: PAGE, host });
     if (next.length === 0) { setHasMore(false); return; }
     setRuns([...current, ...next]);
     if (next.length < PAGE) setHasMore(false);
@@ -103,19 +115,9 @@ export default function WorkflowRuns() {
 
   const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
 
-  // Collect unique host ids for the host filter dropdown.
-  const hostIds = useMemo<string[]>(() => {
-    if (!runs) return [];
-    const seen = new Set<string>();
-    for (const r of runs) {
-      seen.add(r.host_id ?? 'local');
-    }
-    return Array.from(seen).sort();
-  }, [runs]);
-
+  // Trigger filter is still client-side (cheap; host filter is server-side).
   const filtered = (runs ?? []).filter((r) => {
     if (filter !== 'all' && r.trigger !== filter) return false;
-    if (hostFilter !== 'all' && (r.host_id ?? 'local') !== hostFilter) return false;
     return true;
   });
 
@@ -167,20 +169,21 @@ export default function WorkflowRuns() {
           </button>
         ))}
 
-        {/* Host filter — only shown when more than one host is present in the loaded rows. */}
-        {hostIds.length > 1 && (
-          <select
-            value={hostFilter}
-            onChange={(e) => setHostFilter(e.target.value)}
-            aria-label="Host filter"
-            className="text-xs font-medium px-2 py-1 rounded-md border border-border bg-panel text-ink-dim focus:outline-none focus:border-brand-500"
-          >
-            <option value="all">All hosts</option>
-            {hostIds.map((h) => (
-              <option key={h} value={h}>{h}</option>
+        {/* Host filter — always visible; drives server-side fetch scope. */}
+        <select
+          value={hostFilter}
+          onChange={(e) => setHostFilter(e.target.value)}
+          aria-label="Host filter"
+          className="text-xs font-medium px-2 py-1 rounded-md border border-border bg-panel text-ink-dim focus:outline-none focus:border-brand-500"
+        >
+          <option value="local">This host</option>
+          <option value={ALL_HOSTS}>All hosts</option>
+          {(hosts ?? [])
+            .filter((h) => h.transport_kind !== 'local')
+            .map((h) => (
+              <option key={h.id} value={h.id}>{h.name}</option>
             ))}
-          </select>
-        )}
+        </select>
       </div>
 
       {error && (

@@ -59,6 +59,13 @@ export default function AgentLauncherSheet({
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
 
+  // Sessions only run locally. When the user picks a remote host, force back to single-run.
+  useEffect(() => {
+    if (host !== 'local') {
+      setLaunchKind('run');
+    }
+  }, [host]);
+
   async function onLaunch() {
     if (launching) return;
     setLaunching(true);
@@ -133,10 +140,11 @@ export default function AgentLauncherSheet({
               <button
                 type="button"
                 onClick={() => {
+                  if (host !== 'local') return;
                   if (mode === 'ask') setMode('bypass');
                   setLaunchKind('session');
                 }}
-                disabled={launching}
+                disabled={launching || host !== 'local'}
                 aria-pressed={launchKind === 'session'}
                 className={
                   'rounded-none border-l border-border px-2 py-1 text-ui font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
@@ -148,11 +156,15 @@ export default function AgentLauncherSheet({
                 Session
               </button>
             </div>
-            {launchKind === 'session' && (
+            {host !== 'local' ? (
+              <p className="mt-1 text-ui text-ink-mute">
+                Sessions run on the local host only (for now).
+              </p>
+            ) : launchKind === 'session' ? (
               <p className="mt-1 text-ui text-ink-mute">
                 Opens a multi-turn chat you can keep messaging.
               </p>
-            )}
+            ) : null}
           </div>
 
           {/* ── Prompt ─────────────────────────────────────────────── */}
