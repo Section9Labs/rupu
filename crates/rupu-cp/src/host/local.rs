@@ -241,6 +241,10 @@ impl HostConnector for LocalHostConnector {
         Ok(Box::pin(stream))
     }
 
+    // SAFETY/CAVEAT: must not be called with untrusted paths — the HTTP
+    // transcript handler enforces allowed_roots before reaching a connector;
+    // this method does NOT. Do not resolve("local") + get_transcript with
+    // user input.
     async fn get_transcript(
         &self,
         path: &str,

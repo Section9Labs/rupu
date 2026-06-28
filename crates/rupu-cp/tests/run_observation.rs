@@ -553,3 +553,86 @@ async fn get_transcript_local_no_host_param_unchanged() {
         "local path outside allowed roots should be 400"
     );
 }
+
+// ── GET /api/runs/:id/log?host= ───────────────────────────────────────────────
+
+/// `GET /api/runs/:id/log?host=<remote>` proxies SSE frames from the mock
+/// host's `/api/events/stream?run=<id>` endpoint (that is what
+/// `HttpHostConnector::stream_run_events` calls on the remote).
+#[tokio::test]
+async fn get_run_log_proxies_to_remote_host() {
+    use futures_util::TryStreamExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mock_server = httpmock::MockServer::start_async().await;
+    let _m = mock_server.mock(|when, then| {
+        when.method("GET")
+            .path("/api/events/stream")
+            .query_param("run", "remote_log_r1");
+        then.status(200)
+            .header("content-type", "text/event-stream")
+            .body(
+                "data: {\"type\":\"step_completed\",\"run_id\":\"remote_log_r1\"}\n\n",
+            );
+    });
+
+    let (addr, host_id) =
+        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/runs/remote_log_r1/log?host={host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("text/event-stream"),
+        "proxied log stream must be text/event-stream; got {ct:?}"
+    );
+
+    // Read the byte stream and verify the forwarded SSE data line arrives.
+    let stream = resp.bytes_stream().map_err(std::io::Error::other);
+    let async_reader = tokio_util::io::StreamReader::new(stream);
+    let mut lines = tokio::io::BufReader::new(async_reader).lines();
+
+    let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    if v["run_id"] == "remote_log_r1" {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out waiting for proxied SSE frame");
+
+    assert!(found, "proxied SSE log stream should carry the remote run's event");
+}
+
+/// `GET /api/runs/:id/log?host=<unknown>` → 404.
+#[tokio::test]
+async fn get_run_log_unknown_host_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/some_run/log?host=host_DOESNOTEXIST"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

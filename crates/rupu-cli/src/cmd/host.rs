@@ -118,13 +118,21 @@ pub(crate) fn list_hosts(
 }
 
 /// Remove a host by id. Refuses the built-in `"local"` id with an error.
+///
+/// Keychain deletion is **best-effort**: a locked or unavailable keychain
+/// produces a warning but does not fail the command after the store record
+/// has already been removed — matches [`HostRegistry::remove_host`]'s
+/// behaviour so the CLI and CP are consistent.
 pub(crate) fn remove_host(store_root: PathBuf, id: String) -> anyhow::Result<()> {
     if id == "local" {
         anyhow::bail!("cannot remove the built-in local host");
     }
     let store = HostStore { root: store_root };
     store.delete(&id).context("delete host record")?;
-    delete_host_token(&id).context("delete host token from keychain")?;
+    // Best-effort: a locked keychain must not fail the command post-deletion.
+    if let Err(e) = delete_host_token(&id) {
+        tracing::warn!(host_id = %id, error = %e, "host remove: could not delete token from keychain; continuing");
+    }
     Ok(())
 }
 

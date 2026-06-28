@@ -36,7 +36,10 @@ pub fn routes() -> Router<AppState> {
 /// Wrap a pre-formatted `EventByteStream` in an axum `Response` with the
 /// correct `text/event-stream` content-type. The bytes are already SSE frames
 /// (`data: {...}\n\n`), so we pass them through without re-encoding.
-fn proxy_event_byte_stream(stream: EventByteStream) -> Result<Response, ApiError> {
+///
+/// `pub(crate)` so that other handlers (e.g. `api::runs::get_run_log`) can
+/// reuse this builder when they proxy `stream_run_events` from a connector.
+pub(crate) fn proxy_event_byte_stream(stream: EventByteStream) -> Result<Response, ApiError> {
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")

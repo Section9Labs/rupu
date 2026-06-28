@@ -126,6 +126,15 @@ impl HostRegistry {
             last_seen_at: None,
         };
 
+        // Spec §Errors+security: warn when the transport is unencrypted.
+        if base_url.starts_with("http://") {
+            tracing::warn!(
+                %base_url,
+                "host_registry: adding host with unencrypted http:// URL; \
+                 consider using https:// to protect tokens in transit"
+            );
+        }
+
         self.store.save(&host)?;
 
         if let Some(tok) = token {

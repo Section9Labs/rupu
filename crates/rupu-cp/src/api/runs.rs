@@ -582,16 +582,41 @@ async fn get_run(
     Ok(Json(detail))
 }
 
-/// `GET /api/runs/:id/log` — tail the run's `events.jsonl` as a live SSE stream.
+/// `GET /api/runs/:id/log[?host=<id>]` — tail the run's `events.jsonl` as a
+/// live SSE stream.
 ///
-/// Returns 404 if the run does not exist. The stream stays open while the run
-/// is in progress and emits each [`rupu_orchestrator::executor::Event`] as a
-/// JSON `data:` line.
+/// Without `?host=` (or `?host=local`): reads from the local `events.jsonl`
+/// (unchanged from before). Returns 404 if the run does not exist.
+///
+/// With `?host=<remote-id>`: resolves the connector and proxies
+/// [`HostConnector::stream_run_events`] as an SSE response — mirrors exactly
+/// how `events_stream` builds the proxied SSE stream. Unknown host id → 404.
+///
+/// The stream stays open while the run is in progress and emits each
+/// [`rupu_orchestrator::executor::Event`] as a JSON `data:` line.
 async fn get_run_log(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunDetailQuery>,
 ) -> Result<Response, ApiError> {
-    // Verify the run exists before opening the tail.
+    let host_id = q.host.as_deref().unwrap_or("local");
+
+    // Remote host: proxy stream_run_events via the connector.
+    if host_id != "local" {
+        let conn = resolve_host(&s, host_id)?;
+        let stream = conn.stream_run_events(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(_) => {
+                ApiError::not_found(format!("run {id} not found on host {host_id}"))
+            }
+            HostConnectorError::Unreachable(m) => {
+                ApiError::internal(format!("host {host_id} unreachable: {m}"))
+            }
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return crate::api::events::proxy_event_byte_stream(stream);
+    }
+
+    // Local path: unchanged — verify the run exists, then tail its events.jsonl.
     s.run_store.load(&id).map_err(|e| match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         other => ApiError::internal(other.to_string()),
