@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu — Don't code it, rupu it.</title>
+<meta name="description" content="rupu is an agentic code-development platform. Describe the work; autonomous agents and workflows do it — with a visual editor and a control plane to run it all.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="canonical" href="https://rupu.sh/">
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://rupu.sh/">
+<meta property="og:title" content="rupu — Don't code it, rupu it.">
+<meta property="og:description" content="The agentic code-development platform. Describe the work; agents and workflows do it.">
+<meta name="theme-color" content="#0a0a0a">
+<meta name="twitter:card" content="summary">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <a class="brand" href="/" aria-label="rupu home">
+    <span class="mark" aria-hidden="true">&#8734;</span>
+    <span class="name">rupu</span>
+  </a>
+  <span class="soon">Coming soon</span>
+</nav>
+
+<!-- ── Hero ─────────────────────────────────────────────── -->
+<header class="hero">
+  <div class="glyph" aria-hidden="true">&#8734;</div>
+  <h1 class="tagline">Don&rsquo;t code it, rupu it.</h1>
+  <p class="subtagline">The agentic code-development platform.</p>
+  <div class="cta-row">
+    <a class="btn primary" href="#what">See what it does</a>
+    <a class="btn" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </div>
+  <a class="scroll-cue" href="#what" aria-label="Scroll down">&#8595;</a>
+</header>
+
+<main>
+  <!-- ── What is rupu ───────────────────────────────────── -->
+  <section id="what" class="wrap">
+    <p class="eyebrow reveal">What is rupu</p>
+    <p class="lede reveal">You describe the work. <span class="accent">Agents and workflows</span> do it.</p>
+    <p class="section-note reveal">
+      rupu turns plain-language intent into real software changes. Define agents as simple
+      Markdown files, compose them into workflows, and let rupu plan, run, and review the work —
+      end to end, with full transcripts and human approval where it matters.
+    </p>
+  </section>
+
+  <!-- ── Capabilities ───────────────────────────────────── -->
+  <section class="wrap">
+    <div class="cap-head">
+      <p class="eyebrow reveal">Capabilities</p>
+      <p class="lede reveal">Everything you need to ship with agents.</p>
+    </div>
+    <div class="cards">
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9673;</div>
+        <h3>Agents</h3>
+        <p>Author agents as Markdown + YAML. Pick a provider and model, grant tools and permissions, and reuse them everywhere.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9783;</div>
+        <h3>Workflows</h3>
+        <p>Compose agents into multi-step workflows — fan-out, parallel panels, gated review loops, approvals, and triggers.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#8734;</div>
+        <h3>Visual editor</h3>
+        <p>Build workflows on a drag-and-drop canvas that stays in lock-step with the YAML — with live validation and expression autocomplete.</p>
+      </article>
+      <article class="card reveal">
+        <div class="ic" aria-hidden="true">&#9635;</div>
+        <h3>Control plane</h3>
+        <p>Launch, watch, and approve runs from one place. Live graphs, transcripts, token spend, and findings across every host.</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- ── How it works ───────────────────────────────────── -->
+  <section class="wrap">
+    <p class="eyebrow reveal">How it works</p>
+    <p class="lede reveal">From intent to merged change.</p>
+    <div class="steps">
+      <div class="step reveal">
+        <h4>Describe</h4>
+        <p>State the outcome you want — or point rupu at an issue. No glue code, no orchestration boilerplate.</p>
+      </div>
+      <div class="step reveal">
+        <h4>Run</h4>
+        <p>Agents and workflows execute autonomously, in parallel where it helps, pausing for approval at the gates you set.</p>
+      </div>
+      <div class="step reveal">
+        <h4>Review</h4>
+        <p>Inspect every transcript, finding, and diff in the control plane, then ship with confidence.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Closing CTA ────────────────────────────────────── -->
+  <section class="wrap closing">
+    <div class="mark reveal" aria-hidden="true">&#8734;</div>
+    <h2 class="reveal">Don&rsquo;t code it, rupu it.</h2>
+    <p class="reveal">Launching soon.</p>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <span>&copy; <span id="year">2026</span> Section9&nbsp;Labs</span>
+    <span class="links">
+      <a href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub</a>
+      <a href="mailto:hello@rupu.sh">Contact</a>
+    </span>
+  </div>
+</footer>
+
+<script>
+  // current year
+  document.getElementById('year').textContent = new Date().getFullYear();
+  // scroll reveal
+  (function () {
+    var els = document.querySelectorAll('.reveal');
+    if (!('IntersectionObserver' in window)) { els.forEach(function (e) { e.classList.add('in'); }); return; }
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) { if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); } });
+    }, { threshold: 0.15 });
+    els.forEach(function (e) { io.observe(e); });
+  })();
+</script>
+</body>
+</html>
