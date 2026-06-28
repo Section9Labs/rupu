@@ -16,6 +16,7 @@ import { absoluteTime, relativeTime } from '../lib/time';
 import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../lib/sessionStatus';
 import { isSessionActive, pollIntervalFor } from '../lib/sessionPoll';
 import UsageChip from '../components/UsageChip';
+import { Button } from '../components/ui/Button';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import SessionConversation from '../components/session/SessionConversation';
 
@@ -302,14 +303,13 @@ export default function SessionDetailPage() {
                 <span className="text-ink-mute">⌘/Ctrl+Enter to send</span>
               )}
             </div>
-            <button
-              type="button"
+            <Button
               onClick={handleSend}
               disabled={sending || stopped || prompt.trim().length === 0}
-              className="inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-50"
+              className="px-4 text-sm disabled:opacity-50"
             >
               {sending ? 'Sending…' : 'Send'}
-            </button>
+            </Button>
           </div>
         </div>
       </div>

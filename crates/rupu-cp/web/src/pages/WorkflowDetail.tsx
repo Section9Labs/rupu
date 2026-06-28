@@ -10,6 +10,7 @@ import { ArrowLeft, Trash2 } from 'lucide-react';
 import { api, type AgentSummary, type WorkflowDetail } from '../lib/api';
 import { ScopeChip } from './Workflows';
 import LauncherSheet from '../components/LauncherSheet';
+import { Button } from '../components/ui/Button';
 
 // Lazy so the @xyflow/react canvas + CodeMirror (and the rest of the visual
 // editor) stay out of the main bundle — only fetched once the page mounts.
@@ -247,14 +248,9 @@ export default function WorkflowDetailPage() {
             >
               Revert
             </button>
-            <button
-              type="button"
-              onClick={save}
-              disabled={saveDisabled}
-              className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
-            >
+            <Button onClick={save} disabled={saveDisabled}>
               {saving ? 'Saving…' : 'Save'}
-            </button>
+            </Button>
             <button
               type="button"
               onClick={remove}
@@ -265,14 +261,9 @@ export default function WorkflowDetailPage() {
               <Trash2 size={14} />
               Delete
             </button>
-            <button
-              type="button"
-              onClick={() => setLauncherOpen(true)}
-              aria-label={`Run ${wfName}`}
-              className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
-            >
+            <Button onClick={() => setLauncherOpen(true)} aria-label={`Run ${wfName}`}>
               Run
-            </button>
+            </Button>
           </div>
         </div>
         {saveError && (

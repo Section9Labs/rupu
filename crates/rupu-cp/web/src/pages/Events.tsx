@@ -15,6 +15,7 @@ import { ArrowUp, Radio } from 'lucide-react';
 import { api, type RunEvent } from '../lib/api';
 import { type ConnectionState, type SeqEvent, ConnectionBadge } from '../components/RunEventFeed';
 import EventTimelineList from '../components/EventTimelineList';
+import { Button } from '../components/ui/Button';
 
 const MAX_EVENTS = 2000;
 // Pixel distance from the top within which we consider the user "at the top"
@@ -123,17 +124,17 @@ export default function Events() {
 
         {/* "Jump to latest" button — appears when user has scrolled away from top */}
         {!follow && events.length > 0 && (
-          <button
+          <Button
             onClick={() => {
               const el = scrollRef.current;
               if (el) el.scrollTo({ top: 0, behavior: 'smooth' });
               setFollow(true);
             }}
-            className="absolute bottom-4 right-4 inline-flex items-center gap-1.5 bg-brand-500 hover:bg-brand-600 text-white text-xs font-medium px-3 py-2 rounded-full shadow-card transition-colors"
+            className="absolute bottom-4 right-4 gap-1.5 px-3 py-2 text-xs rounded-full shadow-card"
           >
             <ArrowUp size={12} />
             Jump to latest
-          </button>
+          </Button>
         )}
       </div>
     </div>

@@ -10,6 +10,7 @@ import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
 import CodeEditor from '../components/CodeEditor';
 import AgentLauncherSheet from '../components/AgentLauncherSheet';
+import { Button } from '../components/ui/Button';
 
 export default function AgentDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
@@ -123,14 +124,9 @@ export default function AgentDetailPage() {
               <Trash2 size={14} />
               Delete
             </button>
-            <button
-              type="button"
-              onClick={() => setRunOpen(true)}
-              aria-label={`Run ${agent.name}`}
-              className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
-            >
+            <Button onClick={() => setRunOpen(true)} aria-label={`Run ${agent.name}`}>
               Run
-            </button>
+            </Button>
           </div>
         </div>
         {deleteError && (
@@ -189,14 +185,9 @@ export default function AgentDetailPage() {
               >
                 Cancel
               </button>
-              <button
-                type="button"
-                onClick={save}
-                disabled={saving || draft === agent.raw}
-                className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
-              >
+              <Button onClick={save} disabled={saving || draft === agent.raw}>
                 {saving ? 'Saving…' : 'Save'}
-              </button>
+              </Button>
             </div>
           </div>
         ) : agent.raw ? (

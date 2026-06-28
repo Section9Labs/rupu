@@ -45,7 +45,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
     const isActive = state === 'running' || state === 'pending' || state === 'awaiting_approval';
     const border = isErr ? '#fecaca' : isActive ? '#bfdbfe' : '#e5e7eb';
     const bg = isErr ? '#fef2f2' : isActive ? '#eff6ff' : '#ffffff';
-    const labelColor = isErr ? 'text-[#fb4e4e]' : isActive ? 'text-[#1860f2]' : 'text-ink-mute';
+    const labelColor = isErr ? 'text-[#ef4444]' : isActive ? 'text-[#3b82f6]' : 'text-ink-mute';
     const message =
       state === 'running'
         ? 'starting units…'
@@ -87,10 +87,10 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         style={{ borderColor: '#bfdbfe', background: '#eff6ff', width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
-        <div className="mb-1 flex items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-wide text-[#1860f2]">
+        <div className="mb-1 flex items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-wide text-[#3b82f6]">
           <span className="truncate">for_each · {node.id} · {total}</span>
           <span className="tabular-nums">
-            {done} ✓{failed > 0 && <span className="ml-1 text-[#fb4e4e]">· {failed} ✕</span>}
+            {done} ✓{failed > 0 && <span className="ml-1 text-[#ef4444]">· {failed} ✕</span>}
           </span>
         </div>
         <div
@@ -122,20 +122,20 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
-      <div className="text-[10px] font-bold uppercase tracking-wide text-[#1860f2]">
+      <div className="text-[10px] font-bold uppercase tracking-wide text-[#3b82f6]">
         for_each · {node.id}
       </div>
 
       <div className="mt-1 flex items-baseline gap-2">
         <span className="text-[22px] font-bold leading-none text-ink tabular-nums">{done}</span>
         <span className="text-[11px] text-ink-mute">/ {total} units</span>
-        <span className="ml-auto text-[13px] font-bold text-[#1860f2] tabular-nums">{pct}%</span>
+        <span className="ml-auto text-[13px] font-bold text-[#3b82f6] tabular-nums">{pct}%</span>
       </div>
 
       <div className="mt-1.5 h-[9px] overflow-hidden rounded-[5px]" style={{ background: '#e2e8f0' }}>
         <div
           className="h-full"
-          style={{ width: `${pct}%`, background: 'linear-gradient(90deg,#1860f2,#2ac769)' }}
+          style={{ width: `${pct}%`, background: 'linear-gradient(90deg,#3b82f6,#22c55e)' }}
         />
       </div>
 
@@ -149,7 +149,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         <span>
           <b className="text-ink">{pending}</b> pending
         </span>
-        {failed > 0 && <span className="font-bold text-[#fb4e4e]">{failed} failed</span>}
+        {failed > 0 && <span className="font-bold text-[#ef4444]">{failed} failed</span>}
       </div>
 
       <div className="mt-2 grid gap-[2px]" style={{ gridTemplateColumns: 'repeat(20, 9px)' }}>
@@ -165,7 +165,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
       <button
         type="button"
         onClick={() => onExpandFanout?.(node.id)}
-        className="mt-2 text-[11px] font-medium text-[#1860f2] hover:underline"
+        className="mt-2 text-[11px] font-medium text-[#3b82f6] hover:underline"
       >
         ▸ expand all {total}
         {failed > 0 && ` · failed (${failed})`}

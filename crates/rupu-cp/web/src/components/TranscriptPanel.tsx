@@ -12,6 +12,7 @@ import { Loader2, AlertTriangle } from 'lucide-react';
 import { api } from '../lib/api';
 import type { TranscriptEvent } from '../lib/transcript';
 import { cn } from '../lib/cn';
+import { formatDuration } from '../lib/duration';
 import { buildTranscriptView } from './transcript/transcriptView';
 import Turn from './transcript/Turn';
 
@@ -207,14 +208,6 @@ export default function TranscriptPanel({
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
-
-function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(s < 10 ? 1 : 0)}s`;
-  const m = Math.floor(s / 60);
-  return `${m}m ${Math.round(s % 60)}s`;
-}
 
 function statusGlyph(status: string): string {
   switch (status) {

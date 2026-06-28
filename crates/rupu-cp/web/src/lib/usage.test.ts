@@ -2,10 +2,15 @@ import { describe, it, expect } from 'vitest';
 import { formatTokens, formatCost } from './usage';
 
 describe('formatTokens', () => {
-  it('renders small counts with thousands separators', () => {
+  it('renders counts under 10k with thousands separators', () => {
     expect(formatTokens(0)).toBe('0');
     expect(formatTokens(4210)).toBe('4,210');
-    expect(formatTokens(999999)).toBe('999,999');
+    expect(formatTokens(9999)).toBe('9,999');
+  });
+  it('compacts thousands from 10k', () => {
+    expect(formatTokens(10_000)).toBe('10k');
+    expect(formatTokens(50_000)).toBe('50k');
+    expect(formatTokens(950_000)).toBe('950k');
   });
   it('compacts millions and billions', () => {
     expect(formatTokens(1_200_000)).toBe('1.2M');

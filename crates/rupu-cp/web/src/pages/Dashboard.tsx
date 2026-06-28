@@ -23,6 +23,7 @@ import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
 import { formatCost, formatTokens } from '../lib/usage';
+import { shortId } from '../lib/shortId';
 
 // ---------------------------------------------------------------------------
 // Global range control
@@ -158,9 +159,7 @@ function RecentRunRow({ run }: { run: DashboardResponse['recent_runs'][number] }
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-ink truncate">{run.workflow_name}</span>
-          <span className="text-[11px] text-ink-mute font-mono">
-            {run.id.length > 10 ? `${run.id.slice(0, 8)}…` : run.id}
-          </span>
+          <span className="text-[11px] text-ink-mute font-mono">{shortId(run.id)}</span>
         </div>
         <p className="text-[11px] text-ink-dim mt-0.5">started {relativeTime(run.started_at)}</p>
       </div>

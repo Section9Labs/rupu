@@ -40,10 +40,13 @@ export interface UsageTimelineBucket {
   rows: UsageBreakdownRow[];
 }
 
-/** Compact a token count: `4,210` / `1.2M` / `3.4B`. */
+/** Compact a token count consistently from ≥10k so columns don't mix
+ *  `950,000` and `1.2M`: `4,210` / `50k` / `1.2M` / `3.4B`. Below 10k the raw
+ *  grouped number stays legible; at/above 10k we switch to a compact suffix. */
 export function formatTokens(n: number): string {
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${Math.round(n / 1_000)}k`;
   return n.toLocaleString('en-US');
 }
 

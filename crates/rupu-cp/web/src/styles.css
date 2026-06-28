@@ -10,18 +10,6 @@
   }
 }
 
-@layer components {
-  .severity-badge {
-    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium uppercase tracking-wide;
-  }
-  /* CRITICAL purple → HIGH red → MEDIUM orange → LOW yellow → INFO slate */
-  .severity-critical { @apply bg-purple-50 text-sev-critical ring-1 ring-purple-200; }
-  .severity-high     { @apply bg-red-50    text-sev-high     ring-1 ring-red-200;    }
-  .severity-medium   { @apply bg-orange-50 text-sev-medium   ring-1 ring-orange-200; }
-  .severity-low      { @apply bg-yellow-50 text-sev-low      ring-1 ring-yellow-200; }
-  .severity-info     { @apply bg-slate-50  text-sev-info     ring-1 ring-slate-200;  }
-}
-
 /* Timeline animations — used by the Live Events page when new items arrive.
  *
  * Goal: an "item slides in from above and gently settles" feel. The item
@@ -116,9 +104,11 @@
 /*   • active edge   → blue "marching-ants" (xyflow paints the path,  */
 /*     so animate stroke-dashoffset on the SVG path itself)           */
 /* ------------------------------------------------------------------ */
+/* Unified status palette (see lib/status.ts / tailwind `status.*`):
+ *   running #3b82f6 (59,130,246) · awaiting #f59e0b (245,158,11) */
 @keyframes rg-pulse-blue {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(24, 96, 242, 0.45); }
-  50%      { box-shadow: 0 0 0 7px rgba(24, 96, 242, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.45); }
+  50%      { box-shadow: 0 0 0 7px rgba(59, 130, 246, 0); }
 }
 @keyframes rg-pulse-amber {
   0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.45); }
@@ -134,7 +124,7 @@
  * active/awaiting edges via a wrapper class on the <g> and animate the
  * dashed stroke so the ants march along the rendered curve. */
 .react-flow__edge.rg-edge-active .react-flow__edge-path {
-  stroke: #1860f2;
+  stroke: #3b82f6;
   stroke-width: 2;
   stroke-dasharray: 7 7;
   animation: rg-march 0.7s linear infinite;

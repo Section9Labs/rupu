@@ -9,6 +9,7 @@ import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import LauncherSheet from '../components/LauncherSheet';
 import CodeEditor from '../components/CodeEditor';
+import { Button } from '../components/ui/Button';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
@@ -71,14 +72,10 @@ export default function Workflows() {
             and raw YAML.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setCreateOpen(true)}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700"
-        >
+        <Button onClick={() => setCreateOpen(true)} className="shrink-0 gap-1.5">
           <Plus size={14} />
           New workflow
-        </button>
+        </Button>
       </header>
 
       {error && (
@@ -209,14 +206,9 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
           >
             Cancel
           </button>
-          <button
-            type="button"
-            onClick={create}
-            disabled={creating}
-            className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
-          >
+          <Button onClick={create} disabled={creating}>
             {creating ? 'Creating…' : 'Create'}
-          </button>
+          </Button>
         </div>
       </div>
     </div>
