@@ -245,7 +245,6 @@ async fn launch_run(
 mod tests {
     use super::*;
     use crate::launcher::{LaunchError, LaunchRequest, RunLauncher};
-    use rupu_orchestrator::RunStore;
     use std::sync::{Arc, Mutex};
 
     /// Captures the last `LaunchRequest` and returns a canned run id.
@@ -263,18 +262,8 @@ mod tests {
     }
 
     fn test_state(tmp: &tempfile::TempDir) -> AppState {
-        let store = RunStore::new(tmp.path().join("runs"));
-        AppState {
-            global_dir: tmp.path().to_path_buf(),
-            workspace_dir: tmp.path().to_path_buf(),
-            run_store: Arc::new(store),
-            pricing: rupu_config::PricingConfig::default(),
-            launcher: None,
-            session_sender: None,
-            repos: None,
-            agent_launcher: None,
-            session_starter: None,
-        }
+        AppState::new(tmp.path().to_path_buf(), rupu_config::PricingConfig::default())
+            .with_workspace_dir(tmp.path().to_path_buf())
     }
 
     #[tokio::test]

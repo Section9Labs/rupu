@@ -100,12 +100,32 @@ fn load_pricing(global_dir: &Path) -> PricingConfig {
 pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let open_browser = opts.open_browser;
     let pricing = load_pricing(&opts.global_dir);
-    let app_state = state::AppState::new(opts.global_dir, pricing)
-        .with_launcher(opts.launcher)
-        .with_session_sender(opts.session_sender)
+
+    // Build the AppState with the default (read-only) registry first so that
+    // `run_store` and `global_dir` are available for the fully-wired registry
+    // we build next.
+    let app_state = state::AppState::new(opts.global_dir.clone(), pricing.clone())
+        .with_launcher(opts.launcher.clone())
+        .with_session_sender(opts.session_sender.clone())
         .with_repos(opts.repos)
-        .with_agent_launcher(opts.agent_launcher)
-        .with_session_starter(opts.session_starter);
+        .with_agent_launcher(opts.agent_launcher.clone())
+        .with_session_starter(opts.session_starter.clone());
+
+    // Replace the default read-only registry with a fully-wired one that
+    // holds the real launcher / sender / starter adapters.
+    let local = crate::host::local::LocalHostConnector::new(
+        opts.launcher,
+        opts.agent_launcher,
+        opts.session_starter,
+        opts.session_sender,
+        std::sync::Arc::clone(&app_state.run_store),
+        app_state.global_dir.clone(),
+    )
+    .with_pricing(pricing);
+    let store = rupu_workspace::HostStore { root: app_state.global_dir.join("hosts") };
+    let registry = crate::host::registry::HostRegistry::new(store, std::sync::Arc::new(local));
+    let app_state = app_state.with_hosts(std::sync::Arc::new(registry));
+
     let app = server::router(app_state, opts.token);
 
     let listener = tokio::net::TcpListener::bind(opts.bind)
