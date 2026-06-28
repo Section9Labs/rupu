@@ -55,8 +55,9 @@ pub enum Action {
         #[arg(long)]
         editor: Option<String>,
     },
-    /// Scaffold a new agent file from a template, then open it for
-    /// editing. Prompts interactively for scope and name when omitted.
+    /// Scaffold a new agent file, then open it for editing. Prompts
+    /// interactively for scope and name when omitted. With `--describe`,
+    /// a model drafts the definition before you review it.
     Create {
         /// Name for the new agent (no `.md` extension).
         name: Option<String>,
@@ -66,6 +67,18 @@ pub enum Action {
         /// Override the editor (e.g. `--editor "code --wait"`).
         #[arg(long)]
         editor: Option<String>,
+        /// Natural-language description — a model drafts the agent.
+        #[arg(long)]
+        describe: Option<String>,
+        /// Provider for generation (default: first authenticated).
+        #[arg(long)]
+        gen_provider: Option<String>,
+        /// Model for generation (default: provider's default).
+        #[arg(long)]
+        gen_model: Option<String>,
+        /// Host to create on (only `local` available today).
+        #[arg(long, default_value = "local")]
+        host: String,
     },
 }
 
@@ -106,7 +119,21 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             name,
             scope,
             editor,
-        } => match create(name, scope, editor.as_deref()).await {
+            describe,
+            gen_provider,
+            gen_model,
+            host,
+        } => match create(
+            name,
+            scope,
+            editor.as_deref(),
+            describe,
+            gen_provider,
+            gen_model,
+            &host,
+        )
+        .await
+        {
             Ok(()) => ExitCode::from(0),
             Err(e) => crate::output::diag::fail(e),
         },
@@ -323,7 +350,14 @@ async fn create(
     name: Option<String>,
     scope: Option<String>,
     editor_override: Option<&str>,
+    describe: Option<String>,
+    gen_provider: Option<String>,
+    gen_model: Option<String>,
+    host: &str,
 ) -> anyhow::Result<()> {
+    if host != "local" {
+        anyhow::bail!("host `{host}` is not available (only `local` today)");
+    }
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -350,18 +384,55 @@ async fn create(
         );
     }
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(&target, AGENT_TEMPLATE.replace("{{name}}", &name))?;
+
+    let contents = match describe {
+        Some(desc) => {
+            let resolver = rupu_auth::KeychainResolver::new();
+            let (provider, model) = match (gen_provider, gen_model) {
+                (Some(p), Some(m)) => (p, m),
+                (Some(p), None) => {
+                    let m = rupu_orchestrator::generate::DEFAULT_GEN_MODELS
+                        .iter()
+                        .find(|(name, _)| *name == p.as_str())
+                        .map(|(_, m)| m.to_string())
+                        .ok_or_else(|| anyhow::anyhow!("unknown --gen-provider `{p}`"))?;
+                    (p, m)
+                }
+                (None, _) => rupu_orchestrator::pick_default_gen_model(&resolver)
+                    .await
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no authenticated provider; run `rupu auth login` or pass \
+                             --gen-provider/--gen-model"
+                        )
+                    })?,
+            };
+            println!("generating agent `{name}` via {provider}/{model}\u{2026}");
+            let req = rupu_orchestrator::GenerateRequest {
+                kind: rupu_orchestrator::GenKind::Agent,
+                description: desc,
+                provider,
+                model,
+                available_agents: vec![],
+            };
+            let outcome = rupu_orchestrator::generate_definition(&req, &resolver).await?;
+            outcome.content
+        }
+        None => AGENT_TEMPLATE.replace("{{name}}", &name),
+    };
+
+    std::fs::write(&target, &contents)?;
     println!("created {} ({scope})", target.display());
 
     editor::open_for_edit(editor_override, &target)?;
 
     match AgentSpec::parse_file(&target) {
         Ok(_) => {
-            println!("✓ {name}: frontmatter parses cleanly");
+            println!("\u{2713} {name}: frontmatter parses cleanly");
             Ok(())
         }
         Err(e) => {
-            eprintln!("⚠ {name}: failed to re-parse after save:\n  {e}");
+            eprintln!("\u{26a0} {name}: failed to re-parse after save:\n  {e}");
             Ok(())
         }
     }
