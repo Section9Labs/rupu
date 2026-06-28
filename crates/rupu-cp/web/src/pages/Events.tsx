@@ -99,7 +99,7 @@ export default function Events() {
         </div>
         <div className="flex items-center gap-3">
           <ConnectionBadge state={connection} />
-          <span className="text-[11px] text-ink-mute tabular-nums">
+          <span className="text-note text-ink-mute tabular-nums">
             {events.length} event{events.length === 1 ? '' : 's'}
           </span>
         </div>

@@ -48,7 +48,7 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
         {/* Severity badge */}
         <span
           className={cn(
-            'shrink-0 inline-flex items-center justify-center text-center min-w-[72px] rounded px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ring-1 mt-0.5',
+            'shrink-0 inline-flex items-center justify-center text-center min-w-[72px] rounded px-2 py-0.5 text-note font-semibold uppercase tracking-wide ring-1 mt-0.5',
             s.pill,
           )}
         >
@@ -60,21 +60,21 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
           {provenance ? (
             <div className="flex flex-wrap items-start gap-x-2 gap-y-1">
               <p className="text-sm text-ink leading-snug min-w-0 flex-1">{finding.summary}</p>
-              <span className="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium font-mono bg-slate-100 text-ink-mute ring-1 ring-slate-200 mt-0.5">
+              <span className="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-meta font-medium font-mono bg-slate-100 text-ink-mute ring-1 ring-slate-200 mt-0.5">
                 {provenance}
               </span>
             </div>
           ) : (
             <p className="text-sm text-ink leading-snug">{finding.summary}</p>
           )}
-          <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-note text-ink-mute">
             {location && <span className="font-mono break-all">{location}</span>}
             {cwe && (
               <a
                 href={cwe.url}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200"
+                className="inline-flex items-center rounded bg-slate-100 px-1.5 py-0.5 text-note font-medium text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200"
               >
                 {cwe.id}
               </a>
@@ -99,17 +99,17 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
           {hasEvidence && open && (
             <div className="mt-2 space-y-2">
               {rationale && (
-                <p className="text-[12px] text-ink-dim leading-snug whitespace-pre-wrap">
+                <p className="text-ui text-ink-dim leading-snug whitespace-pre-wrap">
                   {rationale}
                 </p>
               )}
               {excerpt && (
-                <pre className="overflow-x-auto rounded bg-slate-50 ring-1 ring-slate-200 px-3 py-2 text-[11px] font-mono text-ink leading-snug whitespace-pre">
+                <pre className="overflow-x-auto rounded bg-slate-50 ring-1 ring-slate-200 px-3 py-2 text-note font-mono text-ink leading-snug whitespace-pre">
                   {excerpt}
                 </pre>
               )}
               {references.length > 0 && (
-                <ul className="list-disc pl-4 text-[11px] text-ink-mute space-y-0.5">
+                <ul className="list-disc pl-4 text-note text-ink-mute space-y-0.5">
                   {references.map((ref, i) => (
                     <li key={i} className="break-all font-mono">{ref}</li>
                   ))}

@@ -11,8 +11,8 @@ interface WorkflowSettingsFormProps {
 }
 
 const fieldCls =
-  'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
-const labelCls = 'mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim';
+  'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
+const labelCls = 'mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim';
 
 export default function WorkflowSettingsForm({ meta, onChange }: WorkflowSettingsFormProps) {
   // Spread `meta` (which carries `rest`) so unmodeled top-level keys survive.
@@ -48,14 +48,14 @@ export default function WorkflowSettingsForm({ meta, onChange }: WorkflowSetting
 
       {restKeys.length > 0 && (
         <div className="rounded-md border border-border bg-slate-50 px-3 py-2.5">
-          <p className="text-[12px] font-medium text-ink-dim">
+          <p className="text-ui font-medium text-ink-dim">
             Preserved advanced keys — edit these in the YAML tab:
           </p>
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             {restKeys.map((k) => (
               <span
                 key={k}
-                className="inline-flex items-center rounded px-1.5 py-0.5 font-mono text-[11px] font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200"
+                className="inline-flex items-center rounded px-1.5 py-0.5 font-mono text-note font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200"
               >
                 {k}
               </span>

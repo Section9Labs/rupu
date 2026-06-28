@@ -37,7 +37,7 @@ export default function RunTranscript() {
 
       <header>
         <h1 className="text-xl font-semibold text-ink font-mono break-all">{label}</h1>
-        <p className="mt-0.5 text-[11px] text-ink-dim font-mono truncate" title={path}>
+        <p className="mt-0.5 text-note text-ink-dim font-mono truncate" title={path}>
           {path}
         </p>
       </header>

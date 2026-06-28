@@ -113,7 +113,7 @@ export default function UsageTimelineStacked({
       {/* Legend — models → colors (stable). */}
       <ul className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5">
         {models.map((m) => (
-          <li key={m} className="flex items-center gap-1.5 text-[11px]">
+          <li key={m} className="flex items-center gap-1.5 text-note">
             <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: colors.get(m) }} />
             <span className="text-ink-dim truncate max-w-[160px]">{m}</span>
           </li>

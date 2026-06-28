@@ -87,7 +87,7 @@ export default function Projects() {
             initialSort={{ key: 'last_active', dir: 'desc' }}
           />
           {all.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
               scroll for more
             </div>
           )}
@@ -116,7 +116,7 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     sortable: true,
     sortValue: (p) => p.path,
     render: (p) => (
-      <span className="text-[11px] text-ink-mute font-mono truncate block max-w-xs">{p.path}</span>
+      <span className="text-note text-ink-mute font-mono truncate block max-w-xs">{p.path}</span>
     ),
   },
   {
@@ -127,13 +127,13 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     render: (p) => (
       <div className="flex items-center gap-1.5 flex-wrap">
         {p.repo_remote && (
-          <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
+          <span className="inline-flex items-center gap-1 text-meta text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
             <GitFork size={10} />
             {p.repo_remote}
           </span>
         )}
         {p.branch ? (
-          <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
+          <span className="inline-flex items-center gap-1 text-meta text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
             <GitBranch size={10} />
             {p.branch}
           </span>

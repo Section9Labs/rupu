@@ -22,6 +22,7 @@ import {
   type UsageTimelinePoint,
 } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
+import { Button } from '../components/ui/Button';
 import { TabBar, TabButton } from '../components/TabBar';
 import { ListCard } from '../components/lists/ListCard';
 import { FindingMetrics } from '../components/findings/FindingMetrics';
@@ -435,7 +436,7 @@ export default function RunDetail() {
               <h1 className="truncate text-2xl font-semibold text-ink">{run.workflow_name}</h1>
               <StatusPill status={effectiveStatus} />
             </div>
-            <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-[11px] text-ink-dim">
+            <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-note text-ink-dim">
               <span className="font-mono">{run.id}</span>
               <span>started {absoluteTime(run.started_at)}</span>
               {run.finished_at && <span>finished {absoluteTime(run.finished_at)}</span>}
@@ -457,17 +458,16 @@ export default function RunDetail() {
 
           {isRunning && (
             <div className="flex shrink-0 flex-col items-end gap-1">
-              <button
-                type="button"
+              <Button
+                variant="danger-outline"
                 onClick={onCancel}
                 disabled={cancelPending}
                 aria-label="Cancel run"
-                className="inline-flex items-center rounded-md border border-red-300 bg-white px-3 py-1.5 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {cancelPending ? 'Cancelling…' : 'Cancel'}
-              </button>
+              </Button>
               {cancelError && (
-                <p className="text-[11px] font-medium text-red-700" role="alert">
+                <p className="text-note font-medium text-red-700" role="alert">
                   {cancelError}
                 </p>
               )}
@@ -488,12 +488,12 @@ export default function RunDetail() {
               <div className="text-sm font-medium text-amber-800">
                 Awaiting approval · <span className="font-mono">{awaiting.stepId}</span>
               </div>
-              <p className="mt-0.5 break-words text-[12px] text-amber-700">{awaiting.reason}</p>
+              <p className="mt-0.5 break-words text-ui text-amber-700">{awaiting.reason}</p>
 
               {cancelled ? (
-                <div className="mt-2 text-[12px] font-medium text-slate-600">Cancelled.</div>
+                <div className="mt-2 text-ui font-medium text-slate-600">Cancelled.</div>
               ) : resumeRequested ? (
-                <div className="mt-2 flex items-center gap-2 text-[12px] font-medium text-emerald-700">
+                <div className="mt-2 flex items-center gap-2 text-ui font-medium text-emerald-700">
                   <span
                     className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500"
                     aria-hidden="true"
@@ -501,11 +501,11 @@ export default function RunDetail() {
                   Approved — resuming…
                 </div>
               ) : rejected ? (
-                <div className="mt-2 text-[12px] font-medium text-red-700">Rejected.</div>
+                <div className="mt-2 text-ui font-medium text-red-700">Rejected.</div>
               ) : (
                 <div className="mt-2 space-y-2">
                   <div className="flex flex-wrap items-center gap-2">
-                    <label htmlFor="approve-mode" className="text-[12px] font-medium text-amber-800">
+                    <label htmlFor="approve-mode" className="text-ui font-medium text-amber-800">
                       Resume mode
                     </label>
                     <select
@@ -516,7 +516,7 @@ export default function RunDetail() {
                       }
                       disabled={gatePending}
                       aria-label="Resume mode"
-                      className="rounded-md border border-amber-300 bg-white px-2 py-1.5 text-[12px] font-medium text-ink focus:border-amber-400 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                      className="rounded-md border border-amber-300 bg-white px-2 py-1.5 text-ui font-medium text-ink focus:border-amber-400 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       <option value="ask">Ask</option>
                       <option value="bypass">Bypass</option>
@@ -527,37 +527,35 @@ export default function RunDetail() {
                       onClick={onApprove}
                       disabled={gatePending}
                       aria-label="Approve run"
-                      className="inline-flex items-center rounded-md bg-emerald-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                      className="inline-flex items-center rounded-md bg-emerald-600 px-3 py-1.5 text-ui font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       {gatePending ? 'Working…' : 'Approve'}
                     </button>
-                    <button
-                      type="button"
+                    <Button
+                      variant="danger-outline"
                       onClick={() => {
                         setRejectOpen((v) => !v);
                         setGateError(null);
                       }}
                       disabled={gatePending}
                       aria-label="Reject run"
-                      className="inline-flex items-center rounded-md border border-red-300 bg-white px-3 py-1.5 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       Reject
-                    </button>
+                    </Button>
                     {cancellable && (
-                      <button
-                        type="button"
+                      <Button
+                        variant="secondary"
                         onClick={onCancel}
                         disabled={cancelPending}
                         aria-label="Cancel run"
-                        className="inline-flex items-center rounded-md border border-slate-300 bg-white px-3 py-1.5 text-[12px] font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         {cancelPending ? 'Cancelling…' : 'Cancel'}
-                      </button>
+                      </Button>
                     )}
                   </div>
 
                   {cancelError && (
-                    <p className="text-[11px] font-medium text-red-700" role="alert">
+                    <p className="text-note font-medium text-red-700" role="alert">
                       {cancelError}
                     </p>
                   )}
@@ -570,22 +568,21 @@ export default function RunDetail() {
                         onChange={(e) => setRejectReason(e.target.value)}
                         placeholder="Reason (optional)"
                         aria-label="Rejection reason"
-                        className="min-w-0 flex-1 rounded-md border border-red-200 bg-white px-2 py-1 text-[12px] text-ink placeholder:text-ink-mute focus:border-red-400 focus:outline-none"
+                        className="min-w-0 flex-1 rounded-md border border-red-200 bg-white px-2 py-1 text-ui text-ink placeholder:text-ink-mute focus:border-red-400 focus:outline-none"
                       />
-                      <button
-                        type="button"
+                      <Button
+                        variant="danger"
                         onClick={onReject}
                         disabled={gatePending}
                         aria-label="Confirm rejection"
-                        className="inline-flex items-center rounded-md bg-red-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
                       >
                         {gatePending ? 'Working…' : 'Confirm reject'}
-                      </button>
+                      </Button>
                     </div>
                   )}
 
                   {gateError && (
-                    <p className="text-[11px] font-medium text-red-700" role="alert">
+                    <p className="text-note font-medium text-red-700" role="alert">
                       {gateError}
                     </p>
                   )}
@@ -626,7 +623,7 @@ export default function RunDetail() {
         </TabBar>
       </div>
 
-      <div className="px-8 pt-2 text-[11px] text-ink-dim">
+      <div className="px-8 pt-2 text-note text-ink-dim">
         selected: <span className="font-mono text-ink-mute">{selectedLabel}</span>
       </div>
 
@@ -671,7 +668,7 @@ export default function RunDetail() {
             ) : findings.findings.length === 0 ? (
               <div className="space-y-1">
                 <p className="text-sm text-ink-mute">No findings recorded for this run.</p>
-                <p className="text-[11px] text-ink-mute">
+                <p className="text-note text-ink-mute">
                   (findings require a workflow with a coverage target)
                 </p>
               </div>

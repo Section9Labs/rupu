@@ -20,8 +20,8 @@ function ExitBadge({ code }: { code: number }) {
     <span
       className={
         isOk
-          ? 'inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-mono font-semibold bg-green-900/40 text-green-300'
-          : 'inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-mono font-semibold bg-red-900/50 text-red-300'
+          ? 'inline-flex items-center rounded px-1.5 py-0.5 text-meta font-mono font-semibold bg-green-900/40 text-green-300'
+          : 'inline-flex items-center rounded px-1.5 py-0.5 text-meta font-mono font-semibold bg-red-900/50 text-red-300'
       }
     >
       exit {code}
@@ -69,7 +69,7 @@ export default function TerminalBlock({
         <div className="flex items-center gap-2 px-3 py-1.5 border-t border-slate-700/60">
           {exitCode !== undefined && <ExitBadge code={exitCode} />}
           {cwd && (
-            <span className="font-mono text-[10px] text-slate-500 truncate">{cwd}</span>
+            <span className="font-mono text-meta text-slate-500 truncate">{cwd}</span>
           )}
         </div>
       )}

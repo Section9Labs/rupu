@@ -234,45 +234,40 @@ export default function WorkflowDetailPage() {
           <h1 className="text-2xl font-semibold text-ink break-all">{wfName}</h1>
           {scope && <ScopeChip scope={scope} />}
           {autoflow && (
-            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-violet-50 text-violet-700 ring-violet-200">
+            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-violet-50 text-violet-700 ring-violet-200">
               Autoflow
             </span>
           )}
           <div className="ml-auto flex items-center gap-2">
             <ValidityBadge validity={validity} />
-            <button
-              type="button"
-              onClick={revertDraft}
-              disabled={revertDisabled}
-              className="inline-flex items-center rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-            >
+            <Button variant="secondary" onClick={revertDraft} disabled={revertDisabled}>
               Revert
-            </button>
+            </Button>
             <Button onClick={save} disabled={saveDisabled}>
               {saving ? 'Saving…' : 'Save'}
             </Button>
-            <button
-              type="button"
+            <Button
+              variant="danger-outline"
               onClick={remove}
               disabled={deleting}
               aria-label={`Delete ${wfName}`}
-              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-red-700 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
+              className="gap-1.5"
             >
               <Trash2 size={14} />
               Delete
-            </button>
+            </Button>
             <Button onClick={() => setLauncherOpen(true)} aria-label={`Run ${wfName}`}>
               Run
             </Button>
           </div>
         </div>
         {saveError && (
-          <p role="alert" className="mt-2 text-[12px] font-medium text-red-700">
+          <p role="alert" className="mt-2 text-ui font-medium text-red-700">
             {saveError}
           </p>
         )}
         {deleteError && (
-          <p role="alert" className="mt-2 text-[12px] font-medium text-red-700">
+          <p role="alert" className="mt-2 text-ui font-medium text-red-700">
             {deleteError}
           </p>
         )}
@@ -313,14 +308,14 @@ function ValidityBadge({ validity }: { validity: { ok: boolean; error?: string }
   if (!validity) return null;
   if (validity.ok) {
     return (
-      <span className="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 bg-green-50 text-green-700 ring-green-200">
+      <span className="inline-flex items-center rounded-full px-2 py-0.5 text-note font-medium ring-1 bg-green-50 text-green-700 ring-green-200">
         ✓ valid
       </span>
     );
   }
   return (
     <span
-      className="inline-flex max-w-[20rem] items-center truncate rounded-full px-2 py-0.5 text-[11px] font-medium ring-1 bg-red-50 text-red-700 ring-red-200"
+      className="inline-flex max-w-[20rem] items-center truncate rounded-full px-2 py-0.5 text-note font-medium ring-1 bg-red-50 text-red-700 ring-red-200"
       title={validity.error}
     >
       ✕ {validity.error ?? 'invalid'}

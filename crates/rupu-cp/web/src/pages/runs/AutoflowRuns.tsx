@@ -13,6 +13,7 @@ import {
 import { ListCard } from '../../components/lists/ListCard';
 import { SectionHeader } from '../../components/lists/SectionHeader';
 import UsageChip from '../../components/UsageChip';
+import { Button } from '../../components/ui/Button';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
@@ -34,7 +35,7 @@ const MODE_CLS: Record<string, string> = {
 function ModeChip({ mode }: { mode: string }) {
   const cls = MODE_CLS[mode] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
   return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
+    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {mode}
     </span>
   );
@@ -59,7 +60,7 @@ function KindBadge({ kind }: { kind: string }) {
   const cls = KIND_CLS[kind] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
   const label = KIND_LABEL[kind] ?? kind.replace(/_/g, ' ');
   return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
+    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {label}
     </span>
   );
@@ -67,7 +68,7 @@ function KindBadge({ kind }: { kind: string }) {
 
 function IssueChip({ displayRef }: { displayRef: string }) {
   return (
-    <span className="inline-flex items-center rounded bg-slate-100 text-slate-600 ring-1 ring-slate-200 text-[10px] font-medium px-1.5 py-0.5">
+    <span className="inline-flex items-center rounded bg-slate-100 text-slate-600 ring-1 ring-slate-200 text-meta font-medium px-1.5 py-0.5">
       {displayRef}
     </span>
   );
@@ -94,7 +95,7 @@ const CLAIM_STATUS_CLS: Record<string, string> = {
 function ClaimStatusBadge({ status }: { status: string }) {
   const cls = CLAIM_STATUS_CLS[status] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
   return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
+    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {titleCase(status)}
     </span>
   );
@@ -223,13 +224,10 @@ export default function AutoflowRuns() {
           <h1 className="text-2xl font-semibold text-ink">Autoflows</h1>
           <p className="mt-1 text-sm text-ink-dim">Runs launched by the autoflow worker across this control plane.</p>
         </div>
-        <button
-          onClick={() => void refresh()}
-          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-border bg-panel text-ink hover:bg-slate-100"
-        >
+        <Button variant="secondary" onClick={() => void refresh()} className="gap-1.5">
           <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
           Refresh
-        </button>
+        </Button>
       </header>
 
       <div className="mb-5 inline-flex rounded-md border border-border bg-panel p-0.5 text-xs font-medium">
@@ -282,7 +280,7 @@ export default function AutoflowRuns() {
               ))}
             </ListCard>
             {sortedEvents.length > 0 && (
-              <div ref={eventsSentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+              <div ref={eventsSentinelRef} className="py-2 text-center text-note text-ink-mute">
                 {eventsLoading ? 'loading more…' : eventsHasMore ? 'scroll for more' : `— end of ${sortedEvents.length} —`}
               </div>
             )}
@@ -302,7 +300,7 @@ export default function AutoflowRuns() {
               ))}
             </ListCard>
             {sortedCycles.length > 0 && (
-              <div ref={cyclesSentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+              <div ref={cyclesSentinelRef} className="py-2 text-center text-note text-ink-mute">
                 {cyclesLoading ? 'loading more…' : cyclesHasMore ? 'scroll for more' : `— end of ${sortedCycles.length} —`}
               </div>
             )}
@@ -396,54 +394,51 @@ function AutoflowClaimItem({
           <ClaimStatusBadge status={claim.status} />
           <IssueChip displayRef={claim.workflow} />
           {requeued && (
-            <span className="text-[10px] font-medium text-green-700">requeued</span>
+            <span className="text-meta font-medium text-green-700">requeued</span>
           )}
         </div>
         {claim.issue_title && (
-          <div className="text-[11px] text-ink-dim mt-0.5 truncate">{claim.issue_title}</div>
+          <div className="text-note text-ink-dim mt-0.5 truncate">{claim.issue_title}</div>
         )}
-        <div className="text-[11px] text-ink-dim mt-0.5">
+        <div className="text-note text-ink-dim mt-0.5">
           {claim.repo_ref}
           {' · '}updated {relativeTime(claim.updated_at)}
           {claim.claim_owner && <> · {claim.claim_owner}</>}
         </div>
         {claim.last_error && (
-          <div className="text-[11px] text-red-600 mt-1">{claim.last_error}</div>
+          <div className="text-note text-red-600 mt-1">{claim.last_error}</div>
         )}
         {!claim.last_error && claim.last_summary && (
-          <div className="text-[11px] text-ink-dim mt-1">{claim.last_summary}</div>
+          <div className="text-note text-ink-dim mt-1">{claim.last_summary}</div>
         )}
         {claim.pr_url && (
           <a
             href={claim.pr_url}
             target="_blank"
             rel="noreferrer"
-            className="inline-block text-[11px] text-brand-600 hover:underline mt-1"
+            className="inline-block text-note text-brand-600 hover:underline mt-1"
           >
             View PR
           </a>
         )}
         {actionError && (
-          <div role="alert" className="text-[11px] text-red-600 mt-1">
+          <div role="alert" className="text-note text-red-600 mt-1">
             {actionError}
           </div>
         )}
       </div>
       <div className="flex items-center gap-2 shrink-0">
-        <button
-          onClick={() => void onRequeue()}
-          disabled={busy !== null}
-          className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-md border border-border bg-panel text-ink hover:bg-slate-100 disabled:opacity-50"
-        >
+        <Button variant="secondary" size="sm" onClick={() => void onRequeue()} disabled={busy !== null}>
           {busy === 'requeue' ? 'Requeuing…' : 'Requeue'}
-        </button>
-        <button
+        </Button>
+        <Button
+          variant="danger-outline"
+          size="sm"
           onClick={() => void onRelease()}
           disabled={busy !== null}
-          className="inline-flex items-center text-xs font-medium px-2.5 py-1 rounded-md border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-50"
         >
           {busy === 'release' ? 'Releasing…' : 'Release'}
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -473,7 +468,7 @@ function AutoflowEventItem({ event }: { event: AutoflowEventRow }) {
           <KindBadge kind={event.kind} />
           {event.issue_display_ref && <IssueChip displayRef={event.issue_display_ref} />}
         </div>
-        <div className="text-[11px] text-ink-dim mt-0.5 flex items-center flex-wrap">
+        <div className="text-note text-ink-dim mt-0.5 flex items-center flex-wrap">
           <span>
             {relativeTime(event.at)}
             {event.worker_name && <> · {event.worker_name}</>}
@@ -508,15 +503,15 @@ function AutoflowCycleItem({ cycle }: { cycle: AutoflowCycleRow }) {
           <span className="text-sm font-medium text-ink font-mono">{shortId(cycle.cycle_id)}</span>
           <ModeChip mode={cycle.mode} />
           {cycle.worker_name && (
-            <span className="text-[11px] text-ink-mute">{cycle.worker_name}</span>
+            <span className="text-note text-ink-mute">{cycle.worker_name}</span>
           )}
         </div>
-        <div className="text-[11px] text-ink-dim mt-0.5">
+        <div className="text-note text-ink-dim mt-0.5">
           started {relativeTime(cycle.started_at)}
           {' · '}
           {durationBetween(cycle.started_at, cycle.finished_at)}
         </div>
-        <div className={cn('text-[11px] mt-1', hasFailed ? 'text-red-600' : 'text-ink-dim')}>
+        <div className={cn('text-note mt-1', hasFailed ? 'text-red-600' : 'text-ink-dim')}>
           ran {cycle.ran_cycles}
           {' · '}
           skipped {cycle.skipped_cycles}
@@ -529,12 +524,12 @@ function AutoflowCycleItem({ cycle }: { cycle: AutoflowCycleRow }) {
         </div>
         {cycle.run_ids.length > 0 && (
           <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
-            <span className="text-[10px] text-ink-mute uppercase tracking-wide">runs:</span>
+            <span className="text-meta text-ink-mute uppercase tracking-wide">runs:</span>
             {cycle.run_ids.map((rid) => (
               <Link
                 key={rid}
                 to={`/runs/${encodeURIComponent(rid)}`}
-                className="text-[11px] font-mono text-brand-600 hover:underline"
+                className="text-note font-mono text-brand-600 hover:underline"
               >
                 {shortId(rid)}
               </Link>

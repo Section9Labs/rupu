@@ -115,22 +115,22 @@ export default function AgentDetailPage() {
         <div className="flex flex-wrap items-start gap-2">
           <h1 className="text-2xl font-semibold text-ink break-all">{agent.name}</h1>
           <div className="ml-auto flex items-center gap-2">
-            <button
-              type="button"
+            <Button
+              variant="danger-outline"
               onClick={remove}
               aria-label={`Delete ${agent.name}`}
-              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-red-700 hover:bg-red-50"
+              className="gap-1.5"
             >
               <Trash2 size={14} />
               Delete
-            </button>
+            </Button>
             <Button onClick={() => setRunOpen(true)} aria-label={`Run ${agent.name}`}>
               Run
             </Button>
           </div>
         </div>
         {deleteError && (
-          <p role="alert" className="mt-2 text-[12px] font-medium text-red-700">
+          <p role="alert" className="mt-2 text-ui font-medium text-red-700">
             {deleteError}
           </p>
         )}
@@ -151,15 +151,16 @@ export default function AgentDetailPage() {
         <div className="mb-2 flex items-center justify-between pl-1">
           <h2 className="text-sm font-semibold text-ink">Definition</h2>
           {!editing && (
-            <button
-              type="button"
+            <Button
+              variant="secondary"
+              size="sm"
               onClick={startEdit}
               aria-label="Edit definition"
-              className="inline-flex items-center gap-1.5 rounded-md border border-border bg-white px-2.5 py-1 text-[12px] font-medium text-ink-dim hover:bg-slate-50"
+              className="gap-1.5"
             >
               <Pencil size={13} />
               Edit
-            </button>
+            </Button>
           )}
         </div>
 
@@ -172,19 +173,14 @@ export default function AgentDetailPage() {
               ariaLabel="Agent definition"
             />
             {saveError && (
-              <p role="alert" className="text-[12px] font-medium text-red-700">
+              <p role="alert" className="text-ui font-medium text-red-700">
                 {saveError}
               </p>
             )}
             <div className="flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={cancelEdit}
-                disabled={saving}
-                className="inline-flex items-center rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-              >
+              <Button variant="secondary" onClick={cancelEdit} disabled={saving}>
                 Cancel
-              </button>
+              </Button>
               <Button onClick={save} disabled={saving || draft === agent.raw}>
                 {saving ? 'Saving…' : 'Save'}
               </Button>
@@ -211,7 +207,7 @@ function MetaChip({ children }: { children: React.ReactNode }) {
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200',
+        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200',
       )}
     >
       {children}

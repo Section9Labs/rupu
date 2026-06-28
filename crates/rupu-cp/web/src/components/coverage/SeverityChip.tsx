@@ -10,7 +10,7 @@ export default function SeverityChip({ severity }: { severity: string }) {
   const pill = style ? style.pill : FALLBACK;
   return (
     <span
-      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ${pill}`}
+      className={`inline-flex items-center rounded px-1.5 py-0.5 text-meta font-medium ring-1 ${pill}`}
     >
       {severity}
     </span>

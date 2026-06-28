@@ -66,24 +66,24 @@ export default function CoverageCatalogTab({ target, wsId }: { target: string; w
             header={
               <span className="flex items-center gap-2 flex-wrap">
                 <span className="text-sm font-medium text-ink">{c.name}</span>
-                <span className="text-[11px] font-mono text-ink-mute">{c.id}</span>
+                <span className="text-note font-mono text-ink-mute">{c.id}</span>
                 <SeverityChip severity={c.severity} />
-                <span className="text-[10px] text-ink-mute">{cat.sources[c.id] ?? 'inline'}</span>
+                <span className="text-meta text-ink-mute">{cat.sources[c.id] ?? 'inline'}</span>
               </span>
             }
           >
             {c.description && <p className="text-xs text-ink-dim leading-snug">{c.description}</p>}
-            <p className="mt-1 text-[11px] text-ink-mute font-mono break-all">
+            <p className="mt-1 text-note text-ink-mute font-mono break-all">
               globs: {c.applicable_globs.join(', ')}
             </p>
-            <p className="mt-1 text-[11px] text-ink-mute">min strength: {c.min_strength}</p>
+            <p className="mt-1 text-note text-ink-mute">min strength: {c.min_strength}</p>
             {c.tags.length > 0 && (
-              <p className="mt-1 text-[11px] text-ink-mute">tags: {c.tags.join(', ')}</p>
+              <p className="mt-1 text-note text-ink-mute">tags: {c.tags.join(', ')}</p>
             )}
             {c.references.length > 0 && (
               <ul className="mt-1 space-y-0.5">
                 {c.references.map((ref) => (
-                  <li key={ref} className="text-[11px] text-ink-mute break-all">
+                  <li key={ref} className="text-note text-ink-mute break-all">
                     {ref}
                   </li>
                 ))}

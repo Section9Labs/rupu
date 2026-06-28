@@ -86,7 +86,7 @@ export default function SortableTable<T>({
     <div className="bg-panel border border-border rounded-xl shadow-card overflow-hidden">
       <table className="w-full text-sm">
         <thead>
-          <tr className="border-b border-border text-[10px] uppercase tracking-wide text-ink-mute">
+          <tr className="border-b border-border text-meta uppercase tracking-wide text-ink-mute">
             {columns.map((col) => {
               const active = sort?.key === col.key;
               const dir = active ? sort?.dir : undefined;

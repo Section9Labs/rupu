@@ -65,7 +65,7 @@ interface TileProps {
 function Tile({ label, value, valueClass, interactive, active, onClick }: TileProps) {
   const body = (
     <>
-      <div className="text-[11px] uppercase tracking-wide text-ink-mute font-medium">{label}</div>
+      <div className="text-note uppercase tracking-wide text-ink-mute font-medium">{label}</div>
       <div className={cn('text-2xl font-semibold mt-0.5 tabular-nums', valueClass)}>{value}</div>
     </>
   );

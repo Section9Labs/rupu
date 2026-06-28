@@ -19,7 +19,7 @@ export default function UsageChip({
     ? 'Partial — some models have no price configured'
     : undefined;
   return (
-    <span className={`inline-flex items-center gap-1.5 text-[11px] text-ink-mute tabular-nums ${className}`}>
+    <span className={`inline-flex items-center gap-1.5 text-note text-ink-mute tabular-nums ${className}`}>
       <span>{formatTokens(usage.total_tokens)} tok</span>
       <span className="text-border">·</span>
       <span title={costTitle} className={partial ? 'text-amber-600' : undefined}>

@@ -96,7 +96,7 @@ const COLUMNS: Column<WorkerView>[] = [
     render: (w) => (
       <div className="min-w-0">
         <div className="text-sm font-medium text-ink truncate">{w.name}</div>
-        <div className="text-[11px] text-ink-mute font-mono truncate">{shortId(w.worker_id)}</div>
+        <div className="text-note text-ink-mute font-mono truncate">{shortId(w.worker_id)}</div>
       </div>
     ),
   },
@@ -112,7 +112,7 @@ const COLUMNS: Column<WorkerView>[] = [
   {
     key: 'host',
     header: 'Host',
-    render: (w) => <span className="text-[11px] text-ink-mute font-mono">{w.host}</span>,
+    render: (w) => <span className="text-note text-ink-mute font-mono">{w.host}</span>,
   },
   {
     key: 'active',
@@ -153,7 +153,7 @@ const COLUMNS: Column<WorkerView>[] = [
     },
     render: (w) =>
       w.last_run_at ? (
-        <span className="text-[12px] text-ink-dim">{relativeTime(w.last_run_at)}</span>
+        <span className="text-ui text-ink-dim">{relativeTime(w.last_run_at)}</span>
       ) : (
         <span className="text-ink-mute">—</span>
       ),
@@ -170,7 +170,7 @@ const COLUMNS: Column<WorkerView>[] = [
       const stale = isStale(w.last_seen_at);
       return (
         <div className="flex items-center gap-2">
-          <span className={cn('text-[12px]', stale ? 'text-amber-700' : 'text-ink-dim')}>
+          <span className={cn('text-ui', stale ? 'text-amber-700' : 'text-ink-dim')}>
             {relativeTime(w.last_seen_at)}
           </span>
           {stale && <Chip className="bg-amber-50 text-amber-800 ring-amber-200">stale</Chip>}
@@ -188,7 +188,7 @@ const COLUMNS: Column<WorkerView>[] = [
     header: 'Version',
     align: 'right',
     width: 'w-16',
-    render: (w) => <span className="text-[11px] text-ink-mute tabular-nums">v{w.version}</span>,
+    render: (w) => <span className="text-note text-ink-mute tabular-nums">v{w.version}</span>,
   },
 ];
 
@@ -198,7 +198,7 @@ function Capabilities({ worker }: { worker: WorkerView }) {
   const scmHosts = caps.scm_hosts ?? [];
   const modes = caps.permission_modes ?? [];
   if (backends.length === 0 && scmHosts.length === 0 && modes.length === 0) {
-    return <span className="text-[11px] text-ink-mute">—</span>;
+    return <span className="text-note text-ink-mute">—</span>;
   }
   return (
     <div className="flex flex-wrap items-center gap-1.5">
@@ -225,7 +225,7 @@ function Chip({ children, className }: { children: React.ReactNode; className?: 
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1',
+        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1',
         className,
       )}
     >
@@ -243,7 +243,7 @@ function Explainer() {
         per-machine, <span className="font-medium text-ink">not per-run</span>: launching work in
         the background refreshes an existing worker rather than spawning a new one here.
       </p>
-      <ul className="mt-2 flex flex-col gap-1 text-[13px]">
+      <ul className="mt-2 flex flex-col gap-1 text-lead">
         <li>
           <Chip className="mr-1.5 bg-slate-100 text-ink-mute ring-slate-200">cli</Chip>
           your machine&apos;s rupu CLI.

@@ -113,7 +113,7 @@ export default function Coverage() {
               </section>
             ))}
           {all.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
               scroll for more
             </div>
           )}
@@ -179,7 +179,7 @@ function TargetRow({
               style={{ width: `${barPct.toFixed(1)}%` }}
             />
           </div>
-          <span className="text-[11px] text-ink-mute tabular-nums whitespace-nowrap">
+          <span className="text-note text-ink-mute tabular-nums whitespace-nowrap">
             {target.assertion_lines} assertion{target.assertion_lines !== 1 ? 's' : ''}
           </span>
         </div>
@@ -198,7 +198,7 @@ function CatalogBadge({ present }: { present: boolean }) {
   return (
     <span
       className={cn(
-        'inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium ring-1',
+        'inline-flex items-center gap-1 rounded px-2 py-0.5 text-note font-medium ring-1',
         present
           ? 'bg-green-50 text-green-700 ring-green-200'
           : 'bg-slate-100 text-ink-mute ring-slate-200',
@@ -214,7 +214,7 @@ function FindingsBadge({ count, hasFindings }: { count: number; hasFindings: boo
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium tabular-nums ring-1',
+        'inline-flex items-center rounded px-2 py-0.5 text-note font-medium tabular-nums ring-1',
         hasFindings
           ? 'bg-red-50 text-sev-high ring-red-200'
           : 'bg-slate-100 text-ink-mute ring-slate-200',

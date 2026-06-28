@@ -32,7 +32,7 @@ function ScopeChip({ scope }: { scope?: string }) {
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded ring-1 text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5',
+        'inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5',
         cls,
       )}
     >
@@ -52,7 +52,7 @@ function TriggerChip({ trigger }: { trigger: string }) {
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded ring-1 text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5',
+        'inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5',
         cls,
       )}
     >
@@ -63,7 +63,7 @@ function TriggerChip({ trigger }: { trigger: string }) {
 
 function MetaChip({ children }: { children: React.ReactNode }) {
   return (
-    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200">
+    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200">
       {children}
     </span>
   );
@@ -123,7 +123,7 @@ export default function ProjectDefinitions() {
       <header className="px-8 pt-8 pb-3">
         <Link
           to={`/projects/${encodedId}`}
-          className="text-[11px] font-medium text-brand-600 hover:text-brand-700"
+          className="text-note font-medium text-brand-600 hover:text-brand-700"
         >
           ← Back to project
         </Link>
@@ -193,7 +193,7 @@ function AgentsTab({ agents }: { agents: AgentSummary[] | null }) {
                 {a.model && <MetaChip>{a.model}</MetaChip>}
               </div>
               {a.description && (
-                <p className="mt-1 text-[12px] text-ink-dim leading-snug line-clamp-2">
+                <p className="mt-1 text-ui text-ink-dim leading-snug line-clamp-2">
                   {a.description}
                 </p>
               )}

@@ -79,10 +79,10 @@ function TemplateRow({ t }: { t: TemplateSummary }) {
       <button onClick={toggle} className="w-full text-left">
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-sm font-medium text-ink">{t.name}</span>
-          <span className="text-[10px] text-ink-mute">v{t.version}</span>
-          <span className="text-[11px] text-ink-mute tabular-nums">{t.concern_count} concerns</span>
+          <span className="text-meta text-ink-mute">v{t.version}</span>
+          <span className="text-note text-ink-mute tabular-nums">{t.concern_count} concerns</span>
           {Object.entries(t.severity_breakdown).map(([sev, n]) => (
-            <span key={sev} className="text-[10px] text-ink-mute">
+            <span key={sev} className="text-meta text-ink-mute">
               {sev}:{n}
             </span>
           ))}
@@ -94,8 +94,8 @@ function TemplateRow({ t }: { t: TemplateSummary }) {
           {detail.concerns.map((c) => (
             <li key={c.id} className="text-xs">
               <span className="font-medium text-ink">{c.name}</span>
-              <span className="ml-2 font-mono text-[10px] text-ink-mute">{c.id}</span>
-              <span className="ml-2 text-[10px] text-ink-mute">{c.severity}</span>
+              <span className="ml-2 font-mono text-meta text-ink-mute">{c.id}</span>
+              <span className="ml-2 text-meta text-ink-mute">{c.severity}</span>
             </li>
           ))}
         </ul>

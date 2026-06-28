@@ -10,6 +10,7 @@ import { MessageSquare, RefreshCw } from 'lucide-react';
 import { api, type SessionSummary } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
+import { Button } from '../components/ui/Button';
 import { cn } from '../lib/cn';
 import { durationBetween } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -87,13 +88,10 @@ export default function Sessions() {
             history.
           </p>
         </div>
-        <button
-          onClick={() => void refresh()}
-          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-border bg-panel text-ink hover:bg-slate-100"
-        >
+        <Button variant="secondary" onClick={() => void refresh()} className="gap-1.5">
           <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
           Refresh
-        </button>
+        </Button>
       </header>
 
       {/* Scope tabs */}
@@ -145,7 +143,7 @@ export default function Sessions() {
             rowKey={(s) => s.session_id}
           />
           {tab !== 'active' && hasMore && (
-            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
               {loading ? 'loading more…' : 'scroll for more'}
             </div>
           )}
@@ -172,7 +170,7 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
     render: (s) => (
       <span className="flex items-center gap-1.5">
         <span className={cn('inline-block w-2 h-2 rounded-full', sessionStatusDot(s.status))} />
-        <span className="text-[11px] text-ink-dim">{sessionStatusLabel(s.status)}</span>
+        <span className="text-note text-ink-dim">{sessionStatusLabel(s.status)}</span>
       </span>
     ),
   },
@@ -189,7 +187,7 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
     render: (s) => (
       <Link
         to={`/sessions/${encodeURIComponent(s.session_id)}`}
-        className="text-[11px] text-ink-mute font-mono hover:underline"
+        className="text-note text-ink-mute font-mono hover:underline"
       >
         {shortId(s.session_id)}
       </Link>
@@ -200,7 +198,7 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
     header: 'Model',
     sortable: true,
     sortValue: (s) => s.model,
-    render: (s) => <span className="text-[11px] text-ink-mute font-mono">{s.model}</span>,
+    render: (s) => <span className="text-note text-ink-mute font-mono">{s.model}</span>,
   },
   {
     key: 'in',
@@ -278,7 +276,7 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
       s.active_run_id ? (
         <Link
           to={`/runs/${encodeURIComponent(s.active_run_id)}`}
-          className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
+          className="inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
         >
           active run
         </Link>

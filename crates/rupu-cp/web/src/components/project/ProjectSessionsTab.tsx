@@ -97,7 +97,7 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
     <div className="space-y-4">
       {/* Scope filter chips */}
       <div className="flex items-center gap-2">
-        <span className="text-[10px] font-semibold uppercase tracking-widest text-ink-mute w-14">
+        <span className="text-meta font-semibold uppercase tracking-widest text-ink-mute w-14">
           Scope
         </span>
         {SCOPE_FILTERS.map((f) => (
@@ -170,15 +170,15 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
                             sessionStatusDot(s.status),
                           )}
                         />
-                        <span className="text-[11px] text-ink-dim">
+                        <span className="text-note text-ink-dim">
                           {sessionStatusLabel(s.status)}
                         </span>
                       </span>
                       <span className="text-sm font-medium text-ink truncate">{s.agent_name}</span>
-                      <span className="text-[11px] text-ink-mute font-mono">
+                      <span className="text-note text-ink-mute font-mono">
                         {shortId(s.session_id)}
                       </span>
-                      <span className="text-[11px] text-ink-mute font-mono">{s.model}</span>
+                      <span className="text-note text-ink-mute font-mono">{s.model}</span>
                     </>
                   }
                   trailing={
@@ -190,7 +190,7 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
                           e.stopPropagation();
                           navigate(`/runs/${encodeURIComponent(s.active_run_id ?? '')}`);
                         }}
-                        className="shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
+                        className="shrink-0 inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
                       >
                         active run
                       </button>
@@ -215,7 +215,7 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
       )}
 
       {sessions !== null && filtered.length > 0 && (
-        <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+        <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
           {loading
             ? 'loading more…'
             : hasMore

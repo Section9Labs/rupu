@@ -141,10 +141,10 @@ export default function TranscriptPanel({
   // ---- ready ---------------------------------------------------------------
 
   return (
-    <div className="flex flex-col rounded-xl border border-border bg-bg p-3 text-[11px]">
+    <div className="flex flex-col rounded-xl border border-border bg-bg p-3 text-note">
       {/* Header: agent · provider · model · live · status / tokens */}
       {!embedded && view.header && (
-        <div className="mb-2 flex flex-wrap items-center gap-2 border-b border-border pb-1.5 text-[11px] text-ink-dim">
+        <div className="mb-2 flex flex-wrap items-center gap-2 border-b border-border pb-1.5 text-note text-ink-dim">
           <b className="text-ink">{view.header.agent || 'agent'}</b>
           {view.header.provider && <span>· {view.header.provider}</span>}
           {view.header.model && <span>· {view.header.model}</span>}
@@ -190,7 +190,7 @@ export default function TranscriptPanel({
 
       {/* Footer: status · total tokens · duration */}
       {!embedded && view.footer && (
-        <div className="mt-2 flex flex-wrap gap-3 border-t border-border pt-1.5 text-[10px] text-ink-dim">
+        <div className="mt-2 flex flex-wrap gap-3 border-t border-border pt-1.5 text-meta text-ink-dim">
           {view.footer.status && <span>{statusGlyph(view.footer.status)} {view.footer.status}</span>}
           {view.footer.totalTokens != null && (
             <span className="tabular-nums">{view.footer.totalTokens.toLocaleString()} tokens</span>

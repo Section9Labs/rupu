@@ -9,6 +9,7 @@ import type { AgentSummary } from '../../lib/api';
 import type { GraphNode, PanelCfg, PanelGate, StepKind, StepNodeData, SubStep } from '../../lib/workflowGraph';
 import type { ExprContext } from '../../lib/workflowExpressions';
 import ExpressionField from './ExpressionField';
+import { Button } from '../ui/Button';
 
 /** Context for expression fields, minus the per-field gates StepForm derives. */
 type StepExprContext = Omit<ExprContext, 'isForEachPrompt' | 'isPanelField'>;
@@ -35,9 +36,9 @@ function fieldCtx(
 }
 
 const fieldCls =
-  'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
-const labelCls = 'mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim';
-const checkLabelCls = 'flex items-center gap-2 text-[13px] text-ink';
+  'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
+const labelCls = 'mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim';
+const checkLabelCls = 'flex items-center gap-2 text-lead text-ink';
 
 /** Parse a numeric input value: empty → undefined (never NaN / 0). */
 function parseNum(v: string): number | undefined {
@@ -86,7 +87,7 @@ export default function StepForm({ node, agents, onChange, problems, exprContext
   return (
     <div className="space-y-4">
       {problems.length > 0 && (
-        <div role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">
+        <div role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-ui text-red-700">
           <ul className="list-disc space-y-0.5 pl-4">
             {problems.map((p, i) => (
               <li key={i}>{p}</li>
@@ -121,7 +122,7 @@ export default function StepForm({ node, agents, onChange, problems, exprContext
             </option>
           ))}
         </select>
-        <span className="mt-1 block text-[11px] text-ink-mute">
+        <span className="mt-1 block text-note text-ink-mute">
           Switching kind clears the previous kind's specific fields.
         </span>
       </label>
@@ -303,14 +304,14 @@ function ParallelFields({
                 placeholder="id"
                 className={`${fieldCls} font-mono`}
               />
-              <button
-                type="button"
+              <Button
+                variant="danger-outline"
                 onClick={() => removeSub(i)}
                 aria-label={`Remove sub-step ${i + 1}`}
-                className="shrink-0 rounded-md border border-border bg-white px-2.5 py-1.5 text-[12px] font-medium text-red-700 hover:bg-red-50"
+                className="shrink-0 px-2.5"
               >
                 Remove
-              </button>
+              </Button>
             </div>
             <AgentSelect
               value={s.agent || undefined}
@@ -333,7 +334,7 @@ function ParallelFields({
       <button
         type="button"
         onClick={addSub}
-        className="text-[12px] font-medium text-brand-600 hover:text-brand-700"
+        className="text-ui font-medium text-brand-600 hover:text-brand-700"
       >
         Add sub-step
       </button>
@@ -378,7 +379,7 @@ function PanelFields({
         <span className={labelCls}>Panelists</span>
         <div className="space-y-1.5 rounded-md border border-border bg-slate-50 p-2.5">
           {panelistNames.length === 0 ? (
-            <p className="text-[12px] text-ink-mute">No agents available.</p>
+            <p className="text-ui text-ink-mute">No agents available.</p>
           ) : (
             panelistNames.map((name) => (
               <label key={name} className={checkLabelCls}>

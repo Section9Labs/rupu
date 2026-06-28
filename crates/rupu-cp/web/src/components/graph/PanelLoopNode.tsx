@@ -39,13 +39,13 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
-      <div className="flex items-center justify-between gap-2 text-[10px] font-bold uppercase tracking-wide text-brand-500">
+      <div className="flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide text-brand-500">
         <span className="truncate">
           panel · {node.id}
           {round && <span className="ml-1 tabular-nums">· round {round.current}/{round.max}</span>}
         </span>
         {running && (
-          <span className="rg-loop-spin text-[12px] leading-none text-[#f59e0b]" aria-label="looping">
+          <span className="rg-loop-spin text-ui leading-none text-[#f59e0b]" aria-label="looping">
             ↻
           </span>
         )}
@@ -63,7 +63,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
         >
           {s.glyph}
         </span>
-        <span className="text-[10px] font-medium text-[#92400e]">
+        <span className="text-meta font-medium text-[#92400e]">
           {gate ? (
             <>
               gate ≥ {gate.until_severity} · max {gate.max_iterations}
@@ -83,7 +83,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
               type="button"
               title={`${u.key} · ${STATE_STYLE[u.state].label}`}
               onClick={() => onOpenUnit?.(node.id, u.index)}
-              className="inline-flex items-center gap-1 rounded bg-white/80 px-1.5 py-px text-[10px] text-slate-600 ring-1 ring-brand-100 transition-colors hover:bg-white hover:text-brand-700"
+              className="inline-flex items-center gap-1 rounded bg-white/80 px-1.5 py-px text-meta text-slate-600 ring-1 ring-brand-100 transition-colors hover:bg-white hover:text-brand-700"
             >
               <span
                 className="inline-block h-2 w-2 shrink-0 rounded-[2px]"
@@ -97,11 +97,11 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
       )}
 
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded bg-white/70 px-1.5 py-px text-[10px] text-brand-700 ring-1 ring-brand-100">
+        <span className="rounded bg-white/70 px-1.5 py-px text-meta text-brand-700 ring-1 ring-brand-100">
           {s.label}
         </span>
         {node.agent && (
-          <span className="truncate rounded bg-white/70 px-1.5 py-px text-[10px] text-slate-500">
+          <span className="truncate rounded bg-white/70 px-1.5 py-px text-meta text-slate-500">
             {node.agent}
           </span>
         )}
