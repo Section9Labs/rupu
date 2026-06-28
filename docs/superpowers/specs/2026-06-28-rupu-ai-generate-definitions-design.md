@@ -51,13 +51,20 @@ And in both cases the user keeps control over **scope** (global vs project) and
 - Generating anything other than agent and workflow definition files.
 - A bespoke prompt-engineering UI (temperature, system-prompt tweaking, etc.).
 
-## 3. The generation core (`rupu_runtime::generate`)
+## 3. The generation core (`rupu_orchestrator::generate`)
 
-Lives in `rupu-runtime` because that crate already owns `provider_factory`
-(`build_for_provider`) and depends on `rupu-providers` / `rupu-auth`. Keeping the
-core here means `rupu-cp` does **not** grow a provider/credential dependency — it
-reaches generation through an adapter port (§5), consistent with the existing
-`RunLauncher` / `SessionStarter` pattern.
+Lives in `rupu-orchestrator`. It needs three things together: `build_for_provider`
+(from `rupu-runtime`), `AgentSpec::parse` (from `rupu-agent`), and `Workflow::parse`
+(native to `rupu-orchestrator`). Orchestrator already depends on runtime and agent,
+so it is the only existing crate that can see all three. `rupu-runtime` itself
+**cannot** host the core: validating a workflow needs `Workflow::parse`, and
+`rupu-orchestrator → rupu-runtime` is already an edge, so `rupu-runtime → rupu-orchestrator`
+would be a dependency cycle.
+
+Both `rupu-cli` and `rupu-cp` already depend on `rupu-orchestrator`, so both
+surfaces reach the core. `rupu-cp` still does **not** grow a direct
+provider/credential dependency — it calls the core through an adapter port (§5),
+consistent with the existing `RunLauncher` / `SessionStarter` pattern.
 
 ### 3.1 Public API
 
@@ -136,10 +143,13 @@ returned file is parseable.
 ### 3.3 Default-model preference order
 
 `pick_default_gen_model` checks, in order, `anthropic` → `openai` → `gemini` →
-`copilot`, via `resolver.peek(pid, ApiKey)` (and the SSO peek where relevant). The
-first authed provider wins, paired with a strong pinned model constant per
-provider (e.g. anthropic → `claude-opus-4-8`). The pinned models live in one table
-so they are easy to bump.
+`copilot`. Availability is tested at the trait level via
+`resolver.get(name, None).await.is_ok()` (the concrete `peek` lives on
+`KeychainResolver`, not the `CredentialResolver` trait the core takes). The first
+authed provider wins, paired with its model from a one-line const table seeded
+with each provider's own `default_model()` value — `anthropic` →
+`claude-sonnet-4-6`, `openai` → `gpt-5.4`, `gemini` → `gemini-2.5-pro`, `copilot`
+→ `claude-sonnet-4-6` — kept in one place so it is easy to bump.
 
 ## 4. CLI surface
 
@@ -169,7 +179,7 @@ Behavior with `--describe`:
 
 Without `--describe` the commands behave exactly as today (static template). The
 CLI stays thin: it does arg-parsing, scope/name/host resolution, and delegates the
-model call to `rupu_runtime::generate`.
+model call to `rupu_orchestrator::generate`.
 
 ### 4.1 Test seam
 
@@ -202,7 +212,7 @@ read-only `rupu-cp`), the generate endpoints return **501 Not Available**, exact
 like `start_session` does today.
 
 The concrete impl is wired in `crates/rupu-cli/src/cmd/cp.rs` (the full runtime),
-calling `rupu_runtime::generate::generate_definition` with the real
+calling `rupu_orchestrator::generate::generate_definition` with the real
 `CredentialResolver`, and `pick_default_gen_model` + the model registry for
 `available_models`.
 
@@ -269,7 +279,7 @@ behind; on CP, generate never writes, so there is nothing to clean up.
 
 ## 9. Testing
 
-- **Core (`rupu-runtime`)**, with a `MockProvider`:
+- **Core (`rupu-orchestrator`)**, with a `MockProvider`:
   - valid first-try output → `attempts == 1`, content passed through;
   - invalid-then-valid → repair loop runs, `attempts == 2`, valid content;
   - always-invalid → `GenerateError::Invalid` after `MAX_ATTEMPTS`;
@@ -293,7 +303,7 @@ embedded UI is current.
 
 ## 11. Implementation slices (for the plan)
 
-1. **Core** — `rupu_runtime::generate` (API, prompt builder, repair loop,
+1. **Core** — `rupu_orchestrator::generate` (API, prompt builder, repair loop,
    default-model picker) + unit tests. No surface yet.
 2. **CLI** — `--describe` on `agent create` / `workflow create`, gen-model flags,
    host flag (local-only), test seam + tests.
