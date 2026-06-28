@@ -1,5 +1,7 @@
 // Filter/control bar shared by the coverage concern tabs: severity dropdown,
 // optional file text-filter, and expand/collapse-all.
+import { Button } from '../ui/Button';
+
 const SEVERITIES = ['all', 'critical', 'high', 'medium', 'low', 'info'];
 
 export default function ConcernControls({
@@ -21,7 +23,7 @@ export default function ConcernControls({
 }) {
   return (
     <div className="mb-3 flex flex-wrap items-center gap-2">
-      <span className="text-[11px] text-ink-mute tabular-nums">{total} concerns</span>
+      <span className="text-note text-ink-mute tabular-nums">{total} concerns</span>
       <select
         value={severity}
         onChange={(e) => onSeverity(e.target.value)}
@@ -42,18 +44,12 @@ export default function ConcernControls({
         />
       )}
       <div className="ml-auto flex gap-1">
-        <button
-          onClick={onExpandAll}
-          className="rounded-md border border-border px-2 py-1 text-xs text-ink-dim hover:bg-slate-100"
-        >
+        <Button variant="secondary" size="sm" onClick={onExpandAll} className="px-2 text-xs">
           expand all
-        </button>
-        <button
-          onClick={onCollapseAll}
-          className="rounded-md border border-border px-2 py-1 text-xs text-ink-dim hover:bg-slate-100"
-        >
+        </Button>
+        <Button variant="secondary" size="sm" onClick={onCollapseAll} className="px-2 text-xs">
           collapse all
-        </button>
+        </Button>
       </div>
     </div>
   );

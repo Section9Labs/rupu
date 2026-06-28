@@ -43,7 +43,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
             {this.state.componentStack && (
               <details className="mt-3">
                 <summary className="text-xs text-ink-dim cursor-pointer">component stack</summary>
-                <pre className="text-[11px] bg-slate-50 border border-border rounded-md p-3 overflow-auto max-h-48 mt-2 text-slate-800 font-mono whitespace-pre-wrap">
+                <pre className="text-note bg-slate-50 border border-border rounded-md p-3 overflow-auto max-h-48 mt-2 text-slate-800 font-mono whitespace-pre-wrap">
 {this.state.componentStack}
                 </pre>
               </details>
@@ -53,13 +53,13 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
                 <RefreshCcw size={13} />
                 Reload page
               </Button>
-              <button
-                type="button"
+              <Button
+                variant="secondary"
                 onClick={() => this.setState({ error: null, componentStack: null })}
-                className="text-sm px-3 py-1.5 border border-border rounded-md text-ink-dim hover:bg-slate-50"
+                className="text-sm"
               >
                 Dismiss
-              </button>
+              </Button>
             </div>
           </div>
         </div>

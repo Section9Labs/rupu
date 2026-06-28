@@ -104,7 +104,7 @@ function Picker({
 }) {
   return (
     <label className="flex flex-col gap-1">
-      <span className="text-[11px] text-ink-mute">{label}</span>
+      <span className="text-note text-ink-mute">{label}</span>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -215,7 +215,7 @@ function FileSection({ title, files }: { title: string; files: string[] }) {
       <SectionHeader tone="muted" label={title} count={files.length} />
       <ListCard>
         {files.map((f) => (
-          <div key={f} className="px-4 py-2 text-[11px] font-mono text-ink-mute break-all">
+          <div key={f} className="px-4 py-2 text-note font-mono text-ink-mute break-all">
             {f}
           </div>
         ))}

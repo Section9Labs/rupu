@@ -171,7 +171,7 @@ export default function SessionDetailPage() {
           <h1 className="font-mono text-base font-semibold text-ink break-all">
             {session.session_id}
           </h1>
-          <span className="text-[12px] text-ink-dim">
+          <span className="text-ui text-ink-dim">
             <span className="font-mono">{session.agent_name}</span>
             <span className="mx-1 text-border">·</span>
             <span className="font-mono">{session.model}</span>
@@ -180,7 +180,7 @@ export default function SessionDetailPage() {
             <span
               className={cn('inline-block h-2 w-2 rounded-full', sessionStatusDot(session.status))}
             />
-            <span className="text-[12px] text-ink-dim">{sessionStatusLabel(session.status)}</span>
+            <span className="text-ui text-ink-dim">{sessionStatusLabel(session.status)}</span>
           </span>
           {/* "working…" pill — visible while a turn is in flight. */}
           {active && (
@@ -196,7 +196,7 @@ export default function SessionDetailPage() {
         {!active && (session.status === 'failed' || session.last_error) && (
           <div
             role="alert"
-            className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700"
+            className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-ui text-red-700"
           >
             {session.last_error ?? 'Session failed.'}
           </div>
@@ -204,7 +204,7 @@ export default function SessionDetailPage() {
 
         {/* Secondary: collapsed details (usage chart + identity fields). */}
         <details className="mt-2 group">
-          <summary className="cursor-pointer list-none text-[12px] font-medium text-ink-dim hover:text-ink">
+          <summary className="cursor-pointer list-none text-ui font-medium text-ink-dim hover:text-ink">
             <span className="group-open:hidden">▸ Session details</span>
             <span className="hidden group-open:inline">▾ Session details</span>
           </summary>
@@ -232,12 +232,12 @@ export default function SessionDetailPage() {
                 value={`${absoluteTime(session.updated_at)} (${relativeTime(session.updated_at)})`}
               />
               <div className="flex items-baseline gap-4 px-4 py-3">
-                <dt className="w-32 shrink-0 text-[12px] font-medium text-ink-mute">Active run</dt>
+                <dt className="w-32 shrink-0 text-ui font-medium text-ink-mute">Active run</dt>
                 <dd className="min-w-0 flex-1 text-sm text-ink">
                   {session.active_run_id ? (
                     <Link
                       to={`/runs/${encodeURIComponent(session.active_run_id)}`}
-                      className="inline-flex items-center rounded bg-blue-50 px-2 py-0.5 font-mono text-[12px] font-medium text-blue-700 ring-1 ring-blue-200 hover:bg-blue-100"
+                      className="inline-flex items-center rounded bg-blue-50 px-2 py-0.5 font-mono text-ui font-medium text-blue-700 ring-1 ring-blue-200 hover:bg-blue-100"
                     >
                       {session.active_run_id}
                     </Link>
@@ -257,7 +257,7 @@ export default function SessionDetailPage() {
       {/* Composer — pinned at the bottom. */}
       <div className="shrink-0 border-t border-border bg-panel px-6 py-3">
         {runsError && (
-          <div className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800">
+          <div className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-ui text-amber-800">
             {runsError}
           </div>
         )}
@@ -294,7 +294,7 @@ export default function SessionDetailPage() {
           )}
 
           <div className="mt-2 flex items-center justify-between gap-3">
-            <div className="text-[12px] text-ink-dim">
+            <div className="text-ui text-ink-dim">
               {stopped ? (
                 <span>Session is stopped — sending is disabled.</span>
               ) : sendOk ? (
@@ -324,7 +324,7 @@ export default function SessionDetailPage() {
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
     <div className="flex items-baseline gap-4 px-4 py-3">
-      <dt className="w-32 shrink-0 text-[12px] font-medium text-ink-mute">{label}</dt>
+      <dt className="w-32 shrink-0 text-ui font-medium text-ink-mute">{label}</dt>
       <dd className={cn('min-w-0 flex-1 text-sm text-ink break-all', mono && 'font-mono')}>
         {value}
       </dd>

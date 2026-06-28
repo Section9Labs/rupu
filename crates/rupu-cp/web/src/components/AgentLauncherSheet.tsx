@@ -78,7 +78,7 @@ export default function AgentLauncherSheet({
   }
 
   const fieldCls =
-    'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
+    'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 
   const submitLabel = launchKind === 'session'
     ? (launching ? 'Starting…' : 'Start session')
@@ -116,7 +116,7 @@ export default function AgentLauncherSheet({
                 disabled={launching}
                 aria-pressed={launchKind === 'run'}
                 className={
-                  'rounded-none px-2 py-1 text-[12px] font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
+                  'rounded-none px-2 py-1 text-ui font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
                   (launchKind === 'run'
                     ? 'bg-brand-600 text-white'
                     : 'bg-white text-ink-dim hover:bg-slate-50')
@@ -133,7 +133,7 @@ export default function AgentLauncherSheet({
                 disabled={launching}
                 aria-pressed={launchKind === 'session'}
                 className={
-                  'rounded-none border-l border-border px-2 py-1 text-[12px] font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
+                  'rounded-none border-l border-border px-2 py-1 text-ui font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
                   (launchKind === 'session'
                     ? 'bg-brand-600 text-white'
                     : 'bg-white text-ink-dim hover:bg-slate-50')
@@ -143,7 +143,7 @@ export default function AgentLauncherSheet({
               </button>
             </div>
             {launchKind === 'session' && (
-              <p className="mt-1 text-[12px] text-ink-mute">
+              <p className="mt-1 text-ui text-ink-mute">
                 Opens a multi-turn chat you can keep messaging.
               </p>
             )}
@@ -151,7 +151,7 @@ export default function AgentLauncherSheet({
 
           {/* ── Prompt ─────────────────────────────────────────────── */}
           <label className="block">
-            <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">
+            <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">
               Prompt
             </span>
             <textarea
@@ -167,7 +167,7 @@ export default function AgentLauncherSheet({
 
           {/* ── Mode ───────────────────────────────────────────────── */}
           <label className="block">
-            <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">
+            <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">
               Mode
             </span>
             <select
@@ -185,26 +185,21 @@ export default function AgentLauncherSheet({
 
           {/* ── Target ─────────────────────────────────────────────── */}
           <div>
-            <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">Target</span>
+            <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">Target</span>
             <TargetPicker value={target} onChange={setTarget} disabled={launching} />
           </div>
 
           {error && (
-            <p role="alert" className="text-[12px] font-medium text-red-700">
+            <p role="alert" className="text-ui font-medium text-red-700">
               {error}
             </p>
           )}
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={launching}
-            className="inline-flex items-center rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-          >
+          <Button variant="secondary" onClick={onClose} disabled={launching}>
             Cancel
-          </button>
+          </Button>
           <Button onClick={onLaunch} disabled={launching}>
             {submitLabel}
           </Button>

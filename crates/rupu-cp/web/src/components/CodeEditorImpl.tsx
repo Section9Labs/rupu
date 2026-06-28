@@ -52,7 +52,7 @@ import type { CodeEditorProps } from './CodeEditor';
 // `font-mono` so the editor matches the read-only display (CodeHighlight), whose
 // <pre> is font-mono — `.cm-scroller` inherits this family below.
 const CONTAINER_CLASS =
-  'overflow-hidden rounded-xl border border-border bg-panel font-mono text-[12px] ' +
+  'overflow-hidden rounded-xl border border-border bg-panel font-mono text-ui ' +
   'leading-relaxed shadow-card focus-within:border-brand-500';
 
 function languageExtension(language: 'markdown' | 'yaml'): Extension {

@@ -48,13 +48,13 @@ function StepBody({ d }: { d: StepNodeData }) {
   return (
     <>
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className={`rounded px-1.5 py-px text-[10px] font-medium ${KIND_CHIP[d.kind]}`}>{d.kind}</span>
-        <span className="truncate rounded bg-slate-100 px-1.5 py-px text-[10px] text-slate-500">
+        <span className={`rounded px-1.5 py-px text-meta font-medium ${KIND_CHIP[d.kind]}`}>{d.kind}</span>
+        <span className="truncate rounded bg-slate-100 px-1.5 py-px text-meta text-slate-500">
           {d.agent ?? '(no agent)'}
         </span>
       </div>
       {d.kind === 'for_each' && (
-        <div className="mt-1 truncate text-[10px] text-ink-mute">for_each: {d.for_each ?? ''}</div>
+        <div className="mt-1 truncate text-meta text-ink-mute">for_each: {d.for_each ?? ''}</div>
       )}
     </>
   );
@@ -66,8 +66,8 @@ function ParallelBody({ d }: { d: StepNodeData }) {
   return (
     <>
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className={`rounded px-1.5 py-px text-[10px] font-medium ${KIND_CHIP.parallel}`}>parallel</span>
-        <span className="text-[10px] text-ink-mute tabular-nums">· {subs.length}</span>
+        <span className={`rounded px-1.5 py-px text-meta font-medium ${KIND_CHIP.parallel}`}>parallel</span>
+        <span className="text-meta text-ink-mute tabular-nums">· {subs.length}</span>
       </div>
       <div className="mt-1.5 flex flex-col gap-1">
         {subs.map((sub, i) => (
@@ -75,11 +75,11 @@ function ParallelBody({ d }: { d: StepNodeData }) {
             key={sub.id || i}
             className="flex items-center gap-1.5 rounded-[6px] border border-border bg-white px-1.5 py-1"
           >
-            <span className="truncate text-[11px] text-ink">{sub.id || `#${i}`}</span>
-            <span className="ml-auto truncate text-[10px] text-ink-mute">{sub.agent || '(no agent)'}</span>
+            <span className="truncate text-note text-ink">{sub.id || `#${i}`}</span>
+            <span className="ml-auto truncate text-meta text-ink-mute">{sub.agent || '(no agent)'}</span>
           </div>
         ))}
-        {subs.length === 0 && <div className="px-1 py-0.5 text-[10px] text-ink-mute">no sub-steps</div>}
+        {subs.length === 0 && <div className="px-1 py-0.5 text-meta text-ink-mute">no sub-steps</div>}
       </div>
     </>
   );
@@ -92,15 +92,15 @@ function PanelBody({ d }: { d: StepNodeData }) {
   return (
     <>
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className={`rounded px-1.5 py-px text-[10px] font-medium ${KIND_CHIP.panel}`}>panel</span>
-        <span className="text-[10px] text-ink-mute tabular-nums">· {panelists.length} panelists</span>
+        <span className={`rounded px-1.5 py-px text-meta font-medium ${KIND_CHIP.panel}`}>panel</span>
+        <span className="text-meta text-ink-mute tabular-nums">· {panelists.length} panelists</span>
       </div>
       {gate && (
         <div
           className="mt-1.5 flex items-center gap-1.5 rounded-[8px] border px-1.5 py-1"
           style={{ borderColor: '#fde68a', background: '#fffbeb' }}
         >
-          <span className="text-[10px] font-medium text-[#92400e]">
+          <span className="text-meta font-medium text-[#92400e]">
             gate ≥ {gate.until_no_findings_at_severity_or_above ?? '—'}
           </span>
         </div>
@@ -133,7 +133,7 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
       />
 
       <div className="flex items-center gap-2 pt-0.5">
-        <span className="flex-1 truncate text-[12px] font-semibold text-ink">{d.id}</span>
+        <span className="flex-1 truncate text-ui font-semibold text-ink">{d.id}</span>
         {hasProblems && (
           <span
             className="inline-block h-2.5 w-2.5 shrink-0 rounded-full bg-red-500"

@@ -28,6 +28,7 @@ import DiffView from './DiffView';
 import TerminalBlock from './TerminalBlock';
 import StructuredView from './StructuredView';
 import { Button } from '../ui/Button';
+import { Badge } from '../ui/Badge';
 import { formatDuration } from '../../lib/duration';
 
 // ---------------------------------------------------------------------------
@@ -136,7 +137,7 @@ function isNonTrivialObject(v: unknown): v is Record<string, unknown> {
 
 function DurationBadge({ ms }: { ms: number }) {
   return (
-    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-mono bg-slate-100 text-slate-500">
+    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-mono bg-slate-100 text-slate-500">
       {formatDuration(ms)}
     </span>
   );
@@ -145,7 +146,7 @@ function DurationBadge({ ms }: { ms: number }) {
 function StatusBadge({ tool }: { tool: ToolView }) {
   if (tool.error) {
     return (
-      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold bg-red-100 text-red-700 ring-1 ring-inset ring-red-200">
+      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-semibold bg-red-100 text-red-700 ring-1 ring-inset ring-red-200">
         error
       </span>
     );
@@ -154,7 +155,7 @@ function StatusBadge({ tool }: { tool: ToolView }) {
     return <DurationBadge ms={tool.durationMs} />;
   }
   return (
-    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] bg-slate-100 text-slate-400">
+    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-slate-100 text-slate-400">
       ok
     </span>
   );
@@ -164,7 +165,7 @@ function CardHeader({ tool, summary }: { tool: ToolView; summary: string }) {
   return (
     <div className="flex items-center gap-2 min-w-0 px-3 py-1.5 bg-slate-50 border-b border-slate-200">
       {/* Tool name */}
-      <span className="font-mono text-[11px] font-semibold text-brand-700 shrink-0">
+      <span className="font-mono text-note font-semibold text-brand-700 shrink-0">
         ⚙ {tool.tool}
       </span>
 
@@ -190,7 +191,7 @@ function CardHeader({ tool, summary }: { tool: ToolView; summary: string }) {
 function ErrorBlock({ error }: { error: string }) {
   return (
     <div className="bg-red-50 border-t border-red-200 px-3 py-2">
-      <p className="text-[11px] font-semibold text-red-700 mb-0.5">Error</p>
+      <p className="text-note font-semibold text-red-700 mb-0.5">Error</p>
       <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-red-800 leading-snug">
         {error}
       </pre>
@@ -223,7 +224,7 @@ function GrepBody({ tool }: { tool: ToolView }) {
   return (
     <div className="px-3 py-2">
       {lines.length > 0 && (
-        <p className="text-[10px] text-slate-400 mb-1">{lines.length} match{lines.length !== 1 ? 'es' : ''}</p>
+        <p className="text-meta text-slate-400 mb-1">{lines.length} match{lines.length !== 1 ? 'es' : ''}</p>
       )}
       <div className="font-mono text-[10.5px] text-slate-700 bg-slate-50 rounded p-2 max-h-72 overflow-y-auto leading-snug space-y-0">
         {lines.map((line, i) => (
@@ -277,14 +278,14 @@ function SubrunBody({
         {/* Summary chips */}
         <div className="flex flex-wrap gap-1.5 items-center">
           {status && (
-            <span className="inline-flex items-center rounded px-2 py-0.5 text-[10px] bg-slate-100 text-slate-600 font-mono">
+            <Badge tone="neutral" className="px-2 font-mono">
               status: {status}
-            </span>
+            </Badge>
           )}
           {totalTokens !== null && (
-            <span className="inline-flex items-center rounded px-2 py-0.5 text-[10px] bg-slate-100 text-slate-600 font-mono">
+            <Badge tone="neutral" className="px-2 font-mono">
               {totalTokens.toLocaleString()} tokens
-            </span>
+            </Badge>
           )}
         </div>
 
@@ -357,7 +358,7 @@ function GenericBody({ tool }: { tool: ToolView }) {
       {/* Input args — only when non-trivial */}
       {showInput && (
         <div>
-          <p className="text-[10px] uppercase tracking-wider text-slate-400 font-semibold mb-1">
+          <p className="text-meta uppercase tracking-wider text-slate-400 font-semibold mb-1">
             args
           </p>
           <StructuredView value={tool.input} />

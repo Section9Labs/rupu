@@ -99,7 +99,7 @@ export default function LauncherSheet({
   }
 
   const fieldCls =
-    'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-[13px] text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
+    'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 
   return (
     <div
@@ -126,14 +126,14 @@ export default function LauncherSheet({
         <div className="space-y-4 px-5 py-4">
           {/* ── Inputs ─────────────────────────────────────────────── */}
           <fieldset>
-            <legend className="mb-1.5 text-[12px] font-semibold uppercase tracking-wide text-ink-dim">
+            <legend className="mb-1.5 text-ui font-semibold uppercase tracking-wide text-ink-dim">
               Inputs
             </legend>
             {hasDeclared ? (
               <div className="space-y-2.5">
                 {(declaredInputs ?? []).map((name) => (
                   <label key={name} className="block">
-                    <span className="mb-1 block text-[12px] font-medium text-ink font-mono">{name}</span>
+                    <span className="mb-1 block text-ui font-medium text-ink font-mono">{name}</span>
                     <input
                       type="text"
                       value={declaredValues[name] ?? ''}
@@ -175,7 +175,7 @@ export default function LauncherSheet({
                   type="button"
                   onClick={() => setRows((prev) => [...prev, { key: '', value: '' }])}
                   disabled={launching}
-                  className="text-[12px] font-medium text-brand-600 hover:text-brand-700 disabled:opacity-60"
+                  className="text-ui font-medium text-brand-600 hover:text-brand-700 disabled:opacity-60"
                 >
                   + Add input
                 </button>
@@ -185,7 +185,7 @@ export default function LauncherSheet({
 
           {/* ── Mode ───────────────────────────────────────────────── */}
           <label className="block">
-            <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">
+            <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">
               Mode
             </span>
             <select
@@ -203,26 +203,21 @@ export default function LauncherSheet({
 
           {/* ── Target ─────────────────────────────────────────────── */}
           <div>
-            <span className="mb-1 block text-[12px] font-semibold uppercase tracking-wide text-ink-dim">Target</span>
+            <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">Target</span>
             <TargetPicker value={target} onChange={setTarget} disabled={launching} />
           </div>
 
           {error && (
-            <p role="alert" className="text-[12px] font-medium text-red-700">
+            <p role="alert" className="text-ui font-medium text-red-700">
               {error}
             </p>
           )}
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={launching}
-            className="inline-flex items-center rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-          >
+          <Button variant="secondary" onClick={onClose} disabled={launching}>
             Cancel
-          </button>
+          </Button>
           <Button onClick={onLaunch} disabled={launching}>
             {launching ? 'Launching…' : 'Launch'}
           </Button>

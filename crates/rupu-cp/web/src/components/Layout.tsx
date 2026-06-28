@@ -32,7 +32,7 @@ export default function Layout() {
           </div>
           <div>
             <div className="font-semibold text-sm leading-tight">rupu</div>
-            <div className="text-[11px] text-ink-mute leading-tight">Control Plane</div>
+            <div className="text-note text-ink-mute leading-tight">Control Plane</div>
           </div>
         </Link>
 
@@ -64,7 +64,7 @@ export default function Layout() {
                   <item.icon size={16} strokeWidth={2} />
                   <span>{item.label}</span>
                   {!item.enabled && (
-                    <span className="ml-auto text-[10px] uppercase tracking-wide text-ink-mute">soon</span>
+                    <span className="ml-auto text-meta uppercase tracking-wide text-ink-mute">soon</span>
                   )}
                 </NavLink>
               );

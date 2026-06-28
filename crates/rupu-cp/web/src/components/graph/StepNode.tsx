@@ -49,24 +49,24 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
 
       <div className="flex items-center gap-2 pt-0.5">
         <span
-          className="inline-flex h-[15px] w-[15px] shrink-0 items-center justify-center rounded text-[10px] font-bold leading-none text-white"
+          className="inline-flex h-[15px] w-[15px] shrink-0 items-center justify-center rounded text-meta font-bold leading-none text-white"
           style={{ background: s.color }}
           aria-hidden
         >
           {s.glyph}
         </span>
-        <span className="flex-1 truncate text-[12px] font-semibold text-ink">{node.id}</span>
-        <span className="text-[10px] text-ink-mute tabular-nums">
+        <span className="flex-1 truncate text-ui font-semibold text-ink">{node.id}</span>
+        <span className="text-meta text-ink-mute tabular-nums">
           {node.state === 'pending' ? '—' : s.label}
         </span>
       </div>
 
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded bg-slate-100 px-1.5 py-px text-[10px] text-slate-500">
+        <span className="rounded bg-slate-100 px-1.5 py-px text-meta text-slate-500">
           {node.kind === 'panel' ? 'panel' : 'step'}
         </span>
         {node.agent && (
-          <span className="truncate rounded bg-slate-100 px-1.5 py-px text-[10px] text-slate-500">
+          <span className="truncate rounded bg-slate-100 px-1.5 py-px text-meta text-slate-500">
             {node.agent}
           </span>
         )}

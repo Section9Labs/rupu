@@ -149,7 +149,7 @@ export default function CoverageAuditTab({ target, wsId }: { target: string; wsI
 function Stat({ label, value }: { label: string; value: string | number }) {
   return (
     <div className="rounded-lg border border-border bg-panel px-3 py-2">
-      <div className="text-[11px] text-ink-mute">{label}</div>
+      <div className="text-note text-ink-mute">{label}</div>
       <div className="text-sm font-semibold text-ink tabular-nums">{value}</div>
     </div>
   );
@@ -175,10 +175,10 @@ function ConcernRow({
         <span className="block">
           <span className="flex items-center gap-2 flex-wrap">
             <span className="text-sm font-medium text-ink">{c.name}</span>
-            <span className="text-[11px] font-mono text-ink-mute">{c.concern_id}</span>
+            <span className="text-note font-mono text-ink-mute">{c.concern_id}</span>
             <SeverityChip severity={c.severity} />
             {c.gap_files.length > 0 && (
-              <span className="text-[10px] text-amber-700 font-medium">
+              <span className="text-meta text-amber-700 font-medium">
                 {c.gap_files.length} gap
               </span>
             )}
@@ -187,11 +187,11 @@ function ConcernRow({
             <span className="h-1.5 flex-1 rounded bg-slate-100 overflow-hidden">
               <span className="block h-full bg-brand-500" style={{ width: `${pct}%` }} />
             </span>
-            <span className="text-[11px] text-ink-mute tabular-nums w-24 text-right">
+            <span className="text-note text-ink-mute tabular-nums w-24 text-right">
               {assessed}/{inScope} files
             </span>
           </span>
-          <span className="mt-1 block text-[11px] text-ink-mute tabular-nums">
+          <span className="mt-1 block text-note text-ink-mute tabular-nums">
             clean {c.clean} · finding {c.findings} · examined {c.examined} · n/a {c.not_applicable}
           </span>
         </span>
@@ -199,18 +199,18 @@ function ConcernRow({
     >
       {c.asserted_files.length > 0 && (
         <div className="mb-2">
-          <p className="text-[11px] font-medium text-ink-dim mb-0.5">Asserted</p>
+          <p className="text-note font-medium text-ink-dim mb-0.5">Asserted</p>
           <CappedList items={c.asserted_files} />
         </div>
       )}
       {c.gap_files.length > 0 && (
         <div>
-          <p className="text-[11px] font-medium text-amber-700 mb-0.5">Gap</p>
+          <p className="text-note font-medium text-amber-700 mb-0.5">Gap</p>
           <CappedList items={c.gap_files} />
         </div>
       )}
       {c.asserted_files.length === 0 && c.gap_files.length === 0 && (
-        <p className="text-[11px] text-ink-mute">No in-scope files.</p>
+        <p className="text-note text-ink-mute">No in-scope files.</p>
       )}
     </CollapsibleRow>
   );

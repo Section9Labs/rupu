@@ -20,7 +20,7 @@ const CodeEditorImpl = lazy(() => import('./CodeEditorImpl'));
 
 const FALLBACK_CLASS =
   'block w-full min-h-[20rem] resize-y rounded-xl border border-border bg-panel ' +
-  'p-4 font-mono text-[12px] leading-relaxed text-ink focus:border-brand-500 ' +
+  'p-4 font-mono text-ui leading-relaxed text-ink focus:border-brand-500 ' +
   'focus:outline-none';
 
 function FallbackEditor({ value, onChange, ariaLabel }: CodeEditorProps) {

@@ -83,9 +83,9 @@ export default function CoverageGapTab({ target, wsId }: { target: string; wsId?
               header={
                 <span className="flex items-center gap-2 flex-wrap">
                   <span className="text-sm font-medium text-ink">{r.name}</span>
-                  <span className="text-[11px] font-mono text-ink-mute">{r.concern_id}</span>
+                  <span className="text-note font-mono text-ink-mute">{r.concern_id}</span>
                   <SeverityChip severity={r.severity} />
-                  <span className="text-[10px] text-amber-700 font-medium tabular-nums">
+                  <span className="text-meta text-amber-700 font-medium tabular-nums">
                     {r.gap_files.length} files
                   </span>
                 </span>

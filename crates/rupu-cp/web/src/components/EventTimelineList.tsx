@@ -203,17 +203,17 @@ export default function EventTimelineList({
                 <span className="text-xs font-medium text-ink truncate">
                   {title}
                 </span>
-                <span className="text-[10px] uppercase tracking-wide text-ink-mute shrink-0">
+                <span className="text-meta uppercase tracking-wide text-ink-mute shrink-0">
                   {labelFor(ev)}
                 </span>
                 {rel && (
-                  <span className="ml-auto text-[10px] text-ink-mute tabular-nums shrink-0">
+                  <span className="ml-auto text-meta text-ink-mute tabular-nums shrink-0">
                     {rel}
                   </span>
                 )}
               </div>
               {detail && (
-                <div className="text-[11px] text-ink-dim mt-0.5 break-words">
+                <div className="text-note text-ink-dim mt-0.5 break-words">
                   {detail}
                 </div>
               )}

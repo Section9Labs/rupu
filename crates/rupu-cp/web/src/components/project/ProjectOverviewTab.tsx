@@ -21,7 +21,7 @@ function SectionTitle({ title, href }: { title: string; href: string }) {
       <h2 className="text-sm font-semibold text-ink">{title}</h2>
       <Link
         to={href}
-        className="text-[11px] font-medium text-brand-600 hover:text-brand-700 transition-colors"
+        className="text-note font-medium text-brand-600 hover:text-brand-700 transition-colors"
       >
         see all →
       </Link>
@@ -73,7 +73,7 @@ export default function ProjectOverviewTab({
                     <span className="text-sm font-medium text-ink truncate">{r.workflow_name}</span>
                     <TriggerChip trigger={r.trigger} />
                   </div>
-                  <p className="text-[11px] text-ink-dim mt-0.5">{relativeTime(r.started_at)}</p>
+                  <p className="text-note text-ink-dim mt-0.5">{relativeTime(r.started_at)}</p>
                 </div>
                 <StatusPill status={r.status} />
               </Link>
@@ -90,12 +90,12 @@ export default function ProjectOverviewTab({
             <h2 className="text-sm font-semibold text-ink">Coverage</h2>
             <Link
               to={`/projects/${encodedId}/coverage`}
-              className="text-[11px] font-medium text-brand-600 hover:text-brand-700 transition-colors"
+              className="text-note font-medium text-brand-600 hover:text-brand-700 transition-colors"
             >
               open →
             </Link>
           </div>
-          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 text-[12px] text-ink-dim">
+          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 text-ui text-ink-dim">
             {coverage.targets === 0 ? (
               <span className="text-ink-mute">No coverage targets yet</span>
             ) : (
@@ -125,16 +125,16 @@ export default function ProjectOverviewTab({
             <h2 className="text-sm font-semibold text-ink">Sessions</h2>
             <Link
               to={`/projects/${encodedId}/sessions`}
-              className="text-[11px] font-medium text-brand-600 hover:text-brand-700 transition-colors"
+              className="text-note font-medium text-brand-600 hover:text-brand-700 transition-colors"
             >
               see all →
             </Link>
           </div>
           <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
             {sessions.total === 0 ? (
-              <p className="text-[12px] text-ink-mute">No sessions yet</p>
+              <p className="text-ui text-ink-mute">No sessions yet</p>
             ) : (
-              <div className="flex items-center gap-3 text-[12px] text-ink-dim">
+              <div className="flex items-center gap-3 text-ui text-ink-dim">
                 <span className="inline-flex items-center gap-1.5">
                   <MessageSquare size={12} className="text-ink-mute" />
                   <span className="font-medium text-ink">{sessions.total}</span> total
@@ -158,7 +158,7 @@ export default function ProjectOverviewTab({
           to={`/projects/${encodedId}/definitions`}
           className="block bg-panel border border-border rounded-xl shadow-card px-4 py-3 hover:bg-slate-50 transition-colors"
         >
-          <div className="flex items-center gap-2.5 text-[12px] text-ink-dim">
+          <div className="flex items-center gap-2.5 text-ui text-ink-dim">
             <Library size={14} className="text-ink-mute" />
             <span>
               Agents, workflows &amp; autoflows visible to this project

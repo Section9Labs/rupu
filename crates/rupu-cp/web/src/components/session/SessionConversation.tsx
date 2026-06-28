@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import TranscriptPanel from '../TranscriptPanel';
+import { Button } from '../ui/Button';
 import type { SessionSummary, SessionRunRow } from '../../lib/api';
 
 /** How many turns to reveal initially, and per "Load older" click. */
@@ -78,13 +79,9 @@ export default function SessionConversation({
     >
       {hasOlder && (
         <div className="mb-4 flex justify-center">
-          <button
-            type="button"
-            onClick={() => setVisible((v) => v + PAGE)}
-            className="rounded-md border border-border bg-panel px-3 py-1.5 text-xs font-medium text-ink hover:bg-slate-100"
-          >
+          <Button variant="secondary" onClick={() => setVisible((v) => v + PAGE)}>
             Load older turns
-          </button>
+          </Button>
         </div>
       )}
 
@@ -94,7 +91,7 @@ export default function SessionConversation({
             {/* User bubble — right-aligned, tinted. */}
             <div className="flex justify-end">
               <div className="max-w-[80%] rounded-2xl rounded-br-sm bg-brand-600 px-3.5 py-2 text-sm text-white">
-                <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wide text-white/70">
+                <div className="mb-0.5 text-meta font-medium uppercase tracking-wide text-white/70">
                   You
                 </div>
                 <div className="whitespace-pre-wrap break-words">{run.prompt}</div>
@@ -111,7 +108,7 @@ export default function SessionConversation({
 
             {/* Per-turn error line (shown when the run terminated with an error). */}
             {run.error && (
-              <p className="text-[11px] text-red-600">{run.error}</p>
+              <p className="text-note text-red-600">{run.error}</p>
             )}
           </div>
         ))}

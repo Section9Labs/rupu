@@ -168,7 +168,7 @@ function highlight(text: string, query: string): React.ReactNode {
 function Hint({ k, label }: { k: string; label: string }) {
   return (
     <span className="inline-flex items-center gap-1">
-      <kbd className="px-1.5 py-0.5 rounded border border-border bg-white text-[10px] font-mono text-ink-dim">
+      <kbd className="px-1.5 py-0.5 rounded border border-border bg-white text-meta font-mono text-ink-dim">
         {k}
       </kbd>
       <span>{label}</span>
@@ -336,7 +336,7 @@ export default function CommandPalette() {
             const SectionIcon = KIND_ICON[group.kind];
             return (
               <div key={group.kind} className="py-1">
-                <div className="px-4 py-1 text-[10px] uppercase tracking-wide text-ink-mute font-medium flex items-center gap-1.5">
+                <div className="px-4 py-1 text-meta uppercase tracking-wide text-ink-mute font-medium flex items-center gap-1.5">
                   <SectionIcon size={11} className={cn('shrink-0', KIND_COLOR[group.kind])} />
                   {KIND_LABEL[group.kind]}
                 </div>
@@ -363,7 +363,7 @@ export default function CommandPalette() {
                       <div className="min-w-0 flex-1">
                         <div className="truncate">{highlight(it.title, query)}</div>
                         {it.subtitle && (
-                          <div className={cn('text-[11px] truncate', isActive ? 'text-brand-700/70' : 'text-ink-mute')}>
+                          <div className={cn('text-note truncate', isActive ? 'text-brand-700/70' : 'text-ink-mute')}>
                             {it.subtitle}
                           </div>
                         )}
@@ -376,7 +376,7 @@ export default function CommandPalette() {
           })}
         </div>
 
-        <footer className="px-4 py-2 border-t border-border flex items-center gap-3 text-[11px] text-ink-mute">
+        <footer className="px-4 py-2 border-t border-border flex items-center gap-3 text-note text-ink-mute">
           <Hint k="↑↓" label="Navigate" />
           <Hint k="↵" label="Open" />
           <Hint k="Esc" label="Close" />

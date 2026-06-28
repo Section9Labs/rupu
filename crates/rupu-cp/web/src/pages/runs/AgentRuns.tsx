@@ -11,6 +11,7 @@ import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AgentRunRow } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
+import { Button } from '../../components/ui/Button';
 import { cn } from '../../lib/cn';
 import { relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
@@ -39,7 +40,7 @@ const SOURCE_CLS: Record<string, string> = {
 function SourceChip({ source }: { source: string }) {
   const cls = SOURCE_CLS[source] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
   return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
+    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {source}
     </span>
   );
@@ -60,7 +61,7 @@ const STATUS_CLS: Record<string, string> = {
 function StatusBadge({ status }: { status: string }) {
   const cls = STATUS_CLS[status] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
   return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-[10px] font-medium px-1.5 py-0.5', cls)}>
+    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium px-1.5 py-0.5', cls)}>
       {status}
     </span>
   );
@@ -128,13 +129,10 @@ export default function AgentRuns() {
           <h1 className="text-2xl font-semibold text-ink">Agent Runs</h1>
           <p className="mt-1 text-sm text-ink-dim">Standalone and session-bound agent invocations.</p>
         </div>
-        <button
-          onClick={() => void refresh()}
-          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-border bg-panel text-ink hover:bg-slate-100"
-        >
+        <Button variant="secondary" onClick={() => void refresh()} className="gap-1.5">
           <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
           Refresh
-        </button>
+        </Button>
       </header>
 
       {/* Lifecycle tabs */}
@@ -185,7 +183,7 @@ export default function AgentRuns() {
             initialSort={{ key: 'started', dir: 'desc' }}
           />
           {tab !== 'active' && hasMore && (
-            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
               {loading ? 'loading more…' : 'scroll for more'}
             </div>
           )}
@@ -212,12 +210,12 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
         {(r.trigger_source || r.session_id) && (
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
             {r.trigger_source && (
-              <span className="text-[11px] text-ink-dim">
+              <span className="text-note text-ink-dim">
                 via <span className="font-mono">{r.trigger_source}</span>
               </span>
             )}
             {r.session_id && (
-              <span className="text-[11px] text-ink-dim">
+              <span className="text-note text-ink-dim">
                 session{' '}
                 <Link
                   to={`/sessions/${encodeURIComponent(r.session_id)}`}
@@ -243,11 +241,11 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
         ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}`
         : null;
       return href ? (
-        <Link to={href} className="text-[11px] text-ink-mute font-mono hover:underline">
+        <Link to={href} className="text-note text-ink-mute font-mono hover:underline">
           {shortId(r.run_id)}
         </Link>
       ) : (
-        <span className="text-[11px] text-ink-mute font-mono">{shortId(r.run_id)}</span>
+        <span className="text-note text-ink-mute font-mono">{shortId(r.run_id)}</span>
       );
     },
   },

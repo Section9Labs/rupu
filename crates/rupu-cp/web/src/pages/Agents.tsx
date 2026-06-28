@@ -107,7 +107,7 @@ export default function Agents() {
             initialSort={{ key: 'name', dir: 'asc' }}
           />
           {sorted.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
               scroll for more
             </div>
           )}
@@ -166,7 +166,7 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
           <h2 id={titleId} className="text-base font-semibold text-ink">
             New agent
           </h2>
-          <p className="mt-1 text-[12px] text-ink-dim">
+          <p className="mt-1 text-ui text-ink-dim">
             Edit the definition below. It is validated server-side before it is saved.
           </p>
         </div>
@@ -179,21 +179,16 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
             ariaLabel="New agent definition"
           />
           {error && (
-            <p role="alert" className="text-[12px] font-medium text-red-700">
+            <p role="alert" className="text-ui font-medium text-red-700">
               {error}
             </p>
           )}
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={creating}
-            className="inline-flex items-center rounded-md border border-border bg-white px-3 py-1.5 text-[12px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-          >
+          <Button variant="secondary" onClick={onClose} disabled={creating}>
             Cancel
-          </button>
+          </Button>
           <Button onClick={create} disabled={creating}>
             {creating ? 'Creating…' : 'Create'}
           </Button>
@@ -223,7 +218,7 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
     header: 'Description',
     render: (a) =>
       a.description ? (
-        <span className="text-[12px] text-ink-dim leading-snug truncate block max-w-md">
+        <span className="text-ui text-ink-dim leading-snug truncate block max-w-md">
           {a.description}
         </span>
       ) : (
@@ -267,7 +262,7 @@ function MetaChip({ children, className }: { children: React.ReactNode; classNam
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200',
+        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200',
         className,
       )}
     >

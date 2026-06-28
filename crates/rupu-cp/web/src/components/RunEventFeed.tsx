@@ -58,7 +58,7 @@ export default function RunEventFeed({
     <div className="flex flex-col h-full min-h-0">
       <div className="flex items-center justify-between px-1 pb-2">
         <ConnectionBadge state={connection} />
-        <span className="text-[11px] text-ink-mute tabular-nums">
+        <span className="text-note text-ink-mute tabular-nums">
           {events.length} event{events.length === 1 ? '' : 's'}
         </span>
       </div>
@@ -87,7 +87,7 @@ export function ConnectionBadge({ state }: { state: ConnectionState }) {
   };
   const m = map[state];
   return (
-    <span className={cn('inline-flex items-center gap-1.5 text-[11px] font-medium', m.text)}>
+    <span className={cn('inline-flex items-center gap-1.5 text-note font-medium', m.text)}>
       <span className={cn('inline-block w-1.5 h-1.5 rounded-full', m.dot, state !== 'live' && 'animate-pulse')} />
       {m.label}
     </span>

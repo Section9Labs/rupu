@@ -9,7 +9,7 @@ export default function CappedList({ items, cap = 10 }: { items: string[]; cap?:
     <div>
       <ul className="space-y-0.5">
         {shown.map((f) => (
-          <li key={f} className="text-[11px] font-mono text-ink-mute break-all">
+          <li key={f} className="text-note font-mono text-ink-mute break-all">
             {f}
           </li>
         ))}
@@ -17,7 +17,7 @@ export default function CappedList({ items, cap = 10 }: { items: string[]; cap?:
       {items.length > cap && (
         <button
           onClick={() => setExpanded((v) => !v)}
-          className="mt-1 text-[11px] font-medium text-brand-700 hover:text-brand-500"
+          className="mt-1 text-note font-medium text-brand-700 hover:text-brand-500"
         >
           {expanded ? 'show less' : `show all ${items.length}`}
         </button>

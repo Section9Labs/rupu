@@ -25,11 +25,11 @@ const ExpressionFieldImpl = lazy(() => import('./ExpressionFieldImpl'));
 // Mirror StepForm's field look (border / radius / size) so the editor reads as a
 // normal form control. `focus-within` lights the brand border like the inputs.
 const SHELL_CLASS =
-  'w-full overflow-hidden rounded-md border border-border bg-white text-[13px] text-ink ' +
+  'w-full overflow-hidden rounded-md border border-border bg-white text-lead text-ink ' +
   'focus-within:border-brand-500';
 
 const FALLBACK_CLASS =
-  'w-full resize-y bg-white px-2.5 py-1.5 font-mono text-[13px] text-ink ' +
+  'w-full resize-y bg-white px-2.5 py-1.5 font-mono text-lead text-ink ' +
   'placeholder:text-ink-mute focus:outline-none';
 
 function Fallback({ value, onChange, multiline, ariaLabel, placeholder }: ExpressionFieldProps) {

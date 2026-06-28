@@ -136,7 +136,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
             <h1 className="text-2xl font-semibold text-ink break-all">{detail.target_id}</h1>
             <CatalogBadge present={detail.has_catalog} />
           </div>
-          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-[12px] text-ink-dim">
+          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-ui text-ink-dim">
             <span>{detail.assertions.length} assertion{detail.assertions.length !== 1 ? 's' : ''}</span>
             <span>{sortedFindings.length} finding{sortedFindings.length !== 1 ? 's' : ''}</span>
             <span>{files.length} file{files.length !== 1 ? 's' : ''} touched</span>
@@ -251,7 +251,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
               ))}
             </ListCard>
             {hiddenCount > 0 && (
-              <p className="mt-2 text-[11px] text-ink-mute pl-1">
+              <p className="mt-2 text-note text-ink-mute pl-1">
                 +{hiddenCount} more assertion{hiddenCount !== 1 ? 's' : ''} not shown
               </p>
             )}
@@ -294,8 +294,8 @@ function FileRow({ file }: { file: FileView }) {
       {/* heatmap accent bar, colored by strongest touch */}
       <span className={cn('shrink-0 w-1 self-stretch rounded-full', t.bar)} aria-hidden />
       <div className="min-w-0 flex-1">
-        <p className="text-[13px] font-mono text-ink truncate">{file.path}</p>
-        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
+        <p className="text-lead font-mono text-ink truncate">{file.path}</p>
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-note text-ink-mute">
           {file.edits > 0 && <span>{file.edits} edit{file.edits !== 1 ? 's' : ''}</span>}
           {file.grep_matches > 0 && <span>{file.grep_matches} grep match{file.grep_matches !== 1 ? 'es' : ''}</span>}
           {file.read_lines.length > 0 && (
@@ -306,7 +306,7 @@ function FileRow({ file }: { file: FileView }) {
       </div>
       <span
         className={cn(
-          'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ring-1',
+          'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-note font-medium uppercase tracking-wide ring-1',
           t.pill,
         )}
       >
@@ -339,18 +339,18 @@ function AssertionRow({ assertion }: { assertion: ConcernAssertion }) {
     <div className="flex items-start gap-3 px-4 py-3">
       <span
         className={cn(
-          'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium ring-1 mt-0.5',
+          'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 mt-0.5',
           s.pill,
         )}
       >
         {s.label}
       </span>
       <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute mb-0.5">
+        <div className="flex flex-wrap items-center gap-x-3 text-note text-ink-mute mb-0.5">
           <span className="font-mono break-all">{assertion.file_path}</span>
           <span className="font-mono text-ink-mute/70">{assertion.concern_id}</span>
         </div>
-        {truncated && <p className="text-[12px] text-ink-dim leading-snug">{truncated}</p>}
+        {truncated && <p className="text-ui text-ink-dim leading-snug">{truncated}</p>}
       </div>
     </div>
   );
@@ -364,7 +364,7 @@ function CatalogBadge({ present }: { present: boolean }) {
   return (
     <span
       className={cn(
-        'inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium ring-1',
+        'inline-flex items-center gap-1 rounded px-2 py-0.5 text-note font-medium ring-1',
         present
           ? 'bg-green-50 text-green-700 ring-green-200'
           : 'bg-slate-100 text-ink-mute ring-slate-200',
@@ -390,7 +390,7 @@ function StatusCount({
   return (
     <span
       className={cn(
-        'inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium ring-1',
+        'inline-flex items-center gap-1 rounded px-2 py-0.5 text-note font-medium ring-1',
         s.pill,
       )}
     >
