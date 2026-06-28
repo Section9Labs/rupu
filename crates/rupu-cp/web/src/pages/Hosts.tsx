@@ -2,7 +2,7 @@
 // active run counts, and last-seen freshness. Provides an Add Host form (name,
 // base URL, token) and a per-row Remove action (local host is immutable).
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Server } from 'lucide-react';
 import { api, type HostView, type HostStatus, type HostTransportKind } from '../lib/api';
@@ -10,7 +10,7 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { shortId } from '../lib/shortId';
 import { relativeTime } from '../lib/time';
-import { cn } from '../lib/cn';
+import { Chip } from '../components/ui/Chip';
 
 // ---------------------------------------------------------------------------
 // Status + transport visual tokens
@@ -43,23 +43,6 @@ interface AddForm {
 }
 
 const EMPTY_FORM: AddForm = { name: '', base_url: '', token: '' };
-
-// ---------------------------------------------------------------------------
-// Chip
-// ---------------------------------------------------------------------------
-
-function Chip({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1',
-        className,
-      )}
-    >
-      {children}
-    </span>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Column definitions
@@ -211,7 +194,7 @@ export default function Hosts() {
       });
       setForm(EMPTY_FORM);
       setShowAdd(false);
-      load();
+      void load();
     } catch (e: unknown) {
       setAddError(e instanceof Error ? e.message : 'Failed to add host');
     } finally {
@@ -223,13 +206,13 @@ export default function Hosts() {
     setRemoveError(null);
     try {
       await api.removeHost(id);
-      load();
+      void load();
     } catch (e: unknown) {
       setRemoveError(e instanceof Error ? e.message : 'Failed to remove host');
     }
   }
 
-  const columns = buildColumns(handleRemove);
+  const columns = useMemo(() => buildColumns(handleRemove), [handleRemove]);
 
   return (
     <div className="p-8">

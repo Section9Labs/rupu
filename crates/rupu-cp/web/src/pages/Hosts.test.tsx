@@ -140,6 +140,9 @@ describe('Hosts page', () => {
       base_url: 'https://rupu.staging.example.com',
       token: 'my-token',
     });
+
+    // List must refresh after a successful add (initial load + post-add refresh)
+    await waitFor(() => expect(vi.mocked(api.getHosts)).toHaveBeenCalledTimes(2));
   });
 
   it('shows loading state before data arrives', () => {

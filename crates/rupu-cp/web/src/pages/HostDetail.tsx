@@ -9,7 +9,7 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { StatusPill } from '../components/StatusPill';
 import { relativeTime } from '../lib/time';
-import { cn } from '../lib/cn';
+import { Chip } from '../components/ui/Chip';
 import type { HostStatus, HostTransportKind } from '../lib/api';
 
 // ---------------------------------------------------------------------------
@@ -26,19 +26,6 @@ const TRANSPORT_LABEL: Record<HostTransportKind, string> = {
   local: 'local',
   http_cp: 'http-cp',
 };
-
-function Chip({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1',
-        className,
-      )}
-    >
-      {children}
-    </span>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Run columns (minimal — matches WorkflowRuns column shape)
