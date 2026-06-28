@@ -217,22 +217,67 @@ impl RunListRow {
     }
 }
 
+/// Shared run-listing logic used by both HTTP handlers and
+/// [`crate::host::local::LocalHostConnector`].
+///
+/// Filters by `workflow_only` (true = exclude event/cron-triggered runs) and
+/// the optional `lifecycle` group, sorts newest-first, and paginates.
+pub(crate) fn query_run_rows(
+    store: &rupu_orchestrator::runs::RunStore,
+    offset: usize,
+    limit: usize,
+    lifecycle: Option<&str>,
+    workflow_only: bool,
+    pricing: &rupu_config::PricingConfig,
+) -> Result<Vec<RunListRow>, rupu_orchestrator::RunStoreError> {
+    let mut runs = store.list()?;
+    if workflow_only {
+        runs.retain(|r| r.event.is_none() && r.source_wake_id.is_none());
+    }
+    if let Some(lc) = lifecycle {
+        runs.retain(|r| in_lifecycle(r.status, Some(lc)));
+    }
+    runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    let page = crate::pagination::PageQuery {
+        offset: Some(offset),
+        limit: Some(limit),
+    };
+    let page_runs = crate::pagination::paginate(runs, &page);
+    Ok(page_runs
+        .iter()
+        .map(|r| RunListRow::with_usage(r, store, pricing))
+        .collect())
+}
+
+/// Shared run-detail builder used by both HTTP handlers and
+/// [`crate::host::local::LocalHostConnector`].
+///
+/// Returns the `{ run, steps, usage }` JSON object `GET /api/runs/:id` produces.
+pub(crate) fn query_run_detail(
+    store: &rupu_orchestrator::runs::RunStore,
+    id: &str,
+    pricing: &rupu_config::PricingConfig,
+) -> Result<serde_json::Value, rupu_orchestrator::RunStoreError> {
+    let record = store.load(id)?;
+    let steps = store.read_step_results(id).unwrap_or_default();
+    let usage = crate::usage::summarize_run(store, id, pricing);
+    Ok(serde_json::json!({ "run": record, "steps": steps, "usage": usage }))
+}
+
 async fn list_runs(
     State(s): State<AppState>,
     Query(page): Query<crate::pagination::PageQuery>,
 ) -> ApiResult<Json<Vec<RunListRow>>> {
-    let mut runs = s
-        .run_store
-        .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-    let page_runs = crate::pagination::paginate(runs, &page);
-    Ok(Json(
-        page_runs
-            .iter()
-            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
-            .collect(),
-    ))
+    let rows = query_run_rows(
+        &s.run_store,
+        page.offset(),
+        page.limit(),
+        None,
+        false,
+        &s.pricing,
+    )
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(rows))
 }
 
 #[derive(serde::Deserialize)]
@@ -276,38 +321,27 @@ async fn list_workflow_runs(
     State(s): State<AppState>,
     Query(q): Query<WorkflowRunsQuery>,
 ) -> ApiResult<Json<Vec<RunListRow>>> {
-    let lifecycle = q.lifecycle.as_deref();
-    let mut runs: Vec<RunRecord> = s
-        .run_store
-        .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .into_iter()
-        .filter(|r| r.event.is_none() && r.source_wake_id.is_none())
-        .filter(|r| in_lifecycle(r.status, lifecycle))
-        .collect();
-    runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-    let page_runs = crate::pagination::paginate(runs, &q.page());
-    Ok(Json(
-        page_runs
-            .iter()
-            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
-            .collect(),
-    ))
+    let rows = query_run_rows(
+        &s.run_store,
+        q.page().offset(),
+        q.page().limit(),
+        q.lifecycle.as_deref(),
+        true,
+        &s.pricing,
+    )
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(rows))
 }
 
 async fn get_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let record = s.run_store.load(&id).map_err(|e| match e {
+    let detail = query_run_detail(&s.run_store, &id, &s.pricing).map_err(|e| match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         other => ApiError::internal(other.to_string()),
     })?;
-    let steps = s.run_store.read_step_results(&id).unwrap_or_default();
-    let usage = crate::usage::summarize_run(&s.run_store, &id, &s.pricing);
-    Ok(Json(
-        serde_json::json!({ "run": record, "steps": steps, "usage": usage }),
-    ))
+    Ok(Json(detail))
 }
 
 /// `GET /api/runs/:id/log` — tail the run's `events.jsonl` as a live SSE stream.

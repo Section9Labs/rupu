@@ -6,6 +6,7 @@ pub mod agent_launcher;
 pub mod api;
 pub mod embed;
 pub mod error;
+pub mod host;
 pub mod launcher;
 pub mod pagination;
 pub mod repos;

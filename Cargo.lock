@@ -6278,6 +6278,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "futures-util",
  "mime_guess",

@@ -21,6 +21,7 @@ subtle.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+bytes.workspace = true
 futures-util = { workspace = true }
 rust-embed.workspace = true
 mime_guess.workspace = true
