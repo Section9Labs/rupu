@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Sessions</title>
+<meta name="description" content="Sessions are long-lived, multi-turn conversations with a rupu agent — context is kept across turns, tools stay available, and a persistent worker drives each turn from the CLI or the web control plane.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item active" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Go further</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Sessions</h1>
+    <p class="intro">A session is a long-lived, interactive conversation with an agent — it keeps context across many turns and can use tools the whole time, unlike a one-shot <code class="inline">rupu run</code>.</p>
+
+    <h2>What is a session</h2>
+    <p>
+      <code class="inline">rupu run</code> is a single shot: you give an agent one
+      prompt, it works, and it exits. A <strong>session</strong> is the
+      conversational counterpart. You start it once against an agent, then keep
+      sending follow-up prompts; each turn sees the full history of everything
+      that came before — earlier messages, tool calls, file edits, and results.
+    </p>
+    <p>
+      Because the context survives between turns, a session is the right surface
+      for back-and-forth work: ask a question, read the reply, refine, correct
+      course, ask the agent to also look at the writer side. The same agent
+      files in <code class="inline">.rupu/agents/</code> that power
+      <code class="inline">rupu run</code> back a session — a session just wraps
+      one in a durable, multi-turn loop.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 680 200" role="img" aria-label="The session turn loop: you prompt, the agent thinks and uses tools, then replies — and the loop repeats across turns.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <!-- forward row -->
+        <rect class="d-box" x="24" y="36" width="170" height="56" rx="10"></rect>
+        <text class="d-label" x="109" y="60" text-anchor="middle">you</text>
+        <text class="d-sub" x="109" y="78" text-anchor="middle">prompt</text>
+
+        <line class="d-edge" x1="194" y1="64" x2="254" y2="64" marker-end="url(#ar)"></line>
+
+        <rect class="d-box-accent" x="254" y="36" width="170" height="56" rx="10"></rect>
+        <text class="d-label" x="339" y="60" text-anchor="middle">agent</text>
+        <text class="d-sub" x="339" y="78" text-anchor="middle">thinks &middot; uses tools</text>
+
+        <line class="d-edge" x1="424" y1="64" x2="484" y2="64" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="484" y="36" width="170" height="56" rx="10"></rect>
+        <text class="d-label" x="569" y="60" text-anchor="middle">reply</text>
+        <text class="d-sub" x="569" y="78" text-anchor="middle">streamed back</text>
+
+        <!-- loop-back edge -->
+        <path class="d-edge" d="M569,92 L569,150 L109,150 L109,92" marker-end="url(#ar)"></path>
+        <text class="d-sub" x="339" y="170" text-anchor="middle">next turn &mdash; full context kept</text>
+      </svg>
+      <figcaption>One turn of a session, repeated. Context carries forward across every turn.</figcaption>
+    </figure>
+
+    <h2>Starting &amp; using a session</h2>
+    <p>
+      Everything lives under the <code class="inline">rupu session</code>
+      subcommand. The full set:
+    </p>
+    <table>
+      <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>start &lt;agent&gt; [target] [prompt]</code></td><td>Start a persistent agent session and run its first turn.</td></tr>
+        <tr><td><code>send &lt;session-id&gt; &lt;prompt&gt;</code></td><td>Send a follow-up prompt to an existing session.</td></tr>
+        <tr><td><code>attach &lt;session-id&gt;</code></td><td>Attach to the current or last run in a session (the live view).</td></tr>
+        <tr><td><code>list</code></td><td>List sessions (<code>--all</code>, <code>--archived</code>).</td></tr>
+        <tr><td><code>show &lt;session-id&gt;</code></td><td>Show session details and transcript.</td></tr>
+        <tr><td><code>stop &lt;session-id&gt;</code></td><td>Stop an active session worker.</td></tr>
+        <tr><td><code>compact &lt;session-id&gt;</code></td><td>Summarize older turns now to reclaim context window (<code>--window</code>).</td></tr>
+        <tr><td><code>archive &lt;session-id&gt;</code></td><td>Archive an inactive session and its owned transcripts.</td></tr>
+        <tr><td><code>restore &lt;session-id&gt;</code></td><td>Restore an archived session.</td></tr>
+        <tr><td><code>delete &lt;session-id&gt;</code></td><td>Permanently delete a session and its transcripts (<code>--force</code>).</td></tr>
+        <tr><td><code>prune</code></td><td>Delete archived sessions older than a cutoff (<code>--older-than 30d</code>, <code>--dry-run</code>).</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">start</code> accepts an agent name, an optional
+      <a class="link" href="/docs/workflows.html">target reference</a> (e.g.
+      <code class="inline">github:owner/repo#42</code>), and an optional opening
+      prompt. Useful flags: <code class="inline">--prompt</code> (pass the opening
+      message without it being parsed as a target),
+      <code class="inline">--mode ask|bypass|readonly</code> to set the permission
+      mode, <code class="inline">--into &lt;PATH&gt;</code> to choose a clone
+      directory for repo targets, <code class="inline">--no-stream</code> to
+      disable token streaming, and <code class="inline">--detach</code> to start
+      the first turn without auto-attaching to the live view.
+    </p>
+    <pre class="code"><span class="c"># start a session against an agent, with an opening question</span>
+$ rupu session <span class="k">start</span> code-explorer <span class="v">--prompt</span> <span class="s">"where is the run target parsed?"</span>
+
+<span class="c"># …rupu prints the new session id, e.g. 01JABCD…  then continue the thread:</span>
+$ rupu session <span class="k">send</span> 01JABCD… <span class="s">"now also check the writer side"</span>
+
+<span class="c"># re-open the live view of a running session, or list what you have</span>
+$ rupu session <span class="k">attach</span> 01JABCD…
+$ rupu session <span class="k">list</span></pre>
+    <div class="callout">
+      <strong>Tip.</strong> If you omit the opening prompt, the first turn
+      defaults to <code class="inline">go</code>. Pass
+      <code class="inline">--prompt</code> when your message could be mistaken
+      for a target reference.
+    </div>
+
+    <h2>Interactive features</h2>
+    <p>
+      Inside the live view (after <code class="inline">start</code> or
+      <code class="inline">attach</code>) the session screen is built for
+      keyboard-driven, conversational use.
+    </p>
+
+    <h3>Slash commands &amp; Tab completion</h3>
+    <p>
+      Slash commands are the control surface of a live session —
+      <code class="inline">/help</code>, <code class="inline">/status</code>,
+      <code class="inline">/history</code>, <code class="inline">/transcript</code>,
+      <code class="inline">/runs</code>, <code class="inline">/cancel</code>,
+      <code class="inline">/compact</code>, <code class="inline">/stop</code>,
+      <code class="inline">/detach</code>, and <code class="inline">/quit</code>,
+      plus routed roots that reach the rest of the CLI
+      (<code class="inline">/workflow</code>, <code class="inline">/session</code>,
+      <code class="inline">/issues</code>). Press <strong>Tab</strong> on a
+      <code class="inline">/</code> buffer to open an in-screen popup of matching
+      commands with the first highlighted; Tab / Down / Up navigate (and wrap),
+      <strong>Enter</strong> accepts the highlighted command into the buffer
+      (without submitting — routed roots get a trailing space so you can type the
+      subcommand), and <strong>Esc</strong> dismisses. Typing re-filters the list
+      live by strict prefix. This turns the slash catalog from something you have
+      to memorize into something you can discover and complete.
+    </p>
+
+    <h3>Role blocks</h3>
+    <p>
+      Each turn renders as a visually distinct block so it's easy to see where
+      one turn ends and the next begins as the transcript scrolls. The agent's
+      turn leads with a status glyph and a labelled header
+      (<code class="inline">&#9679; agent &middot; gpt-5 &middot; &#8673; 2,311 &#8675; 246</code>),
+      and its body lines carry a colored left rail
+      (<code class="inline">&#9474;</code>) that reads continuously into the nested
+      tool-call tree below it. Your turns render as
+      <code class="inline">&#9656; you</code> with a brand-tinted rail. The glyph
+      shifts while a reply streams (<code class="inline">&#9680;</code>) versus
+      when it's complete (<code class="inline">&#9679;</code>), giving the
+      conversation a clear, consistent visual grammar.
+    </p>
+
+    <h2>The session worker</h2>
+    <p>
+      A session is backed by a <strong>persistent worker process</strong> that
+      runs in the background and survives between turns. That's what lets
+      <code class="inline">rupu session send</code> continue the <em>same</em>
+      conversation with all its context intact rather than starting over — each
+      prompt is handed to the already-running worker for the next turn. The live
+      view is just a window onto that worker: <code class="inline">--detach</code>
+      (or the <code class="inline">/detach</code> command) leaves the view while
+      the worker keeps running, and <code class="inline">rupu session attach</code>
+      re-opens the view on the current or last run.
+      <code class="inline">rupu session stop</code> shuts the worker down.
+    </p>
+    <div class="callout">
+      <strong>Note.</strong> Because the worker is a long-lived daemon, replacing
+      the <code class="inline">rupu</code> binary does <em>not</em> update an
+      already-running session. To pick up new code, stop the session
+      (<code class="inline">rupu session stop &lt;id&gt;</code>) and send again,
+      which starts a fresh worker.
+    </div>
+
+    <h2>Sessions in the control plane</h2>
+    <p>
+      The web control plane can drive a live session as a chat: you send a prompt,
+      a turn starts, and the transcript streams back token-by-token with a
+      "working…" indicator while it's in flight, per-turn errors surfaced inline,
+      and final status, tokens, and any failure shown the moment the turn ends.
+      This is the same session surface as the CLI — the same on-disk sessions,
+      transcripts, and worker — just presented as a turn-by-turn chat in the
+      browser instead of the terminal.
+    </p>
+
+    <h2>Sessions vs runs vs workflows</h2>
+    <table>
+      <thead><tr><th>Use</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Session</strong></td><td>Interactive, exploratory, back-and-forth work where you want to refine across turns and keep context — debugging, code exploration, iterative changes.</td></tr>
+        <tr><td><strong>Run</strong> (<code>rupu run</code>)</td><td>A single, self-contained task you can describe in one prompt. No conversation needed — describe it, let it work, review the result.</td></tr>
+        <tr><td><strong>Workflow</strong></td><td>A repeatable, multi-step pipeline defined in YAML — deterministic ordering, templated inputs, and an action allowlist. Reach for this when the same sequence runs again and again.</td></tr>
+      </tbody>
+    </table>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/autoflows.html">&#8592; Autoflows</a>
+      <a href="/docs/examples/">Examples &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

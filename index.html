@@ -23,7 +23,11 @@
     <span class="mark" aria-hidden="true">&#8734;</span>
     <span class="name">rupu</span>
   </a>
-  <span class="soon">Coming soon</span>
+  <span class="navlinks">
+    <a href="/docs/">Docs</a>
+    <a class="hide-sm" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub</a>
+    <a class="dl" href="#download">Download</a>
+  </span>
 </nav>
 
 <!-- ── Hero ─────────────────────────────────────────────── -->
@@ -32,8 +36,8 @@
   <h1 class="tagline">Don&rsquo;t code it, rupu it.</h1>
   <p class="subtagline">The agentic code-development platform.</p>
   <div class="cta-row">
-    <a class="btn primary" href="#what">See what it does</a>
-    <a class="btn" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+    <a class="btn primary" href="/docs/">Get started</a>
+    <a class="btn" href="#download">Download</a>
   </div>
   <a class="scroll-cue" href="#what" aria-label="Scroll down">&#8595;</a>
 </header>
@@ -100,11 +104,31 @@
     </div>
   </section>
 
+  <!-- ── Download ───────────────────────────────────────── -->
+  <section id="download" class="wrap download">
+    <p class="eyebrow reveal">Download</p>
+    <p class="lede reveal">Get rupu.</p>
+    <div class="dl-card reveal">
+      <div class="dl-ver" id="dl-ver">Latest release</div>
+      <div class="dl-primary">
+        <a class="btn primary" id="dl-btn" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">Download for macOS</a>
+      </div>
+      <div class="dl-sub" id="dl-sub">Apple Silicon · signed binary · <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">all releases</a></div>
+
+      <div class="dl-or">or build from source</div>
+      <div class="code-line">
+        <code id="dl-cargo">cargo install --git https://github.com/Section9Labs/rupu</code>
+        <button class="copy-btn" data-copy="#dl-cargo" type="button">Copy</button>
+      </div>
+      <p class="dl-sub">Then run <code class="inline">rupu init</code> and <code class="inline">rupu --help</code>. See the <a class="link" href="/docs/">docs</a> to get started.</p>
+    </div>
+  </section>
+
   <!-- ── Closing CTA ────────────────────────────────────── -->
   <section class="wrap closing">
     <div class="mark reveal" aria-hidden="true">&#8734;</div>
     <h2 class="reveal">Don&rsquo;t code it, rupu it.</h2>
-    <p class="reveal">Launching soon.</p>
+    <p class="reveal">Open source &middot; available now.</p>
   </section>
 </main>
 
@@ -129,6 +153,44 @@
       entries.forEach(function (en) { if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); } });
     }, { threshold: 0.15 });
     els.forEach(function (e) { io.observe(e); });
+  })();
+
+  // copy-to-clipboard buttons
+  document.querySelectorAll('.copy-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var el = document.querySelector(btn.getAttribute('data-copy'));
+      if (!el) return;
+      navigator.clipboard.writeText(el.textContent.trim()).then(function () {
+        var t = btn.textContent; btn.textContent = 'Copied'; setTimeout(function () { btn.textContent = t; }, 1400);
+      });
+    });
+  });
+
+  // live "latest release" — newest release including pre-releases (the -build
+  // stream). GitHub's /releases/latest ignores pre-releases, so we read /releases.
+  (function () {
+    var verEl = document.getElementById('dl-ver');
+    var btn = document.getElementById('dl-btn');
+    var sub = document.getElementById('dl-sub');
+    if (!verEl || !btn) return;
+    fetch('https://api.github.com/repos/Section9Labs/rupu/releases?per_page=1', {
+      headers: { 'Accept': 'application/vnd.github+json' }
+    }).then(function (r) { return r.ok ? r.json() : null; }).then(function (rels) {
+      if (!rels || !rels.length) return;
+      var rel = rels[0];
+      var ver = (rel.tag_name || '').replace(/-build$/, '');
+      verEl.textContent = ver ? 'Latest · ' + ver : 'Latest release';
+      // prefer the raw macOS binary asset named "rupu"
+      var bin = (rel.assets || []).filter(function (a) { return a.name === 'rupu'; })[0]
+             || (rel.assets || []).filter(function (a) { return /darwin|macos|\.tar\.gz$/.test(a.name) && !/\.sha256$/.test(a.name); })[0];
+      if (bin) {
+        btn.href = bin.browser_download_url;
+        btn.removeAttribute('target');
+        if (sub) sub.innerHTML = 'Apple Silicon · signed binary (' + ver + ') · <a class="link" href="' + rel.html_url + '" target="_blank" rel="noopener">all releases</a>';
+      } else {
+        btn.href = rel.html_url;
+      }
+    }).catch(function () { /* keep the static fallback (releases page) */ });
   })();
 </script>
 </body>

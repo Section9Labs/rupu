@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Getting started</title>
+<meta name="description" content="rupu documentation: install rupu and learn to build agents, workflows, autoflows, and sessions.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item active" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Go further</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>rupu documentation</h1>
+    <p class="intro">rupu is an agentic code-development platform. You describe the work; agents and workflows do it — from the terminal, autonomously on triggers, or from a visual control plane.</p>
+
+    <div class="callout"><strong>Don't code it, rupu it.</strong> Define agents as plain Markdown, compose them into workflows, run them by hand or on triggers, and review everything with full transcripts and approvals.</div>
+
+    <h2>Install</h2>
+    <p>rupu is open source. Grab the latest signed macOS binary, or build from source with Cargo (any platform with a Rust toolchain).</p>
+    <h3>macOS (Apple Silicon)</h3>
+    <p>Download the latest <code class="inline">rupu</code> binary from the <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">releases page</a> (or the <a class="link" href="/#download">Download</a> section), then:</p>
+    <pre class="code"><span class="c"># make it executable and put it on your PATH</span>
+chmod +x ./rupu
+sudo mv ./rupu /usr/local/bin/rupu
+rupu --version</pre>
+    <h3>From source</h3>
+    <pre class="code">cargo install --git https://github.com/Section9Labs/rupu</pre>
+
+    <h2>Your first run</h2>
+    <p>Initialize rupu in a repo, authenticate a provider, then run an agent:</p>
+    <pre class="code"><span class="c"># scaffold .rupu/ (agents + workflows) in the current repo</span>
+rupu init
+
+<span class="c"># connect a model provider (Anthropic, OpenAI, Gemini, Copilot…)</span>
+rupu auth login
+
+<span class="c"># run a one-off agent against a prompt</span>
+rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
+    <p>Everything rupu does is recorded as a JSONL transcript you can inspect with <code class="inline">rupu transcript</code>.</p>
+
+    <h2>The four building blocks</h2>
+    <p>Read these in order — each builds on the last.</p>
+    <div class="doc-grid">
+      <a class="card" href="/docs/agents.html">
+        <div class="ic" aria-hidden="true">&#9673;</div>
+        <h3>Agents &#8594;</h3>
+        <p>A single AI worker defined in Markdown + YAML: provider, model, tools, permissions, and a system prompt.</p>
+      </a>
+      <a class="card" href="/docs/workflows.html">
+        <div class="ic" aria-hidden="true">&#9783;</div>
+        <h3>Workflows &#8594;</h3>
+        <p>Multiple agents composed into steps — sequential, fan-out, parallel panels, gated review loops, approvals.</p>
+      </a>
+      <a class="card" href="/docs/autoflows.html">
+        <div class="ic" aria-hidden="true">&#8635;</div>
+        <h3>Autoflows &#8594;</h3>
+        <p>Workflows that run themselves — fired by cron or SCM events, claiming issues and opening PRs autonomously.</p>
+      </a>
+      <a class="card" href="/docs/sessions.html">
+        <div class="ic" aria-hidden="true">&#9636;</div>
+        <h3>Sessions &#8594;</h3>
+        <p>Long-lived, interactive agent conversations — in the terminal or live in the web control plane.</p>
+      </a>
+    </div>
+
+    <h2>Then go further</h2>
+    <ul>
+      <li><a class="link" href="/docs/examples/">Examples</a> — complete, real-world scenarios you can copy.</li>
+      <li><a class="link" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">Source &amp; issues on GitHub</a>.</li>
+    </ul>
+
+    <div class="doc-nav">
+      <span></span>
+      <a href="/docs/agents.html">Agents &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

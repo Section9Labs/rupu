@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Agents</title>
+<meta name="description" content="An agent in rupu is a single AI worker: a Markdown file with YAML frontmatter for config and a body that becomes the system prompt.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item active" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Go further</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Agents</h1>
+    <p class="intro">An agent is a single AI worker — one Markdown file whose YAML frontmatter configures it and whose body becomes its system prompt.</p>
+
+    <h2>What is an agent</h2>
+    <p>
+      An <strong>agent</strong> is the smallest unit of work in rupu: a narrow, single-purpose AI worker.
+      Each agent lives in one Markdown file. The file has two parts — a block of YAML
+      <strong>frontmatter</strong> that tells rupu how to run the agent (which provider, which model,
+      which tools, what it is allowed to do), and a Markdown <strong>body</strong> that is sent verbatim
+      to the model as its system prompt.
+    </p>
+    <p>
+      Good agents are narrow, explicit, and testable. A well-scoped agent answers six questions clearly:
+      what job it owns, what tools it may use, what sequence it should follow, what counts as done,
+      what it must not do, and what shape the final answer should take. When several specialists, review
+      boundaries, or fix loops are involved, reach for a <a class="link" href="/docs/workflows.html">workflow</a>
+      instead of one giant prompt.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Anatomy of an agent file">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box" x="20" y="20" width="250" height="56" rx="10"></rect>
+        <text class="d-label" x="145" y="42" text-anchor="middle">YAML frontmatter</text>
+        <text class="d-sub" x="145" y="60" text-anchor="middle">provider · model · tools · permissions</text>
+        <rect class="d-box" x="20" y="124" width="250" height="56" rx="10"></rect>
+        <text class="d-label" x="145" y="146" text-anchor="middle">system prompt</text>
+        <text class="d-sub" x="145" y="164" text-anchor="middle">the Markdown body</text>
+        <line class="d-edge" x1="270" y1="48" x2="430" y2="92" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="270" y1="152" x2="430" y2="108" marker-end="url(#ar)"></line>
+        <rect class="d-box-accent" x="430" y="72" width="190" height="56" rx="10"></rect>
+        <text class="d-label" x="525" y="94" text-anchor="middle">an agent</text>
+        <text class="d-sub" x="525" y="112" text-anchor="middle">rupu run &lt;name&gt;</text>
+      </svg>
+      <figcaption>Config plus a system prompt is everything an agent is.</figcaption>
+    </figure>
+
+    <h2>The agent file</h2>
+    <p>
+      An agent is a Markdown file with YAML frontmatter. The frontmatter (between the opening and closing
+      <code class="inline">---</code> lines) tells rupu how to run the agent; everything after the closing
+      <code class="inline">---</code> is the system prompt. rupu parses the frontmatter with
+      <strong>strict unknown-field rejection</strong> — a misspelled key fails fast rather than being silently ignored.
+    </p>
+    <p>Agent files resolve from two locations:</p>
+    <ul>
+      <li><code class="inline">~/.rupu/agents/&lt;name&gt;.md</code> — global agents (personal utilities).</li>
+      <li><code class="inline">&lt;project&gt;/.rupu/agents/&lt;name&gt;.md</code> — project-local agents (checked into the repo).</li>
+    </ul>
+    <p>
+      Project-local agents <strong>shadow</strong> global agents by <code class="inline">name:</code>. Shadowing
+      is all-or-nothing — rupu does not merge frontmatter or prompts. <code class="inline">rupu agent list</code>
+      shows whether each agent comes from project or global scope.
+    </p>
+
+    <h3>Frontmatter fields</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>string</td><td>required</td><td>Agent identifier used by <code class="inline">rupu run &lt;name&gt;</code> and by workflows.</td></tr>
+        <tr><td><code>description</code></td><td>string</td><td>none</td><td>Human-readable summary shown by <code class="inline">rupu agent list</code>.</td></tr>
+        <tr><td><code>provider</code></td><td>string</td><td><code>anthropic</code></td><td>Which LLM provider to use: <code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, or <code class="inline">copilot</code>.</td></tr>
+        <tr><td><code>auth</code></td><td><code>api-key</code> | <code>sso</code></td><td>resolver chooses</td><td>Optional auth-mode hint when a provider has both credentials.</td></tr>
+        <tr><td><code>model</code></td><td>string</td><td>config default, else <code>claude-sonnet-4-6</code></td><td>Provider-specific model id. Not validated at parse time.</td></tr>
+        <tr><td><code>tools</code></td><td>array&lt;string&gt;</td><td>built-in + discovered MCP tools</td><td>The agent's tool allowlist. Strongly recommended to declare explicitly.</td></tr>
+        <tr><td><code>maxTurns</code></td><td>integer</td><td><code>50</code></td><td>Hard cap on model turns (not a token budget).</td></tr>
+        <tr><td><code>permissionMode</code></td><td><code>ask</code> | <code>bypass</code> | <code>readonly</code></td><td><code>ask</code></td><td>Permission model for shell and write effects. CLI <code class="inline">--mode</code> overrides it.</td></tr>
+        <tr><td><code>effort</code></td><td>string</td><td>provider default</td><td>Cross-provider reasoning level: <code class="inline">auto</code>, <code class="inline">minimal</code>, <code class="inline">low</code>, <code class="inline">medium</code>, <code class="inline">high</code>, <code class="inline">max</code>.</td></tr>
+        <tr><td><code>contextWindow</code></td><td>string</td><td>model default</td><td>Cross-provider context tier: <code class="inline">default</code> or <code class="inline">1m</code>.</td></tr>
+        <tr><td><code>outputFormat</code></td><td><code>text</code> | <code>json</code></td><td>free-form text</td><td>Hint for structured output; describe the JSON shape in the prompt too.</td></tr>
+        <tr><td><code>anthropicOauthPrefix</code></td><td>bool</td><td>provider default</td><td>Anthropic SSO only — enables/disables the OAuth system prefix.</td></tr>
+        <tr><td><code>anthropicTaskBudget</code></td><td>integer</td><td>none</td><td>Anthropic-only soft output budget, separate from <code class="inline">maxTurns</code>.</td></tr>
+        <tr><td><code>anthropicContextManagement</code></td><td>string</td><td>none</td><td>Anthropic-only server-side pruning of older tool blocks (<code class="inline">tool_clearing</code>).</td></tr>
+        <tr><td><code>anthropicSpeed</code></td><td>string</td><td>none</td><td>Anthropic-only account-gated fast mode (<code class="inline">fast</code>).</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Note.</strong> Keep agents portable by avoiding the <code class="inline">anthropic*</code> fields unless
+      you specifically need them. For checked-in repo agents, set <code class="inline">provider</code>,
+      <code class="inline">model</code>, <code class="inline">tools</code>, and <code class="inline">permissionMode</code>
+      explicitly so behavior does not drift with a mutable global default.
+    </div>
+
+    <h2>A complete example</h2>
+    <p>
+      This is the <code class="inline">code-reviewer</code> agent that ships as a rupu template — a read-only
+      reviewer that can inspect a local file, a diff, or a pull request and return concise findings.
+    </p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">code-reviewer</span>
+<span class="k">description</span>: <span class="s">Read a file, diff, or PR and return concise textual findings.</span>
+<span class="k">provider</span>: <span class="s">anthropic</span>
+<span class="k">model</span>: <span class="s">claude-sonnet-4-6</span>
+<span class="k">tools</span>: <span class="v">[read_file, grep, glob, scm.prs.get, scm.prs.diff]</span>
+<span class="k">maxTurns</span>: <span class="v">12</span>
+<span class="k">permissionMode</span>: <span class="s">readonly</span>
+<span class="c">---</span>
+
+You are a code reviewer.
+
+If the prompt contains a PR reference, use the SCM tools to inspect the PR metadata and diff.
+If the prompt names local files or includes a diff, review that directly.
+
+Focus on:
+- correctness bugs
+- missing edge-case handling
+- unclear or brittle structure
+- missing tests where behavior changed
+
+Return either:
+- <span class="s">`no issues`</span>
+- or a short bulleted list ordered by severity
+
+Do not edit code.</pre>
+    <p>
+      Note the shape: the frontmatter pins a provider and model, declares the smallest useful tool set, and
+      runs <code class="inline">readonly</code> so a <em>reviewer</em> can never mutate the thing it is reviewing.
+      The body gives the agent a role, a process, and an explicit output contract.
+    </p>
+
+    <h2>Tools &amp; permissions</h2>
+    <p>
+      The <code class="inline">tools:</code> field is the agent's tool allowlist. If you omit it, the agent gets
+      the full built-in surface plus, when SCM / issue connectors are configured, any discovered MCP tools. For
+      reusable repo agents, an explicit list is far better than the implicit wide-open default.
+    </p>
+    <p>The built-in tools are:</p>
+    <ul>
+      <li><code class="inline">bash</code> — run shell commands</li>
+      <li><code class="inline">read_file</code> · <code class="inline">write_file</code> · <code class="inline">edit_file</code> — file I/O</li>
+      <li><code class="inline">grep</code> · <code class="inline">glob</code> — search and match</li>
+    </ul>
+    <p>
+      MCP-backed tool names are also valid — for example <code class="inline">scm.prs.get</code>,
+      <code class="inline">scm.prs.diff</code>, <code class="inline">scm.prs.create</code>,
+      <code class="inline">issues.get</code>, <code class="inline">issues.comment</code>. The allowlist supports
+      exact matches (<code class="inline">scm.prs.get</code>), prefix wildcards (<code class="inline">scm.*</code>),
+      and a global wildcard (<code class="inline">*</code>).
+    </p>
+    <div class="callout">
+      <strong>Tools vs. actions.</strong> <code class="inline">tools:</code> gates the tool calls an agent may
+      make. It is <em>not</em> the same as a workflow's <code class="inline">actions:</code>, which gates the
+      action protocol emitted from agent output inside a workflow.
+    </div>
+    <h3>Permission modes</h3>
+    <p>
+      <code class="inline">permissionMode</code> controls what an agent may do without confirmation:
+    </p>
+    <table>
+      <thead><tr><th>Mode</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>ask</code></td><td>Prompt before shell and write effects. The safest default for agents that edit code.</td></tr>
+        <tr><td><code>bypass</code></td><td>Execute allowed tools without confirmation.</td></tr>
+        <tr><td><code>readonly</code></td><td>Allow reads, deny writes.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">readonly</code> blocks the built-in writes (<code class="inline">write_file</code>,
+      <code class="inline">edit_file</code>, destructive shell work via <code class="inline">bash</code>) and MCP
+      write tools such as <code class="inline">scm.prs.create</code>, <code class="inline">issues.comment</code>,
+      <code class="inline">issues.create</code>, and <code class="inline">scm.branches.create</code>. Because
+      <code class="inline">ask</code> cannot proceed in a non-interactive context, pass
+      <code class="inline">--mode bypass</code> or <code class="inline">--mode readonly</code> explicitly there. The
+      CLI <code class="inline">--mode</code> flag always overrides the value in the file.
+    </p>
+
+    <h2>Providers &amp; models</h2>
+    <p>
+      rupu supports four LLM providers, each with two authentication modes (API key or SSO):
+    </p>
+    <table>
+      <thead><tr><th>Provider</th><th>API key</th><th>SSO</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>anthropic</code></td><td>yes</td><td>browser callback</td><td>Console API key or Claude.ai SSO. The most exercised provider.</td></tr>
+        <tr><td><code>openai</code></td><td>yes</td><td>browser callback</td><td>Platform API key or ChatGPT SSO.</td></tr>
+        <tr><td><code>gemini</code></td><td>yes</td><td>browser callback</td><td>API key via Google AI Studio; SSO via Vertex / CLI.</td></tr>
+        <tr><td><code>copilot</code></td><td>yes</td><td>device code</td><td>API-key path uses a GitHub PAT; requires paid Copilot.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      An agent picks its provider with <code class="inline">provider:</code> and its model with
+      <code class="inline">model:</code>. Model ids are provider-specific and are <strong>not</strong> validated
+      at parse time — an invalid id fails at runtime when the provider is called. When an agent omits
+      <code class="inline">model:</code>, rupu falls back to the provider's
+      <code class="inline">default_model</code> from <code class="inline">~/.rupu/config.toml</code>; there is no
+      global default, so the agent must either set <code class="inline">model:</code> or have one resolvable in config.
+    </p>
+    <p>
+      <code class="inline">rupu run</code> resolves a model id through three sources, in order: custom entries
+      under <code class="inline">[[providers.&lt;name&gt;.models]]</code> in config, the live cache
+      (<code class="inline">~/.rupu/cache/models/&lt;provider&gt;.json</code>, TTL 1h), then a baked-in list for
+      providers with limited listing endpoints. Inspect what is available with
+      <code class="inline">rupu models list</code> and refresh the caches with
+      <code class="inline">rupu models refresh</code>.
+    </p>
+    <p>
+      Authenticate a provider before running an agent against it:
+    </p>
+    <pre class="code"><span class="c"># API key (or pipe the secret on stdin)</span>
+rupu auth login --provider anthropic --mode api-key --key &lt;secret&gt;
+
+<span class="c"># SSO</span>
+rupu auth login --provider anthropic --mode sso</pre>
+
+    <h2>Running an agent</h2>
+    <p>List and inspect the agents rupu can see, then run one:</p>
+    <pre class="code"><span class="c"># list every resolvable agent (project + global scope)</span>
+rupu agent list
+
+<span class="c"># show one agent's resolved frontmatter and prompt</span>
+rupu agent show code-reviewer
+
+<span class="c"># run an agent with a prompt</span>
+rupu run code-reviewer --prompt <span class="s">"Review the staged diff for correctness bugs"</span></pre>
+    <p>
+      Use <code class="inline">--mode</code> to override the file's <code class="inline">permissionMode</code> at
+      run time — for example <code class="inline">--mode bypass</code> or <code class="inline">--mode readonly</code>
+      in a non-interactive context. Every run is recorded as a JSONL transcript you can replay later:
+    </p>
+    <pre class="code"><span class="c"># inspect a recorded run</span>
+rupu transcript</pre>
+    <div class="callout">
+      <strong>Next.</strong> When a job needs multiple specialists, review boundaries, fan-out, or fix loops,
+      compose agents into a <a class="link" href="/docs/workflows.html">workflow</a> rather than growing one
+      agent prompt.
+    </div>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/">&#8592; Overview</a>
+      <a href="/docs/workflows.html">Workflows &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Examples</title>
+<meta name="description" content="Three end-to-end rupu workflow examples — a specialist review panel, a sequential investigate-then-fix loop, and a parallel per-file review fan-out — shown with their real bundled YAML.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Go further</div>
+    <a class="item active" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Examples</h1>
+    <p class="intro">Three complete, real-world workflows. Every one of these ships with <code class="inline">rupu init</code>, so you can run them the moment your project is set up — no extra files to write.</p>
+
+    <p>Each scenario below is a workflow template that rupu drops into <code class="inline">.rupu/workflows/</code>. The YAML is quoted verbatim from the bundled templates, the agents it calls live in <code class="inline">.rupu/agents/</code>, and the run command is built from the workflow's own declared inputs. Pick the shape that matches your problem and adapt it.</p>
+
+    <div class="callout"><strong>Before you start.</strong> Run <code class="inline">rupu init</code> in your repo once. It writes the agents and workflows referenced here. List what you have with <code class="inline">rupu workflow list</code>, and inspect any one with <code class="inline">rupu workflow show &lt;name&gt;</code>.</div>
+
+    <!-- ───────────────────────── Scenario 1 ───────────────────────── -->
+    <h2>1 · A specialist review panel</h2>
+    <p><strong>Goal.</strong> Put one diff in front of three reviewers at once — security, performance, maintainability — then collapse their structured findings into a single readable summary.</p>
+
+    <p><strong>How it works.</strong></p>
+    <ol>
+      <li>The <code class="inline">review</code> step has no single agent — it declares a <strong>panel</strong>. The three panelists (<code class="inline">security-reviewer</code>, <code class="inline">performance-reviewer</code>, <code class="inline">maintainability-reviewer</code>) each run the same <code class="inline">subject</code> — the diff you passed in.</li>
+      <li>Each panelist is a <code class="inline">readonly</code> agent with <code class="inline">outputFormat: json</code>, so the panel produces a merged, structured result: a <code class="inline">max_severity</code> gate and a flat <code class="inline">findings</code> list tagged with their <code class="inline">source</code>.</li>
+      <li><code class="inline">max_parallel: 3</code> lets all three reviewers run concurrently.</li>
+      <li>The <code class="inline">summarize</code> step (the <code class="inline">writer</code> agent, no tools) reads <code class="inline">steps.review.max_severity</code> and loops over <code class="inline">steps.review.findings</code> to write the final report.</li>
+    </ol>
+
+    <pre class="code"><span class="k">name</span>: <span class="s">code-review-panel</span>
+<span class="k">description</span>: <span class="s">Run a specialist review panel over one diff or review subject.</span>
+<span class="k">inputs</span>:
+  <span class="k">diff</span>:
+    <span class="k">type</span>: <span class="v">string</span>
+    <span class="k">required</span>: <span class="v">true</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">review</span>
+    <span class="k">actions</span>: []
+    <span class="k">panel</span>:
+      <span class="k">panelists</span>:
+        - <span class="v">security-reviewer</span>
+        - <span class="v">performance-reviewer</span>
+        - <span class="v">maintainability-reviewer</span>
+      <span class="k">subject</span>: <span class="s">"&#123;&#123; inputs.diff &#125;&#125;"</span>
+      <span class="k">max_parallel</span>: <span class="v">3</span>
+
+  - <span class="k">id</span>: <span class="v">summarize</span>
+    <span class="k">agent</span>: <span class="v">writer</span>
+    <span class="k">actions</span>: []
+    <span class="k">prompt</span>: |
+      <span class="s">Summarize this review panel result.</span>
+
+      <span class="s">Max severity: &#123;&#123; steps.review.max_severity &#125;&#125;</span>
+      <span class="s">Findings count: &#123;&#123; steps.review.findings | length &#125;&#125;</span>
+
+      <span class="v">&#123;&#37; for f in steps.review.findings &#37;&#125;</span>
+      <span class="s">- [&#123;&#123; f.severity &#125;&#125;] &#123;&#123; f.title &#125;&#125; (&#123;&#123; f.source &#125;&#125;): &#123;&#123; f.body &#125;&#125;</span>
+      <span class="v">&#123;&#37; endfor &#37;&#125;</span></pre>
+
+    <p><strong>Run it.</strong> The one required input is <code class="inline">diff</code>:</p>
+    <pre class="code"><span class="c"># pipe in a diff, or pass any review subject as a string</span>
+rupu workflow run code-review-panel --input diff=<span class="s">"$(git diff main...HEAD)"</span></pre>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 240" role="img" aria-label="Panel of three reviewers running in parallel, gated on max severity, feeding a writer summary">
+        <defs>
+          <marker id="ar1" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <!-- input -->
+        <rect class="d-box" x="14" y="92" width="120" height="48" rx="10"></rect>
+        <text class="d-label" x="74" y="113" text-anchor="middle">diff</text>
+        <text class="d-sub" x="74" y="129" text-anchor="middle">input</text>
+        <!-- fan to panelists -->
+        <line class="d-edge" x1="134" y1="116" x2="220" y2="40" marker-end="url(#ar1)"></line>
+        <line class="d-edge" x1="134" y1="116" x2="220" y2="116" marker-end="url(#ar1)"></line>
+        <line class="d-edge" x1="134" y1="116" x2="220" y2="192" marker-end="url(#ar1)"></line>
+        <rect class="d-box-accent" x="220" y="16" width="170" height="48" rx="10"></rect>
+        <text class="d-label" x="305" y="37" text-anchor="middle">security-reviewer</text>
+        <text class="d-sub" x="305" y="53" text-anchor="middle">json · readonly</text>
+        <rect class="d-box-accent" x="220" y="92" width="170" height="48" rx="10"></rect>
+        <text class="d-label" x="305" y="113" text-anchor="middle">performance-reviewer</text>
+        <text class="d-sub" x="305" y="129" text-anchor="middle">json · readonly</text>
+        <rect class="d-box-accent" x="220" y="168" width="170" height="48" rx="10"></rect>
+        <text class="d-label" x="305" y="189" text-anchor="middle">maintainability</text>
+        <text class="d-sub" x="305" y="205" text-anchor="middle">json · readonly</text>
+        <!-- gate -->
+        <line class="d-edge" x1="390" y1="40" x2="452" y2="108" marker-end="url(#ar1)"></line>
+        <line class="d-edge" x1="390" y1="116" x2="452" y2="116" marker-end="url(#ar1)"></line>
+        <line class="d-edge" x1="390" y1="192" x2="452" y2="124" marker-end="url(#ar1)"></line>
+        <rect class="d-box" x="452" y="92" width="80" height="48" rx="10"></rect>
+        <text class="d-label" x="492" y="113" text-anchor="middle">merge</text>
+        <text class="d-sub" x="492" y="129" text-anchor="middle">max_severity</text>
+        <!-- summary -->
+        <line class="d-edge" x1="532" y1="116" x2="566" y2="116" marker-end="url(#ar1)"></line>
+        <rect class="d-box" x="566" y="92" width="64" height="48" rx="10"></rect>
+        <text class="d-label" x="598" y="113" text-anchor="middle">writer</text>
+        <text class="d-sub" x="598" y="129" text-anchor="middle">summary</text>
+      </svg>
+      <figcaption>Three panelists review the same diff in parallel; the merged findings and max&#8209;severity feed a single writer summary.</figcaption>
+    </figure>
+
+    <!-- ───────────────────────── Scenario 2 ───────────────────────── -->
+    <h2>2 · Investigate, then fix</h2>
+    <p><strong>Goal.</strong> Hand a bug to a single agent twice — first to find the root cause without touching anything, then to apply the smallest possible fix that follows from what it found.</p>
+
+    <p><strong>How it works.</strong></p>
+    <ol>
+      <li>The <code class="inline">investigate</code> step runs the <code class="inline">fix-bug</code> agent on <code class="inline">inputs.prompt</code> and explicitly tells it to <em>stop without making edits</em> and report the root cause as plain text.</li>
+      <li>The <code class="inline">propose</code> step runs the same agent again, but feeds <code class="inline">steps.investigate.output</code> straight into the prompt — the second pass is grounded in the first. This is the data-flow pattern: one step's <code class="inline">output</code> becomes the next step's input.</li>
+      <li>Because <code class="inline">fix-bug</code> runs in <code class="inline">ask</code> mode, the actual edits in step two surface as approvals you confirm.</li>
+    </ol>
+
+    <pre class="code"><span class="k">name</span>: <span class="s">investigate-then-fix</span>
+<span class="k">description</span>: <span class="s">Two-step bug fix — investigate, then propose minimal edit.</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">investigate</span>
+    <span class="k">agent</span>: <span class="v">fix-bug</span>
+    <span class="k">actions</span>: []
+    <span class="k">prompt</span>: |
+      <span class="s">Investigate the bug described by:</span>
+      <span class="s">&#123;&#123; inputs.prompt &#125;&#125;</span>
+
+      <span class="s">Stop without making edits. Report the root cause as text.</span>
+  - <span class="k">id</span>: <span class="v">propose</span>
+    <span class="k">agent</span>: <span class="v">fix-bug</span>
+    <span class="k">actions</span>: []
+    <span class="k">prompt</span>: |
+      <span class="s">Based on this investigation:</span>
+      <span class="s">&#123;&#123; steps.investigate.output &#125;&#125;</span>
+      <span class="s">Propose and apply the minimal fix.</span></pre>
+
+    <p><strong>Run it.</strong> This workflow has no <code class="inline">inputs</code> block, but its prompt references <code class="inline">inputs.prompt</code> — so pass that key:</p>
+    <pre class="code">rupu workflow run investigate-then-fix \
+  --input prompt=<span class="s">"test_parse_config panics on an empty file"</span></pre>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 120" role="img" aria-label="Investigate then propose: output of step one feeds the prompt of step two">
+        <defs>
+          <marker id="ar2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box" x="10" y="36" width="150" height="48" rx="10"></rect>
+        <text class="d-label" x="85" y="58" text-anchor="middle">inputs.prompt</text>
+        <text class="d-sub" x="85" y="74" text-anchor="middle">bug report</text>
+        <line class="d-edge" x1="160" y1="60" x2="220" y2="60" marker-end="url(#ar2)"></line>
+        <rect class="d-box-accent" x="220" y="36" width="160" height="48" rx="10"></rect>
+        <text class="d-label" x="300" y="58" text-anchor="middle">investigate</text>
+        <text class="d-sub" x="300" y="74" text-anchor="middle">fix-bug · no edits</text>
+        <line class="d-edge" x1="380" y1="60" x2="450" y2="60" marker-end="url(#ar2)"></line>
+        <text class="d-sub" x="415" y="50" text-anchor="middle">.output</text>
+        <rect class="d-box-accent" x="450" y="36" width="180" height="48" rx="10"></rect>
+        <text class="d-label" x="540" y="58" text-anchor="middle">propose</text>
+        <text class="d-sub" x="540" y="74" text-anchor="middle">fix-bug · ask · apply</text>
+      </svg>
+      <figcaption>Sequential: the root cause from <code class="inline">investigate</code> flows forward as the grounding for <code class="inline">propose</code>.</figcaption>
+    </figure>
+
+    <!-- ───────────────────────── Scenario 3 ───────────────────────── -->
+    <h2>3 · Review every changed file in parallel</h2>
+    <p><strong>Goal.</strong> Take one list of files, run the same reviewer over each of them at once, then merge all the per-file notes into one engineering summary.</p>
+
+    <p><strong>How it works.</strong></p>
+    <ol>
+      <li>The <code class="inline">review_each</code> step uses <code class="inline">for_each: "&#123;&#123; inputs.files &#125;&#125;"</code> to fan one <code class="inline">code-reviewer</code> agent out across the list — one independent run per file.</li>
+      <li>Inside the loop the prompt can reach <code class="inline">item</code> (the current file) plus <code class="inline">loop.index</code> and <code class="inline">loop.length</code> for positional context.</li>
+      <li><code class="inline">max_parallel: 4</code> caps how many file reviews run at the same time.</li>
+      <li>The <code class="inline">summarize</code> step iterates <code class="inline">steps.review_each.results</code> — the collected outputs of every iteration — and the <code class="inline">writer</code> agent folds them into one summary.</li>
+    </ol>
+
+    <pre class="code"><span class="k">name</span>: <span class="s">review-changed-files</span>
+<span class="k">description</span>: <span class="s">Fan out one reviewer across a list of files and aggregate the findings.</span>
+<span class="k">inputs</span>:
+  <span class="k">files</span>:
+    <span class="k">type</span>: <span class="v">string</span>
+    <span class="k">required</span>: <span class="v">true</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">review_each</span>
+    <span class="k">agent</span>: <span class="v">code-reviewer</span>
+    <span class="k">actions</span>: []
+    <span class="k">for_each</span>: <span class="s">"&#123;&#123; inputs.files &#125;&#125;"</span>
+    <span class="k">max_parallel</span>: <span class="v">4</span>
+    <span class="k">prompt</span>: |
+      <span class="s">Review file &#123;&#123; item &#125;&#125; (&#123;&#123; loop.index &#125;&#125; of &#123;&#123; loop.length &#125;&#125;).</span>
+      <span class="s">Return either `no issues` or a short bulleted list.</span>
+
+  - <span class="k">id</span>: <span class="v">summarize</span>
+    <span class="k">agent</span>: <span class="v">writer</span>
+    <span class="k">actions</span>: []
+    <span class="k">prompt</span>: |
+      <span class="s">Combine these per-file reviews into one concise engineering summary.</span>
+
+      <span class="v">&#123;&#37; for r in steps.review_each.results &#37;&#125;</span>
+      <span class="s">---</span>
+      <span class="s">&#123;&#123; r &#125;&#125;</span>
+      <span class="v">&#123;&#37; endfor &#37;&#125;</span></pre>
+
+    <p><strong>Run it.</strong> The required <code class="inline">files</code> input is the list to fan out over:</p>
+    <pre class="code"><span class="c"># review every file that changed against main</span>
+rupu workflow run review-changed-files \
+  --input files=<span class="s">"$(git diff --name-only main...HEAD)"</span></pre>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 240" role="img" aria-label="One file list fans out to N parallel reviewers, then aggregates into one summary">
+        <defs>
+          <marker id="ar3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box" x="10" y="92" width="120" height="48" rx="10"></rect>
+        <text class="d-label" x="70" y="113" text-anchor="middle">files</text>
+        <text class="d-sub" x="70" y="129" text-anchor="middle">for_each</text>
+        <line class="d-edge" x1="130" y1="116" x2="230" y2="40" marker-end="url(#ar3)"></line>
+        <line class="d-edge" x1="130" y1="116" x2="230" y2="92" marker-end="url(#ar3)"></line>
+        <line class="d-edge" x1="130" y1="116" x2="230" y2="144" marker-end="url(#ar3)"></line>
+        <line class="d-edge" x1="130" y1="116" x2="230" y2="196" marker-end="url(#ar3)"></line>
+        <rect class="d-box-accent" x="230" y="16" width="180" height="44" rx="10"></rect>
+        <text class="d-label" x="320" y="36" text-anchor="middle">code-reviewer · file 1</text>
+        <text class="d-sub" x="320" y="51" text-anchor="middle">item · loop.index</text>
+        <rect class="d-box-accent" x="230" y="68" width="180" height="44" rx="10"></rect>
+        <text class="d-label" x="320" y="88" text-anchor="middle">code-reviewer · file 2</text>
+        <text class="d-sub" x="320" y="103" text-anchor="middle">max_parallel: 4</text>
+        <rect class="d-box-accent" x="230" y="120" width="180" height="44" rx="10"></rect>
+        <text class="d-label" x="320" y="140" text-anchor="middle">code-reviewer · file 3</text>
+        <text class="d-sub" x="320" y="155" text-anchor="middle">…</text>
+        <rect class="d-box-accent" x="230" y="172" width="180" height="44" rx="10"></rect>
+        <text class="d-label" x="320" y="192" text-anchor="middle">code-reviewer · file N</text>
+        <text class="d-sub" x="320" y="207" text-anchor="middle">readonly</text>
+        <line class="d-edge" x1="410" y1="38" x2="476" y2="106" marker-end="url(#ar3)"></line>
+        <line class="d-edge" x1="410" y1="90" x2="476" y2="112" marker-end="url(#ar3)"></line>
+        <line class="d-edge" x1="410" y1="142" x2="476" y2="120" marker-end="url(#ar3)"></line>
+        <line class="d-edge" x1="410" y1="194" x2="476" y2="126" marker-end="url(#ar3)"></line>
+        <rect class="d-box" x="476" y="92" width="154" height="48" rx="10"></rect>
+        <text class="d-label" x="553" y="113" text-anchor="middle">summarize</text>
+        <text class="d-sub" x="553" y="129" text-anchor="middle">writer · .results</text>
+      </svg>
+      <figcaption>One input list fans out to N concurrent reviewers; <code class="inline">steps.review_each.results</code> aggregates into a single summary.</figcaption>
+    </figure>
+
+    <!-- ───────────────────────── Make your own ───────────────────────── -->
+    <h2>Make your own</h2>
+    <p>These three shapes — a parallel panel, a sequential hand-off, and a <code class="inline">for_each</code> fan-out — cover most real pipelines. To build your own, define the specialists you need as <a class="link" href="/docs/agents.html">Agents</a>, then wire them together with steps, panels, <code class="inline">for_each</code>, and <code class="inline">&#123;&#123; steps.&lt;id&gt;.output &#125;&#125;</code> data flow as described in <a class="link" href="/docs/workflows.html">Workflows</a>. Copy one of the bundled YAML files from <code class="inline">.rupu/workflows/</code> and edit from there.</p>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/sessions.html">&#8592; Sessions</a>
+      <a href="/docs/">Overview &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

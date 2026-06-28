@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Workflows</title>
+<meta name="description" content="A workflow composes several agents into ordered steps in one YAML file, passing data between steps with fan-out, parallel, panel-review, and human-approval shapes.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item active" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Go further</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Workflows</h1>
+    <p class="intro">A workflow composes several agents into ordered steps — one YAML file that orchestrates the run and passes data from each step to the next.</p>
+
+    <h2>What is a workflow</h2>
+    <p>
+      Where an <a class="link" href="/docs/agents.html">agent</a> is a single AI worker, a
+      <strong>workflow</strong> is several of them composed into an ordered process. It lives in one YAML
+      file and describes which specialist owns each stage, where the review and approval boundaries are, and
+      how data flows from one step to the next.
+    </p>
+    <p>A workflow can:</p>
+    <ul>
+      <li>run linear steps in order;</li>
+      <li>fan one agent out across many items with <code class="inline">for_each:</code>;</li>
+      <li>fan many specialist agents out over the same subject with <code class="inline">parallel:</code>;</li>
+      <li>run structured review panels with an optional fix loop using <code class="inline">panel:</code>;</li>
+      <li>pause for a human gate with <code class="inline">approval:</code>;</li>
+      <li>start manually, on cron, or from an event trigger.</li>
+    </ul>
+    <p>
+      Step prompts are rendered with minijinja templates against the workflow's inputs, prior step outputs,
+      and optional issue or event context — that is how data moves between steps. Workflow files resolve from
+      <code class="inline">~/.rupu/workflows/&lt;name&gt;.yaml</code> (global) and
+      <code class="inline">&lt;project&gt;/.rupu/workflows/&lt;name&gt;.yaml</code> (project-local), with
+      project-local files shadowing global ones by <code class="inline">name:</code>.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 660 220" role="img" aria-label="A workflow fanning out across steps">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <!-- investigate -->
+        <rect class="d-box" x="16" y="86" width="130" height="48" rx="10"></rect>
+        <text class="d-label" x="81" y="108" text-anchor="middle">investigate</text>
+        <text class="d-sub" x="81" y="124" text-anchor="middle">linear</text>
+        <line class="d-edge" x1="146" y1="110" x2="200" y2="110" marker-end="url(#ar)"></line>
+        <!-- plan -->
+        <rect class="d-box" x="200" y="86" width="130" height="48" rx="10"></rect>
+        <text class="d-label" x="265" y="108" text-anchor="middle">plan</text>
+        <text class="d-sub" x="265" y="124" text-anchor="middle">linear</text>
+        <!-- fan-out edges -->
+        <line class="d-edge" x1="330" y1="104" x2="392" y2="42" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="330" y1="110" x2="392" y2="110" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="330" y1="116" x2="392" y2="178" marker-end="url(#ar)"></line>
+        <!-- for_each items -->
+        <rect class="d-box-accent" x="392" y="18" width="150" height="44" rx="10"></rect>
+        <text class="d-label" x="467" y="38" text-anchor="middle">item 1</text>
+        <text class="d-sub" x="467" y="53" text-anchor="middle">for_each</text>
+        <rect class="d-box-accent" x="392" y="88" width="150" height="44" rx="10"></rect>
+        <text class="d-label" x="467" y="108" text-anchor="middle">item 2</text>
+        <text class="d-sub" x="467" y="123" text-anchor="middle">for_each</text>
+        <rect class="d-box-accent" x="392" y="158" width="150" height="44" rx="10"></rect>
+        <text class="d-label" x="467" y="178" text-anchor="middle">item 3</text>
+        <text class="d-sub" x="467" y="193" text-anchor="middle">for_each</text>
+        <!-- fan-in edges -->
+        <line class="d-edge" x1="542" y1="40" x2="600" y2="100" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="542" y1="110" x2="600" y2="110" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="542" y1="180" x2="600" y2="120" marker-end="url(#ar)"></line>
+        <!-- report -->
+        <rect class="d-box" x="600" y="86" width="50" height="48" rx="10"></rect>
+        <text class="d-label" x="625" y="114" text-anchor="middle">report</text>
+      </svg>
+      <figcaption>Steps run left to right; a <code class="inline">for_each:</code> step fans out over a list, then later steps consume the aggregate.</figcaption>
+    </figure>
+
+    <h2>The YAML format</h2>
+    <p>
+      A workflow is a YAML document with a handful of top-level keys. Only <code class="inline">name</code> and
+      a non-empty <code class="inline">steps</code> array are required; everything else is optional. The
+      frontmatter is parsed strictly — extraneous fields inside blocks such as <code class="inline">trigger:</code>
+      are rejected at parse time.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>string</td><td>yes</td><td>Workflow identifier used by <code class="inline">rupu workflow run &lt;name&gt;</code>.</td></tr>
+        <tr><td><code>description</code></td><td>string</td><td>no</td><td>Human-readable summary.</td></tr>
+        <tr><td><code>trigger</code></td><td>object</td><td>no</td><td>How the workflow starts: <code class="inline">manual</code> (default), <code class="inline">cron</code>, or <code class="inline">event</code>.</td></tr>
+        <tr><td><code>inputs</code></td><td>map</td><td>no</td><td>Typed runtime inputs (<code class="inline">type</code>, <code class="inline">required</code>, <code class="inline">default</code>, <code class="inline">enum</code>).</td></tr>
+        <tr><td><code>defaults</code></td><td>object</td><td>no</td><td>Workflow-wide defaults — e.g. <code class="inline">continue_on_error: true</code> inherited by steps.</td></tr>
+        <tr><td><code>contracts</code></td><td>object</td><td>no</td><td>Named structured outputs validated against a JSON Schema.</td></tr>
+        <tr><td><code>autoflow</code></td><td>object</td><td>no</td><td>Autonomous-ownership metadata for <code class="inline">rupu autoflow</code> (see <a class="link" href="/docs/autoflows.html">Autoflows</a>).</td></tr>
+        <tr><td><code>notifyIssue</code></td><td>bool</td><td>no</td><td>Auto-comment back only when the run target is an issue.</td></tr>
+        <tr><td><code>steps</code></td><td>array&lt;Step&gt;</td><td>yes</td><td>The ordered step list. An empty array is invalid.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Inputs are declared once and supplied at run time. Each input takes a <code class="inline">type</code> of
+      <code class="inline">string</code>, <code class="inline">int</code>, or <code class="inline">bool</code>; an
+      optional <code class="inline">required</code> flag; an optional <code class="inline">default</code> that must
+      match the type; and an optional <code class="inline">enum</code> of allowed stringified values.
+    </p>
+    <pre class="code"><span class="k">inputs</span>:
+  <span class="k">phase</span>:
+    <span class="k">type</span>: <span class="s">string</span>
+    <span class="k">required</span>: <span class="v">true</span>
+  <span class="k">retries</span>:
+    <span class="k">type</span>: <span class="s">int</span>
+    <span class="k">default</span>: <span class="v">3</span></pre>
+
+    <h2>Step kinds</h2>
+    <p>
+      Every step has a unique <code class="inline">id</code> and exactly one execution shape. A step is either a
+      <strong>linear</strong> step, a <code class="inline">for_each:</code> fan-out, a
+      <code class="inline">parallel:</code> multi-agent fan-out, or a <code class="inline">panel:</code> review.
+    </p>
+    <table>
+      <thead><tr><th>Shape</th><th>Defining fields</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>linear</code></td><td><code>agent</code> + <code>prompt</code></td><td>One agent runs one prompt; its output feeds the next step. The basic shape.</td></tr>
+        <tr><td><code>for_each</code></td><td><code>for_each</code> (+ <code>agent</code>, <code>prompt</code>)</td><td>Renders a list and runs the same agent once per item, with <code class="inline">max_parallel</code> concurrency.</td></tr>
+        <tr><td><code>parallel</code></td><td><code>parallel</code> (list of sub-steps)</td><td>Different specialists run concurrently over the subject. Each sub-step has its own <code>id</code> / <code>agent</code> / <code>prompt</code>; the parent must not set <code>agent</code> / <code>prompt</code>.</td></tr>
+        <tr><td><code>panel</code></td><td><code>panel</code> (<code>panelists</code> + <code>subject</code>)</td><td>Several reviewer agents emit structured findings over one subject, with an optional <code>gate</code> review/fix loop.</td></tr>
+      </tbody>
+    </table>
+    <p>These fields apply to <em>any</em> step regardless of shape:</p>
+    <table>
+      <thead><tr><th>Key</th><th>Applies to</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td>all</td><td>Unique within the workflow.</td></tr>
+        <tr><td><code>actions</code></td><td>all</td><td>Action-protocol allowlist — <strong>not</strong> a tool allowlist. Use <code class="inline">[]</code> unless you intentionally use the action protocol.</td></tr>
+        <tr><td><code>when</code></td><td>all</td><td>Minijinja expression reduced to truthy / falsy; falsy values are empty string, <code class="inline">false</code>, <code class="inline">0</code>, <code class="inline">no</code>, <code class="inline">off</code>.</td></tr>
+        <tr><td><code>continue_on_error</code></td><td>all</td><td>Tolerate failure and keep going; inherits the workflow default.</td></tr>
+        <tr><td><code>max_parallel</code></td><td><code>for_each</code>, <code>parallel</code>, <code>panel</code></td><td>Concurrency cap (at least 1).</td></tr>
+        <tr><td><code>approval</code></td><td>all</td><td>Human pause before the step dispatches (checked after <code class="inline">when:</code>).</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Conditional steps with <code class="inline">when:</code></h3>
+    <p>
+      <code class="inline">when:</code> is rendered as a template and then reduced to a boolean. If it is falsy
+      the step is skipped (and <code class="inline">steps.&lt;id&gt;.skipped</code> becomes true downstream).
+    </p>
+    <pre class="code"><span class="k">when</span>: <span class="s">"&#123;&#123; steps.review.success &#125;&#125;"</span>
+<span class="k">when</span>: <span class="s">"&#123;&#123; steps.panel.max_severity == 'critical' &#125;&#125;"</span></pre>
+
+    <h3>Human gates with <code class="inline">approval:</code></h3>
+    <p>
+      When a step sets <code class="inline">approval.required: true</code>, the run pauses before that step
+      dispatches. Resume with <code class="inline">rupu workflow approve &lt;run-id&gt;</code> or reject with
+      <code class="inline">rupu workflow reject &lt;run-id&gt; --reason "..."</code>.
+    </p>
+    <pre class="code"><span class="k">approval</span>:
+  <span class="k">required</span>: <span class="v">true</span>
+  <span class="k">prompt</span>: <span class="s">|</span>
+    <span class="s">About to deploy &#123;&#123; inputs.tag &#125;&#125;. Approve?</span>
+  <span class="k">timeout_seconds</span>: <span class="v">3600</span></pre>
+
+    <h3>The <code class="inline">panel:</code> gate loop</h3>
+    <p>
+      A <code class="inline">panel:</code> step runs its <code class="inline">panelists</code> over the rendered
+      <code class="inline">subject</code>; each panelist's final message must contain a parseable JSON object with
+      a <code class="inline">findings</code> array. An optional <code class="inline">gate</code> turns the panel into
+      a review/fix loop:
+    </p>
+    <table>
+      <thead><tr><th>Gate field</th><th>Required</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>until_no_findings_at_severity_or_above</code></td><td>yes</td><td>Severity threshold to clear: <code class="inline">low</code>, <code class="inline">medium</code>, <code class="inline">high</code>, or <code class="inline">critical</code>.</td></tr>
+        <tr><td><code>fix_with</code></td><td>yes</td><td>Agent that addresses findings between passes; its output becomes the next pass's subject.</td></tr>
+        <tr><td><code>max_iterations</code></td><td>yes</td><td>Cap on panel passes (at least 1). The loop stops when the gate clears or this is reached.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Template expressions</h2>
+    <p>
+      Prompts, <code class="inline">when:</code> conditions, and <code class="inline">for_each:</code> lists are
+      rendered with minijinja. Missing variables render as empty strings. The most common references are:
+    </p>
+    <table>
+      <thead><tr><th>Expression</th><th>Resolves to</th></tr></thead>
+      <tbody>
+        <tr><td><code>&#123;&#123; inputs.&lt;name&gt; &#125;&#125;</code></td><td>A runtime input value.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.output &#125;&#125;</code></td><td>The final output string of an earlier step.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.success &#125;&#125;</code></td><td>Whether that step completed successfully.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.skipped &#125;&#125;</code></td><td>Whether that step was skipped by <code class="inline">when:</code>.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.results &#125;&#125;</code></td><td>Per-item (<code class="inline">for_each</code>) or per-sub-step (<code class="inline">parallel</code>) outputs.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.sub_results.&lt;sub_id&gt;.output &#125;&#125;</code></td><td>A named output from a <code class="inline">parallel:</code> sub-step (also <code class="inline">.success</code>).</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.findings &#125;&#125;</code></td><td>Aggregated panel findings (also <code class="inline">.max_severity</code>, <code class="inline">.iterations</code>, <code class="inline">.resolved</code>).</td></tr>
+        <tr><td><code>&#123;&#123; item &#125;&#125;</code> · <code>&#123;&#123; loop.index &#125;&#125;</code></td><td>The current item and 1-based index inside a <code class="inline">for_each:</code> (also <code class="inline">loop.index0</code>, <code class="inline">loop.length</code>, <code class="inline">loop.first</code>, <code class="inline">loop.last</code>).</td></tr>
+        <tr><td><code>read_file('&lt;path&gt;')</code></td><td>The contents of a file a prior step wrote, resolved against the run's working directory. Fails loudly if missing.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      When the workflow is invoked against an issue target, an <code class="inline">issue.*</code> context is also
+      available (<code class="inline">issue.number</code>, <code class="inline">issue.title</code>,
+      <code class="inline">issue.labels</code>, and more); event-triggered workflows get the payload under
+      <code class="inline">event.*</code>.
+    </p>
+    <div class="callout">
+      <strong>Deterministic fan-out.</strong> Because <code class="inline">for_each:</code> JSON-parses any
+      rendered value that starts with <code class="inline">[</code>, have an upstream step write a clean JSON
+      array file and feed it with <code class="inline">for_each: "&#123;&#123; read_file('reports/items.json') &#125;&#125;"</code>.
+      That decouples control flow from how terse the agent was in chat.
+    </div>
+
+    <h2>A complete example</h2>
+    <p>
+      This is the <code class="inline">investigate-then-fix</code> workflow that ships as a rupu template — a
+      two-step linear bug fix where the second step consumes the first step's output via a template expression.
+    </p>
+    <pre class="code"><span class="k">name</span>: <span class="s">investigate-then-fix</span>
+<span class="k">description</span>: <span class="s">Two-step bug fix — investigate, then propose minimal edit.</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="s">investigate</span>
+    <span class="k">agent</span>: <span class="s">fix-bug</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Investigate the bug described by:</span>
+      <span class="s">&#123;&#123; inputs.prompt &#125;&#125;</span>
+
+      <span class="s">Stop without making edits. Report the root cause as text.</span>
+  - <span class="k">id</span>: <span class="s">propose</span>
+    <span class="k">agent</span>: <span class="s">fix-bug</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Based on this investigation:</span>
+      <span class="s">&#123;&#123; steps.investigate.output &#125;&#125;</span>
+      <span class="s">Propose and apply the minimal fix.</span></pre>
+    <p>
+      The fan-out shapes follow the same skeleton. A <code class="inline">for_each:</code> step adds a
+      <code class="inline">for_each</code> list and references <code class="inline">&#123;&#123; item &#125;&#125;</code>;
+      a later step then folds the results with a loop over
+      <code class="inline">steps.review_each.results</code>:
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="s">review_each</span>
+    <span class="k">agent</span>: <span class="s">code-reviewer</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">for_each</span>: <span class="s">"&#123;&#123; inputs.files &#125;&#125;"</span>
+    <span class="k">max_parallel</span>: <span class="v">4</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Review file &#123;&#123; item &#125;&#125; (&#123;&#123; loop.index &#125;&#125; of &#123;&#123; loop.length &#125;&#125;).</span>
+  - <span class="k">id</span>: <span class="s">summarize</span>
+    <span class="k">agent</span>: <span class="s">writer</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Combine these per-file reviews into one summary.</span>
+      <span class="v">&#123;% for r in steps.review_each.results %&#125;</span>
+      <span class="s">&#123;&#123; r &#125;&#125;</span>
+      <span class="v">&#123;% endfor %&#125;</span></pre>
+
+    <h2>Running a workflow</h2>
+    <p>List and inspect the workflows rupu can see, then run one:</p>
+    <pre class="code"><span class="c"># list every resolvable workflow (project + global scope)</span>
+rupu workflow list
+
+<span class="c"># show one workflow's resolved definition</span>
+rupu workflow show investigate-then-fix
+
+<span class="c"># run it, passing typed inputs</span>
+rupu workflow run investigate-then-fix --input prompt=<span class="s">"NPE on empty cart checkout"</span></pre>
+    <p>
+      Pass each declared input with a repeated <code class="inline">--input key=value</code> flag. If the
+      workflow also takes an issue target, supply it positionally before the inputs:
+      <code class="inline">rupu workflow run &lt;name&gt; &lt;issue-ref&gt; --input ...</code>. When a step requires
+      <code class="inline">approval:</code>, the run pauses; resume it with
+      <code class="inline">rupu workflow approve &lt;run-id&gt;</code> or reject with
+      <code class="inline">rupu workflow reject &lt;run-id&gt; --reason "..."</code>.
+    </p>
+    <div class="callout">
+      <strong>Build it visually.</strong> Workflows can also be authored in the rupu control plane, where a
+      drag-and-drop graph and the underlying YAML stay in sync — edit either side and the other follows.
+    </div>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/agents.html">&#8592; Agents</a>
+      <a href="/docs/autoflows.html">Autoflows &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
