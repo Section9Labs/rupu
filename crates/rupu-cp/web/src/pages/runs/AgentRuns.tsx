@@ -6,11 +6,10 @@
 // keeping paginated history off the poll loop avoids the scroll-reset flicker.
 
 import { useCallback, useEffect, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AgentRunRow } from '../../lib/api';
-import { ListCard } from '../../components/lists/ListCard';
-import MetricRow from '../../components/lists/MetricRow';
+import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { cn } from '../../lib/cn';
 import { relativeTime } from '../../lib/time';
@@ -179,11 +178,12 @@ export default function AgentRuns() {
               cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
             }))} />
           </div>
-          <ListCard>
-            {sorted.map((r) => (
-              <AgentRunEntry key={r.run_id} run={r} />
-            ))}
-          </ListCard>
+          <SortableTable<AgentRunRow>
+            columns={AGENT_RUN_COLUMNS}
+            rows={sorted}
+            rowKey={(r) => r.run_id}
+            initialSort={{ key: 'started', dir: 'desc' }}
+          />
           {tab !== 'active' && hasMore && (
             <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
               {loading ? 'loading more…' : 'scroll for more'}
@@ -200,75 +200,142 @@ function isRunning(status: string | null | undefined): boolean {
   return status === 'running' || status === 'awaiting_approval';
 }
 
-function AgentRunEntry({ run }: { run: AgentRunRow }) {
-  const live = isRunning(run.status);
-  const navigate = useNavigate();
-
-  const transcriptHref = run.transcript_path
-    ? `/transcript?path=${encodeURIComponent(run.transcript_path)}&live=${live ? 1 : 0}`
-    : null;
-
-  const inner = (
-    <MetricRow
-      header={<>
-        <span className="text-sm font-medium text-ink">{run.agent ?? '—'}</span>
-        <span className="text-[11px] text-ink-mute font-mono">{shortId(run.run_id)}</span>
-        <SourceChip source={run.source} />
-        {run.status && <StatusBadge status={run.status} />}
-        {run.started_at && (
-          <span className="text-[11px] text-ink-dim">started {relativeTime(run.started_at)}</span>
+const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
+  {
+    key: 'agent',
+    header: 'Agent',
+    sortable: true,
+    sortValue: (r) => r.agent ?? null,
+    render: (r) => (
+      <div className="min-w-0">
+        <span className="text-sm font-medium text-ink">{r.agent ?? '—'}</span>
+        {(r.trigger_source || r.session_id) && (
+          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            {r.trigger_source && (
+              <span className="text-[11px] text-ink-dim">
+                via <span className="font-mono">{r.trigger_source}</span>
+              </span>
+            )}
+            {r.session_id && (
+              <span className="text-[11px] text-ink-dim">
+                session{' '}
+                <Link
+                  to={`/sessions/${encodeURIComponent(r.session_id)}`}
+                  className="text-brand-600 hover:underline font-mono"
+                >
+                  {shortId(r.session_id)}
+                </Link>
+              </span>
+            )}
+          </div>
         )}
-        {run.trigger_source && (
-          <span className="text-[11px] text-ink-dim">via <span className="font-mono">{run.trigger_source}</span></span>
-        )}
-        {run.session_id && (
-          <span className="text-[11px] text-ink-dim">
-            session{' '}
-            <Link
-              to={`/sessions/${encodeURIComponent(run.session_id)}`}
-              className="text-brand-600 hover:underline font-mono"
-              onClick={(e) => e.stopPropagation()}
-            >
-              {shortId(run.session_id)}
-            </Link>
-          </span>
-        )}
-      </>}
-      trailing={transcriptHref
-        ? <span className="text-[10px] text-brand-600 font-medium whitespace-nowrap">View transcript →</span>
-        : undefined}
-      metrics={[
-        { label: 'in', value: formatTokens(run.usage.input_tokens) },
-        { label: 'out', value: formatTokens(run.usage.output_tokens) },
-        { label: 'cached', value: run.usage.cached_tokens ? formatTokens(run.usage.cached_tokens) : null },
-        { label: 'cost', value: formatCost(run.usage.cost_usd) },
-        { label: 'duration', value: run.duration_ms != null ? formatDuration(run.duration_ms) : null },
-        { label: 'turns', value: run.turns ? String(run.turns) : null },
-      ]}
-    />
-  );
-
-  if (transcriptHref) {
-    return (
-      <div
-        role="link"
-        tabIndex={0}
-        onClick={() => navigate(transcriptHref)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            navigate(transcriptHref);
-          }
-        }}
-        className="block hover:bg-slate-50 transition-colors cursor-pointer"
-      >
-        {inner}
       </div>
-    );
-  }
-
-  return <div className="opacity-75">{inner}</div>;
-}
+    ),
+  },
+  {
+    key: 'run',
+    header: 'Run',
+    // Agent runs are NOT in the workflow run-store (/api/runs/:id would 404), so
+    // the Run id links to the transcript view — matching the page's pre-table
+    // behavior. No transcript_path → render the id as plain text.
+    render: (r) => {
+      const href = r.transcript_path
+        ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}`
+        : null;
+      return href ? (
+        <Link to={href} className="text-[11px] text-ink-mute font-mono hover:underline">
+          {shortId(r.run_id)}
+        </Link>
+      ) : (
+        <span className="text-[11px] text-ink-mute font-mono">{shortId(r.run_id)}</span>
+      );
+    },
+  },
+  {
+    key: 'source',
+    header: 'Source',
+    sortable: true,
+    sortValue: (r) => r.source,
+    render: (r) => <SourceChip source={r.source} />,
+  },
+  {
+    key: 'status',
+    header: 'Status',
+    sortable: true,
+    sortValue: (r) => r.status ?? null,
+    render: (r) => (r.status ? <StatusBadge status={r.status} /> : <span className="text-ink-mute">—</span>),
+  },
+  {
+    key: 'in',
+    header: 'In',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (r) => r.usage.input_tokens,
+    render: (r) => <span className="text-ink-dim">{formatTokens(r.usage.input_tokens)}</span>,
+  },
+  {
+    key: 'out',
+    header: 'Out',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (r) => r.usage.output_tokens,
+    render: (r) => <span className="text-ink-dim">{formatTokens(r.usage.output_tokens)}</span>,
+  },
+  {
+    key: 'cached',
+    header: 'Cached',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (r) => r.usage.cached_tokens,
+    render: (r) =>
+      r.usage.cached_tokens ? (
+        <span className="text-ink-dim">{formatTokens(r.usage.cached_tokens)}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'cost',
+    header: 'Cost',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (r) => r.usage.cost_usd,
+    render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
+  },
+  {
+    key: 'duration',
+    header: 'Duration',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (r) => r.duration_ms ?? null,
+    render: (r) => <span className="text-ink-dim">{formatDuration(r.duration_ms)}</span>,
+  },
+  {
+    key: 'turns',
+    header: 'Turns',
+    align: 'right',
+    width: 'w-16',
+    sortable: true,
+    sortValue: (r) => r.turns,
+    render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
+  },
+  {
+    key: 'started',
+    header: 'Started',
+    align: 'right',
+    width: 'w-28',
+    sortable: true,
+    sortValue: (r) => (r.started_at ? Date.parse(r.started_at) : null),
+    render: (r) => (
+      <span className="text-ink-mute">{r.started_at ? relativeTime(r.started_at) : '—'}</span>
+    ),
+  },
+];
 
 function AgentRunsEmpty() {
   return (

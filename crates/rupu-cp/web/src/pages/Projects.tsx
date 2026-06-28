@@ -4,8 +4,7 @@
 import { useEffect, useState } from 'react';
 import { FolderGit2, GitBranch, GitFork } from 'lucide-react';
 import { api, type ProjectRow } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
-import MetricRow from '../components/lists/MetricRow';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
@@ -80,11 +79,13 @@ export default function Projects() {
               }))}
             />
           </div>
-          <ListCard>
-            {shown.map((p) => (
-              <ProjectRow key={p.ws_id} project={p} />
-            ))}
-          </ListCard>
+          <SortableTable<ProjectRow>
+            columns={PROJECT_COLUMNS}
+            rows={shown}
+            rowKey={(p) => p.ws_id}
+            rowHref={(p) => `/projects/${encodeURIComponent(p.ws_id)}`}
+            initialSort={{ key: 'last_active', dir: 'desc' }}
+          />
           {all.length > visible && (
             <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
               scroll for more
@@ -96,42 +97,99 @@ export default function Projects() {
   );
 }
 
-function ProjectRow({ project: p }: { project: ProjectRow }) {
-  const lastActive = p.last_active ?? p.last_run_at;
-  return (
-    <MetricRow
-      to={`/projects/${encodeURIComponent(p.ws_id)}`}
-      header={
-        <>
-          <span className="text-sm font-semibold text-ink">{p.name}</span>
-          <span className="text-[11px] text-ink-mute font-mono truncate max-w-xs">{p.path}</span>
-          {p.repo_remote && (
-            <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
-              <GitFork size={10} />
-              {p.repo_remote}
-            </span>
-          )}
-          {p.branch && (
-            <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
-              <GitBranch size={10} />
-              {p.branch}
-            </span>
-          )}
-        </>
-      }
-      trailing={
-        <span className="shrink-0 text-[11px] text-ink-mute tabular-nums">
-          {lastActive ? relativeTime(lastActive) : 'no runs'}
-        </span>
-      }
-      metrics={[
-        { label: 'runs', value: p.run_count ? String(p.run_count) : null },
-        { label: 'tokens', value: p.usage ? formatTokens(p.usage.total_tokens) : null },
-        { label: 'cost', value: p.usage ? formatCost(p.usage.cost_usd) : null },
-      ]}
-    />
-  );
+/** Effective "last active" timestamp for a project (falls back to last run). */
+function projectLastActive(p: ProjectRow): string | null | undefined {
+  return p.last_active ?? p.last_run_at;
 }
+
+const PROJECT_COLUMNS: Column<ProjectRow>[] = [
+  {
+    key: 'name',
+    header: 'Name',
+    sortable: true,
+    sortValue: (p) => p.name,
+    render: (p) => <span className="text-sm font-semibold text-ink">{p.name}</span>,
+  },
+  {
+    key: 'path',
+    header: 'Path',
+    sortable: true,
+    sortValue: (p) => p.path,
+    render: (p) => (
+      <span className="text-[11px] text-ink-mute font-mono truncate block max-w-xs">{p.path}</span>
+    ),
+  },
+  {
+    key: 'branch',
+    header: 'Branch',
+    sortable: true,
+    sortValue: (p) => p.branch ?? null,
+    render: (p) => (
+      <div className="flex items-center gap-1.5 flex-wrap">
+        {p.repo_remote && (
+          <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
+            <GitFork size={10} />
+            {p.repo_remote}
+          </span>
+        )}
+        {p.branch ? (
+          <span className="inline-flex items-center gap-1 text-[10px] text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
+            <GitBranch size={10} />
+            {p.branch}
+          </span>
+        ) : (
+          !p.repo_remote && <span className="text-ink-mute">—</span>
+        )}
+      </div>
+    ),
+  },
+  {
+    key: 'runs',
+    header: 'Runs',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (p) => p.run_count,
+    render: (p) => <span className="text-ink">{p.run_count ? String(p.run_count) : '—'}</span>,
+  },
+  {
+    key: 'tokens',
+    header: 'Tokens',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (p) => p.usage?.total_tokens ?? null,
+    render: (p) => (
+      <span className="text-ink-dim">{p.usage ? formatTokens(p.usage.total_tokens) : '—'}</span>
+    ),
+  },
+  {
+    key: 'cost',
+    header: 'Cost',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (p) => p.usage?.cost_usd ?? null,
+    render: (p) => (
+      <span className="text-ink font-medium">{p.usage ? formatCost(p.usage.cost_usd) : '—'}</span>
+    ),
+  },
+  {
+    key: 'last_active',
+    header: 'Last active',
+    align: 'right',
+    width: 'w-28',
+    sortable: true,
+    sortValue: (p) => {
+      const t = projectLastActive(p);
+      return t ? Date.parse(t) : null;
+    },
+    render: (p) => {
+      const t = projectLastActive(p);
+      return <span className="text-ink-mute">{t ? relativeTime(t) : 'no runs'}</span>;
+    },
+  },
+];
 
 function ProjectsEmpty() {
   return (
