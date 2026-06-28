@@ -530,6 +530,33 @@ export interface SessionRunRow {
 }
 
 // ---------------------------------------------------------------------------
+// Hosts
+// ---------------------------------------------------------------------------
+
+export type HostTransportKind = 'local' | 'http_cp';
+export type HostStatus = 'online' | 'offline' | 'stale';
+
+export interface HostCapabilities {
+  backends: string[];
+  scm_hosts: string[];
+  permission_modes: string[];
+}
+
+/** JSON view of one registered host, enriched with live health data.
+ *  Mirrors `HostView` from rupu-cp/src/api/hosts.rs. */
+export interface HostView {
+  id: string;
+  name: string;
+  transport_kind: HostTransportKind;
+  base_url?: string;
+  status: HostStatus;
+  version?: string;
+  capabilities?: HostCapabilities;
+  active_run_count: number;
+  last_seen_at?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Workers
 // ---------------------------------------------------------------------------
 
@@ -942,12 +969,18 @@ export const api = {
   },
 
   // --- Runs ---
-  getRuns(params?: ListParams): Promise<RunListRow[]> {
-    return request<RunListRow[]>(`/api/runs${listQuery(params)}`);
+  getRuns(params?: ListParams & { host?: string }): Promise<RunListRow[]> {
+    const q = new URLSearchParams();
+    if (params?.offset != null) q.set('offset', String(params.offset));
+    if (params?.limit != null) q.set('limit', String(params.limit));
+    if (params?.host) q.set('host', params.host);
+    const qs = q.toString();
+    return request<RunListRow[]>(`/api/runs${qs ? `?${qs}` : ''}`);
   },
-  getRun(id: string): Promise<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }> {
+  getRun(id: string, opts?: { host?: string }): Promise<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }> {
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
     return request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
-      `/api/runs/${encodeURIComponent(id)}`,
+      `/api/runs/${encodeURIComponent(id)}${qs}`,
     );
   },
   getRunGraph(id: string): Promise<RunGraphResponse> {
@@ -956,24 +989,32 @@ export const api = {
   /** Record approval for an awaiting run. The run stays `awaiting_approval`
    *  but gains `resume_requested_at` (+ `resume_mode`); a worker then resumes
    *  it in the chosen permission mode (defaults to `ask`). */
-  async approveRun(id: string, mode?: 'ask' | 'bypass' | 'readonly'): Promise<void> {
+  async approveRun(id: string, mode?: 'ask' | 'bypass' | 'readonly', host?: string): Promise<void> {
+    const body: Record<string, unknown> = {};
+    if (mode) body.mode = mode;
+    if (host) body.host = host;
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
       `/api/runs/${encodeURIComponent(id)}/approve`,
-      { method: 'POST', body: mode ? JSON.stringify({ mode }) : undefined },
+      { method: 'POST', body: Object.keys(body).length ? JSON.stringify(body) : undefined },
     );
   },
   /** Reject an awaiting run (terminal → `rejected`). */
-  async rejectRun(id: string, reason: string): Promise<void> {
+  async rejectRun(id: string, reason: string, host?: string): Promise<void> {
+    const body: Record<string, unknown> = { reason };
+    if (host) body.host = host;
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
       `/api/runs/${encodeURIComponent(id)}/reject`,
-      { method: 'POST', body: JSON.stringify({ reason }) },
+      { method: 'POST', body: JSON.stringify(body) },
     );
   },
   /** Cancel a non-terminal run (terminal → `cancelled`). */
-  async cancelRun(id: string, reason?: string): Promise<void> {
+  async cancelRun(id: string, reason?: string, host?: string): Promise<void> {
+    const body: Record<string, unknown> = {};
+    if (reason) body.reason = reason;
+    if (host) body.host = host;
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
       `/api/runs/${encodeURIComponent(id)}/cancel`,
-      { method: 'POST', body: reason ? JSON.stringify({ reason }) : undefined },
+      { method: 'POST', body: Object.keys(body).length ? JSON.stringify(body) : undefined },
     );
   },
   getRunUsageTimeline(id: string): Promise<UsageTimelinePoint[]> {
@@ -986,11 +1027,12 @@ export const api = {
   getSessionRuns(id: string): Promise<SessionRunRow[]> {
     return request<SessionRunRow[]>(`/api/sessions/${encodeURIComponent(id)}/runs`);
   },
-  getWorkflowRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed' }): Promise<RunListRow[]> {
+  getWorkflowRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string }): Promise<RunListRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
+    if (params?.host) q.set('host', params.host);
     const qs = q.toString();
     return request<RunListRow[]>(`/api/runs/workflows${qs ? `?${qs}` : ''}`);
   },
@@ -1018,11 +1060,12 @@ export const api = {
       body: JSON.stringify({ issue_ref: issueRef }),
     });
   },
-  getAgentRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed' }): Promise<AgentRunRow[]> {
+  getAgentRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string }): Promise<AgentRunRow[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.lifecycle) q.set('lifecycle', params.lifecycle);
+    if (params?.host) q.set('host', params.host);
     const qs = q.toString();
     return request<AgentRunRow[]>(`/api/runs/agents${qs ? `?${qs}` : ''}`);
   },
@@ -1039,20 +1082,20 @@ export const api = {
   },
   launchAgent(
     agent: string,
-    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string } = {},
+    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string; host?: string } = {},
   ): Promise<LaunchResult> {
     return request<LaunchResult>(`/api/agents/${encodeURIComponent(agent)}/run`, {
       method: 'POST',
-      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir }),
+      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir, host: opts.host }),
     });
   },
   startSession(
     agent: string,
-    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string } = {},
+    opts: { prompt?: string; mode?: LaunchMode; target?: string; working_dir?: string; host?: string } = {},
   ): Promise<{ session_id: string }> {
     return request<{ session_id: string }>(`/api/agents/${encodeURIComponent(agent)}/session`, {
       method: 'POST',
-      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir }),
+      body: JSON.stringify({ prompt: opts.prompt, mode: opts.mode, target: opts.target, working_dir: opts.working_dir, host: opts.host }),
     });
   },
   /**
@@ -1142,11 +1185,11 @@ export const api = {
    */
   launchRun(
     workflow: string,
-    opts: { inputs?: Record<string, string>; mode?: LaunchMode; target?: string; working_dir?: string } = {},
+    opts: { inputs?: Record<string, string>; mode?: LaunchMode; target?: string; working_dir?: string; host?: string } = {},
   ): Promise<LaunchResult> {
     return request<LaunchResult>(`/api/workflows/${encodeURIComponent(workflow)}/run`, {
       method: 'POST',
-      body: JSON.stringify({ inputs: opts.inputs, mode: opts.mode, target: opts.target, working_dir: opts.working_dir }),
+      body: JSON.stringify({ inputs: opts.inputs, mode: opts.mode, target: opts.target, working_dir: opts.working_dir, host: opts.host }),
     });
   },
 
@@ -1174,16 +1217,37 @@ export const api = {
    * Errors: 400 (empty prompt) · 404 (no such session) · 409 (session stopped)
    * · 501 (read-only deploy).
    */
-  sendSessionMessage(id: string, prompt: string): Promise<{ run_id: string }> {
+  sendSessionMessage(id: string, prompt: string, host?: string): Promise<{ run_id: string }> {
+    const body: Record<string, unknown> = { prompt };
+    if (host) body.host = host;
     return request<{ run_id: string }>(`/api/sessions/${encodeURIComponent(id)}/send`, {
       method: 'POST',
-      body: JSON.stringify({ prompt }),
+      body: JSON.stringify(body),
     });
   },
 
   // --- Workers ---
   getWorkers(): Promise<WorkerView[]> {
     return request<WorkerView[]>('/api/workers');
+  },
+
+  // --- Hosts ---
+  /** List all registered hosts, each enriched with live health data. */
+  getHosts(): Promise<HostView[]> {
+    return request<HostView[]>('/api/hosts');
+  },
+  /** Register a new remote host. Requires `rupu cp serve` (501 if absent). */
+  addHost(body: { name: string; base_url: string; token?: string }): Promise<HostView> {
+    return request<HostView>('/api/hosts', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+  /** Remove a registered host. 400 if `id` is `"local"`. */
+  async removeHost(id: string): Promise<void> {
+    await request<void>(`/api/hosts/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
   },
 
   // --- Coverage ---
@@ -1244,8 +1308,10 @@ export const api = {
     id: string,
     onEvent: (e: RunEvent) => void,
     onError?: (e: Event) => void,
+    opts?: { host?: string },
   ): () => void {
-    const es = new EventSource(`/api/runs/${encodeURIComponent(id)}/log`);
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
+    const es = new EventSource(`/api/runs/${encodeURIComponent(id)}/log${qs}`);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
     if (onError) es.onerror = onError;
     return () => es.close();
@@ -1259,12 +1325,14 @@ export const api = {
    */
   subscribeEvents(
     onEvent: (e: RunEvent) => void,
-    opts?: { run?: string },
+    opts?: { run?: string; host?: string },
     onError?: (e: Event) => void,
   ): () => void {
-    const url = opts?.run
-      ? `/api/events/stream?run=${encodeURIComponent(opts.run)}`
-      : '/api/events/stream';
+    const q = new URLSearchParams();
+    if (opts?.run) q.set('run', opts.run);
+    if (opts?.host) q.set('host', opts.host);
+    const qs = q.toString();
+    const url = qs ? `/api/events/stream?${qs}` : '/api/events/stream';
     const es = new EventSource(url);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
     if (onError) es.onerror = onError;
