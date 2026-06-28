@@ -266,7 +266,7 @@ export default function RunDetail() {
 
   // Merge skeleton + checkpoints + live events into the render model. Cheap;
   // recompute on every event so the graph reflects live state.
-  // Only built for local runs; remote runs have no graph skeleton.
+  // Built for both local and remote runs via the host-aware graph endpoint.
   const model = useMemo(
     () => (graph ? buildRunGraphModel(graph, rawEvents) : null),
     [graph, rawEvents],
@@ -465,7 +465,7 @@ export default function RunDetail() {
               <h1 className="truncate text-2xl font-semibold text-ink">{run.workflow_name}</h1>
               <StatusPill status={effectiveStatus} />
               {host && host !== 'local' && (
-                <span className="rounded bg-blue-50 px-1.5 py-0.5 text-note font-medium text-blue-700 ring-1 ring-blue-200 font-mono">
+                <span className="rounded bg-info-bg px-1.5 py-0.5 text-note font-medium text-info ring-1 ring-info/30 font-mono">
                   {host}
                 </span>
               )}

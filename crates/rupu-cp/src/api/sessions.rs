@@ -330,7 +330,10 @@ async fn get_session(
         let v = conn
             .proxy_get_json(&format!("/api/sessions/{id}"))
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
         return Ok(Json(v));
     }
 
@@ -401,7 +404,10 @@ async fn get_session_usage_timeline(
         let v = conn
             .proxy_get_json(&format!("/api/sessions/{id}/usage-timeline"))
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
         return Ok(Json(v));
     }
 
@@ -540,7 +546,10 @@ async fn get_session_runs(
         let v = conn
             .proxy_get_json(&format!("/api/sessions/{id}/runs"))
             .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
         return Ok(Json(v));
     }
 

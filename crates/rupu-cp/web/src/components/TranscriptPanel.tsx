@@ -21,11 +21,15 @@ type LoadState = 'loading' | 'ready' | 'error';
 export default function TranscriptPanel({
   path,
   live,
+  host,
   embedded = false,
   onComplete,
 }: {
   path: string;
   live: boolean;
+  /** Remote host id to forward to the backend transcript endpoints. When set,
+   *  appended as `&host=<id>` on both the fetch and the SSE stream URLs. */
+  host?: string;
   /**
    * When true, hide the run-level header and usage footer chrome — render only
    * the turn/tool conversation body. Used inside a chat conversation, where each
@@ -58,7 +62,7 @@ export default function TranscriptPanel({
     setConnected(false);
 
     api
-      .getTranscript(path)
+      .getTranscript(path, { host })
       .then((res) => {
         if (cancelled) return;
         setEvents(res.events);
@@ -73,7 +77,7 @@ export default function TranscriptPanel({
     return () => {
       cancelled = true;
     };
-  }, [path]);
+  }, [path, host]);
 
   // Live tail: append new events; close on unmount / path change. Kept in a ref
   // so the cleanup always closes the EventSource we actually opened.
@@ -103,13 +107,14 @@ export default function TranscriptPanel({
         }
       },
       () => setConnected(false),
+      { host },
     );
     unsubRef.current = unsub;
     return () => {
       unsub();
       unsubRef.current = null;
     };
-  }, [path, live]);
+  }, [path, live, host]);
 
   const view = buildTranscriptView(events);
 
