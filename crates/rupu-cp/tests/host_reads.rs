@@ -121,7 +121,9 @@ async fn agent_list_fan_out_merges_local_and_remote() {
     });
     let mock = httpmock::MockServer::start_async().await;
     let _m = mock.mock(|when, then| {
-        when.method("GET").path("/api/runs/agents");
+        when.method("GET")
+            .path("/api/runs/agents")
+            .query_param("host", "local");
         then.status(200).json_body(serde_json::json!([remote_row]));
     });
 
@@ -281,7 +283,9 @@ async fn autoflow_cycles_fan_out_merges_local_and_remote() {
     });
     let mock = httpmock::MockServer::start_async().await;
     let _m = mock.mock(|when, then| {
-        when.method("GET").path("/api/runs/autoflows");
+        when.method("GET")
+            .path("/api/runs/autoflows")
+            .query_param("host", "local");
         then.status(200).json_body(serde_json::json!([remote_row]));
     });
 
@@ -384,7 +388,9 @@ async fn autoflow_events_fan_out_merges_local_and_remote() {
     });
     let mock = httpmock::MockServer::start_async().await;
     let _m = mock.mock(|when, then| {
-        when.method("GET").path("/api/runs/autoflows/events");
+        when.method("GET")
+            .path("/api/runs/autoflows/events")
+            .query_param("host", "local");
         then.status(200).json_body(serde_json::json!([remote_row]));
     });
 
