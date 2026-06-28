@@ -12,6 +12,7 @@ pub mod cron_schedule;
 pub mod event_match;
 pub mod event_vocab;
 pub mod executor;
+pub mod generate;
 pub mod runner;
 pub mod runs;
 pub mod step_factory;
@@ -24,6 +25,7 @@ pub use event_vocab::{
     annotate_event_payload, candidate_event_ids, derived_event_ids, matching_event_id,
     matching_event_id_from_candidates,
 };
+pub use generate::{GenKind, GenerateError, GenerateOutcome, GenerateRequest};
 pub use runner::{
     resolve_inputs, run_workflow, AwaitingInfo, Finding, ItemResult, OrchestratorRunOpts,
     OrchestratorRunResult, ResumeState, RunWorkflowError, StepFactory, StepResult,
