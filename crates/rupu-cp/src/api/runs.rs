@@ -113,7 +113,9 @@ async fn approve_run(
     s.run_store
         .request_resume_approval(&id, "web", mode.as_deref(), now)
         .map_err(|e| map_approval_err(&id, e))?;
-    run_response(&s, &id)
+    let mut resp = run_response(&s, &id)?;
+    resp.0["host_id"] = serde_json::json!("local");
+    Ok(resp)
 }
 
 #[derive(serde::Deserialize)]
@@ -151,7 +153,9 @@ async fn reject_run(
     s.run_store
         .reject(&id, "web", &reason, now)
         .map_err(|e| map_approval_err(&id, e))?;
-    run_response(&s, &id)
+    let mut resp = run_response(&s, &id)?;
+    resp.0["host_id"] = serde_json::json!("local");
+    Ok(resp)
 }
 
 /// Optional body for `POST /api/runs/:id/cancel`.
@@ -206,7 +210,9 @@ async fn cancel_run(
         .run_store
         .cancel(&id, "web", &reason, now)
         .map_err(|e| map_cancel_err(&id, e))?;
-    run_response(&s, &id)
+    let mut resp = run_response(&s, &id)?;
+    resp.0["host_id"] = serde_json::json!("local");
+    Ok(resp)
 }
 
 /// Derive a trigger label from a [`RunRecord`].
@@ -688,6 +694,7 @@ mod tests {
         // run AwaitingApproval for the background worker to approve+resume.
         let body = resp.0;
         assert_eq!(body["run"]["status"], serde_json::json!("awaiting_approval"));
+        assert_eq!(body["host_id"], "local");
 
         let loaded = s.run_store.load("run_app").unwrap();
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
@@ -717,6 +724,7 @@ mod tests {
         .await
         .expect("reject should succeed");
         assert_eq!(resp.0["run"]["status"], serde_json::json!("rejected"));
+        assert_eq!(resp.0["host_id"], "local");
 
         let loaded = s.run_store.load("run_rej").unwrap();
         assert_eq!(loaded.status, RunStatus::Rejected);
@@ -832,6 +840,7 @@ mod tests {
         .await
         .expect("cancel should succeed");
         assert_eq!(resp.0["run"]["status"], serde_json::json!("cancelled"));
+        assert_eq!(resp.0["host_id"], "local");
 
         let loaded = s.run_store.load("run_cancel").unwrap();
         assert_eq!(loaded.status, RunStatus::Cancelled);
