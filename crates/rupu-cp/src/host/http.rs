@@ -29,6 +29,15 @@ pub struct HttpHostConnector {
     token: Option<String>,
 }
 
+/// Private response struct for deserializing the `/api/host/info` endpoint.
+#[derive(serde::Deserialize)]
+struct HostInfoBody {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    capabilities: HostCapabilities,
+}
+
 impl HttpHostConnector {
     /// Create a new connector for the remote server at `base_url`.
     ///
@@ -97,18 +106,14 @@ impl HostConnector for HttpHostConnector {
         let req = self.client.get(self.url("/api/host/info"));
         match self.send(req).await {
             Ok(resp) => {
-                let val: serde_json::Value = resp
+                let body: HostInfoBody = resp
                     .json()
                     .await
                     .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
-                let version = val
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
                 Ok(HostInfo {
                     reachable: true,
-                    version,
-                    capabilities: HostCapabilities::default(),
+                    version: body.version,
+                    capabilities: body.capabilities,
                 })
             }
             Err(HostConnectorError::Unreachable(_)) => Ok(HostInfo {

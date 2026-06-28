@@ -172,3 +172,27 @@ async fn info_missing_endpoint_returns_reachable_true() {
     assert!(info.reachable);
     assert!(info.version.is_none());
 }
+
+#[tokio::test]
+async fn info_parses_version_and_capabilities() {
+    let server = httpmock::MockServer::start_async().await;
+    let m = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(serde_json::json!({
+            "version": "9.9.9",
+            "capabilities": {
+                "backends": ["local_worktree"],
+                "scm_hosts": ["github"],
+                "permission_modes": ["ask"]
+            }
+        }));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let info = c.info().await.unwrap();
+    assert!(info.reachable);
+    assert_eq!(info.version, Some("9.9.9".to_string()));
+    assert_eq!(info.capabilities.backends, vec!["local_worktree"]);
+    assert_eq!(info.capabilities.scm_hosts, vec!["github"]);
+    assert_eq!(info.capabilities.permission_modes, vec!["ask"]);
+    m.assert();
+}
