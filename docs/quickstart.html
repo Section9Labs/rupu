@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Quickstart</title>
+<meta name="description" content="Get rupu running in about five minutes: install, connect a model, run your first agent and workflow, open the control plane, and add a host.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item active" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <main class="docs-main">
+    <h1>Quickstart</h1>
+    <p class="intro">From zero to your first autonomous run in about five minutes. Each step is copy-paste.</p>
+
+    <div class="callout"><strong>Prerequisites.</strong> macOS (Apple Silicon) for the prebuilt binary, or any platform with a Rust toolchain to build from source. A model-provider account (Anthropic, OpenAI, Gemini, or Copilot). Run the commands from inside a git repository you want rupu to work in.</div>
+
+    <h2>1 &middot; Install</h2>
+    <p>Grab the latest signed macOS binary from the <a class="link" href="/#download">download</a> section (or the <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">releases page</a>), or build from source:</p>
+    <pre class="code"><span class="c"># prebuilt binary (macOS, Apple Silicon)</span>
+chmod +x ./rupu &amp;&amp; sudo mv ./rupu /usr/local/bin/rupu
+
+<span class="c"># …or from source (any platform with Rust)</span>
+cargo install --git https://github.com/Section9Labs/rupu
+
+rupu --version</pre>
+
+    <h2>2 &middot; Initialize &amp; connect a model</h2>
+    <p><code class="inline">init</code> scaffolds <code class="inline">.rupu/</code> in the current repo with a set of starter agents and workflows; <code class="inline">auth login</code> connects a model provider (credentials are stored in your system keychain).</p>
+    <pre class="code">rupu init
+rupu auth login          <span class="c"># pick anthropic / openai / gemini / copilot</span>
+rupu auth status</pre>
+    <p>See <a class="link" href="/docs/providers.html">Providers &amp; Auth</a> for the full provider + auth-mode list — and note each agent can use a <em>different</em> provider, so one workflow can mix models.</p>
+
+    <h2>3 &middot; Run your first agent</h2>
+    <p>The starter set includes a <code class="inline">code-reviewer</code> agent. Point it at your current diff:</p>
+    <pre class="code">rupu run code-reviewer --prompt <span class="s">"Review the changes on this branch"</span>
+
+<span class="c"># everything is recorded as a JSONL transcript you can replay</span>
+rupu transcript --last</pre>
+    <p>An <strong>agent</strong> is just a Markdown file (config in YAML frontmatter + a system prompt). Open <code class="inline">.rupu/agents/code-reviewer.md</code> to see one — full format in <a class="link" href="/docs/agents.html">Agents</a>.</p>
+
+    <h2>4 &middot; Run your first workflow</h2>
+    <p>Workflows compose agents into steps. <code class="inline">review-changed-files</code> (bundled by <code class="inline">init</code>) fans a reviewer across every changed file in parallel, then summarizes:</p>
+    <pre class="code">rupu workflow run review-changed-files \
+  --input files=<span class="s">"$(git diff --name-only main...HEAD)"</span></pre>
+    <p>List what's available with <code class="inline">rupu workflow list</code>. More shapes — sequential hand-offs, parallel review panels with gated fix-loops — in <a class="link" href="/docs/workflows.html">Workflows</a> and <a class="link" href="/docs/examples/">Examples</a>.</p>
+
+    <h2>5 &middot; Open the Control Plane</h2>
+    <p>Prefer a browser? Launch the local web command center to author, launch, watch, and approve runs — including the drag-and-drop visual workflow editor:</p>
+    <pre class="code">rupu cp serve           <span class="c"># opens http://127.0.0.1:7878</span></pre>
+    <p>Tour of every surface in <a class="link" href="/docs/control-plane.html">Control plane</a>.</p>
+
+    <h2>6 &middot; (Optional) Add a host</h2>
+    <p>Drive rupu on another machine from this same Control Plane. On the remote, serve the API; on your machine, register it:</p>
+    <pre class="code"><span class="c"># on the remote machine (behind TLS)</span>
+rupu cp serve --bind <span class="s">0.0.0.0:7878</span> --token <span class="s">"$RUPU_HOST_TOKEN"</span> --no-open
+
+<span class="c"># on your machine</span>
+rupu host add gpu-box --url <span class="s">https://gpu.internal</span> --token <span class="s">"$RUPU_HOST_TOKEN"</span>
+rupu host list</pre>
+    <p>Then pick the host in the launcher. See <a class="link" href="/docs/multi-host.html">Multi-host</a>.</p>
+
+    <h2>Where to next</h2>
+    <div class="doc-grid">
+      <a class="card" href="/docs/agents.html"><div class="ic" aria-hidden="true">&#9673;</div><h3>Agents &#8594;</h3><p>Author your own specialists — provider, model, tools, permissions, prompt.</p></a>
+      <a class="card" href="/docs/workflows.html"><div class="ic" aria-hidden="true">&#9783;</div><h3>Workflows &#8594;</h3><p>Compose agents into steps, fan-out, panels, and gated review loops.</p></a>
+      <a class="card" href="/docs/autoflows.html"><div class="ic" aria-hidden="true">&#8635;</div><h3>Autoflows &#8594;</h3><p>Let workflows run themselves on a schedule or an SCM event.</p></a>
+      <a class="card" href="/docs/examples/"><div class="ic" aria-hidden="true">&#9636;</div><h3>Examples &#8594;</h3><p>Complete, copy-paste scenarios — review panels, issue&rarr;PR, a fleet.</p></a>
+    </div>
+
+    <div class="doc-nav">
+      <a href="/docs/">&#8592; Overview</a>
+      <a href="/docs/agents.html">Agents &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
