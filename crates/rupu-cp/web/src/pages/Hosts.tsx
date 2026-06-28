@@ -5,26 +5,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Server } from 'lucide-react';
-import { api, type HostView, type HostStatus, type HostTransportKind } from '../lib/api';
+import { api, type HostView, type HostTransportKind } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { shortId } from '../lib/shortId';
 import { relativeTime } from '../lib/time';
 import { Chip } from '../components/ui/Chip';
+import { HostStatusBadge } from '../components/ui/HostStatusBadge';
 
 // ---------------------------------------------------------------------------
-// Status + transport visual tokens
+// Transport visual tokens (status handled by HostStatusBadge)
 // ---------------------------------------------------------------------------
-
-const HOST_STATUS_CLASS: Record<HostStatus, string> = {
-  online: 'bg-green-50 text-green-700 ring-green-200',
-  offline: 'bg-red-50 text-red-700 ring-red-200',
-  stale: 'bg-amber-50 text-amber-800 ring-amber-200',
-};
 
 const TRANSPORT_CLASS: Record<HostTransportKind, string> = {
-  local: 'bg-slate-100 text-slate-700 ring-slate-200',
-  http_cp: 'bg-blue-50 text-blue-700 ring-blue-200',
+  local:   'bg-surface text-ink-dim ring-border',
+  http_cp: 'bg-info-bg text-info ring-info/30',
 };
 
 const TRANSPORT_LABEL: Record<HostTransportKind, string> = {
@@ -83,9 +78,7 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
       header: 'Status',
       sortable: true,
       sortValue: (h) => h.status,
-      render: (h) => (
-        <Chip className={HOST_STATUS_CLASS[h.status]}>{h.status}</Chip>
-      ),
+      render: (h) => <HostStatusBadge status={h.status} />,
     },
     {
       key: 'version',
@@ -137,7 +130,7 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
             type="button"
             aria-label={`Remove host ${h.name}`}
             onClick={() => onRemove(h.id)}
-            className="text-note text-red-600 hover:text-red-700 hover:underline"
+            className="text-note text-err hover:text-err hover:underline"
           >
             Remove
           </button>
@@ -250,7 +243,7 @@ export default function Hosts() {
           <h2 className="text-sm font-semibold text-ink">Add remote host</h2>
 
           {addError && (
-            <p className="text-note text-red-600">{addError}</p>
+            <p className="text-note text-err">{addError}</p>
           )}
 
           <div className="flex flex-col gap-1">
@@ -283,7 +276,7 @@ export default function Hosts() {
               className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
             />
             {form.base_url.startsWith('http://') && (
-              <p className="text-note text-amber-600">
+              <p className="text-note text-warn">
                 Use https for remote hosts — http is unencrypted.
               </p>
             )}
@@ -324,12 +317,12 @@ export default function Hosts() {
 
       {/* Errors */}
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
       {removeError && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {removeError}
         </div>
       )}
@@ -356,7 +349,7 @@ export default function Hosts() {
 function EmptyState() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Server size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No hosts registered</h2>

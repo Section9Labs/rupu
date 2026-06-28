@@ -9,18 +9,12 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { StatusPill } from '../components/StatusPill';
 import { relativeTime } from '../lib/time';
-import { Chip } from '../components/ui/Chip';
-import type { HostStatus, HostTransportKind } from '../lib/api';
+import { HostStatusBadge } from '../components/ui/HostStatusBadge';
+import type { HostTransportKind } from '../lib/api';
 
 // ---------------------------------------------------------------------------
-// Visual tokens (mirrored from Hosts.tsx)
+// Visual tokens
 // ---------------------------------------------------------------------------
-
-const HOST_STATUS_CLASS: Record<HostStatus, string> = {
-  online: 'bg-green-50 text-green-700 ring-green-200',
-  offline: 'bg-red-50 text-red-700 ring-red-200',
-  stale: 'bg-amber-50 text-amber-800 ring-amber-200',
-};
 
 const TRANSPORT_LABEL: Record<HostTransportKind, string> = {
   local: 'local',
@@ -126,7 +120,7 @@ export default function HostDetail() {
 
       {/* Host info */}
       {hostError ? (
-        <div className="mb-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-6 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {hostError}
         </div>
       ) : host === null ? (
@@ -138,7 +132,7 @@ export default function HostDetail() {
               <h1 className="text-2xl font-semibold text-ink">{host.name}</h1>
               <p className="mt-0.5 text-sm font-mono text-ink-mute">{host.id}</p>
             </div>
-            <Chip className={HOST_STATUS_CLASS[host.status]}>{host.status}</Chip>
+            <HostStatusBadge status={host.status} />
           </header>
 
           <dl className="grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-4 rounded-xl border border-border bg-panel px-5 py-4 text-sm">
@@ -186,7 +180,7 @@ export default function HostDetail() {
         />
 
         {runsError && (
-          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
             {runsError}
           </div>
         )}
