@@ -146,6 +146,19 @@ each with id/agent/prompt), and `panel:` (panelists list + subject + prompt, opt
 Keep it minimal unless the description calls for fan-out.\n\nNever leave `agent:` empty \
 \u{2014} every linear/for_each step must name a real agent.\n";
 
+/// First authenticated provider (in [`DEFAULT_GEN_MODELS`] order) paired
+/// with its default generation model. `None` when nothing is authed.
+pub async fn pick_default_gen_model(
+    resolver: &dyn rupu_auth::CredentialResolver,
+) -> Option<(String, String)> {
+    for (provider, model) in DEFAULT_GEN_MODELS {
+        if resolver.get(provider, None).await.is_ok() {
+            return Some((provider.to_string(), model.to_string()));
+        }
+    }
+    None
+}
+
 /// Generate a validated definition, repairing up to [`MAX_ATTEMPTS`].
 pub async fn generate_definition(
     req: &GenerateRequest,
@@ -240,7 +253,10 @@ mod tests {
         assert!(p.contains("fixer"));
     }
 
+    use rupu_auth::backend::ProviderId;
     use rupu_auth::in_memory::InMemoryResolver;
+    use rupu_auth::stored::StoredCredential;
+    use rupu_providers::AuthMode;
     use tokio::sync::Mutex as AsyncMutex;
 
     // Env-var seam is process-global; serialize.
@@ -327,5 +343,39 @@ mod tests {
             GenerateError::Invalid { attempts, .. } => assert_eq!(attempts, MAX_ATTEMPTS),
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn pick_default_returns_none_when_nothing_authed() {
+        let resolver = InMemoryResolver::new();
+        assert!(pick_default_gen_model(&resolver).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pick_default_prefers_anthropic_then_openai() {
+        // Only openai authed → openai wins.
+        let resolver = InMemoryResolver::new();
+        resolver
+            .put(
+                ProviderId::Openai,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("sk-test-openai"),
+            )
+            .await;
+        let (provider, model) = pick_default_gen_model(&resolver).await.expect("some");
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-5.4");
+
+        // Add anthropic → anthropic now wins (higher preference).
+        resolver
+            .put(
+                ProviderId::Anthropic,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("sk-test-anthropic"),
+            )
+            .await;
+        let (provider, model) = pick_default_gen_model(&resolver).await.expect("some");
+        assert_eq!(provider, "anthropic");
+        assert_eq!(model, "claude-sonnet-4-6");
     }
 }

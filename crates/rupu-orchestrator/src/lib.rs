@@ -25,7 +25,10 @@ pub use event_vocab::{
     annotate_event_payload, candidate_event_ids, derived_event_ids, matching_event_id,
     matching_event_id_from_candidates,
 };
-pub use generate::{generate_definition, GenKind, GenerateError, GenerateOutcome, GenerateRequest};
+pub use generate::{
+    generate_definition, pick_default_gen_model, GenKind, GenerateError, GenerateOutcome,
+    GenerateRequest,
+};
 pub use runner::{
     resolve_inputs, run_workflow, AwaitingInfo, Finding, ItemResult, OrchestratorRunOpts,
     OrchestratorRunResult, ResumeState, RunWorkflowError, StepFactory, StepResult,
