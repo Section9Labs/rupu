@@ -129,9 +129,8 @@ impl HostRegistry {
         self.store.save(&host)?;
 
         if let Some(tok) = token {
-            if let Err(e) = set_host_token(&id, tok) {
-                tracing::warn!(host_id = %id, error = %e, "host_registry: could not store token in keychain");
-            }
+            set_host_token(&id, tok)
+                .map_err(|e| HostConnectorError::Invalid(format!("could not store token for host {id}: {e}")))?;
         }
 
         // Invalidate any stale cache entry for this id (shouldn't exist on add,
