@@ -22,7 +22,7 @@ export default function UsageChip({
     <span className={`inline-flex items-center gap-1.5 text-note text-ink-mute tabular-nums ${className}`}>
       <span>{formatTokens(usage.total_tokens)} tok</span>
       <span className="text-border">·</span>
-      <span title={costTitle} className={partial ? 'text-amber-600' : undefined}>
+      <span title={costTitle} className={partial ? 'text-warn' : undefined}>
         {formatCost(usage.cost_usd)}{partial ? '*' : ''}
       </span>
     </span>

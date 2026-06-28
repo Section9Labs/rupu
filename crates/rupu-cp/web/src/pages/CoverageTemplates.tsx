@@ -46,7 +46,7 @@ export default function CoverageTemplates() {
         </p>
       </header>
 
-      {error && <p className="mt-4 text-sm text-red-700">{error}</p>}
+      {error && <p className="mt-4 text-sm text-err">{error}</p>}
       {templates === null ? (
         <p className="mt-4 text-sm text-ink-dim">Loading…</p>
       ) : (

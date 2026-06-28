@@ -78,7 +78,7 @@ export function FindingsTable({
             href={cwe.url}
             target="_blank"
             rel="noreferrer"
-            className="inline-flex items-center rounded bg-slate-100 px-1.5 py-0.5 text-note font-medium text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200"
+            className="inline-flex items-center rounded bg-surface px-1.5 py-0.5 text-note font-medium text-ink ring-1 ring-border hover:bg-surface-hover"
           >
             {cwe.id}
           </a>

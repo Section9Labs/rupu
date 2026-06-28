@@ -404,7 +404,7 @@ export default function RunDetail() {
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {loadError}
         </div>
       </div>
@@ -467,7 +467,7 @@ export default function RunDetail() {
                 {cancelPending ? 'Cancelling…' : 'Cancel'}
               </Button>
               {cancelError && (
-                <p className="text-note font-medium text-red-700" role="alert">
+                <p className="text-note font-medium text-err" role="alert">
                   {cancelError}
                 </p>
               )}
@@ -476,36 +476,36 @@ export default function RunDetail() {
         </header>
 
         {run.error_message && (
-          <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          <div className="mt-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
             {run.error_message}
           </div>
         )}
 
         {awaiting && (
-          <div className="mt-3 flex items-start gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
-            <Pause size={16} className="mt-0.5 shrink-0 text-amber-600" />
+          <div className="mt-3 flex items-start gap-3 rounded-lg border border-warn/30 bg-warn-bg px-4 py-3">
+            <Pause size={16} className="mt-0.5 shrink-0 text-warn" />
             <div className="min-w-0">
-              <div className="text-sm font-medium text-amber-800">
+              <div className="text-sm font-medium text-warn">
                 Awaiting approval · <span className="font-mono">{awaiting.stepId}</span>
               </div>
-              <p className="mt-0.5 break-words text-ui text-amber-700">{awaiting.reason}</p>
+              <p className="mt-0.5 break-words text-ui text-warn">{awaiting.reason}</p>
 
               {cancelled ? (
-                <div className="mt-2 text-ui font-medium text-slate-600">Cancelled.</div>
+                <div className="mt-2 text-ui font-medium text-ink">Cancelled.</div>
               ) : resumeRequested ? (
-                <div className="mt-2 flex items-center gap-2 text-ui font-medium text-emerald-700">
+                <div className="mt-2 flex items-center gap-2 text-ui font-medium text-ok">
                   <span
-                    className="inline-block h-2 w-2 animate-pulse rounded-full bg-emerald-500"
+                    className="inline-block h-2 w-2 animate-pulse rounded-full bg-ok"
                     aria-hidden="true"
                   />
                   Approved — resuming…
                 </div>
               ) : rejected ? (
-                <div className="mt-2 text-ui font-medium text-red-700">Rejected.</div>
+                <div className="mt-2 text-ui font-medium text-err">Rejected.</div>
               ) : (
                 <div className="mt-2 space-y-2">
                   <div className="flex flex-wrap items-center gap-2">
-                    <label htmlFor="approve-mode" className="text-ui font-medium text-amber-800">
+                    <label htmlFor="approve-mode" className="text-ui font-medium text-warn">
                       Resume mode
                     </label>
                     <select
@@ -516,7 +516,7 @@ export default function RunDetail() {
                       }
                       disabled={gatePending}
                       aria-label="Resume mode"
-                      className="rounded-md border border-amber-300 bg-white px-2 py-1.5 text-ui font-medium text-ink focus:border-amber-400 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                      className="rounded-md border border-warn/30 bg-panel px-2 py-1.5 text-ui font-medium text-ink focus:border-warn/30 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       <option value="ask">Ask</option>
                       <option value="bypass">Bypass</option>
@@ -527,7 +527,7 @@ export default function RunDetail() {
                       onClick={onApprove}
                       disabled={gatePending}
                       aria-label="Approve run"
-                      className="inline-flex items-center rounded-md bg-emerald-600 px-3 py-1.5 text-ui font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                      className="inline-flex items-center rounded-md bg-ok px-3 py-1.5 text-ui font-medium text-white hover:bg-ok disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       {gatePending ? 'Working…' : 'Approve'}
                     </button>
@@ -555,7 +555,7 @@ export default function RunDetail() {
                   </div>
 
                   {cancelError && (
-                    <p className="text-note font-medium text-red-700" role="alert">
+                    <p className="text-note font-medium text-err" role="alert">
                       {cancelError}
                     </p>
                   )}
@@ -568,7 +568,7 @@ export default function RunDetail() {
                         onChange={(e) => setRejectReason(e.target.value)}
                         placeholder="Reason (optional)"
                         aria-label="Rejection reason"
-                        className="min-w-0 flex-1 rounded-md border border-red-200 bg-white px-2 py-1 text-ui text-ink placeholder:text-ink-mute focus:border-red-400 focus:outline-none"
+                        className="min-w-0 flex-1 rounded-md border border-err/30 bg-panel px-2 py-1 text-ui text-ink placeholder:text-ink-mute focus:border-err/30 focus:outline-none"
                       />
                       <Button
                         variant="danger"
@@ -582,7 +582,7 @@ export default function RunDetail() {
                   )}
 
                   {gateError && (
-                    <p className="text-note font-medium text-red-700" role="alert">
+                    <p className="text-note font-medium text-err" role="alert">
                       {gateError}
                     </p>
                   )}
@@ -660,7 +660,7 @@ export default function RunDetail() {
         {tab === 'findings' && (
           <div className="h-full min-h-0 overflow-auto">
             {findingsError ? (
-              <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              <div className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
                 {findingsError}
               </div>
             ) : findings === null ? (

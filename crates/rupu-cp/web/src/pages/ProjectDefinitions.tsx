@@ -22,13 +22,13 @@ type Tab = 'agents' | 'workflows' | 'autoflows';
 // ── Scope badge ─────────────────────────────────────────────────────────────
 
 const SCOPE_CLS: Record<string, string> = {
-  project: 'bg-emerald-50 text-emerald-700 ring-emerald-200',
+  project: 'bg-ok-bg text-ok ring-ok/30',
   global: 'bg-indigo-50 text-indigo-700 ring-indigo-200',
 };
 
 function ScopeChip({ scope }: { scope?: string }) {
   const s = scope ?? 'global';
-  const cls = SCOPE_CLS[s] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  const cls = SCOPE_CLS[s] ?? 'bg-surface text-ink ring-border';
   return (
     <span
       className={cn(
@@ -247,7 +247,7 @@ export default function ProjectDefinitions() {
 
       <div className="px-8 py-6">
         {error && (
-          <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
             {error}
           </div>
         )}

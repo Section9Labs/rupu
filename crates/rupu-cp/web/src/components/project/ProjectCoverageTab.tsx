@@ -44,7 +44,7 @@ const COVERAGE_COLUMNS: Column<ProjectCoverageRow>[] = [
     sortValue: (r) => r.findings,
     render: (r) =>
       r.findings > 0 ? (
-        <span className="text-red-700 font-medium">{r.findings}</span>
+        <span className="text-err font-medium">{r.findings}</span>
       ) : (
         <span className="text-ink-mute">—</span>
       ),
@@ -78,7 +78,7 @@ export default function ProjectCoverageTab({ wsId }: { wsId: string }) {
   return (
     <div className="space-y-4">
       {error && (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -87,7 +87,7 @@ export default function ProjectCoverageTab({ wsId }: { wsId: string }) {
 
       {rows !== null && rows.length === 0 && (
         <div className="rounded-xl border border-dashed border-border bg-panel/50 py-12 flex flex-col items-center justify-center text-center">
-          <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center mb-2">
+          <div className="w-10 h-10 rounded-full bg-surface flex items-center justify-center mb-2">
             <ShieldCheck size={18} className="text-ink-mute" />
           </div>
           <p className="text-sm text-ink-mute">No coverage targets for this project yet</p>

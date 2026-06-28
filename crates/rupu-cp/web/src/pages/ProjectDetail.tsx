@@ -118,7 +118,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
     return (
       <div className="p-8">
         <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-          <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+          <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
             <Activity size={20} className="text-ink-mute" />
           </div>
           <h2 className="text-sm font-medium text-ink">Project not found</h2>
@@ -141,7 +141,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   if (error) {
     return (
       <div className="p-8">
-        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       </div>
@@ -207,7 +207,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
         />
         <RollupTile label="Coverage" value={pctLabel}>
           {/* Progress bar — width via inline style (CSS value, not Tailwind class) */}
-          <div className="mt-2 h-1.5 rounded-full bg-slate-200 overflow-hidden">
+          <div className="mt-2 h-1.5 rounded-full bg-surface-hover overflow-hidden">
             {pct !== null ? (
               <div
                 className="h-full rounded-full bg-gradient-to-r from-brand-500 to-green-500"
@@ -218,13 +218,13 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
         </RollupTile>
         <RollupTile label="Findings" value={coverage.findings}>
           {coverage.findings > 0 && (
-            <p className="mt-1 text-note text-red-600 font-medium flex items-center gap-1">
+            <p className="mt-1 text-note text-err font-medium flex items-center gap-1">
               <ShieldAlert size={11} />
               needs attention
             </p>
           )}
           {coverage.findings === 0 && (
-            <p className="mt-1 text-note text-green-600 flex items-center gap-1">
+            <p className="mt-1 text-note text-ok flex items-center gap-1">
               <ShieldCheck size={11} />
               all clear
             </p>

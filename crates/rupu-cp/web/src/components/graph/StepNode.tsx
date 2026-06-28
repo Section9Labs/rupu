@@ -7,7 +7,8 @@
 import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
-import { STATE_STYLE } from './stepStyle';
+import { stateStyle } from './stepStyle';
+import { useThemeColors } from '../../lib/useThemeColors';
 import { STEP_W, STEP_H } from '../../lib/nodeSize';
 
 export interface StepNodeData extends Record<string, unknown> {
@@ -16,28 +17,23 @@ export interface StepNodeData extends Record<string, unknown> {
 
 type StepFlowNode = Node<StepNodeData, 'step'>;
 
-const handleStyle = {
-  background: '#cbd5e1',
-  width: 6,
-  height: 6,
-  border: 'none',
-} as const;
-
 function StepNodeView({ data }: NodeProps<StepFlowNode>) {
   const { node } = data;
-  const s = STATE_STYLE[node.state];
+  const colors = useThemeColors();
+  const s = stateStyle(colors, node.state);
+  const handleStyle = { background: colors.border, width: 6, height: 6, border: 'none' } as const;
   const running = node.state === 'running';
   const awaiting = node.state === 'awaiting_approval';
 
   return (
     <div
       className={[
-        'relative rounded-[10px] border bg-white px-3 py-2 text-left shadow-card',
+        'relative rounded-[10px] border border-border bg-panel px-3 py-2 text-left shadow-card',
         running ? 'rg-pulse-run' : '',
         awaiting ? 'rg-pulse-await' : '',
         node.state === 'pending' ? 'opacity-75' : '',
       ].join(' ')}
-      style={{ borderColor: '#e5e7eb', width: STEP_W, minHeight: STEP_H }}
+      style={{ width: STEP_W, minHeight: STEP_H }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
@@ -62,11 +58,11 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
       </div>
 
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded bg-slate-100 px-1.5 py-px text-meta text-slate-500">
+        <span className="rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
           {node.kind === 'panel' ? 'panel' : 'step'}
         </span>
         {node.agent && (
-          <span className="truncate rounded bg-slate-100 px-1.5 py-px text-meta text-slate-500">
+          <span className="truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
             {node.agent}
           </span>
         )}

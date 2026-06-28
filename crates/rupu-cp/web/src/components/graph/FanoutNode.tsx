@@ -8,12 +8,14 @@
 //            the step's unit file-browser via onExpandFanout.
 //
 // Faithful to the fanout-loop mockup: big X / N, blue→green % bar, failures
-// broken out in red, density grid of colored squares.
+// broken out in red, density grid of colored squares. All colors are themed via
+// `useThemeColors()` so the card reads on both light and dark.
 
 import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
-import { STATE_STYLE, glyphBg } from './stepStyle';
+import { stateStyle, glyphBg } from './stepStyle';
+import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize, FANOUT_INLINE_THRESHOLD, FANOUT_INLINE_COLS } from '../../lib/nodeSize';
 
 export interface FanoutNodeData extends Record<string, unknown> {
@@ -24,13 +26,18 @@ export interface FanoutNodeData extends Record<string, unknown> {
 
 type FanoutFlowNode = Node<FanoutNodeData, 'fanout'>;
 
-const handleStyle = { background: '#bfdbfe', width: 6, height: 6, border: 'none' } as const;
-
 const INLINE_THRESHOLD = FANOUT_INLINE_THRESHOLD;
 const PREVIEW_CELLS = 60;
 
 function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const { node, onOpenUnit, onExpandFanout } = data;
+  const colors = useThemeColors();
+  const handleStyle = {
+    background: colors.alpha('status.running', 0.4),
+    width: 6,
+    height: 6,
+    border: 'none',
+  } as const;
   const fo = node.fanout;
   const running = node.state === 'running';
   const box = nodeSize(node);
@@ -43,9 +50,21 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
     const state = node.state;
     const isErr = state === 'failed';
     const isActive = state === 'running' || state === 'pending' || state === 'awaiting_approval';
-    const border = isErr ? '#fecaca' : isActive ? '#bfdbfe' : '#e5e7eb';
-    const bg = isErr ? '#fef2f2' : isActive ? '#eff6ff' : '#ffffff';
-    const labelColor = isErr ? 'text-[#ef4444]' : isActive ? 'text-[#3b82f6]' : 'text-ink-mute';
+    const border = isErr
+      ? colors.alpha('status.failed', 0.4)
+      : isActive
+        ? colors.alpha('status.running', 0.4)
+        : colors.border;
+    const bg = isErr
+      ? colors.alpha('status.failed', 0.12)
+      : isActive
+        ? colors.alpha('status.running', 0.12)
+        : colors.panel;
+    const labelColor = isErr
+      ? colors.status.failed
+      : isActive
+        ? colors.status.running
+        : colors.inkMute;
     const message =
       state === 'running'
         ? 'starting units…'
@@ -62,7 +81,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         style={{ borderColor: border, background: bg, width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
-        <div className={['text-meta font-bold uppercase tracking-wide', labelColor].join(' ')}>
+        <div className="text-meta font-bold uppercase tracking-wide" style={{ color: labelColor }}>
           for_each · {node.id}
         </div>
         <div className="mt-1 text-note text-ink-mute">{message}</div>
@@ -84,13 +103,24 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
     return (
       <div
         className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
-        style={{ borderColor: '#bfdbfe', background: '#eff6ff', width: box.width, minHeight: box.height }}
+        style={{
+          borderColor: colors.alpha('status.running', 0.4),
+          background: colors.alpha('status.running', 0.12),
+          width: box.width,
+          minHeight: box.height,
+        }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
-        <div className="mb-1 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide text-[#3b82f6]">
+        <div
+          className="mb-1 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide"
+          style={{ color: colors.status.running }}
+        >
           <span className="truncate">for_each · {node.id} · {total}</span>
           <span className="tabular-nums">
-            {done} ✓{failed > 0 && <span className="ml-1 text-[#ef4444]">· {failed} ✕</span>}
+            {done} ✓
+            {failed > 0 && (
+              <span className="ml-1" style={{ color: colors.status.failed }}>· {failed} ✕</span>
+            )}
           </span>
         </div>
         <div
@@ -101,10 +131,10 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
             <button
               key={u.index}
               type="button"
-              title={`${u.key} · ${STATE_STYLE[u.state].label}`}
+              title={`${u.key} · ${stateStyle(colors, u.state).label}`}
               onClick={() => onOpenUnit?.(node.id, u.index)}
               className="h-[15px] w-[15px] rounded-[3px] transition-transform hover:scale-110"
-              style={{ background: glyphBg(u.state) }}
+              style={{ background: glyphBg(colors, u.state) }}
             />
           ))}
         </div>
@@ -117,25 +147,39 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const preview = fo.units.slice(0, PREVIEW_CELLS);
   return (
     <div
-      className={['relative rounded-[12px] border bg-white px-3 py-2.5 shadow-card', running ? 'rg-pulse-run' : ''].join(' ')}
-      style={{ borderColor: '#bfdbfe', width: box.width, minHeight: box.height }}
+      className={['relative rounded-[12px] border bg-panel px-3 py-2.5 shadow-card', running ? 'rg-pulse-run' : ''].join(' ')}
+      style={{ borderColor: colors.alpha('status.running', 0.4), width: box.width, minHeight: box.height }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
-      <div className="text-meta font-bold uppercase tracking-wide text-[#3b82f6]">
+      <div
+        className="text-meta font-bold uppercase tracking-wide"
+        style={{ color: colors.status.running }}
+      >
         for_each · {node.id}
       </div>
 
       <div className="mt-1 flex items-baseline gap-2">
         <span className="text-[22px] font-bold leading-none text-ink tabular-nums">{done}</span>
         <span className="text-note text-ink-mute">/ {total} units</span>
-        <span className="ml-auto text-lead font-bold text-[#3b82f6] tabular-nums">{pct}%</span>
+        <span
+          className="ml-auto text-lead font-bold tabular-nums"
+          style={{ color: colors.status.running }}
+        >
+          {pct}%
+        </span>
       </div>
 
-      <div className="mt-1.5 h-[9px] overflow-hidden rounded-[5px]" style={{ background: '#e2e8f0' }}>
+      <div
+        className="mt-1.5 h-[9px] overflow-hidden rounded-[5px]"
+        style={{ background: colors.surface }}
+      >
         <div
           className="h-full"
-          style={{ width: `${pct}%`, background: 'linear-gradient(90deg,#3b82f6,#22c55e)' }}
+          style={{
+            width: `${pct}%`,
+            background: `linear-gradient(90deg, ${colors.status.running}, ${colors.status.done})`,
+          }}
         />
       </div>
 
@@ -149,7 +193,9 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         <span>
           <b className="text-ink">{pending}</b> pending
         </span>
-        {failed > 0 && <span className="font-bold text-[#ef4444]">{failed} failed</span>}
+        {failed > 0 && (
+          <span className="font-bold" style={{ color: colors.status.failed }}>{failed} failed</span>
+        )}
       </div>
 
       <div className="mt-2 grid gap-[2px]" style={{ gridTemplateColumns: 'repeat(20, 9px)' }}>
@@ -157,7 +203,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
           <span
             key={u.index}
             className="block h-[9px] w-[9px] rounded-[2px]"
-            style={{ background: glyphBg(u.state) }}
+            style={{ background: glyphBg(colors, u.state) }}
           />
         ))}
       </div>
@@ -165,7 +211,8 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
       <button
         type="button"
         onClick={() => onExpandFanout?.(node.id)}
-        className="mt-2 text-note font-medium text-[#3b82f6] hover:underline"
+        className="mt-2 text-note font-medium hover:underline"
+        style={{ color: colors.status.running }}
       >
         ▸ expand all {total}
         {failed > 0 && ` · failed (${failed})`}

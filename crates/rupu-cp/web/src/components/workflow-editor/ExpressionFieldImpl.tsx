@@ -34,6 +34,7 @@ import {
 } from '@codemirror/autocomplete';
 import { completionsFor, type ExprContext, type ExprKind } from '../../lib/workflowExpressions';
 import type { ExpressionFieldProps } from './ExpressionField';
+import type { Mode } from '../theme/ThemeProvider';
 
 // ── mustache scanning (shared by highlighter + completion gate) ───────────────
 
@@ -159,16 +160,33 @@ function makeCompletionSource(getContext: () => ExprContext) {
 
 // ── theme ─────────────────────────────────────────────────────────────────────
 
-const exprTheme = EditorView.theme({
-  '&': { fontSize: '13px' },
-  '.cm-content': { padding: '6px 10px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
-  '.cm-scroller': { fontFamily: 'inherit', lineHeight: '1.5' },
-  '&.cm-focused': { outline: 'none' },
-  '.cm-expr-delim': { color: '#9333ea', fontWeight: '600' },
-  '.cm-expr-path': { color: '#2563eb' },
-  '.cm-expr-filter': { color: '#0d9488' },
-  '.cm-expr-string': { color: '#b45309' },
-});
+// Mustache token colors per mode — the light hexes wash out on near-black, so
+// dark mode uses lighter, higher-contrast variants. The container's `bg-panel`
+// (from the ExpressionField shell) supplies the surface; the editor itself stays
+// transparent with an inherited text color + a mode-tuned caret.
+function makeExprTheme(dark: boolean): Extension {
+  return EditorView.theme(
+    {
+      '&': { fontSize: '13px', backgroundColor: 'transparent', color: 'inherit' },
+      '.cm-content': {
+        padding: '6px 10px',
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        caretColor: dark ? '#e6edf3' : '#0f172a',
+      },
+      '.cm-cursor, .cm-dropCursor': { borderLeftColor: dark ? '#e6edf3' : '#0f172a' },
+      '.cm-scroller': { fontFamily: 'inherit', lineHeight: '1.5' },
+      '.cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection': {
+        backgroundColor: dark ? 'rgba(96, 165, 250, 0.25)' : 'rgba(59, 130, 246, 0.18)',
+      },
+      '&.cm-focused': { outline: 'none' },
+      '.cm-expr-delim': { color: dark ? '#c084fc' : '#9333ea', fontWeight: '600' },
+      '.cm-expr-path': { color: dark ? '#60a5fa' : '#2563eb' },
+      '.cm-expr-filter': { color: dark ? '#2dd4bf' : '#0d9488' },
+      '.cm-expr-string': { color: dark ? '#fbbf24' : '#b45309' },
+    },
+    { dark },
+  );
+}
 
 function singleLineGuard(): Extension {
   // Drop newline insertions so a single-line field stays one line.
@@ -185,13 +203,26 @@ function singleLineGuard(): Extension {
 
 // ── component ─────────────────────────────────────────────────────────────────
 
+/** Resolve the effective mode: explicit prop wins, else read the live
+ *  `data-theme` attribute at mount (the editor mounts imperatively). */
+function resolveMode(theme: Mode | undefined): Mode {
+  if (theme) return theme;
+  try {
+    return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+  } catch {
+    return 'light';
+  }
+}
+
 export default function ExpressionFieldImpl({
   value,
   onChange,
   context,
   multiline = false,
   ariaLabel,
+  theme,
 }: ExpressionFieldProps) {
+  const mode = resolveMode(theme);
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -215,7 +246,7 @@ export default function ExpressionFieldImpl({
       mustacheHighlighter,
       autocompletion({ override: [makeCompletionSource(() => contextRef.current)] }),
       keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...completionKeymap]),
-      exprTheme,
+      makeExprTheme(mode === 'dark'),
       updateListener,
     ];
     if (multiline) extensions.push(EditorView.lineWrapping);
@@ -230,9 +261,10 @@ export default function ExpressionFieldImpl({
       view.destroy();
       viewRef.current = null;
     };
-    // `value` intentionally omitted — external sync is handled below.
+    // `value` intentionally omitted — external sync is handled below. `mode` IS
+    // included so the field recreates with the matching token colors on toggle.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [multiline, ariaLabel]);
+  }, [multiline, ariaLabel, mode]);
 
   // Sync external value changes (e.g. a kind switch / YAML reconcile).
   useEffect(() => {

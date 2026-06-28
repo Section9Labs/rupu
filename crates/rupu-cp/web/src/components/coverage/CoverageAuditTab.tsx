@@ -62,7 +62,7 @@ export default function CoverageAuditTab({ target, wsId }: { target: string; wsI
     });
   }
 
-  if (error) return <p className="mt-4 text-sm text-red-700">{error}</p>;
+  if (error) return <p className="mt-4 text-sm text-err">{error}</p>;
   if (!report) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
 
   return (
@@ -116,7 +116,7 @@ export default function CoverageAuditTab({ target, wsId }: { target: string; wsI
                 <span className="font-mono text-ink">{x.concern_id}</span>
                 <span className="text-ink-mute"> · {x.file_path}</span>
                 {x.disagreement && (
-                  <span className="ml-2 text-amber-700 font-medium">disagreement</span>
+                  <span className="ml-2 text-warn font-medium">disagreement</span>
                 )}
               </div>
             ))}
@@ -178,13 +178,13 @@ function ConcernRow({
             <span className="text-note font-mono text-ink-mute">{c.concern_id}</span>
             <SeverityChip severity={c.severity} />
             {c.gap_files.length > 0 && (
-              <span className="text-meta text-amber-700 font-medium">
+              <span className="text-meta text-warn font-medium">
                 {c.gap_files.length} gap
               </span>
             )}
           </span>
           <span className="mt-1.5 flex items-center gap-2">
-            <span className="h-1.5 flex-1 rounded bg-slate-100 overflow-hidden">
+            <span className="h-1.5 flex-1 rounded bg-surface overflow-hidden">
               <span className="block h-full bg-brand-500" style={{ width: `${pct}%` }} />
             </span>
             <span className="text-note text-ink-mute tabular-nums w-24 text-right">
@@ -205,7 +205,7 @@ function ConcernRow({
       )}
       {c.gap_files.length > 0 && (
         <div>
-          <p className="text-note font-medium text-amber-700 mb-0.5">Gap</p>
+          <p className="text-note font-medium text-warn mb-0.5">Gap</p>
           <CappedList items={c.gap_files} />
         </div>
       )}

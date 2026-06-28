@@ -63,8 +63,8 @@ export function StatusPill({
 }) {
   const s = RUN_STATUS_STYLES[status] ?? {
     label: status,
-    cls: 'bg-slate-100 text-slate-700 ring-slate-200',
-    dot: 'bg-slate-400',
+    cls: 'bg-surface text-ink ring-border',
+    dot: 'bg-ink-mute',
     icon: AlertCircle,
   };
   const Icon = s.icon;
@@ -95,7 +95,7 @@ export function StatusDot({
   const s = RUN_STATUS_STYLES[status];
   return (
     <span
-      className={cn('inline-block w-1.5 h-1.5 rounded-full', s ? s.dot : 'bg-slate-400', className)}
+      className={cn('inline-block w-1.5 h-1.5 rounded-full', s ? s.dot : 'bg-ink-mute', className)}
     />
   );
 }

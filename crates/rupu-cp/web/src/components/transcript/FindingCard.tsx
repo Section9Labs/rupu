@@ -36,7 +36,7 @@ export default function FindingCard({ finding }: { finding: FindingView }) {
   }
 
   return (
-    <div className="border border-border rounded-lg bg-white overflow-hidden shadow-sm my-1">
+    <div className="border border-border rounded-lg bg-panel overflow-hidden shadow-sm my-1">
       {/* 1. Severity hairline */}
       <div className={`h-1 ${s.bar}`} aria-hidden />
 
@@ -53,14 +53,14 @@ export default function FindingCard({ finding }: { finding: FindingView }) {
 
           {/* Scope chip */}
           {finding.scope && (
-            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-slate-100 text-ink-mute">
+            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-surface text-ink-mute">
               {finding.scope}
             </span>
           )}
 
           {/* Concern ID chip */}
           {finding.concernId && (
-            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-slate-100 text-ink-mute font-mono">
+            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-surface text-ink-mute font-mono">
               {finding.concernId}
             </span>
           )}
@@ -73,7 +73,7 @@ export default function FindingCard({ finding }: { finding: FindingView }) {
 
         {/* 4. Location chip */}
         {location && (
-          <span className="inline-flex items-center rounded bg-slate-50 border border-border px-1.5 py-0.5 text-[10.5px] font-mono text-ink-dim break-all">
+          <span className="inline-flex items-center rounded bg-surface border border-border px-1.5 py-0.5 text-[10.5px] font-mono text-ink-dim break-all">
             {location}
           </span>
         )}
@@ -87,7 +87,7 @@ export default function FindingCard({ finding }: { finding: FindingView }) {
 
         {/* 6. Code excerpt */}
         {finding.codeExcerpt && (
-          <pre className="overflow-x-auto rounded bg-slate-50 ring-1 ring-slate-200 px-3 py-2 text-[10.5px] font-mono text-ink leading-snug whitespace-pre">
+          <pre className="overflow-x-auto rounded bg-surface ring-1 ring-border px-3 py-2 text-[10.5px] font-mono text-ink leading-snug whitespace-pre">
             {finding.codeExcerpt}
           </pre>
         )}

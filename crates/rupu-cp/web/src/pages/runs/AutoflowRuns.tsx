@@ -26,15 +26,15 @@ import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 const PAGE = 20;
 
 const MODE_CLS: Record<string, string> = {
-  ask:       'bg-amber-50 text-amber-700 ring-amber-200',
-  bypass:    'bg-green-50 text-green-700 ring-green-200',
-  readonly:  'bg-slate-100 text-slate-600 ring-slate-200',
-  tick:      'bg-slate-100 text-slate-600 ring-slate-200',
+  ask:       'bg-warn-bg text-warn ring-warn/30',
+  bypass:    'bg-ok-bg text-ok ring-ok/30',
+  readonly:  'bg-surface text-ink ring-border',
+  tick:      'bg-surface text-ink ring-border',
   serve:     'bg-sky-50 text-sky-700 ring-sky-200',
 };
 
 function ModeChip({ mode }: { mode: string }) {
-  const cls = MODE_CLS[mode] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  const cls = MODE_CLS[mode] ?? 'bg-surface text-ink ring-border';
   return (
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {mode}
@@ -44,10 +44,10 @@ function ModeChip({ mode }: { mode: string }) {
 
 // Per-kind badge styling + human label for the events view.
 const KIND_CLS: Record<string, string> = {
-  run_launched:     'bg-green-50 text-green-700 ring-green-200',
-  awaiting_human:   'bg-amber-50 text-amber-700 ring-amber-200',
+  run_launched:     'bg-ok-bg text-ok ring-ok/30',
+  awaiting_human:   'bg-warn-bg text-warn ring-warn/30',
   awaiting_external:'bg-sky-50 text-sky-700 ring-sky-200',
-  cycle_failed:     'bg-red-50 text-red-700 ring-red-200',
+  cycle_failed:     'bg-err-bg text-err ring-err/30',
 };
 
 const KIND_LABEL: Record<string, string> = {
@@ -58,7 +58,7 @@ const KIND_LABEL: Record<string, string> = {
 };
 
 function KindBadge({ kind }: { kind: string }) {
-  const cls = KIND_CLS[kind] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  const cls = KIND_CLS[kind] ?? 'bg-surface text-ink ring-border';
   const label = KIND_LABEL[kind] ?? kind.replace(/_/g, ' ');
   return (
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
@@ -69,7 +69,7 @@ function KindBadge({ kind }: { kind: string }) {
 
 function IssueChip({ displayRef }: { displayRef: string }) {
   return (
-    <span className="inline-flex items-center rounded bg-slate-100 text-slate-600 ring-1 ring-slate-200 text-meta font-medium px-1.5 py-0.5">
+    <span className="inline-flex items-center rounded bg-surface text-ink ring-1 ring-border text-meta font-medium px-1.5 py-0.5">
       {displayRef}
     </span>
   );
@@ -86,15 +86,15 @@ function titleCase(s: string): string {
 
 // Per-status badge styling for the claim lifecycle.
 const CLAIM_STATUS_CLS: Record<string, string> = {
-  await_human: 'bg-amber-50 text-amber-700 ring-amber-200',
-  running:     'bg-blue-50 text-blue-700 ring-blue-200',
-  blocked:     'bg-red-50 text-red-700 ring-red-200',
-  complete:    'bg-green-50 text-green-700 ring-green-200',
-  released:    'bg-slate-100 text-slate-600 ring-slate-200',
+  await_human: 'bg-warn-bg text-warn ring-warn/30',
+  running:     'bg-status-running/10 text-status-running ring-status-running/30',
+  blocked:     'bg-err-bg text-err ring-err/30',
+  complete:    'bg-ok-bg text-ok ring-ok/30',
+  released:    'bg-surface text-ink ring-border',
 };
 
 function ClaimStatusBadge({ status }: { status: string }) {
-  const cls = CLAIM_STATUS_CLS[status] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  const cls = CLAIM_STATUS_CLS[status] ?? 'bg-surface text-ink ring-border';
   return (
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {titleCase(status)}
@@ -273,7 +273,7 @@ const CYCLE_COLUMNS: Column<AutoflowCycleRow>[] = [
     sortable: true,
     sortValue: (c) => c.failed_cycles,
     render: (c) => (
-      <span className={c.failed_cycles > 0 ? 'text-red-600 font-medium' : 'text-ink-dim'}>
+      <span className={c.failed_cycles > 0 ? 'text-err font-medium' : 'text-ink-dim'}>
         {c.failed_cycles}
       </span>
     ),
@@ -447,7 +447,7 @@ export default function AutoflowRuns() {
               <div className="text-note text-ink-dim mt-0.5 truncate">{c.issue_title}</div>
             )}
             {c.last_error ? (
-              <div className="text-note text-red-600 mt-0.5">{c.last_error}</div>
+              <div className="text-note text-err mt-0.5">{c.last_error}</div>
             ) : (
               c.last_summary && (
                 <div className="text-note text-ink-dim mt-0.5">{c.last_summary}</div>
@@ -533,7 +533,7 @@ export default function AutoflowRuns() {
           onClick={() => setTab('runs')}
           className={cn(
             'px-3 py-1 rounded',
-            tab === 'runs' ? 'bg-slate-100 text-ink' : 'text-ink-dim hover:text-ink',
+            tab === 'runs' ? 'bg-surface text-ink' : 'text-ink-dim hover:text-ink',
           )}
         >
           Launched runs
@@ -542,7 +542,7 @@ export default function AutoflowRuns() {
           onClick={() => setTab('cycles')}
           className={cn(
             'px-3 py-1 rounded',
-            tab === 'cycles' ? 'bg-slate-100 text-ink' : 'text-ink-dim hover:text-ink',
+            tab === 'cycles' ? 'bg-surface text-ink' : 'text-ink-dim hover:text-ink',
           )}
         >
           Cycles
@@ -551,7 +551,7 @@ export default function AutoflowRuns() {
           onClick={() => setTab('claims')}
           className={cn(
             'px-3 py-1 rounded',
-            tab === 'claims' ? 'bg-slate-100 text-ink' : 'text-ink-dim hover:text-ink',
+            tab === 'claims' ? 'bg-surface text-ink' : 'text-ink-dim hover:text-ink',
           )}
         >
           Claims
@@ -559,7 +559,7 @@ export default function AutoflowRuns() {
       </div>
 
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -604,7 +604,7 @@ export default function AutoflowRuns() {
           </section>
         )
       ) : claimsError ? (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {claimsError}
         </div>
       ) : claims === null ? (
@@ -671,7 +671,7 @@ function ClaimActions({
     <div className="flex flex-col items-end gap-1">
       <div className="flex items-center gap-2 shrink-0">
         {requeued && (
-          <span className="text-meta font-medium text-green-700">requeued</span>
+          <span className="text-meta font-medium text-ok">requeued</span>
         )}
         <Button variant="secondary" size="sm" onClick={() => void onRequeue()} disabled={busy !== null}>
           {busy === 'requeue' ? 'Requeuing…' : 'Requeue'}
@@ -686,7 +686,7 @@ function ClaimActions({
         </Button>
       </div>
       {actionError && (
-        <div role="alert" className="text-note text-red-600">
+        <div role="alert" className="text-note text-err">
           {actionError}
         </div>
       )}
@@ -697,7 +697,7 @@ function ClaimActions({
 function AutoflowClaimsEmpty() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Inbox size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No active claims</h2>
@@ -711,7 +711,7 @@ function AutoflowClaimsEmpty() {
 function AutoflowEventsEmpty() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Inbox size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No autoflow activity yet</h2>
@@ -725,7 +725,7 @@ function AutoflowEventsEmpty() {
 function AutoflowCyclesEmpty() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Inbox size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No autoflow cycles yet</h2>

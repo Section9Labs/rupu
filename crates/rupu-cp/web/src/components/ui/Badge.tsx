@@ -20,13 +20,13 @@ export type BadgeTone =
 export type BadgeSize = 'sm' | 'md';
 
 const TONE_CLS: Record<BadgeTone, string> = {
-  neutral: 'bg-slate-100 text-slate-600',
+  neutral: 'bg-surface text-ink',
   brand: 'bg-brand-50 text-brand-700',
   violet: 'bg-violet-50 text-violet-700',
   sky: 'bg-sky-50 text-sky-700',
-  amber: 'bg-amber-50 text-amber-700',
-  green: 'bg-emerald-50 text-emerald-700',
-  red: 'bg-red-50 text-red-700',
+  amber: 'bg-warn-bg text-warn',
+  green: 'bg-ok-bg text-ok',
+  red: 'bg-err-bg text-err',
 };
 
 const SIZE_CLS: Record<BadgeSize, string> = {

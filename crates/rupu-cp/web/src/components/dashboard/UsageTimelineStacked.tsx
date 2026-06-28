@@ -8,6 +8,7 @@
 import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import type { UsageTimelineBucket } from '../../lib/usage';
 import { formatCost, formatTokens } from '../../lib/usage';
+import { useThemeColors } from '../../lib/useThemeColors';
 import { assignModelColors } from './modelColors';
 
 export type UsageMetric = 'cost' | 'tokens';
@@ -49,10 +50,6 @@ export function toChartData(buckets: UsageTimelineBucket[], metric: UsageMetric)
   return { models, data };
 }
 
-const tooltipStyle: React.CSSProperties = {
-  background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, fontSize: 11, padding: '6px 10px',
-};
-
 /** Short bucket tick: `2026-06-21` → `06-21`. */
 function bucketTick(b: string): string {
   return b.length >= 10 ? b.slice(5) : b;
@@ -65,12 +62,21 @@ export default function UsageTimelineStacked({
   buckets: UsageTimelineBucket[];
   metric: UsageMetric;
 }) {
+  const theme = useThemeColors();
+  const tooltipStyle: React.CSSProperties = {
+    background: theme.panel,
+    border: `1px solid ${theme.border}`,
+    color: theme.ink,
+    borderRadius: 6,
+    fontSize: 11,
+    padding: '6px 10px',
+  };
   const { models, data } = toChartData(buckets, metric);
 
   if (data.length === 0 || models.length === 0) {
     return (
       <div className="h-[240px] flex flex-col items-center justify-center text-center">
-        <div className="w-10 h-10 rounded-full bg-slate-100 mb-2" />
+        <div className="w-10 h-10 rounded-full bg-surface mb-2" />
         <p className="text-xs text-ink-mute">No usage recorded yet</p>
       </div>
     );
@@ -84,10 +90,10 @@ export default function UsageTimelineStacked({
       <div style={{ width: '100%', height: 240 }}>
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-            <XAxis dataKey="bucket" tickFormatter={bucketTick} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+            <XAxis dataKey="bucket" tickFormatter={bucketTick} tick={{ fontSize: 10, fill: theme.inkMute }} />
             <YAxis
               width={48}
-              tick={{ fontSize: 10, fill: '#94a3b8' }}
+              tick={{ fontSize: 10, fill: theme.inkMute }}
               tickFormatter={(v) => fmt(typeof v === 'number' ? v : 0)}
             />
             <Tooltip

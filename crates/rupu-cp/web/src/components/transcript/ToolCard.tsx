@@ -137,7 +137,7 @@ function isNonTrivialObject(v: unknown): v is Record<string, unknown> {
 
 function DurationBadge({ ms }: { ms: number }) {
   return (
-    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-mono bg-slate-100 text-slate-500">
+    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-mono bg-surface text-ink-dim">
       {formatDuration(ms)}
     </span>
   );
@@ -146,7 +146,7 @@ function DurationBadge({ ms }: { ms: number }) {
 function StatusBadge({ tool }: { tool: ToolView }) {
   if (tool.error) {
     return (
-      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-semibold bg-red-100 text-red-700 ring-1 ring-inset ring-red-200">
+      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-semibold bg-err-bg text-err ring-1 ring-inset ring-err/30">
         error
       </span>
     );
@@ -155,7 +155,7 @@ function StatusBadge({ tool }: { tool: ToolView }) {
     return <DurationBadge ms={tool.durationMs} />;
   }
   return (
-    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-slate-100 text-slate-400">
+    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-surface text-ink-mute">
       ok
     </span>
   );
@@ -163,7 +163,7 @@ function StatusBadge({ tool }: { tool: ToolView }) {
 
 function CardHeader({ tool, summary }: { tool: ToolView; summary: string }) {
   return (
-    <div className="flex items-center gap-2 min-w-0 px-3 py-1.5 bg-slate-50 border-b border-slate-200">
+    <div className="flex items-center gap-2 min-w-0 px-3 py-1.5 bg-surface border-b border-border">
       {/* Tool name */}
       <span className="font-mono text-note font-semibold text-brand-700 shrink-0">
         ⚙ {tool.tool}
@@ -171,7 +171,7 @@ function CardHeader({ tool, summary }: { tool: ToolView; summary: string }) {
 
       {/* Input summary */}
       {summary && (
-        <span className="font-mono text-[10.5px] text-slate-500 truncate flex-1 min-w-0">
+        <span className="font-mono text-[10.5px] text-ink-dim truncate flex-1 min-w-0">
           {summary}
         </span>
       )}
@@ -190,9 +190,9 @@ function CardHeader({ tool, summary }: { tool: ToolView; summary: string }) {
 
 function ErrorBlock({ error }: { error: string }) {
   return (
-    <div className="bg-red-50 border-t border-red-200 px-3 py-2">
-      <p className="text-note font-semibold text-red-700 mb-0.5">Error</p>
-      <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-red-800 leading-snug">
+    <div className="bg-err-bg border-t border-err/30 px-3 py-2">
+      <p className="text-note font-semibold text-err mb-0.5">Error</p>
+      <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-err leading-snug">
         {error}
       </pre>
     </div>
@@ -209,7 +209,7 @@ function ReadBody({ tool }: { tool: ToolView }) {
   if (!tool.output) return null;
   return (
     <div className="px-3 py-2">
-      <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-slate-700 bg-slate-50 rounded p-2 max-h-96 overflow-y-auto leading-snug">
+      <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-96 overflow-y-auto leading-snug">
         {tool.output}
       </pre>
     </div>
@@ -224,9 +224,9 @@ function GrepBody({ tool }: { tool: ToolView }) {
   return (
     <div className="px-3 py-2">
       {lines.length > 0 && (
-        <p className="text-meta text-slate-400 mb-1">{lines.length} match{lines.length !== 1 ? 'es' : ''}</p>
+        <p className="text-meta text-ink-mute mb-1">{lines.length} match{lines.length !== 1 ? 'es' : ''}</p>
       )}
-      <div className="font-mono text-[10.5px] text-slate-700 bg-slate-50 rounded p-2 max-h-72 overflow-y-auto leading-snug space-y-0">
+      <div className="font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-72 overflow-y-auto leading-snug space-y-0">
         {lines.map((line, i) => (
           <div key={i} className="whitespace-pre">{line}</div>
         ))}
@@ -242,7 +242,7 @@ function GlobBody({ tool }: { tool: ToolView }) {
   const paths = tool.output.split('\n').filter((l) => l.length > 0);
   return (
     <div className="px-3 py-2">
-      <div className="font-mono text-[10.5px] text-slate-700 bg-slate-50 rounded p-2 max-h-64 overflow-y-auto leading-snug space-y-0">
+      <div className="font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-64 overflow-y-auto leading-snug space-y-0">
         {paths.map((p, i) => (
           <div key={i} className="whitespace-pre">{p}</div>
         ))}
@@ -301,7 +301,7 @@ function SubrunBody({
                 View sub-run transcript →
               </Button>
             ) : (
-              <span className="inline-block font-mono text-[10.5px] text-brand-700 bg-slate-50 border border-border rounded px-2 py-0.5 break-all">
+              <span className="inline-block font-mono text-[10.5px] text-brand-700 bg-surface border border-border rounded px-2 py-0.5 break-all">
                 {transcriptPath}
               </span>
             )}
@@ -315,7 +315,7 @@ function SubrunBody({
   if (tool.output) {
     return (
       <div className="px-3 py-2">
-        <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-slate-700 bg-slate-50 rounded p-2 max-h-64 overflow-y-auto">
+        <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-64 overflow-y-auto">
           {tool.output}
         </pre>
       </div>
@@ -350,7 +350,7 @@ function GenericBody({ tool }: { tool: ToolView }) {
       {parsedOutput !== null ? (
         <StructuredView value={parsedOutput} />
       ) : tool.output ? (
-        <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-slate-700 bg-slate-50 rounded p-2 max-h-64 overflow-y-auto">
+        <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-64 overflow-y-auto">
           {tool.output}
         </pre>
       ) : null}
@@ -358,7 +358,7 @@ function GenericBody({ tool }: { tool: ToolView }) {
       {/* Input args — only when non-trivial */}
       {showInput && (
         <div>
-          <p className="text-meta uppercase tracking-wider text-slate-400 font-semibold mb-1">
+          <p className="text-meta uppercase tracking-wider text-ink-mute font-semibold mb-1">
             args
           </p>
           <StructuredView value={tool.input} />
@@ -400,7 +400,7 @@ export default function ToolCard({
   const headerSummary = tool.kind === 'terminal' ? terminalSummary : summary;
 
   return (
-    <div className="border border-slate-200 rounded-md overflow-hidden my-1 text-[11.5px]">
+    <div className="border border-border rounded-md overflow-hidden my-1 text-[11.5px]">
       <CardHeader tool={tool} summary={headerSummary} />
 
       {/* Kind-specific body */}

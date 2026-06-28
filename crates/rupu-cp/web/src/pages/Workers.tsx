@@ -63,7 +63,7 @@ export default function Workers() {
       <Explainer />
 
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -106,7 +106,7 @@ const COLUMNS: Column<WorkerView>[] = [
     sortable: true,
     sortValue: (w) => w.kind,
     render: (w) => (
-      <Chip className="bg-slate-100 text-ink-mute ring-slate-200">{w.kind}</Chip>
+      <Chip className="bg-surface text-ink-mute ring-border">{w.kind}</Chip>
     ),
   },
   {
@@ -170,10 +170,10 @@ const COLUMNS: Column<WorkerView>[] = [
       const stale = isStale(w.last_seen_at);
       return (
         <div className="flex items-center gap-2">
-          <span className={cn('text-ui', stale ? 'text-amber-700' : 'text-ink-dim')}>
+          <span className={cn('text-ui', stale ? 'text-warn' : 'text-ink-dim')}>
             {relativeTime(w.last_seen_at)}
           </span>
-          {stale && <Chip className="bg-amber-50 text-amber-800 ring-amber-200">stale</Chip>}
+          {stale && <Chip className="bg-warn-bg text-warn ring-warn/30">stale</Chip>}
         </div>
       );
     },
@@ -203,7 +203,7 @@ function Capabilities({ worker }: { worker: WorkerView }) {
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       {backends.map((b) => (
-        <Chip key={`b-${b}`} className="bg-blue-50 text-blue-700 ring-blue-200">
+        <Chip key={`b-${b}`} className="bg-info-bg text-info ring-info/30">
           {b}
         </Chip>
       ))}
@@ -213,7 +213,7 @@ function Capabilities({ worker }: { worker: WorkerView }) {
         </Chip>
       ))}
       {modes.map((m) => (
-        <Chip key={`m-${m}`} className="bg-green-50 text-green-700 ring-green-200">
+        <Chip key={`m-${m}`} className="bg-ok-bg text-ok ring-ok/30">
           {m}
         </Chip>
       ))}
@@ -245,15 +245,15 @@ function Explainer() {
       </p>
       <ul className="mt-2 flex flex-col gap-1 text-lead">
         <li>
-          <Chip className="mr-1.5 bg-slate-100 text-ink-mute ring-slate-200">cli</Chip>
+          <Chip className="mr-1.5 bg-surface text-ink-mute ring-border">cli</Chip>
           your machine&apos;s rupu CLI.
         </li>
         <li>
-          <Chip className="mr-1.5 bg-slate-100 text-ink-mute ring-slate-200">autoflow_serve</Chip>
+          <Chip className="mr-1.5 bg-surface text-ink-mute ring-border">autoflow_serve</Chip>
           the autoflow daemon.
         </li>
         <li>
-          <Chip className="mr-1.5 bg-amber-50 text-amber-800 ring-amber-200">stale</Chip>
+          <Chip className="mr-1.5 bg-warn-bg text-warn ring-warn/30">stale</Chip>
           not seen in over 5 minutes.
         </li>
       </ul>
@@ -264,7 +264,7 @@ function Explainer() {
 function EmptyState() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Server size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No workers registered</h2>

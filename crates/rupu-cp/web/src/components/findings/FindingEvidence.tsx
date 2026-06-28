@@ -22,7 +22,7 @@ export function FindingEvidence({ finding }: { finding: FindingRecord }) {
         <p className="text-ui text-ink-dim leading-snug whitespace-pre-wrap">{rationale}</p>
       )}
       {excerpt && (
-        <pre className="overflow-x-auto rounded bg-slate-50 ring-1 ring-slate-200 px-3 py-2 text-note font-mono text-ink leading-snug whitespace-pre">
+        <pre className="overflow-x-auto rounded bg-surface ring-1 ring-border px-3 py-2 text-note font-mono text-ink leading-snug whitespace-pre">
           {excerpt}
         </pre>
       )}

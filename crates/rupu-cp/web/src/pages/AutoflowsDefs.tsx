@@ -18,7 +18,7 @@ const TRIGGER_CLS: Record<string, string> = {
 };
 
 function TriggerChip({ trigger }: { trigger: string }) {
-  const cls = TRIGGER_CLS[trigger] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  const cls = TRIGGER_CLS[trigger] ?? 'bg-surface text-ink ring-border';
   return (
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {trigger}
@@ -27,13 +27,13 @@ function TriggerChip({ trigger }: { trigger: string }) {
 }
 
 const SCOPE_CLS: Record<string, string> = {
-  workspace:  'bg-slate-100 text-slate-600 ring-slate-200',
-  repository: 'bg-emerald-50 text-emerald-700 ring-emerald-200',
+  workspace:  'bg-surface text-ink ring-border',
+  repository: 'bg-ok-bg text-ok ring-ok/30',
   global:     'bg-indigo-50 text-indigo-700 ring-indigo-200',
 };
 
 function ScopeChip({ scope }: { scope: string }) {
-  const cls = SCOPE_CLS[scope] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  const cls = SCOPE_CLS[scope] ?? 'bg-surface text-ink ring-border';
   return (
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium px-1.5 py-0.5', cls)}>
       {scope}
@@ -111,7 +111,7 @@ export default function AutoflowsDefs() {
       </header>
 
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -144,7 +144,7 @@ export default function AutoflowsDefs() {
 function AutoflowsEmpty() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Inbox size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No autoflow-enabled workflows</h2>

@@ -38,8 +38,8 @@ interface Visual {
 
 const UNKNOWN_VISUAL: Visual = {
   icon: Circle,
-  ring: 'bg-slate-100 ring-slate-200',
-  iconColor: 'text-slate-400',
+  ring: 'bg-surface ring-border',
+  iconColor: 'text-ink-mute',
 };
 
 export function visualFor(ev: KnownRunEvent): Visual {
@@ -47,31 +47,31 @@ export function visualFor(ev: KnownRunEvent): Visual {
     case 'run_started':
       return { icon: PlayCircle, ring: 'bg-brand-50 ring-brand-200', iconColor: 'text-brand-600' };
     case 'step_started':
-      return { icon: Cog, ring: 'bg-blue-50 ring-blue-200', iconColor: 'text-blue-600' };
+      return { icon: Cog, ring: 'bg-status-running/10 ring-status-running/30', iconColor: 'text-status-running' };
     case 'step_working':
-      return { icon: Loader2, ring: 'bg-blue-50 ring-blue-200', iconColor: 'text-blue-600', spin: true };
+      return { icon: Loader2, ring: 'bg-status-running/10 ring-status-running/30', iconColor: 'text-status-running', spin: true };
     case 'step_completed':
       return ev.success
-        ? { icon: CheckCircle2, ring: 'bg-green-50 ring-green-200', iconColor: 'text-green-600' }
-        : { icon: XCircle, ring: 'bg-red-50 ring-red-200', iconColor: 'text-red-600' };
+        ? { icon: CheckCircle2, ring: 'bg-ok-bg ring-ok/30', iconColor: 'text-ok' }
+        : { icon: XCircle, ring: 'bg-err-bg ring-err/30', iconColor: 'text-err' };
     case 'step_failed':
-      return { icon: XCircle, ring: 'bg-red-50 ring-red-200', iconColor: 'text-red-600' };
+      return { icon: XCircle, ring: 'bg-err-bg ring-err/30', iconColor: 'text-err' };
     case 'step_awaiting_approval':
-      return { icon: Pause, ring: 'bg-amber-50 ring-amber-200', iconColor: 'text-amber-600' };
+      return { icon: Pause, ring: 'bg-warn-bg ring-warn/30', iconColor: 'text-warn' };
     case 'step_skipped':
-      return { icon: SkipForward, ring: 'bg-slate-100 ring-slate-200', iconColor: 'text-slate-400' };
+      return { icon: SkipForward, ring: 'bg-surface ring-border', iconColor: 'text-ink-mute' };
     case 'unit_started':
-      return { icon: PlayCircle, ring: 'bg-blue-50 ring-blue-200', iconColor: 'text-blue-600' };
+      return { icon: PlayCircle, ring: 'bg-status-running/10 ring-status-running/30', iconColor: 'text-status-running' };
     case 'unit_completed':
       return ev.success
-        ? { icon: CheckCircle2, ring: 'bg-green-50 ring-green-200', iconColor: 'text-green-600' }
-        : { icon: XCircle, ring: 'bg-red-50 ring-red-200', iconColor: 'text-red-600' };
+        ? { icon: CheckCircle2, ring: 'bg-ok-bg ring-ok/30', iconColor: 'text-ok' }
+        : { icon: XCircle, ring: 'bg-err-bg ring-err/30', iconColor: 'text-err' };
     case 'run_completed':
-      return { icon: CheckCircle2, ring: 'bg-green-50 ring-green-200', iconColor: 'text-green-600' };
+      return { icon: CheckCircle2, ring: 'bg-ok-bg ring-ok/30', iconColor: 'text-ok' };
     case 'run_failed':
-      return { icon: AlertCircle, ring: 'bg-red-50 ring-red-200', iconColor: 'text-red-600' };
+      return { icon: AlertCircle, ring: 'bg-err-bg ring-err/30', iconColor: 'text-err' };
     default:
-      return { icon: Circle, ring: 'bg-slate-100 ring-slate-200', iconColor: 'text-slate-400' };
+      return { icon: Circle, ring: 'bg-surface ring-border', iconColor: 'text-ink-mute' };
   }
 }
 

@@ -47,7 +47,7 @@ export default function CoverageDiffTab({ target, wsId }: { target: string; wsId
     };
   }, [target, wsId, base, compare, runs]);
 
-  if (error) return <p className="mt-4 text-sm text-red-700">{error}</p>;
+  if (error) return <p className="mt-4 text-sm text-err">{error}</p>;
   if (!runs) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
   if (runs.length < 2)
     return (
@@ -172,7 +172,7 @@ function FlipSection({
             <span className="font-mono text-ink">{f.concern_id}</span>
             <span className="text-ink-mute"> · {f.file_path}</span>
             <span
-              className={f.high_signal ? 'ml-2 font-medium text-red-700' : 'ml-2 text-ink-mute'}
+              className={f.high_signal ? 'ml-2 font-medium text-err' : 'ml-2 text-ink-mute'}
             >
               {f.base_status} → {f.compare_status}
             </span>

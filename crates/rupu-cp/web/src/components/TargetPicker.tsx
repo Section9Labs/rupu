@@ -115,10 +115,10 @@ function HighlightedLabel({ label, matched }: { label: string; matched: number[]
 // ---------------------------------------------------------------------------
 
 const KIND_CHIP: Record<TargetKind, string> = {
-  project:   'bg-emerald-50 text-emerald-700 ring-emerald-200',
+  project:   'bg-ok-bg text-ok ring-ok/30',
   repo:      'bg-violet-50 text-violet-700 ring-violet-200',
-  directory: 'bg-slate-100 text-ink-mute ring-slate-200',
-  workspace: 'bg-slate-100 text-ink-mute ring-slate-200',
+  directory: 'bg-surface text-ink-mute ring-border',
+  workspace: 'bg-surface text-ink-mute ring-border',
 };
 
 const KIND_LABEL: Record<TargetKind, string> = {
@@ -332,7 +332,7 @@ export default function TargetPicker({ value, onChange, disabled }: TargetPicker
                     }}
                     className={
                       'cursor-pointer px-2.5 py-1.5 ' +
-                      (isActive ? 'bg-brand-50' : 'hover:bg-slate-50')
+                      (isActive ? 'bg-brand-50' : 'hover:bg-surface-hover')
                     }
                   >
                     <div className="text-lead leading-snug text-ink">

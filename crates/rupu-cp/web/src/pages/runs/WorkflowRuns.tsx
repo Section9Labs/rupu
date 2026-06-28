@@ -32,13 +32,13 @@ type TriggerFilter = 'all' | 'manual' | 'cron' | 'event';
 const FILTERS: TriggerFilter[] = ['all', 'manual', 'cron', 'event'];
 
 const TRIGGER_CHIP_CLS: Record<string, string> = {
-  manual: 'bg-slate-100 text-slate-600 ring-slate-200',
+  manual: 'bg-surface text-ink ring-border',
   cron:   'bg-violet-50 text-violet-700 ring-violet-200',
   event:  'bg-sky-50 text-sky-700 ring-sky-200',
 };
 
 function TriggerChip({ trigger }: { trigger: string }) {
-  const cls = TRIGGER_CHIP_CLS[trigger] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  const cls = TRIGGER_CHIP_CLS[trigger] ?? 'bg-surface text-ink ring-border';
   return (
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {trigger}
@@ -118,7 +118,7 @@ export default function WorkflowRuns() {
               'text-xs font-medium px-3 py-1.5 rounded-md border transition-colors',
               tab === t.id
                 ? 'bg-brand-600 text-white border-brand-600'
-                : 'bg-panel text-ink-dim border-border hover:bg-slate-100',
+                : 'bg-panel text-ink-dim border-border hover:bg-surface-hover',
             )}
           >
             {t.label}
@@ -136,7 +136,7 @@ export default function WorkflowRuns() {
               'text-xs font-medium px-3 py-1 rounded-full border transition-colors',
               filter === f
                 ? 'bg-brand-600 text-white border-brand-600'
-                : 'bg-panel text-ink-dim border-border hover:bg-slate-100',
+                : 'bg-panel text-ink-dim border-border hover:bg-surface-hover',
             )}
           >
             {f === 'all' ? 'All' : f.charAt(0).toUpperCase() + f.slice(1)}
@@ -145,7 +145,7 @@ export default function WorkflowRuns() {
       </div>
 
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -297,7 +297,7 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
 function WorkflowRunsEmpty({ hasRuns }: { hasRuns: boolean }) {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Inbox size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">

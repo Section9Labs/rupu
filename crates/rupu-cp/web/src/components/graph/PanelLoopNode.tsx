@@ -9,7 +9,8 @@
 import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
-import { STATE_STYLE, glyphBg } from './stepStyle';
+import { stateStyle, glyphBg } from './stepStyle';
+import { useThemeColors } from '../../lib/useThemeColors';
 import { PANEL_W, PANEL_H } from '../../lib/nodeSize';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
@@ -20,11 +21,16 @@ export interface PanelLoopNodeData extends Record<string, unknown> {
 
 type PanelFlowNode = Node<PanelLoopNodeData, 'panel'>;
 
-const handleStyle = { background: '#c4b5fd', width: 6, height: 6, border: 'none' } as const;
-
 function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
   const { node, onOpenUnit } = data;
-  const s = STATE_STYLE[node.state];
+  const colors = useThemeColors();
+  const handleStyle = {
+    background: colors.alpha('brand.500', 0.5),
+    width: 6,
+    height: 6,
+    border: 'none',
+  } as const;
+  const s = stateStyle(colors, node.state);
   const running = node.state === 'running';
   const gate = node.gate;
   const round = node.round;
@@ -35,7 +41,12 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
   return (
     <div
       className={['relative rounded-[12px] border px-2.5 py-2', running ? 'rg-pulse-await' : ''].join(' ')}
-      style={{ borderColor: '#c4b5fd', background: '#faf5ff', width: PANEL_W, minHeight: PANEL_H }}
+      style={{
+        borderColor: colors.alpha('brand.500', 0.4),
+        background: colors.alpha('brand.500', 0.08),
+        width: PANEL_W,
+        minHeight: PANEL_H,
+      }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
@@ -45,7 +56,11 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
           {round && <span className="ml-1 tabular-nums">· round {round.current}/{round.max}</span>}
         </span>
         {running && (
-          <span className="rg-loop-spin text-ui leading-none text-[#f59e0b]" aria-label="looping">
+          <span
+            className="rg-loop-spin text-ui leading-none"
+            style={{ color: colors.status.awaiting }}
+            aria-label="looping"
+          >
             ↻
           </span>
         )}
@@ -54,7 +69,10 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
       {/* gate condition block */}
       <div
         className="mt-1.5 flex items-center gap-1.5 rounded-[8px] border px-1.5 py-1"
-        style={{ borderColor: '#fde68a', background: '#fffbeb' }}
+        style={{
+          borderColor: colors.alpha('status.awaiting', 0.45),
+          background: colors.alpha('status.awaiting', 0.12),
+        }}
       >
         <span
           className="inline-flex h-3 w-3 shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"
@@ -63,7 +81,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
         >
           {s.glyph}
         </span>
-        <span className="text-meta font-medium text-[#92400e]">
+        <span className="text-meta font-medium" style={{ color: colors.status.awaiting }}>
           {gate ? (
             <>
               gate ≥ {gate.until_severity} · max {gate.max_iterations}
@@ -81,13 +99,13 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
             <button
               key={u.index}
               type="button"
-              title={`${u.key} · ${STATE_STYLE[u.state].label}`}
+              title={`${u.key} · ${stateStyle(colors, u.state).label}`}
               onClick={() => onOpenUnit?.(node.id, u.index)}
-              className="inline-flex items-center gap-1 rounded bg-white/80 px-1.5 py-px text-meta text-slate-600 ring-1 ring-brand-100 transition-colors hover:bg-white hover:text-brand-700"
+              className="inline-flex items-center gap-1 rounded bg-panel/80 px-1.5 py-px text-meta text-ink-dim ring-1 ring-brand-100 transition-colors hover:bg-panel hover:text-brand-700"
             >
               <span
                 className="inline-block h-2 w-2 shrink-0 rounded-[2px]"
-                style={{ background: glyphBg(u.state) }}
+                style={{ background: glyphBg(colors, u.state) }}
                 aria-hidden
               />
               <span className="max-w-[88px] truncate">{u.key}</span>
@@ -97,11 +115,11 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
       )}
 
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded bg-white/70 px-1.5 py-px text-meta text-brand-700 ring-1 ring-brand-100">
+        <span className="rounded bg-panel/70 px-1.5 py-px text-meta text-brand-700 ring-1 ring-brand-100">
           {s.label}
         </span>
         {node.agent && (
-          <span className="truncate rounded bg-white/70 px-1.5 py-px text-meta text-slate-500">
+          <span className="truncate rounded bg-panel/70 px-1.5 py-px text-meta text-ink-dim">
             {node.agent}
           </span>
         )}

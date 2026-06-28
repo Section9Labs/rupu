@@ -8,8 +8,9 @@
 // controlled `<input>` / `<textarea>` with the same API + form-field look is
 // shown, so editing always works.
 
-import { lazy, Suspense } from 'react';
+import { lazy, Suspense, useContext } from 'react';
 import type { ExprContext } from '../../lib/workflowExpressions';
+import { ThemeContext, type Mode } from '../theme/ThemeProvider';
 
 export interface ExpressionFieldProps {
   value: string;
@@ -18,6 +19,9 @@ export interface ExpressionFieldProps {
   multiline?: boolean;
   ariaLabel?: string;
   placeholder?: string;
+  /** Resolved theme mode — injected by the wrapper so the imperative CodeMirror
+   *  view picks the matching token colors and reconfigures on toggle. */
+  theme?: Mode;
 }
 
 const ExpressionFieldImpl = lazy(() => import('./ExpressionFieldImpl'));
@@ -25,11 +29,11 @@ const ExpressionFieldImpl = lazy(() => import('./ExpressionFieldImpl'));
 // Mirror StepForm's field look (border / radius / size) so the editor reads as a
 // normal form control. `focus-within` lights the brand border like the inputs.
 const SHELL_CLASS =
-  'w-full overflow-hidden rounded-md border border-border bg-white text-lead text-ink ' +
+  'w-full overflow-hidden rounded-md border border-border bg-panel text-lead text-ink ' +
   'focus-within:border-brand-500';
 
 const FALLBACK_CLASS =
-  'w-full resize-y bg-white px-2.5 py-1.5 font-mono text-lead text-ink ' +
+  'w-full resize-y bg-panel px-2.5 py-1.5 font-mono text-lead text-ink ' +
   'placeholder:text-ink-mute focus:outline-none';
 
 function Fallback({ value, onChange, multiline, ariaLabel, placeholder }: ExpressionFieldProps) {
@@ -60,10 +64,13 @@ function Fallback({ value, onChange, multiline, ariaLabel, placeholder }: Expres
 }
 
 export default function ExpressionField(props: ExpressionFieldProps) {
+  // Provider-optional: fall back to undefined (the impl reads `data-theme`) so
+  // the field renders in isolated tests without a ThemeProvider.
+  const mode = useContext(ThemeContext)?.mode;
   return (
     <div className={SHELL_CLASS}>
       <Suspense fallback={<Fallback {...props} />}>
-        <ExpressionFieldImpl {...props} />
+        <ExpressionFieldImpl {...props} theme={mode} />
       </Suspense>
     </div>
   );

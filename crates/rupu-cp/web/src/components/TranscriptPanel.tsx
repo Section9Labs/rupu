@@ -126,12 +126,12 @@ export default function TranscriptPanel({
 
   if (state === 'error') {
     return (
-      <div className="m-3 rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+      <div className="m-3 rounded-lg border border-err/30 bg-err-bg p-4 text-sm text-err">
         <div className="flex items-center gap-1.5 font-medium">
           <AlertTriangle size={14} />
           Failed to load transcript
         </div>
-        <div className="mt-1 text-xs text-red-600">{errorMsg}</div>
+        <div className="mt-1 text-xs text-err">{errorMsg}</div>
       </div>
     );
   }
@@ -152,13 +152,13 @@ export default function TranscriptPanel({
             <span
               className={cn(
                 'inline-flex items-center gap-1 rounded px-1.5 py-px text-[9px] font-medium',
-                connected ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-500',
+                connected ? 'bg-status-running/10 text-status-running' : 'bg-surface text-ink-dim',
               )}
             >
               <span
                 className={cn(
                   'inline-block h-1.5 w-1.5 rounded-full',
-                  connected ? 'animate-pulse bg-blue-500' : 'bg-slate-400',
+                  connected ? 'animate-pulse bg-status-running' : 'bg-ink-mute',
                 )}
               />
               {connected ? 'live' : 'offline'}
@@ -198,7 +198,7 @@ export default function TranscriptPanel({
           {view.footer.durationMs != null && (
             <span className="tabular-nums">{formatDuration(view.footer.durationMs)}</span>
           )}
-          {view.footer.error && <span className="text-red-600">{view.footer.error}</span>}
+          {view.footer.error && <span className="text-err">{view.footer.error}</span>}
         </div>
       )}
     </div>

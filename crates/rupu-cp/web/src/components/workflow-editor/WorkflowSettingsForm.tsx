@@ -11,7 +11,7 @@ interface WorkflowSettingsFormProps {
 }
 
 const fieldCls =
-  'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
+  'w-full rounded-md border border-border bg-panel px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
 const labelCls = 'mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim';
 
 export default function WorkflowSettingsForm({ meta, onChange }: WorkflowSettingsFormProps) {
@@ -47,7 +47,7 @@ export default function WorkflowSettingsForm({ meta, onChange }: WorkflowSetting
       </label>
 
       {restKeys.length > 0 && (
-        <div className="rounded-md border border-border bg-slate-50 px-3 py-2.5">
+        <div className="rounded-md border border-border bg-surface px-3 py-2.5">
           <p className="text-ui font-medium text-ink-dim">
             Preserved advanced keys — edit these in the YAML tab:
           </p>
@@ -55,7 +55,7 @@ export default function WorkflowSettingsForm({ meta, onChange }: WorkflowSetting
             {restKeys.map((k) => (
               <span
                 key={k}
-                className="inline-flex items-center rounded px-1.5 py-0.5 font-mono text-note font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200"
+                className="inline-flex items-center rounded px-1.5 py-0.5 font-mono text-note font-medium ring-1 bg-surface text-ink-mute ring-border"
               >
                 {k}
               </span>

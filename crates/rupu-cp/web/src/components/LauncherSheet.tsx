@@ -99,7 +99,7 @@ export default function LauncherSheet({
   }
 
   const fieldCls =
-    'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
+    'w-full rounded-md border border-border bg-panel px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 
   return (
     <div
@@ -208,7 +208,7 @@ export default function LauncherSheet({
           </div>
 
           {error && (
-            <p role="alert" className="text-ui font-medium text-red-700">
+            <p role="alert" className="text-ui font-medium text-err">
               {error}
             </p>
           )}

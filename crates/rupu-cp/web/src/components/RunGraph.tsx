@@ -25,6 +25,7 @@ import {
 import type { GraphNode, RunGraphModel } from '../lib/runGraphModel';
 import type { StepNodeDto } from '../lib/api';
 import type { Pos } from '../lib/graphLayout';
+import { useThemeColors } from '../lib/useThemeColors';
 import StepNode from './graph/StepNode';
 import ParallelNode from './graph/ParallelNode';
 import FanoutNode from './graph/FanoutNode';
@@ -88,6 +89,7 @@ export default function RunGraph(props: Props) {
 }
 
 function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectNode }: Props) {
+  const colors = useThemeColors();
   // Clicking a fan-out unit square selects that unit's transcript AND keeps the
   // existing drill behavior. Wrap onOpenUnit so the unit click does both.
   const handleOpenUnit = useCallback(
@@ -148,7 +150,11 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
       const active = targetState === 'running';
       const awaiting = targetState === 'awaiting_approval';
 
-      const stroke = active ? '#1860f2' : awaiting ? '#f59e0b' : '#cbd5e1';
+      const stroke = active
+        ? colors.status.running
+        : awaiting
+          ? colors.status.awaiting
+          : colors.inkMute;
       return {
         id: `${e.from}->${e.to}`,
         source: e.from,
@@ -163,7 +169,7 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
         style: active || awaiting ? undefined : { stroke, strokeWidth: 2 },
       };
     });
-  }, [model]);
+  }, [model, colors]);
 
   if (model.nodes.length === 0) {
     return (
@@ -186,10 +192,17 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
         fitView
         fitViewOptions={{ padding: 0.2, maxZoom: 1.0 }}
         proOptions={{ hideAttribution: true }}
-        style={{ background: '#fafafa' }}
+        style={{ background: colors.bg }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="#e2e8f0" />
-        <MiniMap pannable zoomable className="!border-border !bg-panel" />
+        <Background variant={BackgroundVariant.Dots} gap={16} size={1} color={colors.alpha('inkMute', 0.25)} />
+        <MiniMap
+          pannable
+          zoomable
+          className="!border-border !bg-panel"
+          maskColor={colors.alpha('ink', 0.08)}
+          nodeColor={colors.inkMute}
+          nodeStrokeColor={colors.border}
+        />
         <Controls className="!border-border !bg-panel !shadow-card" showInteractive={false} />
       </ReactFlow>
     </div>

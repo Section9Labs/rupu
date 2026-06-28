@@ -74,7 +74,7 @@ export default function Agents() {
       </header>
 
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -179,7 +179,7 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
             ariaLabel="New agent definition"
           />
           {error && (
-            <p role="alert" className="text-ui font-medium text-red-700">
+            <p role="alert" className="text-ui font-medium text-err">
               {error}
             </p>
           )}
@@ -262,7 +262,7 @@ function MetaChip({ children, className }: { children: React.ReactNode; classNam
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200',
+        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-surface text-ink-mute ring-border',
         className,
       )}
     >
@@ -274,7 +274,7 @@ function MetaChip({ children, className }: { children: React.ReactNode; classNam
 function EmptyState() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Sparkles size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No agents found</h2>

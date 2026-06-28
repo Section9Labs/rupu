@@ -22,7 +22,7 @@ describe('status descriptors', () => {
   it('exposes dot + pill Tailwind classes', () => {
     expect(runStatusStyle('running').dotClass).toBe('bg-status-running');
     expect(runStatusStyle('completed').dotClass).toBe('bg-status-done');
-    expect(runStatusStyle('running').pillClass).toContain('bg-blue-50');
+    expect(runStatusStyle('running').pillClass).toContain('text-status-running');
   });
 
   it('done ↔ completed alias resolves to the same descriptor', () => {

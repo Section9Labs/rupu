@@ -20,13 +20,13 @@ interface ChipDef {
 }
 
 const TONE_ACTIVE: Record<ChipDef['tone'], string> = {
-  blue: 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100',
-  amber: 'border-amber-200 bg-amber-50 text-amber-800 hover:bg-amber-100',
-  red: 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100',
+  blue: 'border-info/30 bg-info-bg text-info hover:bg-info-bg',
+  amber: 'border-warn/30 bg-warn-bg text-warn hover:bg-warn-bg',
+  red: 'border-err/30 bg-err-bg text-err hover:bg-err-bg',
   violet: 'border-violet-200 bg-violet-50 text-violet-700 hover:bg-violet-100',
 };
 
-const ZERO_CLS = 'border-border bg-panel text-ink-mute hover:bg-slate-50';
+const ZERO_CLS = 'border-border bg-panel text-ink-mute hover:bg-surface-hover';
 
 function Chip({ def }: { def: ChipDef }) {
   const active = def.value > 0;

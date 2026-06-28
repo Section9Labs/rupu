@@ -93,7 +93,7 @@ export default function SplitPane({
         tabIndex={0}
         onPointerDown={onPointerDown}
         onKeyDown={onKeyDown}
-        className="group flex h-2.5 shrink-0 cursor-row-resize touch-none items-center justify-center border-y border-border bg-panel hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+        className="group flex h-2.5 shrink-0 cursor-row-resize touch-none items-center justify-center border-y border-border bg-panel hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
       >
         <span className="h-1 w-10 rounded-full bg-border group-hover:bg-ink-mute" aria-hidden />
       </div>

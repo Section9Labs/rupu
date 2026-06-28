@@ -127,12 +127,12 @@ const KIND_COLOR: Record<EntityKind, string> = {
   agent:    'text-violet-500',
   workflow: 'text-indigo-500',
   autoflow: 'text-teal-500',
-  session:  'text-emerald-500',
-  project:  'text-amber-600',
-  coverage: 'text-green-600',
+  session:  'text-ok',
+  project:  'text-warn',
+  coverage: 'text-ok',
   finding:  'text-rose-500',
-  issue:    'text-orange-500',
-  worker:   'text-slate-500',
+  issue:    'text-warn',
+  worker:   'text-ink-dim',
 };
 
 function iconFor(item: PaletteItem): LucideIcon {
@@ -168,7 +168,7 @@ function highlight(text: string, query: string): React.ReactNode {
 function Hint({ k, label }: { k: string; label: string }) {
   return (
     <span className="inline-flex items-center gap-1">
-      <kbd className="px-1.5 py-0.5 rounded border border-border bg-white text-meta font-mono text-ink-dim">
+      <kbd className="px-1.5 py-0.5 rounded border border-border bg-panel text-meta font-mono text-ink-dim">
         {k}
       </kbd>
       <span>{label}</span>
@@ -353,7 +353,7 @@ export default function CommandPalette() {
                       onMouseEnter={() => idx >= 0 && setActive(idx)}
                       className={cn(
                         'w-full flex items-center gap-3 px-4 py-2 text-left text-sm',
-                        isActive ? 'bg-brand-50 text-brand-700' : 'text-ink hover:bg-slate-50',
+                        isActive ? 'bg-brand-50 text-brand-700' : 'text-ink hover:bg-surface-hover',
                       )}
                     >
                       <Icon

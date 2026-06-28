@@ -143,7 +143,7 @@ export default function SessionDetailPage() {
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {sessionError}
         </div>
       </div>
@@ -184,8 +184,8 @@ export default function SessionDetailPage() {
           </span>
           {/* "working…" pill — visible while a turn is in flight. */}
           {active && (
-            <span className="inline-flex items-center gap-1 rounded px-1.5 py-px text-[9px] font-medium bg-blue-100 text-blue-700">
-              <span className="inline-block h-1.5 w-1.5 rounded-full animate-pulse bg-blue-500" />
+            <span className="inline-flex items-center gap-1 rounded px-1.5 py-px text-[9px] font-medium bg-status-running/10 text-status-running">
+              <span className="inline-block h-1.5 w-1.5 rounded-full animate-pulse bg-status-running" />
               working…
             </span>
           )}
@@ -196,7 +196,7 @@ export default function SessionDetailPage() {
         {!active && (session.status === 'failed' || session.last_error) && (
           <div
             role="alert"
-            className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-ui text-red-700"
+            className="mt-2 rounded-lg border border-err/30 bg-err-bg px-3 py-2 text-ui text-err"
           >
             {session.last_error ?? 'Session failed.'}
           </div>
@@ -237,7 +237,7 @@ export default function SessionDetailPage() {
                   {session.active_run_id ? (
                     <Link
                       to={`/runs/${encodeURIComponent(session.active_run_id)}`}
-                      className="inline-flex items-center rounded bg-blue-50 px-2 py-0.5 font-mono text-ui font-medium text-blue-700 ring-1 ring-blue-200 hover:bg-blue-100"
+                      className="inline-flex items-center rounded bg-info-bg px-2 py-0.5 font-mono text-ui font-medium text-info ring-1 ring-info/30 hover:bg-info-bg"
                     >
                       {session.active_run_id}
                     </Link>
@@ -257,7 +257,7 @@ export default function SessionDetailPage() {
       {/* Composer — pinned at the bottom. */}
       <div className="shrink-0 border-t border-border bg-panel px-6 py-3">
         {runsError && (
-          <div className="mb-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-ui text-amber-800">
+          <div className="mb-2 rounded-lg border border-warn/30 bg-warn-bg px-3 py-2 text-ui text-warn">
             {runsError}
           </div>
         )}
@@ -281,13 +281,13 @@ export default function SessionDetailPage() {
             disabled={sending || stopped}
             rows={2}
             placeholder="Message this session…"
-            className="w-full resize-y rounded-lg border border-border bg-white px-3 py-2 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-200 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-ink-dim"
+            className="w-full resize-y rounded-lg border border-border bg-panel px-3 py-2 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-200 disabled:cursor-not-allowed disabled:bg-surface disabled:text-ink-dim"
           />
 
           {sendError && (
             <div
               role="alert"
-              className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700"
+              className="mt-2 rounded-lg border border-err/30 bg-err-bg px-3 py-2 text-sm text-err"
             >
               {sendError}
             </div>
@@ -298,7 +298,7 @@ export default function SessionDetailPage() {
               {stopped ? (
                 <span>Session is stopped — sending is disabled.</span>
               ) : sendOk ? (
-                <span className="text-green-700">Sent — turn queued.</span>
+                <span className="text-ok">Sent — turn queued.</span>
               ) : (
                 <span className="text-ink-mute">⌘/Ctrl+Enter to send</span>
               )}

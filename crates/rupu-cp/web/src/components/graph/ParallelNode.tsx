@@ -6,7 +6,8 @@
 import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
-import { STATE_STYLE } from './stepStyle';
+import { stateStyle } from './stepStyle';
+import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
 
 export interface ParallelNodeData extends Record<string, unknown> {
@@ -15,10 +16,15 @@ export interface ParallelNodeData extends Record<string, unknown> {
 
 type ParallelFlowNode = Node<ParallelNodeData, 'parallel'>;
 
-const handleStyle = { background: '#c4b5fd', width: 6, height: 6, border: 'none' } as const;
-
 function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
   const { node } = data;
+  const colors = useThemeColors();
+  const handleStyle = {
+    background: colors.alpha('brand.500', 0.5),
+    width: 6,
+    height: 6,
+    border: 'none',
+  } as const;
   const subs = node.parallel ?? [];
   const total = subs.length;
   const done = subs.filter((s) => s.state === 'done').length;
@@ -28,7 +34,12 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
   return (
     <div
       className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
-      style={{ borderColor: '#c4b5fd', background: '#faf5ff', width: box.width, minHeight: box.height }}
+      style={{
+        borderColor: colors.alpha('brand.500', 0.4),
+        background: colors.alpha('brand.500', 0.08),
+        width: box.width,
+        minHeight: box.height,
+      }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
@@ -41,12 +52,11 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
 
       <div className="flex flex-col gap-1">
         {subs.map((sub) => {
-          const ss = STATE_STYLE[sub.state];
+          const ss = stateStyle(colors, sub.state);
           return (
             <div
               key={sub.id}
-              className="flex items-center gap-1.5 rounded-[6px] border bg-white px-1.5 py-1"
-              style={{ borderColor: '#e5e7eb' }}
+              className="flex items-center gap-1.5 rounded-[6px] border border-border bg-panel px-1.5 py-1"
             >
               <span
                 className="inline-flex h-3 w-3 shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"

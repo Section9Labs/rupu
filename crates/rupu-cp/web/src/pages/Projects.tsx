@@ -53,7 +53,7 @@ export default function Projects() {
       </header>
 
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -127,13 +127,13 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
     render: (p) => (
       <div className="flex items-center gap-1.5 flex-wrap">
         {p.repo_remote && (
-          <span className="inline-flex items-center gap-1 text-meta text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
+          <span className="inline-flex items-center gap-1 text-meta text-ink bg-surface rounded px-1.5 py-0.5">
             <GitFork size={10} />
             {p.repo_remote}
           </span>
         )}
         {p.branch ? (
-          <span className="inline-flex items-center gap-1 text-meta text-slate-600 bg-slate-100 rounded px-1.5 py-0.5">
+          <span className="inline-flex items-center gap-1 text-meta text-ink bg-surface rounded px-1.5 py-0.5">
             <GitBranch size={10} />
             {p.branch}
           </span>
@@ -194,7 +194,7 @@ const PROJECT_COLUMNS: Column<ProjectRow>[] = [
 function ProjectsEmpty() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <FolderGit2 size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No projects yet</h2>

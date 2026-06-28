@@ -200,7 +200,7 @@ export default function WorkflowDetailPage() {
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       </div>
@@ -262,12 +262,12 @@ export default function WorkflowDetailPage() {
           </div>
         </div>
         {saveError && (
-          <p role="alert" className="mt-2 text-ui font-medium text-red-700">
+          <p role="alert" className="mt-2 text-ui font-medium text-err">
             {saveError}
           </p>
         )}
         {deleteError && (
-          <p role="alert" className="mt-2 text-ui font-medium text-red-700">
+          <p role="alert" className="mt-2 text-ui font-medium text-err">
             {deleteError}
           </p>
         )}
@@ -308,14 +308,14 @@ function ValidityBadge({ validity }: { validity: { ok: boolean; error?: string }
   if (!validity) return null;
   if (validity.ok) {
     return (
-      <span className="inline-flex items-center rounded-full px-2 py-0.5 text-note font-medium ring-1 bg-green-50 text-green-700 ring-green-200">
+      <span className="inline-flex items-center rounded-full px-2 py-0.5 text-note font-medium ring-1 bg-ok-bg text-ok ring-ok/30">
         ✓ valid
       </span>
     );
   }
   return (
     <span
-      className="inline-flex max-w-[20rem] items-center truncate rounded-full px-2 py-0.5 text-note font-medium ring-1 bg-red-50 text-red-700 ring-red-200"
+      className="inline-flex max-w-[20rem] items-center truncate rounded-full px-2 py-0.5 text-note font-medium ring-1 bg-err-bg text-err ring-err/30"
       title={validity.error}
     >
       ✕ {validity.error ?? 'invalid'}

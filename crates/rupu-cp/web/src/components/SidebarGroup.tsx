@@ -132,7 +132,7 @@ export default function SidebarGroup({ group, initiallyOpen, containsActive }: P
                 item.enabled
                   ? isActive
                     ? 'bg-brand-50 text-brand-700 font-medium'
-                    : 'text-ink hover:bg-slate-100'
+                    : 'text-ink hover:bg-surface-hover'
                   : 'text-ink-mute cursor-not-allowed',
               )
             }

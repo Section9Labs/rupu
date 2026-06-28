@@ -49,7 +49,7 @@ export default function CoverageGapTab({ target, wsId }: { target: string; wsId?
     });
   }
 
-  if (error) return <p className="mt-4 text-sm text-red-700">{error}</p>;
+  if (error) return <p className="mt-4 text-sm text-err">{error}</p>;
   if (!report) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
   if (gapRows(report).length === 0)
     return <p className="mt-4 text-sm text-ink-dim">No gaps — every in-scope file assessed.</p>;
@@ -85,7 +85,7 @@ export default function CoverageGapTab({ target, wsId }: { target: string; wsId?
                   <span className="text-sm font-medium text-ink">{r.name}</span>
                   <span className="text-note font-mono text-ink-mute">{r.concern_id}</span>
                   <SeverityChip severity={r.severity} />
-                  <span className="text-meta text-amber-700 font-medium tabular-nums">
+                  <span className="text-meta text-warn font-medium tabular-nums">
                     {r.gap_files.length} files
                   </span>
                 </span>

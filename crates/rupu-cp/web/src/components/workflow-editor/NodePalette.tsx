@@ -61,7 +61,7 @@ export default function NodePalette({ onAdd, onDragStartKind, disabled = false }
   };
 
   return (
-    <div className="pointer-events-auto absolute bottom-3 left-3 z-10 max-w-[calc(100%-1.5rem)] rounded-lg border border-border bg-white/95 px-2 py-2 shadow-card">
+    <div className="pointer-events-auto absolute bottom-3 left-3 z-10 max-w-[calc(100%-1.5rem)] rounded-lg border border-border bg-panel/95 px-2 py-2 shadow-card">
       <div className="px-0.5 pb-1.5 text-meta text-ink-mute">
         Drag a card onto the canvas, or click to add at center.
       </div>
@@ -77,7 +77,7 @@ export default function NodePalette({ onAdd, onDragStartKind, disabled = false }
               onClick={() => onAdd(item.kind)}
               onDragStart={handleDragStart(item.kind)}
               aria-label={`Add ${item.label} node`}
-              className="group w-[104px] cursor-grab overflow-hidden rounded-[8px] border border-border bg-white text-left shadow-sm transition hover:ring-1 hover:ring-brand-100 active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-50"
+              className="group w-[104px] cursor-grab overflow-hidden rounded-[8px] border border-border bg-panel text-left shadow-sm transition hover:ring-1 hover:ring-brand-100 active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-50"
             >
               {/* colored top-bar — by KIND, mirrors the real card */}
               <div className="h-[3px] w-full" style={{ background: color }} />

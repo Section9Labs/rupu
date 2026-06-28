@@ -237,7 +237,7 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
                 'text-xs font-medium px-3 py-1 rounded-full border transition-colors',
                 statusFilter === f.id
                   ? 'bg-brand-600 text-white border-brand-600'
-                  : 'bg-panel text-ink-dim border-border hover:bg-slate-100',
+                  : 'bg-panel text-ink-dim border-border hover:bg-surface-hover',
               )}
             >
               {f.label}
@@ -257,7 +257,7 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
                 'text-xs font-medium px-3 py-1 rounded-full border transition-colors',
                 triggerFilter === f.id
                   ? 'bg-brand-600 text-white border-brand-600'
-                  : 'bg-panel text-ink-dim border-border hover:bg-slate-100',
+                  : 'bg-panel text-ink-dim border-border hover:bg-surface-hover',
               )}
             >
               {f.label}
@@ -267,7 +267,7 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
       </div>
 
       {error && (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
