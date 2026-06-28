@@ -271,63 +271,73 @@ describe('host param: approveRun', () => {
     mockFetch(200, {});
     const fetchSpy = vi.mocked(fetch);
     await api.approveRun('r1');
-    const init = fetchSpy.mock.calls[0][1] as RequestInit;
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/runs/r1/approve');
     expect(init.body).toBeUndefined();
   });
 
-  it('includes host in POST body when provided', async () => {
+  it('appends ?host= query param and keeps host out of body', async () => {
     mockFetch(200, {});
     const fetchSpy = vi.mocked(fetch);
     await api.approveRun('r1', 'bypass', 'h-abc');
-    const sentBody = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('?host=h-abc');
+    const sentBody = JSON.parse((init as RequestInit).body as string);
     expect(sentBody.mode).toBe('bypass');
-    expect(sentBody.host).toBe('h-abc');
+    expect(sentBody.host).toBeUndefined();
   });
 
-  it('omits host field when not provided', async () => {
+  it('omits ?host when not provided', async () => {
     mockFetch(200, {});
     const fetchSpy = vi.mocked(fetch);
     await api.approveRun('r1', 'ask');
-    const sentBody = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
-    expect(sentBody.host).toBeUndefined();
+    const [url] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).not.toContain('host=');
   });
 });
 
 describe('host param: rejectRun', () => {
-  it('includes host in POST body when provided', async () => {
+  it('appends ?host= query param and keeps host out of body', async () => {
     mockFetch(200, {});
     const fetchSpy = vi.mocked(fetch);
     await api.rejectRun('r1', 'not needed', 'h-abc');
-    const sentBody = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('?host=h-abc');
+    const sentBody = JSON.parse((init as RequestInit).body as string);
     expect(sentBody.reason).toBe('not needed');
-    expect(sentBody.host).toBe('h-abc');
+    expect(sentBody.host).toBeUndefined();
   });
 
-  it('omits host field when not provided', async () => {
+  it('omits ?host when not provided', async () => {
     mockFetch(200, {});
     const fetchSpy = vi.mocked(fetch);
     await api.rejectRun('r1', 'not needed');
-    const sentBody = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).not.toContain('host=');
+    const sentBody = JSON.parse((init as RequestInit).body as string);
     expect(sentBody.host).toBeUndefined();
   });
 });
 
 describe('host param: cancelRun', () => {
-  it('includes host in POST body when provided', async () => {
+  it('appends ?host= query param and keeps host out of body', async () => {
     mockFetch(200, {});
     const fetchSpy = vi.mocked(fetch);
     await api.cancelRun('r1', 'user request', 'h-abc');
-    const sentBody = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('?host=h-abc');
+    const sentBody = JSON.parse((init as RequestInit).body as string);
     expect(sentBody.reason).toBe('user request');
-    expect(sentBody.host).toBe('h-abc');
+    expect(sentBody.host).toBeUndefined();
   });
 
-  it('sends no body when neither reason nor host provided', async () => {
+  it('sends no body and no ?host when neither reason nor host provided', async () => {
     mockFetch(200, {});
     const fetchSpy = vi.mocked(fetch);
     await api.cancelRun('r1');
-    const init = fetchSpy.mock.calls[0][1] as RequestInit;
-    expect(init.body).toBeUndefined();
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).not.toContain('host=');
+    expect((init as RequestInit).body).toBeUndefined();
   });
 });
 
@@ -384,20 +394,24 @@ describe('host param: startSession', () => {
 });
 
 describe('host param: sendSessionMessage', () => {
-  it('includes host in POST body when provided', async () => {
+  it('appends ?host= query param and keeps host out of body', async () => {
     mockFetch(200, { run_id: 'r-turn' });
     const fetchSpy = vi.mocked(fetch);
     await api.sendSessionMessage('sess-1', 'hello', 'h-abc');
-    const sentBody = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('?host=h-abc');
+    const sentBody = JSON.parse((init as RequestInit).body as string);
     expect(sentBody.prompt).toBe('hello');
-    expect(sentBody.host).toBe('h-abc');
+    expect(sentBody.host).toBeUndefined();
   });
 
-  it('omits host field when not provided (backward compat)', async () => {
+  it('omits ?host when not provided (backward compat)', async () => {
     mockFetch(200, { run_id: 'r-turn' });
     const fetchSpy = vi.mocked(fetch);
     await api.sendSessionMessage('sess-1', 'hello');
-    const sentBody = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(url).not.toContain('host=');
+    const sentBody = JSON.parse((init as RequestInit).body as string);
     expect(sentBody.host).toBeUndefined();
   });
 });

@@ -992,18 +992,18 @@ export const api = {
   async approveRun(id: string, mode?: 'ask' | 'bypass' | 'readonly', host?: string): Promise<void> {
     const body: Record<string, unknown> = {};
     if (mode) body.mode = mode;
-    if (host) body.host = host;
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
-      `/api/runs/${encodeURIComponent(id)}/approve`,
+      `/api/runs/${encodeURIComponent(id)}/approve${qs}`,
       { method: 'POST', body: Object.keys(body).length ? JSON.stringify(body) : undefined },
     );
   },
   /** Reject an awaiting run (terminal → `rejected`). */
   async rejectRun(id: string, reason: string, host?: string): Promise<void> {
     const body: Record<string, unknown> = { reason };
-    if (host) body.host = host;
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
-      `/api/runs/${encodeURIComponent(id)}/reject`,
+      `/api/runs/${encodeURIComponent(id)}/reject${qs}`,
       { method: 'POST', body: JSON.stringify(body) },
     );
   },
@@ -1011,9 +1011,9 @@ export const api = {
   async cancelRun(id: string, reason?: string, host?: string): Promise<void> {
     const body: Record<string, unknown> = {};
     if (reason) body.reason = reason;
-    if (host) body.host = host;
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
-      `/api/runs/${encodeURIComponent(id)}/cancel`,
+      `/api/runs/${encodeURIComponent(id)}/cancel${qs}`,
       { method: 'POST', body: Object.keys(body).length ? JSON.stringify(body) : undefined },
     );
   },
@@ -1218,11 +1218,10 @@ export const api = {
    * · 501 (read-only deploy).
    */
   sendSessionMessage(id: string, prompt: string, host?: string): Promise<{ run_id: string }> {
-    const body: Record<string, unknown> = { prompt };
-    if (host) body.host = host;
-    return request<{ run_id: string }>(`/api/sessions/${encodeURIComponent(id)}/send`, {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    return request<{ run_id: string }>(`/api/sessions/${encodeURIComponent(id)}/send${qs}`, {
       method: 'POST',
-      body: JSON.stringify(body),
+      body: JSON.stringify({ prompt }),
     });
   },
 
