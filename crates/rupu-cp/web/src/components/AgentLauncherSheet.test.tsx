@@ -152,7 +152,7 @@ describe('AgentLauncherSheet toggle', () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/runs/run-local'));
   });
 
-  it('session button is disabled when a remote host is selected', async () => {
+  it('session kind is ENABLED for a remote host', async () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([
       { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
       { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
@@ -163,16 +163,17 @@ describe('AgentLauncherSheet toggle', () => {
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
 
-    // Select remote host.
     await waitFor(() => expect(screen.getByRole('option', { name: 'host_x' })).toBeInTheDocument());
     fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'host_x' } });
 
-    // Session button must be disabled and a hint must be shown.
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Session' })).toBeDisabled());
-    expect(screen.getByText(/Sessions run on the local host only/i)).toBeInTheDocument();
+    // Session button must be ENABLED for remote hosts.
+    const sessionBtn = screen.getByRole('button', { name: 'Session' });
+    expect(sessionBtn).not.toBeDisabled();
+    // The old "local only" note must not appear.
+    expect(screen.queryByText(/Sessions run on the local host only/i)).not.toBeInTheDocument();
   });
 
-  it('switching to remote host while in session mode reverts to single-run', async () => {
+  it('remote session launch: calls startSession with host and navigates to /sessions/:id?host=', async () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([
       { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
       { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
@@ -180,25 +181,24 @@ describe('AgentLauncherSheet toggle', () => {
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/', parent: null, dirs: [] });
-    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-remote' });
-    vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-remote' });
+    const sessionSpy = vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-remote-1' });
+    vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-remote' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
 
-    // Enter session mode while still on local host.
-    fireEvent.click(screen.getByRole('button', { name: 'Session' }));
-    expect(screen.getByRole('button', { name: 'Start session' })).toBeInTheDocument();
-
-    // Switch to remote host → kind should revert to single-run.
     await waitFor(() => expect(screen.getByRole('option', { name: 'host_x' })).toBeInTheDocument());
     fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'host_x' } });
 
-    // Submit button reads "Run", not "Start session".
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Run' })).toBeInTheDocument());
-    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    // Switch to session mode on the remote host.
+    fireEvent.click(screen.getByRole('button', { name: 'Session' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start session' }));
 
     await waitFor(() =>
-      expect(launchSpy).toHaveBeenCalledWith('triage', expect.objectContaining({ host: 'host_x' })),
+      expect(sessionSpy).toHaveBeenCalledWith('triage', expect.objectContaining({ host: 'host_x' })),
+    );
+    await waitFor(() =>
+      expect(navigateMock).toHaveBeenCalledWith('/sessions/ses-remote-1?host=host_x'),
     );
   });
 

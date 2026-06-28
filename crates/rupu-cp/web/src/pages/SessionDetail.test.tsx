@@ -56,9 +56,9 @@ function stubApi(session: SessionSummary) {
   vi.spyOn(api, 'getSessionRuns').mockResolvedValue([]);
 }
 
-function renderPage() {
+function renderPage(search = '') {
   return render(
-    <MemoryRouter initialEntries={['/sessions/sess-1']}>
+    <MemoryRouter initialEntries={[`/sessions/sess-1${search}`]}>
       <Routes>
         <Route path="/sessions/:id" element={<SessionDetailPage />} />
       </Routes>
@@ -82,8 +82,8 @@ describe('SessionDetail composer', () => {
     fireEvent.change(textarea, { target: { value: '  hello there  ' } });
     fireEvent.click(screen.getByRole('button', { name: 'Send' }));
 
-    // Trimmed prompt is sent with the route's session id.
-    await waitFor(() => expect(sendSpy).toHaveBeenCalledWith('sess-1', 'hello there'));
+    // Trimmed prompt is sent with the route's session id (no host → undefined).
+    await waitFor(() => expect(sendSpy).toHaveBeenCalledWith('sess-1', 'hello there', undefined));
     // On success the textarea is cleared and a confirmation shows.
     await waitFor(() => expect(textarea.value).toBe(''));
     expect(screen.getByText(/Sent — turn queued/)).toBeInTheDocument();
@@ -118,5 +118,49 @@ describe('SessionDetail composer', () => {
     // Wait for the session to load then check the banner appears.
     expect(await screen.findByRole('alert')).toBeInTheDocument();
     expect(screen.getByText('provider: API error 401')).toBeInTheDocument();
+  });
+});
+
+describe('SessionDetail host-aware', () => {
+  it('with ?host=h1 calls getSession with {host:"h1"}', async () => {
+    const getSessionSpy = vi.spyOn(api, 'getSession').mockResolvedValue(ACTIVE_SESSION);
+    vi.spyOn(api, 'getSessionUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getSessionRuns').mockResolvedValue([]);
+
+    renderPage('?host=h1');
+
+    await waitFor(() =>
+      expect(getSessionSpy).toHaveBeenCalledWith('sess-1', { host: 'h1' }),
+    );
+  });
+
+  it('with ?host=h1 calls getSessionRuns with {host:"h1"}', async () => {
+    vi.spyOn(api, 'getSession').mockResolvedValue(ACTIVE_SESSION);
+    vi.spyOn(api, 'getSessionUsageTimeline').mockResolvedValue([]);
+    const getRunsSpy = vi.spyOn(api, 'getSessionRuns').mockResolvedValue([]);
+
+    renderPage('?host=h1');
+
+    await waitFor(() =>
+      expect(getRunsSpy).toHaveBeenCalledWith('sess-1', { host: 'h1' }),
+    );
+  });
+
+  it('shows "on h1" chip in the header when ?host=h1', async () => {
+    stubApi(ACTIVE_SESSION);
+
+    renderPage('?host=h1');
+
+    expect(await screen.findByText('on h1')).toBeInTheDocument();
+  });
+
+  it('no host chip when no ?host param', async () => {
+    stubApi(ACTIVE_SESSION);
+
+    renderPage();
+
+    // Wait for the session to render then confirm no chip.
+    await screen.findByText(ACTIVE_SESSION.session_id);
+    expect(screen.queryByText(/^on /)).not.toBeInTheDocument();
   });
 });

@@ -8,7 +8,7 @@
 // Route: /sessions/:id
 
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 import { api, type SessionSummary, type SessionRunRow, type UsageTimelinePoint } from '../lib/api';
 import { cn } from '../lib/cn';
@@ -26,6 +26,8 @@ import SessionConversation from '../components/session/SessionConversation';
 
 export default function SessionDetailPage() {
   const { id = '' } = useParams<{ id: string }>();
+  const [searchParams] = useSearchParams();
+  const host = searchParams.get('host') ?? undefined;
 
   const [session, setSession] = useState<SessionSummary | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
@@ -49,7 +51,7 @@ export default function SessionDetailPage() {
     setSession(null);
     setSessionError(null);
     api
-      .getSession(id)
+      .getSession(id, { host })
       .then((data) => {
         if (cancelled) return;
         setSession(data);
@@ -69,7 +71,7 @@ export default function SessionDetailPage() {
     let cancelled = false;
     setSeries([]);
     api
-      .getSessionUsageTimeline(id)
+      .getSessionUsageTimeline(id, { host })
       .then((pts) => {
         if (cancelled) return;
         setSeries(pts);
@@ -87,7 +89,7 @@ export default function SessionDetailPage() {
   const loadRuns = () => {
     if (!id) return;
     api
-      .getSessionRuns(id)
+      .getSessionRuns(id, { host })
       .then((rows) => {
         setRuns(rows);
         setRunsError(null);
@@ -102,7 +104,7 @@ export default function SessionDetailPage() {
   const reload = () => {
     if (!id) return;
     api
-      .getSession(id)
+      .getSession(id, { host })
       .then((data) => setSession(data))
       .catch(() => {/* keep stale session on transient error */});
     loadRuns();
@@ -125,7 +127,7 @@ export default function SessionDetailPage() {
     setSendError(null);
     setSendOk(false);
     api
-      .sendSessionMessage(id, text)
+      .sendSessionMessage(id, text, host)
       .then(() => {
         setPrompt('');
         setSendOk(true);
@@ -187,6 +189,11 @@ export default function SessionDetailPage() {
             <span className="inline-flex items-center gap-1 rounded px-1.5 py-px text-[9px] font-medium bg-status-running/10 text-status-running">
               <span className="inline-block h-1.5 w-1.5 rounded-full animate-pulse bg-status-running" />
               working…
+            </span>
+          )}
+          {host && (
+            <span className="inline-flex items-center rounded bg-surface px-1.5 py-px text-[10px] font-mono font-medium text-ink-dim ring-1 ring-border">
+              on {host}
             </span>
           )}
           {session.usage && <UsageChip usage={session.usage} className="ml-auto" />}
