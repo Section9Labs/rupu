@@ -636,3 +636,123 @@ async fn get_run_log_unknown_host_returns_404() {
     .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ── GET /api/runs/:id/graph?host= ────────────────────────────────────────────
+
+/// `GET /api/runs/:id/graph?host=<remote>` proxies to the mock host and
+/// returns its graph JSON verbatim.
+#[tokio::test]
+async fn get_run_graph_proxies_to_remote_host() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mock_graph = serde_json::json!({
+        "run": {"id": "remote_graph_r1", "workflow_name": "g-wf", "status": "completed"},
+        "workflow": {"steps": []},
+        "step_results": [],
+        "units": [],
+        "usage": {"priced": false, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
+    });
+
+    let mock_server = httpmock::MockServer::start_async().await;
+    let _m = mock_server.mock(|when, then| {
+        when.method("GET").path("/api/runs/remote_graph_r1/graph");
+        then.status(200).json_body(mock_graph.clone());
+    });
+
+    let (addr, host_id) =
+        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/runs/remote_graph_r1/graph?host={host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["run"]["id"], "remote_graph_r1",
+        "proxied graph should carry the remote run id"
+    );
+    assert!(
+        body.get("workflow").is_some(),
+        "proxied graph should include workflow field"
+    );
+}
+
+/// `GET /api/runs/:id/graph?host=<unknown>` → 404.
+#[tokio::test]
+async fn get_run_graph_unknown_host_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/some_run/graph?host=host_DOESNOTEXIST"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── GET /api/runs/:id/usage-timeline?host= ────────────────────────────────────
+
+/// `GET /api/runs/:id/usage-timeline?host=<remote>` proxies to the mock host
+/// and returns its timeline series JSON verbatim.
+#[tokio::test]
+async fn get_run_usage_timeline_proxies_to_remote_host() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mock_series = serde_json::json!([
+        {"step_id": "s1", "turn": 1, "input_tokens": 100, "output_tokens": 50, "cost_usd": 0.001},
+        {"step_id": "s1", "turn": 2, "input_tokens": 200, "output_tokens": 80, "cost_usd": 0.002}
+    ]);
+
+    let mock_server = httpmock::MockServer::start_async().await;
+    let _m = mock_server.mock(|when, then| {
+        when.method("GET")
+            .path("/api/runs/remote_usage_r1/usage-timeline");
+        then.status(200).json_body(mock_series.clone());
+    });
+
+    let (addr, host_id) =
+        spawn_server_with_remote(tmp.path(), &mock_server.base_url()).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!(
+            "http://{addr}/api/runs/remote_usage_r1/usage-timeline?host={host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.is_array(),
+        "proxied usage-timeline should be a JSON array"
+    );
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "proxied series should have 2 turn points");
+    assert_eq!(
+        arr[0]["step_id"], "s1",
+        "proxied series should carry step_id"
+    );
+}
+
+/// `GET /api/runs/:id/usage-timeline?host=<unknown>` → 404.
+#[tokio::test]
+async fn get_run_usage_timeline_unknown_host_returns_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/runs/some_run/usage-timeline?host=host_DOESNOTEXIST"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

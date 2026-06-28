@@ -5,11 +5,13 @@
 //! half does the I/O and error-mapping.
 
 use crate::{
+    api::runs::{resolve_host, RunDetailQuery},
     error::{ApiError, ApiResult},
+    host::connector::HostConnectorError,
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -24,10 +26,30 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/api/runs/:id/graph", get(run_graph))
 }
 
+/// `GET /api/runs/:id/graph[?host=<id>]` — DAG + step statuses + unit list for
+/// the given run.
+///
+/// Without `?host=` (or `?host=local`): reads from the local store (unchanged).
+/// With `?host=<remote-id>`: proxies to that host's `GET /api/runs/:id/graph`.
+/// Unknown host id → 404.
 async fn run_graph(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunDetailQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let host_id = q.host.as_deref().unwrap_or("local");
+    if host_id != "local" {
+        let conn = resolve_host(&s, host_id)?;
+        let value = conn
+            .proxy_get_json(&format!("/api/runs/{id}/graph"))
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
+        return Ok(Json(value));
+    }
+    // Local path: unchanged.
     // 1. Verify the run exists (gives us the RunRecord too).
     let run = s.run_store.load(&id).map_err(|e| match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),

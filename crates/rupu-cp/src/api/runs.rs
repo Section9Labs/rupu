@@ -546,11 +546,13 @@ async fn list_workflow_runs(
     Ok(Json(crate::pagination::paginate(rows, &page)))
 }
 
-/// Optional `?host=<id>` query param for `GET /api/runs/:id`.
+/// Optional `?host=<id>` query param for `GET /api/runs/:id`,
+/// `GET /api/runs/:id/log`, `GET /api/runs/:id/graph`, and
+/// `GET /api/runs/:id/usage-timeline`.
 #[derive(serde::Deserialize, Default)]
-struct RunDetailQuery {
+pub(crate) struct RunDetailQuery {
     /// When present and not `"local"`, proxy the request to the named host.
-    host: Option<String>,
+    pub(crate) host: Option<String>,
 }
 
 /// `GET /api/runs/:id[?host=<id>]`
@@ -629,13 +631,31 @@ async fn get_run_log(
     Ok(sse.into_response())
 }
 
-/// `GET /api/runs/:id/usage-timeline` — ordered per-turn token series across
-/// every transcript the run produced (step results + fan-out items), labeled
-/// by step id.
+/// `GET /api/runs/:id/usage-timeline[?host=<id>]` — ordered per-turn token
+/// series across every transcript the run produced (step results + fan-out
+/// items), labeled by step id.
+///
+/// Without `?host=` (or `?host=local`): reads from the local store (unchanged).
+/// With `?host=<remote-id>`: proxies to that host's `GET /api/runs/:id/usage-timeline`.
+/// Unknown host id → 404.
 async fn get_run_usage_timeline(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<Vec<crate::usage::TurnPoint>>> {
+    Query(q): Query<RunDetailQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let host_id = q.host.as_deref().unwrap_or("local");
+    if host_id != "local" {
+        let conn = resolve_host(&s, host_id)?;
+        let value = conn
+            .proxy_get_json(&format!("/api/runs/{id}/usage-timeline"))
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
+        return Ok(Json(value));
+    }
+    // Local path: unchanged.
     s.run_store.load(&id).map_err(|e| match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         other => ApiError::internal(other.to_string()),
@@ -648,7 +668,10 @@ async fn get_run_usage_timeline(
             labeled.push((st.step_id.clone(), item.transcript_path.clone()));
         }
     }
-    Ok(Json(crate::usage::turn_series(&labeled)))
+    let series = crate::usage::turn_series(&labeled);
+    Ok(Json(
+        serde_json::to_value(series).map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
 }
 
 #[cfg(test)]
