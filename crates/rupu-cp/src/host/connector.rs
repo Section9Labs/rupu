@@ -146,4 +146,15 @@ pub trait HostConnector: Send + Sync {
         &self,
         run_id: &str,
     ) -> Result<EventByteStream, HostConnectorError>;
+
+    /// Fetch the parsed events + summary for a transcript JSONL path.
+    ///
+    /// Returns the same `{ "events": [...], "summary": ... }` shape that
+    /// `GET /api/transcript` produces. For the local connector, `path` must be
+    /// a `.jsonl` file with no `..` components; for the HTTP connector the
+    /// request is forwarded to the remote's `/api/transcript?path=<path>`.
+    async fn get_transcript(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, HostConnectorError>;
 }

@@ -284,11 +284,25 @@ impl HostConnector for HttpHostConnector {
 
         let resp = self.send(req).await?;
 
-        let stream = resp.bytes_stream().map(|r| {
-            r.map_err(std::io::Error::other)
-        });
+        let stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
 
         Ok(Box::pin(stream))
+    }
+
+    async fn get_transcript(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        let resp = self
+            .send(
+                self.client
+                    .get(self.url("/api/transcript"))
+                    .query(&[("path", path)]),
+            )
+            .await?;
+        resp.json()
+            .await
+            .map_err(|e| HostConnectorError::Remote(0, e.to_string()))
     }
 }
 

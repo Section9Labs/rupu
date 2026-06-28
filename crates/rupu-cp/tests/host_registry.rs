@@ -72,6 +72,9 @@ impl HostConnector for StubLocal {
     async fn stream_run_events(&self, _: &str) -> Result<EventByteStream, HostConnectorError> {
         unimplemented!()
     }
+    async fn get_transcript(&self, _: &str) -> Result<serde_json::Value, HostConnectorError> {
+        unimplemented!()
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -1,5 +1,6 @@
 use crate::{
     error::{ApiError, ApiResult},
+    host::connector::{HostConnectorError, RunKind, RunListQuery},
     state::AppState,
 };
 use axum::{
@@ -8,10 +9,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::future::join_all;
 use rupu_orchestrator::{
     runs::{CancelError, CancelOutcome},
     ApprovalError, RunRecord, RunStatus, RunStoreError,
 };
+use std::sync::Arc;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -160,6 +163,90 @@ pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
     }
 }
 
+// ── Host-aware helpers ────────────────────────────────────────────────────────
+
+/// Upper-bound on rows fetched from each host during a fan-out list.
+/// Prevents unbounded merges while staying well above any realistic run count.
+const FAN_OUT_LIMIT: usize = 10_000;
+
+/// Resolve a `host_id` string to a live connector, mapping unknown host → 404.
+fn resolve_host(
+    s: &AppState,
+    host_id: &str,
+) -> ApiResult<Arc<dyn crate::host::connector::HostConnector>> {
+    s.hosts.resolve(host_id).map_err(|e| match e {
+        HostConnectorError::NotFound(_) => {
+            ApiError::not_found(format!("host {host_id} not found"))
+        }
+        other => ApiError::internal(other.to_string()),
+    })
+}
+
+/// Concurrently call `list_runs` on every registered host, tag each row with
+/// its `host_id`, merge, and sort newest-first. A per-host failure produces an
+/// empty contribution plus a warning — it never fails the whole merge.
+async fn fan_out_list_runs(
+    s: &AppState,
+    kind: RunKind,
+    lifecycle: Option<String>,
+) -> Vec<serde_json::Value> {
+    let hosts = s.hosts.list_hosts();
+    let futs: Vec<_> = hosts
+        .into_iter()
+        .map(|h| {
+            let registry = Arc::clone(&s.hosts);
+            let lifecycle = lifecycle.clone();
+            async move {
+                let host_id = h.id;
+                let params = RunListQuery {
+                    kind,
+                    offset: 0,
+                    limit: FAN_OUT_LIMIT,
+                    lifecycle,
+                };
+                let conn = match registry.resolve(&host_id) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            error = %e,
+                            "run fan-out: could not resolve connector; skipping host"
+                        );
+                        return Vec::new();
+                    }
+                };
+                match conn.list_runs(params).await {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|mut v| {
+                            v["host_id"] = serde_json::json!(&host_id);
+                            v
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            error = %e,
+                            "run fan-out: list_runs failed; skipping host"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let all: Vec<Vec<serde_json::Value>> = join_all(futs).await;
+    let mut merged: Vec<serde_json::Value> = all.into_iter().flatten().collect();
+    // Sort newest-first by `started_at` (ISO-8601 strings compare lexicographically).
+    merged.sort_by(|a, b| {
+        let ta = a["started_at"].as_str().unwrap_or("");
+        let tb = b["started_at"].as_str().unwrap_or("");
+        tb.cmp(ta)
+    });
+    merged
+}
+
 /// Slim list DTO for `GET /api/runs` and `GET /api/runs/workflows`.
 ///
 /// The full record (including step results) is available at
@@ -264,20 +351,61 @@ pub(crate) fn query_run_detail(
     Ok(serde_json::json!({ "run": record, "steps": steps, "usage": usage }))
 }
 
+/// Query params for `GET /api/runs`: offset/limit paging plus an optional
+/// `?host=<id>` to scope to a single host (omitting fans out across all hosts).
+#[derive(serde::Deserialize, Default)]
+struct RunsListQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+    /// When present, restrict to this host only; absent → fan-out all hosts.
+    host: Option<String>,
+}
+
+impl RunsListQuery {
+    fn page(&self) -> crate::pagination::PageQuery {
+        crate::pagination::PageQuery {
+            offset: self.offset,
+            limit: self.limit,
+        }
+    }
+}
+
+/// `GET /api/runs[?host=<id>]`
+///
+/// Without `?host=`: fan-out across every registered host concurrently, tag
+/// each row with `host_id`, merge newest-first, paginate.
+///
+/// With `?host=<id>`: list only that host's runs (tagged with `host_id`).
+/// Unknown host id → 404.
 async fn list_runs(
     State(s): State<AppState>,
-    Query(page): Query<crate::pagination::PageQuery>,
-) -> ApiResult<Json<Vec<RunListRow>>> {
-    let rows = query_run_rows(
-        &s.run_store,
-        page.offset(),
-        page.limit(),
-        None,
-        false,
-        &s.pricing,
-    )
-    .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(rows))
+    Query(q): Query<RunsListQuery>,
+) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let page = q.page();
+    if let Some(host_id) = &q.host {
+        let conn = resolve_host(&s, host_id)?;
+        let params = RunListQuery {
+            kind: RunKind::All,
+            offset: page.offset(),
+            limit: page.limit(),
+            lifecycle: None,
+        };
+        let rows = conn
+            .list_runs(params)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let tagged: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|mut v| {
+                v["host_id"] = serde_json::json!(host_id);
+                v
+            })
+            .collect();
+        return Ok(Json(tagged));
+    }
+    // Fan-out: collect all hosts → merge → paginate.
+    let rows = fan_out_list_runs(&s, RunKind::All, None).await;
+    Ok(Json(crate::pagination::paginate(rows, &page)))
 }
 
 #[derive(serde::Deserialize)]
@@ -289,6 +417,9 @@ struct WorkflowRunsQuery {
     limit: Option<usize>,
     /// Optional lifecycle group: `active` | `completed` | `failed`.
     lifecycle: Option<String>,
+    /// When present, restrict to this host; absent → fan-out all hosts.
+    #[serde(default)]
+    host: Option<String>,
 }
 
 impl WorkflowRunsQuery {
@@ -316,27 +447,67 @@ fn in_lifecycle(status: RunStatus, group: Option<&str>) -> bool {
     }
 }
 
-/// `GET /api/runs/workflows` — manual/direct runs only (no event or cron wake).
+/// `GET /api/runs/workflows[?host=<id>]` — manual/direct runs only (no event or
+/// cron wake), with the same fan-out / single-host routing as `list_runs`.
 async fn list_workflow_runs(
     State(s): State<AppState>,
     Query(q): Query<WorkflowRunsQuery>,
-) -> ApiResult<Json<Vec<RunListRow>>> {
-    let rows = query_run_rows(
-        &s.run_store,
-        q.page().offset(),
-        q.page().limit(),
-        q.lifecycle.as_deref(),
-        true,
-        &s.pricing,
-    )
-    .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(rows))
+) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let page = q.page();
+    if let Some(host_id) = &q.host {
+        let conn = resolve_host(&s, host_id)?;
+        let params = RunListQuery {
+            kind: RunKind::Workflow,
+            offset: page.offset(),
+            limit: page.limit(),
+            lifecycle: q.lifecycle.clone(),
+        };
+        let rows = conn
+            .list_runs(params)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let tagged: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|mut v| {
+                v["host_id"] = serde_json::json!(host_id);
+                v
+            })
+            .collect();
+        return Ok(Json(tagged));
+    }
+    let rows = fan_out_list_runs(&s, RunKind::Workflow, q.lifecycle.clone()).await;
+    Ok(Json(crate::pagination::paginate(rows, &page)))
 }
 
+/// Optional `?host=<id>` query param for `GET /api/runs/:id`.
+#[derive(serde::Deserialize, Default)]
+struct RunDetailQuery {
+    /// When present and not `"local"`, proxy the request to the named host.
+    host: Option<String>,
+}
+
+/// `GET /api/runs/:id[?host=<id>]`
+///
+/// Without `?host=` (or `?host=local`): read from the local store (unchanged).
+/// With `?host=<remote-id>`: proxy to that host's `GET /api/runs/:id`.
+/// Unknown host id → 404.
 async fn get_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunDetailQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let host_id = q.host.as_deref().unwrap_or("local");
+    if host_id != "local" {
+        let conn = resolve_host(&s, host_id)?;
+        let detail = conn.get_run(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(_) => {
+                ApiError::not_found(format!("run {id} not found"))
+            }
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(detail));
+    }
+    // Local path: unchanged
     let detail = query_run_detail(&s.run_store, &id, &s.pricing).map_err(|e| match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         other => ApiError::internal(other.to_string()),

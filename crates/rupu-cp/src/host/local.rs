@@ -240,4 +240,31 @@ impl HostConnector for LocalHostConnector {
 
         Ok(Box::pin(stream))
     }
+
+    async fn get_transcript(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        use std::path::Path;
+        let p = Path::new(path);
+        // Basic safety: no traversal, must be .jsonl
+        if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            return Err(HostConnectorError::Invalid("not a .jsonl file".into()));
+        }
+        if p.components().any(|c| c == std::path::Component::ParentDir) {
+            return Err(HostConnectorError::Invalid(
+                "path must not contain ..".into(),
+            ));
+        }
+        if !p.exists() {
+            return Ok(serde_json::json!({ "events": [], "summary": null }));
+        }
+        let events: Vec<rupu_transcript::Event> =
+            rupu_transcript::JsonlReader::iter(p)
+                .map_err(|e| HostConnectorError::Invalid(e.to_string()))?
+                .filter_map(Result::ok)
+                .collect();
+        let summary = rupu_transcript::JsonlReader::summary(p).ok();
+        Ok(serde_json::json!({ "events": events, "summary": summary }))
+    }
 }
