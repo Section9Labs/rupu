@@ -25,6 +25,7 @@ afterEach(() => {
 
 describe('LauncherSheet', () => {
   it('launches with the declared input + chosen mode, then navigates to the run', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-xyz' });
@@ -52,6 +53,7 @@ describe('LauncherSheet', () => {
   });
 
   it('surfaces an error and does not navigate when the launch fails', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     vi.spyOn(api, 'launchRun').mockRejectedValue(new Error('no launcher'));
@@ -64,6 +66,7 @@ describe('LauncherSheet', () => {
   });
 
   it('renders the TargetPicker and sends working_dir when a directory item is selected', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/tmp/myproject', parent: null, dirs: [] });
@@ -91,6 +94,7 @@ describe('LauncherSheet', () => {
   });
 
   it('sends target when a repo item is selected via the TargetPicker', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-repo' });

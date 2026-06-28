@@ -272,6 +272,9 @@ export interface RunListRow {
   turns: number;
   duration_ms?: number | null;
   usage: UsageSummary;
+  /** Originating host id — `"local"` for runs on this CP; a remote host id
+   *  for proxied runs. Absent on older server versions (treat as `"local"`). */
+  host_id?: string;
 }
 
 // ---------------------------------------------------------------------------
