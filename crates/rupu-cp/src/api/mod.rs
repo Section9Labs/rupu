@@ -8,6 +8,7 @@ pub mod events;
 pub mod findings;
 pub mod fs_safety;
 pub mod graph;
+pub mod host_info;
 pub mod projects;
 pub mod run_streams;
 pub mod repos;
