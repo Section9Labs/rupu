@@ -20,6 +20,8 @@ const AutoflowsDefs     = React.lazy(() => import('./pages/AutoflowsDefs'));
 const Sessions          = React.lazy(() => import('./pages/Sessions'));
 const SessionDetail     = React.lazy(() => import('./pages/SessionDetail'));
 const Workers           = React.lazy(() => import('./pages/Workers'));
+const Hosts             = React.lazy(() => import('./pages/Hosts'));
+const HostDetail        = React.lazy(() => import('./pages/HostDetail'));
 const Settings          = React.lazy(() => import('./pages/Settings'));
 const AgentRuns         = React.lazy(() => import('./pages/runs/AgentRuns'));
 const WorkflowRuns      = React.lazy(() => import('./pages/runs/WorkflowRuns'));
@@ -71,6 +73,8 @@ export default function App() {
             <Route path="/autoflows" element={<Suspense fallback={<PageFallback />}><AutoflowsDefs /></Suspense>} />
             <Route path="/sessions" element={<Suspense fallback={<PageFallback />}><Sessions /></Suspense>} />
             <Route path="/sessions/:id" element={<Suspense fallback={<PageFallback />}><SessionDetail /></Suspense>} />
+            <Route path="/hosts" element={<Suspense fallback={<PageFallback />}><Hosts /></Suspense>} />
+            <Route path="/hosts/:id" element={<Suspense fallback={<PageFallback />}><HostDetail /></Suspense>} />
             <Route path="/workers" element={<Suspense fallback={<PageFallback />}><Workers /></Suspense>} />
             <Route path="/settings" element={<Suspense fallback={<PageFallback />}><Settings /></Suspense>} />
             {/* Transcript-only page (agent/session/standalone runs with no DAG) */}
