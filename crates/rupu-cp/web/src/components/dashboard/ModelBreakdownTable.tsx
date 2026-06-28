@@ -110,7 +110,7 @@ export default function ModelBreakdownTable({ rows }: { rows: UsageBreakdownRow[
           the numeric/Share columns keep their width — nothing overflows. */}
       <table className="w-full table-fixed text-xs">
         <thead>
-          <tr className="text-ink-mute text-[10px] uppercase tracking-wide">
+          <tr className="text-ink-mute text-meta uppercase tracking-wide">
             <th className="text-left font-medium pb-2">Model</th>
             <th className="text-right font-medium pb-2 w-14">Tokens</th>
             <th className="text-right font-medium pb-2 w-20">Cost</th>
@@ -136,7 +136,7 @@ export default function ModelBreakdownTable({ rows }: { rows: UsageBreakdownRow[
                   <span className="min-w-0">
                     <span className="text-ink font-medium truncate block">{r.label}</span>
                     {r.provider && (
-                      <span className="text-ink-mute text-[10px] truncate block">{r.provider}</span>
+                      <span className="text-ink-mute text-meta truncate block">{r.provider}</span>
                     )}
                   </span>
                 </div>
@@ -147,10 +147,10 @@ export default function ModelBreakdownTable({ rows }: { rows: UsageBreakdownRow[
               </td>
               <td className="py-1.5 pl-2">
                 {r.share === null ? (
-                  <span className="text-ink-mute text-[10px] italic block text-right">unpriced</span>
+                  <span className="text-ink-mute text-meta italic block text-right">unpriced</span>
                 ) : (
                   <div className="flex items-center gap-1.5 justify-end">
-                    <span className="text-ink-dim tabular-nums text-[10px] w-9 text-right">
+                    <span className="text-ink-dim tabular-nums text-meta w-9 text-right">
                       {(r.share * 100).toFixed(0)}%
                     </span>
                     <span className="h-1.5 rounded-full bg-slate-100 w-12 overflow-hidden">
@@ -167,7 +167,7 @@ export default function ModelBreakdownTable({ rows }: { rows: UsageBreakdownRow[
         </tbody>
       </table>
 
-      <div className="mt-3 pt-2 border-t border-border text-[11px] text-ink-dim tabular-nums">
+      <div className="mt-3 pt-2 border-t border-border text-note text-ink-dim tabular-nums">
         Total: <span className="text-ink font-semibold">{formatCost(view.totalCost)}</span> (priced)
         {view.hasUnpriced && (
           <>

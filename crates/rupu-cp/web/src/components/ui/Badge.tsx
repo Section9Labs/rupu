@@ -30,8 +30,8 @@ const TONE_CLS: Record<BadgeTone, string> = {
 };
 
 const SIZE_CLS: Record<BadgeSize, string> = {
-  sm: 'px-1.5 py-0.5 text-[10px]',
-  md: 'px-2 py-0.5 text-[11px]',
+  sm: 'px-1.5 py-0.5 text-meta',
+  md: 'px-2 py-0.5 text-note',
 };
 
 export interface BadgeProps extends HTMLAttributes<HTMLSpanElement> {

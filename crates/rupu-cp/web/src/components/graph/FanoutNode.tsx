@@ -62,10 +62,10 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         style={{ borderColor: border, background: bg, width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
-        <div className={['text-[10px] font-bold uppercase tracking-wide', labelColor].join(' ')}>
+        <div className={['text-meta font-bold uppercase tracking-wide', labelColor].join(' ')}>
           for_each · {node.id}
         </div>
-        <div className="mt-1 text-[11px] text-ink-mute">{message}</div>
+        <div className="mt-1 text-note text-ink-mute">{message}</div>
         <Handle type="source" position={Position.Right} style={handleStyle} />
       </div>
     );
@@ -87,7 +87,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         style={{ borderColor: '#bfdbfe', background: '#eff6ff', width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
-        <div className="mb-1 flex items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-wide text-[#3b82f6]">
+        <div className="mb-1 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide text-[#3b82f6]">
           <span className="truncate">for_each · {node.id} · {total}</span>
           <span className="tabular-nums">
             {done} ✓{failed > 0 && <span className="ml-1 text-[#ef4444]">· {failed} ✕</span>}
@@ -122,14 +122,14 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
-      <div className="text-[10px] font-bold uppercase tracking-wide text-[#3b82f6]">
+      <div className="text-meta font-bold uppercase tracking-wide text-[#3b82f6]">
         for_each · {node.id}
       </div>
 
       <div className="mt-1 flex items-baseline gap-2">
         <span className="text-[22px] font-bold leading-none text-ink tabular-nums">{done}</span>
-        <span className="text-[11px] text-ink-mute">/ {total} units</span>
-        <span className="ml-auto text-[13px] font-bold text-[#3b82f6] tabular-nums">{pct}%</span>
+        <span className="text-note text-ink-mute">/ {total} units</span>
+        <span className="ml-auto text-lead font-bold text-[#3b82f6] tabular-nums">{pct}%</span>
       </div>
 
       <div className="mt-1.5 h-[9px] overflow-hidden rounded-[5px]" style={{ background: '#e2e8f0' }}>
@@ -139,7 +139,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         />
       </div>
 
-      <div className="mt-1.5 flex flex-wrap gap-3 text-[11px] text-ink-dim">
+      <div className="mt-1.5 flex flex-wrap gap-3 text-note text-ink-dim">
         <span>
           <b className="text-ink">{done}</b> done
         </span>
@@ -165,7 +165,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
       <button
         type="button"
         onClick={() => onExpandFanout?.(node.id)}
-        className="mt-2 text-[11px] font-medium text-[#3b82f6] hover:underline"
+        className="mt-2 text-note font-medium text-[#3b82f6] hover:underline"
       >
         ▸ expand all {total}
         {failed > 0 && ` · failed (${failed})`}

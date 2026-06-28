@@ -46,28 +46,28 @@ export default function FindingCard({ finding }: { finding: FindingView }) {
         <div className="flex flex-wrap items-center gap-1.5">
           {/* Severity badge */}
           <span
-            className={`inline-flex items-center rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ring-1 ring-inset ${s.pill}`}
+            className={`inline-flex items-center rounded px-2 py-0.5 text-meta font-bold uppercase tracking-wider ring-1 ring-inset ${s.pill}`}
           >
             {s.label.toUpperCase()}
           </span>
 
           {/* Scope chip */}
           {finding.scope && (
-            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] bg-slate-100 text-ink-mute">
+            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-slate-100 text-ink-mute">
               {finding.scope}
             </span>
           )}
 
           {/* Concern ID chip */}
           {finding.concernId && (
-            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] bg-slate-100 text-ink-mute font-mono">
+            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-slate-100 text-ink-mute font-mono">
               {finding.concernId}
             </span>
           )}
         </div>
 
         {/* 3. Summary / title */}
-        <p className={`text-[13px] font-semibold leading-snug ${s.text}`}>
+        <p className={`text-lead font-semibold leading-snug ${s.text}`}>
           {finding.summary}
         </p>
 
@@ -80,7 +80,7 @@ export default function FindingCard({ finding }: { finding: FindingView }) {
 
         {/* 5. Rationale via Markdown */}
         {finding.rationale && (
-          <div className="text-[12px] text-ink-dim">
+          <div className="text-ui text-ink-dim">
             <Markdown text={finding.rationale} />
           </div>
         )}
@@ -95,12 +95,12 @@ export default function FindingCard({ finding }: { finding: FindingView }) {
         {/* 7. References */}
         {finding.references.length > 0 && (
           <div>
-            <p className="text-[10px] uppercase tracking-wider text-ink-mute font-semibold mb-1">
+            <p className="text-meta uppercase tracking-wider text-ink-mute font-semibold mb-1">
               References
             </p>
             <ul className="space-y-0.5">
               {finding.references.map((ref, i) => (
-                <li key={i} className="text-[11px] break-all">
+                <li key={i} className="text-note break-all">
                   <a
                     href={ref}
                     target="_blank"

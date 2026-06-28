@@ -62,7 +62,7 @@ export default function NodePalette({ onAdd, onDragStartKind, disabled = false }
 
   return (
     <div className="pointer-events-auto absolute bottom-3 left-3 z-10 max-w-[calc(100%-1.5rem)] rounded-lg border border-border bg-white/95 px-2 py-2 shadow-card">
-      <div className="px-0.5 pb-1.5 text-[10px] text-ink-mute">
+      <div className="px-0.5 pb-1.5 text-meta text-ink-mute">
         Drag a card onto the canvas, or click to add at center.
       </div>
       <div className="flex flex-wrap gap-1.5">
@@ -82,8 +82,8 @@ export default function NodePalette({ onAdd, onDragStartKind, disabled = false }
               {/* colored top-bar — by KIND, mirrors the real card */}
               <div className="h-[3px] w-full" style={{ background: color }} />
               <div className="px-2 py-1.5">
-                <div className="truncate text-[11px] font-semibold text-ink">{item.label}</div>
-                <div className="mt-0.5 truncate text-[10px] text-ink-mute">{item.sub}</div>
+                <div className="truncate text-note font-semibold text-ink">{item.label}</div>
+                <div className="mt-0.5 truncate text-meta text-ink-mute">{item.sub}</div>
               </div>
             </button>
           );

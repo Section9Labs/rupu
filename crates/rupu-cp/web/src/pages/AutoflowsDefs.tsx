@@ -7,6 +7,7 @@ import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AutoflowDefRow } from '../lib/api';
 import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
+import { Button } from '../components/ui/Button';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
@@ -20,7 +21,7 @@ const TRIGGER_CLS: Record<string, string> = {
 function TriggerChip({ trigger }: { trigger: string }) {
   const cls = TRIGGER_CLS[trigger] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
   return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
+    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {trigger}
     </span>
   );
@@ -35,7 +36,7 @@ const SCOPE_CLS: Record<string, string> = {
 function ScopeChip({ scope }: { scope: string }) {
   const cls = SCOPE_CLS[scope] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
   return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-[10px] font-medium px-1.5 py-0.5', cls)}>
+    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium px-1.5 py-0.5', cls)}>
       {scope}
     </span>
   );
@@ -78,13 +79,10 @@ export default function AutoflowsDefs() {
           <h1 className="text-2xl font-semibold text-ink">Autoflows</h1>
           <p className="mt-1 text-sm text-ink-dim">Workflows with autoflow triggers configured.</p>
         </div>
-        <button
-          onClick={() => void load()}
-          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-border bg-panel text-ink hover:bg-slate-100"
-        >
+        <Button variant="secondary" onClick={() => void load()} className="gap-1.5">
           <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
           Refresh
-        </button>
+        </Button>
       </header>
 
       {error && (
@@ -106,7 +104,7 @@ export default function AutoflowsDefs() {
             ))}
           </ListCard>
           {defs.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+            <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
               scroll for more
             </div>
           )}

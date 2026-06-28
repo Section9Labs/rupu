@@ -115,7 +115,7 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
       {/* Filter chip rows */}
       <div className="space-y-2">
         <div className="flex items-center gap-2">
-          <span className="text-[10px] font-semibold uppercase tracking-widest text-ink-mute w-14">
+          <span className="text-meta font-semibold uppercase tracking-widest text-ink-mute w-14">
             Status
           </span>
           {STATUS_FILTERS.map((f) => (
@@ -135,7 +135,7 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
           ))}
         </div>
         <div className="flex items-center gap-2">
-          <span className="text-[10px] font-semibold uppercase tracking-widest text-ink-mute w-14">
+          <span className="text-meta font-semibold uppercase tracking-widest text-ink-mute w-14">
             Trigger
           </span>
           {TRIGGER_FILTERS.map((f) => (
@@ -195,7 +195,7 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
                 header={
                   <>
                     <span className="text-sm font-medium text-ink truncate">{r.workflow_name}</span>
-                    <span className="text-[11px] text-ink-mute font-mono">{shortId(r.id)}</span>
+                    <span className="text-note text-ink-mute font-mono">{shortId(r.id)}</span>
                     <TriggerChip trigger={r.trigger} />
                   </>
                 }
@@ -224,7 +224,7 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
       )}
 
       {runs !== null && filtered.length > 0 && (
-        <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
+        <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
           {loading ? 'loading more…' : hasMore ? 'scroll for more' : `— end of ${filtered.length} —`}
         </div>
       )}

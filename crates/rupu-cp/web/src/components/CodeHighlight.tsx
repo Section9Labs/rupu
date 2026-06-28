@@ -49,7 +49,7 @@ function highlight(code: string, language: Language): string {
 }
 
 const PRE_CLASS =
-  'whitespace-pre-wrap break-words font-mono text-[12px] leading-relaxed text-ink ' +
+  'whitespace-pre-wrap break-words font-mono text-ui leading-relaxed text-ink ' +
   'bg-panel border border-border rounded-xl shadow-card p-4 overflow-x-auto';
 
 export interface CodeHighlightProps {

@@ -81,20 +81,20 @@ export default function ExpressionReference({ onInsert }: ExpressionReferencePro
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search expressions…"
           aria-label="Search expressions"
-          className="w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-[12px] text-ink placeholder:text-ink-mute focus:border-brand-400 focus:outline-none focus:ring-1 focus:ring-brand-300"
+          className="w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-ui text-ink placeholder:text-ink-mute focus:border-brand-400 focus:outline-none focus:ring-1 focus:ring-brand-300"
         />
-        <p className="mt-1.5 text-[11px] text-ink-mute">
+        <p className="mt-1.5 text-note text-ink-mute">
           {onInsert ? 'Click to insert into the focused field.' : 'Click to copy to the clipboard.'}
         </p>
       </div>
 
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto">
         {groups.length === 0 ? (
-          <p className="text-[12px] text-ink-dim">No expressions match “{query}”.</p>
+          <p className="text-ui text-ink-dim">No expressions match “{query}”.</p>
         ) : (
           groups.map((g) => (
             <section key={g.group}>
-              <h3 className="mb-1.5 text-[11px] font-semibold uppercase tracking-wide text-ink-mute">
+              <h3 className="mb-1.5 text-note font-semibold uppercase tracking-wide text-ink-mute">
                 {g.group}
               </h3>
               <ul className="space-y-1">
@@ -107,20 +107,20 @@ export default function ExpressionReference({ onInsert }: ExpressionReferencePro
                       className="group flex w-full items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left hover:border-border hover:bg-white"
                     >
                       <span className="min-w-0 flex-1">
-                        <span className="block truncate font-mono text-[12px] text-ink">
+                        <span className="block truncate font-mono text-ui text-ink">
                           {entry.label}
                         </span>
-                        <span className="block truncate text-[11px] text-ink-mute">{entry.detail}</span>
+                        <span className="block truncate text-note text-ink-mute">{entry.detail}</span>
                       </span>
                       <span
-                        className={`mt-0.5 shrink-0 rounded px-1 py-0.5 text-[10px] font-medium uppercase ring-1 ${KIND_CLASS[entry.kind]}`}
+                        className={`mt-0.5 shrink-0 rounded px-1 py-0.5 text-meta font-medium uppercase ring-1 ${KIND_CLASS[entry.kind]}`}
                       >
                         {KIND_LABEL[entry.kind]}
                       </span>
                       {copied === entry.insert && (
                         <span
                           role="status"
-                          className="mt-0.5 shrink-0 rounded bg-green-600 px-1 py-0.5 text-[10px] font-medium text-white"
+                          className="mt-0.5 shrink-0 rounded bg-green-600 px-1 py-0.5 text-meta font-medium text-white"
                         >
                           copied
                         </span>

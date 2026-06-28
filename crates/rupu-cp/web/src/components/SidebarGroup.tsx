@@ -90,7 +90,7 @@ export default function SidebarGroup({ group, initiallyOpen, containsActive }: P
         aria-controls={panelId}
         className={cn(
           'w-full flex items-center justify-between px-4 pt-3 pb-1',
-          'text-[10px] uppercase tracking-wide font-semibold',
+          'text-meta uppercase tracking-wide font-semibold',
           'transition-colors',
           headerTone,
         )}
@@ -141,7 +141,7 @@ export default function SidebarGroup({ group, initiallyOpen, containsActive }: P
             <item.icon size={16} strokeWidth={2} />
             <span>{item.label}</span>
             {!item.enabled && (
-              <span className="ml-auto text-[10px] uppercase tracking-wide text-ink-mute">soon</span>
+              <span className="ml-auto text-meta uppercase tracking-wide text-ink-mute">soon</span>
             )}
           </NavLink>
         ))}

@@ -238,7 +238,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
       {connError && (
         <div
           role="alert"
-          className="absolute left-3 right-3 top-3 z-20 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800 shadow-card lg:right-[21rem]"
+          className="absolute left-3 right-3 top-3 z-20 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-ui text-amber-800 shadow-card lg:right-[21rem]"
         >
           <span className="flex-1">{connError}</span>
           <button
@@ -255,7 +255,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
       {notice && (
         <div
           role="status"
-          className="absolute left-1/2 top-3 z-30 -translate-x-1/2 rounded-md border border-slate-300 bg-slate-800 px-3 py-1.5 text-[12px] font-medium text-white shadow-card"
+          className="absolute left-1/2 top-3 z-30 -translate-x-1/2 rounded-md border border-slate-300 bg-slate-800 px-3 py-1.5 text-ui font-medium text-white shadow-card"
         >
           {notice}
         </div>
@@ -264,7 +264,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
       {reformatNotice && (
         <div
           role="status"
-          className="absolute left-3 right-3 top-3 z-20 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-800 shadow-card lg:right-[21rem]"
+          className="absolute left-3 right-3 top-3 z-20 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-ui text-amber-800 shadow-card lg:right-[21rem]"
         >
           <span className="flex-1">
             Editing the graph reformats the YAML and removes comments. Edit the YAML directly to keep
@@ -308,7 +308,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
                 />
               </div>
               <div className="flex items-center gap-2 border-t border-border bg-white px-3 py-1.5">
-                <span className="text-[11px] text-ink-mute">⟳ synced from graph</span>
+                <span className="text-note text-ink-mute">⟳ synced from graph</span>
                 <span className="ml-auto">
                   <ValidityBadge validity={validity} />
                 </span>
@@ -361,7 +361,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
                   exprContext={exprContext}
                 />
               ) : (
-                <p className="text-[13px] text-ink-dim">Select a node to edit its step.</p>
+                <p className="text-lead text-ink-dim">Select a node to edit its step.</p>
               )}
             </div>
           )}
@@ -390,14 +390,14 @@ function ValidityBadge({ validity }: { validity: { ok: boolean; error?: string }
   if (!validity) return null;
   if (validity.ok) {
     return (
-      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-green-50 text-green-700 ring-green-200">
+      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-green-50 text-green-700 ring-green-200">
         ✓ valid
       </span>
     );
   }
   return (
     <span
-      className="inline-flex max-w-[16rem] items-center truncate rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 bg-red-50 text-red-700 ring-red-200"
+      className="inline-flex max-w-[16rem] items-center truncate rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-red-50 text-red-700 ring-red-200"
       title={validity.error}
     >
       ✕ {validity.error ?? 'invalid'}
@@ -428,8 +428,8 @@ function PanelTabButton({
       onClick={onClick}
       className={
         active
-          ? 'rounded-md bg-brand-600 px-3 py-1 text-[12px] font-medium text-white'
-          : 'rounded-md px-3 py-1 text-[12px] font-medium text-ink-dim hover:text-ink'
+          ? 'rounded-md bg-brand-600 px-3 py-1 text-ui font-medium text-white'
+          : 'rounded-md px-3 py-1 text-ui font-medium text-ink-dim hover:text-ink'
       }
     >
       {children}

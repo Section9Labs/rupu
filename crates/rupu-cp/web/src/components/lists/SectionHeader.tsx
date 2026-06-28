@@ -42,7 +42,7 @@ export function SectionHeader({
       <span className={cn('w-2 h-2 rounded-full', t.dot)} />
       <h2 className={cn('text-sm font-semibold', t.text)}>{label}</h2>
       <span className="text-xs text-ink-mute tabular-nums">{count}</span>
-      {hint && <span className="text-[11px] text-ink-mute ml-1">{hint}</span>}
+      {hint && <span className="text-note text-ink-mute ml-1">{hint}</span>}
     </header>
   );
 }

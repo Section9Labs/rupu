@@ -80,7 +80,7 @@ export default function Turn({
           <ChevronRight size={13} className="shrink-0 text-ink-mute" />
         )}
 
-        <span className="min-w-0 flex-1 truncate text-[11px] text-ink-dim">
+        <span className="min-w-0 flex-1 truncate text-note text-ink-dim">
           {snippet(content) || (
             <span className="italic text-ink-mute">no assistant message</span>
           )}
@@ -130,7 +130,7 @@ export default function Turn({
               <button
                 type="button"
                 onClick={() => setShowThinking((v) => !v)}
-                className="flex items-center gap-1 text-[10px] font-medium text-ink-mute"
+                className="flex items-center gap-1 text-meta font-medium text-ink-mute"
               >
                 {showThinking ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
                 thinking

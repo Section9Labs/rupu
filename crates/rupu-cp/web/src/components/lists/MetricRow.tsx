@@ -33,7 +33,7 @@ export default function MetricRow({
           .filter((m) => m.value != null)
           .map((m) => (
             <span key={m.label} className="inline-flex flex-col leading-tight">
-              <span className="text-[13px] font-semibold text-ink tabular-nums">{m.value}</span>
+              <span className="text-lead font-semibold text-ink tabular-nums">{m.value}</span>
               <span className="text-[9px] uppercase tracking-wide text-ink-mute">{m.label}</span>
             </span>
           ))}

@@ -32,7 +32,7 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
-      <div className="mb-1.5 flex items-center justify-between gap-3 text-[10px] font-bold uppercase tracking-wide text-brand-500">
+      <div className="mb-1.5 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide text-brand-500">
         <span className="truncate">parallel · {node.id}</span>
         <span className="tabular-nums">
           {done}/{total} ✓
@@ -55,11 +55,11 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
               >
                 {ss.glyph}
               </span>
-              <span className="truncate text-[11px] text-ink">{sub.id}</span>
+              <span className="truncate text-note text-ink">{sub.id}</span>
             </div>
           );
         })}
-        {total === 0 && <div className="px-1 py-0.5 text-[10px] text-ink-mute">no sub-steps</div>}
+        {total === 0 && <div className="px-1 py-0.5 text-meta text-ink-mute">no sub-steps</div>}
       </div>
 
       <Handle type="source" position={Position.Right} style={handleStyle} />

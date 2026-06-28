@@ -49,6 +49,17 @@ export default {
         sans: ['-apple-system', 'BlinkMacSystemFont', 'Inter', 'system-ui', 'sans-serif'],
         mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
+      // Semantic UI type scale — replaces the ad-hoc `text-[10/11/12/13px]`
+      // literals scattered across the app. Bare strings set ONLY font-size, so
+      // existing `leading-*` classes keep controlling line-height (the rename is
+      // visually identical). meta=labels/captions, note=secondary, ui=default
+      // body, lead=slightly emphasized.
+      fontSize: {
+        meta: '10px',
+        note: '11px',
+        ui: '12px',
+        lead: '13px',
+      },
       boxShadow: {
         card: '0 1px 2px rgba(15, 23, 42, 0.04), 0 0 0 1px rgba(15, 23, 42, 0.06)',
       },

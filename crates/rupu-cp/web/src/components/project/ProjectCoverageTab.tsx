@@ -63,13 +63,13 @@ export default function ProjectCoverageTab({ wsId }: { wsId: string }) {
             >
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium text-ink truncate font-mono">{r.target_id}</p>
-                <p className="text-[11px] text-ink-dim mt-0.5">
+                <p className="text-note text-ink-dim mt-0.5">
                   {r.assertion_lines} assertion{r.assertion_lines !== 1 ? 's' : ''}
                   {r.has_catalog ? ' · has catalog' : ''}
                 </p>
               </div>
               {r.findings > 0 && (
-                <span className="shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium ring-1 bg-red-50 text-red-700 ring-red-200">
+                <span className="shrink-0 inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-red-50 text-red-700 ring-red-200">
                   {r.findings} finding{r.findings !== 1 ? 's' : ''}
                 </span>
               )}

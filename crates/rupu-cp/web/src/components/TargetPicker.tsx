@@ -139,7 +139,7 @@ export interface TargetPickerProps {
 }
 
 const INPUT_CLS =
-  'w-full rounded border border-border bg-panel px-2.5 py-1.5 text-[13px] text-ink ' +
+  'w-full rounded border border-border bg-panel px-2.5 py-1.5 text-lead text-ink ' +
   'placeholder:text-ink-mute focus:outline-none focus:ring-1 focus:ring-brand-500 ' +
   'disabled:cursor-not-allowed disabled:opacity-50';
 
@@ -307,7 +307,7 @@ export default function TargetPicker({ value, onChange, disabled }: TargetPicker
               <div className="flex items-center gap-1.5 px-2.5 pt-2 pb-1">
                 <span
                   className={
-                    'inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ring-1 ' +
+                    'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 ' +
                     KIND_CHIP[group.kind]
                   }
                 >
@@ -335,11 +335,11 @@ export default function TargetPicker({ value, onChange, disabled }: TargetPicker
                       (isActive ? 'bg-brand-50' : 'hover:bg-slate-50')
                     }
                   >
-                    <div className="text-[13px] leading-snug text-ink">
+                    <div className="text-lead leading-snug text-ink">
                       <HighlightedLabel label={ranked.item.label} matched={ranked.matched} />
                     </div>
                     {ranked.item.sublabel && (
-                      <div className="truncate text-[11px] leading-snug text-ink-mute">
+                      <div className="truncate text-note leading-snug text-ink-mute">
                         {ranked.item.sublabel}
                       </div>
                     )}

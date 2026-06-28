@@ -52,7 +52,7 @@ function RollupTile({
         {label}
       </p>
       <p className="text-2xl font-bold text-ink tabular-nums leading-none">{value}</p>
-      {sub && <p className="mt-1 text-[11px] text-ink-dim">{sub}</p>}
+      {sub && <p className="mt-1 text-note text-ink-dim">{sub}</p>}
       {children}
     </div>
   );
@@ -174,7 +174,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       {/* ── Identity header ── */}
       <header className="bg-panel border border-border rounded-xl shadow-card px-5 py-4">
         <h1 className="text-lg font-bold text-ink">{p.name}</h1>
-        <div className="mt-1.5 flex items-center flex-wrap gap-x-4 gap-y-1 text-[11px] text-ink-dim">
+        <div className="mt-1.5 flex items-center flex-wrap gap-x-4 gap-y-1 text-note text-ink-dim">
           <span className="font-mono">{p.path}</span>
           {p.repo_remote && (
             <span className="inline-flex items-center gap-1">
@@ -218,13 +218,13 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
         </RollupTile>
         <RollupTile label="Findings" value={coverage.findings}>
           {coverage.findings > 0 && (
-            <p className="mt-1 text-[11px] text-red-600 font-medium flex items-center gap-1">
+            <p className="mt-1 text-note text-red-600 font-medium flex items-center gap-1">
               <ShieldAlert size={11} />
               needs attention
             </p>
           )}
           {coverage.findings === 0 && (
-            <p className="mt-1 text-[11px] text-green-600 flex items-center gap-1">
+            <p className="mt-1 text-note text-green-600 flex items-center gap-1">
               <ShieldCheck size={11} />
               all clear
             </p>

@@ -76,10 +76,10 @@ export default function StepTranscriptBrowser({
       {/* LEFT — unit list */}
       <div className="flex w-[34%] min-w-0 flex-col border-r border-border">
         <div className="border-b border-border px-4 py-3">
-          <div className="truncate font-mono text-[11px] text-ink" title={stepId}>
+          <div className="truncate font-mono text-note text-ink" title={stepId}>
             {stepId}
           </div>
-          <div className="text-[10px] text-ink-dim">
+          <div className="text-meta text-ink-dim">
             {units.length} unit{units.length === 1 ? '' : 's'}
           </div>
         </div>
@@ -91,7 +91,7 @@ export default function StepTranscriptBrowser({
               type="button"
               onClick={() => setFilter(f.key)}
               className={[
-                'rounded-full px-2.5 py-0.5 text-[11px] font-medium tabular-nums transition-colors',
+                'rounded-full px-2.5 py-0.5 text-note font-medium tabular-nums transition-colors',
                 filter === f.key
                   ? 'bg-brand-500 text-white'
                   : 'bg-slate-100 text-slate-600 hover:bg-slate-200',
@@ -115,7 +115,7 @@ export default function StepTranscriptBrowser({
                     <button
                       type="button"
                       className={[
-                        'flex w-full items-center gap-2 py-1.5 text-left text-[11px] cursor-pointer',
+                        'flex w-full items-center gap-2 py-1.5 text-left text-note cursor-pointer',
                         selected ? 'bg-brand-50' : 'hover:bg-slate-50',
                       ].join(' ')}
                       aria-pressed={selected}
@@ -132,7 +132,7 @@ export default function StepTranscriptBrowser({
                         {u.key}
                       </span>
                       <span
-                        className="ml-auto shrink-0 text-[10px] font-medium uppercase tracking-wide"
+                        className="ml-auto shrink-0 text-meta font-medium uppercase tracking-wide"
                         style={{ color: st.color }}
                       >
                         {st.label}
@@ -144,7 +144,7 @@ export default function StepTranscriptBrowser({
             </ul>
           )}
           {overflow > 0 && (
-            <div className="py-2 text-center text-[11px] text-ink-mute">+{overflow} more</div>
+            <div className="py-2 text-center text-note text-ink-mute">+{overflow} more</div>
           )}
         </div>
       </div>

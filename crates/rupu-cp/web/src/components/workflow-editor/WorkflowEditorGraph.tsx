@@ -359,7 +359,7 @@ function WorkflowEditorGraphInner({
       {paused && (
         <div
           role="status"
-          className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-[11px] font-medium text-amber-800 shadow-card"
+          className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-note font-medium text-amber-800 shadow-card"
         >
           YAML not parseable — graph paused
         </div>
@@ -372,7 +372,7 @@ function WorkflowEditorGraphInner({
           type="button"
           disabled={paused}
           onClick={relayout}
-          className="rounded-md border border-border bg-white px-2 py-1 text-[11px] font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+          className="rounded-md border border-border bg-white px-2 py-1 text-note font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
         >
           Re-layout
         </button>
@@ -381,7 +381,7 @@ function WorkflowEditorGraphInner({
           disabled={paused || !selectedId}
           onClick={addConnectedNext}
           title={selectedId ? `Add a step connected from ${selectedId}` : 'Select a node first'}
-          className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-[11px] font-medium text-blue-700 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
+          className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-note font-medium text-blue-700 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
         >
           ⊕ next
         </button>
@@ -395,7 +395,7 @@ function WorkflowEditorGraphInner({
             onKeyDown={onFindKeyDown}
             placeholder="Find step…"
             aria-label="Find step by id"
-            className="w-28 rounded-md border border-border bg-white px-2 py-1 text-[11px] text-ink placeholder:text-ink-mute focus:outline-none focus:ring-1 focus:ring-brand-100 disabled:cursor-not-allowed disabled:opacity-50"
+            className="w-28 rounded-md border border-border bg-white px-2 py-1 text-note text-ink placeholder:text-ink-mute focus:outline-none focus:ring-1 focus:ring-brand-100 disabled:cursor-not-allowed disabled:opacity-50"
           />
           {matches.length > 0 && (
             <ul className="absolute left-0 top-full z-20 mt-1 max-h-40 w-40 overflow-auto rounded-md border border-border bg-white py-1 shadow-card">
@@ -404,7 +404,7 @@ function WorkflowEditorGraphInner({
                   <button
                     type="button"
                     onClick={() => locate(n.id)}
-                    className="block w-full truncate px-2 py-1 text-left text-[11px] text-ink hover:bg-slate-50"
+                    className="block w-full truncate px-2 py-1 text-left text-note text-ink hover:bg-slate-50"
                   >
                     {n.id}
                   </button>

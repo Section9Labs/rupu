@@ -20,6 +20,7 @@ import { ListCard } from '../components/lists/ListCard';
 import TriageRibbon from '../components/dashboard/TriageRibbon';
 import UsageTimelineStacked, { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
+import { Button } from '../components/ui/Button';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
 import { formatCost, formatTokens } from '../lib/usage';
@@ -159,9 +160,9 @@ function RecentRunRow({ run }: { run: DashboardResponse['recent_runs'][number] }
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-ink truncate">{run.workflow_name}</span>
-          <span className="text-[11px] text-ink-mute font-mono">{shortId(run.id)}</span>
+          <span className="text-note text-ink-mute font-mono">{shortId(run.id)}</span>
         </div>
-        <p className="text-[11px] text-ink-dim mt-0.5">started {relativeTime(run.started_at)}</p>
+        <p className="text-note text-ink-dim mt-0.5">started {relativeTime(run.started_at)}</p>
       </div>
       <UsageChip usage={run.usage} className="ml-2" />
       <StatusPill status={run.status} />
@@ -298,17 +299,14 @@ export default function Dashboard() {
             ))}
           </div>
           {lastUpdated && !refreshing && (
-            <span className="text-[11px] text-ink-mute tabular-nums">
+            <span className="text-note text-ink-mute tabular-nums">
               updated {ageSec < 5 ? 'just now' : `${ageSec}s ago`}
             </span>
           )}
-          <button
-            onClick={() => void load()}
-            className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-border bg-panel text-ink hover:bg-slate-100 transition-colors"
-          >
+          <Button variant="secondary" onClick={() => void load()} className="gap-1.5">
             <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
             Refresh
-          </button>
+          </Button>
         </div>
       </header>
 
@@ -367,7 +365,7 @@ export default function Dashboard() {
                 </div>
               </div>
               {spendPartial && (
-                <p className="-mt-2 mb-3 text-[11px] text-ink-mute">
+                <p className="-mt-2 mb-3 text-note text-ink-mute">
                   <span className="text-amber-500">*</span> partial — some models are unpriced (see breakdown)
                 </p>
               )}

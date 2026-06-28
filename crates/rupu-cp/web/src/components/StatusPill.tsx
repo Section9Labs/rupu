@@ -75,8 +75,8 @@ export function StatusPill({
         'inline-flex items-center gap-1 rounded ring-1 font-medium tabular-nums',
         s.cls,
         size === 'xs'
-          ? 'text-[10px] uppercase tracking-wide px-1.5 py-0.5'
-          : 'text-[11px] px-2 py-0.5',
+          ? 'text-meta uppercase tracking-wide px-1.5 py-0.5'
+          : 'text-note px-2 py-0.5',
       )}
     >
       <Icon size={size === 'xs' ? 9 : 11} className={spin ? 'animate-spin' : undefined} />
