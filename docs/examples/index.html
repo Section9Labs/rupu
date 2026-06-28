@@ -271,6 +271,55 @@ rupu workflow run review-changed-files \
       <figcaption>One input list fans out to N concurrent reviewers; <code class="inline">steps.review_each.results</code> aggregates into a single summary.</figcaption>
     </figure>
 
+    <h2>4 · Run a fleet — one control plane, many hosts</h2>
+    <p><strong>Goal.</strong> Drive rupu running on several machines (a build box, a GPU host, a teammate's server) from a single Control Plane — launch work on a chosen host and watch every run in one browser. <span class="chip accent" style="vertical-align:middle">Multi-host · Slice 1</span></p>
+
+    <p><strong>How it works.</strong></p>
+    <ol>
+      <li><strong>On each remote machine</strong>, run the Control Plane API with a bind address and a shared token. (Put it behind TLS — <code class="inline">cp serve</code> speaks plain HTTP.)</li>
+      <li><strong>On your central machine</strong>, register each remote as a host. The built-in <code class="inline">local</code> host (this machine) is always present; you're adding peers next to it.</li>
+      <li><strong>From the central CP</strong>, the launcher gets a <strong>host selector</strong> — pick a host and launch a run, agent, or session there. Run lists gain a host column and host filtering; <strong>Fleet &rarr; Hosts</strong> shows each host's health and active runs. The central CP keeps no remote state — it live-queries each host's API and merges, and degrades gracefully if one is offline.</li>
+    </ol>
+
+    <pre class="code"><span class="c"># 1 · on each remote host — serve the CP API (bind + token), behind TLS</span>
+rupu cp serve --bind <span class="s">0.0.0.0:7878</span> --token <span class="s">"$RUPU_HOST_TOKEN"</span> --no-open
+
+<span class="c"># 2 · on the central machine — register the remotes</span>
+rupu host add gpu-box   --url <span class="s">https://gpu.internal</span>   --token <span class="s">"$RUPU_HOST_TOKEN"</span>
+rupu host add build-box --url <span class="s">https://build.internal</span> --token-stdin &lt; token.txt
+
+<span class="c"># 3 · see the fleet (local is always first and can't be removed)</span>
+rupu host list</pre>
+
+    <p><strong>Then operate from the Control Plane.</strong> Open <code class="inline">rupu cp serve</code> on the central machine, pick a host in the launcher, and launch any of the workflows above on it — for example the parallel review panel on the build box. Cross-host launch is a Control-Plane action (the host selector); see <a class="link" href="/docs/multi-host.html">Multi-host</a> for the full picture and the transport roadmap.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 220" role="img" aria-label="A central control plane federates over HTTP to local and remote hosts">
+        <defs>
+          <marker id="ar4" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box-accent" x="20" y="84" width="160" height="52" rx="10"></rect>
+        <text class="d-label" x="100" y="106" text-anchor="middle">central CP</text>
+        <text class="d-sub" x="100" y="122" text-anchor="middle">rupu cp serve</text>
+        <line class="d-edge" x1="180" y1="100" x2="430" y2="38" marker-end="url(#ar4)"></line>
+        <line class="d-edge" x1="180" y1="110" x2="430" y2="106" marker-end="url(#ar4)"></line>
+        <line class="d-edge" x1="180" y1="120" x2="430" y2="174" marker-end="url(#ar4)"></line>
+        <text class="d-sub" x="300" y="58" text-anchor="middle">HTTP</text>
+        <rect class="d-box" x="430" y="14" width="200" height="48" rx="10"></rect>
+        <text class="d-label" x="530" y="34" text-anchor="middle">host[0] · local</text>
+        <text class="d-sub" x="530" y="50" text-anchor="middle">this machine</text>
+        <rect class="d-box" x="430" y="82" width="200" height="48" rx="10"></rect>
+        <text class="d-label" x="530" y="102" text-anchor="middle">gpu-box</text>
+        <text class="d-sub" x="530" y="118" text-anchor="middle">rupu cp serve</text>
+        <rect class="d-box" x="430" y="150" width="200" height="48" rx="10"></rect>
+        <text class="d-label" x="530" y="170" text-anchor="middle">build-box</text>
+        <text class="d-sub" x="530" y="186" text-anchor="middle">rupu cp serve</text>
+      </svg>
+      <figcaption>One central control plane live-queries local + remote hosts over HTTP; launch and observe across the fleet from one browser.</figcaption>
+    </figure>
+
     <!-- ───────────────────────── Make your own ───────────────────────── -->
     <h2>Make your own</h2>
     <p>These three shapes — a parallel panel, a sequential hand-off, and a <code class="inline">for_each</code> fan-out — cover most real pipelines. To build your own, define the specialists you need as <a class="link" href="/docs/agents.html">Agents</a>, then wire them together with steps, panels, <code class="inline">for_each</code>, and <code class="inline">&#123;&#123; steps.&lt;id&gt;.output &#125;&#125;</code> data flow as described in <a class="link" href="/docs/workflows.html">Workflows</a>. Copy one of the bundled YAML files from <code class="inline">.rupu/workflows/</code> and edit from there.</p>
