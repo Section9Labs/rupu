@@ -190,6 +190,7 @@ impl HostConnector for LocalHostConnector {
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
         let mode_opt = if mode.is_empty() { None } else { Some(mode) };
         let now = chrono::Utc::now();
+        // TODO(task-5): replace hardcoded "connector" actor with identity from AppState
         self.run_store
             .request_resume_approval(run_id, "connector", mode_opt, now)
             .map(|_| ())
@@ -231,96 +232,12 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
 
         let stream = source.map(|ev| {
-            let json = serde_json::to_string(&ev).unwrap_or_default();
+            let json = serde_json::to_string(&ev)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let frame = format!("data: {json}\n\n");
             Ok::<Bytes, std::io::Error>(Bytes::from(frame.into_bytes()))
         });
 
         Ok(Box::pin(stream))
-    }
-}
-
-// ── Tests (unit) ──────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rupu_orchestrator::runs::RunStatus;
-    use std::collections::BTreeMap;
-
-    fn make_record(id: &str) -> rupu_orchestrator::RunRecord {
-        rupu_orchestrator::RunRecord {
-            id: id.into(),
-            workflow_name: "wf".into(),
-            status: RunStatus::Completed,
-            inputs: BTreeMap::new(),
-            event: None,
-            workspace_id: "ws1".into(),
-            workspace_path: std::path::PathBuf::from("/tmp/proj"),
-            transcript_dir: std::path::PathBuf::from("/tmp/proj/.rupu/transcripts"),
-            started_at: chrono::Utc::now(),
-            finished_at: None,
-            error_message: None,
-            awaiting_step_id: None,
-            approval_prompt: None,
-            awaiting_since: None,
-            expires_at: None,
-            resume_requested_at: None,
-            resume_claimed_at: None,
-            resume_claimed_by: None,
-            resume_mode: None,
-            issue_ref: None,
-            issue: None,
-            parent_run_id: None,
-            backend_id: None,
-            worker_id: None,
-            artifact_manifest_path: None,
-            runner_pid: None,
-            source_wake_id: None,
-            active_step_id: None,
-            active_step_kind: None,
-            active_step_agent: None,
-            active_step_transcript_path: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn info_is_always_reachable() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
-        let c = LocalHostConnector::new(None, None, None, None, store, tmp.path().into());
-        let info = c.info().await.unwrap();
-        assert!(info.reachable);
-        assert!(info.version.is_some());
-    }
-
-    #[tokio::test]
-    async fn get_run_not_found_returns_error() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
-        let c = LocalHostConnector::new(None, None, None, None, store, tmp.path().into());
-        let err = c.get_run("missing").await.unwrap_err();
-        assert!(matches!(err, HostConnectorError::NotFound(_)));
-    }
-
-    #[tokio::test]
-    async fn list_runs_returns_seeded_record() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
-        store
-            .create(make_record("r1"), "name: wf\nsteps: []\n")
-            .unwrap();
-        let c = LocalHostConnector::new(None, None, None, None, store, tmp.path().into());
-        let rows = c
-            .list_runs(RunListQuery {
-                kind: RunKind::All,
-                offset: 0,
-                limit: 10,
-                lifecycle: None,
-            })
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["id"], serde_json::json!("r1"));
     }
 }

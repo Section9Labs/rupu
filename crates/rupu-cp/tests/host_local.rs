@@ -182,7 +182,7 @@ async fn local_connector_info_is_reachable_with_version() {
     let info = connector.info().await.expect("info should succeed");
     assert!(info.reachable, "local connector should always be reachable");
     assert!(
-        info.version.as_deref().map_or(false, |v| !v.is_empty()),
+        info.version.as_deref().is_some_and(|v| !v.is_empty()),
         "version should be a non-empty string"
     );
 }
