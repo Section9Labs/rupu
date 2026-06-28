@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Multi-host</title>
+<meta name="description" content="Control rupu agents and workflows running on other machines from one central Control Plane. Slice 1 federates over HTTP to remote hosts running rupu cp serve.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item active" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Multi-host</h1>
+    <p class="intro">Control rupu agents and workflows running on <em>other machines</em> from one central Control Plane — register remote hosts, launch work on the host you choose, and watch it stream back, all in a single browser tab.</p>
+
+    <h2>What it is</h2>
+    <p>
+      Multi-host is a <strong>hub model</strong>. One central Control Plane
+      federates out to a fleet of <strong>remote hosts</strong>, each running its
+      own <a class="link" href="/docs/control-plane.html">control plane</a>
+      (<code class="inline">rupu cp serve</code>). A <strong>Host</strong> is a
+      top-level peer in rupu — it sits alongside your Projects, not underneath
+      them. The machine the central CP runs on is itself just a host:
+      <strong>host[0], "this host"</strong>, always present and always first.
+    </p>
+    <p>
+      The state model is <strong>proxy / live-query</strong>. The central CP
+      stores <strong>no remote run state</strong> of its own — there is no central
+      database mirroring the fleet. Instead it acts as a <strong>client of each
+      host's HTTP API</strong>: when you open a run list, it fans out to every
+      host on demand, tags each row with the host it came from, and merges the
+      results. Open a remote run's detail, event stream, or transcript and the
+      central CP proxies straight through to the host that owns it. The remote is
+      always the source of truth.
+    </p>
+    <div class="callout">
+      <strong>No new inbound surface.</strong> The central CP is purely a
+      <em>client</em> this slice — it adds no new way in. Each remote host's API
+      is already token-gated by its own <code class="inline">rupu cp serve</code>,
+      and that token is what the center authenticates with.
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 680 320" role="img" aria-label="A central control plane connected over HTTP to host[0] (local), host A, and host B, each running rupu cp serve.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <!-- hub -->
+        <rect class="d-box-accent" x="255" y="40" width="170" height="60" rx="12"></rect>
+        <text class="d-label" x="340" y="66" text-anchor="middle">central control plane</text>
+        <text class="d-sub" x="340" y="84" text-anchor="middle">the hub / client</text>
+
+        <!-- hosts -->
+        <rect class="d-box" x="30" y="230" width="180" height="56" rx="10"></rect>
+        <text class="d-label" x="120" y="253" text-anchor="middle">host[0] (local)</text>
+        <text class="d-sub" x="120" y="271" text-anchor="middle">rupu cp serve</text>
+        <line class="d-edge" x1="290" y1="102" x2="150" y2="226" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="250" y="230" width="180" height="56" rx="10"></rect>
+        <text class="d-label" x="340" y="253" text-anchor="middle">host A</text>
+        <text class="d-sub" x="340" y="271" text-anchor="middle">rupu cp serve</text>
+        <line class="d-edge" x1="340" y1="102" x2="340" y2="226" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="470" y="230" width="180" height="56" rx="10"></rect>
+        <text class="d-label" x="560" y="253" text-anchor="middle">host B</text>
+        <text class="d-sub" x="560" y="271" text-anchor="middle">rupu cp serve</text>
+        <line class="d-edge" x1="390" y1="102" x2="530" y2="226" marker-end="url(#ar)"></line>
+
+        <text class="d-sub" x="205" y="160" text-anchor="middle">HTTP</text>
+        <text class="d-sub" x="356" y="160" text-anchor="middle">HTTP</text>
+        <text class="d-sub" x="475" y="160" text-anchor="middle">HTTP</text>
+      </svg>
+      <figcaption>One central control plane, federating over HTTP to each host's own <code class="inline">rupu cp serve</code>.</figcaption>
+    </figure>
+
+    <h2>Set up a remote host</h2>
+    <p>
+      Federation has two sides. On the <strong>remote machine</strong>, run the
+      control plane so it's reachable from the center and guarded by a bearer
+      token. Bind to an address other than loopback so the central CP can reach
+      it, and set <code class="inline">--token</code> so <code class="inline">/api/*</code>
+      requires <code class="inline">Authorization: Bearer &lt;token&gt;</code>.
+    </p>
+    <pre class="code"><span class="c"># on the REMOTE machine — serve the control plane, bound + token-guarded</span>
+$ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class="s">0.0.0.0:7878</span> <span class="v">--token</span> <span class="s">"$RUPU_CP_TOKEN"</span> <span class="v">--no-open</span></pre>
+    <p>
+      Put a TLS-terminating reverse proxy in front for a real
+      <code class="inline">https://</code> URL — remote base URLs are expected to
+      be HTTPS so the token is protected in transit.
+    </p>
+    <p>
+      Then, on the <strong>central machine</strong>, register that host with
+      <code class="inline">rupu host add</code>. Pass a display name, the
+      remote's base <code class="inline">--url</code>, and the
+      <code class="inline">--token</code>:
+    </p>
+    <pre class="code"><span class="c"># on the CENTRAL machine — register the remote host</span>
+$ rupu host <span class="k">add</span> <span class="s">prod</span> <span class="v">--url</span> <span class="s">https://host.example.com</span> <span class="v">--token</span> <span class="s">"$REMOTE_TOKEN"</span>
+host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
+    <p>
+      To keep the token out of your shell history and process list, read it from
+      stdin instead with <code class="inline">--token-stdin</code>:
+    </p>
+    <pre class="code"><span class="c"># pipe the token in on stdin (mutually exclusive with --token)</span>
+$ pass show rupu/prod | rupu host <span class="k">add</span> <span class="s">prod</span> <span class="v">--url</span> <span class="s">https://host.example.com</span> <span class="v">--token-stdin</span></pre>
+    <div class="callout">
+      <strong>Where it lives.</strong> Each host persists as a TOML record under
+      <code class="inline">~/.rupu/hosts/&lt;id&gt;.toml</code> holding only its name
+      and transport (the base URL) — never the token. The bearer token is stored
+      in the <strong>system keychain</strong>, referenced by host id. Adding a
+      host is privileged: the central CP can now drive that machine.
+    </div>
+
+    <h2>Manage hosts</h2>
+    <p>
+      <code class="inline">rupu host list</code> shows every configured host. The
+      built-in <code class="inline">local</code> host is <strong>always first and
+      can't be removed</strong> — it's host[0], "this host." Each row is the host
+      id, name, and transport (the base URL, or <code class="inline">local</code>):
+    </p>
+    <pre class="code">$ rupu host <span class="k">list</span>
+local                              local   local
+host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8   prod    https://host.example.com</pre>
+    <p>
+      Remove a remote host by its id with <code class="inline">rupu host
+      remove</code>. This deletes the TOML record and its keychain token;
+      removing <code class="inline">local</code> is refused.
+    </p>
+    <pre class="code">$ rupu host <span class="k">remove</span> <span class="s">host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</span>
+removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
+    <p>
+      The same registry is exposed in the browser — adding and removing hosts in
+      the Control Plane writes the exact same TOML records and keychain entries,
+      so the CLI and the CP are always looking at one shared fleet.
+    </p>
+
+    <h2>In the Control Plane</h2>
+    <p>
+      With hosts registered, the central
+      <a class="link" href="/docs/control-plane.html">Control plane</a> becomes
+      fleet-aware. Everything you can do on the local host you can now do on a
+      remote one — over its HTTP API.
+    </p>
+    <ul>
+      <li>
+        <strong>Fleet &#8594; Hosts.</strong> A new top-level surface listing every
+        host (name, transport, status, version, active runs, last seen), with
+        <code class="inline">local</code> pinned first and an <strong>Add Host</strong>
+        form. Each host's status is probed live; a host's detail view scopes the
+        run list to that one host plus its connection and health info.
+      </li>
+      <li>
+        <strong>Host attribution + filtering.</strong> Run lists gain a
+        <strong>Host column and filter</strong> so you can see at a glance where
+        each run is executing. Runs are addressed by
+        <code class="inline">(host_id, run_id)</code>, so deep-links stay stable;
+        run detail shows the owning host. The default view stays "this host," so
+        single-host setups are completely unchanged.
+      </li>
+      <li>
+        <strong>Host selector in the launcher.</strong> The launcher gains a
+        host picker (defaulting to local). Launch a <strong>workflow run</strong>,
+        an <strong>agent run</strong>, or a <strong>session</strong> on whichever
+        host you choose — and send session turns to it — all proxied to that
+        host's launch endpoints.
+      </li>
+      <li>
+        <strong>Observe a host's runs.</strong> List, detail, the live event
+        stream, and the transcript of any remote run all proxy straight through
+        to the owning host's API. The same live SSE view works whether the run is
+        local or three hosts away.
+      </li>
+      <li>
+        <strong>Control remote runs.</strong> Approve, reject, and cancel a
+        paused or in-flight run on the host that owns it — again, proxied over
+        its HTTP API.
+      </li>
+      <li>
+        <strong>Graceful degradation.</strong> When a host is unreachable, the
+        run-list fan-out tolerates it per-host: that host shows an offline marker
+        and the rest of the page stays intact. Launch or control against an
+        offline host returns a clear error, and live streams auto-reconnect.
+      </li>
+    </ul>
+    <div class="callout">
+      <strong>Federation needs the full runtime.</strong> Driving remote hosts
+      requires the central side to run the full <code class="inline">rupu cp
+      serve</code> runtime — that's what installs the host registry with its HTTP
+      connectors. The read-only <code class="inline">rupu cp</code> can show hosts
+      but cannot control them.
+    </div>
+
+    <h2>What's in Slice 1 vs the roadmap</h2>
+    <p>
+      Be clear about the boundary. <strong>Slice 1 is HTTP federation only</strong>:
+      registering and health-checking hosts that run
+      <code class="inline">rupu cp serve</code>, then launching, observing, and
+      controlling their runs over that already-existing HTTP API, with a Fleet
+      surface, host attribution, and graceful degradation. That's everything
+      above — and it's all that ships today.
+    </p>
+    <p>
+      The architecture was built around one transport port
+      (<code class="inline">HostConnector</code>) so each item below slots in as a
+      new implementation without disturbing the surfaces above. These are
+      <strong>coming in later slices, not shipped</strong>:
+    </p>
+    <table>
+      <thead>
+        <tr><th>Coming later</th><th>What it adds</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>More transports</td>
+          <td>A node-agent dial-home <strong>tunnel</strong> (WebSocket + mTLS) and a <strong>pull</strong> dead-drop (S3 bucket), beyond today's HTTP — for hosts that can't expose an inbound port.</td>
+        </tr>
+        <tr>
+          <td>Distributed workflow steps</td>
+          <td>Workflow steps that <strong>target a host or host-set</strong>, with <strong>cross-host fan-out</strong> and per-host result aggregation.</td>
+        </tr>
+        <tr>
+          <td>Mirror / sync</td>
+          <td>Optional central mirroring of remote state for <strong>offline history</strong>, on top of today's pure live-query model.</td>
+        </tr>
+        <tr>
+          <td>Auto-placement</td>
+          <td><strong>Capability-based scheduling</strong> — picking the host for a run automatically from its advertised backends and capabilities.</td>
+        </tr>
+        <tr>
+          <td>Hardening</td>
+          <td><strong>mTLS, enrollment, and SSH-key</strong> security hardening for the fleet, plus heartbeat-based health at scale.</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      None of the row above is available yet — Slice 1 is the HTTP-federation
+      foundation those later slices build on.
+    </p>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/control-plane.html">&#8592; Control plane</a>
+      <a href="/docs/coverage.html">Coverage &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

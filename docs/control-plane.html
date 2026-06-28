@@ -30,6 +30,7 @@
     <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
     <a class="item" href="/docs/triggers.html">Triggers</a>
     <a class="item active" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
     <a class="item" href="/docs/coverage.html">Coverage</a>
     <div class="grp">More</div>
     <a class="item" href="/docs/examples/">Examples</a>
@@ -214,21 +215,21 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       ever save.
     </p>
 
-    <h2>Multi-host (coming)</h2>
+    <h2>Multi-host</h2>
     <p>
-      Today the control plane is <strong>single-host</strong>: it observes and
-      drives the rupu instance on the machine it runs on. The data shapes it
-      reads — portable run, worker, and event records — were chosen so one
-      control plane can eventually observe and drive <em>multiple</em> rupu hosts
-      from a single browser, alongside multi-user sessions and roles. That
-      multi-host, remote story is a later phase and is <strong>not shipped
-      yet</strong>; the single-host surface above is what's available now.
+      One control plane can drive rupu running on <strong>other machines</strong>,
+      not just the one it's on. Register a remote host (any machine running
+      <code class="inline">rupu cp serve</code>) and the central CP federates to it
+      over HTTP — launch runs, agents, and sessions on a chosen host, observe and
+      control them, all from one browser, with a <strong>Fleet &rarr; Hosts</strong>
+      surface and host filtering on run lists. See <a class="link" href="/docs/multi-host.html">Multi-host</a>
+      for setup and the transport roadmap.
     </p>
 
     <!-- prev / next footer nav -->
     <div class="doc-nav">
       <a href="/docs/triggers.html">&#8592; Triggers</a>
-      <a href="/docs/coverage.html">Coverage &#8594;</a>
+      <a href="/docs/multi-host.html">Multi-host &#8594;</a>
     </div>
   </main>
 </div>
