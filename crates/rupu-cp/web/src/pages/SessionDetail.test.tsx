@@ -146,6 +146,18 @@ describe('SessionDetail host-aware', () => {
     );
   });
 
+  it('with ?host=h1 calls getSessionUsageTimeline with {host:"h1"}', async () => {
+    vi.spyOn(api, 'getSession').mockResolvedValue(ACTIVE_SESSION);
+    const timelineSpy = vi.spyOn(api, 'getSessionUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getSessionRuns').mockResolvedValue([]);
+
+    renderPage('?host=h1');
+
+    await waitFor(() =>
+      expect(timelineSpy).toHaveBeenCalledWith('sess-1', { host: 'h1' }),
+    );
+  });
+
   it('shows "on h1" chip in the header when ?host=h1', async () => {
     stubApi(ACTIVE_SESSION);
 

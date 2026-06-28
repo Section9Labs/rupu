@@ -63,7 +63,7 @@ export default function SessionDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, host]);
 
   // Aggregated per-turn usage timeline for the Details disclosure chart.
   useEffect(() => {
@@ -83,7 +83,7 @@ export default function SessionDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, host]);
 
   // Fetch the session's turn-runs (the conversation).
   const loadRuns = () => {
@@ -118,7 +118,7 @@ export default function SessionDetailPage() {
     const t = window.setInterval(loadRuns, pollInterval);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, pollInterval]);
+  }, [id, pollInterval, host]);
 
   const handleSend = () => {
     const text = prompt.trim();
