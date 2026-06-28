@@ -89,7 +89,8 @@ export default function LauncherSheet({
         working_dir: target.resolved.working_dir,
         host: host !== 'local' ? host : undefined,
       });
-      navigate(`/runs/${res.run_id}`);
+      const hostParam = host !== 'local' ? `?host=${encodeURIComponent(host)}` : '';
+      navigate(`/runs/${res.run_id}${hostParam}`);
       onClose();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to launch run');

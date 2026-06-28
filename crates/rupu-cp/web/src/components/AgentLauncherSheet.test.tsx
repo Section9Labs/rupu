@@ -54,6 +54,7 @@ describe('buildAgentLaunch', () => {
 // ---------------------------------------------------------------------------
 
 function stubTargetPickerDeps() {
+  vi.spyOn(api, 'getHosts').mockResolvedValue([]);
   vi.spyOn(api, 'getRepos').mockResolvedValue([]);
   vi.spyOn(api, 'getProjects').mockResolvedValue([]);
   vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/', parent: null, dirs: [] });
@@ -115,6 +116,62 @@ describe('AgentLauncherSheet toggle', () => {
     const calledMode = (sessionSpy.mock.calls[0][1] as { mode: string }).mode;
     expect(calledMode).not.toBe('ask');
     expect(calledMode).toBe('bypass');
+  });
+
+  it('remote host run: passes host to launchAgent and carries ?host= in navigate', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([
+      { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
+      { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
+    ]);
+    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/', parent: null, dirs: [] });
+    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-remote' });
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+
+    // Wait for HostSelect to populate then pick the remote host.
+    await waitFor(() => expect(screen.getByRole('option', { name: 'host_x' })).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'host_x' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    await waitFor(() =>
+      expect(launchSpy).toHaveBeenCalledWith('triage', expect.objectContaining({ host: 'host_x' })),
+    );
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/runs/run-remote?host=host_x'));
+  });
+
+  it('local run: navigate URL has no ?host= query string', async () => {
+    stubTargetPickerDeps();
+    vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-local' });
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/runs/run-local'));
+  });
+
+  it('session branch navigate is unchanged (no ?host=) even when a remote host is selected', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([
+      { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
+      { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
+    ]);
+    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/', parent: null, dirs: [] });
+    vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-remote' });
+
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+
+    // Switch to Session, pick remote host.
+    fireEvent.click(screen.getByRole('button', { name: 'Session' }));
+    await waitFor(() => expect(screen.getByRole('option', { name: 'host_x' })).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'host_x' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start session' }));
+
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/sessions/ses-remote'));
   });
 
   it('shows the session hint only in session mode', () => {

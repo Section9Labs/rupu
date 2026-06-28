@@ -73,7 +73,8 @@ export default function AgentLauncherSheet({
         navigate(`/sessions/${res.session_id}`);
       } else {
         const res = await api.launchAgent(agent, opts);
-        navigate(`/runs/${res.run_id}`);
+        const hostParam = host !== 'local' ? `?host=${encodeURIComponent(host)}` : '';
+        navigate(`/runs/${res.run_id}${hostParam}`);
       }
       onClose();
     } catch (e: unknown) {
