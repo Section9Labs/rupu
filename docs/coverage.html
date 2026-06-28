@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Coverage</title>
+<meta name="description" content="The agentic coverage harness: a persistent, accumulating record of what an agent examined, for which concerns, and what it concluded.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item active" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Coverage</h1>
+    <p class="intro">The agentic coverage harness turns &ldquo;review this repo for X&rdquo; from an unauditable one-shot into a persistent, accumulating, comparable record of what an agent examined, for which concerns, and what it concluded.</p>
+
+    <h2>What coverage is</h2>
+    <p>When a model performs a <strong>survey task</strong> &mdash; &ldquo;review this repo for vulnerabilities&rdquo;, &ldquo;find every place we touch the database&rdquo;, &ldquo;audit for accessibility&rdquo; &mdash; findings vary run-to-run, and you can&rsquo;t tell <em>&ldquo;no issues found&rdquo;</em> apart from <em>&ldquo;the model never looked.&rdquo;</em> The coverage harness fixes that by making coverage explicit and durable:</p>
+    <ul>
+      <li><strong>Coverage is explicit.</strong> For every <code class="inline">(file &times; concern)</code> the agent assesses, it records a verdict &mdash; <code class="inline">clean</code> / <code class="inline">finding</code> / <code class="inline">examined</code> / <code class="inline">not_applicable</code> &mdash; with evidence. File reads, greps, and edits are tracked automatically.</li>
+      <li><strong>Runs accumulate.</strong> A second pass (same model or a different one) picks up where the first left off; cross-model verdicts are attributed and merge-able.</li>
+      <li><strong>Industry-anchored catalogs.</strong> Ship OWASP Top 10, CWE Top 25, the full CWE weakness list, STRIDE, secrets, and more; include or extend them.</li>
+      <li><strong>Surface-uniform.</strong> Works the same whether the agent loop is driven by <code class="inline">rupu run</code>, a workflow, an autoflow cycle, or an interactive session.</li>
+    </ul>
+    <p>On top of that foundation, the harness also lets you <strong>measure and reproduce</strong> variance: diff two runs, and replay a run to compare it against the original.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 220" role="img" aria-label="Targets and concerns produce per-cell assertions that accumulate into a ledger and an audit summary">
+        <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path></marker></defs>
+
+        <rect class="d-box" x="20" y="24" width="150" height="48" rx="10"></rect>
+        <text class="d-label" x="95" y="46" text-anchor="middle">targets</text>
+        <text class="d-sub" x="95" y="62" text-anchor="middle">workspace &times; scope</text>
+
+        <rect class="d-box" x="20" y="148" width="150" height="48" rx="10"></rect>
+        <text class="d-label" x="95" y="170" text-anchor="middle">concerns</text>
+        <text class="d-sub" x="95" y="186" text-anchor="middle">catalog</text>
+
+        <line class="d-edge" x1="170" y1="48" x2="243" y2="98" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="170" y1="172" x2="243" y2="122" marker-end="url(#ar)"></line>
+
+        <rect class="d-box-accent" x="245" y="86" width="160" height="48" rx="10"></rect>
+        <text class="d-label" x="325" y="108" text-anchor="middle">assertions</text>
+        <text class="d-sub" x="325" y="124" text-anchor="middle">(file &times; concern) &rarr; verdict</text>
+
+        <line class="d-edge" x1="405" y1="110" x2="448" y2="110" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="450" y="86" width="170" height="48" rx="10"></rect>
+        <text class="d-label" x="535" y="108" text-anchor="middle">ledger &amp; audit</text>
+        <text class="d-sub" x="535" y="124" text-anchor="middle">coverage / gaps / findings</text>
+      </svg>
+      <figcaption>Targets and concerns produce per-cell assertions that accumulate into an append-only ledger and a pass / gap audit.</figcaption>
+    </figure>
+
+    <h2>The model</h2>
+    <p>Coverage data for a <strong>target</strong> lives under <code class="inline">&lt;workspace&gt;/.rupu/coverage/&lt;target_id&gt;/</code> as append-only JSONL plus a catalog snapshot. The <code class="inline">&lt;target_id&gt;</code> is derived deterministically from <code class="inline">(workspace, scope_name)</code>, so the same agent against the same repo accumulates into one target across runs, while different workspaces stay distinct.</p>
+    <table>
+      <thead><tr><th>Entity</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Target</strong></td><td>The unit of accumulation &mdash; one per <code>(workspace, scope_name)</code>. Runs against the same target merge into one record.</td></tr>
+        <tr><td><strong>Concern</strong></td><td>A single criterion the agent assesses against (e.g. an OWASP or CWE entry), drawn from the effective catalog.</td></tr>
+        <tr><td><strong>Assertion</strong></td><td>A <code>(concern, file)</code> verdict with evidence: <code>clean</code>, <code>finding</code>, <code>examined</code>, or <code>not_applicable</code>.</td></tr>
+        <tr><td><strong>Finding</strong></td><td>A reported issue, with severity, location, and remediation.</td></tr>
+        <tr><td><strong>Ledger</strong></td><td>The append-only JSONL files that make up a target&rsquo;s record (below). Every row carries <code>run_id</code> + <code>model</code> + <code>surface</code> attribution.</td></tr>
+      </tbody>
+    </table>
+    <p>The ledger files under each target directory:</p>
+    <table>
+      <thead><tr><th>File</th><th>Contents</th></tr></thead>
+      <tbody>
+        <tr><td><code>files.jsonl</code></td><td>every file touch (read / grep / glob / edit / cmd), with attribution</td></tr>
+        <tr><td><code>concerns.jsonl</code></td><td>every <code>(concern, file) &rarr; verdict</code> assertion</td></tr>
+        <tr><td><code>findings.jsonl</code></td><td>every reported issue</td></tr>
+        <tr><td><code>catalog.yaml</code></td><td>the effective concern catalog, snapshotted at run start</td></tr>
+        <tr><td><code>runs.jsonl</code></td><td>one manifest per run (its defining inputs, for replay)</td></tr>
+      </tbody>
+    </table>
+    <p>That per-row <code class="inline">run_id</code> + <code class="inline">model</code> + <code class="inline">surface</code> attribution is what makes cross-run and cross-model analysis possible.</p>
+
+    <h2>Declaring coverage</h2>
+    <p>An agent activates the harness by declaring a <code class="inline">concerns:</code> block in its frontmatter. The block is a list of catalog includes (with optional overrides, filters, and render mode). When present, the runtime flattens the catalog, snapshots it, injects the catalog into the system prompt, and registers the coverage tools.</p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">security-assessor</span>
+<span class="k">permissionMode</span>: <span class="s">readonly</span>
+<span class="k">concerns</span>:
+  - <span class="k">include</span>: <span class="s">owasp-top10-2021</span>
+    <span class="k">mode</span>: <span class="v">full</span>
+  - <span class="k">include</span>: <span class="s">cwe-top25-2023</span>
+    <span class="k">mode</span>: <span class="v">full</span>
+  - <span class="k">include</span>: <span class="s">secrets-in-source</span>
+    <span class="k">mode</span>: <span class="v">full</span>
+  - <span class="k">include</span>: <span class="s">stride</span>
+    <span class="k">mode</span>: <span class="v">full</span>
+  - <span class="k">include</span>: <span class="s">cwe-software-development</span>   <span class="c"># ~399 CWEs</span>
+    <span class="k">mode</span>: <span class="v">index</span>                          <span class="c"># one-line table, searched on demand</span>
+<span class="c">---</span>
+<span class="c">You are a security assessor. For each (file × concern) you assess, call</span>
+<span class="c">coverage_mark; for each issue, call report_finding…</span></pre>
+    <p><strong>Render modes.</strong> <code class="inline">full</code> inlines each concern&rsquo;s body into the prompt; <code class="inline">index</code> renders a compact one-line-per-concern table that the agent searches on demand (use it for large catalogs like the full CWE list so the prompt stays small); <code class="inline">auto</code> (default) picks based on catalog size.</p>
+
+    <h3>Bundled catalogs</h3>
+    <p><code class="inline">rupu coverage templates list</code> prints them all:</p>
+    <pre class="code">owasp-top10-2021        owasp-api-top10-2023
+cwe-top25-2023          cwe-software-development   cwe-research
+stride                  secrets-in-source          code-smells
+web-security-default    api-security-default</pre>
+    <p>User catalogs may live in <code class="inline">.rupu/concerns/</code> (project) or <code class="inline">~/.rupu/concerns/</code> (global) and are discovered by name; project overrides global overrides builtin.</p>
+
+    <h3>Coverage tools the agent gets</h3>
+    <p>When <code class="inline">concerns:</code> is set, these tools are injected automatically &mdash; you do <strong>not</strong> list them in the agent&rsquo;s <code class="inline">tools:</code>:</p>
+    <table>
+      <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>coverage_mark</code></td><td>record a <code>(concern, file)</code> verdict + evidence</td></tr>
+        <tr><td><code>report_finding</code></td><td>record an issue (severity, location, remediation)</td></tr>
+        <tr><td><code>coverage_remaining</code></td><td>list in-scope files still lacking an assertion</td></tr>
+        <tr><td><code>coverage_status</code></td><td>summary of assessed-vs-gap progress</td></tr>
+        <tr><td><code>coverage_concerns_search</code> / <code>coverage_concerns_detail</code></td><td>search / fetch full bodies for index-mode catalogs</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Running &amp; auditing</h2>
+    <p>All inspection commands take the global <code class="inline">--format table|json|csv</code> flag (<code class="inline">table</code> is the default; structured commands support <code class="inline">table</code>/<code class="inline">json</code>, tabular ones also <code class="inline">csv</code>).</p>
+    <pre class="code"><span class="k">rupu coverage list</span>                          <span class="c">List targets under .rupu/coverage/</span>
+<span class="k">rupu coverage templates</span> {list, show}        <span class="c">List bundled catalogs / print one's concerns</span>
+<span class="k">rupu coverage catalog</span> &lt;target&gt;              <span class="c">Print the effective catalog snapshot</span>
+<span class="k">rupu coverage show</span> &lt;target&gt;                 <span class="c">Derived view: files touched + assertions + findings</span>
+<span class="k">rupu coverage audit</span> &lt;target&gt;                <span class="c">Full report: per-concern coverage, gaps, cross-model, findings</span>
+<span class="k">rupu coverage gap</span> &lt;target&gt;                  <span class="c">Just the gaps (in-scope files lacking an assertion)</span>
+<span class="k">rupu coverage runs</span> &lt;target&gt;                 <span class="c">List the runs recorded against a target</span>
+<span class="k">rupu coverage diff</span> &lt;target&gt; [base compare]  <span class="c">What changed between two runs (defaults: previous latest)</span>
+<span class="k">rupu coverage rerun</span> &lt;target&gt; &lt;run_id&gt;       <span class="c">Replay an agent run, appending a new run to the same target</span></pre>
+    <p>Find a target id with <code class="inline">rupu coverage list</code>, then inspect:</p>
+    <pre class="code"><span class="k">rupu coverage audit</span> <span class="v">a1b2c3d4e5f6</span>          <span class="c"># human report</span>
+<span class="k">rupu</span> --format json <span class="k">coverage audit</span> <span class="v">a1b2c3d4e5f6</span>   <span class="c"># machine-readable</span>
+<span class="k">rupu</span> --format csv  <span class="k">coverage runs</span>  <span class="v">a1b2c3d4e5f6</span></pre>
+    <p><code class="inline">audit</code> surfaces per-concern coverage, gaps, cross-model attribution, and serendipitous findings; the underlying findings and verdicts come straight from the target&rsquo;s ledger. Because coverage is surface-uniform, runs dispatched through the control plane accumulate into the same target and show up in the same audit.</p>
+
+    <h3>The rerun &rarr; diff loop</h3>
+    <p>Model output varies run-to-run &mdash; sometimes usefully (different angles surface different bugs), but you could never evaluate <em>the combination</em> for completeness. Now you can:</p>
+    <pre class="code"><span class="k">rupu run</span> <span class="s">security-assessor</span> <span class="s">"assess this repo"</span>   <span class="c"># run 1</span>
+<span class="k">rupu coverage runs</span> &lt;target&gt;                      <span class="c"># grab run 1's id</span>
+<span class="k">rupu coverage rerun</span> &lt;target&gt; &lt;run_id&gt;            <span class="c"># replay it → run 2, same target</span>
+<span class="k">rupu coverage diff</span> &lt;target&gt; &lt;run_id&gt; latest      <span class="c"># what did run 2 do differently?</span></pre>
+    <p><code class="inline">diff</code> reports four dimensions: <strong>cell-coverage delta</strong> (newly / no-longer asserted), <strong>verdict flips</strong> (with <code class="inline">clean &rarr; finding</code> flagged), <strong>findings appeared / disappeared</strong>, and <strong>file-touch delta</strong>.</p>
+    <div class="callout"><strong>Note.</strong> v1 <code class="inline">rerun</code> dispatch covers the <strong>agent</strong> surface; session / workflow / autoflow runs are captured but <code class="inline">rerun</code> returns an explicit &ldquo;not yet supported&rdquo; error. A replay re-resolves provider / model / concerns from the agent&rsquo;s current frontmatter (it goes through <code class="inline">rupu run</code>), so those manifest fields are a record of the original run, not replay inputs.</div>
+
+    <h3>Determinism</h3>
+    <p>Everything the harness controls about what the model sees &mdash; concern ordering, the catalog snapshot, and the live file list &mdash; is byte-stable and independent of the order catalog inputs are declared in. That makes the model the <em>only</em> source of run-to-run variance, which is exactly what <code class="inline">diff</code> measures. The harness does <strong>not</strong> claim byte-identical model output: prompt <em>construction</em> is deterministic; sampling is not.</p>
+
+    <div class="doc-nav">
+      <a href="/docs/control-plane.html">&#8592; Control plane</a>
+      <a href="/docs/examples/">Examples &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

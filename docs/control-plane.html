@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Control plane</title>
+<meta name="description" content="The control plane is a local web app — rupu cp serve — to launch, watch, author, and review everything rupu is doing on this host, all in one browser tab.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item active" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Control plane</h1>
+    <p class="intro">A local web app for rupu — launch runs, watch them stream live, author agents and workflows, and review findings and coverage, all in one browser tab.</p>
+
+    <h2>A web command center</h2>
+    <p>
+      The control plane is rupu's window onto everything it's doing on this
+      host. One command opens a browser UI where you can <strong>observe</strong>
+      every run, session, and event as it happens; <strong>control</strong> what
+      runs and approve the steps that ask for it; and <strong>author</strong>
+      your agents and workflows — without leaving the page. It's a thin web
+      adapter over the same on-disk stores the CLI uses (your runs, agents,
+      workflows, sessions, and the coverage ledger under
+      <code class="inline">~/.rupu/</code>), so the browser and the terminal are
+      always looking at the same reality.
+    </p>
+    <p>Start it with one command:</p>
+    <pre class="code"><span class="c"># serve the control plane and open it in your browser</span>
+$ rupu cp <span class="k">serve</span></pre>
+    <p>
+      By default it binds to <code class="inline">127.0.0.1:7878</code> and opens
+      the URL in your browser when you run it interactively. Useful flags:
+      <code class="inline">--bind &lt;addr&gt;</code> to choose a different
+      address or port, <code class="inline">--token &lt;token&gt;</code> to guard
+      the API with a bearer token, and <code class="inline">--no-open</code> to
+      print the URL without launching a browser.
+    </p>
+    <pre class="code"><span class="c"># bind a custom port and require a bearer token on /api/*</span>
+$ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class="s">127.0.0.1:9000</span> <span class="v">--token</span> <span class="s">"$RUPU_CP_TOKEN"</span> <span class="v">--no-open</span></pre>
+    <div class="callout">
+      <strong>Single binary, no setup.</strong> The web UI is compiled into the
+      <code class="inline">rupu</code> binary — there's nothing to install or
+      build. <code class="inline">rupu cp serve</code> serves the embedded app and
+      reads your existing file-based stores directly; there is no database.
+    </div>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 680 300" role="img" aria-label="The control plane sits at the center, connected to runs, sessions, authoring, and findings.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <!-- hub -->
+        <rect class="d-box-accent" x="255" y="120" width="170" height="60" rx="12"></rect>
+        <text class="d-label" x="340" y="146" text-anchor="middle">control plane</text>
+        <text class="d-sub" x="340" y="164" text-anchor="middle">rupu cp serve</text>
+
+        <!-- spokes -->
+        <rect class="d-box" x="40" y="30" width="150" height="50" rx="10"></rect>
+        <text class="d-label" x="115" y="50" text-anchor="middle">runs</text>
+        <text class="d-sub" x="115" y="67" text-anchor="middle">live graph + log</text>
+        <line class="d-edge" x1="190" y1="62" x2="262" y2="124" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="490" y="30" width="150" height="50" rx="10"></rect>
+        <text class="d-label" x="565" y="50" text-anchor="middle">sessions</text>
+        <text class="d-sub" x="565" y="67" text-anchor="middle">chat turns</text>
+        <line class="d-edge" x1="490" y1="62" x2="418" y2="124" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="40" y="220" width="150" height="50" rx="10"></rect>
+        <text class="d-label" x="115" y="240" text-anchor="middle">authoring</text>
+        <text class="d-sub" x="115" y="257" text-anchor="middle">agents + workflows</text>
+        <line class="d-edge" x1="190" y1="238" x2="262" y2="176" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="490" y="220" width="150" height="50" rx="10"></rect>
+        <text class="d-label" x="565" y="240" text-anchor="middle">findings</text>
+        <text class="d-sub" x="565" y="257" text-anchor="middle">coverage ledger</text>
+        <line class="d-edge" x1="490" y1="238" x2="418" y2="176" marker-end="url(#ar)"></line>
+      </svg>
+      <figcaption>One local web app, hub for everything rupu is doing on this host.</figcaption>
+    </figure>
+
+    <h2>Observe</h2>
+    <p>
+      The observability surface is the heart of the control plane — watch
+      everything rupu is doing, live, in the browser.
+    </p>
+    <ul>
+      <li>
+        <strong>Dashboard.</strong> An at-a-glance landing page with aggregated
+        counts and charts, including multi-model token spend over time so you can
+        see what each provider is costing you.
+      </li>
+      <li>
+        <strong>Runs.</strong> A list of every run, and a live run view that
+        paints the workflow as a <strong>left&#8594;right graph</strong> with each
+        step's status updating in place, plus a streaming transcript of the
+        focused step as it works.
+      </li>
+      <li>
+        <strong>Live Events.</strong> A merged, real-time event timeline across
+        everything on the host (streamed over server-sent events).
+      </li>
+      <li>
+        <strong>Sessions.</strong> Every <a class="link" href="/docs/sessions.html">session</a>,
+        with its transcript streaming token-by-token.
+      </li>
+      <li>
+        <strong>Coverage &amp; Findings.</strong> The
+        <a class="link" href="/docs/coverage.html">coverage</a> status of each
+        project and the findings filed against it, read from the coverage ledger.
+      </li>
+    </ul>
+    <p>
+      Live updates arrive over server-sent events: a global stream for the event
+      timeline and per-run streams for each run view. Runs the control plane
+      started stream straight from the executor; runs started elsewhere (the CLI,
+      a cron trigger, an autoflow) are tailed from their on-disk event log — so
+      the same live view works no matter what kicked the run off.
+    </p>
+
+    <h2>Control</h2>
+    <p>
+      Beyond watching, the control plane drives rupu from the browser:
+    </p>
+    <ul>
+      <li>
+        <strong>Launch runs.</strong> Dispatch a workflow or an agent with a
+        target and a permission mode, straight from the UI.
+      </li>
+      <li>
+        <strong>Approve &amp; reject gated steps.</strong> When a run pauses at a
+        gate awaiting approval, approve or reject it in place. Approve marks the
+        run for resume; a background resume worker inside
+        <code class="inline">rupu cp serve</code> claims the marked run and
+        finishes the gate.
+      </li>
+      <li>
+        <strong>Drive sessions.</strong> Send a prompt to a live session and
+        watch the turn stream back as a chat.
+      </li>
+      <li>
+        <strong>Manage autoflows.</strong> See and manage your
+        <a class="link" href="/docs/autoflows.html">autoflows</a> — the
+        scheduled, trigger-driven workflows — from the same place you watch them
+        run.
+      </li>
+    </ul>
+    <div class="callout">
+      <strong>Same engine, new surface.</strong> The control plane doesn't
+      reimplement any logic — launching, approving, and sending all route through
+      the very same code the CLI uses. The browser is just another way in.
+    </div>
+
+    <h2>Author</h2>
+    <p>
+      You can edit your agents (<code class="inline">.md</code>) and workflows
+      (<code class="inline">.yaml</code>) right in the browser. Agents open in a
+      code editor; workflows open in the <strong>visual workflow editor</strong>.
+    </p>
+    <p>
+      The workflow editor is a single screen: a drag-and-drop DAG on top and the
+      live YAML below, kept in lock-step. Drag node cards from a palette onto the
+      canvas, wire steps left&#8594;right exactly like the
+      <a class="link" href="/docs/workflows.html">Runs graph</a>, and watch the
+      YAML rewrite itself underneath — or type in the YAML and watch the graph
+      reconcile as you go. <strong>YAML stays the source of truth</strong>: the
+      graph is a projection of it, and every save passes through the same
+      validation the orchestrator already applies.
+    </p>
+    <p>
+      Every expression field — a step's <code class="inline">prompt</code>,
+      <code class="inline">when</code>, or <code class="inline">for_each</code>,
+      a panel's subject — gets syntax highlighting and
+      <strong>context-aware autocomplete</strong>. Inside
+      <code class="inline">{{ &hellip; }}</code> it suggests the right vocabulary
+      for where you are: declared <code class="inline">inputs</code>, the outputs
+      of steps that run <em>before</em> this one (never a forward reference),
+      loop locals like <code class="inline">item</code> inside a
+      <code class="inline">for_each</code>, panel findings, and the available
+      filters. A searchable expression reference panel surfaces the whole
+      vocabulary and inserts at the cursor. Validity is checked live — at the
+      field, on the node, and in a header badge — so mistakes show up before you
+      ever save.
+    </p>
+
+    <h2>Multi-host (coming)</h2>
+    <p>
+      Today the control plane is <strong>single-host</strong>: it observes and
+      drives the rupu instance on the machine it runs on. The data shapes it
+      reads — portable run, worker, and event records — were chosen so one
+      control plane can eventually observe and drive <em>multiple</em> rupu hosts
+      from a single browser, alongside multi-user sessions and roles. That
+      multi-host, remote story is a later phase and is <strong>not shipped
+      yet</strong>; the single-host surface above is what's available now.
+    </p>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/triggers.html">&#8592; Triggers</a>
+      <a href="/docs/coverage.html">Coverage &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

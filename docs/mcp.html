@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — MCP &amp; tools</title>
+<meta name="description" content="rupu speaks the Model Context Protocol both ways — it exposes its own tool catalog as an MCP server and lets agents consume MCP tools as native tools.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item active" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>MCP &amp; tools</h1>
+    <p class="intro">rupu speaks the Model Context Protocol both ways — it exposes its own capabilities as an MCP server, and it lets agents consume MCP tools as if they were native.</p>
+
+    <h2>rupu speaks MCP both ways</h2>
+    <p>
+      The <strong>Model Context Protocol</strong> (<a class="link" href="https://spec.modelcontextprotocol.io/" target="_blank" rel="noopener">MCP</a>)
+      is a standard way for tools to advertise themselves to AI clients. rupu sits on both sides of that
+      contract. As a <strong>server</strong>, <code class="inline">rupu mcp serve</code> publishes rupu's unified
+      SCM and issue-tracker tool catalog over JSON-RPC so any MCP-aware client — Claude Desktop, Cursor, an
+      IDE — can call the exact tools rupu's own agents call. As a <strong>consumer</strong>, the same catalog
+      is served in-process to rupu's agent runtime, where each MCP tool is wrapped so it appears in an agent's
+      tool list alongside the built-ins. One tool catalog, one permission model, two directions.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 720 220" role="img" aria-label="rupu both consumes and serves MCP">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <!-- left: external MCP tools feeding the agent -->
+        <rect class="d-box" x="16" y="84" width="170" height="52" rx="10"></rect>
+        <text class="d-label" x="101" y="106" text-anchor="middle">MCP tool catalog</text>
+        <text class="d-sub" x="101" y="123" text-anchor="middle">scm.* · issues.*</text>
+        <line class="d-edge" x1="186" y1="110" x2="266" y2="110" marker-end="url(#ar)"></line>
+        <text class="d-sub" x="226" y="100" text-anchor="middle">consume</text>
+        <!-- center: rupu -->
+        <rect class="d-box-accent" x="266" y="60" width="188" height="100" rx="12"></rect>
+        <text class="d-label" x="360" y="100" text-anchor="middle">rupu</text>
+        <text class="d-sub" x="360" y="120" text-anchor="middle">agent runtime</text>
+        <text class="d-sub" x="360" y="136" text-anchor="middle">+ embedded MCP server</text>
+        <!-- right: serve to a client -->
+        <line class="d-edge" x1="454" y1="110" x2="534" y2="110" marker-end="url(#ar)"></line>
+        <text class="d-sub" x="494" y="100" text-anchor="middle">serve</text>
+        <rect class="d-box" x="534" y="84" width="170" height="52" rx="10"></rect>
+        <text class="d-label" x="619" y="106" text-anchor="middle">MCP client</text>
+        <text class="d-sub" x="619" y="123" text-anchor="middle">IDE · Claude Desktop</text>
+      </svg>
+      <figcaption>One catalog, two directions: rupu consumes MCP tools into its agents and serves them to outside clients.</figcaption>
+    </figure>
+
+    <h2>The built-in tools</h2>
+    <p>
+      Every rupu <a class="link" href="/docs/agents.html">agent</a> ships with six built-in tools. They are the
+      bedrock surface an agent uses to read and change a workspace; no plugins are required.
+    </p>
+    <table>
+      <thead><tr><th>Tool</th><th>What it does</th><th>Kind</th></tr></thead>
+      <tbody>
+        <tr><td><code>bash</code></td><td>Execute a shell command in the workspace cwd (controlled env; SIGTERM then SIGKILL on timeout)</td><td>write</td></tr>
+        <tr><td><code>read_file</code></td><td>Read full file contents, line-numbered</td><td>read</td></tr>
+        <tr><td><code>write_file</code></td><td>Create or overwrite a file</td><td>write</td></tr>
+        <tr><td><code>edit_file</code></td><td>Exact-match string replacement; errors if the string is not found</td><td>write</td></tr>
+        <tr><td><code>grep</code></td><td>Search across the workspace (ripgrep-backed)</td><td>read</td></tr>
+        <tr><td><code>glob</code></td><td>File-pattern matching</td><td>read</td></tr>
+      </tbody>
+    </table>
+    <p>
+      By default an agent gets all six. To narrow the surface, list names in the frontmatter
+      <code class="inline">tools:</code> field — rupu builds a registry filtered to exactly those names, so the
+      model is only ever told about the tools it is allowed to call.
+    </p>
+    <pre class="code"><span class="c"># agent frontmatter</span>
+<span class="k">tools</span>:
+  - <span class="s">read_file</span>
+  - <span class="s">grep</span>
+  - <span class="s">glob</span></pre>
+    <p>
+      The same <code class="inline">tools:</code> list doubles as the <strong>allowlist for MCP tools</strong>.
+      MCP tool names are dot-namespaced (for example <code class="inline">scm.repos.list</code>), and allowlist
+      entries match by exact name, the wildcard <code class="inline">*</code> (everything), or a
+      trailing-<code class="inline">*</code> prefix. So <code class="inline">scm.*</code> grants the whole SCM
+      namespace while leaving <code class="inline">issues.*</code> out.
+    </p>
+    <pre class="code"><span class="k">tools</span>:
+  - <span class="s">read_file</span>
+  - <span class="s">grep</span>
+  - <span class="s">"scm.*"</span>          <span class="c"># every scm.* MCP tool</span>
+  - <span class="s">issues.get</span>       <span class="c"># one exact MCP tool</span></pre>
+    <div class="callout">
+      <strong>Note.</strong> When an agent declares a <code class="inline">tools:</code> list, rupu registers only
+      the MCP tools that match it. Without the gate the model would see the full catalog advertised, pick a tool
+      it is not permitted to call, get denied, and waste turns on retries.
+    </div>
+
+    <h2>rupu as an MCP server</h2>
+    <p>
+      <code class="inline">rupu mcp serve</code> runs the embedded MCP server for an outside client. v0 ships the
+      <strong>stdio</strong> transport (the default); the client spawns <code class="inline">rupu</code> as a
+      subprocess and talks JSON-RPC over stdin/stdout. (An <code class="inline">http</code> transport is reserved
+      but not wired in v0 — selecting it returns an error.) Internally the very same server is also exposed over
+      an <strong>in-process</strong> transport, which is how rupu's own agent runtime calls the catalog without a
+      serialization round-trip.
+    </p>
+    <p>
+      The catalog it serves is rupu's unified SCM + issue surface — <code class="inline">scm.*</code> repos,
+      branches, files and pull-requests, <code class="inline">issues.*</code>, plus GitHub/GitLab extras. Each
+      tool's input schema is auto-generated and returned in the MCP <code class="inline">tools/list</code>
+      response. Authentication is shared with the rupu CLI through the OS keychain, so one
+      <code class="inline">rupu auth login</code> unlocks the catalog for both.
+    </p>
+    <pre class="code"><span class="c"># run the server directly (stdio is the default)</span>
+<span class="k">$</span> <span class="v">rupu mcp serve --transport stdio</span></pre>
+    <p>Wiring it into an MCP client — for example Claude Desktop's <code class="inline">claude_desktop_config.json</code>:</p>
+    <pre class="code"><span class="k">{</span>
+  <span class="k">"mcpServers"</span>: {
+    <span class="k">"rupu"</span>: {
+      <span class="k">"command"</span>: <span class="s">"/usr/local/bin/rupu"</span>,
+      <span class="k">"args"</span>: [<span class="s">"mcp"</span>, <span class="s">"serve"</span>, <span class="s">"--transport"</span>, <span class="s">"stdio"</span>]
+    }
+  }
+}</pre>
+    <p>
+      In server mode the permission gate runs with <strong>bypass</strong> mode and an allow-all allowlist: the
+      upstream client is expected to handle write-confirmation prompts itself, which matches the rest of the MCP
+      ecosystem. rupu does not prompt from the server side.
+    </p>
+
+    <h2>Consuming external MCP servers</h2>
+    <p>
+      On the consuming side, an <code class="inline">McpToolAdapter</code> makes each MCP tool satisfy rupu's
+      native <code class="inline">Tool</code> trait. The adapter carries the tool's name, description and input
+      schema, and forwards every <code class="inline">invoke()</code> to the shared
+      <code class="inline">ToolDispatcher</code>. From the model's point of view there is no difference between a
+      built-in like <code class="inline">grep</code> and an MCP-backed tool like
+      <code class="inline">scm.prs.create</code> — both appear in the same tool list.
+    </p>
+    <p>
+      When a run starts with an SCM registry available, rupu spins up the embedded MCP server over the in-process
+      transport, then walks the tool catalog and inserts an adapter per tool into the agent's registry — skipping
+      any tool the agent's <code class="inline">tools:</code> allowlist does not match. MCP/custom tool calls also
+      emit coverage touch events, so they contribute to coverage just like the self-instrumenting built-ins.
+    </p>
+    <div class="callout">
+      <strong>What's confirmed.</strong> The catalog agents consume is rupu's own embedded SCM + issue surface,
+      served in-process and gated by the same <code class="inline">tools:</code> allowlist. The adapter itself is
+      generic over any tool the dispatcher exposes; a configuration shape for registering arbitrary third-party
+      MCP servers as an agent's tools is not part of the surface documented here.
+    </div>
+
+    <h2>Permissions</h2>
+    <p>
+      Tool access is gated by two checks, applied in order: the <strong>allowlist</strong> first, then the
+      <strong>mode</strong>. The allowlist is the agent's <code class="inline">tools:</code> list (or
+      <code class="inline">*</code> when none is set), matched by exact name, <code class="inline">*</code>, or
+      trailing-<code class="inline">*</code> prefix. The mode is one of three, supplied at run time:
+    </p>
+    <table>
+      <thead><tr><th>Mode</th><th>Read tools</th><th>Write tools</th></tr></thead>
+      <tbody>
+        <tr><td><code>readonly</code></td><td>allow</td><td>deny</td></tr>
+        <tr><td><code>ask</code></td><td>allow</td><td>prompt before running</td></tr>
+        <tr><td><code>bypass</code></td><td>allow</td><td>allow</td></tr>
+      </tbody>
+    </table>
+    <p>
+      A tool that is not in the allowlist is denied regardless of mode. A tool that passes the allowlist is then
+      mode-checked: <code class="inline">readonly</code> blocks write tools (<code class="inline">bash</code>,
+      <code class="inline">write_file</code>, <code class="inline">edit_file</code>, and any write-kind MCP tool)
+      even when allowlisted; <code class="inline">bypass</code> permits everything. This same model governs both
+      the built-in tools and the MCP catalog — <code class="inline">rupu mcp serve</code> simply runs it pinned to
+      <code class="inline">bypass</code> + allow-all and defers prompting to the upstream client.
+    </p>
+
+    <div class="doc-nav">
+      <a href="/docs/integrations.html">&#8592; Integrations</a>
+      <a href="/docs/triggers.html">Triggers &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

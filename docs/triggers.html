@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Triggers</title>
+<meta name="description" content="How rupu workflows fire: manual, cron-scheduled, and event-driven triggers via polled sources or webhook serve.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR — copy verbatim; set .active on THIS page's item ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item active" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Triggers</h1>
+    <p class="intro">A trigger is the answer to one question: <em>what makes this workflow run?</em> rupu workflows can fire by hand, on a schedule, or in reaction to an SCM or issue-tracker event.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 220" role="img" aria-label="Three trigger sources feed rupu, which starts a workflow run">
+        <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path></marker></defs>
+        <rect class="d-box" x="20" y="20" width="170" height="44" rx="10"></rect>
+        <text class="d-label" x="105" y="40" text-anchor="middle">manual</text>
+        <text class="d-sub" x="105" y="56" text-anchor="middle">rupu workflow run</text>
+        <rect class="d-box" x="20" y="88" width="170" height="44" rx="10"></rect>
+        <text class="d-label" x="105" y="108" text-anchor="middle">cron clock</text>
+        <text class="d-sub" x="105" y="124" text-anchor="middle">rupu cron tick</text>
+        <rect class="d-box" x="20" y="156" width="170" height="44" rx="10"></rect>
+        <text class="d-label" x="105" y="176" text-anchor="middle">event</text>
+        <text class="d-sub" x="105" y="192" text-anchor="middle">poll / webhook</text>
+        <line class="d-edge" x1="190" y1="42" x2="295" y2="100" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="190" y1="110" x2="295" y2="110" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="190" y1="178" x2="295" y2="120" marker-end="url(#ar)"></line>
+        <rect class="d-box-accent" x="295" y="88" width="120" height="44" rx="10"></rect>
+        <text class="d-label" x="355" y="114" text-anchor="middle">rupu</text>
+        <line class="d-edge" x1="415" y1="110" x2="500" y2="110" marker-end="url(#ar)"></line>
+        <rect class="d-box" x="500" y="88" width="120" height="44" rx="10"></rect>
+        <text class="d-label" x="560" y="108" text-anchor="middle">workflow</text>
+        <text class="d-sub" x="560" y="124" text-anchor="middle">run</text>
+      </svg>
+      <figcaption>Manual, cron, and event sources all converge on rupu, which dispatches one workflow run.</figcaption>
+    </figure>
+
+    <h2>How workflows fire</h2>
+    <p>Every workflow declares a trigger with a top-level <code class="inline">trigger.on</code> field in its <code class="inline">.rupu/workflows/&lt;name&gt;.yaml</code>. There are three modes; <code class="inline">manual</code> is the default when <code class="inline">trigger</code> is omitted.</p>
+
+    <table>
+      <thead><tr><th>trigger.on</th><th>When it fires</th><th>Where it lives</th></tr></thead>
+      <tbody>
+        <tr><td><code>manual</code></td><td><code>rupu workflow run &lt;name&gt;</code></td><td>every install</td></tr>
+        <tr><td><code>cron</code></td><td>system cron / launchd invokes <code>rupu cron tick</code></td><td>every install</td></tr>
+        <tr><td><code>event</code></td><td>matching events appear via <code>rupu cron tick</code> (polled) or <code>rupu webhook serve</code> (live)</td><td>polled + webhook tiers</td></tr>
+      </tbody>
+    </table>
+
+    <p>The full schema, with cross-field validation rules:</p>
+    <pre class="code"><span class="k">trigger</span>:
+  <span class="k">on</span>: <span class="v">manual | cron | event</span>       <span class="c"># default: manual</span>
+  <span class="k">cron</span>: <span class="s">"0 4 * * *"</span>                <span class="c"># required when on: cron (5-field UTC)</span>
+  <span class="k">event</span>: <span class="v">github.issue.opened</span>       <span class="c"># required when on: event</span>
+  <span class="k">filter</span>: <span class="s">"&#123;&#123; event.repo.full_name == 'foo/bar' &#125;&#125;"</span>  <span class="c"># optional, only when on: event</span></pre>
+    <div class="callout"><strong>Validated at parse.</strong> <code class="inline">cron:</code> is only allowed when <code class="inline">on: cron</code>; <code class="inline">event:</code> and <code class="inline">filter:</code> only when <code class="inline">on: event</code>. A missing <code class="inline">on:</code> defaults to <code class="inline">manual</code>.</div>
+
+    <h2>Cron</h2>
+    <p>Cron-scheduled workflows run on a clock. rupu has <strong>no scheduling daemon</strong> of its own — you install a single system-cron or launchd entry that calls <code class="inline">rupu cron tick</code> once a minute, and each tick walks every cron-triggered workflow and fires those whose schedule matched between the persisted <code class="inline">last_fired</code> timestamp and now. It is idempotent at 1-minute granularity, so an overrunning tick never double-fires.</p>
+
+    <p>Install one entry in your crontab / launchd plist:</p>
+    <pre class="code"><span class="v">* * * * *</span>  /usr/local/bin/rupu cron tick</pre>
+
+    <p>Then give the workflow a schedule (5-field UTC expression):</p>
+    <pre class="code"><span class="c"># .rupu/workflows/nightly-audit.yaml</span>
+<span class="k">name</span>: <span class="v">nightly-audit</span>
+<span class="k">trigger</span>:
+  <span class="k">on</span>: <span class="v">cron</span>
+  <span class="k">cron</span>: <span class="s">"0 3 * * *"</span>   <span class="c"># every day at 03:00 UTC</span>
+
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">scan</span>
+    <span class="k">agent</span>: <span class="v">security-reviewer</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Audit the repo for newly-added secrets in the last 24h.</span></pre>
+
+    <p>Use <code class="inline">rupu cron tick --dry-run</code> to verify a crontab line without firing anything. <code class="inline">rupu cron list</code> is read-only — it prints every cron-triggered workflow plus its next firing time, handy before you add the cron entry.</p>
+
+    <h2>Events</h2>
+    <p>Event-triggered workflows react to activity in your SCM and issue trackers. rupu offers two delivery tiers that share the same workflow YAML and the same event vocabulary:</p>
+    <ul>
+      <li><strong>Polled</strong> — the CLI-native path. <code class="inline">rupu cron tick</code> asks each configured connector for new events since the last tick. No server required.</li>
+      <li><strong>Webhook</strong> — <code class="inline">rupu webhook serve</code>, a long-lived HMAC-validated HTTP receiver for sub-second latency and broader event coverage.</li>
+    </ul>
+
+    <h3>Polled sources</h3>
+    <p>Configure the sources you want polled in <code class="inline">~/.rupu/config.toml</code> (global) or <code class="inline">&lt;project&gt;/.rupu/config.toml</code> (project shadows global). The list is empty by default — rupu polls nothing until you ask it to.</p>
+    <pre class="code"><span class="k">[triggers]</span>
+<span class="k">poll_sources</span> = <span class="v">[</span>
+  <span class="s">"github:Section9Labs/rupu"</span>,
+  { <span class="k">source</span> = <span class="s">"gitlab:my-org/my-repo"</span>, <span class="k">poll_interval</span> = <span class="s">"15m"</span> },
+<span class="v">]</span>
+
+<span class="c"># Optional: cap events processed per source per tick. Default 50.</span>
+<span class="k">max_events_per_tick</span> = <span class="v">50</span></pre>
+    <p>Each entry is either a bare <code class="inline">"vendor:owner/repo"</code> string (eligible every event tick) or an inline table with a source-local <code class="inline">poll_interval</code> cadence override (<code class="inline">30s</code>, <code class="inline">5m</code>, <code class="inline">2h</code>, <code class="inline">1d</code>). The source model spans repos and trackers: <code class="inline">github:owner/repo</code>, <code class="inline">gitlab:group/project</code>, <code class="inline">linear:&lt;team-id&gt;</code>, and <code class="inline">jira:&lt;site&gt;/&lt;project&gt;</code> (or <code class="inline">jira:&lt;project&gt;</code> when <code class="inline">[scm.jira].base_url</code> is set).</p>
+
+    <h3>Webhook serve</h3>
+    <p>For sub-second latency or events the polled tier doesn't deliver, run <code class="inline">rupu webhook serve</code> under your own supervisor. Secrets come from environment variables only — never config files, never the keychain.</p>
+    <pre class="code">RUPU_GITHUB_WEBHOOK_SECRET=<span class="v">&lt;your-webhook-secret&gt;</span> \
+  rupu webhook serve --addr 0.0.0.0:8080</pre>
+    <p>The receiver validates the vendor signature (<code class="inline">X-Hub-Signature-256</code> for GitHub, <code class="inline">X-Gitlab-Token</code> for GitLab, <code class="inline">Linear-Signature</code> + timestamp freshness for Linear, <code class="inline">X-Hub-Signature</code> for Jira Cloud), maps the raw delivery onto the rupu event id, and fires matching workflows with <code class="inline">&#123;&#123;event.*&#125;&#125;</code> populated. Bind to <code class="inline">127.0.0.1</code> and front it with a TLS-terminating reverse proxy — rupu does not terminate TLS itself.</p>
+
+    <h3>The event vocabulary</h3>
+    <p>Each connector lifts events from the vendor's events API and maps them onto canonical rupu ids. You match against these in <code class="inline">trigger.event:</code>, and glob wildcards (<code class="inline">*</code>) work — <code class="inline">github.issue.*</code> matches every GitHub issue event, <code class="inline">"*.pr.merged"</code> matches cross-vendor, and <code class="inline">"*"</code> wakes on anything. A few common ids:</p>
+
+    <table>
+      <thead><tr><th>Event id</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>github.issue.opened</code></td><td>a GitHub issue was opened</td></tr>
+        <tr><td><code>github.issue.labeled</code></td><td>a label was added to a GitHub issue</td></tr>
+        <tr><td><code>github.pr.opened</code></td><td>a GitHub pull request was opened</td></tr>
+        <tr><td><code>github.pr.review_requested</code></td><td>review requested on a GitHub PR</td></tr>
+        <tr><td><code>github.push</code></td><td>commits pushed to a GitHub repo</td></tr>
+        <tr><td><code>gitlab.mr.merged</code></td><td>a GitLab merge request was merged</td></tr>
+        <tr><td><code>linear.issue.updated</code></td><td>a Linear issue changed (state/priority/&hellip;)</td></tr>
+        <tr><td><code>issue.queue_entered</code></td><td>semantic alias: issue moved into a queue-like state</td></tr>
+      </tbody>
+    </table>
+
+    <p>Beyond canonical vendor ids, rupu derives a broader <strong>semantic alias</strong> vocabulary (e.g. <code class="inline">issue.queue_entered</code>, <code class="inline">pr.review_activity</code>) from the same deliveries. Aliases are matchable alongside canonical ids, but one delivery still fires a workflow at most once. A complete event matrix and the templating metadata exposed as <code class="inline">&#123;&#123;event.*&#125;&#125;</code> live in <code class="inline">docs/triggers.md</code>.</p>
+
+    <p>A worked event workflow:</p>
+    <pre class="code"><span class="c"># .rupu/workflows/triage-incoming-issues.yaml</span>
+<span class="k">name</span>: <span class="v">triage-incoming-issues</span>
+<span class="k">trigger</span>:
+  <span class="k">on</span>: <span class="v">event</span>
+  <span class="k">event</span>: <span class="v">github.issue.opened</span>
+  <span class="k">filter</span>: <span class="s">"&#123;&#123; event.repo.full_name == 'Section9Labs/rupu' &#125;&#125;"</span>
+
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">comment_back</span>
+    <span class="k">agent</span>: <span class="v">issue-commenter</span>
+    <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Post a triage summary on issue</span>
+      <span class="s">&#123;&#123; event.repo.full_name &#125;&#125;#&#123;&#123; event.payload.issue.number &#125;&#125;.</span></pre>
+
+    <h2>Inspecting &amp; operating</h2>
+    <p>The <code class="inline">cron</code> subcommand is your window into both scheduled and polled-event triggers — there is no separate <code class="inline">events</code> daemon to manage.</p>
+    <ul>
+      <li><code class="inline">rupu cron events</code> — read-only; prints each event-triggered workflow with its matched event id, configured sources, and the persisted cursor.</li>
+      <li><code class="inline">rupu cron tick --skip-events</code> — run the cron tier only, leaving polled events untouched.</li>
+      <li><code class="inline">rupu cron tick --only-events</code> — run the polled-event tier only.</li>
+    </ul>
+    <p>Splitting the two flags lets each tier run at its own cadence:</p>
+    <pre class="code"><span class="v">* * * * *</span>      rupu cron tick --skip-events     <span class="c"># cron only, every minute</span>
+<span class="v">*/5 * * * *</span>    rupu cron tick --only-events     <span class="c"># events every 5 minutes</span></pre>
+    <p>Per-source cadence is controlled by the <code class="inline">poll_interval</code> override on a <code class="inline">poll_sources</code> entry: it decides whether a source is due to be polled on a given <code class="inline">rupu cron tick --only-events</code>, without changing workflow-matching semantics. On a source's first poll rupu emits zero events and sets the cursor to "now," so adding a source never triggers a stampede over its history.</p>
+
+    <h2>From trigger to autonomy</h2>
+    <p>Triggers are the wake-up mechanism for autonomy. An <a class="link" href="/docs/autoflows.html">autoflow</a> is a workflow that runs unattended; its <code class="inline">wake_on:</code> matches the very same event vocabulary described here, so triggers are precisely how autoflows come to life. The events themselves originate from the SCM and issue-tracker connectors covered under <a class="link" href="/docs/integrations.html">Integrations</a> — wire up a connector there, list it under <code class="inline">poll_sources</code> or point a webhook at it, and your workflows start reacting to the world.</p>
+
+    <div class="doc-nav">
+      <a href="/docs/mcp.html">&#8592; MCP &amp; tools</a>
+      <a href="/docs/control-plane.html">Control plane &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

@@ -282,3 +282,20 @@ figure.diagram figcaption { margin-top: 14px; font-size: 13px; color: var(--ink-
   .docs-side { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--line-soft); }
   .doc-grid { grid-template-columns: 1fr; }
 }
+
+/* ── Landing: "works with your stack" showcase ───────────── */
+.stack-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 40px; }
+.stack-col {
+  padding: 24px 22px; border: 1px solid var(--line); border-radius: 18px;
+  background: linear-gradient(180deg, var(--bg-soft), var(--bg));
+}
+.stack-col h3 { margin: 0 0 4px; font-size: 1.05rem; font-weight: 500; }
+.stack-col .blurb { margin: 0 0 16px; font-size: 0.9rem; font-weight: 300; color: var(--ink-mute); }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  font-size: 13px; font-weight: 300; color: var(--ink); padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--line); background: rgba(245,245,245,0.03);
+}
+.chip.accent { border-color: rgba(167,139,250,0.45); color: var(--violet-lite); background: rgba(124,58,237,0.08); }
+.chip .soon { color: var(--ink-mute); font-size: 11px; }
+@media (max-width: 760px) { .stack-grid { grid-template-columns: 1fr; } }
