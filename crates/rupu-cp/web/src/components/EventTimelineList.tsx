@@ -61,8 +61,11 @@ export function visualFor(ev: KnownRunEvent): Visual {
     case 'step_skipped':
       return { icon: SkipForward, ring: 'bg-slate-100 ring-slate-200', iconColor: 'text-slate-400' };
     case 'unit_started':
+      return { icon: PlayCircle, ring: 'bg-blue-50 ring-blue-200', iconColor: 'text-blue-600' };
     case 'unit_completed':
-      return { icon: Circle, ring: 'bg-slate-100 ring-slate-200', iconColor: 'text-slate-400' };
+      return ev.success
+        ? { icon: CheckCircle2, ring: 'bg-green-50 ring-green-200', iconColor: 'text-green-600' }
+        : { icon: XCircle, ring: 'bg-red-50 ring-red-200', iconColor: 'text-red-600' };
     case 'run_completed':
       return { icon: CheckCircle2, ring: 'bg-green-50 ring-green-200', iconColor: 'text-green-600' };
     case 'run_failed':

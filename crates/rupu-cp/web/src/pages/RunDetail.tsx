@@ -423,7 +423,10 @@ export default function RunDetail() {
   const selectedLabel = selection ? selection.stepId : 'whole run';
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    // min-h-full (not h-full): the page grows past the viewport so the parent
+    // <main> scrolls — the tall chrome (graph + usage chart) no longer squeezes
+    // the tab panel into a sliver. The panel below gets its own generous height.
+    <div className="flex min-h-full flex-col">
       <div className="px-8 pt-6">
         <BackLink />
         <header className="mt-3 flex items-start justify-between gap-4">
@@ -627,7 +630,10 @@ export default function RunDetail() {
         selected: <span className="font-mono text-ink-mute">{selectedLabel}</span>
       </div>
 
-      <div className="min-h-0 flex-1 px-8 pb-6 pt-3">
+      {/* Definite, generous height so the transcript / events / findings panels
+          have room and own their internal scroll; the whole page scrolls in the
+          parent <main>. */}
+      <div className="flex h-[65vh] min-h-[420px] flex-col px-8 pb-6 pt-3">
         {tab === 'transcript' && (
           <div className="flex h-full min-h-0 flex-col overflow-auto">
             {selection && selectedFanout ? (
