@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 /// A request to start a fresh workflow run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LaunchRequest {
     pub workflow: String,
     pub inputs: BTreeMap<String, String>,

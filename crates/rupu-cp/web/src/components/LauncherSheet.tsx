@@ -9,6 +9,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, type LaunchMode } from '../lib/api';
 import TargetPicker from './TargetPicker';
+import HostSelect from './HostSelect';
 import { Button } from './ui/Button';
 import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
 
@@ -61,6 +62,7 @@ export default function LauncherSheet({
 
   const [mode, setMode] = useState<LaunchMode>('ask');
   const [target, setTarget] = useState<TargetItem>(WORKSPACE_ITEM);
+  const [host, setHost] = useState('local');
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -85,8 +87,10 @@ export default function LauncherSheet({
         mode,
         target: target.resolved.target,
         working_dir: target.resolved.working_dir,
+        host: host !== 'local' ? host : undefined,
       });
-      navigate(`/runs/${res.run_id}`);
+      const hostParam = host !== 'local' ? `?host=${encodeURIComponent(host)}` : '';
+      navigate(`/runs/${res.run_id}${hostParam}`);
       onClose();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to launch run');
@@ -206,6 +210,19 @@ export default function LauncherSheet({
             <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">Target</span>
             <TargetPicker value={target} onChange={setTarget} disabled={launching} />
           </div>
+
+          {/* ── Host ───────────────────────────────────────────────── */}
+          <label className="block">
+            <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">
+              Host
+            </span>
+            <HostSelect
+              value={host}
+              onChange={setHost}
+              disabled={launching}
+              className="w-full"
+            />
+          </label>
 
           {error && (
             <p role="alert" className="text-ui font-medium text-err">

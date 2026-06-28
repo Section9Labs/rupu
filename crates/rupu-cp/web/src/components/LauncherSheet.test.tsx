@@ -25,6 +25,7 @@ afterEach(() => {
 
 describe('LauncherSheet', () => {
   it('launches with the declared input + chosen mode, then navigates to the run', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-xyz' });
@@ -52,6 +53,7 @@ describe('LauncherSheet', () => {
   });
 
   it('surfaces an error and does not navigate when the launch fails', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     vi.spyOn(api, 'launchRun').mockRejectedValue(new Error('no launcher'));
@@ -64,6 +66,7 @@ describe('LauncherSheet', () => {
   });
 
   it('renders the TargetPicker and sends working_dir when a directory item is selected', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/tmp/myproject', parent: null, dirs: [] });
@@ -90,7 +93,48 @@ describe('LauncherSheet', () => {
     );
   });
 
+  it('remote host launch: passes host to launchRun and carries ?host= in navigate', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([
+      { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
+      { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
+    ]);
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
+    const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-remote' });
+
+    render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
+
+    // Wait for HostSelect to populate with the remote option.
+    await waitFor(() => expect(screen.getByRole('option', { name: 'host_x' })).toBeInTheDocument());
+
+    // Select the remote host.
+    fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'host_x' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Launch' }));
+
+    await waitFor(() =>
+      expect(launchSpy).toHaveBeenCalledWith('audit', expect.objectContaining({ host: 'host_x' })),
+    );
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/runs/run-remote?host=host_x'));
+  });
+
+  it('local host launch: does not append ?host= to navigate', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([
+      { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
+    ]);
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    vi.spyOn(api, 'getRepos').mockResolvedValue([]);
+    vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-local' });
+
+    render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Launch' }));
+
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/runs/run-local'));
+  });
+
   it('sends target when a repo item is selected via the TargetPicker', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-repo' });

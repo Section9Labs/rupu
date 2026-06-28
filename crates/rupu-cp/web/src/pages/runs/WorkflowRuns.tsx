@@ -5,7 +5,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { Inbox, RefreshCw } from 'lucide-react';
-import { api, type RunListRow } from '../../lib/api';
+import { api, type HostView, type RunListRow } from '../../lib/api';
 import { StatusPill } from '../../components/StatusPill';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
@@ -18,6 +18,8 @@ import { shortId } from '../../lib/shortId';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
+/** Sentinel select value meaning "fetch all hosts" (fan-out / no ?host= param). */
+const ALL_HOSTS = '__all__';
 
 type Tab = 'active' | 'completed' | 'failed';
 
@@ -46,6 +48,15 @@ function TriggerChip({ trigger }: { trigger: string }) {
   );
 }
 
+/** Build the detail link for a run, including ?host= for remote runs. */
+function runHref(r: RunListRow): string {
+  const hid = r.host_id;
+  if (hid && hid !== 'local') {
+    return `/runs/${encodeURIComponent(r.id)}?host=${encodeURIComponent(hid)}`;
+  }
+  return `/runs/${encodeURIComponent(r.id)}`;
+}
+
 export default function WorkflowRuns() {
   const [tab, setTab] = useState<Tab>('active');
   const [runs, setRuns] = useState<RunListRow[] | null>(null);
@@ -53,15 +64,25 @@ export default function WorkflowRuns() {
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [filter, setFilter] = useState<TriggerFilter>('all');
+  // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
+  const [hostFilter, setHostFilter] = useState<string>('local');
+  const [hosts, setHosts] = useState<HostView[] | null>(null);
 
-  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab change.
+  useEffect(() => {
+    let cancelled = false;
+    api.getHosts().then((hs) => { if (!cancelled) setHosts(hs); }).catch(() => { if (!cancelled) setHosts([]); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab/host change.
   // Active: fetch ALL in one call (unpaginated) → poll never resets a scrolled
   // list. Completed/Failed: page-0 only; loadMore appends.
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
       const limit = tab === 'active' ? 200 : PAGE;
-      const data = await api.getWorkflowRuns({ lifecycle: tab, limit });
+      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+      const data = await api.getWorkflowRuns({ lifecycle: tab, limit, host });
       setRuns(data);
       setHasMore(tab !== 'active' && data.length >= PAGE);
       setError(null);
@@ -70,22 +91,23 @@ export default function WorkflowRuns() {
     } finally {
       setRefreshing(false);
     }
-  }, [tab]);
+  }, [tab, hostFilter]);
 
   useEffect(() => {
-    setRuns(null); // show loading on tab switch
+    setRuns(null); // show loading on tab/host switch
     void refresh();
     if (tab === 'active') {
       const t = window.setInterval(() => void refresh(), 5000);
       return () => window.clearInterval(t);
     }
     return () => {};
-  }, [tab, refresh]);
+  }, [tab, hostFilter, refresh]);
 
   const loadMore = async () => {
     if (tab === 'active') return; // active is unpaginated
     const current = runs ?? [];
-    const next = await api.getWorkflowRuns({ lifecycle: tab, offset: current.length, limit: PAGE });
+    const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+    const next = await api.getWorkflowRuns({ lifecycle: tab, offset: current.length, limit: PAGE, host });
     if (next.length === 0) { setHasMore(false); return; }
     setRuns([...current, ...next]);
     if (next.length < PAGE) setHasMore(false);
@@ -93,7 +115,11 @@ export default function WorkflowRuns() {
 
   const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
 
-  const filtered = (runs ?? []).filter((r) => filter === 'all' || r.trigger === filter);
+  // Trigger filter is still client-side (cheap; host filter is server-side).
+  const filtered = (runs ?? []).filter((r) => {
+    if (filter !== 'all' && r.trigger !== filter) return false;
+    return true;
+  });
 
   return (
     <div className="p-8">
@@ -126,8 +152,8 @@ export default function WorkflowRuns() {
         ))}
       </div>
 
-      {/* Trigger filter chips */}
-      <div className="flex items-center gap-2 mb-5">
+      {/* Trigger filter chips + Host filter */}
+      <div className="flex flex-wrap items-center gap-2 mb-5">
         {FILTERS.map((f) => (
           <button
             key={f}
@@ -142,6 +168,22 @@ export default function WorkflowRuns() {
             {f === 'all' ? 'All' : f.charAt(0).toUpperCase() + f.slice(1)}
           </button>
         ))}
+
+        {/* Host filter — always visible; drives server-side fetch scope. */}
+        <select
+          value={hostFilter}
+          onChange={(e) => setHostFilter(e.target.value)}
+          aria-label="Host filter"
+          className="text-xs font-medium px-2 py-1 rounded-md border border-border bg-panel text-ink-dim focus:outline-none focus:border-brand-500"
+        >
+          <option value="local">This host</option>
+          <option value={ALL_HOSTS}>All hosts</option>
+          {(hosts ?? [])
+            .filter((h) => h.transport_kind !== 'local')
+            .map((h) => (
+              <option key={h.id} value={h.id}>{h.name}</option>
+            ))}
+        </select>
       </div>
 
       {error && (
@@ -158,7 +200,7 @@ export default function WorkflowRuns() {
         <div className="space-y-6">
           <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
             <UsageBarChart bars={filtered.map((r) => ({
-              id: r.id, label: r.workflow_name, to: `/runs/${encodeURIComponent(r.id)}`,
+              id: r.id, label: r.workflow_name, to: runHref(r),
               input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
               cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
             }))} />
@@ -167,7 +209,7 @@ export default function WorkflowRuns() {
             columns={WORKFLOW_RUN_COLUMNS}
             rows={filtered}
             rowKey={(r) => r.id}
-            rowHref={(r) => `/runs/${encodeURIComponent(r.id)}`}
+            rowHref={runHref}
             initialSort={{ key: 'started', dir: 'desc' }}
           />
           {tab !== 'active' && hasMore && (
@@ -203,6 +245,15 @@ const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     key: 'run',
     header: 'Run',
     render: (r) => <span className="text-note text-ink-mute font-mono">{shortId(r.id)}</span>,
+  },
+  {
+    key: 'host',
+    header: 'Host',
+    sortable: true,
+    sortValue: (r) => r.host_id ?? 'local',
+    render: (r) => (
+      <span className="text-note text-ink-mute font-mono">{r.host_id ?? 'local'}</span>
+    ),
   },
   {
     key: 'trigger',
@@ -305,7 +356,7 @@ function WorkflowRunsEmpty({ hasRuns }: { hasRuns: boolean }) {
       </h2>
       <p className="mt-1 text-xs text-ink-dim max-w-xs">
         {hasRuns
-          ? 'Try selecting a different trigger filter above.'
+          ? 'Try selecting a different trigger or host filter above.'
           : 'Workflow runs will appear here once you dispatch one from the CLI, the desktop app, or a scheduled trigger.'}
       </p>
     </div>

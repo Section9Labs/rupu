@@ -6278,8 +6278,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "futures-util",
+ "httpmock",
  "mime_guess",
  "reqwest",
  "rupu-agent",
@@ -6299,6 +6301,7 @@ dependencies = [
  "tokio-util",
  "tower-http",
  "tracing",
+ "ulid",
 ]
 
 [[package]]
@@ -6496,6 +6499,7 @@ version = "0.25.1"
 dependencies = [
  "assert_fs",
  "chrono",
+ "keyring",
  "predicates",
  "rupu-runtime",
  "serde",

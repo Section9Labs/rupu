@@ -7,9 +7,14 @@
 // chart (chrome that never hides), then a tab panel — Transcript · Events ·
 // Findings — that FOLLOWS the step selected in the graph. Selecting a for_each
 // step swaps the Transcript body for the units/transcript file-browser.
+//
+// REMOTE HOST GATING: when ?host= is set to a non-local host id, getRunGraph
+// and getRunUsageTimeline are NOT called (they'd return wrong/local data).
+// Instead a note is shown where those sections would appear, and the run
+// record is fetched via getRun. All control/SSE calls include the host param.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, FileText, ListOrdered, Pause, ShieldAlert } from 'lucide-react';
 import {
   api,
@@ -19,6 +24,7 @@ import {
   type RunEvent,
   type RunGraphResponse,
   type RunRecord,
+  type UsageSummary,
   type UsageTimelinePoint,
 } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
@@ -101,8 +107,17 @@ function eventStepId(ev: RunEvent): string | undefined {
 
 export default function RunDetail() {
   const { id = '' } = useParams<{ id: string }>();
+  const [searchParams] = useSearchParams();
+  const host = searchParams.get('host') ?? undefined;
+  // A run is "remote" when its host is explicitly set to something other than local.
+  const isRemote = Boolean(host && host !== 'local');
 
+  // Local (full graph) state.
   const [graph, setGraph] = useState<RunGraphResponse | null>(null);
+  // Remote (lightweight) state — only used when isRemote.
+  const [remoteRun, setRemoteRun] = useState<RunRecord | null>(null);
+  const [remoteUsage, setRemoteUsage] = useState<UsageSummary | null>(null);
+
   const [loadError, setLoadError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('transcript');
 
@@ -116,6 +131,7 @@ export default function RunDetail() {
 
   // Aggregated per-turn token series for the "Token usage by turn" timeline —
   // a global index across all of the run's steps (see effect below).
+  // Only populated for local runs (remote gating skips this fetch).
   const [series, setSeries] = useState<UsageTimelinePoint[]>([]);
 
   // Scoped findings for THIS run — lazy-loaded when the Findings tab is first
@@ -146,10 +162,12 @@ export default function RunDetail() {
   // user's manual selection on every SSE event.
   const seededSelRef = useRef(false);
 
-  // Initial fetch of the run-graph (run record + workflow DAG + checkpoints).
+  // Initial fetch: remote uses getRun; local uses getRunGraph (with retry).
   useEffect(() => {
     let cancelled = false;
     setGraph(null);
+    setRemoteRun(null);
+    setRemoteUsage(null);
     setLoadError(null);
     setSelection(null);
     setGateDecision(null);
@@ -164,24 +182,39 @@ export default function RunDetail() {
     setFindings(null);
     setFindingsError(null);
     findingsRequestedRef.current = false;
-    fetchRunGraphWithRetry(id, () => cancelled)
-      .then((res) => {
-        if (cancelled) return;
-        setGraph(res);
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setLoadError(e instanceof Error ? e.message : 'Failed to load run');
-      });
+
+    if (isRemote) {
+      api
+        .getRun(id, { host })
+        .then(({ run, usage }) => {
+          if (cancelled) return;
+          setRemoteRun(run);
+          setRemoteUsage(usage);
+        })
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          setLoadError(e instanceof Error ? e.message : 'Failed to load run');
+        });
+    } else {
+      fetchRunGraphWithRetry(id, () => cancelled)
+        .then((res) => {
+          if (cancelled) return;
+          setGraph(res);
+        })
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          setLoadError(e instanceof Error ? e.message : 'Failed to load run');
+        });
+    }
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, isRemote, host]);
 
-  // Aggregated per-turn usage series across all of the run's steps, served by
-  // the backend's usage-timeline endpoint. One fetch per run id.
+  // Aggregated per-turn usage series — LOCAL ONLY. Remote runs skip this
+  // (getRunUsageTimeline has no host param in this slice).
   useEffect(() => {
-    if (!id) return;
+    if (!id || isRemote) return;
     let cancelled = false;
     setSeries([]);
     api
@@ -197,7 +230,7 @@ export default function RunDetail() {
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, isRemote]);
 
   // Lazy-load this run's findings the first time the Findings tab is opened.
   // Keyed on (id, tab); the ref guard ensures a single fetch per run id.
@@ -223,6 +256,7 @@ export default function RunDetail() {
   }, [id, tab]);
 
   // ONE SSE subscription per open run — shared by graph + feed.
+  // Thread the host param for remote runs.
   useEffect(() => {
     if (!id) return;
     setEvents([]);
@@ -245,15 +279,17 @@ export default function RunDetail() {
         }
       },
       () => setConnection('reconnecting'),
+      isRemote ? { host } : undefined,
     );
     return unsubscribe;
-  }, [id]);
+  }, [id, isRemote, host]);
 
   // Plain RunEvent[] for the model builder (drop the seq wrapper).
   const rawEvents = useMemo<RunEvent[]>(() => events.map((e) => e.event), [events]);
 
   // Merge skeleton + checkpoints + live events into the render model. Cheap;
   // recompute on every event so the graph reflects live state.
+  // Only built for local runs; remote runs have no graph skeleton.
   const model = useMemo(
     () => (graph ? buildRunGraphModel(graph, rawEvents) : null),
     [graph, rawEvents],
@@ -290,7 +326,10 @@ export default function RunDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeIdsKey]);
 
-  const run = graph?.run ?? null;
+  // The effective run record: remote uses remoteRun, local uses graph.run.
+  const run = isRemote ? remoteRun : (graph?.run ?? null);
+  // Usage for the header row: remote uses remoteUsage, local uses graph.usage.
+  const displayUsage = isRemote ? remoteUsage : graph?.usage;
 
   // Live awaiting info: prefer a live awaiting node from the model, else the
   // persisted record.
@@ -324,7 +363,11 @@ export default function RunDetail() {
     setGatePending(true);
     setGateError(null);
     try {
-      await api.approveRun(run.id, approveMode);
+      if (host) {
+        await api.approveRun(run.id, approveMode, host);
+      } else {
+        await api.approveRun(run.id, approveMode);
+      }
       setGateDecision('approved');
     } catch (e: unknown) {
       setGateError(e instanceof Error ? e.message : 'Failed to approve run');
@@ -339,7 +382,11 @@ export default function RunDetail() {
     setCancelPending(true);
     setCancelError(null);
     try {
-      await api.cancelRun(run.id);
+      if (host) {
+        await api.cancelRun(run.id, undefined, host);
+      } else {
+        await api.cancelRun(run.id);
+      }
       // Optimistic — the live stream / next poll reconciles the terminal status.
       setLiveRunStatus('cancelled');
     } catch (e: unknown) {
@@ -354,7 +401,11 @@ export default function RunDetail() {
     setGatePending(true);
     setGateError(null);
     try {
-      await api.rejectRun(run.id, rejectReason);
+      if (host) {
+        await api.rejectRun(run.id, rejectReason, host);
+      } else {
+        await api.rejectRun(run.id, rejectReason);
+      }
       setGateDecision('rejected');
       setRejectOpen(false);
     } catch (e: unknown) {
@@ -411,7 +462,8 @@ export default function RunDetail() {
     );
   }
 
-  if (!run || !model) {
+  // Loading: for remote runs we only need `run`; for local we need both run + model.
+  if (!run || (!isRemote && !model)) {
     return (
       <div className="p-8">
         <BackLink />
@@ -435,22 +487,27 @@ export default function RunDetail() {
             <div className="flex items-center gap-3">
               <h1 className="truncate text-2xl font-semibold text-ink">{run.workflow_name}</h1>
               <StatusPill status={effectiveStatus} />
+              {isRemote && host && (
+                <span className="rounded bg-blue-50 px-1.5 py-0.5 text-note font-medium text-blue-700 ring-1 ring-blue-200 font-mono">
+                  {host}
+                </span>
+              )}
             </div>
             <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-note text-ink-dim">
               <span className="font-mono">{run.id}</span>
               <span>started {absoluteTime(run.started_at)}</span>
               {run.finished_at && <span>finished {absoluteTime(run.finished_at)}</span>}
             </div>
-            {graph?.usage && (
+            {displayUsage && (
               <div className="mt-1.5 flex items-center gap-4 text-xs text-ink-dim tabular-nums">
-                <span><span className="text-ink-mute">in</span> {formatTokens(graph.usage.input_tokens)}</span>
-                <span><span className="text-ink-mute">out</span> {formatTokens(graph.usage.output_tokens)}</span>
-                {graph.usage.cached_tokens > 0 && (
-                  <span><span className="text-ink-mute">cached</span> {formatTokens(graph.usage.cached_tokens)}</span>
+                <span><span className="text-ink-mute">in</span> {formatTokens(displayUsage.input_tokens)}</span>
+                <span><span className="text-ink-mute">out</span> {formatTokens(displayUsage.output_tokens)}</span>
+                {displayUsage.cached_tokens > 0 && (
+                  <span><span className="text-ink-mute">cached</span> {formatTokens(displayUsage.cached_tokens)}</span>
                 )}
-                <span><span className="text-ink-mute">total</span> {formatTokens(graph.usage.total_tokens)}</span>
+                <span><span className="text-ink-mute">total</span> {formatTokens(displayUsage.total_tokens)}</span>
                 <span className="font-medium text-ink">
-                  {formatCost(graph.usage.cost_usd)}{graph.usage.cost_usd !== null && !graph.usage.priced ? '*' : ''}
+                  {formatCost(displayUsage.cost_usd)}{displayUsage.cost_usd !== null && !displayUsage.priced ? '*' : ''}
                 </span>
               </div>
             )}
@@ -592,27 +649,38 @@ export default function RunDetail() {
           </div>
         )}
 
-        {/* Persistent chrome: the run graph — always visible, drives selection. */}
-        <section className="mt-3" data-testid="run-graph-chrome">
-          <RunGraph
-            model={model}
-            positions={positions}
-            onSelectNode={selectFromNode}
-            onExpandFanout={selectStep}
-            onOpenUnit={selectUnit}
-          />
-        </section>
+        {/* Persistent chrome: the run graph — LOCAL ONLY. Remote runs see a note. */}
+        {isRemote ? (
+          <section
+            className="mt-3 rounded-xl border border-border bg-panel px-4 py-6 text-center text-sm text-ink-dim"
+            data-testid="remote-graph-note"
+          >
+            Step graph and usage chart aren&apos;t available for remote-host runs yet.
+          </section>
+        ) : (
+          <>
+            <section className="mt-3" data-testid="run-graph-chrome">
+              <RunGraph
+                model={model!}
+                positions={positions}
+                onSelectNode={selectFromNode}
+                onExpandFanout={selectStep}
+                onOpenUnit={selectUnit}
+              />
+            </section>
 
-        {/* Persistent chrome: per-turn usage chart — always visible. */}
-        <section
-          className="mt-3 bg-panel border border-border rounded-xl shadow-card px-4 py-3"
-          data-testid="usage-timeline-chrome"
-        >
-          <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
-            Token usage by turn
-          </h2>
-          <RunUsageTimeline series={series} separators />
-        </section>
+            {/* Persistent chrome: per-turn usage chart — LOCAL ONLY. */}
+            <section
+              className="mt-3 bg-panel border border-border rounded-xl shadow-card px-4 py-3"
+              data-testid="usage-timeline-chrome"
+            >
+              <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
+                Token usage by turn
+              </h2>
+              <RunUsageTimeline series={series} separators />
+            </section>
+          </>
+        )}
       </div>
 
       <div className="mt-4">
@@ -623,9 +691,11 @@ export default function RunDetail() {
         </TabBar>
       </div>
 
-      <div className="px-8 pt-2 text-note text-ink-dim">
-        selected: <span className="font-mono text-ink-mute">{selectedLabel}</span>
-      </div>
+      {!isRemote && (
+        <div className="px-8 pt-2 text-note text-ink-dim">
+          selected: <span className="font-mono text-ink-mute">{selectedLabel}</span>
+        </div>
+      )}
 
       {/* Definite, generous height so the transcript / events / findings panels
           have room and own their internal scroll; the whole page scrolls in the
@@ -641,13 +711,13 @@ export default function RunDetail() {
               />
             ) : selection && selectedTranscriptPath ? (
               <TranscriptPanel key={selectedTranscriptPath} path={selectedTranscriptPath} live={isRunning} />
-            ) : selection ? (
-              <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
-                No transcript yet for {selection.stepId}.
-              </div>
             ) : (
               <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
-                Select a step in the graph to view its transcript.
+                {isRemote
+                  ? 'Transcript browsing is not available for remote-host runs.'
+                  : selection
+                    ? `No transcript yet for ${selection.stepId}.`
+                    : 'Select a step in the graph to view its transcript.'}
               </div>
             )}
           </div>

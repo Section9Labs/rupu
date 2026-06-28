@@ -8,6 +8,10 @@
 // Heavy children (RunGraph, TranscriptPanel, RunEventFeed, StepTranscriptBrowser,
 // RunUsageTimeline) are mocked so the test drives selection through the graph's
 // callback props without pulling in xyflow / recharts.
+//
+// REMOTE GATING: when ?host= is a non-local host id, getRunGraph and
+// getRunUsageTimeline must NOT be called; a note is shown instead; getRun IS
+// called and control calls include the host param.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -152,6 +156,29 @@ const FINDINGS: FindingsResponse = {
   summary: { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 },
 };
 
+const EMPTY_USAGE = {
+  input_tokens: 0,
+  output_tokens: 0,
+  cached_tokens: 0,
+  total_tokens: 0,
+  cost_usd: null,
+  priced: false,
+  runs: 0,
+};
+
+const REMOTE_RUN_RESPONSE = {
+  run: {
+    id: 'run-1',
+    workflow_name: 'remote-scan',
+    status: 'running' as const,
+    started_at: '2026-06-01T00:00:00Z',
+  },
+  steps: [] as RunGraphResponse['step_results'],
+  usage: EMPTY_USAGE,
+};
+
+// ---- Render helpers -------------------------------------------------------
+
 function renderPage() {
   return render(
     <MemoryRouter initialEntries={['/runs/run-1']}>
@@ -162,9 +189,21 @@ function renderPage() {
   );
 }
 
+function renderRemotePage(hostId = 'h-abc') {
+  return render(
+    <MemoryRouter initialEntries={[`/runs/run-1?host=${hostId}`]}>
+      <Routes>
+        <Route path="/runs/:id" element={<RunDetailLoaded />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
 // Imported here so the vi.mock factories above are hoisted before the module
 // graph resolves RunDetail's child imports.
 import RunDetailLoaded from './RunDetail';
+
+// ---- Local run tests -----------------------------------------------------
 
 describe('RunDetail shell', () => {
   function stubApi() {
@@ -320,5 +359,93 @@ describe('RunDetail shell', () => {
     fireEvent.click(approveBtn);
 
     await waitFor(() => expect(approveSpy).toHaveBeenCalledWith('run-1', 'bypass'));
+  });
+});
+
+// ---- Remote host gating tests --------------------------------------------
+
+describe('RunDetail — remote host (?host=)', () => {
+  it('calls getRun (not getRunGraph), skips getRunUsageTimeline, shows the gating note', async () => {
+    const getRunSpy = vi.spyOn(api, 'getRun').mockResolvedValue(REMOTE_RUN_RESPONSE);
+    const getRunGraphSpy = vi.spyOn(api, 'getRunGraph');
+    const getTimelineSpy = vi.spyOn(api, 'getRunUsageTimeline');
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+
+    renderRemotePage();
+
+    // Header should render the workflow name from getRun.
+    await waitFor(() => expect(screen.getByText('remote-scan')).toBeInTheDocument());
+
+    // getRun was called with the host option.
+    expect(getRunSpy).toHaveBeenCalledWith('run-1', { host: 'h-abc' });
+
+    // getRunGraph and getRunUsageTimeline must NOT be called.
+    expect(getRunGraphSpy).not.toHaveBeenCalled();
+    expect(getTimelineSpy).not.toHaveBeenCalled();
+
+    // The gating note is visible where the graph/usage chart would be.
+    expect(screen.getByTestId('remote-graph-note')).toBeInTheDocument();
+    expect(screen.getByText(/Step graph and usage chart aren't available for remote-host runs yet/)).toBeInTheDocument();
+
+    // The RunGraph and usage-timeline mocks are NOT in the DOM.
+    expect(screen.queryByTestId('run-graph-mock')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('usage-timeline-mock')).not.toBeInTheDocument();
+  });
+
+  it('passes host to subscribeRunLog for remote runs', async () => {
+    vi.spyOn(api, 'getRun').mockResolvedValue(REMOTE_RUN_RESPONSE);
+    const subscribeSpy = vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+
+    renderRemotePage();
+
+    await waitFor(() => expect(screen.getByText('remote-scan')).toBeInTheDocument());
+
+    expect(subscribeSpy).toHaveBeenCalledWith(
+      'run-1',
+      expect.any(Function),
+      expect.any(Function),
+      { host: 'h-abc' },
+    );
+  });
+
+  it('passes host to approveRun when approving a remote awaiting run', async () => {
+    const remoteAwaiting = {
+      run: {
+        id: 'run-1',
+        workflow_name: 'remote-scan',
+        status: 'awaiting_approval' as const,
+        started_at: '2026-06-01T00:00:00Z',
+        awaiting_step_id: 'step_a',
+        approval_prompt: 'Remote approval needed?',
+      },
+      steps: [] as RunGraphResponse['step_results'],
+      usage: EMPTY_USAGE,
+    };
+    vi.spyOn(api, 'getRun').mockResolvedValue(remoteAwaiting);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    const approveSpy = vi.spyOn(api, 'approveRun').mockResolvedValue(undefined);
+
+    renderRemotePage();
+
+    const approveBtn = await screen.findByRole('button', { name: 'Approve run' });
+    fireEvent.click(approveBtn);
+
+    await waitFor(() =>
+      expect(approveSpy).toHaveBeenCalledWith('run-1', 'ask', 'h-abc'),
+    );
+  });
+
+  it('shows the host badge in the header for remote runs', async () => {
+    vi.spyOn(api, 'getRun').mockResolvedValue(REMOTE_RUN_RESPONSE);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+
+    renderRemotePage('my-staging-host');
+
+    await waitFor(() => expect(screen.getByText('remote-scan')).toBeInTheDocument());
+    expect(screen.getByText('my-staging-host')).toBeInTheDocument();
   });
 });

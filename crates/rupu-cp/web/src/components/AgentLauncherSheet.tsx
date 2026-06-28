@@ -8,6 +8,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, type LaunchMode } from '../lib/api';
 import TargetPicker from './TargetPicker';
+import HostSelect from './HostSelect';
 import { Button } from './ui/Button';
 import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
 
@@ -44,6 +45,7 @@ export default function AgentLauncherSheet({
   const [prompt, setPrompt] = useState('');
   const [mode, setMode] = useState<LaunchMode>('ask');
   const [target, setTarget] = useState<TargetItem>(WORKSPACE_ITEM);
+  const [host, setHost] = useState('local');
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -57,18 +59,29 @@ export default function AgentLauncherSheet({
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
 
+  // Sessions only run locally. When the user picks a remote host, force back to single-run.
+  useEffect(() => {
+    if (host !== 'local') {
+      setLaunchKind('run');
+    }
+  }, [host]);
+
   async function onLaunch() {
     if (launching) return;
     setLaunching(true);
     setError(null);
     try {
-      const opts = buildAgentLaunch(prompt, mode, target);
+      const opts = {
+        ...buildAgentLaunch(prompt, mode, target),
+        host: host !== 'local' ? host : undefined,
+      };
       if (launchKind === 'session') {
         const res = await api.startSession(agent, opts);
         navigate(`/sessions/${res.session_id}`);
       } else {
         const res = await api.launchAgent(agent, opts);
-        navigate(`/runs/${res.run_id}`);
+        const hostParam = host !== 'local' ? `?host=${encodeURIComponent(host)}` : '';
+        navigate(`/runs/${res.run_id}${hostParam}`);
       }
       onClose();
     } catch (e: unknown) {
@@ -127,10 +140,11 @@ export default function AgentLauncherSheet({
               <button
                 type="button"
                 onClick={() => {
+                  if (host !== 'local') return;
                   if (mode === 'ask') setMode('bypass');
                   setLaunchKind('session');
                 }}
-                disabled={launching}
+                disabled={launching || host !== 'local'}
                 aria-pressed={launchKind === 'session'}
                 className={
                   'rounded-none border-l border-border px-2 py-1 text-ui font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
@@ -142,11 +156,15 @@ export default function AgentLauncherSheet({
                 Session
               </button>
             </div>
-            {launchKind === 'session' && (
+            {host !== 'local' ? (
+              <p className="mt-1 text-ui text-ink-mute">
+                Sessions run on the local host only (for now).
+              </p>
+            ) : launchKind === 'session' ? (
               <p className="mt-1 text-ui text-ink-mute">
                 Opens a multi-turn chat you can keep messaging.
               </p>
-            )}
+            ) : null}
           </div>
 
           {/* ── Prompt ─────────────────────────────────────────────── */}
@@ -188,6 +206,19 @@ export default function AgentLauncherSheet({
             <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">Target</span>
             <TargetPicker value={target} onChange={setTarget} disabled={launching} />
           </div>
+
+          {/* ── Host ───────────────────────────────────────────────── */}
+          <label className="block">
+            <span className="mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim">
+              Host
+            </span>
+            <HostSelect
+              value={host}
+              onChange={setHost}
+              disabled={launching}
+              className="w-full"
+            />
+          </label>
 
           {error && (
             <p role="alert" className="text-ui font-medium text-err">

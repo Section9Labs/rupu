@@ -137,6 +137,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::completions::Action,
     },
+    /// Manage named rupu-cp hosts (add / list / remove).
+    Host {
+        #[command(subcommand)]
+        action: cmd::host::Action,
+    },
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -220,6 +225,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Usage(args) => cmd::usage::handle(*args, cli.format).await,
         Cmd::Watch(args) => cmd::watch::handle(args).await,
         Cmd::Completions { action } => cmd::completions::handle(action).await,
+        Cmd::Host { action } => cmd::host::handle(action).await,
     }
 }
 
@@ -279,6 +285,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::Completions { .. } => output::formats::ensure_supported(
             "completions",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Host { .. } => output::formats::ensure_supported(
+            "host",
             format,
             &[output::formats::OutputFormat::Table],
         ),

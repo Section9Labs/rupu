@@ -2,6 +2,7 @@ use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
     api::fs_safety::{validate_name, write_atomic},
     error::{ApiError, ApiResult},
+    host::connector::HostConnectorError,
     session_starter::{SessionStartError, SessionStartRequest, SessionStarter},
     state::AppState,
 };
@@ -235,6 +236,11 @@ struct AgentRunBody {
     target: Option<String>,
     #[serde(default)]
     working_dir: Option<String>,
+    /// Optional host id. Absent or `"local"` → local path (including the
+    /// existing 501 when no launcher is installed). A remote id proxies via
+    /// [`HostConnector::launch_agent`] and returns `{ "run_id", "host_id" }`.
+    #[serde(default)]
+    host: Option<String>,
 }
 
 /// Testable core: map the body + a concrete launcher to a run id.
@@ -256,8 +262,9 @@ async fn run_agent_with(
     })
 }
 
-/// Start a fresh run of agent `:name` via the configured [`AgentLauncher`].
-/// Returns the new run id. 501 when no launcher is installed (read-only deploy).
+/// Start a fresh run of agent `:name` via the configured [`AgentLauncher`]
+/// (local) or by proxying to a remote host. Returns the new run id plus the
+/// owning `host_id`. 501 when no launcher is installed and the target is local.
 ///
 /// [`AgentLauncher`]: crate::agent_launcher::AgentLauncher
 async fn run_agent(
@@ -265,12 +272,33 @@ async fn run_agent(
     Path(name): Path<String>,
     body: Option<Json<AgentRunBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let b = body.map(|b| b.0).unwrap_or_default();
+    let host = b.host.as_deref().unwrap_or("local").to_string();
+
+    if host != "local" {
+        let conn = crate::api::runs::resolve_host(&s, &host)?;
+        let req = AgentLaunchRequest {
+            agent: name.clone(),
+            prompt: b.prompt,
+            mode: b.mode,
+            target: b.target,
+            working_dir: b.working_dir,
+        };
+        let run_id = conn.launch_agent(req).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": host })));
+    }
+
+    // Local path: unchanged (including the 501 when no launcher is installed).
     let launcher = s
         .agent_launcher
         .clone()
         .ok_or_else(|| ApiError::not_available("launching agents requires `rupu cp serve`"))?;
-    let run_id = run_agent_with(&name, body.map(|b| b.0).unwrap_or_default(), launcher).await?;
-    Ok(Json(serde_json::json!({ "run_id": run_id })))
+    let run_id = run_agent_with(&name, b, launcher).await?;
+    Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": "local" })))
 }
 
 /// Request body for `POST /api/agents/:name/session`. All fields optional; a
@@ -285,6 +313,11 @@ struct SessionStartBody {
     target: Option<String>,
     #[serde(default)]
     working_dir: Option<String>,
+    /// Optional host id. Absent or `"local"` → local path (including the
+    /// existing 501 when no starter is installed). A remote id proxies via
+    /// [`HostConnector::start_session`] and returns `{ "session_id", "host_id" }`.
+    #[serde(default)]
+    host: Option<String>,
 }
 
 /// Testable core: map the body + a concrete starter to a session id.
@@ -306,8 +339,9 @@ async fn start_session_with(
     })
 }
 
-/// Start a fresh session of agent `:name` via the configured [`SessionStarter`].
-/// Returns the new session id. 501 when no starter is installed (read-only deploy).
+/// Start a fresh session of agent `:name` via the configured [`SessionStarter`]
+/// (local) or by proxying to a remote host. Returns the new session id plus the
+/// owning `host_id`. 501 when no starter is installed and the target is local.
 ///
 /// [`SessionStarter`]: crate::session_starter::SessionStarter
 async fn start_session(
@@ -315,13 +349,37 @@ async fn start_session(
     Path(name): Path<String>,
     body: Option<Json<SessionStartBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let b = body.map(|b| b.0).unwrap_or_default();
+    let host = b.host.as_deref().unwrap_or("local").to_string();
+
+    if host != "local" {
+        let conn = crate::api::runs::resolve_host(&s, &host)?;
+        let req = SessionStartRequest {
+            agent: name.clone(),
+            prompt: b.prompt,
+            mode: b.mode,
+            target: b.target,
+            working_dir: b.working_dir,
+        };
+        let session_id = conn.start_session(req).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(
+            serde_json::json!({ "session_id": session_id, "host_id": host }),
+        ));
+    }
+
+    // Local path: unchanged (including the 501 when no starter is installed).
     let starter = s
         .session_starter
         .clone()
         .ok_or_else(|| ApiError::not_available("starting sessions requires `rupu cp serve`"))?;
-    let session_id =
-        start_session_with(&name, body.map(|b| b.0).unwrap_or_default(), starter).await?;
-    Ok(Json(serde_json::json!({ "session_id": session_id })))
+    let session_id = start_session_with(&name, b, starter).await?;
+    Ok(Json(
+        serde_json::json!({ "session_id": session_id, "host_id": "local" }),
+    ))
 }
 
 #[cfg(test)]
@@ -329,7 +387,6 @@ mod tests {
     use super::*;
     use crate::agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher};
     use crate::session_starter::{SessionStartError, SessionStartRequest, SessionStarter};
-    use rupu_orchestrator::RunStore;
     use std::sync::{Arc, Mutex};
 
     struct MockAgent {
@@ -345,18 +402,8 @@ mod tests {
     }
 
     fn test_state(tmp: &tempfile::TempDir) -> AppState {
-        let store = RunStore::new(tmp.path().join("runs"));
-        AppState {
-            global_dir: tmp.path().to_path_buf(),
-            workspace_dir: tmp.path().to_path_buf(),
-            run_store: Arc::new(store),
-            pricing: rupu_config::PricingConfig::default(),
-            launcher: None,
-            session_sender: None,
-            repos: None,
-            agent_launcher: None,
-            session_starter: None,
-        }
+        AppState::new(tmp.path().to_path_buf(), rupu_config::PricingConfig::default())
+            .with_workspace_dir(tmp.path().to_path_buf())
     }
 
     #[tokio::test]
@@ -369,6 +416,7 @@ mod tests {
             mode: Some("bypass".into()),
             target: None,
             working_dir: Some("/tmp/p".into()),
+            host: None,
         };
         let run_id = run_agent_with("triage", body, mock.clone())
             .await
@@ -476,6 +524,7 @@ mod tests {
             mode: Some("ask".into()),
             target: None,
             working_dir: Some("/tmp/p".into()),
+            host: None,
         };
         let id = start_session_with("triage", body, mock.clone())
             .await

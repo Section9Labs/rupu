@@ -69,6 +69,7 @@ export const sidebarNav: NavSection[] = [
   }},
   { kind: 'group', group: {
     id: 'fleet', label: 'Fleet', items: [
+      { to: '/hosts',    label: 'Hosts',    icon: Server,        enabled: true },
       { to: '/workers',  label: 'Workers',  icon: Server,        enabled: true },
     ],
   }},

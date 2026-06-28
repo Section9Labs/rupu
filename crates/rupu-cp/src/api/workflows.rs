@@ -1,6 +1,7 @@
 use crate::{
     api::fs_safety,
     error::{ApiError, ApiResult},
+    host::connector::HostConnectorError,
     launcher::LaunchError,
     state::AppState,
 };
@@ -211,10 +212,16 @@ struct LaunchBody {
     target: Option<String>,
     #[serde(default)]
     working_dir: Option<String>,
+    /// Optional host id. Absent or `"local"` → local path (including the
+    /// existing 501 when no launcher is installed). A remote id proxies via
+    /// [`HostConnector::launch_run`] and returns `{ "run_id", "host_id" }`.
+    #[serde(default)]
+    host: Option<String>,
 }
 
-/// Start a fresh run of `:name` via the configured [`RunLauncher`]. Returns the
-/// new run id. 501 when no launcher is installed (read-only deploy).
+/// Start a fresh run of `:name` via the configured [`RunLauncher`] (local) or
+/// by proxying to a remote host. Returns the new run id plus the owning
+/// `host_id`. 501 when no launcher is installed and the target is local.
 ///
 /// [`RunLauncher`]: crate::launcher::RunLauncher
 async fn launch_run(
@@ -223,6 +230,27 @@ async fn launch_run(
     body: Option<Json<LaunchBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let b = body.map(|j| j.0).unwrap_or_default();
+    let host = b.host.as_deref().unwrap_or("local").to_string();
+
+    if host != "local" {
+        // Remote path: resolve the connector and proxy the launch.
+        let conn = crate::api::runs::resolve_host(&s, &host)?;
+        let req = crate::launcher::LaunchRequest {
+            workflow: name,
+            inputs: b.inputs,
+            mode: b.mode,
+            target: b.target,
+            working_dir: b.working_dir,
+        };
+        let run_id = conn.launch_run(req).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": host })));
+    }
+
+    // Local path: unchanged (including the 501 when no launcher is installed).
     let launcher = s
         .launcher
         .as_ref()
@@ -235,7 +263,7 @@ async fn launch_run(
         working_dir: b.working_dir,
     };
     match launcher.launch(req).await {
-        Ok(run_id) => Ok(Json(serde_json::json!({ "run_id": run_id }))),
+        Ok(run_id) => Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": "local" }))),
         Err(LaunchError::Invalid(m)) => Err(ApiError::bad_request(m)),
         Err(LaunchError::Spawn(m)) => Err(ApiError::internal(m)),
     }
@@ -245,7 +273,6 @@ async fn launch_run(
 mod tests {
     use super::*;
     use crate::launcher::{LaunchError, LaunchRequest, RunLauncher};
-    use rupu_orchestrator::RunStore;
     use std::sync::{Arc, Mutex};
 
     /// Captures the last `LaunchRequest` and returns a canned run id.
@@ -263,18 +290,8 @@ mod tests {
     }
 
     fn test_state(tmp: &tempfile::TempDir) -> AppState {
-        let store = RunStore::new(tmp.path().join("runs"));
-        AppState {
-            global_dir: tmp.path().to_path_buf(),
-            workspace_dir: tmp.path().to_path_buf(),
-            run_store: Arc::new(store),
-            pricing: rupu_config::PricingConfig::default(),
-            launcher: None,
-            session_sender: None,
-            repos: None,
-            agent_launcher: None,
-            session_starter: None,
-        }
+        AppState::new(tmp.path().to_path_buf(), rupu_config::PricingConfig::default())
+            .with_workspace_dir(tmp.path().to_path_buf())
     }
 
     #[tokio::test]
@@ -293,6 +310,7 @@ mod tests {
             mode: Some("bypass".into()),
             target: None,
             working_dir: None,
+            host: None,
         };
 
         let resp = launch_run(State(s), Path("nightly".into()), Some(Json(body)))
@@ -320,6 +338,7 @@ mod tests {
             mode: None,
             target: None,
             working_dir: Some("/tmp/projX".into()),
+            host: None,
         };
         let _ = launch_run(State(s), Path("nightly".into()), Some(Json(body))).await;
         let got = mock.last.lock().unwrap().clone().unwrap();

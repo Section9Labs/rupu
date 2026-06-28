@@ -230,7 +230,7 @@ export default function Dashboard() {
         api.getUsage({ since, groupBy: 'model' }).catch(() => null),
         api.getUsageTimeline({ since, bucket }).catch(() => null),
         api.getFindings().catch(() => null),
-        api.getRuns({ limit: 500 }).catch(() => null),
+        api.getRuns({ limit: 500, host: 'local' }).catch(() => null),
       ]);
 
       setData(d);

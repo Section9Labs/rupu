@@ -9,6 +9,7 @@
 
 use crate::{
     error::{ApiError, ApiResult},
+    host::connector::HostConnectorError,
     state::AppState,
 };
 use axum::{
@@ -95,6 +96,11 @@ fn canonicalize_existing_prefix(p: &Path) -> Option<PathBuf> {
 #[derive(serde::Deserialize)]
 struct PathQ {
     path: String,
+    /// When present and not `"local"`, proxy the request to the named host.
+    /// The `path` argument is forwarded verbatim — it is meaningful only on
+    /// the remote host's filesystem.
+    #[serde(default)]
+    host: Option<String>,
 }
 
 /// The set of directories a transcript path is allowed to resolve into: the
@@ -118,10 +124,37 @@ pub fn routes() -> Router<AppState> {
         .route("/api/transcript/stream", get(stream_transcript))
 }
 
+/// `GET /api/transcript?path=<path>[&host=<id>]`
+///
+/// Without `?host=` (or `?host=local`): validate the path against local
+/// allowed roots and read from disk (unchanged behaviour).
+///
+/// With `?host=<remote-id>`: proxy to the remote host's `/api/transcript`
+/// endpoint. The path is forwarded verbatim — it is meaningful only on that
+/// host's filesystem. Unknown host id → 404.
 async fn get_transcript(
     State(s): State<AppState>,
     Query(q): Query<PathQ>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let host_id = q.host.as_deref().unwrap_or("local");
+
+    // Remote host: proxy via connector.
+    if host_id != "local" {
+        let conn = s.hosts.resolve(host_id).map_err(|e| match e {
+            HostConnectorError::NotFound(_) => {
+                ApiError::not_found(format!("host {host_id} not found"))
+            }
+            other => ApiError::internal(other.to_string()),
+        })?;
+        let result = conn.get_transcript(&q.path).await.map_err(|e| match e {
+            HostConnectorError::NotFound(_) => ApiError::not_found(e.to_string()),
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(result));
+    }
+
+    // Local path: validate against allowed roots then read from disk.
     let path =
         validate_transcript_path(&q.path, &allowed_roots(&s)).map_err(ApiError::bad_request)?;
     // A validated-but-not-yet-written transcript (freshly-sent turn) is an empty

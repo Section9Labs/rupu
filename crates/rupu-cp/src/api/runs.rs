@@ -1,5 +1,6 @@
 use crate::{
     error::{ApiError, ApiResult},
+    host::connector::{HostConnectorError, RunKind, RunListQuery},
     state::AppState,
 };
 use axum::{
@@ -8,10 +9,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::future::join_all;
 use rupu_orchestrator::{
     runs::{CancelError, CancelOutcome},
     ApprovalError, RunRecord, RunStatus, RunStoreError,
 };
+use std::sync::Arc;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -55,6 +58,15 @@ fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Value>> {
     ))
 }
 
+/// Optional `?host=<id>` query param for control endpoints
+/// (`approve` / `reject` / `cancel`).
+/// Absent or `"local"` → today's local logic. Remote id → proxy via connector.
+#[derive(serde::Deserialize, Default)]
+struct RunControlQuery {
+    #[serde(default)]
+    host: Option<String>,
+}
+
 /// Optional body for `POST /api/runs/:id/approve`. `mode` selects the
 /// permission mode (`ask` / `bypass` / `readonly`) the resumed run runs
 /// under; an absent/empty body leaves it `None` (worker default).
@@ -64,25 +76,46 @@ struct ApproveBody {
     mode: Option<String>,
 }
 
-/// `POST /api/runs/:id/approve` — record a web approval decision for a paused
-/// (awaiting-approval) run. Sets the `resume_requested_at` marker (and the
-/// optional `resume_mode`) that a background worker picks up to re-enter the
-/// workflow; this endpoint does NOT execute the run itself. The run stays
-/// `AwaitingApproval` until the worker approves+resumes it.
+/// `POST /api/runs/:id/approve[?host=<id>]` — record a web approval decision for
+/// a paused (awaiting-approval) run.
+///
+/// Without `?host=` (or `?host=local`): sets the `resume_requested_at` marker
+/// (and the optional `resume_mode`) that a background worker picks up. The run
+/// stays `AwaitingApproval` until the worker resumes it.
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::approve_run`] and
+/// returns `{ "ok": true, "host_id": "<id>" }`.
 ///
 /// The JSON body is optional — a bodyless POST is accepted and treated as
 /// `mode = None`.
 async fn approve_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
     body: Option<Json<ApproveBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        let mode = body
+            .and_then(|b| b.0.mode)
+            .unwrap_or_default();
+        conn.approve_run(&id, &mode).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
+    }
+    // Local path: unchanged.
     let now = chrono::Utc::now();
     let mode = body.and_then(|b| b.0.mode);
     s.run_store
         .request_resume_approval(&id, "web", mode.as_deref(), now)
         .map_err(|e| map_approval_err(&id, e))?;
-    run_response(&s, &id)
+    let mut resp = run_response(&s, &id)?;
+    resp.0["host_id"] = serde_json::json!("local");
+    Ok(resp)
 }
 
 #[derive(serde::Deserialize)]
@@ -91,19 +124,38 @@ struct RejectBody {
     reason: Option<String>,
 }
 
-/// `POST /api/runs/:id/reject` — record a web rejection decision for a paused
-/// run, transitioning it to the terminal `Rejected` state.
+/// `POST /api/runs/:id/reject[?host=<id>]` — record a web rejection decision.
+///
+/// Without `?host=` (or `?host=local`): transitions the run to `Rejected`.
+/// With `?host=<remote-id>`: proxies via [`HostConnector::reject_run`] and
+/// returns `{ "ok": true, "host_id": "<id>" }`.
 async fn reject_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
     Json(body): Json<RejectBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        conn.reject_run(&id, body.reason.as_deref())
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
+        return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
+    }
+    // Local path: unchanged.
     let now = chrono::Utc::now();
     let reason = body.reason.unwrap_or_default();
     s.run_store
         .reject(&id, "web", &reason, now)
         .map_err(|e| map_approval_err(&id, e))?;
-    run_response(&s, &id)
+    let mut resp = run_response(&s, &id)?;
+    resp.0["host_id"] = serde_json::json!("local");
+    Ok(resp)
 }
 
 /// Optional body for `POST /api/runs/:id/cancel`.
@@ -125,15 +177,31 @@ fn map_cancel_err(id: &str, e: CancelError) -> ApiError {
     }
 }
 
-/// `POST /api/runs/:id/cancel` — cancel an in-flight run. A `Pending`/`Running`
-/// run is marked `Cancelled` (and its live runner TERM'd); a run paused at an
-/// approval gate is rejected. Terminal runs yield 409. The JSON body is
-/// optional — a bodyless POST uses the default reason.
+/// `POST /api/runs/:id/cancel[?host=<id>]` — cancel an in-flight run.
+///
+/// Without `?host=` (or `?host=local`): a `Pending`/`Running` run is marked
+/// `Cancelled` (and its live runner TERM'd); a run paused at an approval gate is
+/// rejected. Terminal runs yield 409. The JSON body is optional.
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::cancel_run`] and
+/// returns `{ "ok": true, "host_id": "<id>" }`.
 async fn cancel_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
     body: Option<Json<CancelBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        conn.cancel_run(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
+    }
+    // Local path: unchanged.
     let now = chrono::Utc::now();
     let reason = body
         .and_then(|b| b.0.reason)
@@ -142,7 +210,9 @@ async fn cancel_run(
         .run_store
         .cancel(&id, "web", &reason, now)
         .map_err(|e| map_cancel_err(&id, e))?;
-    run_response(&s, &id)
+    let mut resp = run_response(&s, &id)?;
+    resp.0["host_id"] = serde_json::json!("local");
+    Ok(resp)
 }
 
 /// Derive a trigger label from a [`RunRecord`].
@@ -158,6 +228,90 @@ pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
     } else {
         "manual"
     }
+}
+
+// ── Host-aware helpers ────────────────────────────────────────────────────────
+
+/// Upper-bound on rows fetched from each host during a fan-out list.
+/// Prevents unbounded merges while staying well above any realistic run count.
+const FAN_OUT_LIMIT: usize = 10_000;
+
+/// Resolve a `host_id` string to a live connector, mapping unknown host → 404.
+pub(crate) fn resolve_host(
+    s: &AppState,
+    host_id: &str,
+) -> ApiResult<Arc<dyn crate::host::connector::HostConnector>> {
+    s.hosts.resolve(host_id).map_err(|e| match e {
+        HostConnectorError::NotFound(_) => {
+            ApiError::not_found(format!("host {host_id} not found"))
+        }
+        other => ApiError::internal(other.to_string()),
+    })
+}
+
+/// Concurrently call `list_runs` on every registered host, tag each row with
+/// its `host_id`, merge, and sort newest-first. A per-host failure produces an
+/// empty contribution plus a warning — it never fails the whole merge.
+async fn fan_out_list_runs(
+    s: &AppState,
+    kind: RunKind,
+    lifecycle: Option<String>,
+) -> Vec<serde_json::Value> {
+    let hosts = s.hosts.list_hosts();
+    let futs: Vec<_> = hosts
+        .into_iter()
+        .map(|h| {
+            let registry = Arc::clone(&s.hosts);
+            let lifecycle = lifecycle.clone();
+            async move {
+                let host_id = h.id;
+                let params = RunListQuery {
+                    kind,
+                    offset: 0,
+                    limit: FAN_OUT_LIMIT,
+                    lifecycle,
+                };
+                let conn = match registry.resolve(&host_id) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            error = %e,
+                            "run fan-out: could not resolve connector; skipping host"
+                        );
+                        return Vec::new();
+                    }
+                };
+                match conn.list_runs(params).await {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|mut v| {
+                            v["host_id"] = serde_json::json!(&host_id);
+                            v
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            error = %e,
+                            "run fan-out: list_runs failed; skipping host"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let all: Vec<Vec<serde_json::Value>> = join_all(futs).await;
+    let mut merged: Vec<serde_json::Value> = all.into_iter().flatten().collect();
+    // Sort newest-first by `started_at` (ISO-8601 strings compare lexicographically).
+    merged.sort_by(|a, b| {
+        let ta = a["started_at"].as_str().unwrap_or("");
+        let tb = b["started_at"].as_str().unwrap_or("");
+        tb.cmp(ta)
+    });
+    merged
 }
 
 /// Slim list DTO for `GET /api/runs` and `GET /api/runs/workflows`.
@@ -217,22 +371,108 @@ impl RunListRow {
     }
 }
 
+/// Shared run-listing logic used by both HTTP handlers and
+/// [`crate::host::local::LocalHostConnector`].
+///
+/// Filters by `workflow_only` (true = exclude event/cron-triggered runs) and
+/// the optional `lifecycle` group, sorts newest-first, and paginates.
+pub(crate) fn query_run_rows(
+    store: &rupu_orchestrator::runs::RunStore,
+    offset: usize,
+    limit: usize,
+    lifecycle: Option<&str>,
+    workflow_only: bool,
+    pricing: &rupu_config::PricingConfig,
+) -> Result<Vec<RunListRow>, rupu_orchestrator::RunStoreError> {
+    let mut runs = store.list()?;
+    if workflow_only {
+        runs.retain(|r| r.event.is_none() && r.source_wake_id.is_none());
+    }
+    if let Some(lc) = lifecycle {
+        runs.retain(|r| in_lifecycle(r.status, Some(lc)));
+    }
+    runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
+    let page = crate::pagination::PageQuery {
+        offset: Some(offset),
+        limit: Some(limit),
+    };
+    let page_runs = crate::pagination::paginate(runs, &page);
+    Ok(page_runs
+        .iter()
+        .map(|r| RunListRow::with_usage(r, store, pricing))
+        .collect())
+}
+
+/// Shared run-detail builder used by both HTTP handlers and
+/// [`crate::host::local::LocalHostConnector`].
+///
+/// Returns the `{ run, steps, usage }` JSON object `GET /api/runs/:id` produces.
+pub(crate) fn query_run_detail(
+    store: &rupu_orchestrator::runs::RunStore,
+    id: &str,
+    pricing: &rupu_config::PricingConfig,
+) -> Result<serde_json::Value, rupu_orchestrator::RunStoreError> {
+    let record = store.load(id)?;
+    let steps = store.read_step_results(id).unwrap_or_default();
+    let usage = crate::usage::summarize_run(store, id, pricing);
+    Ok(serde_json::json!({ "run": record, "steps": steps, "usage": usage }))
+}
+
+/// Query params for `GET /api/runs`: offset/limit paging plus an optional
+/// `?host=<id>` to scope to a single host (omitting fans out across all hosts).
+#[derive(serde::Deserialize, Default)]
+struct RunsListQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+    /// When present, restrict to this host only; absent → fan-out all hosts.
+    host: Option<String>,
+}
+
+impl RunsListQuery {
+    fn page(&self) -> crate::pagination::PageQuery {
+        crate::pagination::PageQuery {
+            offset: self.offset,
+            limit: self.limit,
+        }
+    }
+}
+
+/// `GET /api/runs[?host=<id>]`
+///
+/// Without `?host=`: fan-out across every registered host concurrently, tag
+/// each row with `host_id`, merge newest-first, paginate.
+///
+/// With `?host=<id>`: list only that host's runs (tagged with `host_id`).
+/// Unknown host id → 404.
 async fn list_runs(
     State(s): State<AppState>,
-    Query(page): Query<crate::pagination::PageQuery>,
-) -> ApiResult<Json<Vec<RunListRow>>> {
-    let mut runs = s
-        .run_store
-        .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-    let page_runs = crate::pagination::paginate(runs, &page);
-    Ok(Json(
-        page_runs
-            .iter()
-            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
-            .collect(),
-    ))
+    Query(q): Query<RunsListQuery>,
+) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let page = q.page();
+    if let Some(host_id) = &q.host {
+        let conn = resolve_host(&s, host_id)?;
+        let params = RunListQuery {
+            kind: RunKind::All,
+            offset: page.offset(),
+            limit: page.limit(),
+            lifecycle: None,
+        };
+        let rows = conn
+            .list_runs(params)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let tagged: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|mut v| {
+                v["host_id"] = serde_json::json!(host_id);
+                v
+            })
+            .collect();
+        return Ok(Json(tagged));
+    }
+    // Fan-out: collect all hosts → merge → paginate.
+    let rows = fan_out_list_runs(&s, RunKind::All, None).await;
+    Ok(Json(crate::pagination::paginate(rows, &page)))
 }
 
 #[derive(serde::Deserialize)]
@@ -244,6 +484,9 @@ struct WorkflowRunsQuery {
     limit: Option<usize>,
     /// Optional lifecycle group: `active` | `completed` | `failed`.
     lifecycle: Option<String>,
+    /// When present, restrict to this host; absent → fan-out all hosts.
+    #[serde(default)]
+    host: Option<String>,
 }
 
 impl WorkflowRunsQuery {
@@ -271,55 +514,109 @@ fn in_lifecycle(status: RunStatus, group: Option<&str>) -> bool {
     }
 }
 
-/// `GET /api/runs/workflows` — manual/direct runs only (no event or cron wake).
+/// `GET /api/runs/workflows[?host=<id>]` — manual/direct runs only (no event or
+/// cron wake), with the same fan-out / single-host routing as `list_runs`.
 async fn list_workflow_runs(
     State(s): State<AppState>,
     Query(q): Query<WorkflowRunsQuery>,
-) -> ApiResult<Json<Vec<RunListRow>>> {
-    let lifecycle = q.lifecycle.as_deref();
-    let mut runs: Vec<RunRecord> = s
-        .run_store
-        .list()
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .into_iter()
-        .filter(|r| r.event.is_none() && r.source_wake_id.is_none())
-        .filter(|r| in_lifecycle(r.status, lifecycle))
-        .collect();
-    runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
-    let page_runs = crate::pagination::paginate(runs, &q.page());
-    Ok(Json(
-        page_runs
-            .iter()
-            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
-            .collect(),
-    ))
+) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let page = q.page();
+    if let Some(host_id) = &q.host {
+        let conn = resolve_host(&s, host_id)?;
+        let params = RunListQuery {
+            kind: RunKind::Workflow,
+            offset: page.offset(),
+            limit: page.limit(),
+            lifecycle: q.lifecycle.clone(),
+        };
+        let rows = conn
+            .list_runs(params)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let tagged: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|mut v| {
+                v["host_id"] = serde_json::json!(host_id);
+                v
+            })
+            .collect();
+        return Ok(Json(tagged));
+    }
+    let rows = fan_out_list_runs(&s, RunKind::Workflow, q.lifecycle.clone()).await;
+    Ok(Json(crate::pagination::paginate(rows, &page)))
 }
 
+/// Optional `?host=<id>` query param for `GET /api/runs/:id`.
+#[derive(serde::Deserialize, Default)]
+struct RunDetailQuery {
+    /// When present and not `"local"`, proxy the request to the named host.
+    host: Option<String>,
+}
+
+/// `GET /api/runs/:id[?host=<id>]`
+///
+/// Without `?host=` (or `?host=local`): read from the local store (unchanged).
+/// With `?host=<remote-id>`: proxy to that host's `GET /api/runs/:id`.
+/// Unknown host id → 404.
 async fn get_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunDetailQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let record = s.run_store.load(&id).map_err(|e| match e {
+    let host_id = q.host.as_deref().unwrap_or("local");
+    if host_id != "local" {
+        let conn = resolve_host(&s, host_id)?;
+        let detail = conn.get_run(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(_) => {
+                ApiError::not_found(format!("run {id} not found"))
+            }
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(detail));
+    }
+    // Local path: unchanged
+    let detail = query_run_detail(&s.run_store, &id, &s.pricing).map_err(|e| match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         other => ApiError::internal(other.to_string()),
     })?;
-    let steps = s.run_store.read_step_results(&id).unwrap_or_default();
-    let usage = crate::usage::summarize_run(&s.run_store, &id, &s.pricing);
-    Ok(Json(
-        serde_json::json!({ "run": record, "steps": steps, "usage": usage }),
-    ))
+    Ok(Json(detail))
 }
 
-/// `GET /api/runs/:id/log` — tail the run's `events.jsonl` as a live SSE stream.
+/// `GET /api/runs/:id/log[?host=<id>]` — tail the run's `events.jsonl` as a
+/// live SSE stream.
 ///
-/// Returns 404 if the run does not exist. The stream stays open while the run
-/// is in progress and emits each [`rupu_orchestrator::executor::Event`] as a
-/// JSON `data:` line.
+/// Without `?host=` (or `?host=local`): reads from the local `events.jsonl`
+/// (unchanged from before). Returns 404 if the run does not exist.
+///
+/// With `?host=<remote-id>`: resolves the connector and proxies
+/// [`HostConnector::stream_run_events`] as an SSE response — mirrors exactly
+/// how `events_stream` builds the proxied SSE stream. Unknown host id → 404.
+///
+/// The stream stays open while the run is in progress and emits each
+/// [`rupu_orchestrator::executor::Event`] as a JSON `data:` line.
 async fn get_run_log(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunDetailQuery>,
 ) -> Result<Response, ApiError> {
-    // Verify the run exists before opening the tail.
+    let host_id = q.host.as_deref().unwrap_or("local");
+
+    // Remote host: proxy stream_run_events via the connector.
+    if host_id != "local" {
+        let conn = resolve_host(&s, host_id)?;
+        let stream = conn.stream_run_events(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(_) => {
+                ApiError::not_found(format!("run {id} not found on host {host_id}"))
+            }
+            HostConnectorError::Unreachable(m) => {
+                ApiError::internal(format!("host {host_id} unreachable: {m}"))
+            }
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return crate::api::events::proxy_event_byte_stream(stream);
+    }
+
+    // Local path: unchanged — verify the run exists, then tail its events.jsonl.
     s.run_store.load(&id).map_err(|e| match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         other => ApiError::internal(other.to_string()),
@@ -357,24 +654,12 @@ async fn get_run_usage_timeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rupu_orchestrator::RunStore;
     use std::path::PathBuf;
-    use std::sync::Arc;
 
     /// Build an `AppState` backed by a fresh tempdir run store.
     fn test_state(tmp: &tempfile::TempDir) -> AppState {
-        let store = RunStore::new(tmp.path().join("runs"));
-        AppState {
-            global_dir: tmp.path().to_path_buf(),
-            workspace_dir: tmp.path().to_path_buf(),
-            run_store: Arc::new(store),
-            pricing: rupu_config::PricingConfig::default(),
-            launcher: None,
-            session_sender: None,
-            repos: None,
-            agent_launcher: None,
-            session_starter: None,
-        }
+        AppState::new(tmp.path().to_path_buf(), rupu_config::PricingConfig::default())
+            .with_workspace_dir(tmp.path().to_path_buf())
     }
 
     /// An `awaiting_approval` run record paused at `step_id`.
@@ -422,13 +707,19 @@ mod tests {
             .create(awaiting_record("run_app", "gate"), "name: x\n")
             .unwrap();
 
-        let resp = approve_run(State(s.clone()), Path("run_app".into()), None)
-            .await
-            .expect("approve should succeed");
+        let resp = approve_run(
+            State(s.clone()),
+            Path("run_app".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect("approve should succeed");
         // Marker-only: the endpoint records the approval but leaves the
         // run AwaitingApproval for the background worker to approve+resume.
         let body = resp.0;
         assert_eq!(body["run"]["status"], serde_json::json!("awaiting_approval"));
+        assert_eq!(body["host_id"], "local");
 
         let loaded = s.run_store.load("run_app").unwrap();
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
@@ -449,10 +740,16 @@ mod tests {
         let body = RejectBody {
             reason: Some("not safe".into()),
         };
-        let resp = reject_run(State(s.clone()), Path("run_rej".into()), Json(body))
-            .await
-            .expect("reject should succeed");
+        let resp = reject_run(
+            State(s.clone()),
+            Path("run_rej".into()),
+            Query(RunControlQuery { host: None }),
+            Json(body),
+        )
+        .await
+        .expect("reject should succeed");
         assert_eq!(resp.0["run"]["status"], serde_json::json!("rejected"));
+        assert_eq!(resp.0["host_id"], "local");
 
         let loaded = s.run_store.load("run_rej").unwrap();
         assert_eq!(loaded.status, RunStatus::Rejected);
@@ -472,9 +769,14 @@ mod tests {
         rec.awaiting_step_id = None;
         s.run_store.create(rec, "name: x\n").unwrap();
 
-        let err = approve_run(State(s), Path("run_done".into()), None)
-            .await
-            .expect_err("approve on completed run should fail");
+        let err = approve_run(
+            State(s),
+            Path("run_done".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect_err("approve on completed run should fail");
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
@@ -485,6 +787,7 @@ mod tests {
         let err = reject_run(
             State(s),
             Path("nope".into()),
+            Query(RunControlQuery { host: None }),
             Json(RejectBody { reason: None }),
         )
         .await
@@ -503,9 +806,14 @@ mod tests {
         let body = ApproveBody {
             mode: Some("bypass".into()),
         };
-        let _ = approve_run(State(s.clone()), Path("run_mode".into()), Some(Json(body)))
-            .await
-            .expect("approve should succeed");
+        let _ = approve_run(
+            State(s.clone()),
+            Path("run_mode".into()),
+            Query(RunControlQuery { host: None }),
+            Some(Json(body)),
+        )
+        .await
+        .expect("approve should succeed");
 
         let loaded = s.run_store.load("run_mode").unwrap();
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
@@ -521,9 +829,14 @@ mod tests {
             .create(awaiting_record("run_nobody", "gate"), "name: x\n")
             .unwrap();
 
-        let _ = approve_run(State(s.clone()), Path("run_nobody".into()), None)
-            .await
-            .expect("bodyless approve should succeed");
+        let _ = approve_run(
+            State(s.clone()),
+            Path("run_nobody".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect("bodyless approve should succeed");
 
         let loaded = s.run_store.load("run_nobody").unwrap();
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
@@ -543,10 +856,16 @@ mod tests {
         rec.runner_pid = None;
         s.run_store.create(rec, "name: x\n").unwrap();
 
-        let resp = cancel_run(State(s.clone()), Path("run_cancel".into()), None)
-            .await
-            .expect("cancel should succeed");
+        let resp = cancel_run(
+            State(s.clone()),
+            Path("run_cancel".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect("cancel should succeed");
         assert_eq!(resp.0["run"]["status"], serde_json::json!("cancelled"));
+        assert_eq!(resp.0["host_id"], "local");
 
         let loaded = s.run_store.load("run_cancel").unwrap();
         assert_eq!(loaded.status, RunStatus::Cancelled);
@@ -569,9 +888,14 @@ mod tests {
         let body = CancelBody {
             reason: Some("too late".into()),
         };
-        let err = cancel_run(State(s), Path("run_term".into()), Some(Json(body)))
-            .await
-            .expect_err("cancel on completed run should fail");
+        let err = cancel_run(
+            State(s),
+            Path("run_term".into()),
+            Query(RunControlQuery { host: None }),
+            Some(Json(body)),
+        )
+        .await
+        .expect_err("cancel on completed run should fail");
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
@@ -579,9 +903,14 @@ mod tests {
     async fn cancel_unknown_run_is_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
-        let err = cancel_run(State(s), Path("ghost".into()), None)
-            .await
-            .expect_err("cancel on missing run should 404");
+        let err = cancel_run(
+            State(s),
+            Path("ghost".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect_err("cancel on missing run should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 

@@ -27,6 +27,10 @@ pub struct AppState {
     /// Optional session-starter port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess-spawning adapter via [`AppState::with_session_starter`].
     pub session_starter: Option<Arc<dyn crate::session_starter::SessionStarter>>,
+    /// Host registry. Defaults to a local-only registry (no launchers) so that
+    /// read-only `rupu cp` works without a running daemon. `cp serve` replaces
+    /// this with a fully-wired registry via [`AppState::with_hosts`].
+    pub hosts: Arc<crate::host::registry::HostRegistry>,
 }
 
 impl AppState {
@@ -34,6 +38,25 @@ impl AppState {
         let run_store = Arc::new(RunStore::new(global_dir.join("runs")));
         let workspace_dir =
             std::env::current_dir().unwrap_or_else(|_| global_dir.clone());
+
+        // Build a read-only local-only registry. All launchers are `None` so
+        // write-path operations return `HostConnectorError::Invalid`; list/get
+        // run queries work fine because they only need `run_store`.
+        let local = crate::host::local::LocalHostConnector::new(
+            None,
+            None,
+            None,
+            None,
+            Arc::clone(&run_store),
+            global_dir.clone(),
+        )
+        .with_pricing(pricing.clone());
+        let store = rupu_workspace::HostStore { root: global_dir.join("hosts") };
+        let hosts = Arc::new(crate::host::registry::HostRegistry::new(
+            store,
+            Arc::new(local),
+        ));
+
         Self {
             global_dir,
             workspace_dir,
@@ -44,6 +67,7 @@ impl AppState {
             repos: None,
             agent_launcher: None,
             session_starter: None,
+            hosts,
         }
     }
 
@@ -89,6 +113,14 @@ impl AppState {
         starter: Option<Arc<dyn crate::session_starter::SessionStarter>>,
     ) -> Self {
         self.session_starter = starter;
+        self
+    }
+
+    /// Replace the host registry. Used by `cp serve` to install a fully-wired
+    /// registry (with real launchers) after the default read-only one built in
+    /// [`AppState::new`].
+    pub fn with_hosts(mut self, hosts: Arc<crate::host::registry::HostRegistry>) -> Self {
+        self.hosts = hosts;
         self
     }
 
