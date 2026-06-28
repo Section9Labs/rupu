@@ -5,6 +5,7 @@
 //! lives on disk.
 
 use crate::repo_store::sanitize_component;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -73,7 +74,7 @@ impl Host {
             id: "local".into(),
             name: "local".into(),
             transport: HostTransport::Local,
-            created_at: String::new(),
+            created_at: Utc::now().to_rfc3339(),
             last_seen_at: None,
         }
     }

@@ -38,7 +38,8 @@ pub use repo_store::{repo_ref_key, RepoRegistryStore, RepoStoreError};
 pub use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};
 pub use store::{upsert, StoreError, WorkspaceStore};
 pub use host_store::{
-    delete_host_token, get_host_token, set_host_token, Host, HostStatus, HostStore, HostTransport,
+    delete_host_token, get_host_token, set_host_token, Host, HostStoreError, HostStatus, HostStore,
+    HostTransport,
 };
 pub use worker_store::{WorkerStore, WorkerStoreError};
 pub use worktree_layout::{issue_dir_name, issue_worktree_path, repo_dir_name};

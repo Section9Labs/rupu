@@ -6496,6 +6496,7 @@ version = "0.25.1"
 dependencies = [
  "assert_fs",
  "chrono",
+ "keyring",
  "predicates",
  "rupu-runtime",
  "serde",
