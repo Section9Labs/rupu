@@ -5,18 +5,14 @@
 //! generated workflow needs [`crate::Workflow::parse`], and orchestrator
 //! already depends on `rupu-runtime` for `build_for_provider` — putting it
 //! in runtime would cycle.
-//!
-//! Task 2 (`generate_definition`) and Task 3 (`pick_default_gen_model`) add
-//! the async execution surface on top of these pure helpers.  When adding
-//! those functions, also add:
-//!   `use rupu_providers::types::{LlmRequest, Message};`
-//!   `use rupu_runtime::provider_factory::build_for_provider;`
+
+use rupu_providers::types::{LlmRequest, Message};
+use rupu_runtime::provider_factory::build_for_provider;
 
 /// Total send attempts (1 first try + repairs) before giving up.
 pub const MAX_ATTEMPTS: u8 = 3;
 
 /// Output token ceiling for a generated definition.
-#[allow(dead_code)]
 const MAX_TOKENS: u32 = 8192;
 
 /// Provider preference order + the model each one generates with. Seeded
@@ -36,8 +32,6 @@ pub enum GenKind {
 }
 
 impl GenKind {
-    // Used by generate_definition (Task 2) to build the `Invalid` error variant.
-    #[allow(dead_code)]
     fn noun(self) -> &'static str {
         match self {
             GenKind::Agent => "agent",
@@ -152,6 +146,62 @@ each with id/agent/prompt), and `panel:` (panelists list + subject + prompt, opt
 Keep it minimal unless the description calls for fan-out.\n\nNever leave `agent:` empty \
 \u{2014} every linear/for_each step must name a real agent.\n";
 
+/// Generate a validated definition, repairing up to [`MAX_ATTEMPTS`].
+pub async fn generate_definition(
+    req: &GenerateRequest,
+    resolver: &dyn rupu_auth::CredentialResolver,
+) -> Result<GenerateOutcome, GenerateError> {
+    let (_mode, mut provider) = build_for_provider(&req.provider, &req.model, None, resolver)
+        .await
+        .map_err(|_| GenerateError::NoCredentials)?;
+
+    let system = build_system_prompt(req.kind, &req.available_agents);
+    let mut messages = vec![Message::user(&format!(
+        "Create a rupu {} from this description:\n\n{}",
+        req.kind.noun(),
+        req.description
+    ))];
+
+    let mut last_error = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let llm_req = LlmRequest {
+            model: req.model.clone(),
+            system: Some(system.clone()),
+            messages: messages.clone(),
+            max_tokens: MAX_TOKENS,
+            ..Default::default()
+        };
+        let resp = provider.send(&llm_req).await?;
+        let raw = resp.text().ok_or(GenerateError::Empty)?.to_string();
+        let content = strip_fences(&raw).to_string();
+
+        match validate(req.kind, &content) {
+            Ok(()) => {
+                return Ok(GenerateOutcome {
+                    content,
+                    provider: req.provider.clone(),
+                    model: req.model.clone(),
+                    attempts: attempt,
+                });
+            }
+            Err(e) => {
+                last_error = e;
+                messages.push(Message::assistant(&raw));
+                messages.push(Message::user(&format!(
+                    "Your previous output failed to parse as a valid rupu {}: {last_error}\n\nReturn the corrected full file. Output ONLY the file content.",
+                    req.kind.noun()
+                )));
+            }
+        }
+    }
+
+    Err(GenerateError::Invalid {
+        kind: req.kind.noun(),
+        attempts: MAX_ATTEMPTS,
+        last_error,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +238,91 @@ mod tests {
         );
         assert!(p.contains("reviewer"));
         assert!(p.contains("fixer"));
+    }
+
+    use rupu_auth::in_memory::InMemoryResolver;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    // Env-var seam is process-global; serialize.
+    static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+    const VALID_AGENT_MD: &str = "---\nname: gen-agent\ndescription: a test agent\nprovider: anthropic\nmodel: claude-sonnet-4-6\n---\n\nYou are a helpful test agent.\n";
+
+    #[tokio::test]
+    async fn generate_returns_valid_content_first_try() {
+        let _g = ENV_LOCK.lock().await;
+        let script = serde_json::json!([
+            { "AssistantText": { "text": VALID_AGENT_MD, "stop": "end_turn" } }
+        ])
+        .to_string();
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", &script);
+
+        let resolver = InMemoryResolver::new();
+        let req = GenerateRequest {
+            kind: GenKind::Agent,
+            description: "a helpful test agent".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            available_agents: vec![],
+        };
+        let out = generate_definition(&req, &resolver).await.expect("ok");
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        assert_eq!(out.attempts, 1);
+        assert!(out.content.contains("name: gen-agent"));
+    }
+
+    #[tokio::test]
+    async fn generate_repairs_invalid_then_succeeds() {
+        let _g = ENV_LOCK.lock().await;
+        // First turn: invalid (no frontmatter). Second turn: valid.
+        let script = serde_json::json!([
+            { "AssistantText": { "text": "not a valid agent file", "stop": "end_turn" } },
+            { "AssistantText": { "text": VALID_AGENT_MD, "stop": "end_turn" } }
+        ])
+        .to_string();
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", &script);
+
+        let resolver = InMemoryResolver::new();
+        let req = GenerateRequest {
+            kind: GenKind::Agent,
+            description: "x".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            available_agents: vec![],
+        };
+        let out = generate_definition(&req, &resolver).await.expect("ok");
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        assert_eq!(out.attempts, 2);
+        assert!(out.content.contains("name: gen-agent"));
+    }
+
+    #[tokio::test]
+    async fn generate_errors_when_never_valid() {
+        let _g = ENV_LOCK.lock().await;
+        let script = serde_json::json!([
+            { "AssistantText": { "text": "junk", "stop": "end_turn" } },
+            { "AssistantText": { "text": "still junk", "stop": "end_turn" } },
+            { "AssistantText": { "text": "junk again", "stop": "end_turn" } }
+        ])
+        .to_string();
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", &script);
+
+        let resolver = InMemoryResolver::new();
+        let req = GenerateRequest {
+            kind: GenKind::Agent,
+            description: "x".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            available_agents: vec![],
+        };
+        let err = generate_definition(&req, &resolver).await.unwrap_err();
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+
+        match err {
+            GenerateError::Invalid { attempts, .. } => assert_eq!(attempts, MAX_ATTEMPTS),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 }
