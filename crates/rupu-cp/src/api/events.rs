@@ -36,14 +36,14 @@ pub fn routes() -> Router<AppState> {
 /// Wrap a pre-formatted `EventByteStream` in an axum `Response` with the
 /// correct `text/event-stream` content-type. The bytes are already SSE frames
 /// (`data: {...}\n\n`), so we pass them through without re-encoding.
-fn proxy_event_byte_stream(stream: EventByteStream) -> Response {
+fn proxy_event_byte_stream(stream: EventByteStream) -> Result<Response, ApiError> {
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
-        .expect("valid response builder")
-        .into_response()
+        .map(|r| r.into_response())
+        .map_err(|e| ApiError::internal(format!("event proxy response: {e}")))
 }
 
 /// `GET /api/events/stream[?run=<id>][?host=<id>]`
@@ -79,7 +79,7 @@ async fn events_stream(
             }
             other => ApiError::internal(other.to_string()),
         })?;
-        return Ok(proxy_event_byte_stream(stream));
+        return proxy_event_byte_stream(stream);
     }
 
     // --- local: explicit run parameter ---

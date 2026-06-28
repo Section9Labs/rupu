@@ -1,3 +1,9 @@
+// NOTE(multi-host slice 1): /api/runs/agents and /api/runs/autoflows are LOCAL-ONLY.
+// They scan local filesystem sources (transcripts/sessions/autoflow history) that
+// HostConnector does not model.  Host-aware fan-out for these lists awaits
+// HostConnector::list_agent_runs / list_autoflow_runs in a later slice.
+// /api/runs and /api/runs/workflows ARE host-aware.
+
 use crate::{error::ApiResult, state::AppState};
 use axum::{
     extract::{Query, State},

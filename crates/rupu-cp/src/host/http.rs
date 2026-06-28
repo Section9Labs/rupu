@@ -213,7 +213,14 @@ impl HostConnector for HttpHostConnector {
         let mut req = self
             .client
             .get(self.url(path))
-            .query(&[("offset", params.offset.to_string()), ("limit", params.limit.to_string())]);
+            .query(&[
+                ("offset", params.offset.to_string()),
+                ("limit", params.limit.to_string()),
+                // Scope the remote CP to its own local runs so we don't get
+                // recursive fan-out in multi-hop topologies (remote CPs are
+                // host-aware and would otherwise fan out across *their* hosts).
+                ("host", "local".to_string()),
+            ]);
 
         if let Some(lc) = &params.lifecycle {
             req = req.query(&[("lifecycle", lc.as_str())]);

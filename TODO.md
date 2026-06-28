@@ -218,3 +218,7 @@ Roadmap from `docs/superpowers/specs/2026-06-18-rupu-control-plane-design.md` (P
 - ✅ **3c — visual workflow DAG editor**: freeform `@xyflow/react` canvas (palette + drag-connect) ⇄ YAML tab on the workflow page. Edges = run-after ordering; Save topo-sorts to the linear `steps:` list; concurrency only via explicit container nodes; invalid connections (self-loop/cycle/dup) rejected at draw-time with a reason. Pure core (`workflowGraph.ts`) round-trips through `js-yaml`; Save goes through the 3b validated write path; new `POST /api/workflows/validate` drives a live badge. xyflow lazy-loaded (out of main chunk).
   - Deferred (3c follow-ups): persist node layout (v1 auto-lays-out from YAML on every load); edit parallel sub-steps/panelists as first-class canvas nodes (form-managed in v1); preserve YAML comments through a graph-tab Save (rewrites canonically — flagged in-UI); per-field client validation of panel gate (server-validated + live badge today); remap edges on step rename (cosmetic — edges re-derived on reseed); project-scoped workflows (global only).
 - Phase 4 = auth/RBAC for beyond-localhost.
+
+## Multi-host (fleet)
+
+- [ ] multi-host: make /api/runs/agents + /api/runs/autoflows host-aware (needs HostConnector::list_agent_runs/list_autoflow_runs)

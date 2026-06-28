@@ -61,7 +61,8 @@ async fn list_runs_all_forwards_offset_and_limit() {
         when.method("GET")
             .path("/api/runs")
             .query_param("offset", "0")
-            .query_param("limit", "20");
+            .query_param("limit", "20")
+            .query_param("host", "local");
         then.status(200)
             .json_body(serde_json::json!([{"id": "r1", "workflow_name": "wf"}]));
     });
@@ -84,7 +85,9 @@ async fn list_runs_all_forwards_offset_and_limit() {
 async fn list_runs_workflow_hits_workflows_path() {
     let server = httpmock::MockServer::start_async().await;
     let m = server.mock(|when, then| {
-        when.method("GET").path("/api/runs/workflows");
+        when.method("GET")
+            .path("/api/runs/workflows")
+            .query_param("host", "local");
         then.status(200).json_body(serde_json::json!([]));
     });
     let c = HttpHostConnector::new(server.base_url(), None);
