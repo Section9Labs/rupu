@@ -436,6 +436,23 @@ describe('api.getTranscript', () => {
     await expect(api.getTranscript('/no/such/path.jsonl')).rejects.toThrow(ApiError);
     await expect(api.getTranscript('/no/such/path.jsonl')).rejects.toMatchObject({ status: 404 });
   });
+
+  it('appends host query param when opts.host is set', async () => {
+    mockFetch(200, { events: [], summary: null });
+    const fetchSpy = vi.mocked(fetch);
+    await api.getTranscript('/tmp/run-1/transcript.jsonl', { host: 'h1' });
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).toContain('host=h1');
+    expect(calledUrl).toContain('path=');
+  });
+
+  it('omits host query param when opts.host is absent', async () => {
+    mockFetch(200, { events: [], summary: null });
+    const fetchSpy = vi.mocked(fetch);
+    await api.getTranscript('/tmp/run-1/transcript.jsonl');
+    const calledUrl = fetchSpy.mock.calls[0][0] as string;
+    expect(calledUrl).not.toContain('host=');
+  });
 });
 
 // ---------------------------------------------------------------------------

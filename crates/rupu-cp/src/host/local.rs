@@ -241,6 +241,15 @@ impl HostConnector for LocalHostConnector {
         Ok(Box::pin(stream))
     }
 
+    async fn proxy_get_json(
+        &self,
+        _path_and_query: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Invalid(
+            "local host is served in-process".into(),
+        ))
+    }
+
     // SAFETY/CAVEAT: must not be called with untrusted paths — the HTTP
     // transcript handler enforces allowed_roots before reaching a connector;
     // this method does NOT. Do not resolve("local") + get_transcript with

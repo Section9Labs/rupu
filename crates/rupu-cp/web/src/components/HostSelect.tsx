@@ -32,7 +32,7 @@ export default function HostSelect({ value, onChange, disabled, className }: Pro
   }, []);
 
   const baseCls =
-    'rounded-md border border-border bg-white px-2.5 py-1.5 text-lead text-ink ' +
+    'rounded-md border border-border bg-panel px-2.5 py-1.5 text-lead text-ink ' +
     'focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 
   return (

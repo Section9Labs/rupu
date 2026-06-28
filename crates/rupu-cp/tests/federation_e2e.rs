@@ -13,9 +13,34 @@ use chrono::Utc;
 use reqwest::StatusCode;
 use rupu_orchestrator::runs::{RunRecord, RunStatus, RunStore};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Seed a minimal `session.json` under `<global>/sessions/<id>/`.
+fn seed_session(global: &Path, id: &str) {
+    let dir = global.join("sessions").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let payload = serde_json::json!({
+        "session_id": id,
+        "agent_name": "test-agent",
+        "model": "claude-sonnet-4-6",
+        "provider_name": "anthropic",
+        "status": "active",
+        "total_turns": 1,
+        "total_tokens_in": 0,
+        "total_tokens_out": 0,
+        "total_tokens_cached": 0,
+        "created_at": "2026-06-27T10:00:00Z",
+        "updated_at": "2026-06-27T10:00:00Z",
+        "workspace_id": "ws_fed"
+    });
+    std::fs::write(
+        dir.join("session.json"),
+        serde_json::to_string(&payload).unwrap(),
+    )
+    .unwrap();
+}
 
 /// Build a minimal `RunRecord` with the given `id` and `status`.
 fn seed_run(id: &str, status: RunStatus) -> RunRecord {
@@ -233,5 +258,135 @@ async fn central_proxies_remote_host() {
         cancelled.status,
         RunStatus::Cancelled,
         "cancel should have reached the remote and marked the run Cancelled"
+    );
+}
+
+/// Central proxies a remote session (list + detail) and a remote run graph.
+///
+/// 1. Seed a session on the **remote** (`<global>/sessions/<id>/session.json`).
+/// 2. Assert `GET central /api/sessions?host=<remote_id>` lists it tagged
+///    `host_id=<remote_id>`.
+/// 3. Assert `GET central /api/sessions/<id>?host=<remote_id>` returns it
+///    (proxied, 200).
+/// 4. Seed a workflow run on the **remote** (via `RunStore::create`).
+/// 5. Assert `GET central /api/runs/<run_id>/graph?host=<remote_id>` returns
+///    the remote's graph JSON (200 + `run.id` field present).
+#[tokio::test]
+async fn central_proxies_remote_session_and_graph() {
+    // ── Remote setup ──────────────────────────────────────────────────────────
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let session_id = "fed_e2e_sess_01";
+    let graph_run_id = "fed_e2e_graph_run_01";
+
+    // Seed a session on the remote.
+    seed_session(remote_tmp.path(), session_id);
+
+    // Seed a run for the graph assertion.
+    // Workflow::parse requires at least one step with agent + prompt.
+    let remote_store = RunStore::new(remote_tmp.path().join("runs"));
+    remote_store
+        .create(
+            seed_run(graph_run_id, RunStatus::Running),
+            "name: fed-wf\nsteps:\n  - id: step1\n    agent: test-agent\n    prompt: hello\n",
+        )
+        .unwrap();
+
+    // Spawn the remote server on an ephemeral port.
+    let remote_addr = spawn_server(remote_tmp.path()).await;
+    let remote_base_url = format!("http://{remote_addr}");
+
+    // ── Central setup ─────────────────────────────────────────────────────────
+    let central_tmp = tempfile::tempdir().unwrap();
+    let central_state = rupu_cp::state::AppState::new(
+        central_tmp.path().into(),
+        rupu_config::PricingConfig::default(),
+    );
+    let added = central_state
+        .hosts
+        .add_host("remote", &remote_base_url, None)
+        .expect("add_host should succeed");
+    let remote_host_id = added.id.clone();
+    let central_addr = spawn_server_from_state(central_state).await;
+    let client = reqwest::Client::new();
+
+    // ── Assertion 1: session list proxy ───────────────────────────────────────
+    // GET /api/sessions?host=<remote_id> must include the seeded session tagged
+    // with the correct host_id.
+    let resp = client
+        .get(format!(
+            "http://{central_addr}/api/sessions?host={remote_host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "proxied session list should return 200"
+    );
+
+    let sessions: Vec<serde_json::Value> = resp.json().await.unwrap();
+    let found_session = sessions
+        .iter()
+        .find(|s| s["session_id"].as_str() == Some(session_id))
+        .expect("seeded session should appear in the proxied session list");
+    assert_eq!(
+        found_session["host_id"].as_str(),
+        Some(remote_host_id.as_str()),
+        "proxied session rows must carry the remote host_id"
+    );
+
+    // ── Assertion 2: session detail proxy ─────────────────────────────────────
+    // GET /api/sessions/<id>?host=<remote_id> must return the session object.
+    let resp = client
+        .get(format!(
+            "http://{central_addr}/api/sessions/{session_id}?host={remote_host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "proxied session detail should return 200"
+    );
+
+    let detail: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        detail["session_id"].as_str(),
+        Some(session_id),
+        "proxied session detail must include the correct session_id"
+    );
+    assert_eq!(
+        detail["agent_name"].as_str(),
+        Some("test-agent"),
+        "proxied session detail must carry the agent_name"
+    );
+
+    // ── Assertion 3: run graph proxy ──────────────────────────────────────────
+    // GET /api/runs/<run_id>/graph?host=<remote_id> must forward to the remote
+    // and return a recognisable graph object.
+    let resp = client
+        .get(format!(
+            "http://{central_addr}/api/runs/{graph_run_id}/graph?host={remote_host_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "proxied run graph should return 200"
+    );
+
+    let graph: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        graph["run"]["id"].as_str(),
+        Some(graph_run_id),
+        "proxied graph must include the seeded run id in run.id"
+    );
+    assert!(
+        graph.get("workflow").is_some(),
+        "proxied graph must include the workflow DAG field"
     );
 }

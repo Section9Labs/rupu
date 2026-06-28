@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { MessageSquare, RefreshCw } from 'lucide-react';
-import { api, type SessionSummary } from '../lib/api';
+import { api, type SessionSummary, type HostView } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { Button } from '../components/ui/Button';
@@ -18,6 +18,8 @@ import { sessionStatusDot, sessionStatusLabel } from '../lib/sessionStatus';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
 const PAGE = 20;
+/** Sentinel select value meaning "fetch all hosts" (fan-out / no ?host= param). */
+const ALL_HOSTS = '__all__';
 
 type Tab = 'active' | 'archived';
 
@@ -36,15 +38,25 @@ export default function Sessions() {
   const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
+  const [hostFilter, setHostFilter] = useState<string>('local');
+  const [hosts, setHosts] = useState<HostView[] | null>(null);
 
-  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab change.
+  useEffect(() => {
+    let cancelled = false;
+    api.getHosts().then((hs) => { if (!cancelled) setHosts(hs); }).catch(() => { if (!cancelled) setHosts([]); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab/host change.
   // Active: fetch ALL in one call (unpaginated) → poll never resets a scrolled
   // list. Archived: page-0 only; loadMore appends.
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
       const limit = tab === 'active' ? 200 : PAGE;
-      const data = await api.getSessions({ scope: tab, limit });
+      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+      const data = await api.getSessions({ scope: tab, limit, host });
       setSessions(data);
       setHasMore(tab !== 'active' && data.length >= PAGE);
       setError(null);
@@ -53,22 +65,23 @@ export default function Sessions() {
     } finally {
       setRefreshing(false);
     }
-  }, [tab]);
+  }, [tab, hostFilter]);
 
   useEffect(() => {
-    setSessions(null); // show loading on tab switch
+    setSessions(null); // show loading on tab/host switch
     void refresh();
     if (tab === 'active') {
       const t = window.setInterval(() => void refresh(), 5000);
       return () => window.clearInterval(t);
     }
     return () => {};
-  }, [tab, refresh]);
+  }, [tab, hostFilter, refresh]);
 
   const loadMore = async () => {
     if (tab === 'active') return; // active is unpaginated
     const current = sessions ?? [];
-    const next = await api.getSessions({ scope: tab, offset: current.length, limit: PAGE });
+    const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+    const next = await api.getSessions({ scope: tab, offset: current.length, limit: PAGE, host });
     if (next.length === 0) { setHasMore(false); return; }
     setSessions([...current, ...next]);
     if (next.length < PAGE) setHasMore(false);
@@ -95,7 +108,7 @@ export default function Sessions() {
       </header>
 
       {/* Scope tabs */}
-      <div className="flex items-center gap-2 mb-5">
+      <div className="flex items-center gap-2 mb-4">
         {TABS.map((t) => (
           <button
             key={t.id}
@@ -112,6 +125,24 @@ export default function Sessions() {
         ))}
       </div>
 
+      {/* Host filter — drives server-side fetch scope. */}
+      <div className="flex items-center gap-2 mb-5">
+        <select
+          value={hostFilter}
+          onChange={(e) => setHostFilter(e.target.value)}
+          aria-label="Host filter"
+          className="text-xs font-medium px-2 py-1 rounded-md border border-border bg-panel text-ink-dim focus:outline-none focus:border-brand-500"
+        >
+          <option value="local">This host</option>
+          <option value={ALL_HOSTS}>All hosts</option>
+          {(hosts ?? [])
+            .filter((h) => h.transport_kind !== 'local')
+            .map((h) => (
+              <option key={h.id} value={h.id}>{h.name}</option>
+            ))}
+        </select>
+      </div>
+
       {error && (
         <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
@@ -126,12 +157,17 @@ export default function Sessions() {
         <div className="space-y-6">
           {rows.some((s) => s.usage) && (
             <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
-              <UsageBarChart bars={rows.filter((s) => s.usage).map((s) => ({
-                id: s.session_id, label: s.agent_name,
-                to: `/sessions/${encodeURIComponent(s.session_id)}`,
-                input_tokens: s.usage?.input_tokens ?? 0, output_tokens: s.usage?.output_tokens ?? 0,
-                cached_tokens: s.usage?.cached_tokens ?? 0, cost_usd: s.usage?.cost_usd ?? null,
-              }))} />
+              <UsageBarChart bars={rows.filter((s) => s.usage).map((s) => {
+                const hostSuffix = s.host_id && s.host_id !== 'local'
+                  ? `?host=${encodeURIComponent(s.host_id)}`
+                  : '';
+                return {
+                  id: s.session_id, label: s.agent_name,
+                  to: `/sessions/${encodeURIComponent(s.session_id)}${hostSuffix}`,
+                  input_tokens: s.usage?.input_tokens ?? 0, output_tokens: s.usage?.output_tokens ?? 0,
+                  cached_tokens: s.usage?.cached_tokens ?? 0, cost_usd: s.usage?.cost_usd ?? null,
+                };
+              })} />
             </div>
           )}
           {/* No initialSort: the server returns sessions most-recent (updated_at)
@@ -184,13 +220,27 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
   {
     key: 'session',
     header: 'Session',
+    render: (s) => {
+      const hostSuffix = s.host_id && s.host_id !== 'local'
+        ? `?host=${encodeURIComponent(s.host_id)}`
+        : '';
+      return (
+        <Link
+          to={`/sessions/${encodeURIComponent(s.session_id)}${hostSuffix}`}
+          className="text-note text-ink-mute font-mono hover:underline"
+        >
+          {shortId(s.session_id)}
+        </Link>
+      );
+    },
+  },
+  {
+    key: 'host',
+    header: 'Host',
+    sortable: true,
+    sortValue: (s) => s.host_id ?? 'local',
     render: (s) => (
-      <Link
-        to={`/sessions/${encodeURIComponent(s.session_id)}`}
-        className="text-note text-ink-mute font-mono hover:underline"
-      >
-        {shortId(s.session_id)}
-      </Link>
+      <span className="text-note text-ink-mute font-mono">{s.host_id ?? 'local'}</span>
     ),
   },
   {

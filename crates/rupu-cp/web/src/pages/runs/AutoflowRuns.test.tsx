@@ -2,18 +2,45 @@
 // AutoflowRuns — the Claims tab lists active autoflow claims, each with
 // Requeue + Release controls. The page's mount fetch (events + cycles) is
 // stubbed so the test can switch to Claims and drive the per-row actions.
+// Also tests the host filter that drives server-side fetch scope for the
+// Launched runs and Cycles tabs.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, type AutoflowClaim } from '../../lib/api';
+import { api, type AutoflowClaim, type AutoflowEventRow, type HostView } from '../../lib/api';
 import AutoflowRuns from './AutoflowRuns';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
+
+const LOCAL_HOST: HostView = {
+  id: 'local',
+  name: 'Local',
+  transport_kind: 'local',
+  status: 'online',
+  active_run_count: 0,
+};
+const REMOTE_HOST: HostView = {
+  id: 'host_prod',
+  name: 'prod',
+  transport_kind: 'http_cp',
+  status: 'online',
+  active_run_count: 1,
+};
+
+const REMOTE_EVENT: AutoflowEventRow = {
+  event_id: 'evt-1',
+  cycle_id: 'cyc-1',
+  at: '2026-06-01T00:00:00Z',
+  kind: 'run_launched',
+  workflow: 'fix-issue',
+  usage: { input_tokens: 100, output_tokens: 50, cached_tokens: 0, total_tokens: 150, cost_usd: null, priced: false, runs: 1 },
+  host_id: 'host_prod',
+};
 
 const CLAIM: AutoflowClaim = {
   issue_ref: 'github:acme/widgets#42',
@@ -33,6 +60,7 @@ const CLAIM: AutoflowClaim = {
 };
 
 function stubPage() {
+  vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
   vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
   vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
 }
@@ -96,5 +124,58 @@ describe('AutoflowRuns — Claims tab', () => {
 
     fireEvent.click(screen.getByText('Requeue'));
     await waitFor(() => expect(requeue).toHaveBeenCalledWith('github:acme/widgets#42'));
+  });
+});
+
+describe('AutoflowRuns host filter — server-driven (runs + cycles tabs)', () => {
+  it('default fetch passes host: "local" to both events and runs', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    const eventsSpy = vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
+    const runsSpy = vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+
+    await waitFor(() =>
+      expect(eventsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'local' })),
+    );
+    expect(runsSpy).toHaveBeenCalledWith(expect.objectContaining({ host: 'local' }));
+  });
+
+  it('"All hosts" option fetches without a host param', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    const eventsSpy = vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+    await waitFor(() => expect(screen.getByLabelText('Host filter')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByLabelText('Host filter'), { target: { value: '__all__' } });
+
+    await waitFor(() => {
+      const calls = eventsSpy.mock.calls;
+      const lastParams = calls[calls.length - 1]?.[0];
+      expect(lastParams?.host).toBeUndefined();
+    });
+  });
+
+  it('Host column renders host_id on the Launched runs tab', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST, REMOTE_HOST]);
+    vi.spyOn(api, 'getAutoflowEvents').mockResolvedValue([REMOTE_EVENT]);
+    vi.spyOn(api, 'getAutoflowRuns').mockResolvedValue([]);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('host_prod')).toBeInTheDocument());
+  });
+
+  it('host filter is NOT shown on the Claims tab', async () => {
+    stubPage();
+    vi.spyOn(api, 'getAutoflowClaims').mockResolvedValue([]);
+
+    renderPage();
+    fireEvent.click(screen.getByText('Claims'));
+
+    await waitFor(() => expect(screen.getByText('No active claims')).toBeInTheDocument());
+    expect(screen.queryByLabelText('Host filter')).not.toBeInTheDocument();
   });
 });

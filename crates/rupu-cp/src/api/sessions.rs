@@ -8,6 +8,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use crate::api::host_fanout::{fan_out_rows, sort_values_newest_first};
 use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
@@ -210,27 +211,133 @@ struct SessionsQuery {
     offset: Option<usize>,
     limit: Option<usize>,
     scope: Option<String>,
+    /// Absent or `"all"` → fan-out across all hosts (tag each row `host_id`).
+    /// `"local"` → local-only.
+    /// Any other value → proxy to that remote host.
+    #[serde(default)]
+    host: Option<String>,
+}
+
+/// Optional `?host=<id>` query param for single-session detail/runs/usage
+/// endpoints.
+#[derive(Deserialize, Default)]
+struct SessionHostQuery {
+    #[serde(default)]
+    host: Option<String>,
 }
 
 async fn list_sessions(
     State(s): State<AppState>,
     Query(q): Query<SessionsQuery>,
 ) -> ApiResult<Json<Vec<serde_json::Value>>> {
-    let mut sessions = collect_sessions(&s.global_dir, &s.pricing);
-    if let Some(scope) = q.scope.as_deref() {
-        sessions.retain(|v| v.get("scope").and_then(|x| x.as_str()) == Some(scope));
+    let host = q.host.as_deref().unwrap_or("all");
+
+    // ── Single remote host ─────────────────────────────────────────────────────
+    if host != "local" && host != "all" {
+        let conn = crate::api::runs::resolve_host(&s, host)?;
+        let path = {
+            let mut p = "/api/sessions?host=local".to_string();
+            if let Some(scope) = &q.scope {
+                p.push_str("&scope=");
+                p.push_str(scope);
+            }
+            if let Some(off) = q.offset {
+                p.push_str(&format!("&offset={off}"));
+            }
+            if let Some(lim) = q.limit {
+                p.push_str(&format!("&limit={lim}"));
+            }
+            p
+        };
+        let v = conn
+            .proxy_get_json(&path)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let arr = v.as_array().cloned().unwrap_or_default();
+        return Ok(Json(
+            arr.into_iter()
+                .map(|mut row| {
+                    row["host_id"] = serde_json::json!(host);
+                    row
+                })
+                .collect(),
+        ));
     }
+
+    // ── Collect local sessions ─────────────────────────────────────────────────
+    let local_sessions = collect_sessions(&s.global_dir, &s.pricing);
+
     let page = crate::pagination::PageQuery {
         offset: q.offset,
         limit: q.limit,
     };
-    Ok(Json(crate::pagination::paginate(sessions, &page)))
+
+    // ── Local-only path ────────────────────────────────────────────────────────
+    if host == "local" {
+        let mut sessions = local_sessions;
+        if let Some(scope) = q.scope.as_deref() {
+            sessions.retain(|v| v.get("scope").and_then(|x| x.as_str()) == Some(scope));
+        }
+        let paged: Vec<serde_json::Value> = crate::pagination::paginate(sessions, &page)
+            .into_iter()
+            .map(|mut v| {
+                v["host_id"] = serde_json::json!("local");
+                v
+            })
+            .collect();
+        return Ok(Json(paged));
+    }
+
+    // ── Fan-out path (host == "all") ───────────────────────────────────────────
+    let local_values: Vec<serde_json::Value> = local_sessions
+        .into_iter()
+        .map(|mut v| {
+            v["host_id"] = serde_json::json!("local");
+            v
+        })
+        .collect();
+
+    let remote_path = {
+        let mut p = "/api/sessions?host=local&limit=10000".to_string();
+        if let Some(scope) = &q.scope {
+            p.push_str("&scope=");
+            p.push_str(scope);
+        }
+        p
+    };
+
+    let mut all_values = fan_out_rows(&s.hosts, &remote_path, local_values).await;
+
+    // Sort newest-first by updated_at (most recently active sessions first).
+    sort_values_newest_first(&mut all_values, "updated_at");
+
+    // Scope filter after merge.
+    if let Some(scope) = q.scope.as_deref() {
+        all_values.retain(|v| v.get("scope").and_then(|x| x.as_str()) == Some(scope));
+    }
+
+    Ok(Json(crate::pagination::paginate(all_values, &page)))
 }
 
 async fn get_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<SessionHostQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // ── Remote proxy ───────────────────────────────────────────────────────────
+    if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
+        let conn = crate::api::runs::resolve_host(&s, host)?;
+        let v = conn
+            .proxy_get_json(&format!("/api/sessions/{id}"))
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
+        return Ok(Json(v));
+    }
+
+    // ── Local path (unchanged) ─────────────────────────────────────────────────
     // Try active first, then archive.
     let active_dir = s.global_dir.join("sessions").join(&id);
     let archive_dir = s.global_dir.join("sessions-archive").join(&id);
@@ -281,12 +388,30 @@ struct SessionRunEntry {
     transcript_path: Option<String>,
 }
 
-/// `GET /api/sessions/:id/usage-timeline` — ordered per-turn token series across
-/// every run the session recorded (in order), labeled by run id.
+/// `GET /api/sessions/:id/usage-timeline[?host=<id>]` — ordered per-turn token
+/// series across every run the session recorded (in order), labeled by run id.
+///
+/// With `?host=<remote-id>`: proxies to the owning host and forwards the
+/// response verbatim. Local/absent: today's on-disk logic unchanged.
 async fn get_session_usage_timeline(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<Vec<crate::usage::TurnPoint>>> {
+    Query(q): Query<SessionHostQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // ── Remote proxy ───────────────────────────────────────────────────────────
+    if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
+        let conn = crate::api::runs::resolve_host(&s, host)?;
+        let v = conn
+            .proxy_get_json(&format!("/api/sessions/{id}/usage-timeline"))
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
+        return Ok(Json(v));
+    }
+
+    // ── Local path (unchanged logic, boxed into Value) ─────────────────────────
     let active = s.global_dir.join("sessions").join(&id);
     let archive = s.global_dir.join("sessions-archive").join(&id);
     let dir = if active.is_dir() {
@@ -306,7 +431,9 @@ async fn get_session_usage_timeline(
             labeled.push((r.run_id.clone(), std::path::PathBuf::from(tp)));
         }
     }
-    Ok(Json(crate::usage::turn_series(&labeled)))
+    let points = crate::usage::turn_series(&labeled);
+    let v = serde_json::to_value(points).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(v))
 }
 
 // ---------------------------------------------------------------------------
@@ -401,14 +528,32 @@ fn session_runs_from_json(text: &str) -> Result<Vec<SessionRunRow>, serde_json::
     Ok(env.runs.into_iter().map(SessionRunRow::from).collect())
 }
 
-/// `GET /api/sessions/:id/runs` — the session's ordered turns, each with its
-/// user prompt, transcript path, status, and per-turn token totals. Backs the
-/// web chat view. Resolves the active dir first, then the archive; 404 when
-/// neither exists or `session.json` is missing; 500 on a parse error.
+/// `GET /api/sessions/:id/runs[?host=<id>]` — the session's ordered turns,
+/// each with its user prompt, transcript path, status, and per-turn token
+/// totals. Backs the web chat view.
+///
+/// With `?host=<remote-id>`: proxies to the owning host and forwards the
+/// response verbatim. Local/absent: resolves active dir first, then archive;
+/// 404 when neither exists or `session.json` is missing; 500 on a parse error.
 async fn get_session_runs(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<Vec<SessionRunRow>>> {
+    Query(q): Query<SessionHostQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // ── Remote proxy ───────────────────────────────────────────────────────────
+    if let Some(host) = q.host.as_deref().filter(|h| *h != "local") {
+        let conn = crate::api::runs::resolve_host(&s, host)?;
+        let v = conn
+            .proxy_get_json(&format!("/api/sessions/{id}/runs"))
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
+        return Ok(Json(v));
+    }
+
+    // ── Local path (unchanged logic) ───────────────────────────────────────────
     let active = s.global_dir.join("sessions").join(&id);
     let archive = s.global_dir.join("sessions-archive").join(&id);
     let dir = if active.is_dir() {
@@ -434,7 +579,8 @@ async fn get_session_runs(
     };
     let rows = session_runs_from_json(&text)
         .map_err(|e| ApiError::internal(format!("failed to parse {}: {e}", path.display())))?;
-    Ok(Json(rows))
+    let v = serde_json::to_value(rows).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(v))
 }
 
 /// Request body for `POST /api/sessions/:id/send`.
@@ -647,11 +793,16 @@ mod tests {
             tmp.path().to_path_buf(),
             rupu_config::PricingConfig::default(),
         );
-        let resp = get_session_runs(State(s), Path("sessX".into()))
-            .await
-            .expect("runs should load");
-        assert_eq!(resp.0.len(), 1);
-        assert_eq!(resp.0[0].prompt, "hello");
+        let resp = get_session_runs(
+            State(s),
+            Path("sessX".into()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .expect("runs should load");
+        let arr = resp.0.as_array().expect("array response");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["prompt"], "hello");
     }
 
     #[tokio::test]
@@ -661,9 +812,13 @@ mod tests {
             tmp.path().to_path_buf(),
             rupu_config::PricingConfig::default(),
         );
-        let err = get_session_runs(State(s), Path("nope".into()))
-            .await
-            .expect_err("missing session should 404");
+        let err = get_session_runs(
+            State(s),
+            Path("nope".into()),
+            Query(SessionHostQuery::default()),
+        )
+        .await
+        .expect_err("missing session should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 

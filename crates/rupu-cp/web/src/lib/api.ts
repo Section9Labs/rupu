@@ -335,6 +335,9 @@ export interface AutoflowCycleRow {
   failed_cycles: number;
   run_ids: string[];
   usage: UsageSummary;
+  /** Originating host id — `"local"` for local cycles; a remote host id for
+   *  proxied cycles. Absent on older server versions (treat as `"local"`). */
+  host_id?: string;
 }
 
 /**
@@ -354,6 +357,9 @@ export interface AutoflowEventRow {
   status?: string | null;
   worker_name?: string | null;
   usage: UsageSummary;
+  /** Originating host id — `"local"` for local events; a remote host id for
+   *  proxied events. Absent on older server versions (treat as `"local"`). */
+  host_id?: string;
 }
 
 /**
@@ -390,6 +396,9 @@ export interface AgentRunRow {
   turns: number;
   duration_ms?: number | null;
   usage: UsageSummary;
+  /** Originating host id — `"local"` for local runs; a remote host id for
+   *  proxied runs. Absent on older server versions (treat as `"local"`). */
+  host_id?: string;
 }
 
 export interface AutoflowDefRow {
@@ -511,6 +520,9 @@ export interface SessionSummary {
   total_tokens_cached?: number;
   usage?: UsageSummary;
   last_error?: string | null;
+  /** Originating host id — `"local"` for local sessions; a remote host id for
+   *  proxied sessions. Absent on older server versions (treat as `"local"`). */
+  host_id?: string;
 }
 
 /**
@@ -986,8 +998,9 @@ export const api = {
       `/api/runs/${encodeURIComponent(id)}${qs}`,
     );
   },
-  getRunGraph(id: string): Promise<RunGraphResponse> {
-    return request<RunGraphResponse>(`/api/runs/${encodeURIComponent(id)}/graph`);
+  getRunGraph(id: string, opts?: { host?: string }): Promise<RunGraphResponse> {
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
+    return request<RunGraphResponse>(`/api/runs/${encodeURIComponent(id)}/graph${qs}`);
   },
   /** Record approval for an awaiting run. The run stays `awaiting_approval`
    *  but gains `resume_requested_at` (+ `resume_mode`); a worker then resumes
@@ -1020,15 +1033,18 @@ export const api = {
       { method: 'POST', body: Object.keys(body).length ? JSON.stringify(body) : undefined },
     );
   },
-  getRunUsageTimeline(id: string): Promise<UsageTimelinePoint[]> {
-    return request<UsageTimelinePoint[]>(`/api/runs/${encodeURIComponent(id)}/usage-timeline`);
+  getRunUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
+    return request<UsageTimelinePoint[]>(`/api/runs/${encodeURIComponent(id)}/usage-timeline${qs}`);
   },
-  getSessionUsageTimeline(id: string): Promise<UsageTimelinePoint[]> {
-    return request<UsageTimelinePoint[]>(`/api/sessions/${encodeURIComponent(id)}/usage-timeline`);
+  getSessionUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
+    return request<UsageTimelinePoint[]>(`/api/sessions/${encodeURIComponent(id)}/usage-timeline${qs}`);
   },
   /** Turn-runs of a session, oldest-first — one row per `send` (chat turn). */
-  getSessionRuns(id: string): Promise<SessionRunRow[]> {
-    return request<SessionRunRow[]>(`/api/sessions/${encodeURIComponent(id)}/runs`);
+  getSessionRuns(id: string, opts?: { host?: string }): Promise<SessionRunRow[]> {
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
+    return request<SessionRunRow[]>(`/api/sessions/${encodeURIComponent(id)}/runs${qs}`);
   },
   getWorkflowRuns(params?: ListParams & { lifecycle?: 'active' | 'completed' | 'failed'; host?: string }): Promise<RunListRow[]> {
     const q = new URLSearchParams();
@@ -1039,11 +1055,21 @@ export const api = {
     const qs = q.toString();
     return request<RunListRow[]>(`/api/runs/workflows${qs ? `?${qs}` : ''}`);
   },
-  getAutoflowRuns(params?: ListParams): Promise<AutoflowCycleRow[]> {
-    return request<AutoflowCycleRow[]>(`/api/runs/autoflows${listQuery(params)}`);
+  getAutoflowRuns(params?: ListParams & { host?: string }): Promise<AutoflowCycleRow[]> {
+    const q = new URLSearchParams();
+    if (params?.offset != null) q.set('offset', String(params.offset));
+    if (params?.limit != null) q.set('limit', String(params.limit));
+    if (params?.host) q.set('host', params.host);
+    const qs = q.toString();
+    return request<AutoflowCycleRow[]>(`/api/runs/autoflows${qs ? `?${qs}` : ''}`);
   },
-  getAutoflowEvents(params?: ListParams): Promise<AutoflowEventRow[]> {
-    return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${listQuery(params)}`);
+  getAutoflowEvents(params?: ListParams & { host?: string }): Promise<AutoflowEventRow[]> {
+    const q = new URLSearchParams();
+    if (params?.offset != null) q.set('offset', String(params.offset));
+    if (params?.limit != null) q.set('limit', String(params.limit));
+    if (params?.host) q.set('host', params.host);
+    const qs = q.toString();
+    return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${qs ? `?${qs}` : ''}`);
   },
   /** Active autoflow claims — leased issues the worker is (or was) driving. */
   getAutoflowClaims(): Promise<AutoflowClaim[]> {
@@ -1202,16 +1228,18 @@ export const api = {
   },
 
   // --- Sessions ---
-  getSessions(params?: ListParams & { scope?: 'active' | 'archived' }): Promise<SessionSummary[]> {
+  getSessions(params?: ListParams & { scope?: 'active' | 'archived'; host?: string }): Promise<SessionSummary[]> {
     const q = new URLSearchParams();
     if (params?.offset != null) q.set('offset', String(params.offset));
     if (params?.limit != null) q.set('limit', String(params.limit));
     if (params?.scope) q.set('scope', params.scope);
+    if (params?.host) q.set('host', params.host);
     const qs = q.toString();
     return request<SessionSummary[]>(`/api/sessions${qs ? `?${qs}` : ''}`);
   },
-  getSession(id: string): Promise<SessionSummary> {
-    return request<SessionSummary>(`/api/sessions/${encodeURIComponent(id)}`);
+  getSession(id: string, opts?: { host?: string }): Promise<SessionSummary> {
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
+    return request<SessionSummary>(`/api/sessions/${encodeURIComponent(id)}${qs}`);
   },
   /**
    * Send a message into a live session. Fire-and-forget — the session's worker
@@ -1390,8 +1418,10 @@ export const api = {
 
   // --- Transcripts ---
 
-  getTranscript(path: string): Promise<TranscriptResponse> {
-    return request<TranscriptResponse>(`/api/transcript?path=${encodeURIComponent(path)}`);
+  getTranscript(path: string, opts?: { host?: string }): Promise<TranscriptResponse> {
+    let url = `/api/transcript?path=${encodeURIComponent(path)}`;
+    if (opts?.host) url += `&host=${encodeURIComponent(opts.host)}`;
+    return request<TranscriptResponse>(url);
   },
 
   /**
@@ -1404,8 +1434,11 @@ export const api = {
     path: string,
     onEvent: (e: TranscriptEvent) => void,
     onError?: (e: Event) => void,
+    opts?: { host?: string },
   ): () => void {
-    const es = new EventSource(`/api/transcript/stream?path=${encodeURIComponent(path)}`);
+    let url = `/api/transcript/stream?path=${encodeURIComponent(path)}`;
+    if (opts?.host) url += `&host=${encodeURIComponent(opts.host)}`;
+    const es = new EventSource(url);
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as TranscriptEvent);
     if (onError) es.onerror = onError;
     return () => es.close();

@@ -15,6 +15,7 @@ export default function RunTranscript() {
   const path = searchParams.get('path') ?? '';
   const liveParam = searchParams.get('live') ?? '0';
   const live = liveParam === '1' || liveParam === 'true';
+  const host = searchParams.get('host') ?? undefined;
 
   if (!path) {
     return (
@@ -44,7 +45,7 @@ export default function RunTranscript() {
 
       {/* TranscriptPanel fills the remaining page height and handles its own scroll */}
       <div className="flex-1 min-h-0">
-        <TranscriptPanel path={path} live={live} />
+        <TranscriptPanel path={path} live={live} host={host} />
       </div>
     </div>
   );

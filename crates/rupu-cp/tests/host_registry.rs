@@ -75,6 +75,14 @@ impl HostConnector for StubLocal {
     async fn get_transcript(&self, _: &str) -> Result<serde_json::Value, HostConnectorError> {
         unimplemented!()
     }
+    async fn proxy_get_json(
+        &self,
+        _: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Invalid(
+            "local host is served in-process".into(),
+        ))
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
