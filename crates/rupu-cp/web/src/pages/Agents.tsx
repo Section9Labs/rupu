@@ -5,9 +5,8 @@ import { useEffect, useId, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Sparkles } from 'lucide-react';
 import { api, type AgentSummary } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
-import MetricRow from '../components/lists/MetricRow';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import CodeEditor from '../components/CodeEditor';
 import { formatTokens, formatCost } from '../lib/usage';
@@ -103,11 +102,13 @@ export default function Agents() {
             />
           </div>
           <SectionHeader tone="muted" label="Agents" count={sorted.length} />
-          <ListCard>
-            {shown.map((a) => (
-              <AgentRow key={a.name} agent={a} />
-            ))}
-          </ListCard>
+          <SortableTable<AgentSummary>
+            columns={AGENT_COLUMNS}
+            rows={shown}
+            rowKey={(a) => a.name}
+            rowHref={(a) => `/agents/${encodeURIComponent(a.name)}`}
+            initialSort={{ key: 'name', dir: 'asc' }}
+          />
           {sorted.length > visible && (
             <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
               scroll for more
@@ -210,33 +211,65 @@ function NewAgentModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function AgentRow({ agent: a }: { agent: AgentSummary }) {
-  return (
-    <MetricRow
-      to={`/agents/${encodeURIComponent(a.name)}`}
-      header={
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm font-medium text-ink truncate">{a.name}</span>
-            {a.provider && <MetaChip>{a.provider}</MetaChip>}
-            {a.model && <MetaChip>{a.model}</MetaChip>}
-            {a.effort && <MetaChip>effort: {a.effort}</MetaChip>}
-          </div>
-          {a.description && (
-            <p className="mt-1 text-[12px] text-ink-dim leading-snug line-clamp-2">
-              {a.description}
-            </p>
-          )}
-        </div>
-      }
-      metrics={[
-        { label: 'runs', value: a.run_count ? String(a.run_count) : null },
-        { label: 'tokens', value: a.usage ? formatTokens(a.usage.total_tokens) : null },
-        { label: 'cost', value: a.usage ? formatCost(a.usage.cost_usd) : null },
-      ]}
-    />
-  );
-}
+const AGENT_COLUMNS: Column<AgentSummary>[] = [
+  {
+    key: 'name',
+    header: 'Name',
+    sortable: true,
+    sortValue: (a) => a.name,
+    render: (a) => (
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm font-medium text-ink truncate">{a.name}</span>
+        {a.provider && <MetaChip>{a.provider}</MetaChip>}
+        {a.model && <MetaChip>{a.model}</MetaChip>}
+        {a.effort && <MetaChip>effort: {a.effort}</MetaChip>}
+      </div>
+    ),
+  },
+  {
+    key: 'description',
+    header: 'Description',
+    render: (a) =>
+      a.description ? (
+        <span className="text-[12px] text-ink-dim leading-snug truncate block max-w-md">
+          {a.description}
+        </span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'runs',
+    header: 'Runs',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (a) => a.run_count,
+    render: (a) => <span className="text-ink">{a.run_count ? String(a.run_count) : '—'}</span>,
+  },
+  {
+    key: 'tokens',
+    header: 'Tokens',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (a) => a.usage?.total_tokens ?? null,
+    render: (a) => (
+      <span className="text-ink-dim">{a.usage ? formatTokens(a.usage.total_tokens) : '—'}</span>
+    ),
+  },
+  {
+    key: 'cost',
+    header: 'Cost',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (a) => a.usage?.cost_usd ?? null,
+    render: (a) => (
+      <span className="text-ink font-medium">{a.usage ? formatCost(a.usage.cost_usd) : '—'}</span>
+    ),
+  },
+];
 
 function MetaChip({ children, className }: { children: React.ReactNode; className?: string }) {
   return (

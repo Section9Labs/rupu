@@ -1,13 +1,12 @@
 // Workflows library — read-only list of workflow definitions discovered by the
 // control plane. Each row links to /workflows/:name for the steps + raw YAML.
 
-import { useEffect, useId, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useId, useMemo, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { Plus, Workflow as WorkflowIcon } from 'lucide-react';
 import { api, type WorkflowSummary } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
-import MetricRow from '../components/lists/MetricRow';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
 import LauncherSheet from '../components/LauncherSheet';
 import CodeEditor from '../components/CodeEditor';
 import UsageBarChart from '../components/charts/UsageBarChart';
@@ -51,6 +50,9 @@ export default function Workflows() {
       cancelled = true;
     };
   }, []);
+
+  // `setLaunching` is a stable useState setter → build the columns once.
+  const columns = useMemo(() => workflowColumns(setLaunching), []);
 
   const sorted = (workflows ?? []).slice().sort((a, b) => a.name.localeCompare(b.name));
   const shown = sorted.slice(0, visible);
@@ -105,15 +107,12 @@ export default function Workflows() {
             />
           </div>
           <SectionHeader tone="muted" label="Workflows" count={sorted.length} />
-          <ListCard>
-            {shown.map((w) => (
-              <WorkflowRow
-                key={`${w.scope}:${w.name}`}
-                workflow={w}
-                onRun={() => setLaunching(w.name)}
-              />
-            ))}
-          </ListCard>
+          <SortableTable<WorkflowSummary>
+            columns={columns}
+            rows={shown}
+            rowKey={(w) => `${w.scope}:${w.name}`}
+            initialSort={{ key: 'last_run', dir: 'desc' }}
+          />
           {sorted.length > visible && (
             <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
               scroll for more
@@ -224,44 +223,86 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
   );
 }
 
-function WorkflowRow({ workflow: w, onRun }: { workflow: WorkflowSummary; onRun: () => void }) {
-  return (
-    <MetricRow
-      to={`/workflows/${encodeURIComponent(w.name)}`}
-      header={
-        <>
-          <span className="text-sm font-medium text-ink truncate">{w.name}</span>
-          <ScopeChip scope={w.scope} />
-        </>
-      }
-      trailing={
-        <div className="flex shrink-0 items-center gap-3">
-          {w.last_run && (
-            <span className="text-[11px] text-ink-mute tabular-nums">
-              {relativeTime(w.last_run)}
-            </span>
-          )}
-          <button
-            type="button"
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              onRun();
-            }}
-            aria-label={`Run ${w.name}`}
-            className="inline-flex items-center rounded-md border border-brand-600 bg-white px-2.5 py-1 text-[12px] font-medium text-brand-700 hover:bg-brand-50"
+function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>[] {
+  return [
+    {
+      key: 'name',
+      header: 'Name',
+      sortable: true,
+      sortValue: (w) => w.name,
+      render: (w) => (
+        <div className="flex items-center gap-2 min-w-0">
+          <Link
+            to={`/workflows/${encodeURIComponent(w.name)}`}
+            className="text-sm font-medium text-ink truncate hover:underline"
           >
-            Run
-          </button>
+            {w.name}
+          </Link>
+          <ScopeChip scope={w.scope} />
         </div>
-      }
-      metrics={[
-        { label: 'runs', value: w.run_count ? String(w.run_count) : null },
-        { label: 'tokens', value: w.usage ? formatTokens(w.usage.total_tokens) : null },
-        { label: 'cost', value: w.usage ? formatCost(w.usage.cost_usd) : null },
-      ]}
-    />
-  );
+      ),
+    },
+    {
+      key: 'runs',
+      header: 'Runs',
+      align: 'right',
+      width: 'w-20',
+      sortable: true,
+      sortValue: (w) => w.run_count,
+      render: (w) => (
+        <span className="text-ink">{w.run_count ? String(w.run_count) : '—'}</span>
+      ),
+    },
+    {
+      key: 'tokens',
+      header: 'Tokens',
+      align: 'right',
+      width: 'w-24',
+      sortable: true,
+      sortValue: (w) => w.usage?.total_tokens ?? null,
+      render: (w) => (
+        <span className="text-ink-dim">{w.usage ? formatTokens(w.usage.total_tokens) : '—'}</span>
+      ),
+    },
+    {
+      key: 'cost',
+      header: 'Cost',
+      align: 'right',
+      width: 'w-24',
+      sortable: true,
+      sortValue: (w) => w.usage?.cost_usd ?? null,
+      render: (w) => (
+        <span className="text-ink font-medium">{w.usage ? formatCost(w.usage.cost_usd) : '—'}</span>
+      ),
+    },
+    {
+      key: 'last_run',
+      header: 'Last run',
+      align: 'right',
+      width: 'w-28',
+      sortable: true,
+      sortValue: (w) => (w.last_run ? Date.parse(w.last_run) : null),
+      render: (w) => (
+        <span className="text-ink-mute">{w.last_run ? relativeTime(w.last_run) : '—'}</span>
+      ),
+    },
+    {
+      key: 'action',
+      header: '',
+      align: 'right',
+      width: 'w-20',
+      render: (w) => (
+        <button
+          type="button"
+          onClick={() => onRun(w.name)}
+          aria-label={`Run ${w.name}`}
+          className="inline-flex items-center rounded-md border border-brand-600 bg-white px-2.5 py-1 text-[12px] font-medium text-brand-700 hover:bg-brand-50"
+        >
+          Run
+        </button>
+      ),
+    },
+  ];
 }
 
 export function ScopeChip({ scope }: { scope: string }) {

@@ -5,11 +5,10 @@
 // /sessions/:id. Status is `unknown` on the wire, coerced via lib/sessionStatus.
 
 import { useCallback, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { MessageSquare, RefreshCw } from 'lucide-react';
 import { api, type SessionSummary } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
-import MetricRow from '../components/lists/MetricRow';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { cn } from '../lib/cn';
 import { durationBetween } from '../lib/time';
@@ -137,11 +136,14 @@ export default function Sessions() {
               }))} />
             </div>
           )}
-          <ListCard>
-            {rows.map((s) => (
-              <SessionRow key={s.session_id} session={s} />
-            ))}
-          </ListCard>
+          {/* No initialSort: the server returns sessions most-recent (updated_at)
+              first, so source order already satisfies the default. Clicking any
+              header re-sorts client-side. */}
+          <SortableTable<SessionSummary>
+            columns={SESSION_COLUMNS}
+            rows={rows}
+            rowKey={(s) => s.session_id}
+          />
           {tab !== 'active' && hasMore && (
             <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
               {loading ? 'loading more…' : 'scroll for more'}
@@ -153,41 +155,136 @@ export default function Sessions() {
   );
 }
 
-function SessionRow({ session }: { session: SessionSummary }) {
-  const navigate = useNavigate();
-  const u = session.usage;
-  return (
-    <MetricRow
-      to={`/sessions/${encodeURIComponent(session.session_id)}`}
-      header={<>
-        <span className="flex items-center gap-1.5">
-          <span className={cn('inline-block w-2 h-2 rounded-full', sessionStatusDot(session.status))} />
-          <span className="text-[11px] text-ink-dim">{sessionStatusLabel(session.status)}</span>
-        </span>
-        <span className="text-sm font-medium text-ink truncate">{session.agent_name}</span>
-        <span className="text-[11px] text-ink-mute font-mono">{shortId(session.session_id)}</span>
-        <span className="text-[11px] text-ink-mute font-mono">{session.model}</span>
-      </>}
-      trailing={session.active_run_id ? (
-        <button
-          type="button"
-          onClick={(e) => { e.preventDefault(); e.stopPropagation(); navigate(`/runs/${encodeURIComponent(session.active_run_id ?? '')}`); }}
-          className="shrink-0 inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
+/** Session duration in ms (created → last update); null when timestamps are bad. */
+function sessionDurationMs(s: SessionSummary): number | null {
+  const start = Date.parse(s.created_at);
+  const end = Date.parse(s.updated_at);
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
+  return Math.max(0, end - start);
+}
+
+const SESSION_COLUMNS: Column<SessionSummary>[] = [
+  {
+    key: 'status',
+    header: 'Status',
+    sortable: true,
+    sortValue: (s) => sessionStatusLabel(s.status),
+    render: (s) => (
+      <span className="flex items-center gap-1.5">
+        <span className={cn('inline-block w-2 h-2 rounded-full', sessionStatusDot(s.status))} />
+        <span className="text-[11px] text-ink-dim">{sessionStatusLabel(s.status)}</span>
+      </span>
+    ),
+  },
+  {
+    key: 'agent',
+    header: 'Agent',
+    sortable: true,
+    sortValue: (s) => s.agent_name,
+    render: (s) => <span className="text-sm font-medium text-ink truncate">{s.agent_name}</span>,
+  },
+  {
+    key: 'session',
+    header: 'Session',
+    render: (s) => (
+      <Link
+        to={`/sessions/${encodeURIComponent(s.session_id)}`}
+        className="text-[11px] text-ink-mute font-mono hover:underline"
+      >
+        {shortId(s.session_id)}
+      </Link>
+    ),
+  },
+  {
+    key: 'model',
+    header: 'Model',
+    sortable: true,
+    sortValue: (s) => s.model,
+    render: (s) => <span className="text-[11px] text-ink-mute font-mono">{s.model}</span>,
+  },
+  {
+    key: 'in',
+    header: 'In',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (s) => s.usage?.input_tokens ?? null,
+    render: (s) => (
+      <span className="text-ink-dim">{s.usage ? formatTokens(s.usage.input_tokens) : '—'}</span>
+    ),
+  },
+  {
+    key: 'out',
+    header: 'Out',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (s) => s.usage?.output_tokens ?? null,
+    render: (s) => (
+      <span className="text-ink-dim">{s.usage ? formatTokens(s.usage.output_tokens) : '—'}</span>
+    ),
+  },
+  {
+    key: 'cached',
+    header: 'Cached',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (s) => s.usage?.cached_tokens ?? null,
+    render: (s) =>
+      s.usage?.cached_tokens ? (
+        <span className="text-ink-dim">{formatTokens(s.usage.cached_tokens)}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'cost',
+    header: 'Cost',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (s) => s.usage?.cost_usd ?? null,
+    render: (s) => (
+      <span className="text-ink font-medium">{s.usage ? formatCost(s.usage.cost_usd) : '—'}</span>
+    ),
+  },
+  {
+    key: 'turns',
+    header: 'Turns',
+    align: 'right',
+    width: 'w-16',
+    sortable: true,
+    sortValue: (s) => s.total_turns,
+    render: (s) => <span className="text-ink">{s.total_turns ? String(s.total_turns) : '—'}</span>,
+  },
+  {
+    key: 'duration',
+    header: 'Duration',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (s) => sessionDurationMs(s),
+    render: (s) => (
+      <span className="text-ink-dim">{durationBetween(s.created_at, s.updated_at)}</span>
+    ),
+  },
+  {
+    key: 'action',
+    header: '',
+    align: 'right',
+    width: 'w-24',
+    render: (s) =>
+      s.active_run_id ? (
+        <Link
+          to={`/runs/${encodeURIComponent(s.active_run_id)}`}
+          className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
         >
           active run
-        </button>
-      ) : undefined}
-      metrics={[
-        { label: 'in', value: u ? formatTokens(u.input_tokens) : null },
-        { label: 'out', value: u ? formatTokens(u.output_tokens) : null },
-        { label: 'cached', value: u && u.cached_tokens ? formatTokens(u.cached_tokens) : null },
-        { label: 'cost', value: u ? formatCost(u.cost_usd) : null },
-        { label: 'turns', value: session.total_turns ? String(session.total_turns) : null },
-        { label: 'duration', value: durationBetween(session.created_at, session.updated_at) },
-      ]}
-    />
-  );
-}
+        </Link>
+      ) : null,
+  },
+];
 
 function EmptyState({ tab }: { tab: Tab }) {
   return (

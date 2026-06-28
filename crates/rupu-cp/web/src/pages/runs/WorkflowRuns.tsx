@@ -7,11 +7,10 @@ import { useCallback, useEffect, useState } from 'react';
 import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type RunListRow } from '../../lib/api';
 import { StatusPill } from '../../components/StatusPill';
-import MetricRow from '../../components/lists/MetricRow';
+import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
-import { ListCard } from '../../components/lists/ListCard';
 import { cn } from '../../lib/cn';
-import { durationBetween } from '../../lib/time';
+import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
@@ -169,11 +168,13 @@ export default function WorkflowRuns() {
               cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
             }))} />
           </div>
-          <ListCard>
-            {filtered.map((r) => (
-              <WorkflowRunRow key={r.id} run={r} />
-            ))}
-          </ListCard>
+          <SortableTable<RunListRow>
+            columns={WORKFLOW_RUN_COLUMNS}
+            rows={filtered}
+            rowKey={(r) => r.id}
+            rowHref={(r) => `/runs/${encodeURIComponent(r.id)}`}
+            initialSort={{ key: 'started', dir: 'desc' }}
+          />
           {tab !== 'active' && hasMore && (
             <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
               {loading ? 'loading more…' : 'scroll for more'}
@@ -185,27 +186,118 @@ export default function WorkflowRuns() {
   );
 }
 
-function WorkflowRunRow({ run }: { run: RunListRow }) {
-  return (
-    <MetricRow
-      to={`/runs/${encodeURIComponent(run.id)}`}
-      header={<>
-        <span className="text-sm font-medium text-ink truncate">{run.workflow_name}</span>
-        <span className="text-[11px] text-ink-mute font-mono">{shortId(run.id)}</span>
-        <TriggerChip trigger={run.trigger} />
-      </>}
-      trailing={<StatusPill status={run.status} />}
-      metrics={[
-        { label: 'in', value: formatTokens(run.usage.input_tokens) },
-        { label: 'out', value: formatTokens(run.usage.output_tokens) },
-        { label: 'cached', value: run.usage.cached_tokens ? formatTokens(run.usage.cached_tokens) : null },
-        { label: 'cost', value: formatCost(run.usage.cost_usd) },
-        { label: 'duration', value: run.duration_ms != null ? formatDuration(run.duration_ms) : durationBetween(run.started_at, run.finished_at) },
-        { label: 'turns', value: run.turns ? String(run.turns) : null },
-      ]}
-    />
-  );
+/** Run duration in ms — explicit duration_ms, else derived from start/finish. */
+function runDurationMs(run: RunListRow): number | null {
+  if (run.duration_ms != null) return run.duration_ms;
+  const start = Date.parse(run.started_at);
+  if (Number.isNaN(start)) return null;
+  const end = run.finished_at ? Date.parse(run.finished_at) : Date.now();
+  if (Number.isNaN(end)) return null;
+  return Math.max(0, end - start);
 }
+
+const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
+  {
+    key: 'workflow',
+    header: 'Workflow',
+    sortable: true,
+    sortValue: (r) => r.workflow_name,
+    render: (r) => <span className="text-sm font-medium text-ink truncate">{r.workflow_name}</span>,
+  },
+  {
+    key: 'run',
+    header: 'Run',
+    render: (r) => <span className="text-[11px] text-ink-mute font-mono">{shortId(r.id)}</span>,
+  },
+  {
+    key: 'trigger',
+    header: 'Trigger',
+    sortable: true,
+    sortValue: (r) => r.trigger,
+    render: (r) => <TriggerChip trigger={r.trigger} />,
+  },
+  {
+    key: 'status',
+    header: 'Status',
+    sortable: true,
+    sortValue: (r) => r.status,
+    render: (r) => <StatusPill status={r.status} />,
+  },
+  {
+    key: 'in',
+    header: 'In',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (r) => r.usage.input_tokens,
+    render: (r) => <span className="text-ink-dim">{formatTokens(r.usage.input_tokens)}</span>,
+  },
+  {
+    key: 'out',
+    header: 'Out',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (r) => r.usage.output_tokens,
+    render: (r) => <span className="text-ink-dim">{formatTokens(r.usage.output_tokens)}</span>,
+  },
+  {
+    key: 'cached',
+    header: 'Cached',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (r) => r.usage.cached_tokens,
+    render: (r) =>
+      r.usage.cached_tokens ? (
+        <span className="text-ink-dim">{formatTokens(r.usage.cached_tokens)}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'cost',
+    header: 'Cost',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (r) => r.usage.cost_usd,
+    render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
+  },
+  {
+    key: 'duration',
+    header: 'Duration',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (r) => runDurationMs(r),
+    render: (r) => (
+      <span className="text-ink-dim">
+        {r.duration_ms != null
+          ? formatDuration(r.duration_ms)
+          : durationBetween(r.started_at, r.finished_at)}
+      </span>
+    ),
+  },
+  {
+    key: 'turns',
+    header: 'Turns',
+    align: 'right',
+    width: 'w-16',
+    sortable: true,
+    sortValue: (r) => r.turns,
+    render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
+  },
+  {
+    key: 'started',
+    header: 'Started',
+    align: 'right',
+    width: 'w-28',
+    sortable: true,
+    sortValue: (r) => (r.started_at ? Date.parse(r.started_at) : null),
+    render: (r) => <span className="text-ink-mute">{relativeTime(r.started_at)}</span>,
+  },
+];
 
 function WorkflowRunsEmpty({ hasRuns }: { hasRuns: boolean }) {
   return (

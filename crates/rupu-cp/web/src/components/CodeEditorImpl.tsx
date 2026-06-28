@@ -33,7 +33,6 @@ import {
 } from '@codemirror/commands';
 import {
   syntaxHighlighting,
-  defaultHighlightStyle,
   bracketMatching,
   indentOnInput,
   foldGutter,
@@ -47,10 +46,13 @@ import {
 } from '@codemirror/autocomplete';
 import { markdown } from '@codemirror/lang-markdown';
 import { yaml } from '@codemirror/lang-yaml';
+import { githubHighlightStyle } from './codeHighlightTheme';
 import type { CodeEditorProps } from './CodeEditor';
 
+// `font-mono` so the editor matches the read-only display (CodeHighlight), whose
+// <pre> is font-mono — `.cm-scroller` inherits this family below.
 const CONTAINER_CLASS =
-  'overflow-hidden rounded-xl border border-border bg-panel text-[12px] ' +
+  'overflow-hidden rounded-xl border border-border bg-panel font-mono text-[12px] ' +
   'leading-relaxed shadow-card focus-within:border-brand-500';
 
 function languageExtension(language: 'markdown' | 'yaml'): Extension {
@@ -87,7 +89,7 @@ function baseExtensions(): Extension[] {
     drawSelection(),
     dropCursor(),
     indentOnInput(),
-    syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
+    syntaxHighlighting(githubHighlightStyle, { fallback: true }),
     bracketMatching(),
     closeBrackets(),
     autocompletion(),
