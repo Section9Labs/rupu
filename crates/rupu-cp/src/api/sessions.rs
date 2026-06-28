@@ -1,5 +1,6 @@
 use crate::{
     error::{ApiError, ApiResult},
+    host::connector::HostConnectorError,
     state::AppState,
 };
 use axum::{
@@ -442,15 +443,31 @@ struct SendBody {
     prompt: String,
 }
 
-/// `POST /api/sessions/:id/send` — send a message to a live session via the
-/// configured [`SessionSender`]. Returns the new run id. 501 when no sender is
-/// installed (read-only deploy); 400 on an empty prompt; 404 when the session
-/// is missing; 409 when the session is stopped.
+/// Optional `?host=<id>` query param for `POST /api/sessions/:id/send`.
+/// Absent or `"local"` → local path; a remote id proxies via
+/// [`HostConnector::send_session_turn`].
+#[derive(Deserialize, Default)]
+struct SendQuery {
+    #[serde(default)]
+    host: Option<String>,
+}
+
+/// `POST /api/sessions/:id/send[?host=<id>]` — send a message to a live session.
+///
+/// Without `?host=` (or `?host=local`): uses the configured [`SessionSender`].
+/// Returns the new run id plus `host_id: "local"`. 501 when no sender is
+/// installed; 400 on an empty prompt; 404 when the session is missing; 409
+/// when the session is stopped.
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::send_session_turn`]
+/// and returns `{ "run_id", "host_id" }`. The local session-existence
+/// pre-check is skipped for remote sends (the remote CP performs it).
 ///
 /// [`SessionSender`]: crate::session_sender::SessionSender
 async fn send_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<SendQuery>,
     Json(body): Json<SendBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let prompt = body.prompt.trim().to_string();
@@ -458,6 +475,23 @@ async fn send_session(
         return Err(ApiError::bad_request("prompt is empty"));
     }
 
+    let host = q.host.as_deref().unwrap_or("local").to_string();
+
+    if host != "local" {
+        let conn = crate::api::runs::resolve_host(&s, &host)?;
+        let req = crate::session_sender::SendMessageRequest {
+            session_id: id,
+            prompt,
+        };
+        let run_id = conn.send_session_turn(req).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": host })));
+    }
+
+    // Local path: unchanged.
     let sender = s
         .session_sender
         .as_ref()
@@ -491,7 +525,7 @@ async fn send_session(
         prompt,
     };
     match sender.send(req).await {
-        Ok(run_id) => Ok(Json(serde_json::json!({ "run_id": run_id }))),
+        Ok(run_id) => Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": "local" }))),
         Err(crate::session_sender::SendError::Invalid(m)) => Err(ApiError::bad_request(m)),
         Err(crate::session_sender::SendError::Spawn(m)) => Err(ApiError::internal(m)),
     }
@@ -678,6 +712,7 @@ mod tests {
         let resp = send_session(
             State(s),
             Path("sess1".into()),
+            Query(SendQuery { host: None }),
             Json(SendBody {
                 prompt: "hi".into(),
             }),
@@ -702,6 +737,7 @@ mod tests {
         let err = send_session(
             State(s),
             Path("sess1".into()),
+            Query(SendQuery { host: None }),
             Json(SendBody {
                 prompt: "hi".into(),
             }),
@@ -727,6 +763,7 @@ mod tests {
         let err = send_session(
             State(s),
             Path("sess1".into()),
+            Query(SendQuery { host: None }),
             Json(SendBody {
                 prompt: "   ".into(),
             }),

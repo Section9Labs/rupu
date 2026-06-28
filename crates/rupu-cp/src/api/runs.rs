@@ -58,6 +58,15 @@ fn run_response(s: &AppState, id: &str) -> ApiResult<Json<serde_json::Value>> {
     ))
 }
 
+/// Optional `?host=<id>` query param for control endpoints
+/// (`approve` / `reject` / `cancel`).
+/// Absent or `"local"` → today's local logic. Remote id → proxy via connector.
+#[derive(serde::Deserialize, Default)]
+struct RunControlQuery {
+    #[serde(default)]
+    host: Option<String>,
+}
+
 /// Optional body for `POST /api/runs/:id/approve`. `mode` selects the
 /// permission mode (`ask` / `bypass` / `readonly`) the resumed run runs
 /// under; an absent/empty body leaves it `None` (worker default).
@@ -67,19 +76,38 @@ struct ApproveBody {
     mode: Option<String>,
 }
 
-/// `POST /api/runs/:id/approve` — record a web approval decision for a paused
-/// (awaiting-approval) run. Sets the `resume_requested_at` marker (and the
-/// optional `resume_mode`) that a background worker picks up to re-enter the
-/// workflow; this endpoint does NOT execute the run itself. The run stays
-/// `AwaitingApproval` until the worker approves+resumes it.
+/// `POST /api/runs/:id/approve[?host=<id>]` — record a web approval decision for
+/// a paused (awaiting-approval) run.
+///
+/// Without `?host=` (or `?host=local`): sets the `resume_requested_at` marker
+/// (and the optional `resume_mode`) that a background worker picks up. The run
+/// stays `AwaitingApproval` until the worker resumes it.
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::approve_run`] and
+/// returns `{ "ok": true, "host_id": "<id>" }`.
 ///
 /// The JSON body is optional — a bodyless POST is accepted and treated as
 /// `mode = None`.
 async fn approve_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
     body: Option<Json<ApproveBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        let mode = body
+            .and_then(|b| b.0.mode)
+            .unwrap_or_default();
+        conn.approve_run(&id, &mode).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
+    }
+    // Local path: unchanged.
     let now = chrono::Utc::now();
     let mode = body.and_then(|b| b.0.mode);
     s.run_store
@@ -94,13 +122,30 @@ struct RejectBody {
     reason: Option<String>,
 }
 
-/// `POST /api/runs/:id/reject` — record a web rejection decision for a paused
-/// run, transitioning it to the terminal `Rejected` state.
+/// `POST /api/runs/:id/reject[?host=<id>]` — record a web rejection decision.
+///
+/// Without `?host=` (or `?host=local`): transitions the run to `Rejected`.
+/// With `?host=<remote-id>`: proxies via [`HostConnector::reject_run`] and
+/// returns `{ "ok": true, "host_id": "<id>" }`.
 async fn reject_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
     Json(body): Json<RejectBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        conn.reject_run(&id, body.reason.as_deref())
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(m) => ApiError::not_found(m),
+                HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+                other => ApiError::internal(other.to_string()),
+            })?;
+        return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
+    }
+    // Local path: unchanged.
     let now = chrono::Utc::now();
     let reason = body.reason.unwrap_or_default();
     s.run_store
@@ -128,15 +173,31 @@ fn map_cancel_err(id: &str, e: CancelError) -> ApiError {
     }
 }
 
-/// `POST /api/runs/:id/cancel` — cancel an in-flight run. A `Pending`/`Running`
-/// run is marked `Cancelled` (and its live runner TERM'd); a run paused at an
-/// approval gate is rejected. Terminal runs yield 409. The JSON body is
-/// optional — a bodyless POST uses the default reason.
+/// `POST /api/runs/:id/cancel[?host=<id>]` — cancel an in-flight run.
+///
+/// Without `?host=` (or `?host=local`): a `Pending`/`Running` run is marked
+/// `Cancelled` (and its live runner TERM'd); a run paused at an approval gate is
+/// rejected. Terminal runs yield 409. The JSON body is optional.
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::cancel_run`] and
+/// returns `{ "ok": true, "host_id": "<id>" }`.
 async fn cancel_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
     body: Option<Json<CancelBody>>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        conn.cancel_run(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::bad_request(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
+    }
+    // Local path: unchanged.
     let now = chrono::Utc::now();
     let reason = body
         .and_then(|b| b.0.reason)
@@ -170,7 +231,7 @@ pub(crate) fn trigger_of(r: &RunRecord) -> &'static str {
 const FAN_OUT_LIMIT: usize = 10_000;
 
 /// Resolve a `host_id` string to a live connector, mapping unknown host → 404.
-fn resolve_host(
+pub(crate) fn resolve_host(
     s: &AppState,
     host_id: &str,
 ) -> ApiResult<Arc<dyn crate::host::connector::HostConnector>> {
@@ -615,9 +676,14 @@ mod tests {
             .create(awaiting_record("run_app", "gate"), "name: x\n")
             .unwrap();
 
-        let resp = approve_run(State(s.clone()), Path("run_app".into()), None)
-            .await
-            .expect("approve should succeed");
+        let resp = approve_run(
+            State(s.clone()),
+            Path("run_app".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect("approve should succeed");
         // Marker-only: the endpoint records the approval but leaves the
         // run AwaitingApproval for the background worker to approve+resume.
         let body = resp.0;
@@ -642,9 +708,14 @@ mod tests {
         let body = RejectBody {
             reason: Some("not safe".into()),
         };
-        let resp = reject_run(State(s.clone()), Path("run_rej".into()), Json(body))
-            .await
-            .expect("reject should succeed");
+        let resp = reject_run(
+            State(s.clone()),
+            Path("run_rej".into()),
+            Query(RunControlQuery { host: None }),
+            Json(body),
+        )
+        .await
+        .expect("reject should succeed");
         assert_eq!(resp.0["run"]["status"], serde_json::json!("rejected"));
 
         let loaded = s.run_store.load("run_rej").unwrap();
@@ -665,9 +736,14 @@ mod tests {
         rec.awaiting_step_id = None;
         s.run_store.create(rec, "name: x\n").unwrap();
 
-        let err = approve_run(State(s), Path("run_done".into()), None)
-            .await
-            .expect_err("approve on completed run should fail");
+        let err = approve_run(
+            State(s),
+            Path("run_done".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect_err("approve on completed run should fail");
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
@@ -678,6 +754,7 @@ mod tests {
         let err = reject_run(
             State(s),
             Path("nope".into()),
+            Query(RunControlQuery { host: None }),
             Json(RejectBody { reason: None }),
         )
         .await
@@ -696,9 +773,14 @@ mod tests {
         let body = ApproveBody {
             mode: Some("bypass".into()),
         };
-        let _ = approve_run(State(s.clone()), Path("run_mode".into()), Some(Json(body)))
-            .await
-            .expect("approve should succeed");
+        let _ = approve_run(
+            State(s.clone()),
+            Path("run_mode".into()),
+            Query(RunControlQuery { host: None }),
+            Some(Json(body)),
+        )
+        .await
+        .expect("approve should succeed");
 
         let loaded = s.run_store.load("run_mode").unwrap();
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
@@ -714,9 +796,14 @@ mod tests {
             .create(awaiting_record("run_nobody", "gate"), "name: x\n")
             .unwrap();
 
-        let _ = approve_run(State(s.clone()), Path("run_nobody".into()), None)
-            .await
-            .expect("bodyless approve should succeed");
+        let _ = approve_run(
+            State(s.clone()),
+            Path("run_nobody".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect("bodyless approve should succeed");
 
         let loaded = s.run_store.load("run_nobody").unwrap();
         assert_eq!(loaded.status, RunStatus::AwaitingApproval);
@@ -736,9 +823,14 @@ mod tests {
         rec.runner_pid = None;
         s.run_store.create(rec, "name: x\n").unwrap();
 
-        let resp = cancel_run(State(s.clone()), Path("run_cancel".into()), None)
-            .await
-            .expect("cancel should succeed");
+        let resp = cancel_run(
+            State(s.clone()),
+            Path("run_cancel".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect("cancel should succeed");
         assert_eq!(resp.0["run"]["status"], serde_json::json!("cancelled"));
 
         let loaded = s.run_store.load("run_cancel").unwrap();
@@ -762,9 +854,14 @@ mod tests {
         let body = CancelBody {
             reason: Some("too late".into()),
         };
-        let err = cancel_run(State(s), Path("run_term".into()), Some(Json(body)))
-            .await
-            .expect_err("cancel on completed run should fail");
+        let err = cancel_run(
+            State(s),
+            Path("run_term".into()),
+            Query(RunControlQuery { host: None }),
+            Some(Json(body)),
+        )
+        .await
+        .expect_err("cancel on completed run should fail");
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
@@ -772,9 +869,14 @@ mod tests {
     async fn cancel_unknown_run_is_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp);
-        let err = cancel_run(State(s), Path("ghost".into()), None)
-            .await
-            .expect_err("cancel on missing run should 404");
+        let err = cancel_run(
+            State(s),
+            Path("ghost".into()),
+            Query(RunControlQuery { host: None }),
+            None,
+        )
+        .await
+        .expect_err("cancel on missing run should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
