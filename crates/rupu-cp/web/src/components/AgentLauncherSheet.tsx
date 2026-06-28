@@ -8,6 +8,7 @@ import { useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, type LaunchMode } from '../lib/api';
 import TargetPicker from './TargetPicker';
+import { Button } from './ui/Button';
 import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
 
 export interface AgentLaunch {
@@ -204,14 +205,9 @@ export default function AgentLauncherSheet({
           >
             Cancel
           </button>
-          <button
-            type="button"
-            onClick={onLaunch}
-            disabled={launching}
-            className="inline-flex items-center rounded-md bg-brand-600 px-3 py-1.5 text-[12px] font-medium text-white hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-60"
-          >
+          <Button onClick={onLaunch} disabled={launching}>
             {submitLabel}
-          </button>
+          </Button>
         </div>
       </div>
     </div>

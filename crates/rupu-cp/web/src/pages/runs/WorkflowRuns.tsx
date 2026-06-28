@@ -13,6 +13,7 @@ import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
+import { shortId } from '../../lib/shortId';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
@@ -28,10 +29,6 @@ const TABS: { id: Tab; label: string }[] = [
 type TriggerFilter = 'all' | 'manual' | 'cron' | 'event';
 
 const FILTERS: TriggerFilter[] = ['all', 'manual', 'cron', 'event'];
-
-function shortId(id: string): string {
-  return id.length > 10 ? `${id.slice(0, 8)}…` : id;
-}
 
 const TRIGGER_CHIP_CLS: Record<string, string> = {
   manual: 'bg-slate-100 text-slate-600 ring-slate-200',

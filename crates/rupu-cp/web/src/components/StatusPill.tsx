@@ -5,20 +5,10 @@
 // icon + label, and a small status dot), remapped from Okesu's finding-status
 // enum to rupu's run statuses + step states.
 
-import {
-  AlertCircle,
-  Ban,
-  CheckCircle2,
-  Clock,
-  Loader2,
-  Pause,
-  SkipForward,
-  XCircle,
-  XOctagon,
-  type LucideIcon,
-} from 'lucide-react';
+import { AlertCircle, type LucideIcon } from 'lucide-react';
 import type { RunStatusStr } from '../lib/api';
 import { cn } from '../lib/cn';
+import { STATUS, type StatusDescriptor } from '../lib/status';
 
 // Live step state derived from the static record + SSE overrides. Kept in one
 // place so RunGraph and the timeline agree on the vocabulary.
@@ -37,88 +27,31 @@ interface StatusStyle {
   icon: LucideIcon;
 }
 
+// Colors / labels / icons all come from the canonical descriptor map
+// (`lib/status.ts`) so pills, timeline, graph, and dots never diverge.
+function toPillStyle(d: StatusDescriptor): StatusStyle {
+  return { label: d.label, cls: d.pillClass, dot: d.dotClass, icon: d.icon };
+}
+
 export const RUN_STATUS_STYLES: Record<RunStatusStr, StatusStyle> = {
-  pending: {
-    label: 'Pending',
-    cls: 'bg-slate-100 text-slate-700 ring-slate-200',
-    dot: 'bg-slate-400',
-    icon: Clock,
-  },
-  running: {
-    label: 'Running',
-    cls: 'bg-blue-50 text-blue-700 ring-blue-200',
-    dot: 'bg-blue-500',
-    icon: Loader2,
-  },
-  completed: {
-    label: 'Completed',
-    cls: 'bg-green-50 text-green-700 ring-green-200',
-    dot: 'bg-green-500',
-    icon: CheckCircle2,
-  },
-  failed: {
-    label: 'Failed',
-    cls: 'bg-red-50 text-red-700 ring-red-200',
-    dot: 'bg-red-500',
-    icon: XCircle,
-  },
-  awaiting_approval: {
-    label: 'Awaiting approval',
-    cls: 'bg-amber-50 text-amber-800 ring-amber-200',
-    dot: 'bg-amber-500',
-    icon: Pause,
-  },
-  rejected: {
-    label: 'Rejected',
-    cls: 'bg-red-50 text-red-700 ring-red-200',
-    dot: 'bg-red-500',
-    icon: XOctagon,
-  },
-  cancelled: {
-    label: 'Cancelled',
-    cls: 'bg-slate-100 text-slate-700 ring-slate-300',
-    dot: 'bg-slate-500',
-    icon: Ban,
-  },
+  pending: toPillStyle(STATUS.pending),
+  running: toPillStyle(STATUS.running),
+  completed: toPillStyle(STATUS.completed),
+  failed: toPillStyle(STATUS.failed),
+  awaiting_approval: toPillStyle(STATUS.awaiting_approval),
+  rejected: toPillStyle(STATUS.rejected),
+  cancelled: toPillStyle(STATUS.cancelled),
 };
 
 export const STEP_STATE_STYLES: Record<StepState, StatusStyle> = {
-  pending: {
-    label: 'Pending',
-    cls: 'bg-slate-100 text-slate-600 ring-slate-200',
-    dot: 'bg-slate-400',
-    icon: Clock,
-  },
-  running: {
-    label: 'Running',
-    cls: 'bg-blue-50 text-blue-700 ring-blue-200',
-    dot: 'bg-blue-500',
-    icon: Loader2,
-  },
-  completed: {
-    label: 'Completed',
-    cls: 'bg-green-50 text-green-700 ring-green-200',
-    dot: 'bg-green-500',
-    icon: CheckCircle2,
-  },
-  failed: {
-    label: 'Failed',
-    cls: 'bg-red-50 text-red-700 ring-red-200',
-    dot: 'bg-red-500',
-    icon: XCircle,
-  },
-  awaiting_approval: {
-    label: 'Awaiting',
-    cls: 'bg-amber-50 text-amber-800 ring-amber-200',
-    dot: 'bg-amber-500',
-    icon: Pause,
-  },
-  skipped: {
-    label: 'Skipped',
-    cls: 'bg-slate-100 text-slate-600 ring-slate-200',
-    dot: 'bg-slate-400',
-    icon: SkipForward,
-  },
+  pending: toPillStyle(STATUS.pending),
+  running: toPillStyle(STATUS.running),
+  completed: toPillStyle(STATUS.completed),
+  failed: toPillStyle(STATUS.failed),
+  // Step pills use the short 'Awaiting' label (the run pill uses the longer
+  // 'Awaiting approval'); same color/icon, sourced from the descriptor.
+  awaiting_approval: { ...toPillStyle(STATUS.awaiting_approval), label: 'Awaiting' },
+  skipped: toPillStyle(STATUS.skipped),
 };
 
 export function StatusPill({

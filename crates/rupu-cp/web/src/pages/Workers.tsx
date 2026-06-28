@@ -1,20 +1,25 @@
 // Workers list — workers registered with this control plane, with their
-// declared capabilities and last-seen freshness. No detail route. Read-only.
+// declared capabilities, run-activity, and last-seen freshness. No detail
+// route. Read-only.
+//
+// A "worker" is a LOCAL EXECUTION IDENTITY (per-machine/identity, not per-run):
+// it registers/refreshes whenever you `rupu workflow run` or send a session
+// turn. The explainer panel up top makes that explicit so the list isn't
+// mistaken for a per-run process table.
 
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { Server } from 'lucide-react';
-import { api, type WorkerRecord } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
+import { api, type WorkerView } from '../lib/api';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
-import { useInfiniteScroll } from '../lib/useInfiniteScroll';
-
-const STEP = 20;
 
 // A worker is considered stale if it hasn't been seen in this many ms.
 const STALE_MS = 5 * 60 * 1000;
 
+/** Local short-id truncation (a shared helper is being added separately). */
 function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 10)}…` : id;
 }
@@ -26,9 +31,8 @@ function isStale(lastSeen: string): boolean {
 }
 
 export default function Workers() {
-  const [workers, setWorkers] = useState<WorkerRecord[] | null>(null);
+  const [workers, setWorkers] = useState<WorkerView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [visible, setVisible] = useState(STEP);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,7 +41,6 @@ export default function Workers() {
       .then((data) => {
         if (cancelled) return;
         setWorkers(data);
-        setVisible(STEP);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -48,21 +51,16 @@ export default function Workers() {
     };
   }, []);
 
-  const sorted = (workers ?? []).slice().sort((a, b) => a.name.localeCompare(b.name));
-  const shown = sorted.slice(0, visible);
-  const { sentinelRef } = useInfiniteScroll({
-    hasMore: visible < sorted.length,
-    loadMore: () => setVisible((v) => v + STEP),
-  });
-
   return (
     <div className="p-8">
       <header className="mb-6">
         <h1 className="text-2xl font-semibold text-ink">Workers</h1>
         <p className="mt-1 text-sm text-ink-dim">
-          Workers registered with this control plane — their kind, host, and declared capabilities.
+          Local execution identities registered with this control plane.
         </p>
       </header>
+
+      <Explainer />
 
       {error && (
         <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -72,76 +70,153 @@ export default function Workers() {
 
       {workers === null ? (
         <div className="text-sm text-ink-dim">Loading workers…</div>
-      ) : sorted.length === 0 ? (
+      ) : workers.length === 0 ? (
         <EmptyState />
       ) : (
         <section>
-          <SectionHeader tone="muted" label="Workers" count={sorted.length} />
-          <ListCard>
-            {shown.map((w) => (
-              <WorkerRow key={w.worker_id} worker={w} />
-            ))}
-          </ListCard>
-          {sorted.length > visible && (
-            <div ref={sentinelRef} className="py-2 text-center text-[11px] text-ink-mute">
-              scroll for more
-            </div>
-          )}
+          <SectionHeader tone="muted" label="Workers" count={workers.length} />
+          <SortableTable<WorkerView>
+            columns={COLUMNS}
+            rows={workers}
+            rowKey={(w) => w.worker_id}
+            initialSort={{ key: 'name', dir: 'asc' }}
+          />
         </section>
       )}
     </div>
   );
 }
 
-function WorkerRow({ worker }: { worker: WorkerRecord }) {
-  const stale = isStale(worker.last_seen_at);
+const COLUMNS: Column<WorkerView>[] = [
+  {
+    key: 'name',
+    header: 'Name',
+    sortable: true,
+    sortValue: (w) => w.name,
+    render: (w) => (
+      <div className="min-w-0">
+        <div className="text-sm font-medium text-ink truncate">{w.name}</div>
+        <div className="text-[11px] text-ink-mute font-mono truncate">{shortId(w.worker_id)}</div>
+      </div>
+    ),
+  },
+  {
+    key: 'kind',
+    header: 'Kind',
+    sortable: true,
+    sortValue: (w) => w.kind,
+    render: (w) => (
+      <Chip className="bg-slate-100 text-ink-mute ring-slate-200">{w.kind}</Chip>
+    ),
+  },
+  {
+    key: 'host',
+    header: 'Host',
+    render: (w) => <span className="text-[11px] text-ink-mute font-mono">{w.host}</span>,
+  },
+  {
+    key: 'active',
+    header: 'Active runs',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (w) => w.active_run_count,
+    render: (w) =>
+      w.active_run_count > 0 ? (
+        <Link
+          to="/runs/workflows"
+          className="font-medium text-brand-600 hover:text-brand-700 hover:underline tabular-nums"
+        >
+          {w.active_run_count}
+        </Link>
+      ) : (
+        <span className="text-ink-mute tabular-nums">0</span>
+      ),
+  },
+  {
+    key: 'total',
+    header: 'Total runs',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (w) => w.total_run_count,
+    render: (w) => <span className="text-ink-dim tabular-nums">{w.total_run_count}</span>,
+  },
+  {
+    key: 'last_run',
+    header: 'Last run',
+    sortable: true,
+    sortValue: (w) => {
+      if (!w.last_run_at) return null;
+      const t = Date.parse(w.last_run_at);
+      return Number.isNaN(t) ? null : t;
+    },
+    render: (w) =>
+      w.last_run_at ? (
+        <span className="text-[12px] text-ink-dim">{relativeTime(w.last_run_at)}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'last_seen',
+    header: 'Last seen',
+    sortable: true,
+    sortValue: (w) => {
+      const t = Date.parse(w.last_seen_at);
+      return Number.isNaN(t) ? null : t;
+    },
+    render: (w) => {
+      const stale = isStale(w.last_seen_at);
+      return (
+        <div className="flex items-center gap-2">
+          <span className={cn('text-[12px]', stale ? 'text-amber-700' : 'text-ink-dim')}>
+            {relativeTime(w.last_seen_at)}
+          </span>
+          {stale && <Chip className="bg-amber-50 text-amber-800 ring-amber-200">stale</Chip>}
+        </div>
+      );
+    },
+  },
+  {
+    key: 'capabilities',
+    header: 'Capabilities',
+    render: (w) => <Capabilities worker={w} />,
+  },
+  {
+    key: 'version',
+    header: 'Version',
+    align: 'right',
+    width: 'w-16',
+    render: (w) => <span className="text-[11px] text-ink-mute tabular-nums">v{w.version}</span>,
+  },
+];
+
+function Capabilities({ worker }: { worker: WorkerView }) {
   const caps = worker.capabilities ?? {};
   const backends = caps.backends ?? [];
   const scmHosts = caps.scm_hosts ?? [];
   const modes = caps.permission_modes ?? [];
-
+  if (backends.length === 0 && scmHosts.length === 0 && modes.length === 0) {
+    return <span className="text-[11px] text-ink-mute">—</span>;
+  }
   return (
-    <div className="flex items-start gap-4 px-4 py-3">
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm font-medium text-ink truncate">{worker.name}</span>
-          <span className="text-[11px] text-ink-mute font-mono">{shortId(worker.worker_id)}</span>
-          <Chip className="bg-slate-100 text-ink-mute ring-slate-200">{worker.kind}</Chip>
-          <span className="text-[11px] text-ink-mute font-mono">{worker.host}</span>
-          {stale && (
-            <Chip className="bg-amber-50 text-amber-800 ring-amber-200">stale</Chip>
-          )}
-        </div>
-
-        {/* Capabilities */}
-        {(backends.length > 0 || scmHosts.length > 0 || modes.length > 0) && (
-          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-            {backends.map((b) => (
-              <Chip key={`b-${b}`} className="bg-blue-50 text-blue-700 ring-blue-200">
-                {b}
-              </Chip>
-            ))}
-            {scmHosts.map((h) => (
-              <Chip key={`s-${h}`} className="bg-violet-50 text-violet-700 ring-violet-200">
-                {h}
-              </Chip>
-            ))}
-            {modes.map((m) => (
-              <Chip key={`m-${m}`} className="bg-green-50 text-green-700 ring-green-200">
-                {m}
-              </Chip>
-            ))}
-          </div>
-        )}
-
-        <div className="mt-1 flex flex-wrap items-center gap-x-3 text-[11px] text-ink-mute">
-          <span>registered {relativeTime(worker.registered_at)}</span>
-          <span className={cn(stale && 'text-amber-700')}>
-            last seen {relativeTime(worker.last_seen_at)}
-          </span>
-          <span className="tabular-nums">v{worker.version}</span>
-        </div>
-      </div>
+    <div className="flex flex-wrap items-center gap-1.5">
+      {backends.map((b) => (
+        <Chip key={`b-${b}`} className="bg-blue-50 text-blue-700 ring-blue-200">
+          {b}
+        </Chip>
+      ))}
+      {scmHosts.map((h) => (
+        <Chip key={`s-${h}`} className="bg-violet-50 text-violet-700 ring-violet-200">
+          {h}
+        </Chip>
+      ))}
+      {modes.map((m) => (
+        <Chip key={`m-${m}`} className="bg-green-50 text-green-700 ring-green-200">
+          {m}
+        </Chip>
+      ))}
     </div>
   );
 }
@@ -159,6 +234,33 @@ function Chip({ children, className }: { children: React.ReactNode; className?: 
   );
 }
 
+function Explainer() {
+  return (
+    <div className="mb-6 rounded-xl border border-border bg-panel/50 px-4 py-3 text-sm text-ink-dim">
+      <p>
+        A <span className="font-medium text-ink">worker</span> is a local execution identity — it
+        registers (or refreshes) whenever you run a workflow or send a session turn. It is
+        per-machine, <span className="font-medium text-ink">not per-run</span>: launching work in
+        the background refreshes an existing worker rather than spawning a new one here.
+      </p>
+      <ul className="mt-2 flex flex-col gap-1 text-[13px]">
+        <li>
+          <Chip className="mr-1.5 bg-slate-100 text-ink-mute ring-slate-200">cli</Chip>
+          your machine&apos;s rupu CLI.
+        </li>
+        <li>
+          <Chip className="mr-1.5 bg-slate-100 text-ink-mute ring-slate-200">autoflow_serve</Chip>
+          the autoflow daemon.
+        </li>
+        <li>
+          <Chip className="mr-1.5 bg-amber-50 text-amber-800 ring-amber-200">stale</Chip>
+          not seen in over 5 minutes.
+        </li>
+      </ul>
+    </div>
+  );
+}
+
 function EmptyState() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
@@ -167,7 +269,8 @@ function EmptyState() {
       </div>
       <h2 className="text-sm font-medium text-ink">No workers registered</h2>
       <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        Workers appear here once they register with this control plane.
+        Workers appear here once you run a workflow or send a session turn on a machine connected to
+        this control plane.
       </p>
     </div>
   );

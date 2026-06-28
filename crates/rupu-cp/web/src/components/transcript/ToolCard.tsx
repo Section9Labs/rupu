@@ -27,6 +27,8 @@ import FindingCard from './FindingCard';
 import DiffView from './DiffView';
 import TerminalBlock from './TerminalBlock';
 import StructuredView from './StructuredView';
+import { Button } from '../ui/Button';
+import { formatDuration } from '../../lib/duration';
 
 // ---------------------------------------------------------------------------
 // Public helper — exported for unit tests
@@ -133,10 +135,9 @@ function isNonTrivialObject(v: unknown): v is Record<string, unknown> {
 // ---------------------------------------------------------------------------
 
 function DurationBadge({ ms }: { ms: number }) {
-  const text = ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
   return (
     <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-mono bg-slate-100 text-slate-500">
-      {text}
+      {formatDuration(ms)}
     </span>
   );
 }
@@ -291,13 +292,13 @@ function SubrunBody({
         {transcriptPath && (
           <div className="flex items-center gap-2">
             {onOpenTranscript ? (
-              <button
-                type="button"
+              <Button
+                variant="primary"
+                size="sm"
                 onClick={() => onOpenTranscript(transcriptPath)}
-                className="inline-flex items-center rounded bg-brand-700 px-2.5 py-1 text-[11px] text-white font-medium hover:bg-brand-600 transition-colors"
               >
                 View sub-run transcript →
-              </button>
+              </Button>
             ) : (
               <span className="inline-block font-mono text-[10.5px] text-brand-700 bg-slate-50 border border-border rounded px-2 py-0.5 break-all">
                 {transcriptPath}

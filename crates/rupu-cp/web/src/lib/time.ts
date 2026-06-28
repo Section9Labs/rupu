@@ -1,6 +1,8 @@
 // Small, dependency-free time helpers for the Runs views. Kept local so we
 // don't pull in date-fns just for two formatters.
 
+import { formatDuration } from './duration';
+
 /** Relative "time ago" string, e.g. "3m ago", "2h ago", "just now". */
 export function relativeTime(iso?: string | null): string {
   if (!iso) return '—';
@@ -31,17 +33,10 @@ export function durationBetween(startIso?: string | null, endIso?: string | null
   return formatDurationMs(Math.max(0, end - start));
 }
 
-/** Format a millisecond count as a compact human duration. */
+/** Format a millisecond count as a compact human duration. Routes through the
+ *  canonical {@link formatDuration} so every view formats durations the same. */
 export function formatDurationMs(ms: number): string {
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  const totalSec = Math.floor(ms / 1000);
-  const sec = totalSec % 60;
-  const totalMin = Math.floor(totalSec / 60);
-  const min = totalMin % 60;
-  const hr = Math.floor(totalMin / 60);
-  if (hr > 0) return `${hr}h ${min}m`;
-  if (min > 0) return `${min}m ${sec}s`;
-  return `${sec}s`;
+  return formatDuration(ms);
 }
 
 /** Absolute timestamp, locale-formatted; "—" on missing/invalid. */

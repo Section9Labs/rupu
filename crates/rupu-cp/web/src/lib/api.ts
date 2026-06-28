@@ -550,6 +550,20 @@ export interface WorkerRecord {
   last_seen_at: string;
 }
 
+/**
+ * A worker record enriched with run-activity attribution (returned by
+ * `GET /api/workers`). The base `WorkerRecord` fields are flattened in; the
+ * extra fields summarize the runs whose `worker_id` matches this worker.
+ */
+export interface WorkerView extends WorkerRecord {
+  /** Runs currently Running / Pending / AwaitingApproval for this worker. */
+  active_run_count: number;
+  /** Every run ever attributed to this worker. */
+  total_run_count: number;
+  /** Most recent run `started_at`, or null when the worker has no runs. */
+  last_run_at?: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Coverage
 // ---------------------------------------------------------------------------
@@ -1168,8 +1182,8 @@ export const api = {
   },
 
   // --- Workers ---
-  getWorkers(): Promise<WorkerRecord[]> {
-    return request<WorkerRecord[]>('/api/workers');
+  getWorkers(): Promise<WorkerView[]> {
+    return request<WorkerView[]>('/api/workers');
   },
 
   // --- Coverage ---

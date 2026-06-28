@@ -29,6 +29,21 @@ export default {
           low:      '#ca8a04',  // yellow-600
           info:     '#64748b',  // slate-500
         },
+        // Unified run/step status palette — the SINGLE source of truth shared by
+        // pills, the timeline, the run-graph, and session dots. Mirror these
+        // values in `src/lib/status.ts` (the descriptor map) and the literal
+        // hexes in `src/styles.css` (CSS can't import TS).
+        status: {
+          running:   '#3b82f6',  // blue-500
+          done:      '#22c55e',  // green-500 (alias: completed)
+          completed: '#22c55e',  // green-500
+          failed:    '#ef4444',  // red-500
+          awaiting:  '#f59e0b',  // amber-500
+          pending:   '#94a3b8',  // slate-400
+          skipped:   '#cbd5e1',  // slate-300
+          cancelled: '#64748b',  // slate-500
+          rejected:  '#ef4444',  // red-500
+        },
       },
       fontFamily: {
         sans: ['-apple-system', 'BlinkMacSystemFont', 'Inter', 'system-ui', 'sans-serif'],

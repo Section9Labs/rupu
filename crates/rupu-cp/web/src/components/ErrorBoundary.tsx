@@ -1,5 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react';
 import { AlertTriangle, RefreshCcw } from 'lucide-react';
+import { Button } from './ui/Button';
 
 interface State {
   error: Error | null;
@@ -48,14 +49,10 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
               </details>
             )}
             <div className="mt-5 flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => location.reload()}
-                className="inline-flex items-center gap-1.5 bg-brand-500 hover:bg-brand-600 text-white text-sm font-medium px-3 py-1.5 rounded-md"
-              >
+              <Button onClick={() => location.reload()} className="gap-1.5 text-sm">
                 <RefreshCcw size={13} />
                 Reload page
-              </button>
+              </Button>
               <button
                 type="button"
                 onClick={() => this.setState({ error: null, componentStack: null })}

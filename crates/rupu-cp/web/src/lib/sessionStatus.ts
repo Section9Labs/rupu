@@ -2,15 +2,20 @@
 // `unknown` (the wire shape isn't pinned yet), so we coerce defensively: a
 // string is used as-is; anything else is JSON-stringified for display. Common
 // lifecycle values map to a colored dot tone; everything else falls back
-// neutral. Tailwind classes are STATIC literals keyed off a small map.
+// neutral. Dot colors come from the unified status palette (`lib/status.ts`)
+// so session dots match run pills. `idle` stays a distinct tone from a
+// finished run but reuses the green (done) hue; `stopped`/`neutral` reuse the
+// muted pending slate.
+
+import { STATUS } from './status';
 
 export type SessionTone = 'running' | 'idle' | 'stopped' | 'neutral';
 
 const TONE_DOT: Record<SessionTone, string> = {
-  running: 'bg-blue-500',
-  idle: 'bg-green-500',
-  stopped: 'bg-slate-400',
-  neutral: 'bg-slate-400',
+  running: STATUS.running.dotClass, // bg-status-running (blue-500)
+  idle: STATUS.completed.dotClass, // bg-status-done (green-500)
+  stopped: STATUS.pending.dotClass, // bg-status-pending (slate-400)
+  neutral: STATUS.pending.dotClass, // bg-status-pending (slate-400)
 };
 
 /** Raw → display label. Strings pass through; non-strings are stringified. */

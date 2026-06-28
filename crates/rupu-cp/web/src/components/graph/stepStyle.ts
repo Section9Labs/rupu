@@ -1,17 +1,18 @@
 // Shared per-state visual vocabulary for the run-graph node components.
 //
-// One source of truth for the colors + glyph + label of each `StepState`,
-// matching the approved graph-pro / fanout-loop mockups exactly:
-//   running  #1860f2   done #2ac769   failed #fb4e4e
-//   awaiting #f59e0b   pending #cbd5e1
+// Colors come from the unified status descriptor map (`lib/status.ts`) so the
+// graph now matches the pills/timeline exactly (running blue-500, done
+// green-500, failed red-500, awaiting amber-500). Only the glyph + lowercase
+// label are graph-local. The `done`↔`completed` alias is handled by
+// `stepStateStyle`.
 //
 // Colors are JS values consumed via inline `style={{ color, background }}`
 // (NOT Tailwind class interpolation), so dynamic state coloring stays static
 // at the Tailwind level. The `StepState` union here is the runGraphModel one
-// (`done`, not `completed`) — distinct from StatusPill's StepState, hence a
-// dedicated map rather than reusing STEP_STATE_STYLES.
+// (`done`, not `completed`) — distinct from StatusPill's StepState.
 
 import type { StepState } from '../../lib/runGraphModel';
+import { stepStateStyle } from '../../lib/status';
 
 export interface StateStyle {
   /** Foreground / glyph-fill color. */
@@ -25,17 +26,19 @@ export interface StateStyle {
 }
 
 export const STATE_STYLE: Record<StepState, StateStyle> = {
-  running: { color: '#1860f2', bg: '#eff6ff', glyph: '⟳', label: 'running' },
-  done: { color: '#2ac769', bg: '#ecfdf5', glyph: '✓', label: 'done' },
-  failed: { color: '#fb4e4e', bg: '#fef2f2', glyph: '✕', label: 'failed' },
-  awaiting_approval: { color: '#f59e0b', bg: '#fffbeb', glyph: '⏸', label: 'awaiting' },
-  pending: { color: '#94a3b8', bg: '#f8fafc', glyph: '•', label: 'pending' },
-  skipped: { color: '#94a3b8', bg: '#f1f5f9', glyph: '⤼', label: 'skipped' },
+  running: { color: stepStateStyle('running').hex, bg: stepStateStyle('running').tint, glyph: '⟳', label: 'running' },
+  done: { color: stepStateStyle('done').hex, bg: stepStateStyle('done').tint, glyph: '✓', label: 'done' },
+  failed: { color: stepStateStyle('failed').hex, bg: stepStateStyle('failed').tint, glyph: '✕', label: 'failed' },
+  awaiting_approval: { color: stepStateStyle('awaiting_approval').hex, bg: stepStateStyle('awaiting_approval').tint, glyph: '⏸', label: 'awaiting' },
+  // pending keeps the slate-400 glyph color (text reads on the light card).
+  pending: { color: stepStateStyle('pending').hex, bg: stepStateStyle('pending').tint, glyph: '•', label: 'pending' },
+  skipped: { color: stepStateStyle('pending').hex, bg: stepStateStyle('skipped').tint, glyph: '⤼', label: 'skipped' },
 };
 
 /** Fill color used for the colored unit squares in fan-out grids. */
 export function glyphBg(state: StepState): string {
-  // Pending squares read as a muted fill (#cbd5e1) rather than the dim text
-  // color, matching the mockup's `.glyph-pend`.
-  return state === 'pending' ? '#cbd5e1' : STATE_STYLE[state].color;
+  // Pending squares read as a muted fill (slate-300 = `status.skipped` token)
+  // rather than the dim slate-400 glyph color, matching the mockup's
+  // `.glyph-pend`.
+  return state === 'pending' ? stepStateStyle('skipped').hex : STATE_STYLE[state].color;
 }
