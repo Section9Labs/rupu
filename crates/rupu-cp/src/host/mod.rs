@@ -10,3 +10,4 @@
 pub mod connector;
 pub mod http;
 pub mod local;
+pub mod registry;
