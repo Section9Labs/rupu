@@ -12,8 +12,8 @@ import {
   type AutoflowDefRow,
   type WorkflowSummary,
 } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
-import { SectionHeader } from '../components/lists/SectionHeader';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
+import { TriggerChip } from '../components/TriggerChip';
 import { TabBar, TabButton } from '../components/TabBar';
 import { cn } from '../lib/cn';
 
@@ -41,33 +41,123 @@ function ScopeChip({ scope }: { scope?: string }) {
   );
 }
 
-const TRIGGER_CLS: Record<string, string> = {
-  cron: 'bg-violet-50 text-violet-700 ring-violet-200',
-  event: 'bg-sky-50 text-sky-700 ring-sky-200',
-  manual: 'bg-slate-100 text-slate-600 ring-slate-200',
-};
+// ── Columns ─────────────────────────────────────────────────────────────────
 
-function TriggerChip({ trigger }: { trigger: string }) {
-  const cls = TRIGGER_CLS[trigger] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5',
-        cls,
-      )}
-    >
-      {trigger}
-    </span>
-  );
-}
+const AGENT_COLUMNS: Column<AgentSummary>[] = [
+  {
+    key: 'name',
+    header: 'Name',
+    sortable: true,
+    sortValue: (a) => a.name,
+    render: (a) => (
+      <Link
+        to={`/agents/${encodeURIComponent(a.name)}`}
+        className="text-sm font-medium text-ink truncate hover:underline"
+      >
+        {a.name}
+      </Link>
+    ),
+  },
+  {
+    key: 'scope',
+    header: 'Scope',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (a) => a.scope ?? 'global',
+    render: (a) => <ScopeChip scope={a.scope} />,
+  },
+  {
+    key: 'provider',
+    header: 'Provider',
+    width: 'w-32',
+    sortable: true,
+    sortValue: (a) => a.provider ?? null,
+    render: (a) =>
+      a.provider ? (
+        <span className="text-note text-ink-dim">{a.provider}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'model',
+    header: 'Model',
+    width: 'w-40',
+    sortable: true,
+    sortValue: (a) => a.model ?? null,
+    render: (a) =>
+      a.model ? (
+        <span className="text-note text-ink-mute font-mono">{a.model}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'description',
+    header: 'Description',
+    render: (a) => (
+      <span className="text-ui text-ink-dim truncate block max-w-md">{a.description ?? ''}</span>
+    ),
+  },
+];
 
-function MetaChip({ children }: { children: React.ReactNode }) {
-  return (
-    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200">
-      {children}
-    </span>
-  );
-}
+const WORKFLOW_COLUMNS: Column<WorkflowSummary>[] = [
+  {
+    key: 'name',
+    header: 'Name',
+    sortable: true,
+    sortValue: (w) => w.name,
+    render: (w) => (
+      <Link
+        to={`/workflows/${encodeURIComponent(w.name)}`}
+        className="text-sm font-medium text-ink truncate hover:underline"
+      >
+        {w.name}
+      </Link>
+    ),
+  },
+  {
+    key: 'scope',
+    header: 'Scope',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (w) => w.scope,
+    render: (w) => <ScopeChip scope={w.scope} />,
+  },
+];
+
+const AUTOFLOW_COLUMNS: Column<AutoflowDefRow>[] = [
+  {
+    key: 'name',
+    header: 'Name',
+    sortable: true,
+    sortValue: (d) => d.name,
+    render: (d) => (
+      <Link
+        to={`/workflows/${encodeURIComponent(d.slug)}`}
+        className="text-sm font-medium text-ink truncate hover:underline"
+      >
+        {d.name}
+      </Link>
+    ),
+  },
+  {
+    key: 'trigger',
+    header: 'Trigger',
+    width: 'w-28',
+    sortable: true,
+    sortValue: (d) => d.trigger,
+    render: (d) => <TriggerChip trigger={d.trigger} />,
+  },
+  {
+    key: 'scope',
+    header: 'Scope',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (d) => d.scope,
+    render: (d) => <ScopeChip scope={d.scope} />,
+  },
+];
 
 // ── Empty state ─────────────────────────────────────────────────────────────
 
@@ -176,32 +266,12 @@ function AgentsTab({ agents }: { agents: AgentSummary[] | null }) {
   if (agents === null) return <div className="text-sm text-ink-dim">Loading agents…</div>;
   if (agents.length === 0) return <EmptyDefs label="agents" />;
   return (
-    <section>
-      <SectionHeader tone="muted" label="Agents" count={agents.length} />
-      <ListCard>
-        {agents.map((a) => (
-          <Link
-            key={a.name}
-            to={`/agents/${encodeURIComponent(a.name)}`}
-            className="flex items-start gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
-          >
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-sm font-medium text-ink truncate">{a.name}</span>
-                <ScopeChip scope={a.scope} />
-                {a.provider && <MetaChip>{a.provider}</MetaChip>}
-                {a.model && <MetaChip>{a.model}</MetaChip>}
-              </div>
-              {a.description && (
-                <p className="mt-1 text-ui text-ink-dim leading-snug line-clamp-2">
-                  {a.description}
-                </p>
-              )}
-            </div>
-          </Link>
-        ))}
-      </ListCard>
-    </section>
+    <SortableTable<AgentSummary>
+      columns={AGENT_COLUMNS}
+      rows={agents}
+      rowKey={(a) => a.name}
+      initialSort={{ key: 'name', dir: 'asc' }}
+    />
   );
 }
 
@@ -209,25 +279,12 @@ function WorkflowsTab({ workflows }: { workflows: WorkflowSummary[] | null }) {
   if (workflows === null) return <div className="text-sm text-ink-dim">Loading workflows…</div>;
   if (workflows.length === 0) return <EmptyDefs label="workflows" />;
   return (
-    <section>
-      <SectionHeader tone="muted" label="Workflows" count={workflows.length} />
-      <ListCard>
-        {workflows.map((w) => (
-          <Link
-            key={w.name}
-            to={`/workflows/${encodeURIComponent(w.name)}`}
-            className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
-          >
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-sm font-medium text-ink truncate">{w.name}</span>
-                <ScopeChip scope={w.scope} />
-              </div>
-            </div>
-          </Link>
-        ))}
-      </ListCard>
-    </section>
+    <SortableTable<WorkflowSummary>
+      columns={WORKFLOW_COLUMNS}
+      rows={workflows}
+      rowKey={(w) => w.name}
+      initialSort={{ key: 'name', dir: 'asc' }}
+    />
   );
 }
 
@@ -235,21 +292,11 @@ function AutoflowsTab({ autoflows }: { autoflows: AutoflowDefRow[] | null }) {
   if (autoflows === null) return <div className="text-sm text-ink-dim">Loading autoflows…</div>;
   if (autoflows.length === 0) return <EmptyDefs label="autoflows" />;
   return (
-    <section>
-      <SectionHeader tone="muted" label="Autoflows" count={autoflows.length} />
-      <ListCard>
-        {autoflows.map((d) => (
-          <div key={d.name} className="flex items-center gap-4 px-4 py-3">
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-sm font-medium text-ink truncate">{d.name}</span>
-                <ScopeChip scope={d.scope} />
-                <TriggerChip trigger={d.trigger} />
-              </div>
-            </div>
-          </div>
-        ))}
-      </ListCard>
-    </section>
+    <SortableTable<AutoflowDefRow>
+      columns={AUTOFLOW_COLUMNS}
+      rows={autoflows}
+      rowKey={(d) => d.name}
+      initialSort={{ key: 'name', dir: 'asc' }}
+    />
   );
 }

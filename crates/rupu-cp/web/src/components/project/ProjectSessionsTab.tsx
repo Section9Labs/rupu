@@ -3,25 +3,21 @@
 // loaded rows.
 //
 // Ported from pages/ProjectSessions.tsx, reshaped into a self-contained
-// component keyed off the `wsId` prop.
+// component keyed off the `wsId` prop. Rows render via the shared SortableTable.
 
 import { useCallback, useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { api, type SessionSummary } from '../../lib/api';
-import { ListCard } from '../lists/ListCard';
-import MetricRow from '../lists/MetricRow';
+import SortableTable, { type Column } from '../lists/SortableTable';
 import UsageBarChart from '../charts/UsageBarChart';
 import { durationBetween } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { sessionStatusDot, sessionStatusLabel, sessionStatusTone } from '../../lib/sessionStatus';
+import { shortId } from '../../lib/shortId';
 import { cn } from '../../lib/cn';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
-
-function shortId(id: string): string {
-  return id.length > 12 ? `${id.slice(0, 10)}…` : id;
-}
 
 // --- Scope filter -----------------------------------------------------------
 
@@ -45,8 +41,138 @@ function matchesScope(s: SessionSummary, filter: ScopeFilter): boolean {
   return filter === 'archived' ? isArchived(s) : !isArchived(s);
 }
 
+/** Session duration in ms (created → last update); null when timestamps are bad. */
+function sessionDurationMs(s: SessionSummary): number | null {
+  const start = Date.parse(s.created_at);
+  const end = Date.parse(s.updated_at);
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
+  return Math.max(0, end - start);
+}
+
+const SESSION_COLUMNS: Column<SessionSummary>[] = [
+  {
+    key: 'status',
+    header: 'Status',
+    sortable: true,
+    sortValue: (s) => sessionStatusLabel(s.status),
+    render: (s) => (
+      <span className="flex items-center gap-1.5">
+        <span className={cn('inline-block w-2 h-2 rounded-full', sessionStatusDot(s.status))} />
+        <span className="text-note text-ink-dim">{sessionStatusLabel(s.status)}</span>
+      </span>
+    ),
+  },
+  {
+    key: 'agent',
+    header: 'Agent',
+    sortable: true,
+    sortValue: (s) => s.agent_name,
+    render: (s) => <span className="text-sm font-medium text-ink truncate">{s.agent_name}</span>,
+  },
+  {
+    key: 'session',
+    header: 'Session',
+    render: (s) => (
+      <Link
+        to={`/sessions/${encodeURIComponent(s.session_id)}`}
+        className="text-note text-ink-mute font-mono hover:underline"
+      >
+        {shortId(s.session_id, 10)}
+      </Link>
+    ),
+  },
+  {
+    key: 'model',
+    header: 'Model',
+    sortable: true,
+    sortValue: (s) => s.model,
+    render: (s) => <span className="text-note text-ink-mute font-mono">{s.model}</span>,
+  },
+  {
+    key: 'in',
+    header: 'In',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (s) => s.usage?.input_tokens ?? null,
+    render: (s) => (
+      <span className="text-ink-dim">{s.usage ? formatTokens(s.usage.input_tokens) : '—'}</span>
+    ),
+  },
+  {
+    key: 'out',
+    header: 'Out',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (s) => s.usage?.output_tokens ?? null,
+    render: (s) => (
+      <span className="text-ink-dim">{s.usage ? formatTokens(s.usage.output_tokens) : '—'}</span>
+    ),
+  },
+  {
+    key: 'cached',
+    header: 'Cached',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (s) => s.usage?.cached_tokens ?? null,
+    render: (s) =>
+      s.usage?.cached_tokens ? (
+        <span className="text-ink-dim">{formatTokens(s.usage.cached_tokens)}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'cost',
+    header: 'Cost',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (s) => s.usage?.cost_usd ?? null,
+    render: (s) => (
+      <span className="text-ink font-medium">{s.usage ? formatCost(s.usage.cost_usd) : '—'}</span>
+    ),
+  },
+  {
+    key: 'turns',
+    header: 'Turns',
+    align: 'right',
+    width: 'w-16',
+    sortable: true,
+    sortValue: (s) => s.total_turns,
+    render: (s) => <span className="text-ink">{s.total_turns ? String(s.total_turns) : '—'}</span>,
+  },
+  {
+    key: 'duration',
+    header: 'Duration',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (s) => sessionDurationMs(s),
+    render: (s) => (
+      <span className="text-ink-dim">{durationBetween(s.created_at, s.updated_at)}</span>
+    ),
+  },
+  {
+    key: 'action',
+    header: '',
+    align: 'right',
+    width: 'w-24',
+    render: (s) =>
+      s.active_run_id ? (
+        <Link
+          to={`/runs/${encodeURIComponent(s.active_run_id)}`}
+          className="inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
+        >
+          active run
+        </Link>
+      ) : null,
+  },
+];
+
 export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
-  const navigate = useNavigate();
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
   const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -154,63 +280,14 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
               />
             </div>
           )}
-          <ListCard>
-            {filtered.map((s) => {
-              const u = s.usage;
-              return (
-                <MetricRow
-                  key={s.session_id}
-                  to={`/sessions/${encodeURIComponent(s.session_id)}`}
-                  header={
-                    <>
-                      <span className="flex items-center gap-1.5">
-                        <span
-                          className={cn(
-                            'inline-block w-2 h-2 rounded-full shrink-0',
-                            sessionStatusDot(s.status),
-                          )}
-                        />
-                        <span className="text-note text-ink-dim">
-                          {sessionStatusLabel(s.status)}
-                        </span>
-                      </span>
-                      <span className="text-sm font-medium text-ink truncate">{s.agent_name}</span>
-                      <span className="text-note text-ink-mute font-mono">
-                        {shortId(s.session_id)}
-                      </span>
-                      <span className="text-note text-ink-mute font-mono">{s.model}</span>
-                    </>
-                  }
-                  trailing={
-                    s.active_run_id ? (
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          navigate(`/runs/${encodeURIComponent(s.active_run_id ?? '')}`);
-                        }}
-                        className="shrink-0 inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
-                      >
-                        active run
-                      </button>
-                    ) : undefined
-                  }
-                  metrics={[
-                    { label: 'in', value: u ? formatTokens(u.input_tokens) : null },
-                    { label: 'out', value: u ? formatTokens(u.output_tokens) : null },
-                    {
-                      label: 'cached',
-                      value: u && u.cached_tokens ? formatTokens(u.cached_tokens) : null,
-                    },
-                    { label: 'cost', value: u ? formatCost(u.cost_usd) : null },
-                    { label: 'turns', value: s.total_turns ? String(s.total_turns) : null },
-                    { label: 'duration', value: durationBetween(s.created_at, s.updated_at) },
-                  ]}
-                />
-              );
-            })}
-          </ListCard>
+          {/* No initialSort: the server returns sessions most-recent first, so
+              source order already satisfies the default. Headers re-sort
+              client-side. */}
+          <SortableTable<SessionSummary>
+            columns={SESSION_COLUMNS}
+            rows={filtered}
+            rowKey={(s) => s.session_id}
+          />
         </div>
       )}
 

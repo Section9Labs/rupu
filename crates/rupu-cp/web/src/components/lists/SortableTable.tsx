@@ -8,9 +8,9 @@
 // numbers compare numerically; null/undefined always sort LAST regardless of
 // direction. The sort is stable (original order is the tiebreaker).
 
-import { useMemo, useState } from 'react';
+import { Fragment, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronUp } from 'lucide-react';
 import { cn } from '../../lib/cn';
 
 export interface Column<T> {
@@ -43,14 +43,31 @@ export default function SortableTable<T>({
   rowKey,
   initialSort,
   rowHref,
+  renderDetail,
 }: {
   columns: Column<T>[];
   rows: T[];
   rowKey: (row: T) => string;
   initialSort?: SortSpec;
   rowHref?: (row: T) => string | undefined;
+  /** When provided, each row gets a leading expand chevron that toggles a
+   *  full-width detail panel below it (for evidence / nested concerns / etc).
+   *  Expandable rows are never link-wrapped (`rowHref` is ignored). */
+  renderDetail?: (row: T) => React.ReactNode;
 }) {
   const [sort, setSort] = useState<SortSpec | null>(initialSort ?? null);
+  const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
+  const expandable = Boolean(renderDetail);
+  const totalCols = columns.length + (expandable ? 1 : 0);
+
+  function toggleOpen(key: string) {
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
 
   const sorted = useMemo(() => {
     if (!sort) return rows;
@@ -87,6 +104,7 @@ export default function SortableTable<T>({
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-border text-meta uppercase tracking-wide text-ink-mute">
+            {expandable && <th scope="col" className="w-8" aria-label="Expand" />}
             {columns.map((col) => {
               const active = sort?.key === col.key;
               const dir = active ? sort?.dir : undefined;
@@ -133,32 +151,58 @@ export default function SortableTable<T>({
         </thead>
         <tbody className="divide-y divide-border">
           {sorted.map((row) => {
-            const href = rowHref?.(row);
+            const key = rowKey(row);
+            // Expandable tables never link-wrap rows (the chevron is the row's
+            // interaction); plain tables honour rowHref.
+            const href = expandable ? undefined : rowHref?.(row);
+            const isOpen = expandable && open.has(key);
             return (
-              <tr key={rowKey(row)} className="hover:bg-bg/60 transition-colors">
-                {columns.map((col) => {
-                  const alignCls = cn(
-                    col.align === 'right' ? 'text-right tabular-nums' : 'text-left',
-                    col.width,
-                  );
-                  // When the whole row is a link, each cell wraps its content in
-                  // a block <Link> so the entire row is clickable (and every cell
-                  // is a navigation target) without nesting anchors. Pages that
-                  // use rowHref render plain content (no inner links); pages with
-                  // per-column links / interactive cells omit rowHref.
-                  return href ? (
-                    <td key={col.key} className={alignCls}>
-                      <Link to={href} className="block px-4 py-2.5 align-middle">
+              <Fragment key={key}>
+                <tr className="hover:bg-bg/60 transition-colors">
+                  {expandable && (
+                    <td className="w-8 pl-3 align-middle">
+                      <button
+                        type="button"
+                        onClick={() => toggleOpen(key)}
+                        aria-expanded={isOpen}
+                        aria-label={isOpen ? 'Collapse row' : 'Expand row'}
+                        className="flex h-5 w-5 items-center justify-center rounded text-ink-mute hover:bg-bg hover:text-ink-dim"
+                      >
+                        {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      </button>
+                    </td>
+                  )}
+                  {columns.map((col) => {
+                    const alignCls = cn(
+                      col.align === 'right' ? 'text-right tabular-nums' : 'text-left',
+                      col.width,
+                    );
+                    // When the whole row is a link, each cell wraps its content in
+                    // a block <Link> so the entire row is clickable (and every cell
+                    // is a navigation target) without nesting anchors. Pages that
+                    // use rowHref render plain content (no inner links); pages with
+                    // per-column links / interactive cells omit rowHref.
+                    return href ? (
+                      <td key={col.key} className={alignCls}>
+                        <Link to={href} className="block px-4 py-2.5 align-middle">
+                          {col.render(row)}
+                        </Link>
+                      </td>
+                    ) : (
+                      <td key={col.key} className={cn('px-4 py-2.5 align-middle', alignCls)}>
                         {col.render(row)}
-                      </Link>
+                      </td>
+                    );
+                  })}
+                </tr>
+                {isOpen && (
+                  <tr className="bg-bg/40">
+                    <td colSpan={totalCols} className="px-4 py-3">
+                      {renderDetail?.(row)}
                     </td>
-                  ) : (
-                    <td key={col.key} className={cn('px-4 py-2.5 align-middle', alignCls)}>
-                      {col.render(row)}
-                    </td>
-                  );
-                })}
-              </tr>
+                  </tr>
+                )}
+              </Fragment>
             );
           })}
         </tbody>

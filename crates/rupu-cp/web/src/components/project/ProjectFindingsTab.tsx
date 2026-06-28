@@ -7,8 +7,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api, normFindingSeverity, type FindingsResponse } from '../../lib/api';
 import { type Severity } from '../../lib/severity';
 import { FindingMetrics } from '../findings/FindingMetrics';
-import { FindingRow } from '../findings/FindingRow';
-import { ListCard } from '../lists/ListCard';
+import { FindingsTable } from '../findings/FindingsTable';
 
 export default function ProjectFindingsTab({ wsId }: { wsId: string }) {
   const [resp, setResp] = useState<FindingsResponse | null>(null);
@@ -74,16 +73,7 @@ export default function ProjectFindingsTab({ wsId }: { wsId: string }) {
           No {activeSev} findings.
         </div>
       ) : (
-        <ListCard>
-          {rows.map((f) => (
-            <FindingRow
-              key={`${f.ws_id}/${f.target_id}/${f.id}`}
-              finding={f}
-              project={f.project}
-              targetId={f.target_id}
-            />
-          ))}
-        </ListCard>
+        <FindingsTable findings={rows} showProvenance />
       )}
     </div>
   );

@@ -1,15 +1,14 @@
 // Global Findings — every finding across every project, severity-ordered
 // (critical → info, then newest first; the backend pre-sorts). A clickable
-// metric strip filters the list to a single severity; the FindingRow
-// provenance chip shows the owning `[project · target]`.
+// metric strip filters the list to a single severity; the table's Project /
+// Target columns show each finding's owning project · target.
 
 import { useEffect, useMemo, useState } from 'react';
 import { Inbox } from 'lucide-react';
 import { api, normFindingSeverity, type FindingOut, type FindingsSummary } from '../lib/api';
 import { type Severity } from '../lib/severity';
 import { FindingMetrics } from '../components/findings/FindingMetrics';
-import { FindingRow } from '../components/findings/FindingRow';
-import { ListCard } from '../components/lists/ListCard';
+import { FindingsTable } from '../components/findings/FindingsTable';
 
 const EMPTY_SUMMARY: FindingsSummary = { total: 0, critical: 0, high: 0, medium: 0, low: 0, info: 0 };
 
@@ -75,16 +74,7 @@ export default function Findings() {
               No {activeSev} findings.
             </div>
           ) : (
-            <ListCard>
-              {rows.map((f) => (
-                <FindingRow
-                  key={`${f.ws_id}/${f.target_id}/${f.id}`}
-                  finding={f}
-                  project={f.project}
-                  targetId={f.target_id}
-                />
-              ))}
-            </ListCard>
+            <FindingsTable findings={rows} showProvenance />
           )}
         </div>
       )}

@@ -5,7 +5,11 @@ import { Link } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 import { api, type TemplateSummary, type TemplateDetail } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
-import { ListCard } from '../components/lists/ListCard';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
+import { SEVERITY_STYLE, type Severity } from '../lib/severity';
+
+// Severity columns, most → least severe.
+const SEV_COLS: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
 
 export default function CoverageTemplates() {
   const [templates, setTemplates] = useState<TemplateSummary[] | null>(null);
@@ -48,58 +52,109 @@ export default function CoverageTemplates() {
       ) : (
         <section className="mt-6">
           <SectionHeader tone="muted" label="Templates" count={templates.length} />
-          <ListCard>
-            {templates.map((t) => (
-              <TemplateRow key={t.name} t={t} />
-            ))}
-          </ListCard>
+          <TemplatesTable templates={templates} />
         </section>
       )}
     </div>
   );
 }
 
-function TemplateRow({ t }: { t: TemplateSummary }) {
-  const [open, setOpen] = useState(false);
-  const [detail, setDetail] = useState<TemplateDetail | null>(null);
+/**
+ * Templates as a SortableTable. Columns: Template | Version | Concerns |
+ * Critical | High | Medium | Low | Info (severity-breakdown counts). Each row
+ * expands (via `renderDetail`) to its nested concern list, lazily fetched.
+ * Sortable on Template / Version / Concerns.
+ */
+function TemplatesTable({ templates }: { templates: TemplateSummary[] }) {
+  const sevCol = (sev: Severity): Column<TemplateSummary> => ({
+    key: sev,
+    header: SEVERITY_STYLE[sev].label,
+    align: 'right',
+    width: 'w-16',
+    render: (t) => {
+      const n = t.severity_breakdown[sev] ?? 0;
+      return n > 0 ? <span className={SEVERITY_STYLE[sev].text}>{n}</span> : <span className="text-ink-mute">—</span>;
+    },
+  });
 
-  function toggle() {
-    const next = !open;
-    setOpen(next);
-    if (next && !detail) {
-      api
-        .getCoverageTemplate(t.name)
-        .then(setDetail)
-        .catch(() => setDetail(null));
-    }
-  }
+  const columns: Column<TemplateSummary>[] = [
+    {
+      key: 'name',
+      header: 'Template',
+      sortable: true,
+      sortValue: (t) => t.name,
+      render: (t) => (
+        <div className="min-w-0">
+          <span className="text-sm font-medium text-ink">{t.name}</span>
+          {t.description && (
+            <p className="mt-0.5 text-xs text-ink-dim leading-snug">{t.description}</p>
+          )}
+        </div>
+      ),
+    },
+    {
+      key: 'version',
+      header: 'Version',
+      width: 'w-20',
+      sortable: true,
+      sortValue: (t) => t.version,
+      render: (t) => <span className="text-meta text-ink-mute">v{t.version}</span>,
+    },
+    {
+      key: 'concerns',
+      header: 'Concerns',
+      align: 'right',
+      width: 'w-24',
+      sortable: true,
+      sortValue: (t) => t.concern_count,
+      render: (t) => t.concern_count,
+    },
+    ...SEV_COLS.map(sevCol),
+  ];
 
   return (
-    <div className="px-4 py-3">
-      <button onClick={toggle} className="w-full text-left">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium text-ink">{t.name}</span>
-          <span className="text-meta text-ink-mute">v{t.version}</span>
-          <span className="text-note text-ink-mute tabular-nums">{t.concern_count} concerns</span>
-          {Object.entries(t.severity_breakdown).map(([sev, n]) => (
-            <span key={sev} className="text-meta text-ink-mute">
-              {sev}:{n}
-            </span>
-          ))}
-        </div>
-        {t.description && <p className="mt-1 text-xs text-ink-dim leading-snug">{t.description}</p>}
-      </button>
-      {open && detail && (
-        <ul className="mt-2 space-y-1 border-l-2 border-border pl-3">
-          {detail.concerns.map((c) => (
-            <li key={c.id} className="text-xs">
-              <span className="font-medium text-ink">{c.name}</span>
-              <span className="ml-2 font-mono text-meta text-ink-mute">{c.id}</span>
-              <span className="ml-2 text-meta text-ink-mute">{c.severity}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+    <SortableTable<TemplateSummary>
+      columns={columns}
+      rows={templates}
+      rowKey={(t) => t.name}
+      renderDetail={(t) => <TemplateConcerns name={t.name} />}
+    />
+  );
+}
+
+/** Nested concern list for one template — lazily fetched when the row expands. */
+function TemplateConcerns({ name }: { name: string }) {
+  const [detail, setDetail] = useState<TemplateDetail | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFailed(false);
+    api
+      .getCoverageTemplate(name)
+      .then((d) => {
+        if (!cancelled) setDetail(d);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [name]);
+
+  if (failed) return <p className="text-note text-ink-mute">Failed to load concerns.</p>;
+  if (!detail) return <p className="text-note text-ink-mute">Loading concerns…</p>;
+
+  return (
+    <ul className="space-y-1 border-l-2 border-border pl-3">
+      {detail.concerns.map((c) => (
+        <li key={c.id} className="text-xs">
+          <span className="font-medium text-ink">{c.name}</span>
+          <span className="ml-2 font-mono text-meta text-ink-mute">{c.id}</span>
+          <span className="ml-2 text-meta text-ink-mute">{c.severity}</span>
+        </li>
+      ))}
+    </ul>
   );
 }
