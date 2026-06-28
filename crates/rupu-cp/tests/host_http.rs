@@ -159,3 +159,16 @@ async fn server_error_maps_to_remote() {
         Err(HostConnectorError::Remote(500, _))
     ));
 }
+
+#[tokio::test]
+async fn info_missing_endpoint_returns_reachable_true() {
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(404);
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    let info = c.info().await.unwrap();
+    assert!(info.reachable);
+    assert!(info.version.is_none());
+}

@@ -116,6 +116,11 @@ impl HostConnector for HttpHostConnector {
                 version: None,
                 capabilities: HostCapabilities::default(),
             }),
+            Err(HostConnectorError::NotFound(_)) => Ok(HostInfo {
+                reachable: true,
+                version: None,
+                capabilities: HostCapabilities::default(),
+            }),
             Err(e) => Err(e),
         }
     }
