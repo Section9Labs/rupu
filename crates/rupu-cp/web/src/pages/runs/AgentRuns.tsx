@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
-import { api, type AgentRunRow } from '../../lib/api';
+import { api, type AgentRunRow, type HostView } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
@@ -19,6 +19,8 @@ import { formatDuration } from '../../lib/duration';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
+/** Sentinel select value meaning "fetch all hosts" (fan-out / no ?host= param). */
+const ALL_HOSTS = '__all__';
 
 type Tab = 'active' | 'completed' | 'failed';
 
@@ -73,15 +75,25 @@ export default function AgentRuns() {
   const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
+  const [hostFilter, setHostFilter] = useState<string>('local');
+  const [hosts, setHosts] = useState<HostView[] | null>(null);
 
-  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab change.
+  useEffect(() => {
+    let cancelled = false;
+    api.getHosts().then((hs) => { if (!cancelled) setHosts(hs); }).catch(() => { if (!cancelled) setHosts([]); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab/host change.
   // Active: fetch ALL in one call (unpaginated) → poll never resets a scrolled
   // list. Completed/Failed: page-0 only; loadMore appends.
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
       const limit = tab === 'active' ? 200 : PAGE;
-      const data = await api.getAgentRuns({ lifecycle: tab, limit });
+      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+      const data = await api.getAgentRuns({ lifecycle: tab, limit, host });
       setAgentRuns(data);
       setHasMore(tab !== 'active' && data.length >= PAGE);
       setError(null);
@@ -90,22 +102,23 @@ export default function AgentRuns() {
     } finally {
       setRefreshing(false);
     }
-  }, [tab]);
+  }, [tab, hostFilter]);
 
   useEffect(() => {
-    setAgentRuns(null); // show loading on tab switch
+    setAgentRuns(null); // show loading on tab/host switch
     void refresh();
     if (tab === 'active') {
       const t = window.setInterval(() => void refresh(), 5000);
       return () => window.clearInterval(t);
     }
     return () => {};
-  }, [tab, refresh]);
+  }, [tab, hostFilter, refresh]);
 
   const loadMore = async () => {
     if (tab === 'active') return; // active is unpaginated
     const current = agentRuns ?? [];
-    const next = await api.getAgentRuns({ lifecycle: tab, offset: current.length, limit: PAGE });
+    const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+    const next = await api.getAgentRuns({ lifecycle: tab, offset: current.length, limit: PAGE, host });
     if (next.length === 0) { setHasMore(false); return; }
     setAgentRuns([...current, ...next]);
     if (next.length < PAGE) setHasMore(false);
@@ -136,7 +149,7 @@ export default function AgentRuns() {
       </header>
 
       {/* Lifecycle tabs */}
-      <div className="flex items-center gap-2 mb-5">
+      <div className="flex items-center gap-2 mb-4">
         {TABS.map((t) => (
           <button
             key={t.id}
@@ -153,6 +166,24 @@ export default function AgentRuns() {
         ))}
       </div>
 
+      {/* Host filter — drives server-side fetch scope. */}
+      <div className="flex items-center gap-2 mb-5">
+        <select
+          value={hostFilter}
+          onChange={(e) => setHostFilter(e.target.value)}
+          aria-label="Host filter"
+          className="text-xs font-medium px-2 py-1 rounded-md border border-border bg-panel text-ink-dim focus:outline-none focus:border-brand-500"
+        >
+          <option value="local">This host</option>
+          <option value={ALL_HOSTS}>All hosts</option>
+          {(hosts ?? [])
+            .filter((h) => h.transport_kind !== 'local')
+            .map((h) => (
+              <option key={h.id} value={h.id}>{h.name}</option>
+            ))}
+        </select>
+      </div>
+
       {error && (
         <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
@@ -166,15 +197,20 @@ export default function AgentRuns() {
       ) : (
         <section>
           <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
-            <UsageBarChart bars={sorted.map((r) => ({
-              id: r.run_id,
-              label: r.agent ?? r.run_id,
-              to: r.transcript_path
-                ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}`
-                : undefined,
-              input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
-              cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
-            }))} />
+            <UsageBarChart bars={sorted.map((r) => {
+              const hostSuffix = r.host_id && r.host_id !== 'local'
+                ? `&host=${encodeURIComponent(r.host_id)}`
+                : '';
+              return {
+                id: r.run_id,
+                label: r.agent ?? r.run_id,
+                to: r.transcript_path
+                  ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}${hostSuffix}`
+                  : undefined,
+                input_tokens: r.usage.input_tokens, output_tokens: r.usage.output_tokens,
+                cached_tokens: r.usage.cached_tokens, cost_usd: r.usage.cost_usd,
+              };
+            })} />
           </div>
           <SortableTable<AgentRunRow>
             columns={AGENT_RUN_COLUMNS}
@@ -236,9 +272,13 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     // Agent runs are NOT in the workflow run-store (/api/runs/:id would 404), so
     // the Run id links to the transcript view — matching the page's pre-table
     // behavior. No transcript_path → render the id as plain text.
+    // Append &host= for remote runs so the transcript view can proxy-fetch.
     render: (r) => {
+      const hostSuffix = r.host_id && r.host_id !== 'local'
+        ? `&host=${encodeURIComponent(r.host_id)}`
+        : '';
       const href = r.transcript_path
-        ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}`
+        ? `/transcript?path=${encodeURIComponent(r.transcript_path)}&live=${isRunning(r.status) ? 1 : 0}${hostSuffix}`
         : null;
       return href ? (
         <Link to={href} className="text-note text-ink-mute font-mono hover:underline">
@@ -248,6 +288,15 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
         <span className="text-note text-ink-mute font-mono">{shortId(r.run_id)}</span>
       );
     },
+  },
+  {
+    key: 'host',
+    header: 'Host',
+    sortable: true,
+    sortValue: (r) => r.host_id ?? 'local',
+    render: (r) => (
+      <span className="text-note text-ink-mute font-mono">{r.host_id ?? 'local'}</span>
+    ),
   },
   {
     key: 'source',

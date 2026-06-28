@@ -13,6 +13,7 @@ import {
   type AutoflowClaim,
   type AutoflowCycleRow,
   type AutoflowEventRow,
+  type HostView,
 } from '../../lib/api';
 import { SectionHeader } from '../../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
@@ -24,6 +25,8 @@ import { shortId } from '../../lib/shortId';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
+/** Sentinel select value meaning "fetch all hosts" (fan-out / no ?host= param). */
+const ALL_HOSTS = '__all__';
 
 const MODE_CLS: Record<string, string> = {
   ask:       'bg-warn-bg text-warn ring-warn/30',
@@ -180,17 +183,29 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
   {
     key: 'run',
     header: 'Run',
-    render: (e) =>
-      e.run_id ? (
+    render: (e) => {
+      if (!e.run_id) return <span className="text-ink-mute">—</span>;
+      const hostSuffix = e.host_id && e.host_id !== 'local'
+        ? `?host=${encodeURIComponent(e.host_id)}`
+        : '';
+      return (
         <Link
-          to={`/runs/${encodeURIComponent(e.run_id)}`}
+          to={`/runs/${encodeURIComponent(e.run_id)}${hostSuffix}`}
           className="text-note font-mono text-brand-600 hover:underline"
         >
           {shortId(e.run_id)}
         </Link>
-      ) : (
-        <span className="text-ink-mute">—</span>
-      ),
+      );
+    },
+  },
+  {
+    key: 'host',
+    header: 'Host',
+    sortable: true,
+    sortValue: (e) => e.host_id ?? 'local',
+    render: (e) => (
+      <span className="text-note text-ink-mute font-mono">{e.host_id ?? 'local'}</span>
+    ),
   },
   {
     key: 'usage',
@@ -284,21 +299,34 @@ const CYCLE_COLUMNS: Column<AutoflowCycleRow>[] = [
     align: 'right',
     render: (c) => <UsageChip usage={c.usage} />,
   },
+  {
+    key: 'host',
+    header: 'Host',
+    sortable: true,
+    sortValue: (c) => c.host_id ?? 'local',
+    render: (c) => (
+      <span className="text-note text-ink-mute font-mono">{c.host_id ?? 'local'}</span>
+    ),
+  },
 ];
 
 // Expandable detail: the run ids spawned by this cycle, each linking to its
 // run graph (preserves the linkage the bespoke list rendered inline).
+// Appends ?host= when the cycle originated on a remote host.
 function CycleDetail(c: AutoflowCycleRow) {
   if (c.run_ids.length === 0) {
     return <span className="text-note text-ink-mute">No runs launched in this cycle.</span>;
   }
+  const hostSuffix = c.host_id && c.host_id !== 'local'
+    ? `?host=${encodeURIComponent(c.host_id)}`
+    : '';
   return (
     <div className="flex items-center gap-1.5 flex-wrap">
       <span className="text-meta text-ink-mute uppercase tracking-wide">runs:</span>
       {c.run_ids.map((rid) => (
         <Link
           key={rid}
-          to={`/runs/${encodeURIComponent(rid)}`}
+          to={`/runs/${encodeURIComponent(rid)}${hostSuffix}`}
           className="text-note font-mono text-brand-600 hover:underline"
         >
           {shortId(rid)}
@@ -318,6 +346,22 @@ export default function AutoflowRuns() {
   const [cyclesHasMore, setCyclesHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
+  const [hostFilter, setHostFilter] = useState<string>('local');
+  const [hosts, setHosts] = useState<HostView[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getHosts().then((hs) => { if (!cancelled) setHosts(hs); }).catch(() => { if (!cancelled) setHosts([]); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Reset lists to null when the host filter changes so the poll guard allows
+  // the first page-0 result through (guard reads prev == null as "allow reset").
+  useEffect(() => {
+    setEvents(null);
+    setCycles(null);
+  }, [hostFilter]);
 
   // Claims tab: lazily fetched on selection (cancel-guarded). `null` = loading.
   const [claims, setClaims] = useState<AutoflowClaim[] | null>(null);
@@ -359,10 +403,11 @@ export default function AutoflowRuns() {
   // accumulated pages and cause the reset/regrow flicker.
   const refresh = useCallback(async () => {
     setRefreshing(true);
+    const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
     try {
       const [ev, cy] = await Promise.all([
-        api.getAutoflowEvents({ limit: PAGE }),
-        api.getAutoflowRuns({ limit: PAGE }),
+        api.getAutoflowEvents({ limit: PAGE, host }),
+        api.getAutoflowRuns({ limit: PAGE, host }),
       ]);
       // Functional setState so the guard reads the CURRENT length, not a
       // stale closure (refresh is memoised with [] deps).
@@ -386,7 +431,7 @@ export default function AutoflowRuns() {
     } finally {
       setRefreshing(false);
     }
-  }, []);
+  }, [hostFilter]);
 
   useEffect(() => {
     void refresh();
@@ -398,7 +443,8 @@ export default function AutoflowRuns() {
   // "Cycles" feed each get their own pagination state + sentinel.
   const loadMoreEvents = async () => {
     const current = events ?? [];
-    const next = await api.getAutoflowEvents({ offset: current.length, limit: PAGE });
+    const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+    const next = await api.getAutoflowEvents({ offset: current.length, limit: PAGE, host });
     if (next.length === 0) { setEventsHasMore(false); return; }
     setEvents([...current, ...next]);
     if (next.length < PAGE) setEventsHasMore(false);
@@ -406,7 +452,8 @@ export default function AutoflowRuns() {
 
   const loadMoreCycles = async () => {
     const current = cycles ?? [];
-    const next = await api.getAutoflowRuns({ offset: current.length, limit: PAGE });
+    const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+    const next = await api.getAutoflowRuns({ offset: current.length, limit: PAGE, host });
     if (next.length === 0) { setCyclesHasMore(false); return; }
     setCycles([...current, ...next]);
     if (next.length < PAGE) setCyclesHasMore(false);
@@ -528,7 +575,7 @@ export default function AutoflowRuns() {
         </Button>
       </header>
 
-      <div className="mb-5 inline-flex rounded-md border border-border bg-panel p-0.5 text-xs font-medium">
+      <div className="mb-4 inline-flex rounded-md border border-border bg-panel p-0.5 text-xs font-medium">
         <button
           onClick={() => setTab('runs')}
           className={cn(
@@ -557,6 +604,26 @@ export default function AutoflowRuns() {
           Claims
         </button>
       </div>
+
+      {/* Host filter — shown for runs and cycles tabs; claims are always local. */}
+      {tab !== 'claims' && (
+        <div className="flex items-center gap-2 mb-5">
+          <select
+            value={hostFilter}
+            onChange={(e) => setHostFilter(e.target.value)}
+            aria-label="Host filter"
+            className="text-xs font-medium px-2 py-1 rounded-md border border-border bg-panel text-ink-dim focus:outline-none focus:border-brand-500"
+          >
+            <option value="local">This host</option>
+            <option value={ALL_HOSTS}>All hosts</option>
+            {(hosts ?? [])
+              .filter((h) => h.transport_kind !== 'local')
+              .map((h) => (
+                <option key={h.id} value={h.id}>{h.name}</option>
+              ))}
+          </select>
+        </div>
+      )}
 
       {error && (
         <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">

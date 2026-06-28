@@ -335,6 +335,9 @@ export interface AutoflowCycleRow {
   failed_cycles: number;
   run_ids: string[];
   usage: UsageSummary;
+  /** Originating host id — `"local"` for local cycles; a remote host id for
+   *  proxied cycles. Absent on older server versions (treat as `"local"`). */
+  host_id?: string;
 }
 
 /**
@@ -354,6 +357,9 @@ export interface AutoflowEventRow {
   status?: string | null;
   worker_name?: string | null;
   usage: UsageSummary;
+  /** Originating host id — `"local"` for local events; a remote host id for
+   *  proxied events. Absent on older server versions (treat as `"local"`). */
+  host_id?: string;
 }
 
 /**
@@ -390,6 +396,9 @@ export interface AgentRunRow {
   turns: number;
   duration_ms?: number | null;
   usage: UsageSummary;
+  /** Originating host id — `"local"` for local runs; a remote host id for
+   *  proxied runs. Absent on older server versions (treat as `"local"`). */
+  host_id?: string;
 }
 
 export interface AutoflowDefRow {
@@ -511,6 +520,9 @@ export interface SessionSummary {
   total_tokens_cached?: number;
   usage?: UsageSummary;
   last_error?: string | null;
+  /** Originating host id — `"local"` for local sessions; a remote host id for
+   *  proxied sessions. Absent on older server versions (treat as `"local"`). */
+  host_id?: string;
 }
 
 /**
