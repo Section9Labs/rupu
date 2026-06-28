@@ -56,7 +56,7 @@ const STRING_INLINE_MAX = 120;
 function ScalarChip({ v }: { v: string | number | null }) {
   const text = v === null ? 'null' : String(v);
   return (
-    <span className="inline-block bg-slate-100 text-slate-700 rounded px-1.5 py-0.5 font-mono text-xs mr-1 mb-1">
+    <span className="inline-block bg-surface text-ink rounded px-1.5 py-0.5 font-mono text-xs mr-1 mb-1">
       {text}
     </span>
   );
@@ -78,7 +78,7 @@ function TableView({
             {keys.map((k) => (
               <th
                 key={k}
-                className="text-left font-mono text-brand-700 bg-slate-50 border border-border px-2 py-0.5 whitespace-nowrap"
+                className="text-left font-mono text-brand-700 bg-surface border border-border px-2 py-0.5 whitespace-nowrap"
               >
                 {k}
               </th>
@@ -87,7 +87,7 @@ function TableView({
         </thead>
         <tbody>
           {rows.map((row, i) => (
-            <tr key={i} className="even:bg-slate-50">
+            <tr key={i} className="even:bg-surface">
               {keys.map((k) => (
                 <td
                   key={k}
@@ -113,7 +113,7 @@ function ObjectView({
 }) {
   const entries = Object.entries(obj);
   if (entries.length === 0) {
-    return <span className="font-mono text-xs text-slate-400">{'{}'}</span>;
+    return <span className="font-mono text-xs text-ink-mute">{'{}'}</span>;
   }
   return (
     <div className="space-y-0.5">
@@ -145,7 +145,7 @@ export default function StructuredView({
   // Depth cap — prevent runaway recursion on deeply nested data
   if (depth > DEPTH_CAP) {
     return (
-      <pre className="whitespace-pre-wrap font-mono text-xs text-slate-600 bg-slate-50 rounded p-1">
+      <pre className="whitespace-pre-wrap font-mono text-xs text-ink bg-surface rounded p-1">
         {JSON.stringify(value, null, 2)}
       </pre>
     );
@@ -153,22 +153,22 @@ export default function StructuredView({
 
   // null
   if (value === null) {
-    return <span className="font-mono text-xs text-slate-400">null</span>;
+    return <span className="font-mono text-xs text-ink-mute">null</span>;
   }
 
   // undefined
   if (value === undefined) {
-    return <span className="font-mono text-xs text-slate-400">—</span>;
+    return <span className="font-mono text-xs text-ink-mute">—</span>;
   }
 
   // boolean
   if (typeof value === 'boolean') {
     return value ? (
-      <span className="inline-block rounded-full bg-green-50 text-green-700 text-xs px-2 py-0.5 font-mono font-medium">
+      <span className="inline-block rounded-full bg-ok-bg text-ok text-xs px-2 py-0.5 font-mono font-medium">
         true
       </span>
     ) : (
-      <span className="inline-block rounded-full bg-slate-100 text-slate-500 text-xs px-2 py-0.5 font-mono font-medium">
+      <span className="inline-block rounded-full bg-surface text-ink-dim text-xs px-2 py-0.5 font-mono font-medium">
         false
       </span>
     );
@@ -186,7 +186,7 @@ export default function StructuredView({
     const isLong = value.length > STRING_INLINE_MAX || value.includes('\n');
     if (isLong) {
       return (
-        <pre className="whitespace-pre-wrap font-mono text-xs text-ink bg-slate-50 rounded p-1 my-0.5">
+        <pre className="whitespace-pre-wrap font-mono text-xs text-ink bg-surface rounded p-1 my-0.5">
           {value}
         </pre>
       );
@@ -197,7 +197,7 @@ export default function StructuredView({
   // array
   if (Array.isArray(value)) {
     if (value.length === 0) {
-      return <span className="font-mono text-xs text-slate-400">[]</span>;
+      return <span className="font-mono text-xs text-ink-mute">[]</span>;
     }
 
     if (isHomogeneousObjectArray(value)) {
@@ -219,7 +219,7 @@ export default function StructuredView({
       <div className="space-y-0.5 pl-2 border-l border-border">
         {value.map((el, i) => (
           <div key={i} className="flex gap-2 items-start">
-            <span className="shrink-0 font-mono text-xs text-slate-400 pt-0.5">
+            <span className="shrink-0 font-mono text-xs text-ink-mute pt-0.5">
               {i}
             </span>
             <div className="min-w-0 flex-1">
@@ -238,7 +238,7 @@ export default function StructuredView({
 
   // Fallback for anything else (shouldn't happen with well-typed JSON)
   return (
-    <span className="font-mono text-xs text-slate-600">
+    <span className="font-mono text-xs text-ink">
       {String(value)}
     </span>
   );

@@ -66,7 +66,7 @@ export default function ProjectOverviewTab({
               <Link
                 key={r.id}
                 to={`/runs/${encodeURIComponent(r.id)}`}
-                className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
+                className="flex items-center gap-4 px-4 py-3 hover:bg-surface-hover transition-colors"
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
@@ -108,7 +108,7 @@ export default function ProjectOverviewTab({
                 assessed ·{' '}
                 <span
                   className={
-                    coverage.findings > 0 ? 'font-medium text-red-600' : 'font-medium text-ink'
+                    coverage.findings > 0 ? 'font-medium text-err' : 'font-medium text-ink'
                   }
                 >
                   {coverage.findings}
@@ -141,7 +141,7 @@ export default function ProjectOverviewTab({
                 </span>
                 {sessions.active > 0 && (
                   <span className="inline-flex items-center gap-1.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-status-running" />
                     <span className="font-medium text-ink">{sessions.active}</span> active
                   </span>
                 )}
@@ -156,7 +156,7 @@ export default function ProjectOverviewTab({
         <SectionTitle title="Definitions" href={`/projects/${encodedId}/definitions`} />
         <Link
           to={`/projects/${encodedId}/definitions`}
-          className="block bg-panel border border-border rounded-xl shadow-card px-4 py-3 hover:bg-slate-50 transition-colors"
+          className="block bg-panel border border-border rounded-xl shadow-card px-4 py-3 hover:bg-surface-hover transition-colors"
         >
           <div className="flex items-center gap-2.5 text-ui text-ink-dim">
             <Library size={14} className="text-ink-mute" />

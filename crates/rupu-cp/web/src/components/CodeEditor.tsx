@@ -7,13 +7,17 @@
 // (and as a graceful fallback if it never does) a plain controlled
 // `<textarea>` with the same external API is shown — so editing always works.
 
-import { lazy, Suspense } from 'react';
+import { lazy, Suspense, useContext } from 'react';
+import { ThemeContext, type Mode } from './theme/ThemeProvider';
 
 export interface CodeEditorProps {
   value: string;
   onChange: (v: string) => void;
   language?: 'markdown' | 'yaml';
   ariaLabel?: string;
+  /** Resolved theme mode — injected by the wrapper so the imperative CodeMirror
+   *  view picks the matching highlight + editor theme and reconfigures on toggle. */
+  theme?: Mode;
 }
 
 const CodeEditorImpl = lazy(() => import('./CodeEditorImpl'));
@@ -36,9 +40,12 @@ function FallbackEditor({ value, onChange, ariaLabel }: CodeEditorProps) {
 }
 
 export default function CodeEditor(props: CodeEditorProps) {
+  // Provider-optional: fall back to undefined (the impl reads `data-theme`) so
+  // the editor renders in isolated tests without a ThemeProvider.
+  const mode = useContext(ThemeContext)?.mode;
   return (
     <Suspense fallback={<FallbackEditor {...props} />}>
-      <CodeEditorImpl {...props} />
+      <CodeEditorImpl {...props} theme={mode} />
     </Suspense>
   );
 }

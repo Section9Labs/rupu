@@ -74,10 +74,10 @@ export function parseDiff(diff: string): DiffLine[] {
 // ---------------------------------------------------------------------------
 
 const LINE_CLASS: Record<DiffLineType, string> = {
-  hunk: 'text-slate-400',
-  add:  'bg-green-50 text-green-700',
-  del:  'bg-red-50 text-red-700',
-  ctx:  'text-slate-600',
+  hunk: 'text-ink-mute',
+  add:  'bg-ok-bg text-ok',
+  del:  'bg-err-bg text-err',
+  ctx:  'text-ink',
 };
 
 // ---------------------------------------------------------------------------
@@ -101,17 +101,17 @@ export default function DiffView({
   const header = headerParts.join(' · ');
 
   return (
-    <div className="rounded-md border border-slate-200 overflow-hidden my-1 text-[11.5px]">
+    <div className="rounded-md border border-border overflow-hidden my-1 text-[11.5px]">
       {/* Header row */}
       {header && (
-        <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 border-b border-slate-200">
-          <span className="font-mono text-slate-500 truncate">{header}</span>
+        <div className="flex items-center gap-2 px-3 py-1.5 bg-surface border-b border-border">
+          <span className="font-mono text-ink-dim truncate">{header}</span>
         </div>
       )}
 
       {/* Diff lines */}
       <div className="overflow-x-auto">
-        <pre className="font-mono leading-5 px-0 py-0 m-0 bg-white">
+        <pre className="font-mono leading-5 px-0 py-0 m-0 bg-panel">
           {lines.map((line, i) => (
             <div
               key={i}

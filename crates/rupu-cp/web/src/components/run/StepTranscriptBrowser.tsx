@@ -6,7 +6,8 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import type { StepState, UnitView } from '../../lib/runGraphModel';
-import { STATE_STYLE, glyphBg } from '../graph/stepStyle';
+import { stateStyle, glyphBg } from '../graph/stepStyle';
+import { useThemeColors } from '../../lib/useThemeColors';
 import TranscriptPanel from '../TranscriptPanel';
 
 const ROW_CAP = 300;
@@ -39,6 +40,7 @@ export default function StepTranscriptBrowser({
    */
   initialUnitIndex?: number;
 }) {
+  const colors = useThemeColors();
   const [filter, setFilter] = useState<Filter>('all');
   const [selectedIndex, setSelectedIndex] = useState<number | null>(
     initialUnitIndex ?? null,
@@ -94,7 +96,7 @@ export default function StepTranscriptBrowser({
                 'rounded-full px-2.5 py-0.5 text-note font-medium tabular-nums transition-colors',
                 filter === f.key
                   ? 'bg-brand-500 text-white'
-                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200',
+                  : 'bg-surface text-ink hover:bg-surface-hover',
               ].join(' ')}
             >
               {f.label} ({counts[f.key]})
@@ -106,9 +108,9 @@ export default function StepTranscriptBrowser({
           {shown.length === 0 ? (
             <div className="py-8 text-center text-sm text-ink-dim">No units match this filter.</div>
           ) : (
-            <ul className="divide-y divide-slate-100">
+            <ul className="divide-y divide-border">
               {shown.map((u) => {
-                const st = STATE_STYLE[u.state];
+                const st = stateStyle(colors, u.state);
                 const selected = u.index === selectedIndex;
                 return (
                   <li key={u.index}>
@@ -116,14 +118,14 @@ export default function StepTranscriptBrowser({
                       type="button"
                       className={[
                         'flex w-full items-center gap-2 py-1.5 text-left text-note cursor-pointer',
-                        selected ? 'bg-brand-50' : 'hover:bg-slate-50',
+                        selected ? 'bg-brand-50' : 'hover:bg-surface-hover',
                       ].join(' ')}
                       aria-pressed={selected}
                       onClick={() => setSelectedIndex(u.index)}
                     >
                       <span
                         className="inline-flex h-[13px] w-[13px] shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"
-                        style={{ background: glyphBg(u.state) }}
+                        style={{ background: glyphBg(colors, u.state) }}
                         aria-hidden
                       >
                         {st.glyph}

@@ -153,7 +153,7 @@ export default function ModelBreakdownTable({ rows }: { rows: UsageBreakdownRow[
                     <span className="text-ink-dim tabular-nums text-meta w-9 text-right">
                       {(r.share * 100).toFixed(0)}%
                     </span>
-                    <span className="h-1.5 rounded-full bg-slate-100 w-12 overflow-hidden">
+                    <span className="h-1.5 rounded-full bg-surface w-12 overflow-hidden">
                       <span
                         className="block h-full rounded-full"
                         style={{ width: `${Math.round(r.share * 100)}%`, background: colorFor(r) }}

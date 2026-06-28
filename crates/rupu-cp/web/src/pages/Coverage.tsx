@@ -84,7 +84,7 @@ export default function Coverage() {
       </header>
 
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -182,7 +182,7 @@ function CoverageGroupTable({
         const barPct = maxLines > 0 ? (t.assertion_lines / maxLines) * 100 : 0;
         return (
           <div className="flex items-center justify-end gap-2">
-            <div className="w-24 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+            <div className="w-24 h-1.5 bg-surface rounded-full overflow-hidden">
               <div
                 className="h-full bg-brand-500 rounded-full transition-all"
                 style={{ width: `${barPct.toFixed(1)}%` }}
@@ -229,8 +229,8 @@ function CatalogBadge({ present }: { present: boolean }) {
       className={cn(
         'inline-flex items-center gap-1 rounded px-2 py-0.5 text-note font-medium ring-1',
         present
-          ? 'bg-green-50 text-green-700 ring-green-200'
-          : 'bg-slate-100 text-ink-mute ring-slate-200',
+          ? 'bg-ok-bg text-ok ring-ok/30'
+          : 'bg-surface text-ink-mute ring-border',
       )}
     >
       {present ? <ShieldCheck size={11} /> : <ShieldOff size={11} />}
@@ -245,8 +245,8 @@ function FindingsBadge({ count, hasFindings }: { count: number; hasFindings: boo
       className={cn(
         'inline-flex items-center rounded px-2 py-0.5 text-note font-medium tabular-nums ring-1',
         hasFindings
-          ? 'bg-red-50 text-sev-high ring-red-200'
-          : 'bg-slate-100 text-ink-mute ring-slate-200',
+          ? 'bg-err-bg text-sev-high ring-err/30'
+          : 'bg-surface text-ink-mute ring-border',
       )}
     >
       {count} finding{count !== 1 ? 's' : ''}
@@ -257,7 +257,7 @@ function FindingsBadge({ count, hasFindings }: { count: number; hasFindings: boo
 function EmptyState() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Inbox size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No coverage data</h2>

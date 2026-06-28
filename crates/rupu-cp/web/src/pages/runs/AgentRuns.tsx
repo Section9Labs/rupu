@@ -33,12 +33,12 @@ function shortId(id: string): string {
 }
 
 const SOURCE_CLS: Record<string, string> = {
-  standalone: 'bg-slate-100 text-slate-600 ring-slate-200',
+  standalone: 'bg-surface text-ink ring-border',
   session:    'bg-sky-50 text-sky-700 ring-sky-200',
 };
 
 function SourceChip({ source }: { source: string }) {
-  const cls = SOURCE_CLS[source] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  const cls = SOURCE_CLS[source] ?? 'bg-surface text-ink ring-border';
   return (
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {source}
@@ -50,16 +50,16 @@ function SourceChip({ source }: { source: string }) {
 // free-form string (not RunStatusStr), so we map known values to colors
 // and fall back to neutral for unknown ones.
 const STATUS_CLS: Record<string, string> = {
-  running:           'bg-blue-50 text-blue-700 ring-blue-200',
-  completed:         'bg-green-50 text-green-700 ring-green-200',
-  failed:            'bg-red-50 text-red-700 ring-red-200',
-  awaiting_approval: 'bg-amber-50 text-amber-800 ring-amber-200',
-  rejected:          'bg-red-50 text-red-700 ring-red-200',
-  pending:           'bg-slate-100 text-slate-600 ring-slate-200',
+  running:           'bg-status-running/10 text-status-running ring-status-running/30',
+  completed:         'bg-ok-bg text-ok ring-ok/30',
+  failed:            'bg-err-bg text-err ring-err/30',
+  awaiting_approval: 'bg-warn-bg text-warn ring-warn/30',
+  rejected:          'bg-err-bg text-err ring-err/30',
+  pending:           'bg-surface text-ink ring-border',
 };
 
 function StatusBadge({ status }: { status: string }) {
-  const cls = STATUS_CLS[status] ?? 'bg-slate-100 text-slate-600 ring-slate-200';
+  const cls = STATUS_CLS[status] ?? 'bg-surface text-ink ring-border';
   return (
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium px-1.5 py-0.5', cls)}>
       {status}
@@ -145,7 +145,7 @@ export default function AgentRuns() {
               'text-xs font-medium px-3 py-1.5 rounded-md border transition-colors',
               tab === t.id
                 ? 'bg-brand-600 text-white border-brand-600'
-                : 'bg-panel text-ink-dim border-border hover:bg-slate-100',
+                : 'bg-panel text-ink-dim border-border hover:bg-surface-hover',
             )}
           >
             {t.label}
@@ -154,7 +154,7 @@ export default function AgentRuns() {
       </div>
 
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -338,7 +338,7 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
 function AgentRunsEmpty() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <Inbox size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No agent runs yet</h2>

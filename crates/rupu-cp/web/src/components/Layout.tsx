@@ -4,6 +4,7 @@ import Brand from './Brand';
 import CommandPalette from './CommandPalette';
 import { sidebarNav, type NavLeaf, type NavGroup } from '../lib/sidebarNav';
 import SidebarGroup from './SidebarGroup';
+import ThemeToggle from './theme/ThemeToggle';
 
 // Pure helpers — kept outside the component so React doesn't have to
 // recreate them on every render.
@@ -50,7 +51,7 @@ export default function Layout() {
                       item.enabled
                         ? isActive
                           ? 'bg-brand-50 text-brand-700 font-medium'
-                          : 'text-ink hover:bg-slate-100'
+                          : 'text-ink hover:bg-surface-hover'
                         : 'text-ink-mute cursor-not-allowed',
                     )
                   }
@@ -77,6 +78,11 @@ export default function Layout() {
             );
           })}
         </nav>
+
+        {/* Footer — theme switcher */}
+        <div className="border-t border-border px-2 py-2">
+          <ThemeToggle />
+        </div>
       </aside>
 
       <main className="flex-1 overflow-auto">

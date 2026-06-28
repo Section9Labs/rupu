@@ -79,7 +79,7 @@ export default function Workflows() {
       </header>
 
       {error && (
-        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -191,7 +191,7 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
             ariaLabel="New workflow definition"
           />
           {error && (
-            <p role="alert" className="text-ui font-medium text-red-700">
+            <p role="alert" className="text-ui font-medium text-err">
               {error}
             </p>
           )}
@@ -283,7 +283,7 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
           type="button"
           onClick={() => onRun(w.name)}
           aria-label={`Run ${w.name}`}
-          className="inline-flex items-center rounded-md border border-brand-600 bg-white px-2.5 py-1 text-ui font-medium text-brand-700 hover:bg-brand-50"
+          className="inline-flex items-center rounded-md border border-brand-600 bg-panel px-2.5 py-1 text-ui font-medium text-brand-700 hover:bg-brand-50"
         >
           Run
         </button>
@@ -300,7 +300,7 @@ export function ScopeChip({ scope }: { scope: string }) {
         'inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1',
         isGlobal
           ? 'bg-violet-50 text-violet-700 ring-violet-200'
-          : 'bg-slate-100 text-ink-mute ring-slate-200',
+          : 'bg-surface text-ink-mute ring-border',
       )}
     >
       {scope}
@@ -311,7 +311,7 @@ export function ScopeChip({ scope }: { scope: string }) {
 function EmptyState() {
   return (
     <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-      <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mb-3">
+      <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
         <WorkflowIcon size={20} className="text-ink-mute" />
       </div>
       <h2 className="text-sm font-medium text-ink">No workflows found</h2>

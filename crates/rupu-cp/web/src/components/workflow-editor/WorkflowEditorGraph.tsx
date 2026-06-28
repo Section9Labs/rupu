@@ -37,6 +37,7 @@ import {
   type WorkflowGraph,
 } from '../../lib/workflowGraph';
 import { autoLayout, NODE_W } from '../../lib/workflowLayout';
+import { useThemeColors } from '../../lib/useThemeColors';
 import EditableStepNode, { type NodeData } from './nodes/EditableStepNode';
 import NodePalette, { NODE_KIND_MIME } from './NodePalette';
 
@@ -198,6 +199,7 @@ function WorkflowEditorGraphInner({
   onInvalidConnection,
   paused = false,
 }: Props) {
+  const colors = useThemeColors();
   const nodes = useMemo<Node<NodeData>[]>(
     () =>
       graph.nodes.map((node) => ({
@@ -359,7 +361,7 @@ function WorkflowEditorGraphInner({
       {paused && (
         <div
           role="status"
-          className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-full border border-amber-300 bg-amber-50 px-3 py-1 text-note font-medium text-amber-800 shadow-card"
+          className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2 rounded-full border border-warn/30 bg-warn-bg px-3 py-1 text-note font-medium text-warn shadow-card"
         >
           YAML not parseable — graph paused
         </div>
@@ -367,12 +369,12 @@ function WorkflowEditorGraphInner({
 
       {/* toolbar — Re-layout / + next / find. The "Add" palette is now the
           graphical NodePalette dock (bottom-left). */}
-      <div className="absolute left-3 top-3 z-10 flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-white/95 px-2 py-1.5 shadow-card">
+      <div className="absolute left-3 top-3 z-10 flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-panel/95 px-2 py-1.5 shadow-card">
         <button
           type="button"
           disabled={paused}
           onClick={relayout}
-          className="rounded-md border border-border bg-white px-2 py-1 text-note font-medium text-ink-dim hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+          className="rounded-md border border-border bg-panel px-2 py-1 text-note font-medium text-ink-dim hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
         >
           Re-layout
         </button>
@@ -381,7 +383,7 @@ function WorkflowEditorGraphInner({
           disabled={paused || !selectedId}
           onClick={addConnectedNext}
           title={selectedId ? `Add a step connected from ${selectedId}` : 'Select a node first'}
-          className="rounded-md border border-blue-200 bg-blue-50 px-2 py-1 text-note font-medium text-blue-700 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-50"
+          className="rounded-md border border-info/30 bg-info-bg px-2 py-1 text-note font-medium text-info hover:bg-info-bg disabled:cursor-not-allowed disabled:opacity-50"
         >
           ⊕ next
         </button>
@@ -395,16 +397,16 @@ function WorkflowEditorGraphInner({
             onKeyDown={onFindKeyDown}
             placeholder="Find step…"
             aria-label="Find step by id"
-            className="w-28 rounded-md border border-border bg-white px-2 py-1 text-note text-ink placeholder:text-ink-mute focus:outline-none focus:ring-1 focus:ring-brand-100 disabled:cursor-not-allowed disabled:opacity-50"
+            className="w-28 rounded-md border border-border bg-panel px-2 py-1 text-note text-ink placeholder:text-ink-mute focus:outline-none focus:ring-1 focus:ring-brand-100 disabled:cursor-not-allowed disabled:opacity-50"
           />
           {matches.length > 0 && (
-            <ul className="absolute left-0 top-full z-20 mt-1 max-h-40 w-40 overflow-auto rounded-md border border-border bg-white py-1 shadow-card">
+            <ul className="absolute left-0 top-full z-20 mt-1 max-h-40 w-40 overflow-auto rounded-md border border-border bg-panel py-1 shadow-card">
               {matches.slice(0, 8).map((n) => (
                 <li key={n.id}>
                   <button
                     type="button"
                     onClick={() => locate(n.id)}
-                    className="block w-full truncate px-2 py-1 text-left text-note text-ink hover:bg-slate-50"
+                    className="block w-full truncate px-2 py-1 text-left text-note text-ink hover:bg-surface-hover"
                   >
                     {n.id}
                   </button>
@@ -438,10 +440,17 @@ function WorkflowEditorGraphInner({
         fitView
         fitViewOptions={{ padding: 0.2, maxZoom: 1.0 }}
         proOptions={{ hideAttribution: true }}
-        style={{ background: '#fafafa' }}
+        style={{ background: colors.bg }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="#e2e8f0" />
-        <MiniMap pannable zoomable className="!border-border !bg-panel" />
+        <Background variant={BackgroundVariant.Dots} gap={16} size={1} color={colors.alpha('inkMute', 0.25)} />
+        <MiniMap
+          pannable
+          zoomable
+          className="!border-border !bg-panel"
+          maskColor={colors.alpha('ink', 0.08)}
+          nodeColor={colors.inkMute}
+          nodeStrokeColor={colors.border}
+        />
         <Controls className="!border-border !bg-panel !shadow-card" showInteractive={false} />
       </ReactFlow>
       </div>

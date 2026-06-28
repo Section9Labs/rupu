@@ -38,13 +38,13 @@ describe('visualFor — unit lifecycle is visually distinct', () => {
   it('a successful unit_completed shows a green check', () => {
     const v = visualFor(ok);
     expect(v.icon).toBe(CheckCircle2);
-    expect(v.iconColor).toContain('green');
+    expect(v.iconColor).toContain('ok');
   });
 
   it('a failed unit_completed shows a red X', () => {
     const v = visualFor(failed);
     expect(v.icon).toBe(XCircle);
-    expect(v.iconColor).toContain('red');
+    expect(v.iconColor).toContain('err');
   });
 
   it('started and completed never resolve to the same icon', () => {

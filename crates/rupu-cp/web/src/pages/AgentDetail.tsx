@@ -91,7 +91,7 @@ export default function AgentDetailPage() {
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       </div>
@@ -130,7 +130,7 @@ export default function AgentDetailPage() {
           </div>
         </div>
         {deleteError && (
-          <p role="alert" className="mt-2 text-ui font-medium text-red-700">
+          <p role="alert" className="mt-2 text-ui font-medium text-err">
             {deleteError}
           </p>
         )}
@@ -173,7 +173,7 @@ export default function AgentDetailPage() {
               ariaLabel="Agent definition"
             />
             {saveError && (
-              <p role="alert" className="text-ui font-medium text-red-700">
+              <p role="alert" className="text-ui font-medium text-err">
                 {saveError}
               </p>
             )}
@@ -207,7 +207,7 @@ function MetaChip({ children }: { children: React.ReactNode }) {
   return (
     <span
       className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-slate-100 text-ink-mute ring-slate-200',
+        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-surface text-ink-mute ring-border',
       )}
     >
       {children}

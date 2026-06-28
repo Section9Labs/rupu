@@ -86,7 +86,7 @@ const components: Components = {
     }
     return (
       <code
-        className="bg-slate-100 rounded px-1 font-mono text-[0.9em] text-ink"
+        className="bg-surface rounded px-1 font-mono text-[0.9em] text-ink"
         {...props}
       >
         {children}
@@ -97,7 +97,7 @@ const components: Components = {
   // Fenced code block wrapper
   pre: ({ children, ...props }) => (
     <pre
-      className="bg-slate-50 border border-border rounded-md overflow-x-auto text-[0.82rem] leading-relaxed my-2 p-3 font-mono"
+      className="bg-surface border border-border rounded-md overflow-x-auto text-[0.82rem] leading-relaxed my-2 p-3 font-mono"
       {...props}
     >
       {children}

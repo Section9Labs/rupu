@@ -11,12 +11,12 @@ export type ButtonSize = 'sm' | 'md';
 
 const VARIANT_CLS: Record<ButtonVariant, string> = {
   primary: 'bg-brand-600 hover:bg-brand-700 text-white',
-  secondary: 'border border-border bg-white hover:bg-bg text-ink',
+  secondary: 'border border-border bg-panel hover:bg-bg text-ink',
   ghost: 'hover:bg-bg text-ink-dim',
   // Destructive: filled for the committed action, outline for the lighter one
   // (Cancel / Reject buttons that sit next to a primary).
-  danger: 'bg-red-600 hover:bg-red-700 text-white',
-  'danger-outline': 'border border-red-300 bg-white text-red-700 hover:bg-red-50',
+  danger: 'bg-err hover:bg-err text-white',
+  'danger-outline': 'border border-err/30 bg-panel text-err hover:bg-err-bg',
 };
 
 const SIZE_CLS: Record<ButtonSize, string> = {

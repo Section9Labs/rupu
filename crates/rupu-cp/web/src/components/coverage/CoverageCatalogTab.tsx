@@ -42,7 +42,7 @@ export default function CoverageCatalogTab({ target, wsId }: { target: string; w
     });
   }
 
-  if (error) return <p className="mt-4 text-sm text-red-700">{error}</p>;
+  if (error) return <p className="mt-4 text-sm text-err">{error}</p>;
   if (!cat) return <p className="mt-4 text-sm text-ink-dim">Loading…</p>;
   if (cat.concerns.length === 0)
     return <p className="mt-4 text-sm text-ink-dim">No catalog snapshot for this target.</p>;

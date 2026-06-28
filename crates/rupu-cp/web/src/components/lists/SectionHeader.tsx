@@ -12,13 +12,13 @@ export type SectionTone =
   | 'muted'; // slate   — pending / info
 
 const TONE: Record<SectionTone, { dot: string; text: string }> = {
-  good: { dot: 'bg-green-500', text: 'text-green-700' },
+  good: { dot: 'bg-ok', text: 'text-ok' },
   progress: { dot: 'bg-brand-500', text: 'text-brand-700' },
-  warn: { dot: 'bg-yellow-500', text: 'text-yellow-700' },
-  bad: { dot: 'bg-red-500', text: 'text-red-700' },
+  warn: { dot: 'bg-warn', text: 'text-warn' },
+  bad: { dot: 'bg-err', text: 'text-err' },
   critical: { dot: 'bg-purple-500', text: 'text-purple-700' },
-  low: { dot: 'bg-amber-500', text: 'text-amber-700' },
-  muted: { dot: 'bg-slate-400', text: 'text-slate-600' },
+  low: { dot: 'bg-warn', text: 'text-warn' },
+  muted: { dot: 'bg-ink-mute', text: 'text-ink' },
 };
 
 export function SectionHeader({

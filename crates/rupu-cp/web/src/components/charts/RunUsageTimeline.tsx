@@ -1,14 +1,7 @@
 import { Area, ComposedChart, Line, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import type { UsageTimelinePoint } from '../../lib/api';
 import { formatTokens } from '../../lib/usage';
-
-const tooltipStyle: React.CSSProperties = {
-  background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, fontSize: 11, padding: '6px 10px',
-};
-
-const COLOR_IN = '#1860f2';
-const COLOR_OUT = '#22c55e';
-const COLOR_CACHED = '#f59e0b';
+import { useThemeColors } from '../../lib/useThemeColors';
 
 /** Chart datum — all three series positive. `in` is drawn on the LEFT axis (its
  *  own large scale); `out` and `cached` share a RIGHT axis scaled to their own
@@ -51,6 +44,18 @@ export default function RunUsageTimeline({
   series: UsageTimelinePoint[];
   separators?: boolean;
 }) {
+  const colors = useThemeColors();
+  const COLOR_IN = colors.status.running;
+  const COLOR_OUT = colors.status.done;
+  const COLOR_CACHED = colors.status.awaiting;
+  const tooltipStyle: React.CSSProperties = {
+    background: colors.panel,
+    border: `1px solid ${colors.border}`,
+    color: colors.ink,
+    borderRadius: 6,
+    fontSize: 11,
+    padding: '6px 10px',
+  };
   if (series.length === 0) {
     return <div className="text-xs text-ink-mute py-6 text-center">No per-turn usage yet</div>;
   }
@@ -63,12 +68,12 @@ export default function RunUsageTimeline({
     <div style={{ width: '100%', height: 140 }}>
       <ResponsiveContainer width="100%" height="100%">
         <ComposedChart data={data} margin={{ top: 12, right: 8, bottom: 0, left: 0 }}>
-          <XAxis dataKey="turn" tick={{ fontSize: 10, fill: '#94a3b8' }} />
+          <XAxis dataKey="turn" tick={{ fontSize: 10, fill: colors.inkMute }} />
           {/* Left axis: input only (its own large scale). */}
           <YAxis yAxisId="in" tick={{ fontSize: 10, fill: COLOR_IN }} width={40}
             tickFormatter={(v) => formatTokenTick(typeof v === 'number' ? v : 0)} />
           {/* Right axis: output + cached, scaled to their own range. */}
-          <YAxis yAxisId="oc" orientation="right" tick={{ fontSize: 10, fill: '#94a3b8' }} width={40}
+          <YAxis yAxisId="oc" orientation="right" tick={{ fontSize: 10, fill: colors.inkMute }} width={40}
             tickFormatter={(v) => formatTokenTick(typeof v === 'number' ? v : 0)} />
           <Tooltip contentStyle={tooltipStyle}
             formatter={(v, name) => {
@@ -80,8 +85,8 @@ export default function RunUsageTimeline({
               return p?.label ? `turn ${l} · ${p.label}` : `turn ${l}`;
             }} />
           {boundaries.map((b) => (
-            <ReferenceLine key={`${b.label}-${b.turn}`} yAxisId="in" x={b.turn} stroke="#cbd5e1" strokeDasharray="3 3"
-              label={{ value: b.label, position: 'top', fontSize: 9, fill: '#94a3b8' }} />
+            <ReferenceLine key={`${b.label}-${b.turn}`} yAxisId="in" x={b.turn} stroke={colors.border} strokeDasharray="3 3"
+              label={{ value: b.label, position: 'top', fontSize: 9, fill: colors.inkMute }} />
           ))}
           <Area yAxisId="in" type="monotone" dataKey="in" name="In" stroke={COLOR_IN} fill={COLOR_IN} fillOpacity={0.18} />
           <Line yAxisId="oc" type="monotone" dataKey="out" name="Out" stroke={COLOR_OUT} dot={false} strokeWidth={1.5} />

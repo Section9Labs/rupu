@@ -24,9 +24,9 @@ import { cn } from '../../lib/cn';
 // ---------------------------------------------------------------------------
 
 const RESULT_PILL: Record<TurnView['summary']['result'], string> = {
-  ok: 'bg-green-100 text-green-700 ring-green-200',
-  error: 'bg-red-100 text-red-700 ring-red-200',
-  running: 'bg-amber-100 text-amber-700 ring-amber-200',
+  ok: 'bg-ok-bg text-ok ring-ok/30',
+  error: 'bg-err-bg text-err ring-err/30',
+  running: 'bg-warn-bg text-warn ring-warn/30',
 };
 
 const RESULT_LABEL: Record<TurnView['summary']['result'], string> = {
@@ -89,13 +89,13 @@ export default function Turn({
         {/* Pills */}
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
           {toolCount > 0 && (
-            <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium bg-slate-100 text-slate-600">
+            <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium bg-surface text-ink">
               <Wrench size={9} />
               {toolCount} {toolCount === 1 ? 'tool' : 'tools'}
             </span>
           )}
           {findingCount > 0 && (
-            <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset bg-orange-50 text-sev-medium ring-orange-200">
+            <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset bg-warn-bg text-sev-medium ring-warn/30">
               <AlertTriangle size={9} />
               {findingCount} {findingCount === 1 ? 'finding' : 'findings'}
             </span>

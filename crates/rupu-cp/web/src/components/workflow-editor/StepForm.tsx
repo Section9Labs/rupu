@@ -36,7 +36,7 @@ function fieldCtx(
 }
 
 const fieldCls =
-  'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
+  'w-full rounded-md border border-border bg-panel px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
 const labelCls = 'mb-1 block text-ui font-semibold uppercase tracking-wide text-ink-dim';
 const checkLabelCls = 'flex items-center gap-2 text-lead text-ink';
 
@@ -87,7 +87,7 @@ export default function StepForm({ node, agents, onChange, problems, exprContext
   return (
     <div className="space-y-4">
       {problems.length > 0 && (
-        <div role="alert" className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-ui text-red-700">
+        <div role="alert" className="rounded-md border border-err/30 bg-err-bg px-3 py-2 text-ui text-err">
           <ul className="list-disc space-y-0.5 pl-4">
             {problems.map((p, i) => (
               <li key={i}>{p}</li>
@@ -294,7 +294,7 @@ function ParallelFields({
 
       <div className="space-y-3">
         {subs.map((s, i) => (
-          <div key={i} className="space-y-2 rounded-md border border-border bg-slate-50 p-2.5">
+          <div key={i} className="space-y-2 rounded-md border border-border bg-surface p-2.5">
             <div className="flex items-center gap-2">
               <input
                 type="text"
@@ -377,7 +377,7 @@ function PanelFields({
     <div className="space-y-3">
       <div>
         <span className={labelCls}>Panelists</span>
-        <div className="space-y-1.5 rounded-md border border-border bg-slate-50 p-2.5">
+        <div className="space-y-1.5 rounded-md border border-border bg-surface p-2.5">
           {panelistNames.length === 0 ? (
             <p className="text-ui text-ink-mute">No agents available.</p>
           ) : (
@@ -441,7 +441,7 @@ function PanelFields({
       </label>
 
       {panel.gate !== undefined && (
-        <div className="space-y-3 rounded-md border border-border bg-slate-50 p-2.5">
+        <div className="space-y-3 rounded-md border border-border bg-surface p-2.5">
           <label className="block">
             <span className={labelCls}>Until no findings at severity or above</span>
             <input
@@ -510,7 +510,7 @@ function ApprovalFields({
       </label>
 
       {d.approvalRequired && (
-        <div className="space-y-3 rounded-md border border-border bg-slate-50 p-2.5">
+        <div className="space-y-3 rounded-md border border-border bg-surface p-2.5">
           <label className="block">
             <span className={labelCls}>Approval prompt</span>
             <input

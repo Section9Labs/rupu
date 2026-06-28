@@ -81,7 +81,7 @@ function Tile({ label, value, valueClass, interactive, active, onClick }: TilePr
         aria-label={`Filter by ${label}`}
         className={cn(
           base,
-          'transition-shadow hover:border-slate-300',
+          'transition-shadow hover:border-border',
           active && 'ring-2 ring-brand-400 border-brand-300',
         )}
       >

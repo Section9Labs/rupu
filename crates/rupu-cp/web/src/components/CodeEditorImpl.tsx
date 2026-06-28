@@ -46,8 +46,9 @@ import {
 } from '@codemirror/autocomplete';
 import { markdown } from '@codemirror/lang-markdown';
 import { yaml } from '@codemirror/lang-yaml';
-import { githubHighlightStyle } from './codeHighlightTheme';
+import { highlightStyleFor } from './codeHighlightTheme';
 import type { CodeEditorProps } from './CodeEditor';
+import type { Mode } from './theme/ThemeProvider';
 
 // `font-mono` so the editor matches the read-only display (CodeHighlight), whose
 // <pre> is font-mono — `.cm-scroller` inherits this family below.
@@ -59,27 +60,41 @@ function languageExtension(language: 'markdown' | 'yaml'): Extension {
   return language === 'yaml' ? yaml() : markdown();
 }
 
-// A small light theme on top of `defaultHighlightStyle` (which supplies the
-// token colors). Keeps the gutter/active-line subtle against the white panel.
-const editorTheme = EditorView.theme({
-  '&': { maxHeight: '32rem' },
-  '.cm-scroller': { fontFamily: 'inherit', overflow: 'auto' },
-  '.cm-content': { padding: '0.5rem 0' },
-  '.cm-gutters': {
-    backgroundColor: 'transparent',
-    color: '#9ca3af',
-    border: 'none',
-  },
-  '.cm-activeLine': { backgroundColor: 'rgba(59, 130, 246, 0.06)' },
-  '.cm-activeLineGutter': { backgroundColor: 'rgba(59, 130, 246, 0.06)' },
-  '&.cm-focused .cm-matchingBracket': {
-    backgroundColor: 'rgba(59, 130, 246, 0.18)',
-    outline: 'none',
-  },
-});
+// A small editor theme on top of the syntax highlight style (which supplies the
+// token colors). Keeps the gutter/active-line subtle against the panel. Tuned
+// per mode so dark mode isn't light-grey-gutter-on-near-black; the container's
+// `bg-panel` provides the surface, so the editor background stays transparent.
+function makeEditorTheme(dark: boolean): Extension {
+  return EditorView.theme(
+    {
+      '&': { maxHeight: '32rem', backgroundColor: 'transparent', color: 'inherit' },
+      '.cm-scroller': { fontFamily: 'inherit', overflow: 'auto' },
+      '.cm-content': { padding: '0.5rem 0', caretColor: dark ? '#e6edf3' : '#0f172a' },
+      '.cm-cursor, .cm-dropCursor': { borderLeftColor: dark ? '#e6edf3' : '#0f172a' },
+      '.cm-gutters': {
+        backgroundColor: 'transparent',
+        color: dark ? '#6b7280' : '#9ca3af',
+        border: 'none',
+      },
+      '.cm-activeLine': { backgroundColor: dark ? 'rgba(96, 165, 250, 0.10)' : 'rgba(59, 130, 246, 0.06)' },
+      '.cm-activeLineGutter': {
+        backgroundColor: dark ? 'rgba(96, 165, 250, 0.10)' : 'rgba(59, 130, 246, 0.06)',
+      },
+      '.cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection': {
+        backgroundColor: dark ? 'rgba(96, 165, 250, 0.25)' : 'rgba(59, 130, 246, 0.18)',
+      },
+      '&.cm-focused .cm-matchingBracket': {
+        backgroundColor: dark ? 'rgba(96, 165, 250, 0.30)' : 'rgba(59, 130, 246, 0.18)',
+        outline: 'none',
+      },
+    },
+    { dark },
+  );
+}
 
 /** The full "rich editor" extension set, sans the language (added per-mode). */
-function baseExtensions(): Extension[] {
+function baseExtensions(mode: Mode): Extension[] {
+  const dark = mode === 'dark';
   return [
     lineNumbers(),
     highlightActiveLineGutter(),
@@ -89,7 +104,7 @@ function baseExtensions(): Extension[] {
     drawSelection(),
     dropCursor(),
     indentOnInput(),
-    syntaxHighlighting(githubHighlightStyle, { fallback: true }),
+    syntaxHighlighting(highlightStyleFor(mode), { fallback: true }),
     bracketMatching(),
     closeBrackets(),
     autocompletion(),
@@ -105,8 +120,19 @@ function baseExtensions(): Extension[] {
       ...completionKeymap,
       indentWithTab,
     ]),
-    editorTheme,
+    makeEditorTheme(dark),
   ];
+}
+
+/** Resolve the effective mode: explicit prop wins, else read the live
+ *  `data-theme` attribute at mount (the editor mounts imperatively). */
+function resolveMode(theme: Mode | undefined): Mode {
+  if (theme) return theme;
+  try {
+    return document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+  } catch {
+    return 'light';
+  }
 }
 
 export default function CodeEditorImpl({
@@ -114,7 +140,9 @@ export default function CodeEditorImpl({
   onChange,
   language = 'markdown',
   ariaLabel,
+  theme,
 }: CodeEditorProps) {
+  const mode = resolveMode(theme);
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   // Keep the latest onChange without re-creating the editor on every render.
@@ -133,7 +161,7 @@ export default function CodeEditorImpl({
     const state = EditorState.create({
       doc: value,
       extensions: [
-        ...baseExtensions(),
+        ...baseExtensions(mode),
         languageExtension(language),
         updateListener,
       ],
@@ -148,9 +176,10 @@ export default function CodeEditorImpl({
       viewRef.current = null;
     };
     // `value` is intentionally omitted — external value sync is handled below;
-    // recreating on every keystroke would reset the cursor.
+    // recreating on every keystroke would reset the cursor. `mode` IS included so
+    // the editor recreates with the matching highlight/theme on a theme toggle.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [language, ariaLabel]);
+  }, [language, ariaLabel, mode]);
 
   // Sync external `value` changes (e.g. a reset to the saved definition) into
   // the doc without clobbering local edits when they already match.

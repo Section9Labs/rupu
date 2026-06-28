@@ -15,6 +15,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode, StepKind, StepNodeData } from '../../../lib/workflowGraph';
 import { editorNodeSize } from '../../../lib/workflowLayout';
+import { useThemeColors, type ColorKey, type ThemeColors } from '../../../lib/useThemeColors';
 
 // Node data carried on the xyflow node. Exported so WorkflowEditorGraph projects
 // the exact same shape when it derives the flow `nodes`.
@@ -25,31 +26,32 @@ export interface NodeData extends Record<string, unknown> {
 
 type EditableFlowNode = Node<NodeData, 'editable'>;
 
-const handleStyle = { background: '#cbd5e1', width: 7, height: 7, border: 'none' } as const;
+// Per-kind accent → a THEMED palette token: step/blue (running), for_each/violet
+// (brand), parallel/purple (sev-critical), panel/amber (awaiting). Resolved from
+// the hook at render so the kind coloring matches the rest of the UI and stays
+// legible on dark — the kind chips paint with an inline alpha tint of the accent
+// (no fixed `bg-*-50` classes that wash out on near-black).
+const KIND_KEY: Record<StepKind, ColorKey> = {
+  step: 'status.running',
+  for_each: 'brand.500',
+  parallel: 'sev.critical',
+  panel: 'status.awaiting',
+};
 
-// Per-kind accent color (top-bar) + kind-chip classes: step/blue, for_each/
-// violet, parallel/purple, panel/amber. Chip classes are static literals so
-// Tailwind's content scanner keeps them.
-const KIND_COLOR: Record<StepKind, string> = {
-  step: '#1860f2',
-  for_each: '#8b5cf6',
-  parallel: '#9333ea',
-  panel: '#f59e0b',
-};
-const KIND_CHIP: Record<StepKind, string> = {
-  step: 'bg-blue-50 text-blue-600',
-  for_each: 'bg-violet-50 text-violet-600',
-  parallel: 'bg-purple-50 text-purple-600',
-  panel: 'bg-amber-50 text-amber-600',
-};
+/** Inline style for a kind chip — soft accent tint bg + accent text. */
+function kindChipStyle(colors: ThemeColors, kind: StepKind): React.CSSProperties {
+  return { background: colors.alpha(KIND_KEY[kind], 0.14), color: colors.get(KIND_KEY[kind]) };
+}
 
 /** kind chip + agent chip — shared by step / for_each. */
-function StepBody({ d }: { d: StepNodeData }) {
+function StepBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
   return (
     <>
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className={`rounded px-1.5 py-px text-meta font-medium ${KIND_CHIP[d.kind]}`}>{d.kind}</span>
-        <span className="truncate rounded bg-slate-100 px-1.5 py-px text-meta text-slate-500">
+        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, d.kind)}>
+          {d.kind}
+        </span>
+        <span className="truncate rounded bg-surface px-1.5 py-px text-meta text-ink-dim">
           {d.agent ?? '(no agent)'}
         </span>
       </div>
@@ -61,19 +63,21 @@ function StepBody({ d }: { d: StepNodeData }) {
 }
 
 /** header roll-up + stacked sub-step rows — mirrors ParallelNode. */
-function ParallelBody({ d }: { d: StepNodeData }) {
+function ParallelBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
   const subs = d.parallel ?? [];
   return (
     <>
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className={`rounded px-1.5 py-px text-meta font-medium ${KIND_CHIP.parallel}`}>parallel</span>
+        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'parallel')}>
+          parallel
+        </span>
         <span className="text-meta text-ink-mute tabular-nums">· {subs.length}</span>
       </div>
       <div className="mt-1.5 flex flex-col gap-1">
         {subs.map((sub, i) => (
           <div
             key={sub.id || i}
-            className="flex items-center gap-1.5 rounded-[6px] border border-border bg-white px-1.5 py-1"
+            className="flex items-center gap-1.5 rounded-[6px] border border-border bg-panel px-1.5 py-1"
           >
             <span className="truncate text-note text-ink">{sub.id || `#${i}`}</span>
             <span className="ml-auto truncate text-meta text-ink-mute">{sub.agent || '(no agent)'}</span>
@@ -86,21 +90,26 @@ function ParallelBody({ d }: { d: StepNodeData }) {
 }
 
 /** panelists count + optional gate block — mirrors PanelLoopNode. */
-function PanelBody({ d }: { d: StepNodeData }) {
+function PanelBody({ d, colors }: { d: StepNodeData; colors: ThemeColors }) {
   const panelists = d.panel?.panelists ?? [];
   const gate = d.panel?.gate;
   return (
     <>
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className={`rounded px-1.5 py-px text-meta font-medium ${KIND_CHIP.panel}`}>panel</span>
+        <span className="rounded px-1.5 py-px text-meta font-medium" style={kindChipStyle(colors, 'panel')}>
+          panel
+        </span>
         <span className="text-meta text-ink-mute tabular-nums">· {panelists.length} panelists</span>
       </div>
       {gate && (
         <div
           className="mt-1.5 flex items-center gap-1.5 rounded-[8px] border px-1.5 py-1"
-          style={{ borderColor: '#fde68a', background: '#fffbeb' }}
+          style={{
+            borderColor: colors.alpha('status.awaiting', 0.45),
+            background: colors.alpha('status.awaiting', 0.12),
+          }}
         >
-          <span className="text-meta font-medium text-[#92400e]">
+          <span className="text-meta font-medium" style={{ color: colors.status.awaiting }}>
             gate ≥ {gate.until_no_findings_at_severity_or_above ?? '—'}
           </span>
         </div>
@@ -112,17 +121,19 @@ function PanelBody({ d }: { d: StepNodeData }) {
 function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const { node, problems } = data;
   const d = node.data;
-  const color = KIND_COLOR[d.kind];
+  const colors = useThemeColors();
+  const handleStyle = { background: colors.border, width: 7, height: 7, border: 'none' } as const;
+  const color = colors.get(KIND_KEY[d.kind]);
   const box = editorNodeSize(d);
   const hasProblems = problems.length > 0;
 
   return (
     <div
       className={[
-        'relative rounded-[10px] border bg-white px-3 py-2 text-left shadow-card',
+        'relative rounded-[10px] border bg-panel px-3 py-2 text-left shadow-card',
         selected ? 'ring-2 ring-brand-500' : '',
       ].join(' ')}
-      style={{ borderColor: selected ? color : '#e5e7eb', width: box.width, minHeight: box.height }}
+      style={{ borderColor: selected ? color : colors.border, width: box.width, minHeight: box.height }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
 
@@ -136,7 +147,7 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
         <span className="flex-1 truncate text-ui font-semibold text-ink">{d.id}</span>
         {hasProblems && (
           <span
-            className="inline-block h-2.5 w-2.5 shrink-0 rounded-full bg-red-500"
+            className="inline-block h-2.5 w-2.5 shrink-0 rounded-full bg-status-failed"
             title={problems.join('\n')}
             aria-label="has problems"
           />
@@ -144,11 +155,11 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
       </div>
 
       {d.kind === 'parallel' ? (
-        <ParallelBody d={d} />
+        <ParallelBody d={d} colors={colors} />
       ) : d.kind === 'panel' ? (
-        <PanelBody d={d} />
+        <PanelBody d={d} colors={colors} />
       ) : (
-        <StepBody d={d} />
+        <StepBody d={d} colors={colors} />
       )}
 
       <Handle type="source" position={Position.Right} style={handleStyle} />

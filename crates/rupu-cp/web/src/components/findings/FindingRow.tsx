@@ -60,7 +60,7 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
           {provenance ? (
             <div className="flex flex-wrap items-start gap-x-2 gap-y-1">
               <p className="text-sm text-ink leading-snug min-w-0 flex-1">{finding.summary}</p>
-              <span className="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-meta font-medium font-mono bg-slate-100 text-ink-mute ring-1 ring-slate-200 mt-0.5">
+              <span className="shrink-0 inline-flex items-center rounded px-1.5 py-0.5 text-meta font-medium font-mono bg-surface text-ink-mute ring-1 ring-border mt-0.5">
                 {provenance}
               </span>
             </div>
@@ -74,7 +74,7 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
                 href={cwe.url}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center rounded bg-slate-100 px-1.5 py-0.5 text-note font-medium text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200"
+                className="inline-flex items-center rounded bg-surface px-1.5 py-0.5 text-note font-medium text-ink ring-1 ring-border hover:bg-surface-hover"
               >
                 {cwe.id}
               </a>
@@ -104,7 +104,7 @@ export function FindingRow({ finding, project, targetId }: FindingRowProps) {
                 </p>
               )}
               {excerpt && (
-                <pre className="overflow-x-auto rounded bg-slate-50 ring-1 ring-slate-200 px-3 py-2 text-note font-mono text-ink leading-snug whitespace-pre">
+                <pre className="overflow-x-auto rounded bg-surface ring-1 ring-border px-3 py-2 text-note font-mono text-ink leading-snug whitespace-pre">
                   {excerpt}
                 </pre>
               )}

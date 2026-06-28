@@ -69,7 +69,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       </div>
@@ -266,11 +266,11 @@ function touchRank(raw: string): number {
 
 // Heatmap palette: hotter (edit) → cooler (glob). STATIC classes only.
 const TOUCH_STYLES: Record<(typeof TOUCH_ORDER)[number], { pill: string; bar: string; label: string }> = {
-  edit: { pill: 'bg-red-50 text-red-700 ring-red-200',       bar: 'bg-red-400',    label: 'edit' },
-  read: { pill: 'bg-orange-50 text-orange-700 ring-orange-200', bar: 'bg-orange-300', label: 'read' },
-  grep: { pill: 'bg-yellow-50 text-yellow-700 ring-yellow-200', bar: 'bg-yellow-300', label: 'grep' },
-  cmd:  { pill: 'bg-blue-50 text-blue-700 ring-blue-200',     bar: 'bg-blue-300',   label: 'cmd' },
-  glob: { pill: 'bg-slate-100 text-ink-mute ring-slate-200',  bar: 'bg-slate-300',  label: 'glob' },
+  edit: { pill: 'bg-err-bg text-err ring-err/30',       bar: 'bg-err',    label: 'edit' },
+  read: { pill: 'bg-warn-bg text-warn ring-warn/30', bar: 'bg-warn', label: 'read' },
+  grep: { pill: 'bg-warn-bg text-warn ring-warn/30', bar: 'bg-warn', label: 'grep' },
+  cmd:  { pill: 'bg-info-bg text-info ring-info/30',     bar: 'bg-info',   label: 'cmd' },
+  glob: { pill: 'bg-surface text-ink-mute ring-border',  bar: 'bg-ink-mute',  label: 'glob' },
 };
 
 /** Whether a file carries a given touch mode (presence, not a count — the
@@ -390,11 +390,11 @@ function FilesTable({ files }: { files: FileView[] }) {
 // ---------------------------------------------------------------------------
 
 const ASSERTION_STATUS_STYLES: Record<AssertionStatus, { pill: string; label: string }> = {
-  clean:          { pill: 'bg-green-50 text-green-700 ring-green-200',   label: 'clean' },
-  finding:        { pill: 'bg-orange-50 text-sev-medium ring-orange-200', label: 'finding' },
-  examined:       { pill: 'bg-blue-50 text-blue-700 ring-blue-200',      label: 'examined' },
-  not_applicable: { pill: 'bg-slate-100 text-ink-mute ring-slate-200',   label: 'n/a' },
-  unknown:        { pill: 'bg-slate-100 text-ink-mute ring-slate-200',   label: '?' },
+  clean:          { pill: 'bg-ok-bg text-ok ring-ok/30',   label: 'clean' },
+  finding:        { pill: 'bg-warn-bg text-sev-medium ring-warn/30', label: 'finding' },
+  examined:       { pill: 'bg-info-bg text-info ring-info/30',      label: 'examined' },
+  not_applicable: { pill: 'bg-surface text-ink-mute ring-border',   label: 'n/a' },
+  unknown:        { pill: 'bg-surface text-ink-mute ring-border',   label: '?' },
 };
 
 /** First line of an assertion's evidence ranges, for the `File:Line` cell. */
@@ -486,8 +486,8 @@ function CatalogBadge({ present }: { present: boolean }) {
       className={cn(
         'inline-flex items-center gap-1 rounded px-2 py-0.5 text-note font-medium ring-1',
         present
-          ? 'bg-green-50 text-green-700 ring-green-200'
-          : 'bg-slate-100 text-ink-mute ring-slate-200',
+          ? 'bg-ok-bg text-ok ring-ok/30'
+          : 'bg-surface text-ink-mute ring-border',
       )}
     >
       {present ? <ShieldCheck size={11} /> : <ShieldOff size={11} />}

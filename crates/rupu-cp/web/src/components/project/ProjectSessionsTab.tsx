@@ -164,7 +164,7 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
       s.active_run_id ? (
         <Link
           to={`/runs/${encodeURIComponent(s.active_run_id)}`}
-          className="inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-blue-50 text-blue-700 ring-blue-200 hover:bg-blue-100"
+          className="inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-info-bg text-info ring-info/30 hover:bg-info-bg"
         >
           active run
         </Link>
@@ -235,7 +235,7 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
               'text-xs font-medium px-3 py-1 rounded-full border transition-colors',
               scope === f.id
                 ? 'bg-brand-600 text-white border-brand-600'
-                : 'bg-panel text-ink-dim border-border hover:bg-slate-100',
+                : 'bg-panel text-ink-dim border-border hover:bg-surface-hover',
             )}
           >
             {f.label}
@@ -244,7 +244,7 @@ export default function ProjectSessionsTab({ wsId }: { wsId: string }) {
       </div>
 
       {error && (
-        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}

@@ -2,6 +2,97 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ──────────────────────────────────────────────────────────────────────────
+ * Theme tokens. Colors are stored as space-separated RGB *channels* so the
+ * Tailwind tokens (see tailwind.config.ts → `rgb(var(--c-x) / <alpha-value>)`)
+ * keep their opacity modifiers working (e.g. `bg-status-running/10`).
+ *
+ * `:root` is the LIGHT theme (values identical to the previous hard-coded
+ * hexes — light is visually unchanged). `[data-theme="dark"]` is the rupu.sh
+ * "lifted near-black" palette. ThemeProvider sets `data-theme` on <html>.
+ * Dark neutrals are PRE-BLENDED solids (not alpha) so full-opacity tokens like
+ * `border-border` read as the intended subtle line.
+ * ────────────────────────────────────────────────────────────────────────── */
+:root {
+  --c-bg: 250 250 250;
+  --c-panel: 255 255 255;
+  --c-surface: 241 245 249;
+  --c-surface-hover: 226 232 240;
+  --c-border: 229 231 235;
+  --c-ink: 15 23 42;
+  --c-ink-dim: 100 116 139;
+  --c-ink-mute: 148 163 184;
+  --c-brand-50: 245 243 255;
+  --c-brand-100: 237 233 254;
+  --c-brand-500: 124 58 237;
+  --c-brand-600: 109 40 217;
+  --c-brand-700: 91 33 182;
+  --c-sev-critical: 147 51 234;
+  --c-sev-high: 220 38 38;
+  --c-sev-medium: 234 88 12;
+  --c-sev-low: 202 138 4;
+  --c-sev-info: 100 116 139;
+  /* Soft severity backgrounds (light = the former -50 tints). */
+  --c-sev-critical-bg: 250 245 255; /* purple-50  */
+  --c-sev-high-bg: 254 242 242;     /* red-50     */
+  --c-sev-medium-bg: 255 247 237;   /* orange-50  */
+  --c-sev-low-bg: 254 252 232;      /* yellow-50  */
+  --c-sev-info-bg: 248 250 252;     /* slate-50   */
+  --c-status-running: 59 130 246;
+  --c-status-done: 34 197 94;
+  --c-status-completed: 34 197 94;
+  --c-status-failed: 239 68 68;
+  --c-status-awaiting: 245 158 11;
+  --c-status-pending: 148 163 184;
+  --c-status-skipped: 203 213 225;
+  --c-status-cancelled: 100 116 139;
+  --c-status-rejected: 239 68 68;
+  --c-err: 220 38 38;   --c-err-bg: 254 242 242;
+  --c-ok: 22 163 74;    --c-ok-bg: 240 253 244;
+  --c-warn: 217 119 6;  --c-warn-bg: 255 251 235;
+  --c-info: 37 99 235;  --c-info-bg: 239 246 255;
+}
+
+[data-theme="dark"] {
+  --c-bg: 10 10 10;
+  --c-panel: 20 20 22;
+  --c-surface: 27 27 31;
+  --c-surface-hover: 35 35 39;
+  --c-border: 38 38 42;
+  --c-ink: 245 245 245;
+  --c-ink-dim: 161 161 170;
+  --c-ink-mute: 113 113 122;
+  --c-brand-50: 33 23 56;
+  --c-brand-100: 45 33 74;
+  --c-brand-500: 124 58 237;
+  --c-brand-600: 124 58 237;
+  --c-brand-700: 167 139 250;
+  --c-sev-critical: 168 85 247;
+  --c-sev-high: 248 113 113;
+  --c-sev-medium: 251 146 60;
+  --c-sev-low: 250 204 21;
+  --c-sev-info: 148 163 184;
+  /* Low-saturation dark severity backgrounds (legible tinted fills on near-black). */
+  --c-sev-critical-bg: 42 28 56;
+  --c-sev-high-bg: 48 24 24;
+  --c-sev-medium-bg: 48 32 18;
+  --c-sev-low-bg: 46 40 16;
+  --c-sev-info-bg: 30 31 35;
+  --c-status-running: 96 165 250;
+  --c-status-done: 74 222 128;
+  --c-status-completed: 74 222 128;
+  --c-status-failed: 248 113 113;
+  --c-status-awaiting: 251 191 36;
+  --c-status-pending: 113 113 122;
+  --c-status-skipped: 82 82 91;
+  --c-status-cancelled: 161 161 170;
+  --c-status-rejected: 248 113 113;
+  --c-err: 248 113 113; --c-err-bg: 43 22 22;
+  --c-ok: 74 222 128;   --c-ok-bg: 18 40 27;
+  --c-warn: 251 191 36; --c-warn-bg: 48 36 12;
+  --c-info: 96 165 250; --c-info-bg: 20 32 54;
+}
+
 @layer base {
   html, body, #root { height: 100%; }
   body {
@@ -30,7 +121,7 @@
   }
 }
 @keyframes timeline-row-glow {
-  0%   { background-color: rgb(124 58 237 / 0.06); }
+  0%   { background-color: rgb(var(--c-brand-500) / 0.06); }
   100% { background-color: transparent; }
 }
 @keyframes dot-pulse {
@@ -61,7 +152,7 @@
   bottom: 4px;
   width: 2px;
   border-radius: 2px;
-  background: linear-gradient(to bottom, #a78bfa, #7c3aed);
+  background: linear-gradient(to bottom, rgb(var(--c-brand-700)), rgb(var(--c-brand-500)));
   animation: fresh-stripe 2400ms ease-out both;
 }
 @keyframes fresh-stripe {
@@ -107,12 +198,12 @@
 /* Unified status palette (see lib/status.ts / tailwind `status.*`):
  *   running #3b82f6 (59,130,246) · awaiting #f59e0b (245,158,11) */
 @keyframes rg-pulse-blue {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.45); }
-  50%      { box-shadow: 0 0 0 7px rgba(59, 130, 246, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgb(var(--c-status-running) / 0.45); }
+  50%      { box-shadow: 0 0 0 7px rgb(var(--c-status-running) / 0); }
 }
 @keyframes rg-pulse-amber {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.45); }
-  50%      { box-shadow: 0 0 0 7px rgba(245, 158, 11, 0); }
+  0%, 100% { box-shadow: 0 0 0 0 rgb(var(--c-status-awaiting) / 0.45); }
+  50%      { box-shadow: 0 0 0 7px rgb(var(--c-status-awaiting) / 0); }
 }
 .rg-pulse-run   { animation: rg-pulse-blue  1.7s ease-in-out infinite; }
 .rg-pulse-await { animation: rg-pulse-amber 1.7s ease-in-out infinite; }
@@ -124,13 +215,13 @@
  * active/awaiting edges via a wrapper class on the <g> and animate the
  * dashed stroke so the ants march along the rendered curve. */
 .react-flow__edge.rg-edge-active .react-flow__edge-path {
-  stroke: #3b82f6;
+  stroke: rgb(var(--c-status-running));
   stroke-width: 2;
   stroke-dasharray: 7 7;
   animation: rg-march 0.7s linear infinite;
 }
 .react-flow__edge.rg-edge-await .react-flow__edge-path {
-  stroke: #f59e0b;
+  stroke: rgb(var(--c-status-awaiting));
   stroke-width: 2;
   stroke-dasharray: 6 6;
   animation: rg-march 0.9s linear infinite;
@@ -141,3 +232,39 @@
   to { transform: rotate(360deg); }
 }
 .rg-loop-spin { animation: rg-loop-spin 2.4s linear infinite; display: inline-block; }
+
+/* ------------------------------------------------------------------ */
+/* xyflow chrome on dark — the vendored `@xyflow/react/dist/style.css` */
+/* paints controls / minimap / edges / attribution with its own LIGHT  */
+/* defaults. Override the key surfaces so the canvas backdrop and       */
+/* controls read on the near-black panel. (Light mode keeps xyflow's    */
+/* defaults, which already match the light UI.)                         */
+/* ------------------------------------------------------------------ */
+[data-theme="dark"] .react-flow__controls-button {
+  background: rgb(var(--c-panel));
+  border-bottom: 1px solid rgb(var(--c-border));
+  color: rgb(var(--c-ink));
+  fill: rgb(var(--c-ink));
+}
+[data-theme="dark"] .react-flow__controls-button:hover {
+  background: rgb(var(--c-surface-hover));
+}
+[data-theme="dark"] .react-flow__controls-button svg {
+  fill: rgb(var(--c-ink-dim));
+}
+[data-theme="dark"] .react-flow__minimap {
+  background: rgb(var(--c-panel));
+}
+[data-theme="dark"] .react-flow__attribution {
+  background: transparent;
+  color: rgb(var(--c-ink-mute));
+}
+/* Default (non-animated) editor edges have no inline stroke — give them a
+ * visible mid-grey on dark. The active/awaiting marching-ants rules above carry
+ * higher specificity, so they win for live frontier edges. */
+[data-theme="dark"] .react-flow__edge-path {
+  stroke: rgb(var(--c-ink-mute));
+}
+[data-theme="dark"] .react-flow__edge-text {
+  fill: rgb(var(--c-ink-dim));
+}

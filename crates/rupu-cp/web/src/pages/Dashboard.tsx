@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Activity, MessageSquare, RefreshCw, Server, ShieldCheck } from 'lucide-react';
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
 import { api, type DashboardResponse, type RunStatusStr, type UsageOverview, type UsageTimelineBucket } from '../lib/api';
+import { useThemeColors } from '../lib/useThemeColors';
 import { StatusPill } from '../components/StatusPill';
 import UsageChip from '../components/UsageChip';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
@@ -53,15 +54,18 @@ function rangeParams(range: Range): { since: string; bucket: 'day' | 'week' } {
 // Run-status donut chart (bottom rail)
 // ---------------------------------------------------------------------------
 
-const STATUS_FILL: Record<RunStatusStr, string> = {
-  running:          '#3b82f6',
-  completed:        '#10b981',
-  failed:           '#ef4444',
-  awaiting_approval:'#f59e0b',
-  pending:          '#94a3b8',
-  rejected:         '#64748b',
-  cancelled:        '#64748b',
-};
+/** Themed per-status donut fills, resolved from the current palette. */
+function statusFill(colors: ReturnType<typeof useThemeColors>): Record<RunStatusStr, string> {
+  return {
+    running: colors.status.running,
+    completed: colors.status.completed,
+    failed: colors.status.failed,
+    awaiting_approval: colors.status.awaiting,
+    pending: colors.status.pending,
+    rejected: colors.status.rejected,
+    cancelled: colors.status.cancelled,
+  };
+}
 
 const STATUS_ORDER: RunStatusStr[] = [
   'running', 'awaiting_approval', 'pending', 'completed', 'failed', 'rejected', 'cancelled',
@@ -77,17 +81,23 @@ const STATUS_LABEL: Record<RunStatusStr, string> = {
   cancelled:         'Cancelled',
 };
 
-const tooltipStyle: React.CSSProperties = {
-  background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, fontSize: 11, padding: '6px 10px',
-  boxShadow: '0 2px 6px rgba(0,0,0,0.06)',
-};
-
 function RunStatusChart({ byStatus, total }: { byStatus: Record<RunStatusStr, number>; total: number }) {
+  const colors = useThemeColors();
+  const STATUS_FILL = statusFill(colors);
+  const tooltipStyle: React.CSSProperties = {
+    background: colors.panel,
+    border: `1px solid ${colors.border}`,
+    color: colors.ink,
+    borderRadius: 6,
+    fontSize: 11,
+    padding: '6px 10px',
+    boxShadow: '0 2px 6px rgba(0,0,0,0.18)',
+  };
   if (total === 0) {
     return (
       <div className="py-12 flex flex-col items-center justify-center text-center">
-        <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center mb-2">
-          <Activity size={18} className="text-slate-400" />
+        <div className="w-10 h-10 rounded-full bg-surface flex items-center justify-center mb-2">
+          <Activity size={18} className="text-ink-mute" />
         </div>
         <p className="text-xs text-ink-mute">No runs yet</p>
       </div>
@@ -328,7 +338,7 @@ export default function Dashboard() {
       </header>
 
       {error && (
-        <div className="mb-5 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+        <div className="mb-5 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {error}
         </div>
       )}
@@ -355,7 +365,7 @@ export default function Dashboard() {
                     <p className="text-xs text-ink-dim font-medium uppercase tracking-wide">Spend</p>
                     <p className="mt-1 text-3xl font-semibold text-ink tabular-nums">
                       {formatCost(summary?.cost_usd ?? null)}
-                      {spendPartial && <span className="text-amber-500">*</span>}
+                      {spendPartial && <span className="text-warn">*</span>}
                     </p>
                   </div>
                   <div>
@@ -383,7 +393,7 @@ export default function Dashboard() {
               </div>
               {spendPartial && (
                 <p className="-mt-2 mb-3 text-note text-ink-mute">
-                  <span className="text-amber-500">*</span> partial — some models are unpriced (see breakdown)
+                  <span className="text-warn">*</span> partial — some models are unpriced (see breakdown)
                 </p>
               )}
               <UsageTimelineStacked buckets={timeline ?? []} metric={metric} />
@@ -398,12 +408,12 @@ export default function Dashboard() {
 
           {/* ── Secondary tiles ── */}
           <section className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-            <StatTile icon={Activity} iconCls="bg-blue-50 text-blue-600" label="Total runs" value={data.runs.total}
+            <StatTile icon={Activity} iconCls="bg-info-bg text-info" label="Total runs" value={data.runs.total}
               sub={running > 0 ? `${running} running` : undefined} />
             <StatTile icon={MessageSquare} iconCls="bg-brand-50 text-brand-600" label="Sessions" value={activeSessions}
               sub={`${activeSessions} of ${totalSessions} active`} />
-            <StatTile icon={Server} iconCls="bg-slate-100 text-slate-600" label="Workers" value={totalWorkers} />
-            <StatTile icon={ShieldCheck} iconCls="bg-green-50 text-green-600" label="Coverage targets" value={coverageTargets}
+            <StatTile icon={Server} iconCls="bg-surface text-ink" label="Workers" value={totalWorkers} />
+            <StatTile icon={ShieldCheck} iconCls="bg-ok-bg text-ok" label="Coverage targets" value={coverageTargets}
               sub={coverageAssertions > 0 ? `${coverageAssertions} assertions` : undefined} />
           </section>
 
@@ -417,8 +427,8 @@ export default function Dashboard() {
               </div>
               {data.recent_runs.length === 0 ? (
                 <div className="rounded-xl border border-dashed border-border bg-panel/50 py-10 flex flex-col items-center justify-center text-center">
-                  <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center mb-2">
-                    <Activity size={17} className="text-slate-400" />
+                  <div className="w-10 h-10 rounded-full bg-surface flex items-center justify-center mb-2">
+                    <Activity size={17} className="text-ink-mute" />
                   </div>
                   <p className="text-xs text-ink-mute">No runs yet</p>
                 </div>

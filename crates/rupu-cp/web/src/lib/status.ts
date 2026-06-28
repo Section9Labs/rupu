@@ -59,7 +59,7 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     tint: '#f8fafc',
     icon: Clock,
     dotClass: 'bg-status-pending',
-    pillClass: 'bg-slate-100 text-slate-700 ring-slate-200',
+    pillClass: 'bg-surface text-ink-dim ring-border',
   },
   running: {
     label: 'Running',
@@ -67,7 +67,7 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     tint: '#eff6ff',
     icon: Loader2,
     dotClass: 'bg-status-running',
-    pillClass: 'bg-blue-50 text-blue-700 ring-blue-200',
+    pillClass: 'bg-status-running/10 text-status-running ring-status-running/30',
   },
   completed: {
     label: 'Completed',
@@ -75,7 +75,7 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     tint: '#f0fdf4',
     icon: CheckCircle2,
     dotClass: 'bg-status-done',
-    pillClass: 'bg-green-50 text-green-700 ring-green-200',
+    pillClass: 'bg-status-done/10 text-status-done ring-status-done/30',
   },
   failed: {
     label: 'Failed',
@@ -83,7 +83,7 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     tint: '#fef2f2',
     icon: XCircle,
     dotClass: 'bg-status-failed',
-    pillClass: 'bg-red-50 text-red-700 ring-red-200',
+    pillClass: 'bg-status-failed/10 text-status-failed ring-status-failed/30',
   },
   awaiting_approval: {
     label: 'Awaiting approval',
@@ -91,7 +91,7 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     tint: '#fffbeb',
     icon: Pause,
     dotClass: 'bg-status-awaiting',
-    pillClass: 'bg-amber-50 text-amber-800 ring-amber-200',
+    pillClass: 'bg-status-awaiting/10 text-status-awaiting ring-status-awaiting/30',
   },
   rejected: {
     label: 'Rejected',
@@ -99,7 +99,7 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     tint: '#fef2f2',
     icon: XOctagon,
     dotClass: 'bg-status-rejected',
-    pillClass: 'bg-red-50 text-red-700 ring-red-200',
+    pillClass: 'bg-status-rejected/10 text-status-rejected ring-status-rejected/30',
   },
   cancelled: {
     label: 'Cancelled',
@@ -107,7 +107,7 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     tint: '#f1f5f9',
     icon: Ban,
     dotClass: 'bg-status-cancelled',
-    pillClass: 'bg-slate-100 text-slate-700 ring-slate-300',
+    pillClass: 'bg-surface text-ink-dim ring-border',
   },
   skipped: {
     label: 'Skipped',
@@ -115,7 +115,7 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     tint: '#f1f5f9',
     icon: SkipForward,
     dotClass: 'bg-status-skipped',
-    pillClass: 'bg-slate-100 text-slate-600 ring-slate-200',
+    pillClass: 'bg-surface text-ink-mute ring-border',
   },
 };
 

@@ -26,9 +26,9 @@ const KIND_LABEL: Record<ExprKind, string> = {
 const KIND_CLASS: Record<ExprKind, string> = {
   path: 'bg-sky-50 text-sky-700 ring-sky-200',
   filter: 'bg-violet-50 text-violet-700 ring-violet-200',
-  function: 'bg-amber-50 text-amber-700 ring-amber-200',
-  loop: 'bg-emerald-50 text-emerald-700 ring-emerald-200',
-  keyword: 'bg-slate-100 text-slate-700 ring-slate-200',
+  function: 'bg-warn-bg text-warn ring-warn/30',
+  loop: 'bg-ok-bg text-ok ring-ok/30',
+  keyword: 'bg-surface text-ink ring-border',
 };
 
 function matches(entry: ExprEntry, q: string): boolean {
@@ -81,7 +81,7 @@ export default function ExpressionReference({ onInsert }: ExpressionReferencePro
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search expressions…"
           aria-label="Search expressions"
-          className="w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-ui text-ink placeholder:text-ink-mute focus:border-brand-400 focus:outline-none focus:ring-1 focus:ring-brand-300"
+          className="w-full rounded-md border border-border bg-panel px-2.5 py-1.5 text-ui text-ink placeholder:text-ink-mute focus:border-brand-400 focus:outline-none focus:ring-1 focus:ring-brand-300"
         />
         <p className="mt-1.5 text-note text-ink-mute">
           {onInsert ? 'Click to insert into the focused field.' : 'Click to copy to the clipboard.'}
@@ -104,7 +104,7 @@ export default function ExpressionReference({ onInsert }: ExpressionReferencePro
                       type="button"
                       onClick={() => handleClick(entry)}
                       title={entry.insert}
-                      className="group flex w-full items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left hover:border-border hover:bg-white"
+                      className="group flex w-full items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left hover:border-border hover:bg-panel"
                     >
                       <span className="min-w-0 flex-1">
                         <span className="block truncate font-mono text-ui text-ink">
@@ -120,7 +120,7 @@ export default function ExpressionReference({ onInsert }: ExpressionReferencePro
                       {copied === entry.insert && (
                         <span
                           role="status"
-                          className="mt-0.5 shrink-0 rounded bg-green-600 px-1 py-0.5 text-meta font-medium text-white"
+                          className="mt-0.5 shrink-0 rounded bg-ok px-1 py-0.5 text-meta font-medium text-white"
                         >
                           copied
                         </span>

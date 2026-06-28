@@ -81,9 +81,9 @@ export default function RunEventFeed({
 
 export function ConnectionBadge({ state }: { state: ConnectionState }) {
   const map: Record<ConnectionState, { label: string; dot: string; text: string }> = {
-    connecting: { label: 'Connecting', dot: 'bg-amber-500', text: 'text-amber-700' },
-    live: { label: 'Live', dot: 'bg-green-500', text: 'text-green-700' },
-    reconnecting: { label: 'Reconnecting', dot: 'bg-amber-500', text: 'text-amber-700' },
+    connecting: { label: 'Connecting', dot: 'bg-warn', text: 'text-warn' },
+    live: { label: 'Live', dot: 'bg-ok', text: 'text-ok' },
+    reconnecting: { label: 'Reconnecting', dot: 'bg-warn', text: 'text-warn' },
   };
   const m = map[state];
   return (

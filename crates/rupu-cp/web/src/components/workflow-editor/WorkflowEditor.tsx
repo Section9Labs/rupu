@@ -238,14 +238,14 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
       {connError && (
         <div
           role="alert"
-          className="absolute left-3 right-3 top-3 z-20 flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-ui text-amber-800 shadow-card lg:right-[21rem]"
+          className="absolute left-3 right-3 top-3 z-20 flex items-start gap-2 rounded-md border border-warn/30 bg-warn-bg px-3 py-2 text-ui text-warn shadow-card lg:right-[21rem]"
         >
           <span className="flex-1">{connError}</span>
           <button
             type="button"
             onClick={() => setConnError(null)}
             aria-label="Dismiss"
-            className="shrink-0 font-semibold text-amber-700 hover:text-amber-900"
+            className="shrink-0 font-semibold text-warn hover:text-warn"
           >
             ✕
           </button>
@@ -307,7 +307,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
                   ariaLabel="Workflow YAML editor"
                 />
               </div>
-              <div className="flex items-center gap-2 border-t border-border bg-white px-3 py-1.5">
+              <div className="flex items-center gap-2 border-t border-border bg-panel px-3 py-1.5">
                 <span className="text-note text-ink-mute">⟳ synced from graph</span>
                 <span className="ml-auto">
                   <ValidityBadge validity={validity} />
@@ -321,7 +321,7 @@ export default function WorkflowEditor({ draftYaml, onYamlChange, agents, validi
       {/* ── RIGHT: inspector rail ─────────────────────────────────────────── */}
       <aside className="flex w-full shrink-0 flex-col border-t border-border bg-panel lg:w-80 lg:border-l lg:border-t-0">
         <div className="border-b border-border p-3">
-          <div role="tablist" aria-label="Inspector" className="inline-flex rounded-lg border border-border bg-white p-0.5">
+          <div role="tablist" aria-label="Inspector" className="inline-flex rounded-lg border border-border bg-panel p-0.5">
             <PanelTabButton
               active={panelTab === 'settings'}
               onClick={() => setPanelTab('settings')}
@@ -390,14 +390,14 @@ function ValidityBadge({ validity }: { validity: { ok: boolean; error?: string }
   if (!validity) return null;
   if (validity.ok) {
     return (
-      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-green-50 text-green-700 ring-green-200">
+      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-ok-bg text-ok ring-ok/30">
         ✓ valid
       </span>
     );
   }
   return (
     <span
-      className="inline-flex max-w-[16rem] items-center truncate rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-red-50 text-red-700 ring-red-200"
+      className="inline-flex max-w-[16rem] items-center truncate rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-err-bg text-err ring-err/30"
       title={validity.error}
     >
       ✕ {validity.error ?? 'invalid'}

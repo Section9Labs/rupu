@@ -3,7 +3,7 @@
 // (previously every severity rendered the same gray).
 import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
 
-const FALLBACK = 'bg-slate-100 text-ink-mute ring-slate-200';
+const FALLBACK = 'bg-surface text-ink-mute ring-border';
 
 export default function SeverityChip({ severity }: { severity: string }) {
   const style = SEVERITY_STYLE[severity as Severity];

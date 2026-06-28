@@ -20,7 +20,7 @@ export default function RunTranscript() {
     return (
       <div className="p-8 max-w-3xl">
         <BackButton navigate={navigate} />
-        <div className="mt-6 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+        <div className="mt-6 rounded-lg border border-warn/30 bg-warn-bg px-4 py-3 text-sm text-warn">
           No transcript path provided. Navigate here via an agent run or session turn row.
         </div>
       </div>

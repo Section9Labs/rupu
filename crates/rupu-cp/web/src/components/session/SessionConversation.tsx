@@ -108,7 +108,7 @@ export default function SessionConversation({
 
             {/* Per-turn error line (shown when the run terminated with an error). */}
             {run.error && (
-              <p className="text-note text-red-600">{run.error}</p>
+              <p className="text-note text-err">{run.error}</p>
             )}
           </div>
         ))}

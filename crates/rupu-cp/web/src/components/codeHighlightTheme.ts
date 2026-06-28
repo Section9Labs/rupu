@@ -65,3 +65,68 @@ export const githubHighlightStyle = HighlightStyle.define([
   },
   { tag: t.invalid, color: INVALID },
 ]);
+
+// Dark counterpart — a github-dark-ish palette so the editor stays legible on the
+// near-black panel in dark mode. Same tag→role mapping as the light style above;
+// only the hexes change (lifted from `highlight.js/styles/github-dark.css`):
+//   #ff7b72 keyword/type · #d2a8ff title/def · #79c0ff number/attr/meta/heading
+//   #a5d6ff string/link  · #8b949e comment   · #7ee787 name/tag/quote
+//   #ffa657 list bullet  · #e6edf3 base text  · #ffa198 invalid
+const D_RED = '#ff7b72';
+const D_PURPLE = '#d2a8ff';
+const D_BLUE = '#79c0ff';
+const D_LIGHTBLUE = '#a5d6ff';
+const D_GRAY = '#8b949e';
+const D_GREEN = '#7ee787';
+const D_ORANGE = '#ffa657';
+const D_INK = '#e6edf3';
+const D_INVALID = '#ffa198';
+
+export const githubDarkHighlightStyle = HighlightStyle.define([
+  {
+    tag: [
+      t.keyword,
+      t.controlKeyword,
+      t.operatorKeyword,
+      t.definitionKeyword,
+      t.moduleKeyword,
+      t.typeName,
+    ],
+    color: D_RED,
+  },
+  {
+    tag: [t.function(t.variableName), t.function(t.propertyName), t.definition(t.name), t.macroName],
+    color: D_PURPLE,
+  },
+  {
+    tag: [t.number, t.integer, t.float, t.bool, t.atom, t.literal, t.null, t.unit, t.self],
+    color: D_BLUE,
+  },
+  {
+    tag: [t.propertyName, t.attributeName, t.meta, t.annotation, t.operator, t.labelName],
+    color: D_BLUE,
+  },
+  {
+    tag: [t.heading, t.heading1, t.heading2, t.heading3, t.heading4, t.heading5, t.heading6],
+    color: D_BLUE,
+    fontWeight: '600',
+  },
+  { tag: [t.string, t.special(t.string), t.regexp, t.character, t.attributeValue], color: D_LIGHTBLUE },
+  { tag: [t.link, t.url], color: D_LIGHTBLUE, textDecoration: 'underline' },
+  { tag: [t.comment, t.lineComment, t.blockComment, t.docComment], color: D_GRAY, fontStyle: 'italic' },
+  { tag: [t.name, t.tagName, t.quote], color: D_GREEN },
+  { tag: [t.list], color: D_ORANGE },
+  { tag: t.strong, color: D_INK, fontWeight: '700' },
+  { tag: t.emphasis, color: D_INK, fontStyle: 'italic' },
+  { tag: t.strikethrough, textDecoration: 'line-through' },
+  {
+    tag: [t.punctuation, t.separator, t.bracket, t.contentSeparator, t.processingInstruction],
+    color: D_INK,
+  },
+  { tag: t.invalid, color: D_INVALID },
+]);
+
+/** Pick the highlight style for the current theme mode. */
+export function highlightStyleFor(mode: 'light' | 'dark') {
+  return mode === 'dark' ? githubDarkHighlightStyle : githubHighlightStyle;
+}

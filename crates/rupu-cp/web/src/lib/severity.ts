@@ -6,12 +6,16 @@
  *   - FindingCard (transcript finding cards)
  *
  * Only STATIC Tailwind class strings; no `bg-${x}` template expressions.
- * Colour ramp comes from the `sev.*` tokens in tailwind.config.ts:
- *   sev-critical #9333ea  → purple
- *   sev-high     #dc2626  → red
- *   sev-medium   #ea580c  → orange
- *   sev-low      #ca8a04  → yellow
- *   sev-info     #64748b  → slate
+ * Colour ramp + soft backgrounds come from the THEMED `sev.*` / `sev.*-bg`
+ * tokens in tailwind.config.ts (which flip light↔dark via `data-theme`):
+ *   sev-critical → purple   · sev-critical-bg → soft purple tint
+ *   sev-high     → red      · sev-high-bg     → soft red tint
+ *   sev-medium   → orange   · sev-medium-bg   → soft orange tint
+ *   sev-low      → yellow   · sev-low-bg      → soft yellow tint
+ *   sev-info     → slate    · sev-info-bg     → soft slate tint
+ *
+ * Backgrounds, text, ring, and the hairline bar all use sev tokens, so the
+ * whole ramp themes automatically (no white-on-dark / light tints on dark).
  */
 
 export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical';
@@ -34,42 +38,42 @@ export interface SeverityStyle {
 export const SEVERITY_STYLE: Record<Severity, SeverityStyle> = {
   critical: {
     text: 'text-sev-critical',
-    bg: 'bg-purple-50',
-    ring: 'ring-purple-200',
-    bar: 'bg-[#9333ea]',
+    bg: 'bg-sev-critical-bg',
+    ring: 'ring-sev-critical/30',
+    bar: 'bg-sev-critical',
     label: 'critical',
-    pill: 'bg-purple-50 text-sev-critical ring-purple-200',
+    pill: 'bg-sev-critical-bg text-sev-critical ring-sev-critical/30',
   },
   high: {
     text: 'text-sev-high',
-    bg: 'bg-red-50',
-    ring: 'ring-red-200',
-    bar: 'bg-[#dc2626]',
+    bg: 'bg-sev-high-bg',
+    ring: 'ring-sev-high/30',
+    bar: 'bg-sev-high',
     label: 'high',
-    pill: 'bg-red-50 text-sev-high ring-red-200',
+    pill: 'bg-sev-high-bg text-sev-high ring-sev-high/30',
   },
   medium: {
     text: 'text-sev-medium',
-    bg: 'bg-orange-50',
-    ring: 'ring-orange-200',
-    bar: 'bg-[#ea580c]',
+    bg: 'bg-sev-medium-bg',
+    ring: 'ring-sev-medium/30',
+    bar: 'bg-sev-medium',
     label: 'medium',
-    pill: 'bg-orange-50 text-sev-medium ring-orange-200',
+    pill: 'bg-sev-medium-bg text-sev-medium ring-sev-medium/30',
   },
   low: {
     text: 'text-sev-low',
-    bg: 'bg-yellow-50',
-    ring: 'ring-yellow-200',
-    bar: 'bg-[#ca8a04]',
+    bg: 'bg-sev-low-bg',
+    ring: 'ring-sev-low/30',
+    bar: 'bg-sev-low',
     label: 'low',
-    pill: 'bg-yellow-50 text-sev-low ring-yellow-200',
+    pill: 'bg-sev-low-bg text-sev-low ring-sev-low/30',
   },
   info: {
     text: 'text-sev-info',
-    bg: 'bg-slate-100',
-    ring: 'ring-slate-200',
-    bar: 'bg-[#64748b]',
+    bg: 'bg-sev-info-bg',
+    ring: 'ring-sev-info/30',
+    bar: 'bg-sev-info',
     label: 'info',
-    pill: 'bg-slate-100 text-sev-info ring-slate-200',
+    pill: 'bg-sev-info-bg text-sev-info ring-sev-info/30',
   },
 };

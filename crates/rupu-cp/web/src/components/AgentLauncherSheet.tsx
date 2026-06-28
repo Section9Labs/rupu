@@ -78,7 +78,7 @@ export default function AgentLauncherSheet({
   }
 
   const fieldCls =
-    'w-full rounded-md border border-border bg-white px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
+    'w-full rounded-md border border-border bg-panel px-2.5 py-1.5 text-lead text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 
   const submitLabel = launchKind === 'session'
     ? (launching ? 'Starting…' : 'Start session')
@@ -119,7 +119,7 @@ export default function AgentLauncherSheet({
                   'rounded-none px-2 py-1 text-ui font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
                   (launchKind === 'run'
                     ? 'bg-brand-600 text-white'
-                    : 'bg-white text-ink-dim hover:bg-slate-50')
+                    : 'bg-panel text-ink-dim hover:bg-surface-hover')
                 }
               >
                 Single run
@@ -136,7 +136,7 @@ export default function AgentLauncherSheet({
                   'rounded-none border-l border-border px-2 py-1 text-ui font-medium disabled:cursor-not-allowed disabled:opacity-60 ' +
                   (launchKind === 'session'
                     ? 'bg-brand-600 text-white'
-                    : 'bg-white text-ink-dim hover:bg-slate-50')
+                    : 'bg-panel text-ink-dim hover:bg-surface-hover')
                 }
               >
                 Session
@@ -190,7 +190,7 @@ export default function AgentLauncherSheet({
           </div>
 
           {error && (
-            <p role="alert" className="text-ui font-medium text-red-700">
+            <p role="alert" className="text-ui font-medium text-err">
               {error}
             </p>
           )}
