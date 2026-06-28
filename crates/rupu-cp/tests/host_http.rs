@@ -177,6 +177,20 @@ async fn info_missing_endpoint_returns_reachable_true() {
 }
 
 #[tokio::test]
+async fn proxy_get_json_forwards_path_with_bearer() {
+    let server = httpmock::MockServer::start_async().await;
+    let m = server.mock(|when, then| {
+        when.method("GET").path("/api/runs/agents").query_param("limit", "5")
+            .header("authorization", "Bearer tok");
+        then.status(200).json_body(serde_json::json!([{"run_id":"r1"}]));
+    });
+    let c = HttpHostConnector::new(server.base_url(), Some("tok".into()));
+    let v = c.proxy_get_json("/api/runs/agents?limit=5").await.unwrap();
+    assert_eq!(v[0]["run_id"], "r1");
+    m.assert();
+}
+
+#[tokio::test]
 async fn info_parses_version_and_capabilities() {
     let server = httpmock::MockServer::start_async().await;
     let m = server.mock(|when, then| {

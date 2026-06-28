@@ -311,6 +311,21 @@ impl HostConnector for HttpHostConnector {
             .await
             .map_err(|e| HostConnectorError::Remote(0, e.to_string()))
     }
+
+    async fn proxy_get_json(
+        &self,
+        path_and_query: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        let resp = self
+            .send(
+                self.client
+                    .get(format!("{}{}", self.base_url, path_and_query)),
+            )
+            .await?;
+        resp.json()
+            .await
+            .map_err(|e| HostConnectorError::Remote(0, e.to_string()))
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

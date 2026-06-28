@@ -157,4 +157,15 @@ pub trait HostConnector: Send + Sync {
         &self,
         path: &str,
     ) -> Result<serde_json::Value, HostConnectorError>;
+
+    /// Generic GET passthrough: issue `GET {base_url}{path_and_query}` (bearer
+    /// token attached) and return the parsed JSON body.
+    ///
+    /// `path_and_query` is an absolute path including any query string,
+    /// e.g. `/api/runs/agents?limit=5`. The local connector always returns
+    /// `Err(HostConnectorError::Invalid("local host is served in-process"))`.
+    async fn proxy_get_json(
+        &self,
+        path_and_query: &str,
+    ) -> Result<serde_json::Value, HostConnectorError>;
 }
