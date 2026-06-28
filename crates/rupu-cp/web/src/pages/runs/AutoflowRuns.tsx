@@ -1,5 +1,9 @@
 // Autoflow run-stream page — leads with individual launched runs (clickable),
-// not opaque batch cycle ticks. A secondary "Cycles" tab keeps the batch view.
+// not opaque batch cycle ticks. A secondary "Cycles" tab keeps the batch view,
+// and a "Claims" tab exposes the worker's leased issues with requeue/release.
+//
+// All three tabs render via the shared SortableTable; the page chrome (tab
+// switcher, refresh, per-tab pagination, empty/loading states) is preserved.
 
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -10,19 +14,16 @@ import {
   type AutoflowCycleRow,
   type AutoflowEventRow,
 } from '../../lib/api';
-import { ListCard } from '../../components/lists/ListCard';
 import { SectionHeader } from '../../components/lists/SectionHeader';
+import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageChip from '../../components/UsageChip';
 import { Button } from '../../components/ui/Button';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
+import { shortId } from '../../lib/shortId';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
 const PAGE = 20;
-
-function shortId(id: string): string {
-  return id.length > 10 ? `${id.slice(0, 8)}…` : id;
-}
 
 const MODE_CLS: Record<string, string> = {
   ask:       'bg-amber-50 text-amber-700 ring-amber-200',
@@ -98,6 +99,212 @@ function ClaimStatusBadge({ status }: { status: string }) {
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {titleCase(status)}
     </span>
+  );
+}
+
+// Cycle wall-clock duration in ms (raw sort value for the Duration column).
+function cycleDurationMs(c: AutoflowCycleRow): number | null {
+  const start = Date.parse(c.started_at);
+  if (Number.isNaN(start)) return null;
+  const end = c.finished_at ? Date.parse(c.finished_at) : Date.now();
+  if (Number.isNaN(end)) return null;
+  return Math.max(0, end - start);
+}
+
+// ---------------------------------------------------------------------------
+// Launched-runs (events) columns
+// ---------------------------------------------------------------------------
+
+const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
+  {
+    key: 'workflow',
+    header: 'Workflow',
+    sortable: true,
+    sortValue: (e) => e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' '),
+    render: (e) => (
+      <span className="text-sm font-medium text-ink truncate">
+        {e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' ')}
+      </span>
+    ),
+  },
+  {
+    key: 'kind',
+    header: 'Kind',
+    sortable: true,
+    sortValue: (e) => e.kind,
+    render: (e) => <KindBadge kind={e.kind} />,
+  },
+  {
+    key: 'issue',
+    header: 'Issue Ref',
+    sortable: true,
+    sortValue: (e) => e.issue_display_ref ?? null,
+    render: (e) =>
+      e.issue_display_ref ? (
+        <IssueChip displayRef={e.issue_display_ref} />
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'time',
+    header: 'Time',
+    sortable: true,
+    sortValue: (e) => (e.at ? Date.parse(e.at) : null),
+    render: (e) => <span className="text-ink-mute">{relativeTime(e.at)}</span>,
+  },
+  {
+    key: 'worker',
+    header: 'Worker',
+    sortable: true,
+    sortValue: (e) => e.worker_name ?? null,
+    render: (e) =>
+      e.worker_name ? (
+        <span className="text-ink-dim">{e.worker_name}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'status',
+    header: 'Status',
+    sortable: true,
+    sortValue: (e) => e.status ?? null,
+    render: (e) =>
+      e.status ? (
+        <span className="text-ink-dim">{e.status}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'run',
+    header: 'Run',
+    render: (e) =>
+      e.run_id ? (
+        <Link
+          to={`/runs/${encodeURIComponent(e.run_id)}`}
+          className="text-note font-mono text-brand-600 hover:underline"
+        >
+          {shortId(e.run_id)}
+        </Link>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'usage',
+    header: 'Usage',
+    align: 'right',
+    render: (e) => <UsageChip usage={e.usage} />,
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Cycles columns
+// ---------------------------------------------------------------------------
+
+const CYCLE_COLUMNS: Column<AutoflowCycleRow>[] = [
+  {
+    key: 'cycle',
+    header: 'Cycle',
+    sortable: true,
+    sortValue: (c) => c.cycle_id,
+    render: (c) => <span className="text-sm font-medium text-ink font-mono">{shortId(c.cycle_id)}</span>,
+  },
+  {
+    key: 'mode',
+    header: 'Mode',
+    sortable: true,
+    sortValue: (c) => c.mode,
+    render: (c) => <ModeChip mode={c.mode} />,
+  },
+  {
+    key: 'worker',
+    header: 'Worker',
+    sortable: true,
+    sortValue: (c) => c.worker_name ?? null,
+    render: (c) =>
+      c.worker_name ? (
+        <span className="text-ink-dim">{c.worker_name}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'started',
+    header: 'Started',
+    sortable: true,
+    sortValue: (c) => (c.started_at ? Date.parse(c.started_at) : null),
+    render: (c) => <span className="text-ink-mute">{relativeTime(c.started_at)}</span>,
+  },
+  {
+    key: 'duration',
+    header: 'Duration',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (c) => cycleDurationMs(c),
+    render: (c) => <span className="text-ink-dim">{durationBetween(c.started_at, c.finished_at)}</span>,
+  },
+  {
+    key: 'ran',
+    header: 'Ran',
+    align: 'right',
+    width: 'w-16',
+    sortable: true,
+    sortValue: (c) => c.ran_cycles,
+    render: (c) => <span className="text-ink">{c.ran_cycles}</span>,
+  },
+  {
+    key: 'skipped',
+    header: 'Skipped',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (c) => c.skipped_cycles,
+    render: (c) => <span className="text-ink-dim">{c.skipped_cycles}</span>,
+  },
+  {
+    key: 'failed',
+    header: 'Failed',
+    align: 'right',
+    width: 'w-16',
+    sortable: true,
+    sortValue: (c) => c.failed_cycles,
+    render: (c) => (
+      <span className={c.failed_cycles > 0 ? 'text-red-600 font-medium' : 'text-ink-dim'}>
+        {c.failed_cycles}
+      </span>
+    ),
+  },
+  {
+    key: 'usage',
+    header: 'Usage',
+    align: 'right',
+    render: (c) => <UsageChip usage={c.usage} />,
+  },
+];
+
+// Expandable detail: the run ids spawned by this cycle, each linking to its
+// run graph (preserves the linkage the bespoke list rendered inline).
+function CycleDetail(c: AutoflowCycleRow) {
+  if (c.run_ids.length === 0) {
+    return <span className="text-note text-ink-mute">No runs launched in this cycle.</span>;
+  }
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap">
+      <span className="text-meta text-ink-mute uppercase tracking-wide">runs:</span>
+      {c.run_ids.map((rid) => (
+        <Link
+          key={rid}
+          to={`/runs/${encodeURIComponent(rid)}`}
+          className="text-note font-mono text-brand-600 hover:underline"
+        >
+          {shortId(rid)}
+        </Link>
+      ))}
+    </div>
   );
 }
 
@@ -210,12 +417,103 @@ export default function AutoflowRuns() {
   const { sentinelRef: cyclesSentinelRef, loading: cyclesLoading } =
     useInfiniteScroll({ hasMore: cyclesHasMore, loadMore: loadMoreCycles });
 
-  const sortedEvents = [...(events ?? [])].sort(
-    (a, b) => Date.parse(b.at) - Date.parse(a.at),
-  );
-  const sortedCycles = [...(cycles ?? [])].sort(
-    (a, b) => Date.parse(b.started_at) - Date.parse(a.started_at),
-  );
+  const eventRows = events ?? [];
+  const cycleRows = cycles ?? [];
+
+  // Claims columns close over refetchClaims for the row actions.
+  const claimColumns: Column<AutoflowClaim>[] = [
+    {
+      key: 'issue',
+      header: 'Issue Ref',
+      sortable: true,
+      sortValue: (c) => c.issue_display_ref ?? c.issue_ref,
+      render: (c) => {
+        const label = c.issue_display_ref ?? c.issue_ref;
+        return (
+          <div className="min-w-0">
+            {c.issue_url ? (
+              <a
+                href={c.issue_url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-sm font-medium text-brand-600 hover:underline truncate"
+              >
+                {label}
+              </a>
+            ) : (
+              <span className="text-sm font-medium text-ink truncate">{label}</span>
+            )}
+            {c.issue_title && (
+              <div className="text-note text-ink-dim mt-0.5 truncate">{c.issue_title}</div>
+            )}
+            {c.last_error ? (
+              <div className="text-note text-red-600 mt-0.5">{c.last_error}</div>
+            ) : (
+              c.last_summary && (
+                <div className="text-note text-ink-dim mt-0.5">{c.last_summary}</div>
+              )
+            )}
+            {c.pr_url && (
+              <a
+                href={c.pr_url}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-block text-note text-brand-600 hover:underline mt-1"
+              >
+                View PR
+              </a>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      key: 'status',
+      header: 'Status',
+      sortable: true,
+      sortValue: (c) => c.status,
+      render: (c) => <ClaimStatusBadge status={c.status} />,
+    },
+    {
+      key: 'workflow',
+      header: 'Workflow',
+      sortable: true,
+      sortValue: (c) => c.workflow,
+      render: (c) => <IssueChip displayRef={c.workflow} />,
+    },
+    {
+      key: 'repo',
+      header: 'Repo',
+      sortable: true,
+      sortValue: (c) => c.repo_ref,
+      render: (c) => <span className="text-note text-ink-dim">{c.repo_ref}</span>,
+    },
+    {
+      key: 'owner',
+      header: 'Owner',
+      sortable: true,
+      sortValue: (c) => c.claim_owner ?? null,
+      render: (c) =>
+        c.claim_owner ? (
+          <span className="text-note text-ink-dim">{c.claim_owner}</span>
+        ) : (
+          <span className="text-ink-mute">—</span>
+        ),
+    },
+    {
+      key: 'updated',
+      header: 'Updated',
+      sortable: true,
+      sortValue: (c) => (c.updated_at ? Date.parse(c.updated_at) : null),
+      render: (c) => <span className="text-ink-mute">{relativeTime(c.updated_at)}</span>,
+    },
+    {
+      key: 'actions',
+      header: 'Actions',
+      align: 'right',
+      render: (c) => <ClaimActions claim={c} onChanged={() => void refetchClaims()} />,
+    },
+  ];
 
   return (
     <div className="p-8">
@@ -269,41 +567,40 @@ export default function AutoflowRuns() {
       {tab === 'runs' ? (
         events === null ? (
           <div className="text-sm text-ink-dim">Loading autoflow activity…</div>
-        ) : sortedEvents.length === 0 ? (
+        ) : eventRows.length === 0 ? (
           <AutoflowEventsEmpty />
         ) : (
           <section>
-            <SectionHeader tone="muted" label="Activity" count={sortedEvents.length} />
-            <ListCard>
-              {sortedEvents.map((e) => (
-                <AutoflowEventItem key={e.event_id} event={e} />
-              ))}
-            </ListCard>
-            {sortedEvents.length > 0 && (
-              <div ref={eventsSentinelRef} className="py-2 text-center text-note text-ink-mute">
-                {eventsLoading ? 'loading more…' : eventsHasMore ? 'scroll for more' : `— end of ${sortedEvents.length} —`}
-              </div>
-            )}
+            <SectionHeader tone="muted" label="Activity" count={eventRows.length} />
+            <SortableTable<AutoflowEventRow>
+              columns={EVENT_COLUMNS}
+              rows={eventRows}
+              rowKey={(e) => e.event_id}
+              initialSort={{ key: 'time', dir: 'desc' }}
+            />
+            <div ref={eventsSentinelRef} className="py-2 text-center text-note text-ink-mute">
+              {eventsLoading ? 'loading more…' : eventsHasMore ? 'scroll for more' : `— end of ${eventRows.length} —`}
+            </div>
           </section>
         )
       ) : tab === 'cycles' ? (
         cycles === null ? (
           <div className="text-sm text-ink-dim">Loading autoflow cycles…</div>
-        ) : sortedCycles.length === 0 ? (
+        ) : cycleRows.length === 0 ? (
           <AutoflowCyclesEmpty />
         ) : (
           <section>
-            <SectionHeader tone="muted" label="Cycles" count={sortedCycles.length} />
-            <ListCard>
-              {sortedCycles.map((c) => (
-                <AutoflowCycleItem key={c.cycle_id} cycle={c} />
-              ))}
-            </ListCard>
-            {sortedCycles.length > 0 && (
-              <div ref={cyclesSentinelRef} className="py-2 text-center text-note text-ink-mute">
-                {cyclesLoading ? 'loading more…' : cyclesHasMore ? 'scroll for more' : `— end of ${sortedCycles.length} —`}
-              </div>
-            )}
+            <SectionHeader tone="muted" label="Cycles" count={cycleRows.length} />
+            <SortableTable<AutoflowCycleRow>
+              columns={CYCLE_COLUMNS}
+              rows={cycleRows}
+              rowKey={(c) => c.cycle_id}
+              initialSort={{ key: 'started', dir: 'desc' }}
+              renderDetail={CycleDetail}
+            />
+            <div ref={cyclesSentinelRef} className="py-2 text-center text-note text-ink-mute">
+              {cyclesLoading ? 'loading more…' : cyclesHasMore ? 'scroll for more' : `— end of ${cycleRows.length} —`}
+            </div>
           </section>
         )
       ) : claimsError ? (
@@ -317,22 +614,19 @@ export default function AutoflowRuns() {
       ) : (
         <section>
           <SectionHeader tone="muted" label="Claims" count={claims.length} />
-          <ListCard>
-            {claims.map((c) => (
-              <AutoflowClaimItem
-                key={c.issue_ref}
-                claim={c}
-                onChanged={() => void refetchClaims()}
-              />
-            ))}
-          </ListCard>
+          <SortableTable<AutoflowClaim>
+            columns={claimColumns}
+            rows={claims}
+            rowKey={(c) => c.issue_ref}
+            initialSort={{ key: 'updated', dir: 'desc' }}
+          />
         </section>
       )}
     </div>
   );
 }
 
-function AutoflowClaimItem({
+function ClaimActions({
   claim,
   onChanged,
 }: {
@@ -342,8 +636,6 @@ function AutoflowClaimItem({
   const [busy, setBusy] = useState<'requeue' | 'release' | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [requeued, setRequeued] = useState(false);
-
-  const label = claim.issue_display_ref ?? claim.issue_ref;
 
   const onRequeue = async () => {
     if (busy) return;
@@ -376,58 +668,11 @@ function AutoflowClaimItem({
   };
 
   return (
-    <div className="flex items-start gap-4 px-4 py-3">
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 flex-wrap">
-          {claim.issue_url ? (
-            <a
-              href={claim.issue_url}
-              target="_blank"
-              rel="noreferrer"
-              className="text-sm font-medium text-brand-600 hover:underline truncate"
-            >
-              {label}
-            </a>
-          ) : (
-            <span className="text-sm font-medium text-ink truncate">{label}</span>
-          )}
-          <ClaimStatusBadge status={claim.status} />
-          <IssueChip displayRef={claim.workflow} />
-          {requeued && (
-            <span className="text-meta font-medium text-green-700">requeued</span>
-          )}
-        </div>
-        {claim.issue_title && (
-          <div className="text-note text-ink-dim mt-0.5 truncate">{claim.issue_title}</div>
-        )}
-        <div className="text-note text-ink-dim mt-0.5">
-          {claim.repo_ref}
-          {' · '}updated {relativeTime(claim.updated_at)}
-          {claim.claim_owner && <> · {claim.claim_owner}</>}
-        </div>
-        {claim.last_error && (
-          <div className="text-note text-red-600 mt-1">{claim.last_error}</div>
-        )}
-        {!claim.last_error && claim.last_summary && (
-          <div className="text-note text-ink-dim mt-1">{claim.last_summary}</div>
-        )}
-        {claim.pr_url && (
-          <a
-            href={claim.pr_url}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-block text-note text-brand-600 hover:underline mt-1"
-          >
-            View PR
-          </a>
-        )}
-        {actionError && (
-          <div role="alert" className="text-note text-red-600 mt-1">
-            {actionError}
-          </div>
-        )}
-      </div>
+    <div className="flex flex-col items-end gap-1">
       <div className="flex items-center gap-2 shrink-0">
+        {requeued && (
+          <span className="text-meta font-medium text-green-700">requeued</span>
+        )}
         <Button variant="secondary" size="sm" onClick={() => void onRequeue()} disabled={busy !== null}>
           {busy === 'requeue' ? 'Requeuing…' : 'Requeue'}
         </Button>
@@ -440,6 +685,11 @@ function AutoflowClaimItem({
           {busy === 'release' ? 'Releasing…' : 'Release'}
         </Button>
       </div>
+      {actionError && (
+        <div role="alert" className="text-note text-red-600">
+          {actionError}
+        </div>
+      )}
     </div>
   );
 }
@@ -454,89 +704,6 @@ function AutoflowClaimsEmpty() {
       <p className="mt-1 text-xs text-ink-dim max-w-xs">
         Issues the autoflow worker has leased will appear here, each with requeue and release controls.
       </p>
-    </div>
-  );
-}
-
-function AutoflowEventItem({ event }: { event: AutoflowEventRow }) {
-  const headline = event.workflow ?? KIND_LABEL[event.kind] ?? event.kind.replace(/_/g, ' ');
-  const body = (
-    <div className="flex items-start gap-4 px-4 py-3">
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium text-ink truncate">{headline}</span>
-          <KindBadge kind={event.kind} />
-          {event.issue_display_ref && <IssueChip displayRef={event.issue_display_ref} />}
-        </div>
-        <div className="text-note text-ink-dim mt-0.5 flex items-center flex-wrap">
-          <span>
-            {relativeTime(event.at)}
-            {event.worker_name && <> · {event.worker_name}</>}
-            {event.status && <> · {event.status}</>}
-            {event.run_id && <> · <span className="font-mono">{shortId(event.run_id)}</span></>}
-          </span>
-          <UsageChip usage={event.usage} className="ml-2" />
-        </div>
-      </div>
-    </div>
-  );
-
-  if (event.run_id) {
-    return (
-      <Link
-        to={`/runs/${encodeURIComponent(event.run_id)}`}
-        className="block hover:bg-slate-50"
-      >
-        {body}
-      </Link>
-    );
-  }
-  return body;
-}
-
-function AutoflowCycleItem({ cycle }: { cycle: AutoflowCycleRow }) {
-  const hasFailed = cycle.failed_cycles > 0;
-  return (
-    <div className="flex items-start gap-4 px-4 py-3">
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium text-ink font-mono">{shortId(cycle.cycle_id)}</span>
-          <ModeChip mode={cycle.mode} />
-          {cycle.worker_name && (
-            <span className="text-note text-ink-mute">{cycle.worker_name}</span>
-          )}
-        </div>
-        <div className="text-note text-ink-dim mt-0.5">
-          started {relativeTime(cycle.started_at)}
-          {' · '}
-          {durationBetween(cycle.started_at, cycle.finished_at)}
-        </div>
-        <div className={cn('text-note mt-1', hasFailed ? 'text-red-600' : 'text-ink-dim')}>
-          ran {cycle.ran_cycles}
-          {' · '}
-          skipped {cycle.skipped_cycles}
-          {hasFailed && (
-            <span className="text-red-600"> · failed {cycle.failed_cycles}</span>
-          )}
-          {' '}
-          of {cycle.workflow_count}
-          <UsageChip usage={cycle.usage} className="ml-2" />
-        </div>
-        {cycle.run_ids.length > 0 && (
-          <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
-            <span className="text-meta text-ink-mute uppercase tracking-wide">runs:</span>
-            {cycle.run_ids.map((rid) => (
-              <Link
-                key={rid}
-                to={`/runs/${encodeURIComponent(rid)}`}
-                className="text-note font-mono text-brand-600 hover:underline"
-              >
-                {shortId(rid)}
-              </Link>
-            ))}
-          </div>
-        )}
-      </div>
     </div>
   );
 }

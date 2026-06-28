@@ -2,11 +2,10 @@
 // Shows the static list of workflows that have autoflow triggers configured.
 
 import { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { Inbox, RefreshCw } from 'lucide-react';
 import { api, type AutoflowDefRow } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Button } from '../components/ui/Button';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
@@ -41,6 +40,32 @@ function ScopeChip({ scope }: { scope: string }) {
     </span>
   );
 }
+
+// Autoflows are workflows with `autoflow.enabled`, so they reuse the workflow
+// detail page — keyed by file stem (`slug`), not the parsed display name.
+const DEF_COLUMNS: Column<AutoflowDefRow>[] = [
+  {
+    key: 'name',
+    header: 'Name',
+    sortable: true,
+    sortValue: (d) => d.name,
+    render: (d) => <span className="text-sm font-medium text-ink truncate">{d.name}</span>,
+  },
+  {
+    key: 'trigger',
+    header: 'Trigger',
+    sortable: true,
+    sortValue: (d) => d.trigger,
+    render: (d) => <TriggerChip trigger={d.trigger} />,
+  },
+  {
+    key: 'scope',
+    header: 'Scope',
+    sortable: true,
+    sortValue: (d) => d.scope,
+    render: (d) => <ScopeChip scope={d.scope} />,
+  },
+];
 
 export default function AutoflowsDefs() {
   const [defs, setDefs] = useState<AutoflowDefRow[] | null>(null);
@@ -98,11 +123,13 @@ export default function AutoflowsDefs() {
       ) : (
         <section>
           <SectionHeader tone="muted" label="Autoflow Workflows" count={defs.length} />
-          <ListCard>
-            {shown.map((d) => (
-              <AutoflowDefEntry key={d.name} def={d} />
-            ))}
-          </ListCard>
+          <SortableTable<AutoflowDefRow>
+            columns={DEF_COLUMNS}
+            rows={shown}
+            rowKey={(d) => d.slug}
+            rowHref={(d) => `/workflows/${encodeURIComponent(d.slug)}`}
+            initialSort={{ key: 'name', dir: 'asc' }}
+          />
           {defs.length > visible && (
             <div ref={sentinelRef} className="py-2 text-center text-note text-ink-mute">
               scroll for more
@@ -111,25 +138,6 @@ export default function AutoflowsDefs() {
         </section>
       )}
     </div>
-  );
-}
-
-function AutoflowDefEntry({ def }: { def: AutoflowDefRow }) {
-  // Autoflows are workflows with `autoflow.enabled`, so they reuse the workflow
-  // detail page — keyed by file stem (`slug`), not the parsed display name.
-  return (
-    <Link
-      to={`/workflows/${encodeURIComponent(def.slug)}`}
-      className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50"
-    >
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium text-ink">{def.name}</span>
-          <TriggerChip trigger={def.trigger} />
-          <ScopeChip scope={def.scope} />
-        </div>
-      </div>
-    </Link>
   );
 }
 

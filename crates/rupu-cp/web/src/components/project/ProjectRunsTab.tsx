@@ -1,27 +1,24 @@
 // Project Runs tab body — paginated run list scoped to one project, with
 // client-side status + trigger filter chips applied to the loaded rows.
 //
-// Ported from pages/ProjectRuns.tsx (fetch / load-more / MetricRow rendering),
-// reshaped into a self-contained component keyed off the `wsId` prop.
+// Ported from pages/ProjectRuns.tsx (fetch / load-more rendering), reshaped
+// into a self-contained component keyed off the `wsId` prop. Rows render via
+// the shared SortableTable.
 
 import { useCallback, useEffect, useState } from 'react';
 import { api, type RunListRow, type RunStatusStr } from '../../lib/api';
-import { ListCard } from '../lists/ListCard';
 import { StatusPill } from '../StatusPill';
 import { TriggerChip } from '../TriggerChip';
-import MetricRow from '../lists/MetricRow';
+import SortableTable, { type Column } from '../lists/SortableTable';
 import UsageBarChart from '../charts/UsageBarChart';
-import { durationBetween } from '../../lib/time';
+import { durationBetween, relativeTime } from '../../lib/time';
 import { formatTokens, formatCost } from '../../lib/usage';
 import { formatDuration } from '../../lib/duration';
+import { shortId } from '../../lib/shortId';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 import { cn } from '../../lib/cn';
 
 const PAGE = 20;
-
-function shortId(id: string): string {
-  return id.length > 10 ? `${id.slice(0, 8)}…` : id;
-}
 
 // --- Filter definitions -----------------------------------------------------
 
@@ -55,6 +52,119 @@ const STATUS_GROUP: Record<Exclude<StatusFilter, 'all'>, ReadonlySet<RunStatusSt
 function matchesStatus(status: RunStatusStr, filter: StatusFilter): boolean {
   return filter === 'all' || STATUS_GROUP[filter].has(status);
 }
+
+/** Run duration in ms — explicit duration_ms, else derived from start/finish. */
+function runDurationMs(run: RunListRow): number | null {
+  if (run.duration_ms != null) return run.duration_ms;
+  const start = Date.parse(run.started_at);
+  if (Number.isNaN(start)) return null;
+  const end = run.finished_at ? Date.parse(run.finished_at) : Date.now();
+  if (Number.isNaN(end)) return null;
+  return Math.max(0, end - start);
+}
+
+const RUN_COLUMNS: Column<RunListRow>[] = [
+  {
+    key: 'workflow',
+    header: 'Workflow',
+    sortable: true,
+    sortValue: (r) => r.workflow_name,
+    render: (r) => <span className="text-sm font-medium text-ink truncate">{r.workflow_name}</span>,
+  },
+  {
+    key: 'run',
+    header: 'Run',
+    render: (r) => <span className="text-note text-ink-mute font-mono">{shortId(r.id)}</span>,
+  },
+  {
+    key: 'trigger',
+    header: 'Trigger',
+    sortable: true,
+    sortValue: (r) => r.trigger,
+    render: (r) => <TriggerChip trigger={r.trigger} />,
+  },
+  {
+    key: 'status',
+    header: 'Status',
+    sortable: true,
+    sortValue: (r) => r.status,
+    render: (r) => <StatusPill status={r.status} />,
+  },
+  {
+    key: 'in',
+    header: 'In',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (r) => r.usage.input_tokens,
+    render: (r) => <span className="text-ink-dim">{formatTokens(r.usage.input_tokens)}</span>,
+  },
+  {
+    key: 'out',
+    header: 'Out',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (r) => r.usage.output_tokens,
+    render: (r) => <span className="text-ink-dim">{formatTokens(r.usage.output_tokens)}</span>,
+  },
+  {
+    key: 'cached',
+    header: 'Cached',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (r) => r.usage.cached_tokens,
+    render: (r) =>
+      r.usage.cached_tokens ? (
+        <span className="text-ink-dim">{formatTokens(r.usage.cached_tokens)}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'cost',
+    header: 'Cost',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (r) => r.usage.cost_usd,
+    render: (r) => <span className="text-ink font-medium">{formatCost(r.usage.cost_usd)}</span>,
+  },
+  {
+    key: 'duration',
+    header: 'Duration',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (r) => runDurationMs(r),
+    render: (r) => (
+      <span className="text-ink-dim">
+        {r.duration_ms != null
+          ? formatDuration(r.duration_ms)
+          : durationBetween(r.started_at, r.finished_at)}
+      </span>
+    ),
+  },
+  {
+    key: 'turns',
+    header: 'Turns',
+    align: 'right',
+    width: 'w-16',
+    sortable: true,
+    sortValue: (r) => r.turns,
+    render: (r) => <span className="text-ink">{r.turns ? String(r.turns) : '—'}</span>,
+  },
+  {
+    key: 'started',
+    header: 'Started',
+    align: 'right',
+    width: 'w-28',
+    sortable: true,
+    sortValue: (r) => (r.started_at ? Date.parse(r.started_at) : null),
+    render: (r) => <span className="text-ink-mute">{relativeTime(r.started_at)}</span>,
+  },
+];
 
 export default function ProjectRunsTab({ wsId }: { wsId: string }) {
   const [runs, setRuns] = useState<RunListRow[] | null>(null);
@@ -187,39 +297,13 @@ export default function ProjectRunsTab({ wsId }: { wsId: string }) {
               }))}
             />
           </div>
-          <ListCard>
-            {filtered.map((r) => (
-              <MetricRow
-                key={r.id}
-                to={`/runs/${encodeURIComponent(r.id)}`}
-                header={
-                  <>
-                    <span className="text-sm font-medium text-ink truncate">{r.workflow_name}</span>
-                    <span className="text-note text-ink-mute font-mono">{shortId(r.id)}</span>
-                    <TriggerChip trigger={r.trigger} />
-                  </>
-                }
-                trailing={<StatusPill status={r.status} />}
-                metrics={[
-                  { label: 'in', value: formatTokens(r.usage.input_tokens) },
-                  { label: 'out', value: formatTokens(r.usage.output_tokens) },
-                  {
-                    label: 'cached',
-                    value: r.usage.cached_tokens ? formatTokens(r.usage.cached_tokens) : null,
-                  },
-                  { label: 'cost', value: formatCost(r.usage.cost_usd) },
-                  {
-                    label: 'duration',
-                    value:
-                      r.duration_ms != null
-                        ? formatDuration(r.duration_ms)
-                        : durationBetween(r.started_at, r.finished_at),
-                  },
-                  { label: 'turns', value: r.turns ? String(r.turns) : null },
-                ]}
-              />
-            ))}
-          </ListCard>
+          <SortableTable<RunListRow>
+            columns={RUN_COLUMNS}
+            rows={filtered}
+            rowKey={(r) => r.id}
+            rowHref={(r) => `/runs/${encodeURIComponent(r.id)}`}
+            initialSort={{ key: 'started', dir: 'desc' }}
+          />
         </div>
       )}
 

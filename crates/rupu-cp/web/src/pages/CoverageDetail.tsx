@@ -22,9 +22,9 @@ import {
   type FileView,
   type FindingsSummary,
 } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
-import { FindingRow } from '../components/findings/FindingRow';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
+import { FindingsTable } from '../components/findings/FindingsTable';
 import { FindingMetrics } from '../components/findings/FindingMetrics';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
@@ -192,11 +192,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
             <div className="mb-3">
               <FindingMetrics summary={findingsSummary} />
             </div>
-            <ListCard>
-              {sortedFindings.map((f) => (
-                <FindingRow key={f.id} finding={f} />
-              ))}
-            </ListCard>
+            <FindingsTable findings={sortedFindings} />
           </>
         )}
       </section>
@@ -212,11 +208,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
         {files.length === 0 ? (
           <p className="text-sm text-ink-dim pl-1 mt-1">No file activity recorded.</p>
         ) : (
-          <ListCard>
-            {files.map((f) => (
-              <FileRow key={f.path} file={f} />
-            ))}
-          </ListCard>
+          <FilesTable files={files} />
         )}
       </section>
 
@@ -245,11 +237,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
           <p className="text-sm text-ink-dim pl-1 mt-1">No assertions recorded.</p>
         ) : (
           <>
-            <ListCard>
-              {visibleAssertions.map((a, i) => (
-                <AssertionRow key={`${a.concern_id}-${a.file_path}-${i}`} assertion={a} />
-              ))}
-            </ListCard>
+            <AssertionsTable assertions={visibleAssertions} />
             {hiddenCount > 0 && (
               <p className="mt-2 text-note text-ink-mute pl-1">
                 +{hiddenCount} more assertion{hiddenCount !== 1 ? 's' : ''} not shown
@@ -285,34 +273,115 @@ const TOUCH_STYLES: Record<(typeof TOUCH_ORDER)[number], { pill: string; bar: st
   glob: { pill: 'bg-slate-100 text-ink-mute ring-slate-200',  bar: 'bg-slate-300',  label: 'glob' },
 };
 
-function FileRow({ file }: { file: FileView }) {
-  const key = TOUCH_ORDER[touchRank(file.strongest)];
-  const t = TOUCH_STYLES[key];
+/** Whether a file carries a given touch mode (presence, not a count — the
+ *  per-file ledger only exposes counts for edits / reads / greps). */
+function hasMode(file: FileView, mode: string): boolean {
+  if (file.strongest?.toLowerCase() === mode) return true;
+  return (file.touch_modes ?? []).some((m) => m.toLowerCase() === mode);
+}
+
+function PresenceCell({ on }: { on: boolean }) {
+  return on ? (
+    <span className="tabular-nums text-ink">•</span>
+  ) : (
+    <span className="text-ink-mute">—</span>
+  );
+}
+
+/**
+ * Files-touched heatmap as a SortableTable. Columns: File (swatch + path) |
+ * Touch type | Edits | Reads | Greps | Cmds | Globs | Last updated. Sortable on
+ * File / Touch type / Edits / Last updated; default order is the
+ * strongest-touch-first pre-sort. Cmds / Globs are presence indicators (the
+ * file ledger only counts edits / reads / greps).
+ */
+function FilesTable({ files }: { files: FileView[] }) {
+  const columns: Column<FileView>[] = [
+    {
+      key: 'path',
+      header: 'File',
+      sortable: true,
+      sortValue: (f) => f.path,
+      render: (f) => {
+        const t = TOUCH_STYLES[TOUCH_ORDER[touchRank(f.strongest)]];
+        return (
+          <span className="flex items-center gap-2 min-w-0">
+            <span className={cn('shrink-0 w-1.5 h-3.5 rounded-full', t.bar)} aria-hidden />
+            <span className="font-mono text-ink truncate">{f.path}</span>
+          </span>
+        );
+      },
+    },
+    {
+      key: 'touch',
+      header: 'Touch type',
+      width: 'w-28',
+      sortable: true,
+      sortValue: (f) => touchRank(f.strongest),
+      render: (f) => {
+        const t = TOUCH_STYLES[TOUCH_ORDER[touchRank(f.strongest)]];
+        return (
+          <span
+            className={cn(
+              'inline-flex items-center rounded px-2 py-0.5 text-note font-medium uppercase tracking-wide ring-1',
+              t.pill,
+            )}
+          >
+            {t.label}
+          </span>
+        );
+      },
+    },
+    {
+      key: 'edits',
+      header: 'Edits',
+      align: 'right',
+      width: 'w-20',
+      sortable: true,
+      sortValue: (f) => f.edits,
+      render: (f) => f.edits,
+    },
+    {
+      key: 'reads',
+      header: 'Reads',
+      align: 'right',
+      width: 'w-20',
+      render: (f) => f.read_lines.length,
+    },
+    {
+      key: 'greps',
+      header: 'Greps',
+      align: 'right',
+      width: 'w-20',
+      render: (f) => f.grep_matches,
+    },
+    {
+      key: 'cmds',
+      header: 'Cmds',
+      align: 'right',
+      width: 'w-16',
+      render: (f) => <PresenceCell on={hasMode(f, 'cmd')} />,
+    },
+    {
+      key: 'globs',
+      header: 'Globs',
+      align: 'right',
+      width: 'w-16',
+      render: (f) => <PresenceCell on={hasMode(f, 'glob')} />,
+    },
+    {
+      key: 'last',
+      header: 'Last updated',
+      align: 'right',
+      width: 'w-32',
+      sortable: true,
+      sortValue: (f) => f.last_at ?? null,
+      render: (f) => <span className="text-ink-mute">{relativeTime(f.last_at)}</span>,
+    },
+  ];
 
   return (
-    <div className="flex items-center gap-3 px-4 py-2.5">
-      {/* heatmap accent bar, colored by strongest touch */}
-      <span className={cn('shrink-0 w-1 self-stretch rounded-full', t.bar)} aria-hidden />
-      <div className="min-w-0 flex-1">
-        <p className="text-lead font-mono text-ink truncate">{file.path}</p>
-        <div className="mt-0.5 flex flex-wrap items-center gap-x-3 text-note text-ink-mute">
-          {file.edits > 0 && <span>{file.edits} edit{file.edits !== 1 ? 's' : ''}</span>}
-          {file.grep_matches > 0 && <span>{file.grep_matches} grep match{file.grep_matches !== 1 ? 'es' : ''}</span>}
-          {file.read_lines.length > 0 && (
-            <span>{file.read_lines.length} read range{file.read_lines.length !== 1 ? 's' : ''}</span>
-          )}
-          <span>{relativeTime(file.last_at)}</span>
-        </div>
-      </div>
-      <span
-        className={cn(
-          'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-note font-medium uppercase tracking-wide ring-1',
-          t.pill,
-        )}
-      >
-        {t.label}
-      </span>
-    </div>
+    <SortableTable<FileView> columns={columns} rows={files} rowKey={(f) => f.path} />
   );
 }
 
@@ -328,31 +397,82 @@ const ASSERTION_STATUS_STYLES: Record<AssertionStatus, { pill: string; label: st
   unknown:        { pill: 'bg-slate-100 text-ink-mute ring-slate-200',   label: '?' },
 };
 
-function AssertionRow({ assertion }: { assertion: ConcernAssertion }) {
-  const status = normAssertionStatus(assertion.status);
-  const s = ASSERTION_STATUS_STYLES[status];
+/** First line of an assertion's evidence ranges, for the `File:Line` cell. */
+function assertionLine(a: ConcernAssertion): number | null {
+  const first = a.evidence?.line_ranges?.[0];
+  return first && first.length > 0 ? first[0] : null;
+}
 
-  const summary = assertion.evidence?.summary ?? '';
-  const truncated = summary.length > 160 ? summary.slice(0, 157) + '…' : summary;
+/**
+ * Assessed concerns as a SortableTable. Columns: Concern | File:Line | Status.
+ * All three are sortable. Rows are pre-capped (+N note rendered by the caller).
+ */
+// concern_id + file_path is not unique (the same concern can be asserted on a
+// file across several line ranges), so each row carries a positional id.
+type AssertionRowT = ConcernAssertion & { _key: string };
+
+function AssertionsTable({ assertions }: { assertions: ConcernAssertion[] }) {
+  const rows: AssertionRowT[] = assertions.map((a, i) => ({
+    ...a,
+    _key: `${a.concern_id}-${a.file_path}-${i}`,
+  }));
+
+  const columns: Column<AssertionRowT>[] = [
+    {
+      key: 'concern',
+      header: 'Concern',
+      sortable: true,
+      sortValue: (a) => a.concern_id,
+      render: (a) => <span className="font-mono text-note text-ink break-all">{a.concern_id}</span>,
+    },
+    {
+      key: 'location',
+      header: 'File:Line',
+      sortable: true,
+      sortValue: (a) => a.file_path,
+      render: (a) => {
+        const line = assertionLine(a);
+        return (
+          <span className="font-mono text-note text-ink-mute break-all">
+            {a.file_path}
+            {line !== null && `:${line}`}
+          </span>
+        );
+      },
+    },
+    {
+      key: 'status',
+      header: 'Status',
+      width: 'w-28',
+      sortable: true,
+      sortValue: (a) => normAssertionStatus(a.status),
+      render: (a) => {
+        const s = ASSERTION_STATUS_STYLES[normAssertionStatus(a.status)];
+        return (
+          <span
+            className={cn(
+              'inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1',
+              s.pill,
+            )}
+          >
+            {s.label}
+          </span>
+        );
+      },
+    },
+  ];
 
   return (
-    <div className="flex items-start gap-3 px-4 py-3">
-      <span
-        className={cn(
-          'shrink-0 inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 mt-0.5',
-          s.pill,
-        )}
-      >
-        {s.label}
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-x-3 text-note text-ink-mute mb-0.5">
-          <span className="font-mono break-all">{assertion.file_path}</span>
-          <span className="font-mono text-ink-mute/70">{assertion.concern_id}</span>
-        </div>
-        {truncated && <p className="text-ui text-ink-dim leading-snug">{truncated}</p>}
-      </div>
-    </div>
+    <SortableTable<AssertionRowT>
+      columns={columns}
+      rows={rows}
+      rowKey={(a) => a._key}
+      renderDetail={(a) => (
+        <p className="text-note text-ink-dim whitespace-pre-wrap break-words">
+          {a.evidence.summary?.trim() ? a.evidence.summary : 'No evidence summary recorded.'}
+        </p>
+      )}
+    />
   );
 }
 

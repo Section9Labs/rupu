@@ -1,12 +1,55 @@
 // Project Coverage tab body — coverage-target list scoped to one project.
 // Ported from pages/ProjectCoverage.tsx; self-fetches on the `wsId` prop.
-// No filter chips.
+// No filter chips. Rows render via the shared SortableTable.
 
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { ShieldCheck } from 'lucide-react';
 import { api, type ProjectCoverageRow } from '../../lib/api';
-import { ListCard } from '../lists/ListCard';
+import SortableTable, { type Column } from '../lists/SortableTable';
+
+const COVERAGE_COLUMNS: Column<ProjectCoverageRow>[] = [
+  {
+    key: 'target',
+    header: 'Target',
+    sortable: true,
+    sortValue: (r) => r.target_id,
+    render: (r) => <span className="text-sm font-medium text-ink truncate font-mono">{r.target_id}</span>,
+  },
+  {
+    key: 'assertions',
+    header: 'Assertions',
+    align: 'right',
+    width: 'w-28',
+    sortable: true,
+    sortValue: (r) => r.assertion_lines,
+    render: (r) => <span className="text-ink-dim">{r.assertion_lines}</span>,
+  },
+  {
+    key: 'catalog',
+    header: 'Catalog',
+    width: 'w-24',
+    render: (r) =>
+      r.has_catalog ? (
+        <span className="text-note text-ink-dim">yes</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'findings',
+    header: 'Findings',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (r) => r.findings,
+    render: (r) =>
+      r.findings > 0 ? (
+        <span className="text-red-700 font-medium">{r.findings}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+];
 
 export default function ProjectCoverageTab({ wsId }: { wsId: string }) {
   const [rows, setRows] = useState<ProjectCoverageRow[] | null>(null);
@@ -52,30 +95,16 @@ export default function ProjectCoverageTab({ wsId }: { wsId: string }) {
       )}
 
       {rows !== null && rows.length > 0 && (
-        <ListCard>
-          {rows.map((r) => (
-            <Link
-              key={r.target_id}
-              to={`/coverage/${encodeURIComponent(r.target_id)}${
-                wsId ? `?ws_id=${encodeURIComponent(wsId)}` : ''
-              }`}
-              className="flex items-center gap-4 px-4 py-3 hover:bg-panel/60 transition-colors"
-            >
-              <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-ink truncate font-mono">{r.target_id}</p>
-                <p className="text-note text-ink-dim mt-0.5">
-                  {r.assertion_lines} assertion{r.assertion_lines !== 1 ? 's' : ''}
-                  {r.has_catalog ? ' · has catalog' : ''}
-                </p>
-              </div>
-              {r.findings > 0 && (
-                <span className="shrink-0 inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-red-50 text-red-700 ring-red-200">
-                  {r.findings} finding{r.findings !== 1 ? 's' : ''}
-                </span>
-              )}
-            </Link>
-          ))}
-        </ListCard>
+        <SortableTable<ProjectCoverageRow>
+          columns={COVERAGE_COLUMNS}
+          rows={rows}
+          rowKey={(r) => r.target_id}
+          rowHref={(r) =>
+            `/coverage/${encodeURIComponent(r.target_id)}${
+              wsId ? `?ws_id=${encodeURIComponent(wsId)}` : ''
+            }`
+          }
+        />
       )}
     </div>
   );

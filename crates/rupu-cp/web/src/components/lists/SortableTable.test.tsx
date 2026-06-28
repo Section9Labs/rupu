@@ -102,4 +102,23 @@ describe('SortableTable', () => {
     const link = screen.getAllByRole('link')[0] as HTMLAnchorElement;
     expect(link).toHaveAttribute('href', '/things/b');
   });
+
+  it('toggles an expandable detail row via the chevron (and ignores rowHref)', () => {
+    renderTable({
+      rowHref: (r) => `/things/${r.id}`,
+      renderDetail: (r) => <div>detail for {r.name}</div>,
+    });
+    // Expandable tables are not link-wrapped.
+    expect(screen.queryByRole('link')).toBeNull();
+    // Detail hidden until expanded.
+    expect(screen.queryByText('detail for Beta')).toBeNull();
+
+    const toggles = screen.getAllByRole('button', { name: 'Expand row' });
+    fireEvent.click(toggles[0]);
+    expect(screen.getByText('detail for Beta')).toBeInTheDocument();
+
+    // Clicking again collapses it.
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse row' }));
+    expect(screen.queryByText('detail for Beta')).toBeNull();
+  });
 });

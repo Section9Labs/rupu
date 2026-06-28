@@ -7,8 +7,8 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Inbox, ShieldCheck, ShieldOff } from 'lucide-react';
 import { api, type CoverageSummary } from '../lib/api';
-import { ListCard } from '../components/lists/ListCard';
 import { SectionHeader } from '../components/lists/SectionHeader';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
@@ -105,11 +105,7 @@ export default function Coverage() {
                   count={g.total}
                   hint="sorted by findings ↓ then activity ↓"
                 />
-                <ListCard>
-                  {g.rows.map((t) => (
-                    <TargetRow key={`${t.ws_id}/${t.target_id}`} target={t} maxLines={maxLines} />
-                  ))}
-                </ListCard>
+                <CoverageGroupTable rows={g.rows} maxLines={maxLines} />
               </section>
             ))}
           {all.length > visible && (
@@ -152,45 +148,78 @@ function groupByProject(targets: CoverageSummary[]): ProjectGroup[] {
     .sort((a, b) => a.project.localeCompare(b.project));
 }
 
-function TargetRow({
-  target,
+/**
+ * One project group's targets as a SortableTable. Columns: Target (mono) |
+ * Assertions (right, with comparative bar) | Findings (right) | Catalog. Rows
+ * link to the per-target detail view. Sortable on Target / Assertions /
+ * Findings; default order is the findings ↓ / activity ↓ pre-sort.
+ */
+function CoverageGroupTable({
+  rows,
   maxLines,
 }: {
-  target: CoverageSummary;
+  rows: CoverageSummary[];
   maxLines: number;
 }) {
-  const barPct = maxLines > 0 ? (target.assertion_lines / maxLines) * 100 : 0;
-  const hasFindings = target.findings > 0;
+  const columns: Column<CoverageSummary>[] = [
+    {
+      key: 'target',
+      header: 'Target',
+      sortable: true,
+      sortValue: (t) => t.target_id,
+      render: (t) => (
+        <span className="font-mono text-sm font-medium text-ink truncate block">{t.target_id}</span>
+      ),
+    },
+    {
+      key: 'assertions',
+      header: 'Assertions',
+      align: 'right',
+      width: 'w-56',
+      sortable: true,
+      sortValue: (t) => t.assertion_lines,
+      render: (t) => {
+        const barPct = maxLines > 0 ? (t.assertion_lines / maxLines) * 100 : 0;
+        return (
+          <div className="flex items-center justify-end gap-2">
+            <div className="w-24 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-brand-500 rounded-full transition-all"
+                style={{ width: `${barPct.toFixed(1)}%` }}
+              />
+            </div>
+            <span className="tabular-nums whitespace-nowrap">{t.assertion_lines}</span>
+          </div>
+        );
+      },
+    },
+    {
+      key: 'findings',
+      header: 'Findings',
+      align: 'right',
+      width: 'w-28',
+      sortable: true,
+      sortValue: (t) => t.findings,
+      render: (t) => <FindingsBadge count={t.findings} hasFindings={t.findings > 0} />,
+    },
+    {
+      key: 'catalog',
+      header: 'Catalog',
+      align: 'right',
+      width: 'w-24',
+      render: (t) => <CatalogBadge present={t.has_catalog} />,
+    },
+  ];
 
   return (
-    <Link
-      to={`/coverage/${encodeURIComponent(target.target_id)}?ws_id=${encodeURIComponent(target.ws_id)}`}
-      className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
-    >
-      {/* Target name */}
-      <div className="min-w-0 flex-1">
-        <span className="text-sm font-medium text-ink truncate block">{target.target_id}</span>
-
-        {/* Comparative activity bar — labeled explicitly as "N assertions" */}
-        <div className="mt-1.5 flex items-center gap-2">
-          <div className="flex-1 max-w-[180px] h-1.5 bg-slate-100 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-brand-500 rounded-full transition-all"
-              style={{ width: `${barPct.toFixed(1)}%` }}
-            />
-          </div>
-          <span className="text-note text-ink-mute tabular-nums whitespace-nowrap">
-            {target.assertion_lines} assertion{target.assertion_lines !== 1 ? 's' : ''}
-          </span>
-        </div>
-      </div>
-
-      {/* Catalog badge */}
-      <CatalogBadge present={target.has_catalog} />
-
-      {/* Findings count badge */}
-      <FindingsBadge count={target.findings} hasFindings={hasFindings} />
-    </Link>
+    <SortableTable<CoverageSummary>
+      columns={columns}
+      rows={rows}
+      rowKey={(t) => `${t.ws_id}/${t.target_id}`}
+      rowHref={(t) =>
+        `/coverage/${encodeURIComponent(t.target_id)}?ws_id=${encodeURIComponent(t.ws_id)}`
+      }
+    />
   );
 }
 
@@ -205,7 +234,7 @@ function CatalogBadge({ present }: { present: boolean }) {
       )}
     >
       {present ? <ShieldCheck size={11} /> : <ShieldOff size={11} />}
-      {present ? 'catalog' : 'no catalog'}
+      {present ? 'yes' : '—'}
     </span>
   );
 }

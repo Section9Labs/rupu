@@ -10,13 +10,12 @@
 // Polls every 15 s; clears the interval on unmount.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { Activity, MessageSquare, RefreshCw, Server, ShieldCheck } from 'lucide-react';
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
 import { api, type DashboardResponse, type RunStatusStr, type UsageOverview, type UsageTimelineBucket } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
 import UsageChip from '../components/UsageChip';
-import { ListCard } from '../components/lists/ListCard';
+import SortableTable, { type Column } from '../components/lists/SortableTable';
 import TriageRibbon from '../components/dashboard/TriageRibbon';
 import UsageTimelineStacked, { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
@@ -151,24 +150,42 @@ function StatTile({
 // Recent runs
 // ---------------------------------------------------------------------------
 
-function RecentRunRow({ run }: { run: DashboardResponse['recent_runs'][number] }) {
-  return (
-    <Link
-      to={`/runs/${encodeURIComponent(run.id)}`}
-      className="flex items-center gap-4 px-4 py-3 hover:bg-slate-50 transition-colors"
-    >
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-ink truncate">{run.workflow_name}</span>
-          <span className="text-note text-ink-mute font-mono">{shortId(run.id)}</span>
-        </div>
-        <p className="text-note text-ink-dim mt-0.5">started {relativeTime(run.started_at)}</p>
-      </div>
-      <UsageChip usage={run.usage} className="ml-2" />
-      <StatusPill status={run.status} />
-    </Link>
-  );
-}
+type RecentRun = DashboardResponse['recent_runs'][number];
+
+const RECENT_RUN_COLUMNS: Column<RecentRun>[] = [
+  {
+    key: 'workflow',
+    header: 'Workflow',
+    sortable: true,
+    sortValue: (r) => r.workflow_name,
+    render: (r) => <span className="text-sm font-medium text-ink truncate">{r.workflow_name}</span>,
+  },
+  {
+    key: 'run',
+    header: 'Run',
+    render: (r) => <span className="text-note text-ink-mute font-mono">{shortId(r.id)}</span>,
+  },
+  {
+    key: 'started',
+    header: 'Started',
+    sortable: true,
+    sortValue: (r) => (r.started_at ? Date.parse(r.started_at) : null),
+    render: (r) => <span className="text-ink-mute">{relativeTime(r.started_at)}</span>,
+  },
+  {
+    key: 'status',
+    header: 'Status',
+    sortable: true,
+    sortValue: (r) => r.status,
+    render: (r) => <StatusPill status={r.status} />,
+  },
+  {
+    key: 'usage',
+    header: 'Usage',
+    align: 'right',
+    render: (r) => <UsageChip usage={r.usage} />,
+  },
+];
 
 // ---------------------------------------------------------------------------
 // Page
@@ -406,9 +423,13 @@ export default function Dashboard() {
                   <p className="text-xs text-ink-mute">No runs yet</p>
                 </div>
               ) : (
-                <ListCard>
-                  {data.recent_runs.map((r) => <RecentRunRow key={r.id} run={r} />)}
-                </ListCard>
+                <SortableTable<RecentRun>
+                  columns={RECENT_RUN_COLUMNS}
+                  rows={data.recent_runs}
+                  rowKey={(r) => r.id}
+                  rowHref={(r) => `/runs/${encodeURIComponent(r.id)}`}
+                  initialSort={{ key: 'started', dir: 'desc' }}
+                />
               )}
             </div>
             <div className="lg:col-span-2">
