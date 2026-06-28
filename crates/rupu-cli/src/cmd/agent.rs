@@ -398,7 +398,10 @@ async fn create(
                         .ok_or_else(|| anyhow::anyhow!("unknown --gen-provider `{p}`"))?;
                     (p, m)
                 }
-                (None, _) => rupu_orchestrator::pick_default_gen_model(&resolver)
+                (None, Some(m)) => {
+                    anyhow::bail!("--gen-model `{m}` requires --gen-provider to be set")
+                }
+                (None, None) => rupu_orchestrator::pick_default_gen_model(&resolver)
                     .await
                     .ok_or_else(|| {
                         anyhow::anyhow!(
