@@ -7,7 +7,7 @@
 // so this component is a pure render of the accumulated event list plus a small
 // connection indicator. Auto-scrolls to newest unless the user has scrolled up.
 
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { cn } from '../lib/cn';
 import EventTimelineList from './EventTimelineList';
 
@@ -27,23 +27,28 @@ export default function RunEventFeed({
   connection: ConnectionState;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  // Whether to follow the tail. Flips false when the user scrolls up; back to
-  // true when they scroll (near) the bottom.
+  // Newest-first: follow=true pins to the TOP (new events prepend visually).
+  // Flips false when the user scrolls down to read history; resumes when they
+  // scroll back to the top. Matches the global Live Events page.
   const [follow, setFollow] = useState(true);
 
-  // Stick to the bottom on new events while following.
+  // Render newest-first (latest at top) — a timeline, not a chat log. The
+  // parent accumulates events oldest-first, so reverse a shallow copy.
+  const ordered = useMemo(() => events.slice().reverse(), [events]);
+
+  // Stick to the top on new events while following.
   useLayoutEffect(() => {
     if (!follow) return;
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el) el.scrollTop = 0;
   }, [events.length, follow]);
 
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const onScroll = () => {
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-      setFollow(nearBottom);
+      const atTop = el.scrollTop < 48;
+      setFollow(atTop);
     };
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
@@ -62,12 +67,12 @@ export default function RunEventFeed({
         ref={scrollRef}
         className="flex-1 min-h-0 overflow-y-auto rounded-xl border border-border bg-panel shadow-card"
       >
-        {events.length === 0 ? (
+        {ordered.length === 0 ? (
           <div className="p-8 text-center text-sm text-ink-dim">
             Waiting for events…
           </div>
         ) : (
-          <EventTimelineList events={events} />
+          <EventTimelineList events={ordered} />
         )}
       </div>
     </div>

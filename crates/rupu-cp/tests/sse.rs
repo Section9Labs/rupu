@@ -244,6 +244,67 @@ async fn events_stream_explicit_run_unknown_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// `/api/events/stream` with no `?run` param multiplexes EVERY active run:
+/// events from two concurrent runs both arrive on the single firehose. This is
+/// the behaviour the single-run Phase-1 tail could not provide.
+#[tokio::test]
+async fn events_stream_multiplexes_active_runs() {
+    use futures_util::TryStreamExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RunStore::new(tmp.path().join("runs"));
+
+    for run_id in ["mux_run_a", "mux_run_b"] {
+        store
+            .create(seed_run(run_id, RunStatus::Running), "name: test\nsteps: []\n")
+            .unwrap();
+        let events = vec![Event::RunStarted {
+            event_version: 1,
+            run_id: run_id.into(),
+            workflow_path: PathBuf::from("/tmp/wf.yaml"),
+            started_at: Utc::now(),
+        }];
+        write_events_jsonl(&store, run_id, &events);
+    }
+
+    let addr = spawn_server(tmp.path()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/api/events/stream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let async_reader =
+        tokio_util::io::StreamReader::new(resp.bytes_stream().map_err(std::io::Error::other));
+    let mut lines = tokio::io::BufReader::new(async_reader).lines();
+
+    // Collect run_ids from data lines until we've seen BOTH runs (or time out).
+    let mut seen = std::collections::HashSet::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(rid) = v["run_id"].as_str() {
+                        seen.insert(rid.to_string());
+                    }
+                }
+            }
+            if seen.contains("mux_run_a") && seen.contains("mux_run_b") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("timed out before both runs' events arrived on the firehose");
+
+    assert!(
+        seen.contains("mux_run_a") && seen.contains("mux_run_b"),
+        "firehose should carry events from both runs, saw {seen:?}"
+    );
+}
+
 /// `/api/events/stream` with a seeded run and no `?run` param → auto-selects
 /// the run and returns 200 `text/event-stream`.
 #[tokio::test]

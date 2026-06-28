@@ -35,18 +35,37 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const running = node.state === 'running';
   const box = nodeSize(node);
 
-  // No fan-out data yet (units haven't started) — render a slim pending card.
+  // No units to show. This is NOT always "awaiting" — a for_each over an empty
+  // list completes with zero units, and a failed/skipped step never fans out.
+  // Render a card that reflects the step's actual state instead of a permanent
+  // blue "awaiting units…".
   if (!fo || fo.total === 0) {
+    const state = node.state;
+    const isErr = state === 'failed';
+    const isActive = state === 'running' || state === 'pending' || state === 'awaiting_approval';
+    const border = isErr ? '#fecaca' : isActive ? '#bfdbfe' : '#e5e7eb';
+    const bg = isErr ? '#fef2f2' : isActive ? '#eff6ff' : '#ffffff';
+    const labelColor = isErr ? 'text-[#fb4e4e]' : isActive ? 'text-[#1860f2]' : 'text-ink-mute';
+    const message =
+      state === 'running'
+        ? 'starting units…'
+        : state === 'done'
+          ? 'no units — nothing to fan out'
+          : state === 'failed'
+            ? 'failed before fan-out'
+            : state === 'skipped'
+              ? 'skipped'
+              : 'awaiting units…';
     return (
       <div
-        className={['relative rounded-[12px] border px-3 py-2', running ? 'rg-pulse-run' : 'opacity-75'].join(' ')}
-        style={{ borderColor: '#bfdbfe', background: '#eff6ff', width: box.width, minHeight: box.height }}
+        className={['relative rounded-[12px] border px-3 py-2', running ? 'rg-pulse-run' : ''].join(' ')}
+        style={{ borderColor: border, background: bg, width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
-        <div className="text-[10px] font-bold uppercase tracking-wide text-[#1860f2]">
+        <div className={['text-[10px] font-bold uppercase tracking-wide', labelColor].join(' ')}>
           for_each · {node.id}
         </div>
-        <div className="mt-1 text-[11px] text-ink-mute">awaiting units…</div>
+        <div className="mt-1 text-[11px] text-ink-mute">{message}</div>
         <Handle type="source" position={Position.Right} style={handleStyle} />
       </div>
     );
