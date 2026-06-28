@@ -28,6 +28,35 @@ afterEach(() => {
 });
 
 // ---------------------------------------------------------------------------
+// getAgentRuns
+// ---------------------------------------------------------------------------
+
+describe('host param: getAgentRuns', () => {
+  it('omits ?host when not provided', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getAgentRuns();
+    expect(fetchSpy.mock.calls[0][0]).toBe('/api/runs/agents');
+  });
+
+  it('appends ?host=<id> when provided', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getAgentRuns({ host: 'h1' });
+    expect(fetchSpy.mock.calls[0][0]).toBe('/api/runs/agents?host=h1');
+  });
+
+  it('combines lifecycle + host in query', async () => {
+    mockFetch(200, []);
+    const fetchSpy = vi.mocked(fetch);
+    await api.getAgentRuns({ lifecycle: 'active', host: 'h1' });
+    const url = fetchSpy.mock.calls[0][0] as string;
+    expect(url).toContain('lifecycle=active');
+    expect(url).toContain('host=h1');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // getAutoflowRuns
 // ---------------------------------------------------------------------------
 
