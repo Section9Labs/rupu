@@ -265,8 +265,9 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             available_agents: vec![],
         };
-        let out = generate_definition(&req, &resolver).await.expect("ok");
+        let out = generate_definition(&req, &resolver).await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let out = out.expect("ok");
 
         assert_eq!(out.attempts, 1);
         assert!(out.content.contains("name: gen-agent"));
@@ -291,8 +292,9 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             available_agents: vec![],
         };
-        let out = generate_definition(&req, &resolver).await.expect("ok");
+        let out = generate_definition(&req, &resolver).await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let out = out.expect("ok");
 
         assert_eq!(out.attempts, 2);
         assert!(out.content.contains("name: gen-agent"));
@@ -317,8 +319,9 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             available_agents: vec![],
         };
-        let err = generate_definition(&req, &resolver).await.unwrap_err();
+        let out = generate_definition(&req, &resolver).await;
         std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        let err = out.unwrap_err();
 
         match err {
             GenerateError::Invalid { attempts, .. } => assert_eq!(attempts, MAX_ATTEMPTS),
