@@ -8,6 +8,7 @@ pub mod events;
 pub mod findings;
 pub mod fs_safety;
 pub mod graph;
+pub mod host_fanout;
 pub mod host_info;
 pub mod hosts;
 pub mod projects;
