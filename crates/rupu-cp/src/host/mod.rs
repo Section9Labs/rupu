@@ -8,4 +8,5 @@
 //! and wiring into `AppState` (Task 5).
 
 pub mod connector;
+pub mod http;
 pub mod local;

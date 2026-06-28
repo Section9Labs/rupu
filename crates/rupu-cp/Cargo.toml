@@ -23,6 +23,7 @@ async-trait.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 futures-util = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
 rust-embed.workspace = true
 mime_guess.workspace = true
 
@@ -40,7 +41,7 @@ chrono.workspace = true
 tempfile.workspace = true
 rupu-config = { path = "../rupu-config" }
 rupu-transcript = { path = "../rupu-transcript" }
-reqwest = { workspace = true, features = ["json", "stream"] }
+httpmock.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-util = { workspace = true, features = ["io"] }
 futures-util = { workspace = true }

@@ -6281,6 +6281,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
+ "httpmock",
  "mime_guess",
  "reqwest",
  "rupu-agent",
