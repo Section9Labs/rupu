@@ -355,6 +355,87 @@ async fn ssh_host_resolves_reachable_false_when_ssh_unreachable() {
     );
 }
 
+/// Task 4: a `Bucket` host persisted in the store resolves to a
+/// `BucketHostConnector` (when tunnel deps are wired via `with_tunnel_deps`) and
+/// `info()` returns `Ok` because the `file://` local-filesystem backend is
+/// reachable in the test environment.
+///
+/// Resolution path under test:
+///   `add_bucket_host` → `HostStore` → `HostRegistry::resolve` → `BucketHostConnector`
+#[tokio::test]
+async fn bucket_host_resolves_ok_with_deps() {
+    use rupu_cp::node::{NodeMirror, NodeRegistry};
+    use rupu_orchestrator::runs::RunStore;
+    use rupu_workspace::add_bucket_host;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Create the bucket directory so the local filesystem backend can probe it.
+    let bucket_dir = tmp.path().join("bucket");
+    std::fs::create_dir_all(&bucket_dir).unwrap();
+    let bucket_url = format!("file://{}", bucket_dir.display());
+
+    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let host = add_bucket_host(&host_store, "test-bucket-node", &bucket_url, None).unwrap();
+
+    // Build the shared deps required by BucketHostConnector (same bundle as Tunnel/SSH).
+    let run_store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let node_registry = Arc::new(NodeRegistry::new());
+    let node_mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+
+    // Build a HostRegistry with tunnel deps wired — Bucket uses mirror + run_store
+    // from this same bundle.
+    let reg = HostRegistry::new(host_store, Arc::new(StubLocal) as Arc<dyn HostConnector>)
+        .with_tunnel_deps(
+            node_registry,
+            node_mirror,
+            run_store,
+            rupu_config::PricingConfig::default(),
+        );
+
+    // resolve() must succeed — the Bucket host record exists and deps are wired.
+    let conn = reg
+        .resolve(&host.id)
+        .expect("resolve() must succeed when tunnel deps are wired for a Bucket host");
+
+    // info() must return Ok — the file:// backend is reachable.
+    let info = conn
+        .info()
+        .await
+        .expect("info() must not error for a local-filesystem bucket");
+    assert!(
+        info.reachable,
+        "BucketHostConnector must report reachable=true for a reachable file:// bucket"
+    );
+}
+
+/// Negative wiring guard (Bucket): a `HostRegistry` built WITHOUT
+/// `with_tunnel_deps` returns `HostConnectorError::Invalid` when resolving a
+/// `Bucket` host.
+///
+/// Bucket needs `node_mirror` + `run_store` from the `with_tunnel_deps` bundle;
+/// skipping the call must produce `Invalid`.
+#[test]
+fn bucket_host_without_tunnel_deps_returns_invalid() {
+    use rupu_workspace::add_bucket_host;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let host =
+        add_bucket_host(&host_store, "test-bucket-unwired", "file:///tmp/rupu-test-unwired", None)
+            .unwrap();
+
+    // Deliberately skip with_tunnel_deps.
+    let reg = HostRegistry::new(host_store, Arc::new(StubLocal) as Arc<dyn HostConnector>);
+
+    let result = reg.resolve(&host.id);
+    assert!(
+        matches!(result, Err(HostConnectorError::Invalid(_))),
+        "expected Invalid when tunnel deps not wired for Bucket host"
+    );
+}
+
 /// Negative wiring guard (SSH): a `HostRegistry` built WITHOUT `with_tunnel_deps`
 /// returns `HostConnectorError::Invalid` when resolving an `Ssh` host.
 ///

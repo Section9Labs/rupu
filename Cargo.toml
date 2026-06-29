@@ -107,6 +107,9 @@ rand = "0.8"
 sha2 = "0.10"
 url = "2"
 
+# Object storage (bucket dead-drop transport for multi-host Slice 2b)
+object_store = { version = "0.14", features = ["aws", "gcp"] }
+
 # Webhook receiver / control-plane (axum chosen for async-native + tower middleware)
 axum = "0.7"
 tokio-tungstenite = "0.24"

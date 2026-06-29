@@ -8,7 +8,7 @@
 
 use anyhow::Context;
 use clap::Subcommand;
-use rupu_workspace::{add_ssh_host, delete_host_token, set_host_token, Host, HostStore, HostTransport};
+use rupu_workspace::{add_bucket_host, add_ssh_host, delete_host_token, set_host_token, Host, HostStore, HostTransport};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,12 +32,12 @@ pub struct AddArgs {
     /// Display name for the host.
     pub name: String,
     /// Base URL of the remote rupu-cp instance (e.g. https://rupu.example.com).
-    /// Mutually exclusive with `--ssh`.
-    #[arg(long, conflicts_with = "ssh", required_unless_present = "ssh")]
+    /// Mutually exclusive with `--ssh` and `--bucket`.
+    #[arg(long, conflicts_with_all = ["ssh", "bucket"], required_unless_present_any = ["ssh", "bucket"])]
     pub url: Option<String>,
     /// SSH destination: `user@host` or an `~/.ssh/config` alias. Selects the
-    /// Ssh transport. Mutually exclusive with `--url`.
-    #[arg(long)]
+    /// Ssh transport. Mutually exclusive with `--url` and `--bucket`.
+    #[arg(long, conflicts_with = "bucket")]
     pub ssh: Option<String>,
     /// SSH port override (default: 22). Only relevant with `--ssh`.
     #[arg(long)]
@@ -45,6 +45,15 @@ pub struct AddArgs {
     /// Path to an SSH identity file. Only relevant with `--ssh`.
     #[arg(long)]
     pub identity: Option<PathBuf>,
+    /// Object-store URL for the bucket transport (`s3://…` / `gs://…` /
+    /// `file://…`). Selects the Bucket transport. Mutually exclusive with
+    /// `--url` and `--ssh`. Credentials come from the environment / cloud
+    /// credential chain and are never stored.
+    #[arg(long, conflicts_with_all = ["url", "ssh"])]
+    pub bucket: Option<String>,
+    /// Object-store key prefix (optional). Only relevant with `--bucket`.
+    #[arg(long)]
+    pub prefix: Option<String>,
     /// API token. Mutually exclusive with `--token-stdin`. Only relevant with `--url`.
     #[arg(long, conflicts_with = "token_stdin")]
     pub token: Option<String>,
@@ -123,6 +132,22 @@ pub(crate) fn add_ssh_host_cli(
     Ok(record.id)
 }
 
+/// Add a Bucket host. Returns the newly-minted host id.
+///
+/// No secret is stored — authentication is delegated to the environment /
+/// cloud credential chain.
+pub(crate) fn add_bucket_host_cli(
+    store_root: PathBuf,
+    name: String,
+    url: String,
+    prefix: Option<String>,
+) -> anyhow::Result<String> {
+    let store = HostStore { root: store_root };
+    let record = add_bucket_host(&store, &name, &url, prefix)
+        .context("save bucket host record")?;
+    Ok(record.id)
+}
+
 /// List all hosts. The implicit `local` entry is always first; remote hosts
 /// follow sorted by id (the order `HostStore::list` already returns).
 ///
@@ -144,6 +169,7 @@ pub(crate) fn list_hosts(
                 Some(p) => format!("ssh:{host}:{p}"),
                 None => format!("ssh:{host}"),
             },
+            HostTransport::Bucket { url, .. } => format!("bucket:{url}"),
         };
         rows.push((host.id, host.name, label));
     }
@@ -184,9 +210,13 @@ fn add_inner(args: AddArgs) -> anyhow::Result<()> {
         // SSH transport — no token involved.
         let id = add_ssh_host_cli(hosts_dir()?, args.name, ssh_dest, args.port, args.identity)?;
         println!("{id}");
+    } else if let Some(bucket_url) = args.bucket {
+        // Bucket transport — no token involved; credentials from env/cloud chain.
+        let id = add_bucket_host_cli(hosts_dir()?, args.name, bucket_url, args.prefix)?;
+        println!("{id}");
     } else {
         // HttpCp transport.
-        let url = args.url.expect("clap requires --url when --ssh is absent");
+        let url = args.url.expect("clap requires --url when --ssh and --bucket are absent");
         let token = if args.token_stdin {
             let mut buf = String::new();
             io::stdin().read_to_string(&mut buf)?;
@@ -279,6 +309,70 @@ mod tests {
         assert_eq!(rows.len(), 1, "should have exactly one row (local)");
         assert_eq!(rows[0].0, "local");
         assert_eq!(rows[0].2, "local");
+    }
+
+    #[test]
+    fn bucket_add_roundtrip() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("hosts");
+
+        // -- add Bucket host (no prefix) --
+        let id = add_bucket_host_cli(
+            root.clone(),
+            "my-bucket".into(),
+            "s3://my-bucket/rupu".into(),
+            None,
+        )
+        .expect("add_bucket_host_cli failed");
+        assert!(id.starts_with("host_"), "id should start with host_: {id}");
+
+        // -- host record must persist with correct Bucket transport --
+        let store = HostStore { root: root.clone() };
+        let hosts = store.list().expect("store.list failed");
+        let h = hosts
+            .iter()
+            .find(|h| h.id == id)
+            .expect("bucket host not found in store");
+        assert_eq!(h.name, "my-bucket");
+        assert!(h.token_hash.is_none(), "Bucket hosts must not store a token");
+        match &h.transport {
+            HostTransport::Bucket { url, prefix } => {
+                assert_eq!(url, "s3://my-bucket/rupu");
+                assert!(prefix.is_none(), "prefix should be None");
+            }
+            other => panic!("expected Bucket transport, got {other:?}"),
+        }
+
+        // -- add Bucket host with prefix --
+        let id2 = add_bucket_host_cli(
+            root.clone(),
+            "my-bucket-prefixed".into(),
+            "gs://my-gcs-bucket".into(),
+            Some("runs/prod/".into()),
+        )
+        .expect("add_bucket_host_cli with prefix failed");
+
+        let hosts2 = store.list().expect("store.list 2 failed");
+        let h2 = hosts2
+            .iter()
+            .find(|h| h.id == id2)
+            .expect("second bucket host not found");
+        match &h2.transport {
+            HostTransport::Bucket { url, prefix } => {
+                assert_eq!(url, "gs://my-gcs-bucket");
+                assert_eq!(prefix.as_deref(), Some("runs/prod/"));
+            }
+            other => panic!("expected Bucket transport for id2, got {other:?}"),
+        }
+
+        // -- both appear in list with correct labels --
+        let rows = list_hosts(root.clone()).expect("list_hosts failed");
+        let found1 = rows.iter().find(|(i, _, _)| i == &id);
+        let found2 = rows.iter().find(|(i, _, _)| i == &id2);
+        assert!(found1.is_some(), "host {id} missing from list");
+        assert!(found2.is_some(), "host {id2} missing from list");
+        assert_eq!(found1.unwrap().2, "bucket:s3://my-bucket/rupu");
+        assert_eq!(found2.unwrap().2, "bucket:gs://my-gcs-bucket");
     }
 
     #[test]

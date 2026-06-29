@@ -28,6 +28,7 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::Subcommand;
 use futures_util::{SinkExt, StreamExt};
+use rupu_cp::host::bucket::{Bucket, ControlEnvelope, ObjectStoreBucket};
 use rupu_cp::node::protocol::{ArtifactFile, Auth, Frame, RunSpec, RunSpecKind};
 use rupu_workspace::{enroll_node, HostStore};
 use tokio_tungstenite::tungstenite::Message;
@@ -82,6 +83,37 @@ pub enum NodeAction {
         #[arg(long)]
         cp_url: Option<String>,
     },
+
+    /// Poll a bucket dead-drop, atomically claim jobs, run them locally,
+    /// write results back, and apply queued control messages.
+    Pull(PullArgs),
+}
+
+/// Args for `rupu node pull`.
+#[derive(clap::Args, Debug)]
+pub struct PullArgs {
+    /// Bucket URL (e.g. `s3://my-bucket`, `gs://my-bucket`).
+    /// Credentials are resolved via the environment credential chain.
+    #[arg(long)]
+    pub bucket: String,
+
+    /// Optional key prefix within the bucket (e.g. `rupu/host-1`).
+    #[arg(long)]
+    pub prefix: Option<String>,
+
+    /// Override the worker identity.  Default: the stable `node_<ULID>`
+    /// persisted at `~/.rupu/node_id` (same as the tunnel node agent).
+    #[arg(long)]
+    pub host_id: Option<String>,
+
+    /// Claim all currently-available jobs, drain them to terminal (bounded),
+    /// then exit.  In loop mode (the default) the agent runs forever.
+    #[arg(long)]
+    pub once: bool,
+
+    /// Poll interval between ticks in seconds (loop mode only).
+    #[arg(long, default_value = "15")]
+    pub interval: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +131,19 @@ struct FileOffsets {
     unit_checkpoints: u64,
 }
 
+/// Per-run state for the bucket pull agent.  Extends [`FileOffsets`] with
+/// per-kind result sequence counters and a last-applied-control-seq tracker.
+struct BucketRunState {
+    child: tokio::process::Child,
+    offsets: FileOffsets,
+    /// Monotonic counter: how many result objects we've written for each kind.
+    events_seq: u64,
+    step_results_seq: u64,
+    unit_checkpoints_seq: u64,
+    /// Highest control seq we've already applied (`None` = none applied yet).
+    last_ctrl_seq: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------
 // Public handler
 // ---------------------------------------------------------------------------
@@ -108,6 +153,7 @@ pub async fn handle(args: NodeArgs) -> ExitCode {
         Some(NodeAction::Enroll { name, cp_url }) => {
             enroll_inner(&name, cp_url.as_deref())
         }
+        Some(NodeAction::Pull(pull_args)) => pull(pull_args).await,
         None => {
             let Some(cp_url) = args.cp_url else {
                 eprintln!(
@@ -697,6 +743,286 @@ fn read_terminal_status(run_json: &Path) -> Option<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// Bucket pull agent helpers (unit-testable)
+// ---------------------------------------------------------------------------
+
+/// Build the result object key for a drained JSONL file chunk.
+///
+/// Format: `"<kind>.<seq:04>.jsonl"` — e.g. `"events.0001.jsonl"`.
+/// The four-digit zero-padding keeps keys lexicographically ordered up to
+/// 9 999 chunks per kind per run.
+pub(crate) fn result_key(kind: &str, seq: u64) -> String {
+    format!("{kind}.{seq:04}.jsonl")
+}
+
+/// Return the next control sequence number to assign given an existing list.
+///
+/// Returns `max(seq) + 1` if `existing` is non-empty, or `0` if empty.
+/// Useful for the connector side when writing new control envelopes and
+/// for verifying the last-applied watermark in tests.
+// Called only in unit tests; suppress the dead_code lint for non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn next_control_seq(existing: &[(u64, Vec<u8>)]) -> u64 {
+    existing
+        .iter()
+        .map(|(s, _)| *s + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Bucket pull agent loop
+// ---------------------------------------------------------------------------
+
+/// Maximum polling iterations in `--once` mode before giving up on
+/// active runs that have not reached a terminal status.
+/// 200 × 250 ms = 50 s.
+const ONCE_MAX_ITERS: u32 = 200;
+
+async fn pull(args: PullArgs) -> anyhow::Result<()> {
+    let bucket = ObjectStoreBucket::from_url(&args.bucket, args.prefix.as_deref())
+        .context("build ObjectStoreBucket from url")?;
+    let exe = std::env::current_exe().context("resolve current executable path")?;
+    let global = crate::paths::global_dir()?;
+    let runs_root = global.join("runs");
+    let host_id = resolve_node_id(args.host_id).context("resolve host id")?;
+
+    info!(
+        host_id = %host_id,
+        bucket = %args.bucket,
+        once = args.once,
+        interval = args.interval,
+        "node pull: starting"
+    );
+
+    let mut active: HashMap<String, BucketRunState> = HashMap::new();
+    let mut once_iters: u32 = 0;
+
+    loop {
+        // ── Step 1: claim new jobs ────────────────────────────────────────────
+        let job_ids = bucket.list_jobs().await.context("list_jobs")?;
+        for run_id in job_ids {
+            let won = bucket
+                .claim_job(&run_id, &host_id)
+                .await
+                .context("claim_job")?;
+            if !won {
+                info!(run_id = %run_id, "node pull: job already claimed by another node");
+                continue;
+            }
+            info!(run_id = %run_id, "node pull: claimed job");
+            let job_bytes = bucket.get_job(&run_id).await.context("get_job")?;
+            let spec: RunSpec =
+                serde_json::from_slice(&job_bytes).context("deserialize RunSpec")?;
+            match spawn_run(&exe, &run_id, &spec) {
+                Ok(child) => {
+                    active.insert(
+                        run_id.clone(),
+                        BucketRunState {
+                            child,
+                            offsets: FileOffsets {
+                                events: 0,
+                                step_results: 0,
+                                unit_checkpoints: 0,
+                            },
+                            events_seq: 0,
+                            step_results_seq: 0,
+                            unit_checkpoints_seq: 0,
+                            last_ctrl_seq: None,
+                        },
+                    );
+                    info!(run_id = %run_id, "node pull: run spawned");
+                }
+                Err(e) => {
+                    warn!(run_id = %run_id, error = %e, "node pull: spawn failed");
+                    let _ = bucket.put_finished(&run_id, "failed").await;
+                }
+            }
+        }
+
+        // ── Step 2: drain active runs ─────────────────────────────────────────
+        let run_ids: Vec<String> = active.keys().cloned().collect();
+        let mut finished: Vec<String> = Vec::new();
+
+        for rid in &run_ids {
+            let state = active.get_mut(rid).expect("rid came from active.keys()");
+            let run_dir = runs_root.join(rid);
+
+            // Drain events.jsonl
+            let lines =
+                drain_new_lines(&run_dir.join("events.jsonl"), &mut state.offsets.events);
+            if !lines.is_empty() {
+                let body = lines.join("\n") + "\n";
+                let key = result_key("events", state.events_seq);
+                if let Err(e) = bucket.put_result(rid, &key, body.as_bytes()).await {
+                    warn!(run_id = %rid, key = %key, error = %e, "node pull: put events result failed");
+                } else {
+                    state.events_seq += 1;
+                }
+            }
+
+            // Drain step_results.jsonl
+            let lines = drain_new_lines(
+                &run_dir.join("step_results.jsonl"),
+                &mut state.offsets.step_results,
+            );
+            if !lines.is_empty() {
+                let body = lines.join("\n") + "\n";
+                let key = result_key("step_results", state.step_results_seq);
+                if let Err(e) = bucket.put_result(rid, &key, body.as_bytes()).await {
+                    warn!(run_id = %rid, key = %key, error = %e, "node pull: put step_results result failed");
+                } else {
+                    state.step_results_seq += 1;
+                }
+            }
+
+            // Drain unit_checkpoints.jsonl
+            let lines = drain_new_lines(
+                &run_dir.join("unit_checkpoints.jsonl"),
+                &mut state.offsets.unit_checkpoints,
+            );
+            if !lines.is_empty() {
+                let body = lines.join("\n") + "\n";
+                let key = result_key("unit_checkpoints", state.unit_checkpoints_seq);
+                if let Err(e) = bucket.put_result(rid, &key, body.as_bytes()).await {
+                    warn!(run_id = %rid, key = %key, error = %e, "node pull: put unit_checkpoints result failed");
+                } else {
+                    state.unit_checkpoints_seq += 1;
+                }
+            }
+
+            // Upload run.json (always — reflects current in-progress status).
+            let run_json_path = run_dir.join("run.json");
+            if let Ok(body) = std::fs::read(&run_json_path) {
+                if let Err(e) = bucket.put_result(rid, "run.json", &body).await {
+                    warn!(run_id = %rid, error = %e, "node pull: put run.json failed");
+                }
+            }
+
+            // Drain queued control messages beyond the last-applied seq.
+            match bucket.list_control(rid).await {
+                Ok(controls) => {
+                    for (seq, bytes) in &controls {
+                        // Skip already-applied controls.
+                        if let Some(last) = state.last_ctrl_seq {
+                            if *seq <= last {
+                                continue;
+                            }
+                        }
+                        match serde_json::from_slice::<ControlEnvelope>(bytes) {
+                            Ok(envelope) => {
+                                match envelope.kind.as_str() {
+                                    "cancel" => {
+                                        info!(run_id = %rid, seq, "node pull: cancel");
+                                        if let Err(e) = state.child.start_kill() {
+                                            warn!(run_id = %rid, error = %e, "node pull: kill child failed");
+                                        }
+                                        // Cancel: advance unconditionally — the process
+                                        // is gone (or already dead) regardless of kill() error.
+                                        state.last_ctrl_seq = Some(*seq);
+                                    }
+                                    "approve" => {
+                                        info!(run_id = %rid, seq, "node pull: approve");
+                                        let argv = build_control_argv(
+                                            ControlKind::Approve,
+                                            rid,
+                                            envelope.mode.as_deref().unwrap_or(""),
+                                            None,
+                                        );
+                                        match spawn_control(&exe, &argv) {
+                                            Ok(child) => {
+                                                state.child = child;
+                                                // Advance ONLY on successful spawn so a
+                                                // transient spawn error causes a retry
+                                                // next tick instead of stranding the run.
+                                                state.last_ctrl_seq = Some(*seq);
+                                            }
+                                            Err(e) => {
+                                                warn!(run_id = %rid, error = %e, "node pull: approve spawn failed");
+                                                // Leave last_ctrl_seq unchanged → retry.
+                                            }
+                                        }
+                                    }
+                                    "reject" => {
+                                        info!(run_id = %rid, seq, "node pull: reject");
+                                        let argv = build_control_argv(
+                                            ControlKind::Reject,
+                                            rid,
+                                            "",
+                                            envelope.reason.as_deref(),
+                                        );
+                                        match spawn_control(&exe, &argv) {
+                                            Ok(child) => {
+                                                state.child = child;
+                                                // Advance ONLY on successful spawn.
+                                                state.last_ctrl_seq = Some(*seq);
+                                            }
+                                            Err(e) => {
+                                                warn!(run_id = %rid, error = %e, "node pull: reject spawn failed");
+                                                // Leave last_ctrl_seq unchanged → retry.
+                                            }
+                                        }
+                                    }
+                                    other => {
+                                        warn!(run_id = %rid, seq, kind = other, "node pull: unknown control kind (ignored)");
+                                        // Advance past unknown kinds so they are never
+                                        // reprocessed (the kind won't become known on retry).
+                                        state.last_ctrl_seq = Some(*seq);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(run_id = %rid, seq, error = %e, "node pull: failed to deserialize ControlEnvelope (skipped)");
+                                // Advance past corrupt envelopes so they are never
+                                // reprocessed (the bytes won't change on retry).
+                                state.last_ctrl_seq = Some(*seq);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(run_id = %rid, error = %e, "node pull: list_control failed");
+                }
+            }
+
+            // Check for terminal status → put_finished + remove from active.
+            if let Some((status, _body)) = read_terminal_status(&run_json_path) {
+                info!(run_id = %rid, status = %status, "node pull: run finished");
+                if let Err(e) = bucket.put_finished(rid, &status).await {
+                    warn!(run_id = %rid, status = %status, error = %e, "node pull: put_finished failed");
+                }
+                finished.push(rid.clone());
+            }
+        }
+
+        for rid in &finished {
+            active.remove(rid);
+        }
+
+        // ── Loop control ──────────────────────────────────────────────────────
+        if args.once {
+            if active.is_empty() {
+                info!("node pull: --once: all runs terminal, exiting");
+                break;
+            }
+            once_iters += 1;
+            if once_iters >= ONCE_MAX_ITERS {
+                warn!(
+                    active = active.len(),
+                    "node pull: --once: max-iterations reached, exiting with active runs"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_secs(args.interval)).await;
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -925,5 +1251,45 @@ mod tests {
     #[test]
     fn next_backoff_caps_at_60() {
         assert_eq!(next_backoff(40), 60);
+    }
+
+    // ------------------------------------------------------------------
+    // result_key: bucket result object key helper
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn result_key_zero_padded_four_digits() {
+        assert_eq!(result_key("events", 0), "events.0000.jsonl");
+        assert_eq!(result_key("events", 1), "events.0001.jsonl");
+        assert_eq!(result_key("events", 42), "events.0042.jsonl");
+        assert_eq!(result_key("step_results", 9999), "step_results.9999.jsonl");
+        assert_eq!(result_key("unit_checkpoints", 100), "unit_checkpoints.0100.jsonl");
+    }
+
+    #[test]
+    fn result_key_overflows_past_9999() {
+        // Beyond four digits the seq simply expands — still monotonic.
+        assert_eq!(result_key("events", 10000), "events.10000.jsonl");
+    }
+
+    // ------------------------------------------------------------------
+    // next_control_seq: watermark helper
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn next_control_seq_empty_returns_zero() {
+        assert_eq!(next_control_seq(&[]), 0);
+    }
+
+    #[test]
+    fn next_control_seq_single_item() {
+        assert_eq!(next_control_seq(&[(0, vec![])]), 1);
+        assert_eq!(next_control_seq(&[(5, vec![])]), 6);
+    }
+
+    #[test]
+    fn next_control_seq_multiple_items_returns_max_plus_one() {
+        let items = vec![(1u64, vec![]), (3u64, vec![]), (2u64, vec![])];
+        assert_eq!(next_control_seq(&items), 4, "should be max(1,3,2)+1=4");
     }
 }
