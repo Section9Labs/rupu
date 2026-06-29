@@ -69,6 +69,7 @@ fn transport_fields(t: &HostTransport) -> (String, Option<String>) {
             };
             ("ssh".to_string(), Some(addr))
         }
+        HostTransport::Bucket { url, .. } => ("bucket".to_string(), Some(url.clone())),
     }
 }
 

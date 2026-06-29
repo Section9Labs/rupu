@@ -294,6 +294,9 @@ impl HostRegistry {
                         .into(),
                 )),
             },
+            HostTransport::Bucket { .. } => Err(HostConnectorError::Invalid(
+                "bucket transport not yet wired (slice 2b task 4)".into(),
+            )),
         }
     }
 }
