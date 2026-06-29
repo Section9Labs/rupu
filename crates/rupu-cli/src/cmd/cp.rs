@@ -85,6 +85,12 @@ pub async fn handle(action: Action) -> ExitCode {
             let session_sender: Arc<dyn rupu_cp::session_sender::SessionSender> =
                 Arc::new(crate::cp_session_sender::SubprocessSessionSender { exe: exe.clone() });
 
+            // Adapter for rupu-cp's SessionMutator port: shells
+            // `rupu session archive|restore|delete <id>` using this same binary.
+            let session_mutator: Option<Arc<dyn rupu_cp::session_mutator::SessionMutator>> = Some(
+                Arc::new(crate::cp_session_mutator::SubprocessSessionMutator { exe: exe.clone() }),
+            );
+
             // Adapter for rupu-cp's SessionStarter port: shells
             // `rupu session start <agent> … --detach` using this same binary.
             let session_starter: Option<Arc<dyn rupu_cp::session_starter::SessionStarter>> = Some(
@@ -120,7 +126,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 agent_launcher,
                 session_starter,
                 generator,
-                session_mutator: None, // wired in Task 6
+                session_mutator,
             })
             .await;
 
