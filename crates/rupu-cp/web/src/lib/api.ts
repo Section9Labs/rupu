@@ -1312,6 +1312,18 @@ export const api = {
       body: JSON.stringify({ prompt }),
     });
   },
+  /** Archive an active session (hides it from the active list). */
+  async archiveSession(id: string): Promise<void> {
+    await request(`/api/sessions/${encodeURIComponent(id)}/archive`, { method: 'POST' });
+  },
+  /** Restore a previously-archived session back to the active list. */
+  async restoreSession(id: string): Promise<void> {
+    await request(`/api/sessions/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+  },
+  /** Permanently delete a session and its on-disk data. */
+  async deleteSession(id: string): Promise<void> {
+    await request(`/api/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  },
 
   // --- Workers ---
   getWorkers(): Promise<WorkerView[]> {

@@ -41,6 +41,7 @@ export default function Sessions() {
   // Default to 'local' → fast server-side path; ALL_HOSTS → fan-out.
   const [hostFilter, setHostFilter] = useState<string>('local');
   const [hosts, setHosts] = useState<HostView[] | null>(null);
+  const [rowError, setRowError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -88,6 +89,41 @@ export default function Sessions() {
   };
 
   const { sentinelRef, loading } = useInfiniteScroll({ hasMore, loadMore });
+
+  // Row-level archive / restore / delete — each refetches after success.
+  async function handleRowArchive(id: string) {
+    setRowError(null);
+    try {
+      await api.archiveSession(id);
+      void refresh();
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : 'Archive failed');
+    }
+  }
+
+  async function handleRowRestore(id: string) {
+    setRowError(null);
+    try {
+      await api.restoreSession(id);
+      void refresh();
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : 'Restore failed');
+    }
+  }
+
+  async function handleRowDelete(id: string) {
+    if (!window.confirm('Permanently delete this session and its transcripts? This cannot be undone.')) return;
+    setRowError(null);
+    try {
+      await api.deleteSession(id);
+      void refresh();
+    } catch (e) {
+      setRowError(e instanceof Error ? e.message : 'Delete failed');
+    }
+  }
+
+  // Action column — changes shape based on current tab (active vs archived).
+  const actionColumn = buildActionColumn(tab, handleRowArchive, handleRowRestore, handleRowDelete);
 
   const rows = sessions ?? [];
 
@@ -143,9 +179,9 @@ export default function Sessions() {
         </select>
       </div>
 
-      {error && (
+      {(error || rowError) && (
         <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
+          {error ?? rowError}
         </div>
       )}
 
@@ -174,7 +210,7 @@ export default function Sessions() {
               first, so source order already satisfies the default. Clicking any
               header re-sorts client-side. */}
           <SortableTable<SessionSummary>
-            columns={SESSION_COLUMNS}
+            columns={[...SESSION_BASE_COLUMNS, actionColumn]}
             rows={rows}
             rowKey={(s) => s.session_id}
           />
@@ -197,7 +233,7 @@ function sessionDurationMs(s: SessionSummary): number | null {
   return Math.max(0, end - start);
 }
 
-const SESSION_COLUMNS: Column<SessionSummary>[] = [
+const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
   {
     key: 'status',
     header: 'Status',
@@ -317,22 +353,65 @@ const SESSION_COLUMNS: Column<SessionSummary>[] = [
       <span className="text-ink-dim">{durationBetween(s.created_at, s.updated_at)}</span>
     ),
   },
-  {
+];
+
+/** Build the per-row action column. Recreated whenever the tab changes. */
+function buildActionColumn(
+  tab: Tab,
+  onArchive: (id: string) => void,
+  onRestore: (id: string) => void,
+  onDelete: (id: string) => void,
+): Column<SessionSummary> {
+  return {
     key: 'action',
     header: '',
     align: 'right',
-    width: 'w-24',
-    render: (s) =>
-      s.active_run_id ? (
-        <Link
-          to={`/runs/${encodeURIComponent(s.active_run_id)}`}
-          className="inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-info-bg text-info ring-info/30 hover:bg-info-bg"
+    width: 'w-48',
+    render: (s) => (
+      <div
+        className="flex items-center justify-end gap-1"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {s.active_run_id && (
+          <Link
+            to={`/runs/${encodeURIComponent(s.active_run_id)}`}
+            className="inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1 bg-info-bg text-info ring-info/30 hover:bg-info-bg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            active run
+          </Link>
+        )}
+        {tab === 'active' ? (
+          <button
+            type="button"
+            onClick={() => onArchive(s.session_id)}
+            className="rounded px-2 py-0.5 text-note font-medium ring-1 bg-panel text-ink-dim ring-border hover:bg-surface-hover"
+            aria-label={`Archive session ${s.session_id}`}
+          >
+            Archive
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onRestore(s.session_id)}
+            className="rounded px-2 py-0.5 text-note font-medium ring-1 bg-panel text-ink-dim ring-border hover:bg-surface-hover"
+            aria-label={`Restore session ${s.session_id}`}
+          >
+            Restore
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => onDelete(s.session_id)}
+          className="rounded px-2 py-0.5 text-note font-medium ring-1 bg-err-bg text-err ring-err/30 hover:bg-err-bg"
+          aria-label={`Delete session ${s.session_id}`}
         >
-          active run
-        </Link>
-      ) : null,
-  },
-];
+          Delete
+        </button>
+      </div>
+    ),
+  };
+}
 
 function EmptyState({ tab }: { tab: Tab }) {
   return (
