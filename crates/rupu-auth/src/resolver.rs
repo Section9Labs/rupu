@@ -301,13 +301,19 @@ impl KeychainResolver {
                         Err(rupu_keychain_acl::AclError::NotFound { .. }) => {
                             if mode == AuthMode::ApiKey {
                                 if let Some(lb) = legacy_base {
-                                    if let Ok(bytes) =
-                                        rupu_keychain_acl::get_generic_password(service, lb)
-                                    {
-                                        let s = String::from_utf8(bytes).map_err(|e| {
-                                            anyhow::anyhow!("keychain legacy read: {e}")
-                                        })?;
-                                        return Ok(Some(StoredCredential::api_key(s)));
+                                    match rupu_keychain_acl::get_generic_password(service, lb) {
+                                        Ok(bytes) => {
+                                            let s = String::from_utf8(bytes).map_err(|e| {
+                                                anyhow::anyhow!("keychain legacy read: {e}")
+                                            })?;
+                                            return Ok(Some(StoredCredential::api_key(s)));
+                                        }
+                                        Err(rupu_keychain_acl::AclError::NotFound { .. }) => {}
+                                        Err(e) => {
+                                            return Err(anyhow::anyhow!(
+                                                "keychain legacy read: {e}"
+                                            ))
+                                        }
                                     }
                                 }
                             }
@@ -331,8 +337,14 @@ impl KeychainResolver {
                                         service: service.clone(),
                                         account: lb.to_string(),
                                     };
-                                    if let Ok(s) = self.entry(&lk)?.get_password() {
-                                        return Ok(Some(StoredCredential::api_key(s)));
+                                    match self.entry(&lk)?.get_password() {
+                                        Ok(s) => return Ok(Some(StoredCredential::api_key(s))),
+                                        Err(keyring::Error::NoEntry) => {}
+                                        Err(e) => {
+                                            return Err(anyhow::anyhow!(
+                                                "keychain legacy read: {e}"
+                                            ))
+                                        }
                                     }
                                 }
                             }
@@ -393,7 +405,7 @@ impl KeychainResolver {
         sc: &StoredCredential,
     ) -> Result<()> {
         let account = format!("{name}/{}", mode.as_str());
-        let payload = serde_json::to_string(sc)?;
+        let payload = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
         self.write_account(&account, &payload)
     }
 
@@ -405,7 +417,7 @@ impl KeychainResolver {
 
     /// True if a named credential exists for `name`/`mode`.
     pub async fn peek_named(&self, name: &str, mode: AuthMode) -> bool {
-        self.read_account(name, None, mode)
+        self.read_account(name, Some(name), mode)
             .map(|o| o.is_some())
             .unwrap_or(false)
     }
@@ -689,13 +701,31 @@ mod resolver_named_tests {
     use super::*;
     use rupu_providers::auth::AuthCredentials;
 
+    /// Serialise all env-mutating tests through a single lock so they
+    /// cannot race each other over shared process-global env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: removes the listed env vars on drop, even on panic.
+    struct EnvGuard(Vec<&'static str>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for k in &self.0 {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn named_provider_reads_from_json_file() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND"]);
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         std::fs::write(&path, r#"{ "oracle/api-key": "sk-oracle-123" }"#).unwrap();
         std::env::set_var("RUPU_AUTH_FILE", &path);
         std::env::set_var("RUPU_AUTH_BACKEND", "file");
+
         let r = KeychainResolver::new();
         let (mode, creds) = r.get("oracle", None).await.unwrap();
         assert_eq!(mode, rupu_providers::AuthMode::ApiKey);
@@ -705,17 +735,19 @@ mod resolver_named_tests {
             }
             _ => panic!("expected api key"),
         }
-        std::env::remove_var("RUPU_AUTH_FILE");
-        std::env::remove_var("RUPU_AUTH_BACKEND");
     }
 
     #[tokio::test]
     async fn named_provider_falls_back_to_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND", "RUPU_ACME_API_KEY"]);
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
         std::env::set_var("RUPU_AUTH_FILE", &path);
         std::env::set_var("RUPU_AUTH_BACKEND", "file");
         std::env::set_var("RUPU_ACME_API_KEY", "sk-env-456");
+
         let r = KeychainResolver::new();
         let (_mode, creds) = r.get("acme", None).await.unwrap();
         match creds {
@@ -724,9 +756,6 @@ mod resolver_named_tests {
             }
             _ => panic!("expected api key"),
         }
-        std::env::remove_var("RUPU_AUTH_FILE");
-        std::env::remove_var("RUPU_AUTH_BACKEND");
-        std::env::remove_var("RUPU_ACME_API_KEY");
     }
 }
 
