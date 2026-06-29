@@ -1004,23 +1004,66 @@ mod tunnel_connector {
         assert!(matches!(err, HostConnectorError::Invalid(_)));
     }
 
-    /// `approve_run` and `reject_run` return `Invalid` (unsupported).
+    /// `approve_run` sends `Frame::Approve` with the correct run_id and mode.
     #[tokio::test]
-    async fn unsupported_approval_ops_return_invalid() {
+    async fn approve_run_sends_approve_frame() {
         let dir = tempdir().unwrap();
-        let (conn, _rx, _store) = setup("node-noapprove", dir.path());
+        let (conn, mut rx, _store) = setup("node-approve", dir.path());
 
-        let err = conn
-            .approve_run("run_x", "bypass")
+        conn.approve_run("run_01ABC", "bypass")
             .await
-            .expect_err("approve_run should fail");
-        assert!(matches!(err, HostConnectorError::Invalid(_)));
+            .expect("approve_run should succeed");
 
-        let err = conn
-            .reject_run("run_x", None)
+        let frame = rx.recv().await.expect("should receive a frame");
+        match frame {
+            Frame::Approve { run_id, mode } => {
+                assert_eq!(run_id, "run_01ABC");
+                assert_eq!(mode, "bypass");
+            }
+            other => panic!("expected Frame::Approve, got {other:?}"),
+        }
+    }
+
+    /// `reject_run` sends `Frame::Reject` with the correct run_id and reason.
+    #[tokio::test]
+    async fn reject_run_sends_reject_frame() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store) = setup("node-reject", dir.path());
+
+        conn.reject_run("run_01ABC", Some("nope"))
             .await
-            .expect_err("reject_run should fail");
-        assert!(matches!(err, HostConnectorError::Invalid(_)));
+            .expect("reject_run should succeed");
+
+        match rx.recv().await.expect("should receive a frame") {
+            Frame::Reject { run_id, reason } => {
+                assert_eq!(run_id, "run_01ABC");
+                assert_eq!(reason.as_deref(), Some("nope"));
+            }
+            other => panic!("expected Frame::Reject, got {other:?}"),
+        }
+    }
+
+    /// `approve_run` and `reject_run` on an OFFLINE node return `Unreachable`.
+    #[tokio::test]
+    async fn approve_reject_offline_node_returns_unreachable() {
+        let dir = tempdir().unwrap();
+        let run_store = Arc::new(RunStore::new(dir.path().join("runs")));
+        // Do NOT register the node → it is offline.
+        let registry = Arc::new(NodeRegistry::new());
+        let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        let conn = TunnelHostConnector::new(
+            "node-offline",
+            registry,
+            mirror,
+            run_store,
+            rupu_config::PricingConfig::default(),
+        );
+
+        let a = conn.approve_run("run_01ABC", "").await;
+        assert!(matches!(a, Err(HostConnectorError::Unreachable(_))));
+
+        let r = conn.reject_run("run_01ABC", None).await;
+        assert!(matches!(r, Err(HostConnectorError::Unreachable(_))));
     }
 
     /// `launch_agent` creates a mirror run with `RunSpecKind::Agent`.
