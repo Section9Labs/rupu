@@ -124,6 +124,7 @@ impl HostRegistry {
             },
             created_at: chrono::Utc::now().to_rfc3339(),
             last_seen_at: None,
+            token_hash: None,
         };
 
         // Spec §Errors+security: warn when the transport is unencrypted.
@@ -194,6 +195,9 @@ impl HostRegistry {
                 Ok(Arc::new(HttpHostConnector::new(base_url.clone(), token)))
             }
             HostTransport::Local => Ok(Arc::clone(&self.local)),
+            HostTransport::Tunnel { .. } => Err(HostConnectorError::Invalid(
+                "tunnel hosts are not yet resolvable via HostRegistry".to_string(),
+            )),
         }
     }
 }

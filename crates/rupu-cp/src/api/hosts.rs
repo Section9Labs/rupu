@@ -60,6 +60,7 @@ fn transport_fields(t: &HostTransport) -> (String, Option<String>) {
         HostTransport::HttpCp { base_url } => {
             ("http_cp".to_string(), Some(base_url.clone()))
         }
+        HostTransport::Tunnel { node_id } => ("tunnel".to_string(), Some(node_id.clone())),
     }
 }
 
