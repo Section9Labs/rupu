@@ -294,9 +294,33 @@ impl HostRegistry {
                         .into(),
                 )),
             },
-            HostTransport::Bucket { .. } => Err(HostConnectorError::Invalid(
-                "bucket transport not yet wired (slice 2b task 4)".into(),
-            )),
+            HostTransport::Bucket { url, prefix } => {
+                match (&self.node_mirror, &self.run_store) {
+                    (Some(mir), Some(store)) => {
+                        let bucket = crate::host::bucket::ObjectStoreBucket::from_url(
+                            url,
+                            prefix.as_deref(),
+                        )
+                        .map_err(|e| {
+                            HostConnectorError::Invalid(format!("bad bucket url: {e}"))
+                        })?;
+                        Ok(std::sync::Arc::new(
+                            crate::host::bucket::BucketHostConnector::new(
+                                host.id.clone(),
+                                std::sync::Arc::new(bucket),
+                                std::sync::Arc::clone(mir),
+                                std::sync::Arc::clone(store),
+                                self.pricing.clone(),
+                            ),
+                        ))
+                    }
+                    _ => Err(HostConnectorError::Invalid(
+                        "bucket deps not wired (call HostRegistry::with_tunnel_deps; \
+                         mirror + run_store shared with tunnel)"
+                            .into(),
+                    )),
+                }
+            }
         }
     }
 }
