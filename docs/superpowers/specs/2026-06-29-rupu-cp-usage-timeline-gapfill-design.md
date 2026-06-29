@@ -113,7 +113,7 @@ already renders as a zero point.
 | Case | Behavior |
 |---|---|
 | No runs in store | Empty series (`[]`). |
-| Runs exist but none in the selected window | Full window drawn as all-zero buckets (since `fill_start = start`, `fill_end = now`). |
+| Runs exist but none in the selected window | Backend returns the full window as all-zero buckets (since `fill_start = start`, `fill_end = now`). **UI note:** the chart derives its model series from non-empty rows, so a *fully* idle window (zero rows anywhere in range) renders the existing "No usage recorded yet" placeholder rather than a flat-zero line. This is intentional/unchanged behavior — gap-fill only affects windows containing at least one active day (the common case). |
 | `all` range, runs since epoch unbounded | Series starts at first-ever run, weekly. |
 | Window younger than first run | Starts at first run, no pre-existence zeros. |
 | `fill_start == fill_end` (single day) | Exactly one bucket (today). |
