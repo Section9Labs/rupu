@@ -1,10 +1,13 @@
 //! `HostConnector` port — the trait every host adapter (local or HTTP) must
-//! implement, plus the shared types it works over.
+//! implement, plus the shared types and free helper functions used by multiple
+//! connector implementations.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt as _};
+use rupu_orchestrator::{executor::FileTailRunSource, runs::RunStore};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -168,4 +171,63 @@ pub trait HostConnector: Send + Sync {
         &self,
         path_and_query: &str,
     ) -> Result<serde_json::Value, HostConnectorError>;
+}
+
+// ── Shared read helpers ───────────────────────────────────────────────────────
+
+/// Open a live SSE byte-stream for `run_id`'s `events.jsonl`.
+///
+/// The caller is responsible for verifying that the run exists (and optionally
+/// that it belongs to the expected host/worker) **before** calling this
+/// function. This helper only opens the file tail and maps it into the
+/// `data: …\n\n` SSE frame format.
+pub(crate) async fn open_run_events_tail(
+    run_store: &Arc<RunStore>,
+    run_id: &str,
+) -> Result<EventByteStream, HostConnectorError> {
+    let events_path = run_store.events_path(run_id);
+    let source = FileTailRunSource::open(&events_path)
+        .await
+        .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+
+    let stream = source.map(|ev| {
+        let json = serde_json::to_string(&ev)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let frame = format!("data: {json}\n\n");
+        Ok::<Bytes, std::io::Error>(Bytes::from(frame.into_bytes()))
+    });
+
+    Ok(Box::pin(stream))
+}
+
+/// Read and parse a transcript `.jsonl` file into the standard
+/// `{ "events": [...], "summary": … }` shape.
+///
+/// Returns the same value regardless of whether it is called from a local or
+/// tunnel connector.  Basic path safety (no `..` components, must be `.jsonl`)
+/// is enforced here; callers that accept user-supplied paths must also apply
+/// their own `allowed_roots` checks before delegating.
+pub(crate) fn read_transcript_file(
+    path: &str,
+) -> Result<serde_json::Value, HostConnectorError> {
+    use std::path::Path;
+    let p = Path::new(path);
+    if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return Err(HostConnectorError::Invalid("not a .jsonl file".into()));
+    }
+    if p.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(HostConnectorError::Invalid(
+            "path must not contain ..".into(),
+        ));
+    }
+    if !p.exists() {
+        return Ok(serde_json::json!({ "events": [], "summary": null }));
+    }
+    let events: Vec<rupu_transcript::Event> =
+        rupu_transcript::JsonlReader::iter(p)
+            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?
+            .filter_map(Result::ok)
+            .collect();
+    let summary = rupu_transcript::JsonlReader::summary(p).ok();
+    Ok(serde_json::json!({ "events": events, "summary": summary }))
 }

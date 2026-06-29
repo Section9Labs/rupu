@@ -10,7 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 chrono.workspace = true
 tokio = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -45,5 +45,6 @@ rupu-transcript = { path = "../rupu-transcript" }
 httpmock.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-util = { workspace = true, features = ["io"] }
+tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 serde_json.workspace = true

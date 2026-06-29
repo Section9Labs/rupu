@@ -16,7 +16,7 @@ use crate::{
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures_util::future::join_all;
@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/hosts", get(list_hosts).post(add_host))
+        .route("/api/hosts/node", post(enroll_node_handler))
         .route("/api/hosts/:id", delete(remove_host))
 }
 
@@ -60,6 +61,7 @@ fn transport_fields(t: &HostTransport) -> (String, Option<String>) {
         HostTransport::HttpCp { base_url } => {
             ("http_cp".to_string(), Some(base_url.clone()))
         }
+        HostTransport::Tunnel { node_id } => ("tunnel".to_string(), Some(node_id.clone())),
     }
 }
 
@@ -210,6 +212,77 @@ async fn add_host(
         capabilities: None,
         active_run_count: 0,
         last_seen_at: host.last_seen_at,
+    }))
+}
+
+// ── Enroll-node types + handler ───────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct EnrollNodeBody {
+    name: String,
+}
+
+/// Response from `POST /api/hosts/node`.
+///
+/// `token` is the plaintext enrollment token — shown **once** here and never
+/// persisted (the store holds only the SHA-256 hash).  Callers must surface
+/// this to the operator and then discard it.  Do **not** log this response body.
+#[derive(Serialize)]
+pub struct EnrollNodeResponse {
+    pub host: HostView,
+    /// Full `rupu node` command the operator can paste on the target machine.
+    pub command: String,
+    /// One-time plaintext token.  Only present in this response.
+    pub token: String,
+}
+
+/// `POST /api/hosts/node` — enroll a new tunnel node.
+///
+/// Mints a one-time enrollment token and a `Tunnel` host record.  Returns the
+/// host view, the runnable command (with a placeholder for the CP's public WSS
+/// URL — substitute the real address before running), and the plaintext token.
+///
+/// Requires the `cp serve` launcher adapter; returns 501 on a read-only deploy.
+async fn enroll_node_handler(
+    State(s): State<AppState>,
+    Json(body): Json<EnrollNodeBody>,
+) -> ApiResult<Json<EnrollNodeResponse>> {
+    // Read-only guard — same pattern as add_host.
+    s.launcher
+        .as_ref()
+        .ok_or_else(|| ApiError::not_available("enrolling a node requires `rupu cp serve`"))?;
+
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+
+    let (host, token) = s
+        .hosts
+        .enroll_node(&name)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let (transport_kind, base_url) = transport_fields(&host.transport);
+
+    // AppState does not carry the CP's public URL; emit a clear placeholder so
+    // the operator knows they must substitute the real hostname/port.
+    let command = format!("rupu node --cp-url wss://<your-cp-host>:7878 --token {token}");
+
+    Ok(Json(EnrollNodeResponse {
+        host: HostView {
+            id: host.id,
+            name: host.name,
+            transport_kind,
+            base_url,
+            // Newly enrolled: offline until the node connects.
+            status: "offline".to_string(),
+            version: None,
+            capabilities: None,
+            active_run_count: 0,
+            last_seen_at: host.last_seen_at,
+        },
+        command,
+        token,
     }))
 }
 

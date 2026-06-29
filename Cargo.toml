@@ -109,6 +109,7 @@ url = "2"
 
 # Webhook receiver / control-plane (axum chosen for async-native + tower middleware)
 axum = "0.7"
+tokio-tungstenite = "0.24"
 tower-http = { version = "0.6", features = ["trace"] }
 rust-embed = "8"
 mime_guess = "2"

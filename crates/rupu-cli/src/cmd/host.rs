@@ -84,6 +84,7 @@ pub(crate) fn add_host(
         id: id.clone(),
         name,
         transport: HostTransport::HttpCp { base_url },
+        token_hash: None,
         created_at: chrono::Utc::now().to_rfc3339(),
         last_seen_at: None,
     };
@@ -111,6 +112,7 @@ pub(crate) fn list_hosts(
         let label = match &host.transport {
             HostTransport::Local => "local".to_string(),
             HostTransport::HttpCp { base_url } => base_url.clone(),
+            HostTransport::Tunnel { node_id } => format!("tunnel:{node_id}"),
         };
         rows.push((host.id, host.name, label));
     }

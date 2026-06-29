@@ -60,6 +60,8 @@ tempfile.workspace = true
 syntect.workspace = true
 minijinja.workspace = true
 reqwest.workspace = true
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 assert_fs.workspace = true

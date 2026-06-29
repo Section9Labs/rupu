@@ -34,12 +34,21 @@ pub struct AppState {
     /// read-only `rupu cp` works without a running daemon. `cp serve` replaces
     /// this with a fully-wired registry via [`AppState::with_hosts`].
     pub hosts: Arc<crate::host::registry::HostRegistry>,
+    /// Live tunnel connection registry. Shared across all WS handler tasks.
+    pub node_registry: Arc<crate::node::NodeRegistry>,
+    /// Mirror writer: streams artifact frames from tunnel nodes into the
+    /// central [`RunStore`] so node runs appear as first-class runs.
+    pub node_mirror: Arc<crate::node::NodeMirror>,
 }
 
 impl AppState {
     pub fn new(global_dir: PathBuf, pricing: rupu_config::PricingConfig) -> Self {
         let run_store = Arc::new(RunStore::new(global_dir.join("runs")));
         let workspace_dir = std::env::current_dir().unwrap_or_else(|_| global_dir.clone());
+
+        // Build tunnel deps first so they can be wired into the host registry.
+        let node_registry = Arc::new(crate::node::NodeRegistry::new());
+        let node_mirror = Arc::new(crate::node::NodeMirror::new(Arc::clone(&run_store)));
 
         // Build a read-only local-only registry. All launchers are `None` so
         // write-path operations return `HostConnectorError::Invalid`; list/get
@@ -56,10 +65,14 @@ impl AppState {
         let store = rupu_workspace::HostStore {
             root: global_dir.join("hosts"),
         };
-        let hosts = Arc::new(crate::host::registry::HostRegistry::new(
-            store,
-            Arc::new(local),
-        ));
+        let hosts = Arc::new(
+            crate::host::registry::HostRegistry::new(store, Arc::new(local)).with_tunnel_deps(
+                Arc::clone(&node_registry),
+                Arc::clone(&node_mirror),
+                Arc::clone(&run_store),
+                pricing.clone(),
+            ),
+        );
 
         Self {
             global_dir,
@@ -73,6 +86,8 @@ impl AppState {
             session_starter: None,
             generator: None,
             hosts,
+            node_registry,
+            node_mirror,
         }
     }
 

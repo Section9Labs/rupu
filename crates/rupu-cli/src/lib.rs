@@ -143,6 +143,8 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::host::Action,
     },
+    /// Dial-home tunnel agent + node enrollment.
+    Node(cmd::node::NodeArgs),
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -227,6 +229,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Watch(args) => cmd::watch::handle(args).await,
         Cmd::Completions { action } => cmd::completions::handle(action).await,
         Cmd::Host { action } => cmd::host::handle(action).await,
+        Cmd::Node(args) => cmd::node::handle(args).await,
     }
 }
 
@@ -291,6 +294,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::Host { .. } => output::formats::ensure_supported(
             "host",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Node(_) => output::formats::ensure_supported(
+            "node",
             format,
             &[output::formats::OutputFormat::Table],
         ),

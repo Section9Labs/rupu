@@ -371,17 +371,21 @@ impl RunListRow {
     }
 }
 
-/// Shared run-listing logic used by both HTTP handlers and
-/// [`crate::host::local::LocalHostConnector`].
+/// Shared run-listing logic used by both HTTP handlers and host connectors
+/// ([`crate::host::local::LocalHostConnector`],
+/// [`crate::host::tunnel::TunnelHostConnector`]).
 ///
-/// Filters by `workflow_only` (true = exclude event/cron-triggered runs) and
-/// the optional `lifecycle` group, sorts newest-first, and paginates.
+/// Filters by `workflow_only` (true = exclude event/cron-triggered runs), the
+/// optional `lifecycle` group, and the optional `worker_id` (pass `Some(id)`
+/// to scope results to a specific tunnel node; `None` returns all runs).
+/// Sorts newest-first and paginates.
 pub(crate) fn query_run_rows(
     store: &rupu_orchestrator::runs::RunStore,
     offset: usize,
     limit: usize,
     lifecycle: Option<&str>,
     workflow_only: bool,
+    worker_id: Option<&str>,
     pricing: &rupu_config::PricingConfig,
 ) -> Result<Vec<RunListRow>, rupu_orchestrator::RunStoreError> {
     let mut runs = store.list()?;
@@ -390,6 +394,9 @@ pub(crate) fn query_run_rows(
     }
     if let Some(lc) = lifecycle {
         runs.retain(|r| in_lifecycle(r.status, Some(lc)));
+    }
+    if let Some(wid) = worker_id {
+        runs.retain(|r| r.worker_id.as_deref() == Some(wid));
     }
     runs.sort_by_key(|r| std::cmp::Reverse(r.started_at));
     let page = crate::pagination::PageQuery {

@@ -75,6 +75,11 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        // Node WS endpoint sits OUTSIDE the bearer layer — it is token-gated
+        // by the Hello frame's enrollment token, not the API bearer.  Mounting
+        // it here (same level as /healthz) keeps it reachable even when a
+        // bearer token is configured.
+        .merge(crate::node::server::routes())
         .merge(api)
         // Registered routes above match first; anything else (incl. client-side
         // routes like `/runs/abc`) falls through to the embedded SPA.

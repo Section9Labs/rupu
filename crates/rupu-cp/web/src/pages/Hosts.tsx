@@ -20,24 +20,35 @@ import { HostStatusBadge } from '../components/ui/HostStatusBadge';
 const TRANSPORT_CLASS: Record<HostTransportKind, string> = {
   local:   'bg-surface text-ink-dim ring-border',
   http_cp: 'bg-info-bg text-info ring-info/30',
+  tunnel:  'bg-warn-bg text-warn ring-warn/30',
 };
 
 const TRANSPORT_LABEL: Record<HostTransportKind, string> = {
   local: 'local',
   http_cp: 'http-cp',
+  tunnel: 'tunnel',
 };
 
 // ---------------------------------------------------------------------------
 // Add-host form state
 // ---------------------------------------------------------------------------
 
+type AddMode = 'http_cp' | 'tunnel';
+
 interface AddForm {
+  mode: AddMode;
   name: string;
   base_url: string;
   token: string;
 }
 
-const EMPTY_FORM: AddForm = { name: '', base_url: '', token: '' };
+const EMPTY_FORM: AddForm = { mode: 'http_cp', name: '', base_url: '', token: '' };
+
+/// One-time enrollment result shown after a successful tunnel node enroll.
+interface EnrollResult {
+  command: string;
+  token: string;
+}
 
 // ---------------------------------------------------------------------------
 // Column definitions
@@ -153,6 +164,9 @@ export default function Hosts() {
   const [form, setForm] = useState<AddForm>(EMPTY_FORM);
   const [submitting, setSubmitting] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
+  // One-time enrollment result (tunnel mode only).
+  const [enrollResult, setEnrollResult] = useState<EnrollResult | null>(null);
+  const [copied, setCopied] = useState(false);
   const nameRef = useRef<HTMLInputElement>(null);
 
   function load() {
@@ -176,9 +190,30 @@ export default function Hosts() {
 
   async function handleAdd(e: React.FormEvent) {
     e.preventDefault();
-    if (!form.name.trim() || !form.base_url.trim()) return;
+    if (!form.name.trim()) return;
     setSubmitting(true);
     setAddError(null);
+
+    if (form.mode === 'tunnel') {
+      try {
+        const result = await api.enrollNode({ name: form.name.trim() });
+        setEnrollResult({ command: result.command, token: result.token });
+        setForm(EMPTY_FORM);
+        setShowAdd(false);
+        void load();
+      } catch (e: unknown) {
+        setAddError(e instanceof Error ? e.message : 'Failed to enroll node');
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
+    // HTTP CP mode.
+    if (!form.base_url.trim()) {
+      setSubmitting(false);
+      return;
+    }
     try {
       await api.addHost({
         name: form.name.trim(),
@@ -193,6 +228,13 @@ export default function Hosts() {
     } finally {
       setSubmitting(false);
     }
+  }
+
+  function handleCopyCommand(command: string) {
+    void navigator.clipboard.writeText(command).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
   }
 
   async function handleRemove(id: string) {
@@ -233,6 +275,44 @@ export default function Hosts() {
         </button>
       </header>
 
+      {/* One-time enrollment panel — shown after a successful tunnel node enroll */}
+      {enrollResult && (
+        <div
+          role="region"
+          aria-label="Node enrollment result"
+          className="mb-6 rounded-xl border border-warn/40 bg-warn-bg px-5 py-4 flex flex-col gap-3"
+        >
+          <p className="text-sm font-semibold text-warn">
+            ⚠ Token shown once — copy it now
+          </p>
+          <p className="text-xs text-ink-dim">
+            This token is displayed only once and cannot be recovered. Run the
+            command below on the target machine to connect the node to this
+            Control Plane.
+          </p>
+          <div className="flex items-start gap-2">
+            <code className="flex-1 rounded border border-border bg-bg px-3 py-2 text-xs font-mono text-ink break-all select-all">
+              {enrollResult.command}
+            </code>
+            <button
+              type="button"
+              aria-label="Copy command"
+              onClick={() => handleCopyCommand(enrollResult.command)}
+              className="shrink-0 rounded border border-border bg-panel px-3 py-2 text-xs font-medium text-ink hover:bg-bg transition-colors"
+            >
+              {copied ? 'Copied!' : 'Copy'}
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={() => { setEnrollResult(null); setCopied(false); }}
+            className="self-start text-xs text-ink-dim hover:text-ink"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Add host inline form */}
       {showAdd && (
         <form
@@ -240,11 +320,40 @@ export default function Hosts() {
           aria-label="Add host form"
           className="mb-6 rounded-xl border border-border bg-panel/70 px-5 py-4 flex flex-col gap-3"
         >
-          <h2 className="text-sm font-semibold text-ink">Add remote host</h2>
+          <h2 className="text-sm font-semibold text-ink">Add host</h2>
 
           {addError && (
             <p className="text-note text-err">{addError}</p>
           )}
+
+          {/* Transport type selector */}
+          <fieldset className="flex flex-col gap-1">
+            <legend className="text-note font-medium text-ink-dim mb-1">Type</legend>
+            <div className="flex gap-4">
+              <label className="flex items-center gap-1.5 text-sm text-ink cursor-pointer">
+                <input
+                  type="radio"
+                  name="host-mode"
+                  value="http_cp"
+                  checked={form.mode === 'http_cp'}
+                  onChange={() => setForm((f) => ({ ...f, mode: 'http_cp' }))}
+                  className="accent-brand-600"
+                />
+                HTTP CP
+              </label>
+              <label className="flex items-center gap-1.5 text-sm text-ink cursor-pointer">
+                <input
+                  type="radio"
+                  name="host-mode"
+                  value="tunnel"
+                  checked={form.mode === 'tunnel'}
+                  onChange={() => setForm((f) => ({ ...f, mode: 'tunnel' }))}
+                  className="accent-brand-600"
+                />
+                Tunnel node
+              </label>
+            </div>
+          </fieldset>
 
           <div className="flex flex-col gap-1">
             <label htmlFor="host-name" className="text-note font-medium text-ink-dim">
@@ -256,45 +365,56 @@ export default function Hosts() {
               type="text"
               value={form.name}
               onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-              placeholder="prod-east"
+              placeholder={form.mode === 'tunnel' ? 'my-box' : 'prod-east'}
               required
               className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
             />
           </div>
 
-          <div className="flex flex-col gap-1">
-            <label htmlFor="host-base-url" className="text-note font-medium text-ink-dim">
-              Base URL
-            </label>
-            <input
-              id="host-base-url"
-              type="url"
-              value={form.base_url}
-              onChange={(e) => setForm((f) => ({ ...f, base_url: e.target.value }))}
-              placeholder="https://rupu.example.com"
-              required
-              className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
-            />
-            {form.base_url.startsWith('http://') && (
-              <p className="text-note text-warn">
-                Use https for remote hosts — http is unencrypted.
-              </p>
-            )}
-          </div>
+          {form.mode === 'http_cp' && (
+            <>
+              <div className="flex flex-col gap-1">
+                <label htmlFor="host-base-url" className="text-note font-medium text-ink-dim">
+                  Base URL
+                </label>
+                <input
+                  id="host-base-url"
+                  type="url"
+                  value={form.base_url}
+                  onChange={(e) => setForm((f) => ({ ...f, base_url: e.target.value }))}
+                  placeholder="https://rupu.example.com"
+                  required
+                  className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
+                />
+                {form.base_url.startsWith('http://') && (
+                  <p className="text-note text-warn">
+                    Use https for remote hosts — http is unencrypted.
+                  </p>
+                )}
+              </div>
 
-          <div className="flex flex-col gap-1">
-            <label htmlFor="host-token" className="text-note font-medium text-ink-dim">
-              Token <span className="font-normal text-ink-mute">(optional)</span>
-            </label>
-            <input
-              id="host-token"
-              type="password"
-              value={form.token}
-              onChange={(e) => setForm((f) => ({ ...f, token: e.target.value }))}
-              placeholder="Bearer token for remote CP"
-              className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
-            />
-          </div>
+              <div className="flex flex-col gap-1">
+                <label htmlFor="host-token" className="text-note font-medium text-ink-dim">
+                  Token <span className="font-normal text-ink-mute">(optional)</span>
+                </label>
+                <input
+                  id="host-token"
+                  type="password"
+                  value={form.token}
+                  onChange={(e) => setForm((f) => ({ ...f, token: e.target.value }))}
+                  placeholder="Bearer token for remote CP"
+                  className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
+                />
+              </div>
+            </>
+          )}
+
+          {form.mode === 'tunnel' && (
+            <p className="text-xs text-ink-dim">
+              A one-time token and connection command will be shown after enrollment.
+              Run the command on the target machine to bring the node online.
+            </p>
+          )}
 
           <div className="flex items-center gap-2">
             <button
@@ -302,7 +422,9 @@ export default function Hosts() {
               disabled={submitting}
               className="rounded-lg bg-brand-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-60 transition-colors"
             >
-              {submitting ? 'Adding…' : 'Add host'}
+              {submitting
+                ? (form.mode === 'tunnel' ? 'Enrolling…' : 'Adding…')
+                : (form.mode === 'tunnel' ? 'Enroll node' : 'Add host')}
             </button>
             <button
               type="button"
