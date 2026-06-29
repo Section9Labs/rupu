@@ -429,7 +429,7 @@ git commit -m "refactor(providers): extract openai_wire chat-completions helpers
 
 ---
 
-### Task 2: Add `ProviderId::OpenAiCompatible` variant
+### Task 2: Add `ProviderId::OpenaiCompatible` variant
 
 The `LlmProvider` trait requires `fn provider_id(&self) -> ProviderId`, so the new client needs a stable enum identity. Add the variant and update all exhaustive matches.
 
@@ -441,7 +441,7 @@ The `LlmProvider` trait requires `fn provider_id(&self) -> ProviderId`, so the n
 - Modify: `crates/rupu-providers/src/auth/discovery.rs`
 
 **Interfaces:**
-- Produces: `ProviderId::OpenAiCompatible` (serde kebab-case → `"open-ai-compatible"`; we override the string forms below to `"openai-compatible"`).
+- Produces: `ProviderId::OpenaiCompatible` (lowercase `a`, matching the existing `OpenaiCodex` sibling so serde kebab-case → `"openai-compatible"`, consistent with `auth_key()` / `from_str`).
 
 - [ ] **Step 1: Add the variant and update the three `provider_id.rs` matches**
 
@@ -450,40 +450,40 @@ In `crates/rupu-providers/src/provider_id.rs`:
 Add to the enum (after `GithubCopilot`):
 ```rust
     GithubCopilot,
-    OpenAiCompatible,
+    OpenaiCompatible,
 }
 ```
 
 Add to `ALL`:
 ```rust
         ProviderId::GithubCopilot,
-        ProviderId::OpenAiCompatible,
+        ProviderId::OpenaiCompatible,
     ];
 ```
 
 `auth_key` arm:
 ```rust
             ProviderId::GithubCopilot => "github-copilot",
-            ProviderId::OpenAiCompatible => "openai-compatible",
+            ProviderId::OpenaiCompatible => "openai-compatible",
 ```
 
 `env_var_name` arm:
 ```rust
             ProviderId::GithubCopilot => "GITHUB_TOKEN",
-            ProviderId::OpenAiCompatible => "OPENAI_COMPATIBLE_API_KEY",
+            ProviderId::OpenaiCompatible => "OPENAI_COMPATIBLE_API_KEY",
 ```
 
 `from_str` arm (before the `_` catch-all):
 ```rust
             "github-copilot" | "copilot" => Ok(ProviderId::GithubCopilot),
-            "openai-compatible" => Ok(ProviderId::OpenAiCompatible),
+            "openai-compatible" => Ok(ProviderId::OpenaiCompatible),
 ```
 
 - [ ] **Step 2: Update the `registry.rs` exhaustive match**
 
 The OAuth-credential registry does not build openai-compatible clients (they need a `base_url` that the `CredentialSource` doesn't carry — they are built by the runtime factory). Add an arm to `create_provider`'s `match id` that returns a clear error. Add before the closing `}` of the match:
 ```rust
-            ProviderId::OpenAiCompatible => Err(ProviderError::NotImplemented {
+            ProviderId::OpenaiCompatible => Err(ProviderError::NotImplemented {
                 provider: "openai-compatible (built via runtime provider factory, not the OAuth registry)"
                     .to_string(),
             }),
@@ -494,14 +494,14 @@ The OAuth-credential registry does not build openai-compatible clients (they nee
 OpenAI-compatible model ids are arbitrary server paths; always pass the requested model through verbatim. Add to the `match provider.provider_id()`:
 ```rust
             ProviderId::GithubCopilot => true,
-            ProviderId::OpenAiCompatible => true,
+            ProviderId::OpenaiCompatible => true,
 ```
 
 - [ ] **Step 4: Update `model_tier.rs::for_provider`**
 
 Tier→model mapping is unknown for arbitrary endpoints; the configured `default_model` is used directly elsewhere, so the static tier names here are placeholders never consulted for this provider. Add an arm:
 ```rust
-            ProviderId::OpenAiCompatible => Self {
+            ProviderId::OpenaiCompatible => Self {
                 provider: id,
                 fast: "",
                 default: "",
@@ -515,7 +515,7 @@ Tier→model mapping is unknown for arbitrary endpoints; the configured `default
 No filesystem auto-discovery for openai-compatible providers (keys come from `auth.json`/env via the resolver). Add:
 ```rust
             ProviderId::GithubCopilot => discover_github_copilot(),
-            ProviderId::OpenAiCompatible => None,
+            ProviderId::OpenaiCompatible => None,
 ```
 
 - [ ] **Step 6: Verify compilation and existing provider tests**
@@ -528,7 +528,7 @@ Expected: PASS — including the existing `test_serde_roundtrip` / `test_from_st
 ```bash
 cargo fmt -p rupu-providers
 git add crates/rupu-providers/src/provider_id.rs crates/rupu-providers/src/registry.rs crates/rupu-providers/src/router.rs crates/rupu-providers/src/model_tier.rs crates/rupu-providers/src/auth/discovery.rs
-git commit -m "feat(providers): add ProviderId::OpenAiCompatible variant"
+git commit -m "feat(providers): add ProviderId::OpenaiCompatible variant"
 ```
 
 ---
@@ -615,7 +615,7 @@ mod tests {
     fn default_model_and_provider_id() {
         let c = client();
         assert_eq!(c.default_model(), "/raid/models/zai-org/GLM-5.2-FP8");
-        assert_eq!(c.provider_id(), crate::provider_id::ProviderId::OpenAiCompatible);
+        assert_eq!(c.provider_id(), crate::provider_id::ProviderId::OpenaiCompatible);
     }
 
     #[tokio::test]
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "/raid/models/zai-org/GLM-5.2-FP8");
         assert_eq!(models[0].context_window, 131072);
-        assert_eq!(models[0].provider, crate::provider_id::ProviderId::OpenAiCompatible);
+        assert_eq!(models[0].provider, crate::provider_id::ProviderId::OpenaiCompatible);
     }
 }
 ```
@@ -791,7 +791,7 @@ impl OpenAiCompatibleClient {
     fn model_info(&self, m: &OpenAiCompatibleModel) -> ModelInfo {
         ModelInfo {
             id: m.id.clone(),
-            provider: ProviderId::OpenAiCompatible,
+            provider: ProviderId::OpenaiCompatible,
             context_window: m.context_window,
             max_output_tokens: m.max_output,
             capabilities: vec![ModelCapability::ToolUse, ModelCapability::Streaming],
@@ -840,7 +840,7 @@ impl LlmProvider for OpenAiCompatibleClient {
     }
 
     fn provider_id(&self) -> ProviderId {
-        ProviderId::OpenAiCompatible
+        ProviderId::OpenaiCompatible
     }
 
     async fn list_models(&self) -> Vec<ModelInfo> {
