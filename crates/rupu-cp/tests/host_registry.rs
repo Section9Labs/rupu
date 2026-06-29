@@ -222,3 +222,76 @@ fn resolve_after_remove_returns_not_found() {
         "expected NotFound after remove"
     );
 }
+
+/// Task 7 Step-1 acceptance test: a `Tunnel` host enrolled in the store
+/// resolves via `HostRegistry` (when tunnel deps are wired via
+/// `with_tunnel_deps`) and reports `reachable = false` because no node
+/// has connected to the `NodeRegistry`.
+///
+/// Resolution path under test:
+///   `enroll_node` → `HostStore` → `HostRegistry::resolve` → `TunnelHostConnector`
+#[tokio::test]
+async fn tunnel_host_resolves_reachable_false_when_no_node_connected() {
+    use rupu_cp::node::{NodeMirror, NodeRegistry};
+    use rupu_orchestrator::runs::RunStore;
+    use rupu_workspace::enroll_node;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Enroll a tunnel node — this writes a Tunnel Host record to HostStore.
+    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let (host, _token) = enroll_node(&host_store, "t7-test-node").unwrap();
+
+    // Build the shared deps required by TunnelHostConnector.
+    let run_store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let node_registry = Arc::new(NodeRegistry::new());
+    let node_mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+
+    // Build a HostRegistry with tunnel deps wired.
+    let reg = HostRegistry::new(host_store, Arc::new(StubLocal) as Arc<dyn HostConnector>)
+        .with_tunnel_deps(
+            node_registry,
+            node_mirror,
+            run_store,
+            rupu_config::PricingConfig::default(),
+        );
+
+    // resolve() must succeed — the Tunnel host record exists and deps are wired.
+    let conn = reg
+        .resolve(&host.id)
+        .expect("resolve() must succeed when tunnel deps are wired");
+
+    // info() must report reachable=false: no node has connected to NodeRegistry.
+    let info = conn
+        .info()
+        .await
+        .expect("info() must not error even when the node is offline");
+    assert!(
+        !info.reachable,
+        "TunnelHostConnector must report reachable=false when no node is connected"
+    );
+}
+
+/// Negative wiring guard: a `HostRegistry` built WITHOUT `with_tunnel_deps`
+/// returns `HostConnectorError::Invalid` when resolving a `Tunnel` host.
+///
+/// This guards the requirement that `serve()` calls `with_tunnel_deps` before
+/// any tunnel host can be resolved.
+#[test]
+fn tunnel_host_without_tunnel_deps_returns_invalid() {
+    use rupu_workspace::enroll_node;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let (host, _token) = enroll_node(&host_store, "t7-unwired-node").unwrap();
+
+    // Deliberately skip with_tunnel_deps.
+    let reg = HostRegistry::new(host_store, Arc::new(StubLocal) as Arc<dyn HostConnector>);
+
+    let result = reg.resolve(&host.id);
+    assert!(
+        matches!(result, Err(HostConnectorError::Invalid(_))),
+        "expected Invalid when tunnel deps not wired"
+    );
+}
