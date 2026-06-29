@@ -1,6 +1,7 @@
-//! Integration tests for `NodeRegistry` (live tunnel connections).
+//! Integration tests for `NodeRegistry` (live tunnel connections) and
+//! `NodeMirror` (stream artifacts into RunStore).
 //!
-//! Covers:
+//! NodeRegistry covers:
 //! - register → get returns the same conn (Arc::ptr_eq).
 //! - re-register same id evicts the old; old `send` errors Offline.
 //! - `remove(only_if)` no-ops when a newer conn has replaced the old one.
@@ -8,6 +9,9 @@
 //! - `is_online` reflects presence / absence.
 //! - `mark_seen` updates last_seen.
 //! - `send` succeeds when receiver is alive; errors Offline when dropped.
+//!
+//! NodeMirror covers:
+//! - create_run → append(Events) ×2 → finish → load shows Completed + 2-line events.jsonl.
 
 use rupu_cp::node::{Frame, NodeError, NodeRegistry};
 use std::sync::Arc;
@@ -182,5 +186,78 @@ async fn send_errors_offline_when_receiver_dropped() {
     assert!(
         matches!(result, Err(NodeError::Offline)),
         "expected Offline, got {result:?}"
+    );
+}
+
+// ── NodeMirror ────────────────────────────────────────────────────────────────
+
+#[test]
+fn mirror_create_append_finish_round_trip() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::{RunStatus, RunStore};
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "smoke-workflow".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+
+    let run_id = "run_NODEMIRRTEST001";
+    let node_id = "node-42";
+
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+
+    mirror
+        .append(
+            run_id,
+            ArtifactFile::Events,
+            r#"{"type":"step_started","step_id":"s1"}"#,
+        )
+        .expect("append event 1");
+
+    mirror
+        .append(
+            run_id,
+            ArtifactFile::Events,
+            r#"{"type":"step_completed","step_id":"s1"}"#,
+        )
+        .expect("append event 2");
+
+    mirror.finish(run_id, "completed").expect("finish");
+
+    // Status must be Completed and worker_id must carry the node attribution.
+    let record = store.load(run_id).expect("load");
+    assert_eq!(record.status, RunStatus::Completed, "expected Completed");
+    assert_eq!(
+        record.worker_id.as_deref(),
+        Some("node-42"),
+        "worker_id must carry node attribution"
+    );
+    assert!(record.finished_at.is_some(), "finished_at must be set");
+
+    // events.jsonl must have exactly 2 lines at events_path.
+    let events_path = store.events_path(run_id);
+    let content = std::fs::read_to_string(&events_path).expect("read events.jsonl");
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 lines in events.jsonl");
+    assert!(
+        lines[0].contains("step_started"),
+        "line 0 should contain step_started"
+    );
+    assert!(
+        lines[1].contains("step_completed"),
+        "line 1 should contain step_completed"
     );
 }
