@@ -108,3 +108,50 @@ pub struct RetryConfig {
     pub max_attempts: Option<u32>,
     pub initial_delay_ms: Option<u64>,
 }
+
+impl Config {
+    /// Validate cross-field invariants not expressible in serde.
+    pub fn validate(&self) -> Result<(), crate::layer::LayerError> {
+        for (name, p) in &self.providers {
+            if p.kind.as_deref() == Some("openai-compatible") && p.base_url.is_none() {
+                return Err(crate::layer::LayerError::Invalid(format!(
+                    "provider '{name}': kind=\"openai-compatible\" requires base_url"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_openai_compatible_without_base_url() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "oracle".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                ..Default::default()
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("base_url"));
+    }
+
+    #[test]
+    fn validate_accepts_openai_compatible_with_base_url() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "oracle".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://host:8080".into()),
+                ..Default::default()
+            },
+        );
+        assert!(cfg.validate().is_ok());
+    }
+}
