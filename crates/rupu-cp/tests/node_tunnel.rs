@@ -438,6 +438,86 @@ async fn recv_frame(
     }
 }
 
+/// Spawn the CP router **with a bearer token configured** and return its bound
+/// address together with the shared `NodeRegistry`.  Used to verify that
+/// `/api/node/connect` remains reachable despite the bearer middleware.
+async fn spawn_cp_with_bearer(
+    dir: &std::path::Path,
+    bearer: &str,
+) -> (std::net::SocketAddr, std::sync::Arc<rupu_cp::node::NodeRegistry>) {
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let registry = std::sync::Arc::clone(&state.node_registry);
+    let app = rupu_cp::server::router(state, Some(bearer.to_string()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, registry)
+}
+
+/// Regression guard for Finding 1: `/api/node/connect` must be **outside** the
+/// bearer middleware.  With a bearer token configured the WS upgrade must still
+/// succeed without any `Authorization` header — the route is token-gated by the
+/// Hello frame's enrollment token only.
+#[tokio::test]
+async fn ws_node_connect_exempt_from_bearer() {
+    use rupu_workspace::{enroll_node, HostStore};
+    use tempfile::tempdir;
+    use tokio_tungstenite::connect_async;
+
+    let dir = tempdir().unwrap();
+
+    let host_store = HostStore { root: dir.path().join("hosts") };
+    let (host, token) = enroll_node(&host_store, "test-node-bearer-exempt").unwrap();
+
+    let node_id = match &host.transport {
+        rupu_workspace::HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport"),
+    };
+
+    // Spawn with a bearer token — /api/* would return 401 without an
+    // Authorization header.  /api/node/connect must be exempt.
+    let (addr, registry) =
+        spawn_cp_with_bearer(dir.path(), "super-secret-bearer-token").await;
+
+    let url = format!("ws://{addr}/api/node/connect");
+    // Connect WITHOUT any Authorization header.
+    let (mut ws, _) = connect_async(&url)
+        .await
+        .expect("WS connect should succeed without Authorization header");
+
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: node_id.clone(),
+            auth: rupu_cp::node::Auth::Token { token },
+            rupu_version: "test".to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Welcome")
+    .expect("connection closed before Welcome");
+
+    assert!(
+        matches!(response, Frame::Welcome {}),
+        "expected Welcome, got {response:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        registry.is_online(&node_id),
+        "node should be online in the registry after bearer-exempt WS Hello"
+    );
+}
+
 /// A valid `Hello` with an enrolled token → CP replies `Welcome` and node is online.
 #[tokio::test]
 async fn ws_valid_hello_receives_welcome_and_is_online() {
