@@ -2,7 +2,9 @@
 
 use crate::paths;
 use clap::Subcommand;
+use rupu_cp::host::bucket::{ObjectStoreBucket, poll_bucket_run};
 use rupu_orchestrator::runs::RunStore;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -58,6 +60,11 @@ pub async fn handle(action: Action) -> ExitCode {
                 worker_id,
                 rupu_workspace::HostStore { root: global_dir.join("hosts") },
                 shutdown_rx,
+            ));
+            let poller_handle = tokio::spawn(run_bucket_poller(
+                Arc::clone(&store),
+                rupu_workspace::HostStore { root: global_dir.join("hosts") },
+                shutdown_tx.subscribe(),
             ));
 
             // Adapter for rupu-cp's RunLauncher port: spawns detached
@@ -131,9 +138,10 @@ pub async fn handle(action: Action) -> ExitCode {
             })
             .await;
 
-            // Signal the worker to stop and wait for it to drain.
+            // Signal both background workers to stop and wait for them to drain.
             let _ = shutdown_tx.send(true);
             let _ = worker_handle.await;
+            let _ = poller_handle.await;
 
             serve_result
         }
@@ -144,6 +152,120 @@ pub async fn handle(action: Action) -> ExitCode {
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// How often the bucket poller wakes to check for new result objects.
+const BUCKET_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Background worker that polls each bucket host for completed result objects
+/// and mirrors them into the central [`RunStore`] via [`rupu_cp::node::NodeMirror`].
+///
+/// This is the counterpart to the tunnel read-pump: instead of streaming events
+/// over a WebSocket, the node writes artifacts into the shared object-store bucket
+/// and this poller reads them back on a fixed interval.
+///
+/// A per-`(host_id, run_id)` [`HashSet<String>`] accumulates the keys that have
+/// already been mirrored, so re-polling never double-appends.
+async fn run_bucket_poller(
+    store: Arc<RunStore>,
+    hosts: rupu_workspace::HostStore,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    // Outer key: "<host_id>\x00<run_id>", value: set of consumed bucket keys.
+    let mut consumed: HashMap<String, HashSet<String>> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(BUCKET_POLL_INTERVAL) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("bucket poller shutting down");
+                    break;
+                }
+                continue;
+            }
+        }
+
+        let bucket_hosts: Vec<rupu_workspace::Host> = hosts
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| matches!(h.transport, rupu_workspace::HostTransport::Bucket { .. }))
+            .collect();
+
+        for host in &bucket_hosts {
+            let (url, prefix) = match &host.transport {
+                rupu_workspace::HostTransport::Bucket { url, prefix } => {
+                    (url.clone(), prefix.clone())
+                }
+                _ => continue,
+            };
+
+            let bucket = match ObjectStoreBucket::from_url(&url, prefix.as_deref()) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        host_id = %host.id,
+                        error = %e,
+                        "bucket poller: failed to build bucket from url"
+                    );
+                    continue;
+                }
+            };
+
+            let mirror = rupu_cp::node::NodeMirror::new(Arc::clone(&store));
+
+            // Find in-flight runs attributed to this bucket host.
+            let inflight: Vec<String> = match store.list() {
+                Ok(runs) => runs
+                    .into_iter()
+                    .filter(|r| {
+                        r.worker_id.as_deref() == Some(host.id.as_str())
+                            && !r.status.is_terminal()
+                    })
+                    .map(|r| r.id)
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        host_id = %host.id,
+                        error = %e,
+                        "bucket poller: RunStore::list failed"
+                    );
+                    continue;
+                }
+            };
+
+            for run_id in inflight {
+                // Compound map key avoids collisions across hosts.
+                let map_key = format!("{}\x00{}", host.id, run_id);
+
+                let poll_result = {
+                    let consumed_set = consumed.entry(map_key.clone()).or_default();
+                    poll_bucket_run(&bucket, &mirror, &host.id, &run_id, consumed_set).await
+                };
+
+                match poll_result {
+                    Ok(true) => {
+                        tracing::info!(
+                            host_id = %host.id,
+                            run_id = %run_id,
+                            "bucket poller: run finished, removing from tracking"
+                        );
+                        consumed.remove(&map_key);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host.id,
+                            run_id = %run_id,
+                            error = %e,
+                            "bucket poller: poll_bucket_run failed"
+                        );
+                    }
+                }
+            }
         }
     }
 }

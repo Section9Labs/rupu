@@ -27,21 +27,21 @@ use super::{
 
 // ── struct ────────────────────────────────────────────────────────────────────
 
-pub(crate) struct ObjectStoreBucket {
+pub struct ObjectStoreBucket {
     store: Arc<dyn ObjectStore>,
     prefix: Path,
 }
 
 impl ObjectStoreBucket {
     /// Create from an already-constructed store (e.g. `InMemory` in tests).
-    pub(crate) fn new(store: Arc<dyn ObjectStore>, prefix: &str) -> Self {
+    pub fn new(store: Arc<dyn ObjectStore>, prefix: &str) -> Self {
         let prefix = Path::parse(prefix).unwrap_or_else(|_| Path::from(prefix));
         Self { store, prefix }
     }
 
     /// Create from a URL in production; credentials are resolved by `object_store`
     /// via environment variables / instance metadata.
-    pub(crate) fn from_url(url: &str, prefix: Option<&str>) -> Result<Self, BucketError> {
+    pub fn from_url(url: &str, prefix: Option<&str>) -> Result<Self, BucketError> {
         let parsed = url::Url::parse(url)
             .map_err(|e| BucketError::Io(format!("invalid bucket url: {e}")))?;
         let (store, url_path) = object_store::parse_url_opts(&parsed, std::iter::empty::<(&str, &str)>())

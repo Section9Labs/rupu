@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 pub(crate) mod connector;
 pub(crate) use connector::BucketHostConnector;
 pub(crate) mod object_store_bucket;
-pub(crate) use object_store_bucket::ObjectStoreBucket;
+pub use object_store_bucket::ObjectStoreBucket;
+pub mod poller;
+pub use poller::poll_bucket_run;
 
 // ── control envelope ──────────────────────────────────────────────────────────
 
@@ -38,7 +40,7 @@ pub(crate) struct ControlEnvelope {
 // ── error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BucketError {
+pub enum BucketError {
     #[error("bucket io: {0}")]
     Io(String),
     #[error("not found: {0}")]
@@ -51,7 +53,7 @@ pub(crate) enum BucketError {
 ///
 /// Implementations must be `Send + Sync`; all methods are async.
 #[async_trait]
-pub(crate) trait Bucket: Send + Sync {
+pub trait Bucket: Send + Sync {
     /// Write the job envelope for `run_id` at `jobs/<run_id>.json`.
     async fn put_job(&self, run_id: &str, envelope: &[u8]) -> Result<(), BucketError>;
 
