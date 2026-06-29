@@ -429,6 +429,30 @@ async fn connect_and_run(
             Frame::Ping {} => {
                 send_frame(&mut sink, &Frame::Pong {}).await;
             }
+            Frame::Approve { run_id, mode } => {
+                info!(run_id = %run_id, "node: Approve received");
+                if let Some(state) = active.get_mut(&run_id) {
+                    let argv = build_control_argv(ControlKind::Approve, &run_id, &mode, None);
+                    match spawn_control(exe, &argv) {
+                        Ok(child) => { state.child = child; }
+                        Err(e) => warn!(run_id = %run_id, error = %e, "node: approve spawn failed"),
+                    }
+                } else {
+                    warn!(run_id = %run_id, "node: Approve for unknown run_id (ignored)");
+                }
+            }
+            Frame::Reject { run_id, reason } => {
+                info!(run_id = %run_id, "node: Reject received");
+                if let Some(state) = active.get_mut(&run_id) {
+                    let argv = build_control_argv(ControlKind::Reject, &run_id, "", reason.as_deref());
+                    match spawn_control(exe, &argv) {
+                        Ok(child) => { state.child = child; }
+                        Err(e) => warn!(run_id = %run_id, error = %e, "node: reject spawn failed"),
+                    }
+                } else {
+                    warn!(run_id = %run_id, "node: Reject for unknown run_id (ignored)");
+                }
+            }
             Frame::Hello { .. }
             | Frame::Welcome {}
             | Frame::Pong {}
@@ -448,6 +472,58 @@ async fn connect_and_run(
 // ---------------------------------------------------------------------------
 // Run spawning
 // ---------------------------------------------------------------------------
+
+/// Which control subprocess to launch in response to an Approve/Reject frame.
+#[derive(Debug, Clone, Copy)]
+enum ControlKind {
+    Approve,
+    Reject,
+}
+
+/// Build the argv (after the executable) for the local approve/reject command
+/// the node runs against a gated run.
+///   Approve: `workflow approve <run_id> [--mode <mode>]`
+///   Reject:  `workflow reject  <run_id> [--reason <reason>]`
+fn build_control_argv(
+    kind: ControlKind,
+    run_id: &str,
+    mode: &str,
+    reason: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec!["workflow".to_string()];
+    match kind {
+        ControlKind::Approve => {
+            argv.push("approve".to_string());
+            argv.push(run_id.to_string());
+            if !mode.is_empty() {
+                argv.push("--mode".to_string());
+                argv.push(mode.to_string());
+            }
+        }
+        ControlKind::Reject => {
+            argv.push("reject".to_string());
+            argv.push(run_id.to_string());
+            if let Some(r) = reason {
+                argv.push("--reason".to_string());
+                argv.push(r.to_string());
+            }
+        }
+    }
+    argv
+}
+
+/// Spawn a detached `rupu workflow approve|reject` child, same launch posture
+/// as `spawn_run` (null stdio, own process group on Unix).
+fn spawn_control(exe: &Path, argv: &[String]) -> anyhow::Result<tokio::process::Child> {
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(argv)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.spawn().context("spawn rupu control child")
+}
 
 fn spawn_run(exe: &Path, run_id: &str, spec: &RunSpec) -> anyhow::Result<tokio::process::Child> {
     let argv = build_argv(run_id, spec);
@@ -807,6 +883,34 @@ mod tests {
         };
         let argv = build_argv("run_W", &spec);
         assert_eq!(argv, vec!["run", "check", "--run-id", "run_W"]);
+    }
+
+    // ------------------------------------------------------------------
+    // build_control_argv: approve/reject argv builders
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn control_argv_approve_with_and_without_mode() {
+        assert_eq!(
+            build_control_argv(ControlKind::Approve, "run_1", "bypass", None),
+            vec!["workflow", "approve", "run_1", "--mode", "bypass"]
+        );
+        assert_eq!(
+            build_control_argv(ControlKind::Approve, "run_1", "", None),
+            vec!["workflow", "approve", "run_1"]
+        );
+    }
+
+    #[test]
+    fn control_argv_reject_with_and_without_reason() {
+        assert_eq!(
+            build_control_argv(ControlKind::Reject, "run_1", "", Some("nope")),
+            vec!["workflow", "reject", "run_1", "--reason", "nope"]
+        );
+        assert_eq!(
+            build_control_argv(ControlKind::Reject, "run_1", "", None),
+            vec!["workflow", "reject", "run_1"]
+        );
     }
 
     // ------------------------------------------------------------------

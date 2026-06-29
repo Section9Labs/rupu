@@ -56,6 +56,7 @@ pub async fn handle(action: Action) -> ExitCode {
             let worker_handle = tokio::spawn(run_resume_worker(
                 Arc::clone(&store),
                 worker_id,
+                rupu_workspace::HostStore { root: global_dir.join("hosts") },
                 shutdown_rx,
             ));
 
@@ -162,6 +163,7 @@ pub async fn handle(action: Action) -> ExitCode {
 async fn run_resume_worker(
     store: Arc<RunStore>,
     worker_id: String,
+    hosts: rupu_workspace::HostStore,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -185,7 +187,28 @@ async fn run_resume_worker(
             }
         };
 
+        // Defense-in-depth: never resume a run that belongs to a tunnel node;
+        // its real run lives on the node and is resumed via a control frame,
+        // not by this local worker. (Tunnel runs also never carry the
+        // resume_requested_at marker, so this is belt-and-suspenders.)
+        let tunnel_nodes: std::collections::HashSet<String> = hosts
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|h| match h.transport {
+                rupu_workspace::HostTransport::Tunnel { node_id } => Some(node_id),
+                _ => None,
+            })
+            .collect();
+
         for run in pending {
+            if let Some(w) = run.worker_id.as_deref() {
+                if tunnel_nodes.contains(w) {
+                    tracing::debug!(run_id = %run.id, worker = %w,
+                        "resume worker: skipping tunnel-node run");
+                    continue;
+                }
+            }
             let claimed = match store.claim_resume(&run.id, &worker_id, now) {
                 Ok(c) => c,
                 Err(e) => {

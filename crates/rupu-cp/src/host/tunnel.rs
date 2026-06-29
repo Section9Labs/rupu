@@ -246,20 +246,38 @@ impl HostConnector for TunnelHostConnector {
         })
     }
 
-    async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
-        Err(HostConnectorError::Invalid(
-            "approval over tunnel not supported (slice 2)".into(),
-        ))
+    async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
+        let conn = self.live_conn()?;
+        conn.send(Frame::Approve {
+            run_id: run_id.to_string(),
+            mode: mode.to_string(),
+        })
+        .await
+        .map_err(|_| {
+            HostConnectorError::Unreachable(format!(
+                "node {} disconnected before Approve frame could be sent",
+                self.node_id
+            ))
+        })
     }
 
     async fn reject_run(
         &self,
-        _run_id: &str,
-        _reason: Option<&str>,
+        run_id: &str,
+        reason: Option<&str>,
     ) -> Result<(), HostConnectorError> {
-        Err(HostConnectorError::Invalid(
-            "rejection over tunnel not supported (slice 2)".into(),
-        ))
+        let conn = self.live_conn()?;
+        conn.send(Frame::Reject {
+            run_id: run_id.to_string(),
+            reason: reason.map(str::to_string),
+        })
+        .await
+        .map_err(|_| {
+            HostConnectorError::Unreachable(format!(
+                "node {} disconnected before Reject frame could be sent",
+                self.node_id
+            ))
+        })
     }
 
     async fn cancel_run(&self, run_id: &str) -> Result<(), HostConnectorError> {

@@ -18,6 +18,18 @@ pub enum Frame {
     Cancel {
         run_id: String,
     },
+    /// CP→node: approve a run paused at an approval gate. `mode` is the
+    /// resume mode (`"ask"` | `"bypass"` | `"readonly"`); empty means the
+    /// node uses the run's stored mode / default.
+    Approve {
+        run_id: String,
+        mode: String,
+    },
+    /// CP→node: reject a run paused at an approval gate.
+    Reject {
+        run_id: String,
+        reason: Option<String>,
+    },
     Ping {},
     Pong {},
     Artifact {
@@ -122,5 +134,38 @@ mod tests {
         // Assert that auth.kind == "token"
         assert_eq!(json["auth"]["kind"], "token");
         assert_eq!(json["type"], "hello");
+    }
+
+    #[test]
+    fn approve_frame_round_trips() {
+        let f = Frame::Approve {
+            run_id: "run_01ABC".to_string(),
+            mode: "bypass".to_string(),
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains(r#""type":"approve""#));
+        assert!(json.contains(r#""run_id":"run_01ABC""#));
+        assert!(json.contains(r#""mode":"bypass""#));
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
+    }
+
+    #[test]
+    fn reject_frame_round_trips_with_and_without_reason() {
+        let with = Frame::Reject {
+            run_id: "run_01ABC".to_string(),
+            reason: Some("not now".to_string()),
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""type":"reject""#));
+        assert!(json.contains(r#""reason":"not now""#));
+        assert_eq!(serde_json::from_str::<Frame>(&json).unwrap(), with);
+
+        let without = Frame::Reject {
+            run_id: "run_01ABC".to_string(),
+            reason: None,
+        };
+        let json2 = serde_json::to_string(&without).unwrap();
+        assert_eq!(serde_json::from_str::<Frame>(&json2).unwrap(), without);
     }
 }
