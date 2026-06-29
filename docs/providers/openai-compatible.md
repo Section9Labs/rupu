@@ -35,8 +35,9 @@ Set `stream = false` for servers (or server versions) that do not implement
 the server-sent-event (SSE) streaming endpoint. rupu will send a standard
 blocking request and synthesise the same event sequence for the agent loop.
 
-Each `[[providers.oracle.models]]` entry must have at least `id`,
-`context_window`, and `max_output`. These appear in `rupu models list
+Each `[[providers.oracle.models]]` entry requires `id`; `context_window`
+and `max_output` are optional (rupu applies defaults of 32768 and 8192
+respectively when omitted). These appear in `rupu models list
 --provider oracle` with source `custom`.
 
 You can name the provider anything — replace `oracle` with `vllm`, `together`,
@@ -56,7 +57,7 @@ echo -n "$MY_API_KEY" | rupu auth login --provider oracle --mode api-key
 The key is written to `~/.rupu/auth.json` (chmod 600). To verify:
 
 ```sh
-rupu auth status --provider oracle
+rupu auth status
 ```
 
 For CI or ephemeral environments, skip `rupu auth login` and set the env var
@@ -107,8 +108,8 @@ Each `[[providers.<name>.models]]` entry:
 | Field            | Type   | Required | Description                    |
 | ---------------- | ------ | :------: | ------------------------------ |
 | `id`             | string | yes      | Model id passed verbatim to the API.  |
-| `context_window` | u32    | yes      | Maximum context in tokens.     |
-| `max_output`     | u32    | yes      | Maximum output tokens.         |
+| `context_window` | u32    | no       | Maximum context in tokens (default 32768). |
+| `max_output`     | u32    | no       | Maximum output tokens (default 8192). |
 
 ## Limitations
 
@@ -128,7 +129,7 @@ Each `[[providers.<name>.models]]` entry:
 
 **`ProviderError::Api { status: 401, … }`**
 The Bearer key is missing or wrong. Check the key stored in `auth.json`
-(`rupu auth status --provider oracle`) or the `RUPU_ORACLE_API_KEY` env var.
+(`rupu auth status`) or the `RUPU_ORACLE_API_KEY` env var.
 
 **`ProviderError::Http(…)` or connection refused**
 The `base_url` is unreachable. Verify the server is running and the URL is

@@ -138,8 +138,9 @@ stream = true   # set false if the server has no SSE endpoint
 ```
 
 `base_url` may include or omit a trailing `/v1` — rupu normalises both.
-Each `[[providers.<name>.models]]` entry requires `id`, `context_window`,
-and `max_output`; these surface in `rupu models list --provider oracle`.
+Each `[[providers.<name>.models]]` entry requires `id`; `context_window`
+and `max_output` are optional (defaults 32768 / 8192 when omitted). These
+surface in `rupu models list --provider oracle`.
 
 ### Authentication
 
