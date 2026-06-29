@@ -295,3 +295,93 @@ fn tunnel_host_without_tunnel_deps_returns_invalid() {
         "expected Invalid when tunnel deps not wired"
     );
 }
+
+/// Task 5: an `Ssh` host persisted in the store resolves to an `SshHostConnector`
+/// (when tunnel deps are wired via `with_tunnel_deps`) and `info()` returns
+/// `reachable = false` because the SSH target (`nonexistent-rupu-test.invalid`)
+/// is unreachable in the test environment.
+///
+/// Resolution path under test:
+///   `add_ssh_host` → `HostStore` → `HostRegistry::resolve` → `SshHostConnector`
+#[tokio::test]
+async fn ssh_host_resolves_reachable_false_when_ssh_unreachable() {
+    use rupu_cp::node::{NodeMirror, NodeRegistry};
+    use rupu_orchestrator::runs::RunStore;
+    use rupu_workspace::add_ssh_host;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Persist an SSH host record pointing at a host that will never respond.
+    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let host = add_ssh_host(
+        &host_store,
+        "test-ssh-node",
+        "nonexistent-rupu-test.invalid",
+        None,
+        None,
+    )
+    .unwrap();
+
+    // Build the shared deps (same bundle used by TunnelHostConnector).
+    let run_store = Arc::new(RunStore::new(tmp.path().join("runs")));
+    let node_registry = Arc::new(NodeRegistry::new());
+    let node_mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+
+    // Build a HostRegistry with tunnel deps wired — SSH uses mirror + run_store
+    // from this same bundle.
+    let reg = HostRegistry::new(host_store, Arc::new(StubLocal) as Arc<dyn HostConnector>)
+        .with_tunnel_deps(
+            node_registry,
+            node_mirror,
+            run_store,
+            rupu_config::PricingConfig::default(),
+        );
+
+    // resolve() must succeed — the SSH host record exists and deps are wired.
+    let conn = reg
+        .resolve(&host.id)
+        .expect("resolve() must succeed when tunnel deps are wired");
+
+    // info() must return Ok with reachable=false: the remote SSH target is
+    // unreachable in the test environment (BatchMode=yes + ConnectTimeout=10
+    // ensures ssh exits fast rather than hanging).
+    let info = conn
+        .info()
+        .await
+        .expect("info() must not error even when ssh target is unreachable");
+    assert!(
+        !info.reachable,
+        "SshHostConnector must report reachable=false when the remote ssh target is offline"
+    );
+}
+
+/// Negative wiring guard (SSH): a `HostRegistry` built WITHOUT `with_tunnel_deps`
+/// returns `HostConnectorError::Invalid` when resolving an `Ssh` host.
+///
+/// SSH needs `node_mirror` + `run_store` from the same `with_tunnel_deps` bundle
+/// that Tunnel uses; skipping the call must produce `Invalid`.
+#[test]
+fn ssh_host_without_tunnel_deps_returns_invalid() {
+    use rupu_workspace::add_ssh_host;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let host_store = HostStore { root: tmp.path().join("hosts") };
+    let host = add_ssh_host(
+        &host_store,
+        "test-ssh-unwired",
+        "nonexistent-rupu-test.invalid",
+        None,
+        None,
+    )
+    .unwrap();
+
+    // Deliberately skip with_tunnel_deps.
+    let reg = HostRegistry::new(host_store, Arc::new(StubLocal) as Arc<dyn HostConnector>);
+
+    let result = reg.resolve(&host.id);
+    assert!(
+        matches!(result, Err(HostConnectorError::Invalid(_))),
+        "expected Invalid when tunnel deps not wired for SSH host"
+    );
+}

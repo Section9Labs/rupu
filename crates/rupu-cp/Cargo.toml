@@ -23,6 +23,7 @@ async-trait.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 futures-util = { workspace = true }
+tokio-stream = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 ulid.workspace = true
 rust-embed.workspace = true

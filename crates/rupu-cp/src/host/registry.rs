@@ -17,6 +17,7 @@ use crate::{
     host::{
         connector::{HostConnector, HostConnectorError},
         http::HttpHostConnector,
+        ssh::{SshExec, SshHostConnector},
         tunnel::TunnelHostConnector,
     },
     node::{NodeMirror, NodeRegistry},
@@ -268,6 +269,31 @@ impl HostRegistry {
                     )),
                 }
             }
+            HostTransport::Ssh {
+                host: ssh_host,
+                port,
+                identity_file,
+            } => match (&self.node_mirror, &self.run_store) {
+                (Some(mir), Some(store)) => {
+                    let exec = Arc::new(SshExec {
+                        host: ssh_host.clone(),
+                        port: *port,
+                        identity_file: identity_file.clone(),
+                    });
+                    Ok(Arc::new(SshHostConnector::new(
+                        host.id.clone(),
+                        exec,
+                        Arc::clone(mir),
+                        Arc::clone(store),
+                        self.pricing.clone(),
+                    )))
+                }
+                _ => Err(HostConnectorError::Invalid(
+                    "ssh deps not wired (call HostRegistry::with_tunnel_deps; \
+                     mirror + run_store are shared with tunnel hosts)"
+                        .into(),
+                )),
+            },
         }
     }
 }

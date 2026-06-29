@@ -18,10 +18,10 @@ use ulid::Ulid;
 
 use crate::{
     agent_launcher::AgentLaunchRequest,
-    api::runs::{query_run_detail, query_run_rows},
     host::connector::{
-        open_run_events_tail, read_transcript_file, EventByteStream, HostCapabilities,
-        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
+        mirror_get_run, mirror_list_runs, mirror_stream_run_events, read_transcript_file,
+        EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
+        RunListQuery,
     },
     launcher::LaunchRequest,
     node::{
@@ -205,45 +205,11 @@ impl HostConnector for TunnelHostConnector {
         &self,
         params: RunListQuery,
     ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
-        let workflow_only = params.kind == RunKind::Workflow;
-        let rows = query_run_rows(
-            &self.run_store,
-            params.offset,
-            params.limit,
-            params.lifecycle.as_deref(),
-            workflow_only,
-            Some(self.node_id.as_str()),
-            &self.pricing,
-        )
-        .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
-
-        rows.iter()
-            .map(|r| {
-                serde_json::to_value(r)
-                    .map_err(|e| HostConnectorError::Invalid(e.to_string()))
-            })
-            .collect()
+        mirror_list_runs(&self.run_store, &self.node_id, &params, &self.pricing)
     }
 
     async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
-        // Verify the run exists and belongs to this node before returning detail.
-        let record = self
-            .run_store
-            .load(run_id)
-            .map_err(|e| match e {
-                rupu_orchestrator::RunStoreError::NotFound(_) => {
-                    HostConnectorError::NotFound(run_id.to_string())
-                }
-                other => HostConnectorError::Invalid(other.to_string()),
-            })?;
-
-        if record.worker_id.as_deref() != Some(self.node_id.as_str()) {
-            return Err(HostConnectorError::NotFound(run_id.to_string()));
-        }
-
-        query_run_detail(&self.run_store, run_id, &self.pricing).map_err(|e| {
-            HostConnectorError::Invalid(e.to_string())
-        })
+        mirror_get_run(&self.run_store, &self.node_id, run_id, &self.pricing)
     }
 
     async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
@@ -298,22 +264,7 @@ impl HostConnector for TunnelHostConnector {
         &self,
         run_id: &str,
     ) -> Result<EventByteStream, HostConnectorError> {
-        // Verify the run exists and belongs to this node.
-        let record = self
-            .run_store
-            .load(run_id)
-            .map_err(|e| match e {
-                rupu_orchestrator::RunStoreError::NotFound(_) => {
-                    HostConnectorError::NotFound(run_id.to_string())
-                }
-                other => HostConnectorError::Invalid(other.to_string()),
-            })?;
-
-        if record.worker_id.as_deref() != Some(self.node_id.as_str()) {
-            return Err(HostConnectorError::NotFound(run_id.to_string()));
-        }
-
-        open_run_events_tail(&self.run_store, run_id).await
+        mirror_stream_run_events(&self.run_store, &self.node_id, run_id).await
     }
 
     async fn get_transcript(
