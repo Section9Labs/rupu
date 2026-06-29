@@ -259,3 +259,98 @@ async fn delete_added_host_returns_204_and_removes_it() {
     assert_eq!(hosts.len(), 1, "only local should remain after delete");
     assert_eq!(hosts[0]["id"], "local");
 }
+
+// ── Task 9 — tunnel node enrollment ──────────────────────────────────────────
+
+/// `POST /api/hosts/node` without a launcher → 501.
+#[tokio::test]
+async fn post_hosts_node_without_launcher_returns_501() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server(tmp.path()).await; // no launcher
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/api/hosts/node"))
+        .json(&serde_json::json!({ "name": "my-node" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+/// `POST /api/hosts/node` with a launcher → 200; response has a non-empty
+/// `token`, a `command` that contains `--token`, and the host is a Tunnel
+/// host visible in `GET /api/hosts`.
+#[tokio::test]
+async fn post_hosts_node_enrolls_and_appears_in_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server_serve(tmp.path()).await;
+
+    let client = reqwest::Client::new();
+
+    // Enroll the node.
+    let post_resp = client
+        .post(format!("http://{addr}/api/hosts/node"))
+        .json(&serde_json::json!({ "name": "my-test-node" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        post_resp.status(),
+        StatusCode::OK,
+        "POST /api/hosts/node should return 200"
+    );
+
+    let body: serde_json::Value = post_resp.json().await.unwrap();
+
+    // Token must be non-empty.
+    let token = body["token"].as_str().expect("token must be a string");
+    assert!(!token.is_empty(), "token must not be empty");
+
+    // Command must contain --token.
+    let command = body["command"].as_str().expect("command must be a string");
+    assert!(
+        command.contains("--token"),
+        "command must contain --token, got {command:?}"
+    );
+
+    // Host must be a Tunnel transport.
+    let host = &body["host"];
+    assert_eq!(host["name"], "my-test-node");
+    assert_eq!(
+        host["transport_kind"], "tunnel",
+        "enrolled host must be a tunnel transport"
+    );
+    assert_eq!(
+        host["status"], "offline",
+        "freshly enrolled node should be offline"
+    );
+
+    let enrolled_id = host["id"].as_str().expect("host.id must be a string").to_string();
+    assert!(
+        enrolled_id.starts_with("node_"),
+        "tunnel host id must start with node_, got {enrolled_id:?}"
+    );
+
+    // The enrolled host must appear in GET /api/hosts.
+    let list_resp = client
+        .get(format!("http://{addr}/api/hosts"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(list_resp.status(), StatusCode::OK);
+
+    let hosts: Vec<serde_json::Value> = list_resp.json().await.unwrap();
+    assert_eq!(hosts.len(), 2, "list should have local + the enrolled node");
+
+    let node_host = hosts
+        .iter()
+        .find(|h| h["id"] == enrolled_id)
+        .expect("enrolled node should appear in GET /api/hosts");
+
+    assert_eq!(node_host["transport_kind"], "tunnel");
+    assert_eq!(node_host["name"], "my-test-node");
+}

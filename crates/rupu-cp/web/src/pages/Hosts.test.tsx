@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 // Hosts list — rows from mocked getHosts; local pinned first; Add Host form
-// calls addHost; Remove button absent for local.
+// calls addHost; Remove button absent for local. Tunnel node enrollment shows
+// the one-time command + token-once warning.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -33,6 +34,14 @@ const REMOTE_HOST: HostView = {
   version: '0.9.0',
   active_run_count: 2,
   last_seen_at: new Date().toISOString(),
+};
+
+const TUNNEL_HOST: HostView = {
+  id: 'node_01JZTESTNODE001',
+  name: 'my-box',
+  transport_kind: 'tunnel',
+  status: 'offline',
+  active_run_count: 0,
 };
 
 afterEach(() => {
@@ -168,5 +177,76 @@ describe('Hosts page', () => {
     );
 
     expect(await screen.findByText(/network failure/i)).toBeInTheDocument();
+  });
+
+  // ── Tunnel node enrollment ──────────────────────────────────────────────────
+
+  it('tunnel mode: calls enrollNode and shows command + token-once warning', async () => {
+    const FAKE_TOKEN = 'abc123deadbeef';
+    const FAKE_COMMAND = `rupu node --cp-url wss://<your-cp-host>:7878 --token ${FAKE_TOKEN}`;
+
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    const enrollSpy = vi.spyOn(api, 'enrollNode').mockResolvedValue({
+      host: TUNNEL_HOST,
+      command: FAKE_COMMAND,
+      token: FAKE_TOKEN,
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/hosts']}>
+        <Hosts />
+      </MemoryRouter>,
+    );
+
+    // Open the Add host form.
+    fireEvent.click(await screen.findByRole('button', { name: 'Add host' }));
+
+    // Select "Tunnel node" transport.
+    fireEvent.click(screen.getByRole('radio', { name: /tunnel node/i }));
+
+    // Fill in the name.
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'my-box' } });
+
+    // Submit.
+    fireEvent.click(screen.getByRole('button', { name: /enroll node/i }));
+
+    // enrollNode must be called with the trimmed name.
+    await waitFor(() => expect(enrollSpy).toHaveBeenCalledTimes(1));
+    expect(enrollSpy.mock.calls[0][0]).toMatchObject({ name: 'my-box' });
+
+    // The command must appear in the one-time panel.
+    expect(await screen.findByText(FAKE_COMMAND)).toBeInTheDocument();
+
+    // The token-once warning must render.
+    expect(screen.getByText(/token shown once/i)).toBeInTheDocument();
+  });
+
+  it('tunnel mode: form closes after enroll and host list refreshes', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([LOCAL_HOST]);
+    vi.spyOn(api, 'enrollNode').mockResolvedValue({
+      host: TUNNEL_HOST,
+      command: 'rupu node --cp-url wss://<your-cp-host>:7878 --token t',
+      token: 't',
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/hosts']}>
+        <Hosts />
+      </MemoryRouter>,
+    );
+
+    // Open, switch to tunnel, fill, submit.
+    fireEvent.click(await screen.findByRole('button', { name: 'Add host' }));
+    fireEvent.click(screen.getByRole('radio', { name: /tunnel node/i }));
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'my-box' } });
+    fireEvent.click(screen.getByRole('button', { name: /enroll node/i }));
+
+    // After submit the form should close (the "Enroll node" submit button gone).
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /enroll node/i })).not.toBeInTheDocument(),
+    );
+
+    // The host list should refresh (getHosts called a second time).
+    await waitFor(() => expect(vi.mocked(api.getHosts)).toHaveBeenCalledTimes(2));
   });
 });

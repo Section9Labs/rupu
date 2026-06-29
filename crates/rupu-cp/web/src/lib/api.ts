@@ -548,7 +548,7 @@ export interface SessionRunRow {
 // Hosts
 // ---------------------------------------------------------------------------
 
-export type HostTransportKind = 'local' | 'http_cp';
+export type HostTransportKind = 'local' | 'http_cp' | 'tunnel';
 export type HostStatus = 'online' | 'offline' | 'stale';
 
 export interface HostCapabilities {
@@ -1277,6 +1277,18 @@ export const api = {
   async removeHost(id: string): Promise<void> {
     await request<void>(`/api/hosts/${encodeURIComponent(id)}`, {
       method: 'DELETE',
+    });
+  },
+  /**
+   * Enroll a new tunnel node.  Returns the new host view, the runnable command
+   * (with the CP's WSS URL), and the **one-time** plaintext token.  The token
+   * is only present in this response — the server never returns it again.
+   * Requires `rupu cp serve` (501 if absent).
+   */
+  enrollNode(body: { name: string }): Promise<{ host: HostView; command: string; token: string }> {
+    return request<{ host: HostView; command: string; token: string }>('/api/hosts/node', {
+      method: 'POST',
+      body: JSON.stringify(body),
     });
   },
 

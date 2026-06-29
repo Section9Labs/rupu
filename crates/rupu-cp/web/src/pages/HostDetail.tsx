@@ -19,6 +19,7 @@ import type { HostTransportKind } from '../lib/api';
 const TRANSPORT_LABEL: Record<HostTransportKind, string> = {
   local: 'local',
   http_cp: 'http-cp',
+  tunnel: 'tunnel',
 };
 
 // ---------------------------------------------------------------------------

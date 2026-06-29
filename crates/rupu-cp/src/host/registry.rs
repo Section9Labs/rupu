@@ -189,6 +189,24 @@ impl HostRegistry {
         Ok(host)
     }
 
+    /// Enroll a new tunnel node.
+    ///
+    /// Delegates to [`rupu_workspace::enroll_node`]: generates a `node_id`, a
+    /// cryptographically random one-time token, and persists a `Tunnel` [`Host`]
+    /// whose `token_hash` is the SHA-256 of the token.  Returns
+    /// `(host, plaintext_token)`.
+    ///
+    /// The plaintext token is returned **once** and never stored or logged.
+    /// Callers must surface it to the operator over a secure channel and discard
+    /// it immediately.
+    pub fn enroll_node(&self, name: &str) -> Result<(Host, String), HostConnectorError> {
+        let (host, token) = rupu_workspace::enroll_node(&self.store, name)?;
+        // Invalidate any stale cache entry (no entry should exist for a new id,
+        // but safe to remove anyway).
+        self.cache.lock().unwrap().remove(&host.id);
+        Ok((host, token))
+    }
+
     /// Remove a persisted host, its keychain token, and its cache entry.
     ///
     /// Refuses `"local"` with [`HostConnectorError::Invalid`].
