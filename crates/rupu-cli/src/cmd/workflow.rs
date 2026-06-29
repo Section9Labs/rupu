@@ -20,6 +20,7 @@ use crate::output::report::{self, CollectionOutput, DetailOutput, EventOutput};
 use crate::paths;
 use clap::Subcommand;
 use clap_complete::ArgValueCompleter;
+use rupu_agent::load_agents as load_agent_specs;
 use rupu_app_canvas::{render_rows as render_graph_rows, GraphCell, NodeStatus};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts};
 use rupu_orchestrator::runs::{CancelError, CancelOutcome};
@@ -155,6 +156,7 @@ pub enum Action {
     },
     /// Scaffold a new workflow YAML from a template, then open it for
     /// editing. Prompts interactively for scope and name when omitted.
+    /// With `--describe`, a model drafts the definition before you review it.
     Create {
         /// Workflow name (no `.yaml` extension).
         name: Option<String>,
@@ -164,6 +166,18 @@ pub enum Action {
         /// Override the editor (e.g. `--editor "code --wait"`).
         #[arg(long)]
         editor: Option<String>,
+        /// Natural-language description — a model drafts the workflow.
+        #[arg(long)]
+        describe: Option<String>,
+        /// Provider for generation (default: first authenticated).
+        #[arg(long)]
+        gen_provider: Option<String>,
+        /// Model for generation (default: provider's default).
+        #[arg(long)]
+        gen_model: Option<String>,
+        /// Host to create on (only `local` available today).
+        #[arg(long, default_value = "local")]
+        host: String,
     },
     /// Run a workflow.
     Run {
@@ -318,7 +332,22 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             name,
             scope,
             editor,
-        } => create(name, scope, editor.as_deref()).await,
+            describe,
+            gen_provider,
+            gen_model,
+            host,
+        } => {
+            create(
+                name,
+                scope,
+                editor.as_deref(),
+                describe,
+                gen_provider,
+                gen_model,
+                &host,
+            )
+            .await
+        }
         Action::Run {
             name,
             target,
@@ -1466,7 +1495,14 @@ async fn create(
     name: Option<String>,
     scope: Option<String>,
     editor_override: Option<&str>,
+    describe: Option<String>,
+    gen_provider: Option<String>,
+    gen_model: Option<String>,
+    host: &str,
 ) -> anyhow::Result<()> {
+    if host != "local" {
+        anyhow::bail!("host `{host}` is not available (only `local` today)");
+    }
     let global = paths::global_dir()?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -1503,18 +1539,63 @@ async fn create(
         );
     }
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(&target, WORKFLOW_TEMPLATE.replace("{{name}}", &name))?;
+
+    let contents = match describe {
+        Some(desc) => {
+            let resolver = rupu_auth::KeychainResolver::new();
+            let (provider, model) = match (gen_provider, gen_model) {
+                (Some(p), Some(m)) => (p, m),
+                (Some(p), None) => {
+                    let m = rupu_orchestrator::generate::DEFAULT_GEN_MODELS
+                        .iter()
+                        .find(|(n, _)| *n == p.as_str())
+                        .map(|(_, m)| m.to_string())
+                        .ok_or_else(|| anyhow::anyhow!("unknown --gen-provider `{p}`"))?;
+                    (p, m)
+                }
+                (None, Some(m)) => {
+                    anyhow::bail!("--gen-model `{m}` requires --gen-provider to be set")
+                }
+                (None, None) => rupu_orchestrator::pick_default_gen_model(&resolver)
+                    .await
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no authenticated provider; run `rupu auth login` or pass \
+                             --gen-provider/--gen-model"
+                        )
+                    })?,
+            };
+            // Real agent names so generated steps reference agents that exist.
+            let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
+            let available_agents = load_agent_specs(&global, project_agents_parent.as_deref())
+                .map(|specs| specs.into_iter().map(|s| s.name).collect::<Vec<_>>())
+                .unwrap_or_default();
+            println!("generating workflow `{name}` via {provider}/{model}\u{2026}");
+            let req = rupu_orchestrator::GenerateRequest {
+                kind: rupu_orchestrator::GenKind::Workflow,
+                description: desc,
+                provider,
+                model,
+                available_agents,
+            };
+            let outcome = rupu_orchestrator::generate_definition(&req, &resolver).await?;
+            outcome.content
+        }
+        None => WORKFLOW_TEMPLATE.replace("{{name}}", &name),
+    };
+
+    std::fs::write(&target, &contents)?;
     println!("created {} ({scope})", target.display());
 
     crate::cmd::editor::open_for_edit(editor_override, &target)?;
 
     match Workflow::parse_file(&target) {
         Ok(_) => {
-            println!("✓ {name}: workflow YAML parses cleanly");
+            println!("\u{2713} {name}: workflow YAML parses cleanly");
             Ok(())
         }
         Err(e) => {
-            eprintln!("⚠ {name}: failed to re-parse after save:\n  {e}");
+            eprintln!("\u{26a0} {name}: failed to re-parse after save:\n  {e}");
             Ok(())
         }
     }
@@ -2496,7 +2577,17 @@ pub async fn run_by_path(
 /// (interactive line-stream by default) so the issue-targeted run
 /// looks identical to the user.
 pub async fn run_by_target(name: &str, target: &str, mode: Option<&str>) -> anyhow::Result<()> {
-    run(name, Some(target), Vec::new(), mode, None, None, false, None).await
+    run(
+        name,
+        Some(target),
+        Vec::new(),
+        mode,
+        None,
+        None,
+        false,
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]

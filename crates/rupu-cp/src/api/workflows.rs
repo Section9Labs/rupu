@@ -26,6 +26,8 @@ pub fn routes() -> Router<AppState> {
         // axum matches static literal segments before dynamic `:name` captures,
         // so this route is reachable and is NOT shadowed by `/api/workflows/:name`.
         .route("/api/workflows/validate", post(validate_workflow))
+        .route("/api/workflows/generate", post(generate_workflow))
+        .route("/api/generate/models", get(generate_models))
 }
 
 /// Directory where global workflow `.yaml` definitions live.
@@ -247,7 +249,9 @@ async fn launch_run(
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
             other => ApiError::internal(other.to_string()),
         })?;
-        return Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "run_id": run_id, "host_id": host }),
+        ));
     }
 
     // Local path: unchanged (including the 501 when no launcher is installed).
@@ -263,10 +267,82 @@ async fn launch_run(
         working_dir: b.working_dir,
     };
     match launcher.launch(req).await {
-        Ok(run_id) => Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": "local" }))),
+        Ok(run_id) => Ok(Json(
+            serde_json::json!({ "run_id": run_id, "host_id": "local" }),
+        )),
         Err(LaunchError::Invalid(m)) => Err(ApiError::bad_request(m)),
         Err(LaunchError::Spawn(m)) => Err(ApiError::internal(m)),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct GenerateWorkflowBody {
+    description: String,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GeneratedWfDto {
+    raw: String,
+    provider: String,
+    model: String,
+    attempts: u8,
+}
+
+#[derive(serde::Serialize)]
+struct ProviderModelsDto {
+    provider: String,
+    models: Vec<String>,
+    is_default: bool,
+}
+
+async fn generate_workflow(
+    State(s): State<AppState>,
+    Json(body): Json<GenerateWorkflowBody>,
+) -> ApiResult<Json<GeneratedWfDto>> {
+    use crate::definition_generator::{DefKind, GenDefError, GenerateDefRequest};
+    let gen = s
+        .generator
+        .clone()
+        .ok_or_else(|| ApiError::not_available("AI generation requires `rupu cp serve`"))?;
+    let out = gen
+        .generate(GenerateDefRequest {
+            kind: DefKind::Workflow,
+            description: body.description,
+            provider: body.provider,
+            model: body.model,
+        })
+        .await
+        .map_err(|e| match e {
+            GenDefError::NoCredentials => ApiError::bad_request(e.to_string()),
+            GenDefError::Failed(m) => ApiError::internal(m),
+        })?;
+    Ok(Json(GeneratedWfDto {
+        raw: out.raw,
+        provider: out.provider,
+        model: out.model,
+        attempts: out.attempts,
+    }))
+}
+
+async fn generate_models(State(s): State<AppState>) -> Json<Vec<ProviderModelsDto>> {
+    let list = match &s.generator {
+        Some(g) => g
+            .available_models()
+            .await
+            .into_iter()
+            .map(|p| ProviderModelsDto {
+                provider: p.provider,
+                models: p.models,
+                is_default: p.is_default,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Json(list)
 }
 
 #[cfg(test)]
@@ -290,8 +366,11 @@ mod tests {
     }
 
     fn test_state(tmp: &tempfile::TempDir) -> AppState {
-        AppState::new(tmp.path().to_path_buf(), rupu_config::PricingConfig::default())
-            .with_workspace_dir(tmp.path().to_path_buf())
+        AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf())
     }
 
     #[tokio::test]

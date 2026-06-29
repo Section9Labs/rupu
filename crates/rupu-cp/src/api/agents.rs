@@ -25,6 +25,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/agents/:name/run", post(run_agent))
         .route("/api/agents/:name/session", post(start_session))
+        .route("/api/agents/generate", post(generate_agent))
 }
 
 /// Directory where global agent `.md` definitions live.
@@ -289,7 +290,9 @@ async fn run_agent(
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
             other => ApiError::internal(other.to_string()),
         })?;
-        return Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "run_id": run_id, "host_id": host }),
+        ));
     }
 
     // Local path: unchanged (including the 501 when no launcher is installed).
@@ -298,7 +301,9 @@ async fn run_agent(
         .clone()
         .ok_or_else(|| ApiError::not_available("launching agents requires `rupu cp serve`"))?;
     let run_id = run_agent_with(&name, b, launcher).await?;
-    Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": "local" })))
+    Ok(Json(
+        serde_json::json!({ "run_id": run_id, "host_id": "local" }),
+    ))
 }
 
 /// Request body for `POST /api/agents/:name/session`. All fields optional; a
@@ -382,6 +387,52 @@ async fn start_session(
     ))
 }
 
+#[derive(Deserialize)]
+struct GenerateAgentBody {
+    description: String,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeneratedDefDto {
+    raw: String,
+    provider: String,
+    model: String,
+    attempts: u8,
+}
+
+async fn generate_agent(
+    State(s): State<AppState>,
+    Json(body): Json<GenerateAgentBody>,
+) -> ApiResult<Json<GeneratedDefDto>> {
+    use crate::definition_generator::{DefKind, GenDefError, GenerateDefRequest};
+    let gen = s
+        .generator
+        .clone()
+        .ok_or_else(|| ApiError::not_available("AI generation requires `rupu cp serve`"))?;
+    let out = gen
+        .generate(GenerateDefRequest {
+            kind: DefKind::Agent,
+            description: body.description,
+            provider: body.provider,
+            model: body.model,
+        })
+        .await
+        .map_err(|e| match e {
+            GenDefError::NoCredentials => ApiError::bad_request(e.to_string()),
+            GenDefError::Failed(m) => ApiError::internal(m),
+        })?;
+    Ok(Json(GeneratedDefDto {
+        raw: out.raw,
+        provider: out.provider,
+        model: out.model,
+        attempts: out.attempts,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,8 +453,11 @@ mod tests {
     }
 
     fn test_state(tmp: &tempfile::TempDir) -> AppState {
-        AppState::new(tmp.path().to_path_buf(), rupu_config::PricingConfig::default())
-            .with_workspace_dir(tmp.path().to_path_buf())
+        AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf())
     }
 
     #[tokio::test]
@@ -543,6 +597,65 @@ mod tests {
         let err = start_session(State(s), Path("triage".into()), None)
             .await
             .expect_err("no starter");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    use crate::definition_generator::{
+        DefKind, DefinitionGenerator, GenDefError, GenerateDefRequest, GeneratedDef, ProviderModels,
+    };
+
+    struct StubGen;
+    #[async_trait::async_trait]
+    impl DefinitionGenerator for StubGen {
+        async fn generate(&self, req: GenerateDefRequest) -> Result<GeneratedDef, GenDefError> {
+            assert_eq!(req.kind, DefKind::Agent);
+            Ok(GeneratedDef {
+                raw: VALID_MD.to_string(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-6".into(),
+                attempts: 1,
+            })
+        }
+        async fn available_models(&self) -> Vec<ProviderModels> {
+            vec![ProviderModels {
+                provider: "anthropic".into(),
+                models: vec!["claude-sonnet-4-6".into()],
+                is_default: true,
+            }]
+        }
+    }
+
+    #[tokio::test]
+    async fn generate_agent_returns_content_without_writing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = test_state(&tmp).with_generator(Some(std::sync::Arc::new(StubGen)));
+        let body = GenerateAgentBody {
+            description: "x".into(),
+            provider: None,
+            model: None,
+        };
+        let Json(out) = generate_agent(State(state), Json(body)).await.expect("ok");
+        assert!(out.raw.contains("name:"));
+        // Nothing persisted by generate.
+        assert!(
+            !tmp.path().join("agents").exists()
+                || std::fs::read_dir(tmp.path().join("agents"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_agent_without_adapter_is_not_available() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = test_state(&tmp); // generator = None
+        let body = GenerateAgentBody {
+            description: "x".into(),
+            provider: None,
+            model: None,
+        };
+        let err = generate_agent(State(state), Json(body)).await.unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 }

@@ -27,6 +27,9 @@ pub struct AppState {
     /// Optional session-starter port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess-spawning adapter via [`AppState::with_session_starter`].
     pub session_starter: Option<Arc<dyn crate::session_starter::SessionStarter>>,
+    /// Optional definition generator; `rupu cp serve` installs the
+    /// orchestrator-backed adapter via [`AppState::with_generator`].
+    pub generator: Option<Arc<dyn crate::definition_generator::DefinitionGenerator>>,
     /// Host registry. Defaults to a local-only registry (no launchers) so that
     /// read-only `rupu cp` works without a running daemon. `cp serve` replaces
     /// this with a fully-wired registry via [`AppState::with_hosts`].
@@ -41,8 +44,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(global_dir: PathBuf, pricing: rupu_config::PricingConfig) -> Self {
         let run_store = Arc::new(RunStore::new(global_dir.join("runs")));
-        let workspace_dir =
-            std::env::current_dir().unwrap_or_else(|_| global_dir.clone());
+        let workspace_dir = std::env::current_dir().unwrap_or_else(|_| global_dir.clone());
 
         // Build tunnel deps first so they can be wired into the host registry.
         let node_registry = Arc::new(crate::node::NodeRegistry::new());
@@ -60,7 +62,9 @@ impl AppState {
             global_dir.clone(),
         )
         .with_pricing(pricing.clone());
-        let store = rupu_workspace::HostStore { root: global_dir.join("hosts") };
+        let store = rupu_workspace::HostStore {
+            root: global_dir.join("hosts"),
+        };
         let hosts = Arc::new(
             crate::host::registry::HostRegistry::new(store, Arc::new(local)).with_tunnel_deps(
                 Arc::clone(&node_registry),
@@ -80,6 +84,7 @@ impl AppState {
             repos: None,
             agent_launcher: None,
             session_starter: None,
+            generator: None,
             hosts,
             node_registry,
             node_mirror,
@@ -105,10 +110,7 @@ impl AppState {
     }
 
     /// Install a repo-lister adapter (or clear it with `None`).
-    pub fn with_repos(
-        mut self,
-        repos: Option<Arc<dyn crate::repos::RepoLister>>,
-    ) -> Self {
+    pub fn with_repos(mut self, repos: Option<Arc<dyn crate::repos::RepoLister>>) -> Self {
         self.repos = repos;
         self
     }
@@ -128,6 +130,15 @@ impl AppState {
         starter: Option<Arc<dyn crate::session_starter::SessionStarter>>,
     ) -> Self {
         self.session_starter = starter;
+        self
+    }
+
+    /// Install a definition-generator adapter (or clear it with `None`).
+    pub fn with_generator(
+        mut self,
+        generator: Option<Arc<dyn crate::definition_generator::DefinitionGenerator>>,
+    ) -> Self {
+        self.generator = generator;
         self
     }
 
