@@ -109,14 +109,43 @@ pub struct RetryConfig {
     pub initial_delay_ms: Option<u64>,
 }
 
+/// Provider names reserved for built-in providers. A `[providers.<name>]`
+/// entry with `kind = "openai-compatible"` may not reuse one of these —
+/// mirrors the built-ins in `rupu_runtime::provider_factory::is_builtin_provider`
+/// and `rupu-auth`'s `parse_provider`. Keep in sync if built-ins change.
+const RESERVED_PROVIDER_NAMES: &[&str] = &[
+    "anthropic",
+    "openai",
+    "gemini",
+    "copilot",
+    "local",
+    "github",
+    "gitlab",
+    "linear",
+    "jira",
+];
+
 impl Config {
     /// Validate cross-field invariants not expressible in serde.
     pub fn validate(&self) -> Result<(), crate::layer::LayerError> {
         for (name, p) in &self.providers {
-            if p.kind.as_deref() == Some("openai-compatible") && p.base_url.is_none() {
-                return Err(crate::layer::LayerError::Invalid(format!(
-                    "provider '{name}': kind=\"openai-compatible\" requires base_url"
-                )));
+            if p.kind.as_deref() == Some("openai-compatible") {
+                if RESERVED_PROVIDER_NAMES.contains(&name.as_str()) {
+                    return Err(crate::layer::LayerError::Invalid(format!(
+                        "provider '{name}': \"openai-compatible\" cannot reuse the reserved \
+                         built-in provider name '{name}'; choose a distinct name"
+                    )));
+                }
+                if p.base_url.is_none() {
+                    return Err(crate::layer::LayerError::Invalid(format!(
+                        "provider '{name}': kind=\"openai-compatible\" requires base_url"
+                    )));
+                }
+                if p.default_model.as_deref().map_or(true, |m| m.is_empty()) {
+                    return Err(crate::layer::LayerError::Invalid(format!(
+                        "provider '{name}': kind=\"openai-compatible\" requires default_model"
+                    )));
+                }
             }
         }
         Ok(())
@@ -149,9 +178,41 @@ mod tests {
             crate::provider_config::ProviderConfig {
                 kind: Some("openai-compatible".into()),
                 base_url: Some("http://host:8080".into()),
+                default_model: Some("llama3".into()),
                 ..Default::default()
             },
         );
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_openai_compatible_reserved_name() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "openai".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://host:8080".into()),
+                default_model: Some("gpt-4".into()),
+                ..Default::default()
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("openai"));
+    }
+
+    #[test]
+    fn validate_rejects_openai_compatible_without_default_model() {
+        let mut cfg = Config::default();
+        cfg.providers.insert(
+            "my-llm".into(),
+            crate::provider_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://host:8080".into()),
+                ..Default::default()
+            },
+        );
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("default_model"));
     }
 }
