@@ -187,25 +187,28 @@ async fn run_resume_worker(
             }
         };
 
-        // Defense-in-depth: never resume a run that belongs to a tunnel node;
-        // its real run lives on the node and is resumed via a control frame,
-        // not by this local worker. (Tunnel runs also never carry the
-        // resume_requested_at marker, so this is belt-and-suspenders.)
-        let tunnel_nodes: std::collections::HashSet<String> = hosts
+        // Defense-in-depth: never resume a run that belongs to a REMOTE host
+        // (tunnel or ssh); its real run lives on that host and is resumed via
+        // the transport, not by this local worker. (Remote runs also never carry
+        // the resume_requested_at marker, so this is belt-and-suspenders.)
+        // KEY ASYMMETRY: a Tunnel run's worker_id is the node_id; an SSH run's
+        // worker_id is the host record id (host_<ULID>).
+        let remote_workers: std::collections::HashSet<String> = hosts
             .list()
             .unwrap_or_default()
             .into_iter()
             .filter_map(|h| match h.transport {
                 rupu_workspace::HostTransport::Tunnel { node_id } => Some(node_id),
+                rupu_workspace::HostTransport::Ssh { .. } => Some(h.id),
                 _ => None,
             })
             .collect();
 
         for run in pending {
             if let Some(w) = run.worker_id.as_deref() {
-                if tunnel_nodes.contains(w) {
+                if remote_workers.contains(w) {
                     tracing::debug!(run_id = %run.id, worker = %w,
-                        "resume worker: skipping tunnel-node run");
+                        "resume worker: skipping remote-host run");
                     continue;
                 }
             }
