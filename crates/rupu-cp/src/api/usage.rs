@@ -99,7 +99,9 @@ impl Granularity {
         match s {
             None | Some("day") => Ok(Granularity::Day),
             Some("week") => Ok(Granularity::Week),
-            Some(other) => Err(format!("invalid bucket {other:?}: expected \"day\" or \"week\"")),
+            Some(other) => Err(format!(
+                "invalid bucket {other:?}: expected \"day\" or \"week\""
+            )),
         }
     }
 }
@@ -125,20 +127,61 @@ fn bucket_key(dt: DateTime<Utc>, granularity: Granularity) -> String {
     let date = dt.date_naive();
     let date = match granularity {
         Granularity::Day => date,
-        Granularity::Week => {
-            date - Duration::days(date.weekday().num_days_from_monday() as i64)
-        }
+        Granularity::Week => date - Duration::days(date.weekday().num_days_from_monday() as i64),
     };
     date.format("%Y-%m-%d").to_string()
 }
 
-/// Group per-run `(started_at, rows)` by bucket key, then break each bucket down
-/// per model. Returns buckets sorted chronologically (the `YYYY-MM-DD` key sorts
-/// lexicographically into chronological order).
+/// Gap-fill start for the timeline, or `None` when the store has no runs at all
+/// (caller returns an empty series). Clamps the window start up to the
+/// first-ever run: bounded windows (7d/30d) draw the full window with zeros;
+/// the unbounded `all` window starts at the first run instead of the epoch.
+fn timeline_fill_start(
+    window_start: DateTime<Utc>,
+    earliest_run: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    earliest_run.map(|earliest| window_start.max(earliest))
+}
+
+/// Every bucket key from `fill_start` to `fill_end` inclusive, at the granularity.
+/// `Day` → one key per calendar day; `Week` → one key per ISO week, starting from
+/// the Monday on or before `fill_start`. Produces `YYYY-MM-DD` keys identical in
+/// form to [`bucket_key`], so they align with grouped run buckets.
+fn enumerate_bucket_keys(
+    fill_start: DateTime<Utc>,
+    fill_end: DateTime<Utc>,
+    granularity: Granularity,
+) -> Vec<String> {
+    let mut cursor = match granularity {
+        Granularity::Day => fill_start.date_naive(),
+        Granularity::Week => {
+            let d = fill_start.date_naive();
+            d - Duration::days(d.weekday().num_days_from_monday() as i64)
+        }
+    };
+    let end = fill_end.date_naive();
+    let step = match granularity {
+        Granularity::Day => Duration::days(1),
+        Granularity::Week => Duration::days(7),
+    };
+    let mut keys = Vec::new();
+    while cursor <= end {
+        keys.push(cursor.format("%Y-%m-%d").to_string());
+        cursor += step;
+    }
+    keys
+}
+
+/// Group per-run `(started_at, rows)` by bucket key, then emit a CONTINUOUS run
+/// of buckets from `fill_start` to `fill_end` inclusive at the granularity —
+/// synthesizing an empty bucket (`rows: []`) for every period with no runs, so
+/// the timeline has no gaps and reaches `fill_end`. Buckets are chronological.
 fn build_timeline(
     runs_with_rows: Vec<(DateTime<Utc>, Vec<rupu_transcript::UsageRow>)>,
     pricing: &rupu_config::PricingConfig,
     granularity: Granularity,
+    fill_start: DateTime<Utc>,
+    fill_end: DateTime<Utc>,
 ) -> Vec<UsageTimelineBucket> {
     let mut grouped: std::collections::BTreeMap<String, Vec<rupu_transcript::UsageRow>> =
         std::collections::BTreeMap::new();
@@ -146,11 +189,14 @@ fn build_timeline(
         let key = bucket_key(started_at, granularity);
         grouped.entry(key).or_default().extend(rows);
     }
-    grouped
+    enumerate_bucket_keys(fill_start, fill_end, granularity)
         .into_iter()
-        .map(|(bucket, rows)| UsageTimelineBucket {
-            rows: crate::usage::breakdown(&rows, pricing, crate::usage::GroupBy::Model),
-            bucket,
+        .map(|bucket| {
+            let rows = grouped
+                .get(&bucket)
+                .map(|rows| crate::usage::breakdown(rows, pricing, crate::usage::GroupBy::Model))
+                .unwrap_or_default();
+            UsageTimelineBucket { rows, bucket }
         })
         .collect()
 }
@@ -168,6 +214,12 @@ async fn get_usage_timeline(
         .list()
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
+    // Clamp the fill start to the first-ever run; no runs at all → empty series.
+    let earliest_overall = runs.iter().map(|r| r.started_at).min();
+    let Some(fill_start) = timeline_fill_start(start, earliest_overall) else {
+        return Ok(Json(Vec::new()));
+    };
+
     let mut runs_with_rows: Vec<(DateTime<Utc>, Vec<rupu_transcript::UsageRow>)> = Vec::new();
     for r in runs
         .iter()
@@ -178,7 +230,13 @@ async fn get_usage_timeline(
         runs_with_rows.push((r.started_at, rows));
     }
 
-    Ok(Json(build_timeline(runs_with_rows, &s.pricing, granularity)))
+    Ok(Json(build_timeline(
+        runs_with_rows,
+        &s.pricing,
+        granularity,
+        fill_start,
+        end,
+    )))
 }
 
 #[cfg(test)]
@@ -225,9 +283,7 @@ mod tests {
     }
 
     fn dt(s: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(s)
-            .unwrap()
-            .with_timezone(&Utc)
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
     }
 
     fn urow(provider: &str, model: &str, input: u64, output: u64) -> rupu_transcript::UsageRow {
@@ -278,6 +334,106 @@ mod tests {
     }
 
     #[test]
+    fn timeline_fill_start_clamps_to_window_then_first_run() {
+        let start = dt("2026-06-01T00:00:00Z");
+        // No runs at all → None (caller returns an empty series).
+        assert_eq!(timeline_fill_start(start, None), None);
+        // First run older than the window → clamp up to the window start.
+        assert_eq!(
+            timeline_fill_start(start, Some(dt("2026-05-10T00:00:00Z"))),
+            Some(start)
+        );
+        // First run inside the window → start at the first run (no flat lead-in).
+        let first = dt("2026-06-10T08:00:00Z");
+        assert_eq!(timeline_fill_start(start, Some(first)), Some(first));
+    }
+
+    #[test]
+    fn enumerate_bucket_keys_daily_is_inclusive_continuous() {
+        let keys = enumerate_bucket_keys(
+            dt("2026-06-10T23:00:00Z"),
+            dt("2026-06-13T01:00:00Z"),
+            Granularity::Day,
+        );
+        assert_eq!(
+            keys,
+            vec!["2026-06-10", "2026-06-11", "2026-06-12", "2026-06-13"]
+        );
+    }
+
+    #[test]
+    fn enumerate_bucket_keys_weekly_snaps_to_monday_and_steps_weeks() {
+        // 2026-06-24 is a Wednesday (week of 06-22); end 2026-07-06 is a Monday.
+        let keys = enumerate_bucket_keys(
+            dt("2026-06-24T10:00:00Z"),
+            dt("2026-07-06T10:00:00Z"),
+            Granularity::Week,
+        );
+        assert_eq!(keys, vec!["2026-06-22", "2026-06-29", "2026-07-06"]);
+    }
+
+    #[test]
+    fn build_timeline_gap_fills_empty_days_between_and_after_runs() {
+        let pricing = rupu_config::PricingConfig::default();
+        let runs = vec![
+            (
+                dt("2026-06-10T10:00:00Z"),
+                vec![urow("anthropic", "claude-sonnet-4-6", 1000, 0)],
+            ),
+            (
+                dt("2026-06-12T10:00:00Z"),
+                vec![urow("anthropic", "claude-sonnet-4-6", 2000, 0)],
+            ),
+        ];
+        // Fill from the first run through 06-15 (e.g. "now").
+        let buckets = build_timeline(
+            runs,
+            &pricing,
+            Granularity::Day,
+            dt("2026-06-10T10:00:00Z"),
+            dt("2026-06-15T00:00:00Z"),
+        );
+        let keys: Vec<&str> = buckets.iter().map(|b| b.bucket.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "2026-06-10",
+                "2026-06-11",
+                "2026-06-12",
+                "2026-06-13",
+                "2026-06-14",
+                "2026-06-15"
+            ]
+        );
+        // Populated days carry rows; gap days are empty.
+        assert!(!buckets[0].rows.is_empty()); // 06-10
+        assert!(buckets[1].rows.is_empty()); // 06-11
+        assert!(!buckets[2].rows.is_empty()); // 06-12
+        assert!(buckets[3].rows.is_empty()); // 06-13
+        assert!(buckets[5].rows.is_empty()); // 06-15 (reaches the end)
+        assert_eq!(buckets[2].rows[0].input_tokens, 2000);
+    }
+
+    #[test]
+    fn build_timeline_reaches_end_when_no_recent_activity() {
+        let pricing = rupu_config::PricingConfig::default();
+        let runs = vec![(
+            dt("2026-06-10T10:00:00Z"),
+            vec![urow("anthropic", "claude-sonnet-4-6", 1000, 0)],
+        )];
+        let buckets = build_timeline(
+            runs,
+            &pricing,
+            Granularity::Day,
+            dt("2026-06-10T10:00:00Z"),
+            dt("2026-06-13T00:00:00Z"),
+        );
+        assert_eq!(buckets.len(), 4); // 06-10..06-13 inclusive
+        assert_eq!(buckets.last().unwrap().bucket, "2026-06-13");
+        assert!(buckets.last().unwrap().rows.is_empty());
+    }
+
+    #[test]
     fn build_timeline_buckets_by_day_with_per_model_breakdown() {
         let pricing = rupu_config::PricingConfig::default();
         let runs = vec![
@@ -298,7 +454,13 @@ mod tests {
             ),
         ];
 
-        let buckets = build_timeline(runs, &pricing, Granularity::Day);
+        let buckets = build_timeline(
+            runs,
+            &pricing,
+            Granularity::Day,
+            dt("2026-06-24T10:00:00Z"),
+            dt("2026-06-25T09:00:00Z"),
+        );
         assert_eq!(buckets.len(), 2);
         // Chronological order.
         assert_eq!(buckets[0].bucket, "2026-06-24");
@@ -339,7 +501,13 @@ mod tests {
                 vec![urow("anthropic", "claude-sonnet-4-6", 2000, 0)],
             ),
         ];
-        let buckets = build_timeline(runs, &pricing, Granularity::Week);
+        let buckets = build_timeline(
+            runs,
+            &pricing,
+            Granularity::Week,
+            dt("2026-06-24T10:00:00Z"),
+            dt("2026-06-25T10:00:00Z"),
+        );
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].bucket, "2026-06-22");
         assert_eq!(buckets[0].rows[0].input_tokens, 3000);
