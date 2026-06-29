@@ -42,6 +42,24 @@ function renderPage() {
   );
 }
 
+describe('WorkflowRuns archived mode — kind-filtered fetch', () => {
+  it('clicking Archived calls getArchivedRuns with kind="workflow"', async () => {
+    stubDeps();
+    vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
+    const archivedSpy = vi.spyOn(api, 'getArchivedRuns').mockResolvedValue([]);
+
+    renderPage();
+    // Wait for initial active-tab fetch to settle.
+    await waitFor(() => expect(screen.getByText('Archived')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText('Archived'));
+
+    await waitFor(() =>
+      expect(archivedSpy).toHaveBeenCalledWith('workflow'),
+    );
+  });
+});
+
 describe('WorkflowRuns host filter — server-driven', () => {
   it('default fetch is called with host: "local" (fast path, not fan-out)', async () => {
     stubDeps();

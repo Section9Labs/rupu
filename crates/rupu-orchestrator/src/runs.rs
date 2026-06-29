@@ -430,6 +430,8 @@ pub enum RunStoreError {
     /// re-delivery; the caller should log + skip, not panic.
     #[error("run `{0}` already exists")]
     AlreadyExists(String),
+    #[error("run `{0}` is not in a terminal state (cancel it first)")]
+    NotTerminal(String),
 }
 
 /// Filesystem-backed run store. One root directory; one
@@ -732,11 +734,11 @@ impl RunStore {
         self.run_dir(run_id).join("events.jsonl")
     }
 
-    /// List every run currently on disk, newest-first by
-    /// `started_at`. Malformed `run.json` files are skipped.
-    pub fn list(&self) -> Result<Vec<RunRecord>, RunStoreError> {
+    /// Read run records from an arbitrary runs root (active or archive),
+    /// newest first. Shared by `list` / `list_archived`.
+    fn list_in(root: &std::path::Path) -> Result<Vec<RunRecord>, RunStoreError> {
         let mut out: Vec<RunRecord> = Vec::new();
-        let rd = match std::fs::read_dir(&self.root) {
+        let rd = match std::fs::read_dir(root) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
             Err(e) => return Err(e.into()),
@@ -754,6 +756,75 @@ impl RunStore {
         }
         out.sort_by_key(|r| std::cmp::Reverse(r.started_at));
         Ok(out)
+    }
+
+    /// List every run currently on disk, newest-first by
+    /// `started_at`. Malformed `run.json` files are skipped.
+    pub fn list(&self) -> Result<Vec<RunRecord>, RunStoreError> {
+        Self::list_in(&self.root)
+    }
+
+    /// Directory holding archived runs — sibling of the active runs dir
+    /// (`<global>/runs` → `<global>/runs-archive`).
+    fn archive_root(&self) -> PathBuf {
+        self.root.with_file_name("runs-archive")
+    }
+
+    /// List archived runs (reads `<root>/../runs-archive`), newest first.
+    pub fn list_archived(&self) -> Result<Vec<RunRecord>, RunStoreError> {
+        Self::list_in(&self.archive_root())
+    }
+
+    /// Move `runs/<id>` → `runs-archive/<id>` (reversible). Requires the run
+    /// to exist and be in a terminal state. The run dir carries its own
+    /// transcript artifacts, so the rename takes them with it.
+    pub fn archive(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let src = self.run_dir(run_id);
+        if !src.join("run.json").is_file() {
+            return Err(RunStoreError::NotFound(run_id.to_string()));
+        }
+        let rec: RunRecord = serde_json::from_slice(&std::fs::read(src.join("run.json"))?)?;
+        if !rec.status.is_terminal() {
+            return Err(RunStoreError::NotTerminal(run_id.to_string()));
+        }
+        let dst = self.archive_root().join(run_id);
+        if dst.exists() {
+            return Err(RunStoreError::AlreadyExists(run_id.to_string()));
+        }
+        std::fs::create_dir_all(self.archive_root())?;
+        std::fs::rename(&src, &dst)?;
+        Ok(())
+    }
+
+    /// Move `runs-archive/<id>` → `runs/<id>`.
+    pub fn restore(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let src = self.archive_root().join(run_id);
+        if !src.join("run.json").is_file() {
+            return Err(RunStoreError::NotFound(run_id.to_string()));
+        }
+        let dst = self.run_dir(run_id);
+        if dst.exists() {
+            return Err(RunStoreError::AlreadyExists(run_id.to_string()));
+        }
+        std::fs::create_dir_all(&self.root)?;
+        std::fs::rename(&src, &dst)?;
+        Ok(())
+    }
+
+    /// Permanently remove the run directory from whichever scope holds it.
+    /// No terminal-state guard here — the CP/CLI layer enforces that.
+    pub fn delete(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let active = self.run_dir(run_id);
+        let archived = self.archive_root().join(run_id);
+        let target = if active.is_dir() {
+            active
+        } else if archived.is_dir() {
+            archived
+        } else {
+            return Err(RunStoreError::NotFound(run_id.to_string()));
+        };
+        std::fs::remove_dir_all(&target)?;
+        Ok(())
     }
 
     /// If `record` is in `AwaitingApproval` and its `expires_at`
@@ -1000,9 +1071,9 @@ impl RunStore {
             .clone()
             .ok_or(ApprovalError::NoAwaitingStep)?;
         let _ = approver; // identity recorded in transcript via runner re-entry
-        // Marker-only: leave status AwaitingApproval and keep
-        // awaiting_step_id / approval_prompt / awaiting_since /
-        // expires_at intact for the worker to approve+resume.
+                          // Marker-only: leave status AwaitingApproval and keep
+                          // awaiting_step_id / approval_prompt / awaiting_since /
+                          // expires_at intact for the worker to approve+resume.
         record.resume_requested_at = Some(now);
         record.resume_mode = mode
             .filter(|m| matches!(*m, "ask" | "bypass" | "readonly"))
@@ -1118,10 +1189,11 @@ impl RunStore {
             | RunStatus::Rejected
             | RunStatus::Cancelled => Err(CancelError::AlreadyTerminal(record.status)),
             RunStatus::AwaitingApproval => {
-                self.reject(run_id, approver, reason, now).map_err(|e| match e {
-                    ApprovalError::NotFound(s) => CancelError::NotFound(s),
-                    other => CancelError::Store(other.to_string()),
-                })?;
+                self.reject(run_id, approver, reason, now)
+                    .map_err(|e| match e {
+                        ApprovalError::NotFound(s) => CancelError::NotFound(s),
+                        other => CancelError::Store(other.to_string()),
+                    })?;
                 Ok(CancelOutcome::RejectedAwaitingApproval)
             }
             RunStatus::Pending | RunStatus::Running => {
@@ -1997,5 +2069,77 @@ mod tests {
             err,
             CancelError::AlreadyTerminal(RunStatus::Completed)
         ));
+    }
+
+    #[test]
+    fn archive_moves_run_out_of_list_and_restore_brings_it_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let mut rec = sample_record("run_01ARCHIVE");
+        rec.status = RunStatus::Completed;
+        store.create(rec.clone(), "x").unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        store.archive(&rec.id).unwrap();
+        assert_eq!(
+            store.list().unwrap().len(),
+            0,
+            "archived run leaves active list"
+        );
+        let archived = store.list_archived().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, rec.id);
+        // The archive dir is a sibling of the runs dir.
+        assert!(tmp
+            .path()
+            .join("runs-archive")
+            .join(&rec.id)
+            .join("run.json")
+            .is_file());
+
+        store.restore(&rec.id).unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.list_archived().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn archive_requires_terminal_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let mut rec = sample_record("run_01RUNNING");
+        rec.status = RunStatus::Running;
+        store.create(rec.clone(), "x").unwrap();
+        match store.archive(&rec.id) {
+            Err(RunStoreError::NotTerminal(_)) => {}
+            other => panic!("expected NotTerminal, got {other:?}"),
+        }
+        // Still listed, untouched.
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_removes_from_either_scope_and_then_404s() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let mut rec = sample_record("run_01DELETE");
+        rec.status = RunStatus::Failed;
+        store.create(rec.clone(), "x").unwrap();
+
+        store.delete(&rec.id).unwrap();
+        assert!(!tmp.path().join("runs").join(&rec.id).exists());
+        match store.delete(&rec.id) {
+            Err(RunStoreError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_missing_run_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        match store.archive("run_NOPE") {
+            Err(RunStoreError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }

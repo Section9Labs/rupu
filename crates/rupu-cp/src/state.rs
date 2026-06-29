@@ -30,6 +30,9 @@ pub struct AppState {
     /// Optional definition generator; `rupu cp serve` installs the
     /// orchestrator-backed adapter via [`AppState::with_generator`].
     pub generator: Option<Arc<dyn crate::definition_generator::DefinitionGenerator>>,
+    /// Optional session-mutator port. Defaults to `None`; rupu-cli's `cp serve`
+    /// installs a subprocess adapter via [`AppState::with_session_mutator`].
+    pub session_mutator: Option<Arc<dyn crate::session_mutator::SessionMutator>>,
     /// Host registry. Defaults to a local-only registry (no launchers) so that
     /// read-only `rupu cp` works without a running daemon. `cp serve` replaces
     /// this with a fully-wired registry via [`AppState::with_hosts`].
@@ -85,6 +88,7 @@ impl AppState {
             agent_launcher: None,
             session_starter: None,
             generator: None,
+            session_mutator: None,
             hosts,
             node_registry,
             node_mirror,
@@ -139,6 +143,15 @@ impl AppState {
         generator: Option<Arc<dyn crate::definition_generator::DefinitionGenerator>>,
     ) -> Self {
         self.generator = generator;
+        self
+    }
+
+    /// Install a session-mutator adapter (or clear it with `None`).
+    pub fn with_session_mutator(
+        mut self,
+        m: Option<Arc<dyn crate::session_mutator::SessionMutator>>,
+    ) -> Self {
+        self.session_mutator = m;
         self
     }
 

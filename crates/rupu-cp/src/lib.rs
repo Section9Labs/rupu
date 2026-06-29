@@ -13,6 +13,7 @@ pub mod node;
 pub mod pagination;
 pub mod repos;
 pub mod server;
+pub mod session_mutator;
 pub mod session_sender;
 pub mod session_starter;
 pub mod sse;
@@ -54,6 +55,10 @@ pub struct ServeOpts {
     /// Optional definition-generator adapter. rupu-cli's `cp serve` provides the
     /// orchestrator-backed impl; `None` → the generate endpoints return 501.
     pub generator: Option<std::sync::Arc<dyn crate::definition_generator::DefinitionGenerator>>,
+    /// Optional session-mutator adapter. rupu-cli's `cp serve` provides the
+    /// subprocess impl; `None` → the session archive/restore/delete endpoints
+    /// return 501.
+    pub session_mutator: Option<std::sync::Arc<dyn crate::session_mutator::SessionMutator>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -115,7 +120,8 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .with_repos(opts.repos)
         .with_agent_launcher(opts.agent_launcher.clone())
         .with_session_starter(opts.session_starter.clone())
-        .with_generator(opts.generator);
+        .with_generator(opts.generator)
+        .with_session_mutator(opts.session_mutator.clone());
 
     // Replace the default read-only registry with a fully-wired one that
     // holds the real launcher / sender / starter adapters.

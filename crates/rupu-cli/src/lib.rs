@@ -10,6 +10,7 @@ pub mod cp_agent_launcher;
 pub mod cp_definition_generator;
 pub mod cp_launcher;
 pub mod cp_repos;
+pub mod cp_session_mutator;
 pub mod cp_session_sender;
 pub mod cp_session_starter;
 pub mod crash;
@@ -276,11 +277,9 @@ fn ensure_output_format_supported(
             format,
             &[output::formats::OutputFormat::Table],
         ),
-        Cmd::Cp { .. } => output::formats::ensure_supported(
-            "cp",
-            format,
-            &[output::formats::OutputFormat::Table],
-        ),
+        Cmd::Cp { .. } => {
+            output::formats::ensure_supported("cp", format, &[output::formats::OutputFormat::Table])
+        }
         Cmd::Usage(args) => cmd::usage::ensure_output_format(args, format),
         Cmd::Watch(_) => output::formats::ensure_supported(
             "watch",

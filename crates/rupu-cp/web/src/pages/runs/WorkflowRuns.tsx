@@ -2,6 +2,9 @@
 // Three tabs (Running / Completed / Failed-Rejected) with independent fetches.
 // Running polls every 5 s (unpaginated); Completed/Failed paginate (no poll) —
 // keeping paginated history off the poll loop avoids the scroll-reset flicker.
+//
+// Archived toggle: when enabled, switches the fetch to /api/runs/archived and
+// shows Restore + Delete per-row actions; when disabled, shows Archive + Delete.
 
 import { useCallback, useEffect, useState } from 'react';
 import { Inbox, RefreshCw } from 'lucide-react';
@@ -59,6 +62,7 @@ function runHref(r: RunListRow): string {
 
 export default function WorkflowRuns() {
   const [tab, setTab] = useState<Tab>('active');
+  const [archived, setArchived] = useState(false);
   const [runs, setRuns] = useState<RunListRow[] | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -74,37 +78,44 @@ export default function WorkflowRuns() {
     return () => { cancelled = true; };
   }, []);
 
-  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab/host change.
+  // Page-0 fetch (and the 5 s poll on the active tab). Reset on tab/host/archived change.
   // Active: fetch ALL in one call (unpaginated) → poll never resets a scrolled
   // list. Completed/Failed: page-0 only; loadMore appends.
+  // Archived: single fetch from /api/runs/archived (no lifecycle tabs, no poll).
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const limit = tab === 'active' ? 200 : PAGE;
-      const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
-      const data = await api.getWorkflowRuns({ lifecycle: tab, limit, host });
-      setRuns(data);
-      setHasMore(tab !== 'active' && data.length >= PAGE);
+      if (archived) {
+        const data = await api.getArchivedRuns('workflow');
+        setRuns(data);
+        setHasMore(false);
+      } else {
+        const limit = tab === 'active' ? 200 : PAGE;
+        const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
+        const data = await api.getWorkflowRuns({ lifecycle: tab, limit, host });
+        setRuns(data);
+        setHasMore(tab !== 'active' && data.length >= PAGE);
+      }
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load runs');
     } finally {
       setRefreshing(false);
     }
-  }, [tab, hostFilter]);
+  }, [tab, hostFilter, archived]);
 
   useEffect(() => {
-    setRuns(null); // show loading on tab/host switch
+    setRuns(null); // show loading on tab/host/archived switch
     void refresh();
-    if (tab === 'active') {
+    if (!archived && tab === 'active') {
       const t = window.setInterval(() => void refresh(), 5000);
       return () => window.clearInterval(t);
     }
     return () => {};
-  }, [tab, hostFilter, refresh]);
+  }, [tab, hostFilter, refresh, archived]);
 
   const loadMore = async () => {
-    if (tab === 'active') return; // active is unpaginated
+    if (archived || tab === 'active') return; // archived + active are unpaginated
     const current = runs ?? [];
     const host = hostFilter === ALL_HOSTS ? undefined : hostFilter;
     const next = await api.getWorkflowRuns({ lifecycle: tab, offset: current.length, limit: PAGE, host });
@@ -117,9 +128,82 @@ export default function WorkflowRuns() {
 
   // Trigger filter is still client-side (cheap; host filter is server-side).
   const filtered = (runs ?? []).filter((r) => {
-    if (filter !== 'all' && r.trigger !== filter) return false;
+    if (!archived && filter !== 'all' && r.trigger !== filter) return false;
     return true;
   });
+
+  // Row-level archive / restore / delete — each refetches after success.
+  async function handleRowArchive(id: string) {
+    try {
+      await api.archiveRun(id);
+      void refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Archive failed');
+    }
+  }
+
+  async function handleRowRestore(id: string) {
+    try {
+      await api.restoreRun(id);
+      void refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Restore failed');
+    }
+  }
+
+  async function handleRowDelete(id: string) {
+    if (!window.confirm('Permanently delete this run and its transcripts? This cannot be undone.')) return;
+    try {
+      await api.deleteRun(id);
+      void refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Delete failed');
+    }
+  }
+
+  // Action column — changes shape based on archived mode.
+  const actionColumn: Column<RunListRow> = {
+    key: 'actions',
+    header: '',
+    align: 'right',
+    width: 'w-36',
+    render: (r) => (
+      <div
+        className="flex items-center justify-end gap-1"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {archived ? (
+          <button
+            type="button"
+            onClick={() => void handleRowRestore(r.id)}
+            className="rounded px-2 py-0.5 text-note font-medium ring-1 bg-panel text-ink-dim ring-border hover:bg-surface-hover"
+            aria-label={`Restore run ${r.id}`}
+          >
+            Restore
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => void handleRowArchive(r.id)}
+            className="rounded px-2 py-0.5 text-note font-medium ring-1 bg-panel text-ink-dim ring-border hover:bg-surface-hover"
+            aria-label={`Archive run ${r.id}`}
+          >
+            Archive
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => void handleRowDelete(r.id)}
+          className="rounded px-2 py-0.5 text-note font-medium ring-1 bg-err-bg text-err ring-err/30 hover:bg-err-bg"
+          aria-label={`Delete run ${r.id}`}
+        >
+          Delete
+        </button>
+      </div>
+    ),
+  };
+
+  const columns: Column<RunListRow>[] = [...WORKFLOW_RUN_COLUMNS, actionColumn];
 
   return (
     <div className="p-8">
@@ -134,9 +218,23 @@ export default function WorkflowRuns() {
         </Button>
       </header>
 
-      {/* Lifecycle tabs */}
+      {/* Lifecycle tabs + Archived toggle */}
       <div className="flex items-center gap-2 mb-4">
-        {TABS.map((t) => (
+        {/* Archived toggle — when active, replaces lifecycle tabs with archived list */}
+        <button
+          onClick={() => setArchived((v) => !v)}
+          className={cn(
+            'text-xs font-medium px-3 py-1.5 rounded-md border transition-colors',
+            archived
+              ? 'bg-brand-600 text-white border-brand-600'
+              : 'bg-panel text-ink-dim border-border hover:bg-surface-hover',
+          )}
+          aria-pressed={archived}
+        >
+          Archived
+        </button>
+
+        {!archived && TABS.map((t) => (
           <button
             key={t.id}
             onClick={() => setTab(t.id)}
@@ -152,8 +250,8 @@ export default function WorkflowRuns() {
         ))}
       </div>
 
-      {/* Trigger filter chips + Host filter */}
-      <div className="flex flex-wrap items-center gap-2 mb-5">
+      {/* Trigger filter chips + Host filter (hidden in archived mode) */}
+      <div className={cn('flex flex-wrap items-center gap-2 mb-5', archived && 'hidden')}>
         {FILTERS.map((f) => (
           <button
             key={f}
@@ -206,7 +304,7 @@ export default function WorkflowRuns() {
             }))} />
           </div>
           <SortableTable<RunListRow>
-            columns={WORKFLOW_RUN_COLUMNS}
+            columns={columns}
             rows={filtered}
             rowKey={(r) => r.id}
             rowHref={runHref}
