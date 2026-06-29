@@ -4,12 +4,13 @@ Slice B-1 adds four LLM providers, each supporting two authentication modes. Thi
 
 ## Provider × auth-mode matrix
 
-| Provider  | API key | SSO  | SSO flow         | Notes                                                              |
-| --------- | :-----: | :--: | ---------------- | ------------------------------------------------------------------ |
-| anthropic |   ✓     |  ✓   | Browser callback | Console API key OR Claude.ai SSO.                                  |
-| openai    |   ✓     |  ✓   | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.   |
-| gemini    |   ✓     |  ✓   | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO via Vertex / CLI also supported. |
-| copilot   |   ✓     |  ✓   | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot. |
+| Provider           | API key | SSO  | SSO flow         | Notes                                                                                      |
+| ------------------ | :-----: | :--: | ---------------- | ------------------------------------------------------------------------------------------ |
+| anthropic          |   ✓     |  ✓   | Browser callback | Console API key OR Claude.ai SSO.                                                          |
+| openai             |   ✓     |  ✓   | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.                           |
+| gemini             |   ✓     |  ✓   | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO via Vertex / CLI also supported.            |
+| copilot            |   ✓     |  ✓   | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot.                   |
+| openai-compatible  |   ✓     |  —   | —                | Generic adapter for any `/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …). |
 
 Anthropic remains the most exercised provider; Copilot's API-key path is most reliable for users who already have `gh auth login` configured.
 
@@ -112,6 +113,84 @@ max_output = 16000
 - **`max_concurrency`** (`Option<usize>`): per-provider semaphore size. Defaults: anthropic 4, openai 8, gemini 4, copilot 4.
 - **`default_model`** (`Option<String>`): model used when an agent file omits `model:`. No global default — the agent must either set `model:` or have one resolvable here.
 - **`[[providers.<name>.models]]`** (`Vec<CustomModel>`): register private/internal/fine-tuned models that aren't returned by `/v1/models`. Each entry takes `id` (required) plus optional `context_window` and `max_output`.
+
+## OpenAI-compatible providers (Oracle GenAI, vLLM, …)
+
+The `openai-compatible` kind connects rupu to any server that speaks the
+`/v1/chat/completions` API with a static Bearer key — self-hosted vLLM,
+Oracle GenAI, Together, Fireworks, OpenRouter, and similar endpoints.
+
+### Config (`~/.rupu/config.toml`)
+
+```toml
+default_provider = "oracle"
+
+[providers.oracle]
+kind = "openai-compatible"
+base_url = "http://192.29.35.246:8080"
+default_model = "/raid/models/zai-org/GLM-5.2-FP8"
+stream = true   # set false if the server has no SSE endpoint
+
+  [[providers.oracle.models]]
+  id = "/raid/models/zai-org/GLM-5.2-FP8"
+  context_window = 131072
+  max_output = 8192
+```
+
+`base_url` may include or omit a trailing `/v1` — rupu normalises both.
+Each `[[providers.<name>.models]]` entry requires `id`, `context_window`,
+and `max_output`; these surface in `rupu models list --provider oracle`.
+
+### Authentication
+
+Only API-key auth is supported for openai-compatible providers — there is
+no SSO flow.
+
+```sh
+# Store the Bearer key (written to auth.json, mode 0600):
+rupu auth login --provider oracle --mode api-key   # prompts for the key
+# …or pipe from stdin / paste inline:
+echo -n "$KEY" | rupu auth login --provider oracle --mode api-key
+```
+
+For CI / ephemeral environments, set the env var instead (rupu reads it
+automatically and does not require a prior `rupu auth login`):
+
+```sh
+export RUPU_ORACLE_API_KEY=sk-...
+```
+
+The env var name is always `RUPU_<UPPERCASED_PROVIDER_NAME>_API_KEY`.
+
+### Running an agent
+
+Set `provider: oracle` in the agent's YAML frontmatter:
+
+```markdown
+---
+name: oracle-codereview
+provider: oracle
+model: /raid/models/zai-org/GLM-5.2-FP8
+---
+
+You review code changes for correctness and style.
+```
+
+Then run:
+
+```sh
+rupu run --agent oracle-codereview
+```
+
+### Workflow steps and subagents
+
+Workflow steps and subagents will gain openai-compatible support in Plan 2.
+For now they use the built-in providers (anthropic, openai, gemini, copilot)
+only.
+
+### Per-provider walkthrough
+
+See `docs/providers/openai-compatible.md` for a step-by-step setup guide.
 
 ## Model resolution
 
