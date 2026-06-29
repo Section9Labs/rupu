@@ -12,10 +12,17 @@
 //!
 //! NodeMirror covers:
 //! - create_run → append(Events) ×2 → finish → load shows Completed + 2-line events.jsonl.
+//!
+//! WS endpoint (`GET /api/node/connect`) covers:
+//! - valid Hello → Welcome + node is_online.
+//! - bad token Hello → connection closed, not registered.
 
 use rupu_cp::node::{Frame, NodeError, NodeRegistry};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+// Used by WS endpoint integration tests below.
+use axum;
 
 // ── register + get ────────────────────────────────────────────────────────────
 
@@ -360,5 +367,192 @@ fn mirror_run_json_repins_cp_local_paths() {
     assert_eq!(
         record.workspace_id, "",
         "workspace_id must be empty (not the node id)"
+    );
+}
+
+// ── WS endpoint integration tests ─────────────────────────────────────────────
+//
+// Spawn the real CP router on a `TcpListener` (same pattern as tests/sse.rs),
+// enroll a tunnel node via `enroll_node`, then connect a `tokio-tungstenite`
+// client to `ws://127.0.0.1:PORT/api/node/connect`.
+
+/// Spawn the CP router and return its bound address.
+#[allow(dead_code)]
+async fn spawn_cp(dir: &std::path::Path) -> std::net::SocketAddr {
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// Spawn the CP with an AppState whose `node_registry` is shared with the
+/// caller so we can inspect it after the WS handshake.
+async fn spawn_cp_with_state(
+    dir: &std::path::Path,
+) -> (std::net::SocketAddr, std::sync::Arc<rupu_cp::node::NodeRegistry>) {
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let registry = std::sync::Arc::clone(&state.node_registry);
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, registry)
+}
+
+/// Send a JSON-serialised [`Frame`] as a text WS message.
+async fn send_frame(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    frame: &Frame,
+) {
+    use futures_util::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    let text = serde_json::to_string(frame).unwrap();
+    ws.send(Message::Text(text.into())).await.unwrap();
+}
+
+/// Receive the next text message from the WS and deserialise it as a [`Frame`].
+async fn recv_frame(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<Frame> {
+    use futures_util::StreamExt as _;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        match ws.next().await? {
+            Ok(Message::Text(t)) => {
+                return Some(serde_json::from_str(&t).expect("frame JSON"))
+            }
+            Ok(Message::Close(_)) => return None,
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// A valid `Hello` with an enrolled token → CP replies `Welcome` and node is online.
+#[tokio::test]
+async fn ws_valid_hello_receives_welcome_and_is_online() {
+    use rupu_workspace::{enroll_node, HostStore};
+    use tempfile::tempdir;
+    use tokio_tungstenite::connect_async;
+
+    let dir = tempdir().unwrap();
+
+    // Enroll a tunnel host into the hosts directory.
+    let host_store = HostStore { root: dir.path().join("hosts") };
+    let (host, token) = enroll_node(&host_store, "test-node-valid").unwrap();
+    let node_id = host.id.clone();
+
+    let (addr, registry) = spawn_cp_with_state(dir.path()).await;
+
+    let url = format!("ws://{addr}/api/node/connect");
+    let (mut ws, _) = connect_async(&url).await.expect("WS connect failed");
+
+    // Determine the node_id from the Tunnel transport.
+    let nid = match &host.transport {
+        rupu_workspace::HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport"),
+    };
+    assert_eq!(nid, node_id);
+
+    // Send Hello with the valid token.
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: nid.clone(),
+            auth: rupu_cp::node::Auth::Token { token },
+            rupu_version: "test".to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await;
+
+    // Expect Welcome.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Welcome")
+    .expect("connection closed before Welcome");
+
+    assert!(
+        matches!(response, Frame::Welcome {}),
+        "expected Welcome, got {response:?}"
+    );
+
+    // Node must be online in the registry.
+    // Give the server a moment to register before we check.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        registry.is_online(&nid),
+        "node should be online in the registry after Welcome"
+    );
+}
+
+/// A `Hello` with a wrong token → server closes the connection and the node
+/// is NOT registered.
+#[tokio::test]
+async fn ws_bad_token_closes_connection_and_not_registered() {
+    use rupu_workspace::{enroll_node, HostStore};
+    use tempfile::tempdir;
+    use tokio_tungstenite::connect_async;
+
+    let dir = tempdir().unwrap();
+
+    // Enroll a tunnel host.
+    let host_store = HostStore { root: dir.path().join("hosts") };
+    let (host, _correct_token) = enroll_node(&host_store, "test-node-bad").unwrap();
+
+    let node_id = match &host.transport {
+        rupu_workspace::HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport"),
+    };
+
+    let (addr, registry) = spawn_cp_with_state(dir.path()).await;
+
+    let url = format!("ws://{addr}/api/node/connect");
+    let (mut ws, _) = connect_async(&url).await.expect("WS connect failed");
+
+    // Send Hello with a WRONG token.
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: node_id.clone(),
+            auth: rupu_cp::node::Auth::Token {
+                token: "this-is-not-the-right-token".to_string(),
+            },
+            rupu_version: "test".to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await;
+
+    // Expect the server to close (None from recv_frame) or send Close.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for server close");
+
+    assert!(
+        response.is_none(),
+        "expected connection close after bad token, got frame {response:?}"
+    );
+
+    // Node must NOT be online.
+    assert!(
+        !registry.is_online(&node_id),
+        "node should NOT be registered after bad-token Hello"
     );
 }

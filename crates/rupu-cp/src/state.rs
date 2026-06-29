@@ -31,6 +31,11 @@ pub struct AppState {
     /// read-only `rupu cp` works without a running daemon. `cp serve` replaces
     /// this with a fully-wired registry via [`AppState::with_hosts`].
     pub hosts: Arc<crate::host::registry::HostRegistry>,
+    /// Live tunnel connection registry. Shared across all WS handler tasks.
+    pub node_registry: Arc<crate::node::NodeRegistry>,
+    /// Mirror writer: streams artifact frames from tunnel nodes into the
+    /// central [`RunStore`] so node runs appear as first-class runs.
+    pub node_mirror: Arc<crate::node::NodeMirror>,
 }
 
 impl AppState {
@@ -57,6 +62,9 @@ impl AppState {
             Arc::new(local),
         ));
 
+        let node_registry = Arc::new(crate::node::NodeRegistry::new());
+        let node_mirror = Arc::new(crate::node::NodeMirror::new(Arc::clone(&run_store)));
+
         Self {
             global_dir,
             workspace_dir,
@@ -68,6 +76,8 @@ impl AppState {
             agent_launcher: None,
             session_starter: None,
             hosts,
+            node_registry,
+            node_mirror,
         }
     }
 
