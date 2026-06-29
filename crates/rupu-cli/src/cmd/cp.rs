@@ -310,11 +310,12 @@ async fn run_resume_worker(
         };
 
         // Defense-in-depth: never resume a run that belongs to a REMOTE host
-        // (tunnel or ssh); its real run lives on that host and is resumed via
+        // (tunnel, ssh, or bucket); its real run lives on that host and is resumed via
         // the transport, not by this local worker. (Remote runs also never carry
         // the resume_requested_at marker, so this is belt-and-suspenders.)
         // KEY ASYMMETRY: a Tunnel run's worker_id is the node_id; an SSH run's
-        // worker_id is the host record id (host_<ULID>).
+        // worker_id is the host record id (host_<ULID>); a Bucket run's worker_id
+        // is also the host record id.
         let remote_workers: std::collections::HashSet<String> = hosts
             .list()
             .unwrap_or_default()
@@ -322,6 +323,7 @@ async fn run_resume_worker(
             .filter_map(|h| match h.transport {
                 rupu_workspace::HostTransport::Tunnel { node_id } => Some(node_id),
                 rupu_workspace::HostTransport::Ssh { .. } => Some(h.id),
+                rupu_workspace::HostTransport::Bucket { .. } => Some(h.id),
                 _ => None,
             })
             .collect();
