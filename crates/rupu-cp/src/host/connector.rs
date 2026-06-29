@@ -200,6 +200,84 @@ pub(crate) async fn open_run_events_tail(
     Ok(Box::pin(stream))
 }
 
+// ── Mirror-backed observation helpers ────────────────────────────────────────
+
+/// List runs from the central [`RunStore`] filtered to `worker_id`.
+///
+/// Shared by [`TunnelHostConnector`] and the upcoming `SshHostConnector` — both
+/// read from the same mirror; only the `worker_id` they scope to differs.
+pub(crate) fn mirror_list_runs(
+    run_store: &RunStore,
+    worker_id: &str,
+    params: &RunListQuery,
+    pricing: &rupu_config::PricingConfig,
+) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+    let workflow_only = params.kind == RunKind::Workflow;
+    let rows = crate::api::runs::query_run_rows(
+        run_store,
+        params.offset,
+        params.limit,
+        params.lifecycle.as_deref(),
+        workflow_only,
+        Some(worker_id),
+        pricing,
+    )
+    .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+
+    rows.iter()
+        .map(|r| {
+            serde_json::to_value(r)
+                .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+        })
+        .collect()
+}
+
+/// Fetch detail for a single run, verifying it belongs to `worker_id`.
+///
+/// Returns [`HostConnectorError::NotFound`] when the run does not exist or
+/// belongs to a different node — callers should not distinguish these two cases
+/// (leaking the existence of another node's run would be a data-scope violation).
+pub(crate) fn mirror_get_run(
+    run_store: &RunStore,
+    worker_id: &str,
+    run_id: &str,
+    pricing: &rupu_config::PricingConfig,
+) -> Result<serde_json::Value, HostConnectorError> {
+    let record = run_store.load(run_id).map_err(|e| match e {
+        rupu_orchestrator::RunStoreError::NotFound(_) => {
+            HostConnectorError::NotFound(run_id.to_string())
+        }
+        other => HostConnectorError::Invalid(other.to_string()),
+    })?;
+    if record.worker_id.as_deref() != Some(worker_id) {
+        return Err(HostConnectorError::NotFound(run_id.to_string()));
+    }
+    crate::api::runs::query_run_detail(run_store, run_id, pricing)
+        .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+}
+
+/// Open a live SSE byte-stream for `run_id`, verifying it belongs to
+/// `worker_id` first.
+///
+/// Returns [`HostConnectorError::NotFound`] when the run does not exist or
+/// belongs to a different node.
+pub(crate) async fn mirror_stream_run_events(
+    run_store: &Arc<RunStore>,
+    worker_id: &str,
+    run_id: &str,
+) -> Result<EventByteStream, HostConnectorError> {
+    let record = run_store.load(run_id).map_err(|e| match e {
+        rupu_orchestrator::RunStoreError::NotFound(_) => {
+            HostConnectorError::NotFound(run_id.to_string())
+        }
+        other => HostConnectorError::Invalid(other.to_string()),
+    })?;
+    if record.worker_id.as_deref() != Some(worker_id) {
+        return Err(HostConnectorError::NotFound(run_id.to_string()));
+    }
+    open_run_events_tail(run_store, run_id).await
+}
+
 /// Read and parse a transcript `.jsonl` file into the standard
 /// `{ "events": [...], "summary": … }` shape.
 ///
