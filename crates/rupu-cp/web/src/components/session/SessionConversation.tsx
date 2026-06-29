@@ -85,7 +85,7 @@ export default function SessionConversation({
         </div>
       )}
 
-      <div className="mx-auto flex max-w-3xl flex-col gap-6">
+      <div className="flex flex-col gap-6">
         {shown.map((run) => (
           <div key={run.run_id} className="flex flex-col gap-2">
             {/* User bubble — right-aligned, tinted. */}

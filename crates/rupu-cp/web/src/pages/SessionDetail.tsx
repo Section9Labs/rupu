@@ -354,7 +354,7 @@ export default function SessionDetailPage() {
             {runsError}
           </div>
         )}
-        <div className="mx-auto max-w-3xl">
+        <div>
           <label htmlFor="session-composer" className="sr-only">
             Message this session
           </label>
