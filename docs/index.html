@@ -49,8 +49,9 @@
     <h2>Install</h2>
     <p>rupu is open source. Grab the latest signed macOS binary, or build from source with Cargo (any platform with a Rust toolchain).</p>
     <h3>macOS (Apple Silicon)</h3>
-    <p>Download the latest <code class="inline">rupu</code> binary from the <a class="link" href="https://github.com/Section9Labs/rupu/releases" target="_blank" rel="noopener">releases page</a> (or the <a class="link" href="/#download">Download</a> section), then:</p>
-    <pre class="code"><span class="c"># make it executable and put it on your PATH</span>
+    <p>Download the latest signed &amp; notarized tarball from the <a class="link" href="https://github.com/Section9Labs/rupu/releases/latest" target="_blank" rel="noopener">latest release</a> (or the <a class="link" href="/#download">Download</a> section), then:</p>
+    <pre class="code"><span class="c"># unpack, make executable, put it on your PATH</span>
+tar -xzf rupu-*-aarch64-apple-darwin.tar.gz
 chmod +x ./rupu
 sudo mv ./rupu /usr/local/bin/rupu
 rupu --version</pre>

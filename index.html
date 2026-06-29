@@ -233,27 +233,27 @@
     });
   });
 
-  // live "latest release" — newest release including pre-releases (the -build
-  // stream). GitHub's /releases/latest ignores pre-releases, so we read /releases.
+  // live "latest release" — the official Latest (the signed + notarized `-cli`
+  // release). /releases/latest returns the newest NON-prerelease, so it skips
+  // the `-build` prerelease stream and resolves to the current `-cli` tarball.
   (function () {
     var verEl = document.getElementById('dl-ver');
     var btn = document.getElementById('dl-btn');
     var sub = document.getElementById('dl-sub');
     if (!verEl || !btn) return;
-    fetch('https://api.github.com/repos/Section9Labs/rupu/releases?per_page=1', {
+    fetch('https://api.github.com/repos/Section9Labs/rupu/releases/latest', {
       headers: { 'Accept': 'application/vnd.github+json' }
-    }).then(function (r) { return r.ok ? r.json() : null; }).then(function (rels) {
-      if (!rels || !rels.length) return;
-      var rel = rels[0];
-      var ver = (rel.tag_name || '').replace(/-build$/, '');
+    }).then(function (r) { return r.ok ? r.json() : null; }).then(function (rel) {
+      if (!rel) return;
+      var ver = (rel.tag_name || '').replace(/-(cli|build)$/, '');
       verEl.textContent = ver ? 'Latest · ' + ver : 'Latest release';
-      // prefer the raw macOS binary asset named "rupu"
-      var bin = (rel.assets || []).filter(function (a) { return a.name === 'rupu'; })[0]
-             || (rel.assets || []).filter(function (a) { return /darwin|macos|\.tar\.gz$/.test(a.name) && !/\.sha256$/.test(a.name); })[0];
+      // prefer the macOS (Apple Silicon) tarball; fall back to a bare binary.
+      var bin = (rel.assets || []).filter(function (a) { return /\.tar\.gz$/.test(a.name) && !/\.sha256$/.test(a.name); })[0]
+             || (rel.assets || []).filter(function (a) { return a.name === 'rupu'; })[0];
       if (bin) {
         btn.href = bin.browser_download_url;
         btn.removeAttribute('target');
-        if (sub) sub.innerHTML = 'Apple Silicon · signed binary (' + ver + ') · <a class="link" href="' + rel.html_url + '" target="_blank" rel="noopener">all releases</a>';
+        if (sub) sub.innerHTML = 'macOS · Apple Silicon · signed &amp; notarized (' + ver + ') · <a class="link" href="' + rel.html_url + '" target="_blank" rel="noopener">all releases</a>';
       } else {
         btn.href = rel.html_url;
       }
