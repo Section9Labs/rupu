@@ -20,12 +20,15 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/runs", get(list_runs))
         .route("/api/runs/workflows", get(list_workflow_runs))
-        .route("/api/runs/:id", get(get_run))
+        .route("/api/runs/archived", get(list_archived_runs))
+        .route("/api/runs/:id", get(get_run).delete(delete_run))
         .route("/api/runs/:id/log", get(get_run_log))
         .route("/api/runs/:id/usage-timeline", get(get_run_usage_timeline))
         .route("/api/runs/:id/approve", post(approve_run))
         .route("/api/runs/:id/reject", post(reject_run))
         .route("/api/runs/:id/cancel", post(cancel_run))
+        .route("/api/runs/:id/archive", post(archive_run))
+        .route("/api/runs/:id/restore", post(restore_run))
 }
 
 /// Map an [`ApprovalError`] from the store's approve/reject flow to an
@@ -97,9 +100,7 @@ async fn approve_run(
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = resolve_host(&s, host)?;
-        let mode = body
-            .and_then(|b| b.0.mode)
-            .unwrap_or_default();
+        let mode = body.and_then(|b| b.0.mode).unwrap_or_default();
         conn.approve_run(&id, &mode).await.map_err(|e| match e {
             HostConnectorError::NotFound(m) => ApiError::not_found(m),
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
@@ -242,9 +243,7 @@ pub(crate) fn resolve_host(
     host_id: &str,
 ) -> ApiResult<Arc<dyn crate::host::connector::HostConnector>> {
     s.hosts.resolve(host_id).map_err(|e| match e {
-        HostConnectorError::NotFound(_) => {
-            ApiError::not_found(format!("host {host_id} not found"))
-        }
+        HostConnectorError::NotFound(_) => ApiError::not_found(format!("host {host_id} not found")),
         other => ApiError::internal(other.to_string()),
     })
 }
@@ -576,9 +575,7 @@ async fn get_run(
     if host_id != "local" {
         let conn = resolve_host(&s, host_id)?;
         let detail = conn.get_run(&id).await.map_err(|e| match e {
-            HostConnectorError::NotFound(_) => {
-                ApiError::not_found(format!("run {id} not found"))
-            }
+            HostConnectorError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
             other => ApiError::internal(other.to_string()),
         })?;
         return Ok(Json(detail));
@@ -681,6 +678,99 @@ async fn get_run_usage_timeline(
     ))
 }
 
+/// Map a [`RunStoreError`] to an [`ApiError`]:
+/// - `NotFound` → 404
+/// - `NotTerminal` / `AlreadyExists` → 409
+/// - `Io` / `Json` → 500
+fn map_run_store_err(id: &str, e: RunStoreError) -> ApiError {
+    match e {
+        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        RunStoreError::NotTerminal(_) => {
+            ApiError::conflict(format!("run {id} is not terminal — cancel it first"))
+        }
+        RunStoreError::AlreadyExists(_) => {
+            ApiError::conflict(format!("run {id} already exists in the target scope"))
+        }
+        RunStoreError::Io(err) => ApiError::internal(err.to_string()),
+        RunStoreError::Json(err) => ApiError::internal(err.to_string()),
+    }
+}
+
+/// `POST /api/runs/:id/archive` — move a terminal run to the archive scope.
+///
+/// Non-terminal runs yield 409. The run's directory (including transcripts)
+/// is renamed into `<global>/runs-archive/<id>`.
+async fn archive_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    s.run_store
+        .archive(&id)
+        .map_err(|e| map_run_store_err(&id, e))?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "id": id, "archived": true }),
+    ))
+}
+
+/// `POST /api/runs/:id/restore` — move an archived run back to the active scope.
+///
+/// Returns 404 if the run is not in the archive.
+async fn restore_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    s.run_store
+        .restore(&id)
+        .map_err(|e| map_run_store_err(&id, e))?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "id": id, "archived": false }),
+    ))
+}
+
+/// `DELETE /api/runs/:id` — permanently remove a run from either scope.
+///
+/// Non-terminal runs in the active scope yield 409. Archived runs are
+/// already terminal, so the guard is skipped for them (load returns
+/// `NotFound` for archived runs; the guard is omitted, and delete
+/// resolves the archive scope).
+async fn delete_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Guard: refuse to delete a non-terminal active run.
+    // `load` only checks the active scope; archived runs are always terminal.
+    if let Ok(rec) = s.run_store.load(&id) {
+        if !rec.status.is_terminal() {
+            return Err(ApiError::conflict(format!(
+                "run {id} is not terminal — cancel it first"
+            )));
+        }
+    }
+    s.run_store
+        .delete(&id)
+        .map_err(|e| map_run_store_err(&id, e))?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "id": id, "deleted": true }),
+    ))
+}
+
+/// `GET /api/runs/archived` — list archived runs, newest-first.
+///
+/// Returns the same [`RunListRow`] shape as the local path of
+/// `GET /api/runs`, built with usage metrics via [`RunListRow::with_usage`].
+async fn list_archived_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<RunListRow>>> {
+    let records = s
+        .run_store
+        .list_archived()
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(
+        records
+            .iter()
+            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
+            .collect(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,8 +778,11 @@ mod tests {
 
     /// Build an `AppState` backed by a fresh tempdir run store.
     fn test_state(tmp: &tempfile::TempDir) -> AppState {
-        AppState::new(tmp.path().to_path_buf(), rupu_config::PricingConfig::default())
-            .with_workspace_dir(tmp.path().to_path_buf())
+        AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf())
     }
 
     /// An `awaiting_approval` run record paused at `step_id`.
@@ -748,7 +841,10 @@ mod tests {
         // Marker-only: the endpoint records the approval but leaves the
         // run AwaitingApproval for the background worker to approve+resume.
         let body = resp.0;
-        assert_eq!(body["run"]["status"], serde_json::json!("awaiting_approval"));
+        assert_eq!(
+            body["run"]["status"],
+            serde_json::json!("awaiting_approval")
+        );
         assert_eq!(body["host_id"], "local");
 
         let loaded = s.run_store.load("run_app").unwrap();
@@ -783,10 +879,7 @@ mod tests {
 
         let loaded = s.run_store.load("run_rej").unwrap();
         assert_eq!(loaded.status, RunStatus::Rejected);
-        assert_eq!(
-            loaded.error_message.as_deref(),
-            Some("rejected: not safe")
-        );
+        assert_eq!(loaded.error_message.as_deref(), Some("rejected: not safe"));
         assert!(loaded.finished_at.is_some());
     }
 
@@ -942,6 +1035,54 @@ mod tests {
         .await
         .expect_err("cancel on missing run should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// A completed run record suitable for archive / delete tests.
+    fn terminal_record(id: &str) -> RunRecord {
+        let mut rec = awaiting_record(id, "gate");
+        rec.status = RunStatus::Completed;
+        rec.awaiting_step_id = None;
+        rec.approval_prompt = None;
+        rec.awaiting_since = None;
+        rec.finished_at = Some(chrono::Utc::now());
+        rec
+    }
+
+    #[tokio::test]
+    async fn archive_then_delete_run_flow() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let rec = terminal_record("run_01CPFLOW");
+        let id = rec.id.clone();
+        s.run_store.create(rec, "name: x\n").unwrap();
+
+        // archive — run moves from active → archive scope
+        let _ = archive_run(State(s.clone()), Path(id.clone()))
+            .await
+            .expect("archive ok");
+        assert_eq!(s.run_store.list().unwrap().len(), 0);
+        assert_eq!(s.run_store.list_archived().unwrap().len(), 1);
+
+        // delete (from archive)
+        let _ = delete_run(State(s.clone()), Path(id.clone()))
+            .await
+            .expect("delete ok");
+        let err = delete_run(State(s.clone()), Path(id.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn archive_running_run_conflicts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let mut rec = terminal_record("run_01RUN");
+        rec.status = RunStatus::Running;
+        let id = rec.id.clone();
+        s.run_store.create(rec, "name: x\n").unwrap();
+        let err = archive_run(State(s.clone()), Path(id)).await.unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
     #[test]
