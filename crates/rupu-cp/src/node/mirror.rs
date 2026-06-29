@@ -79,7 +79,10 @@ impl NodeMirror {
             status: RunStatus::Running,
             inputs: spec.inputs.clone(),
             event: None,
-            workspace_id: node_id.to_string(),
+            // workspace_id is a workspace identifier, not the node id.
+            // Host attribution is carried by worker_id; leave workspace_id
+            // empty so the CP never mistakes the node id for a workspace.
+            workspace_id: String::new(),
             workspace_path: PathBuf::from("."),
             transcript_dir: run_dir,
             started_at: Utc::now(),
@@ -171,18 +174,37 @@ impl NodeMirror {
                 writeln!(f, "{line}")?;
             }
             ArtifactFile::RunJson => {
-                // Parse the node's run.json, then reapply our run_id and
-                // node_id so host attribution is never clobbered.
-                let node_id = {
-                    let guard = self.node_ids.lock().unwrap();
-                    guard
-                        .get(run_id)
-                        .ok_or_else(|| MirrorError::NotTracked(run_id.to_string()))?
-                        .clone()
-                };
+                // Parse the node's run.json.  Load the record that
+                // create_run originally persisted and re-pin the
+                // CP-local identity / location fields — the node's
+                // values point at paths that don't exist on the CP
+                // and its workspace_id is meaningless here.  Run-state
+                // fields (status, finished_at, active_step_*, etc.)
+                // are taken from `incoming` — that is the point of the
+                // RunJson update.
                 let mut incoming: RunRecord = serde_json::from_str(line)?;
-                incoming.id = run_id.to_string();
-                incoming.worker_id = Some(node_id);
+                match self.run_store.load(run_id) {
+                    Ok(existing) => {
+                        incoming.id = existing.id;
+                        incoming.worker_id = existing.worker_id;
+                        incoming.workspace_id = existing.workspace_id;
+                        incoming.transcript_dir = existing.transcript_dir;
+                        incoming.workspace_path = existing.workspace_path;
+                    }
+                    Err(_) => {
+                        // create_run hasn't run yet (edge case) —
+                        // best-effort attribution from the in-memory map.
+                        let node_id = {
+                            let guard = self.node_ids.lock().unwrap();
+                            guard
+                                .get(run_id)
+                                .ok_or_else(|| MirrorError::NotTracked(run_id.to_string()))?
+                                .clone()
+                        };
+                        incoming.id = run_id.to_string();
+                        incoming.worker_id = Some(node_id);
+                    }
+                }
                 self.run_store.update(&incoming)?;
             }
         }

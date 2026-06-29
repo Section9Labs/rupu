@@ -261,3 +261,104 @@ fn mirror_create_append_finish_round_trip() {
         "line 1 should contain step_completed"
     );
 }
+
+/// After `create_run` + `append(RunJson, <node record with bogus paths>)`,
+/// the loaded record must carry the CP-side `transcript_dir` and
+/// `workspace_path` (not the node's paths), while run-state fields
+/// (e.g. `status`) are taken from the node's `RunRecord`.
+#[test]
+fn mirror_run_json_repins_cp_local_paths() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::{RunStatus, RunStore};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "repin-test".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+
+    let run_id = "run_REPINTEST001";
+    let node_id = "node-repin";
+
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+
+    // Record what create_run stored as the CP-side transcript_dir and
+    // workspace_path so we can assert they survive the RunJson update.
+    let created = store.load(run_id).expect("load after create_run");
+    let cp_transcript_dir: PathBuf = created.transcript_dir.clone();
+    let cp_workspace_path: PathBuf = created.workspace_path.clone();
+
+    // Build a node-side RunRecord JSON with bogus paths and status=completed.
+    let node_run_json = serde_json::json!({
+        "id": run_id,
+        "workflow_name": "repin-test",
+        "status": "completed",
+        "inputs": {},
+        "workspace_id": "node-ws-id",
+        "workspace_path": "/node/only/path",
+        "transcript_dir": "/node/only/path/transcripts",
+        "started_at": "2026-01-01T00:00:00Z",
+        "worker_id": "node-worker-override"
+    });
+    let line = serde_json::to_string(&node_run_json).expect("serialize node record");
+
+    mirror
+        .append(run_id, ArtifactFile::RunJson, &line)
+        .expect("append RunJson");
+
+    let record = store.load(run_id).expect("load after RunJson append");
+
+    // Run-state: status must reflect the node's completed value.
+    assert_eq!(
+        record.status,
+        RunStatus::Completed,
+        "status should come from the node RunJson"
+    );
+
+    // CP-local location fields must NOT be the node's bogus paths.
+    assert_eq!(
+        record.transcript_dir, cp_transcript_dir,
+        "transcript_dir must remain the CP-side value"
+    );
+    assert_eq!(
+        record.workspace_path, cp_workspace_path,
+        "workspace_path must remain the CP-side value"
+    );
+    assert_ne!(
+        record.transcript_dir,
+        PathBuf::from("/node/only/path/transcripts"),
+        "transcript_dir must not be the node's path"
+    );
+    assert_ne!(
+        record.workspace_path,
+        PathBuf::from("/node/only/path"),
+        "workspace_path must not be the node's path"
+    );
+
+    // Host attribution: worker_id must be the original node_id (not the
+    // node record's overridden value).
+    assert_eq!(
+        record.worker_id.as_deref(),
+        Some(node_id),
+        "worker_id must remain the CP's node attribution"
+    );
+
+    // workspace_id must be empty (set by create_run, not the node id).
+    assert_eq!(
+        record.workspace_id, "",
+        "workspace_id must be empty (not the node id)"
+    );
+}
