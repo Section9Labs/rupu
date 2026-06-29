@@ -12,9 +12,28 @@
 //! ```
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
+pub(crate) mod connector;
+pub(crate) use connector::BucketHostConnector;
 pub(crate) mod object_store_bucket;
 pub(crate) use object_store_bucket::ObjectStoreBucket;
+
+// ── control envelope ──────────────────────────────────────────────────────────
+
+/// Control message written by the CP into `control/<run_id>/<seq:020>.json`
+/// and consumed by the node agent (Task 6).
+///
+/// Both the connector (T3) and the node agent (T6) use this SAME type so
+/// there is no wire-format drift between the two ends of the protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ControlEnvelope {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
 
 // ── error ─────────────────────────────────────────────────────────────────────
 
