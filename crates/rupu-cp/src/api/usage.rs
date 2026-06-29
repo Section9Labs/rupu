@@ -512,4 +512,67 @@ mod tests {
         assert_eq!(buckets[0].bucket, "2026-06-22");
         assert_eq!(buckets[0].rows[0].input_tokens, 3000);
     }
+
+    #[test]
+    fn build_timeline_week_gap_fills_intervening_empty_week() {
+        // 2026-06-10 is a Wednesday → ISO week Mon = 2026-06-08.
+        // 2026-06-24 is a Wednesday → ISO week Mon = 2026-06-22.
+        // The intervening Monday 2026-06-15 has no run and must be synthesised
+        // as an empty bucket so the series has no gaps.
+        let pricing = rupu_config::PricingConfig::default();
+        let runs = vec![
+            (
+                dt("2026-06-10T10:00:00Z"),
+                vec![urow("anthropic", "claude-sonnet-4-6", 1000, 200)],
+            ),
+            (
+                dt("2026-06-24T10:00:00Z"),
+                vec![urow("anthropic", "claude-sonnet-4-6", 3000, 400)],
+            ),
+        ];
+        let buckets = build_timeline(
+            runs,
+            &pricing,
+            Granularity::Week,
+            dt("2026-06-10T10:00:00Z"),
+            dt("2026-06-24T10:00:00Z"),
+        );
+
+        let keys: Vec<&str> = buckets.iter().map(|b| b.bucket.as_str()).collect();
+        assert_eq!(keys, vec!["2026-06-08", "2026-06-15", "2026-06-22"]);
+
+        // First week (2026-06-08) has the run from 2026-06-10 → non-empty.
+        assert!(!buckets[0].rows.is_empty());
+        assert_eq!(buckets[0].rows[0].input_tokens, 1000);
+
+        // Middle week (2026-06-15) has no run → synthesised empty bucket.
+        assert!(buckets[1].rows.is_empty());
+
+        // Last week (2026-06-22) has the run from 2026-06-24 → non-empty.
+        assert!(!buckets[2].rows.is_empty());
+        assert_eq!(buckets[2].rows[0].input_tokens, 3000);
+    }
+
+    #[tokio::test]
+    async fn get_usage_timeline_returns_empty_vec_when_store_has_no_runs() {
+        // AppState::new over a fresh tempdir → RunStore::list returns Ok(vec![])
+        // → timeline_fill_start(_, None) returns None → handler short-circuits
+        // with Ok(Json(vec![])).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        );
+        let result = get_usage_timeline(
+            State(s),
+            Query(TimelineQuery {
+                since: None,
+                until: None,
+                bucket: None,
+            }),
+        )
+        .await
+        .expect("handler should not error on empty store");
+        assert!(result.0.is_empty(), "expected empty timeline for empty store");
+    }
 }
