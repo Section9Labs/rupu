@@ -1095,6 +1095,69 @@ mod tunnel_connector {
     }
 }
 
+// ── Resume-worker invariant ───────────────────────────────────────────────────
+
+/// Primary invariant: a mirrored awaiting-approval run (worker_id = tunnel
+/// node) with no `resume_requested_at` marker is never returned by
+/// `list_pending_resume`. The tunnel approve path sends a Frame::Approve
+/// instead of calling `request_resume_approval`, so the marker is never set.
+/// This test locks that invariant and will fail if a future change makes the
+/// tunnel path set the marker.
+#[test]
+fn mirrored_awaiting_run_is_not_pending_resume() {
+    use rupu_orchestrator::{RunRecord, RunStatus, RunStore};
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let store = RunStore::new(dir.path().join("runs"));
+
+    // Construct a RunRecord in AwaitingApproval — same field layout as the
+    // sample_record helper in rupu-orchestrator/src/runs.rs tests, but with
+    // status = AwaitingApproval, awaiting_step_id set, and — crucially —
+    // resume_requested_at = None (no marker).
+    let rec = RunRecord {
+        id: "run_node_1".to_string(),
+        workflow_name: "gate-workflow".to_string(),
+        status: RunStatus::AwaitingApproval,
+        inputs: BTreeMap::new(),
+        event: None,
+        workspace_id: String::new(),
+        workspace_path: dir.path().to_path_buf(),
+        transcript_dir: dir.path().to_path_buf(),
+        started_at: chrono::Utc::now(),
+        finished_at: None,
+        error_message: None,
+        awaiting_step_id: Some("gate-step".to_string()),
+        approval_prompt: Some("approve?".to_string()),
+        awaiting_since: Some(chrono::Utc::now()),
+        expires_at: None,
+        issue_ref: None,
+        issue: None,
+        parent_run_id: None,
+        backend_id: None,
+        worker_id: Some("node_abc".to_string()),
+        artifact_manifest_path: None,
+        runner_pid: None,
+        source_wake_id: None,
+        active_step_id: None,
+        active_step_kind: None,
+        active_step_agent: None,
+        active_step_transcript_path: None,
+        resume_requested_at: None,
+        resume_claimed_at: None,
+        resume_claimed_by: None,
+        resume_mode: None,
+    };
+    store.create(rec, "").unwrap();
+
+    let pending = store.list_pending_resume(chrono::Utc::now()).unwrap();
+    assert!(
+        pending.iter().all(|r| r.id != "run_node_1"),
+        "mirrored awaiting-approval run must not be queued for the local resume worker"
+    );
+}
+
 /// A `Hello` with a wrong token → server closes the connection and the node
 /// is NOT registered.
 #[tokio::test]
