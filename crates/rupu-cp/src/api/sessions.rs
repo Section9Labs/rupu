@@ -1,3 +1,4 @@
+use crate::api::host_fanout::{fan_out_rows, sort_values_newest_first};
 use crate::{
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
@@ -8,19 +9,20 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use crate::api::host_fanout::{fan_out_rows, sort_values_newest_first};
 use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/sessions", get(list_sessions))
-        .route("/api/sessions/:id", get(get_session))
+        .route("/api/sessions/:id", get(get_session).delete(delete_session))
         .route(
             "/api/sessions/:id/usage-timeline",
             get(get_session_usage_timeline),
         )
         .route("/api/sessions/:id/runs", get(get_session_runs))
         .route("/api/sessions/:id/send", post(send_session))
+        .route("/api/sessions/:id/archive", post(archive_session))
+        .route("/api/sessions/:id/restore", post(restore_session))
 }
 
 /// Minimal projection of the on-disk `session.json`. All fields are
@@ -117,8 +119,15 @@ fn session_usage(
 ) -> crate::usage::UsageSummary {
     let total_tokens = dto.total_tokens_in + dto.total_tokens_out;
     let cost_usd =
-        rupu_config::pricing::lookup(pricing, &dto.provider_name, &dto.model, &dto.agent_name)
-            .map(|p| p.cost_usd(dto.total_tokens_in, dto.total_tokens_out, dto.total_tokens_cached));
+        rupu_config::pricing::lookup(pricing, &dto.provider_name, &dto.model, &dto.agent_name).map(
+            |p| {
+                p.cost_usd(
+                    dto.total_tokens_in,
+                    dto.total_tokens_out,
+                    dto.total_tokens_cached,
+                )
+            },
+        );
     crate::usage::UsageSummary {
         input_tokens: dto.total_tokens_in,
         output_tokens: dto.total_tokens_out,
@@ -358,8 +367,7 @@ async fn get_session(
     };
 
     let usage = session_usage(&dto, &s.pricing);
-    let mut val =
-        serde_json::to_value(&dto).map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut val = serde_json::to_value(&dto).map_err(|e| ApiError::internal(e.to_string()))?;
     if let serde_json::Value::Object(ref mut map) = val {
         map.insert(
             "scope".to_string(),
@@ -634,7 +642,9 @@ async fn send_session(
             HostConnectorError::Invalid(m) => ApiError::bad_request(m),
             other => ApiError::internal(other.to_string()),
         })?;
-        return Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "run_id": run_id, "host_id": host }),
+        ));
     }
 
     // Local path: unchanged.
@@ -671,10 +681,55 @@ async fn send_session(
         prompt,
     };
     match sender.send(req).await {
-        Ok(run_id) => Ok(Json(serde_json::json!({ "run_id": run_id, "host_id": "local" }))),
+        Ok(run_id) => Ok(Json(
+            serde_json::json!({ "run_id": run_id, "host_id": "local" }),
+        )),
         Err(crate::session_sender::SendError::Invalid(m)) => Err(ApiError::bad_request(m)),
         Err(crate::session_sender::SendError::Spawn(m)) => Err(ApiError::internal(m)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session archive / restore / delete — /api/sessions/:id/{archive,restore}
+// and DELETE /api/sessions/:id
+// ---------------------------------------------------------------------------
+
+async fn mutate_session(
+    s: &AppState,
+    id: &str,
+    action: crate::session_mutator::SessionAction,
+) -> ApiResult<Json<serde_json::Value>> {
+    use crate::session_mutator::SessionMutateError as E;
+    let m = s.session_mutator.clone().ok_or_else(|| {
+        ApiError::not_available("session archive/delete requires `rupu cp serve`")
+    })?;
+    m.mutate(id, action).await.map_err(|e| match e {
+        E::NotFound(_) => ApiError::not_found(format!("session {id} not found")),
+        E::Invalid(msg) => ApiError::conflict(msg),
+        E::Failed { message, .. } => ApiError::internal(message),
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true, "id": id })))
+}
+
+async fn archive_session(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    mutate_session(&s, &id, crate::session_mutator::SessionAction::Archive).await
+}
+
+async fn restore_session(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    mutate_session(&s, &id, crate::session_mutator::SessionAction::Restore).await
+}
+
+async fn delete_session(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    mutate_session(&s, &id, crate::session_mutator::SessionAction::Delete).await
 }
 
 #[cfg(test)]
@@ -765,7 +820,10 @@ mod tests {
         // status lowercased; timestamps surfaced.
         assert_eq!(rows[0].status.as_deref(), Some("ok"));
         assert_eq!(rows[0].started_at.as_deref(), Some("2026-06-26T00:00:00Z"));
-        assert_eq!(rows[0].completed_at.as_deref(), Some("2026-06-26T00:01:00Z"));
+        assert_eq!(
+            rows[0].completed_at.as_deref(),
+            Some("2026-06-26T00:01:00Z")
+        );
         assert_eq!(rows[1].status.as_deref(), Some("error"));
         assert_eq!(rows[1].started_at, None);
         // Per-run error is surfaced.
@@ -820,6 +878,50 @@ mod tests {
         .await
         .expect_err("missing session should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    use crate::session_mutator::{SessionAction, SessionMutateError, SessionMutator};
+
+    struct StubMutator;
+    #[async_trait::async_trait]
+    impl SessionMutator for StubMutator {
+        async fn mutate(&self, id: &str, action: SessionAction) -> Result<(), SessionMutateError> {
+            if id == "missing" {
+                return Err(SessionMutateError::NotFound(id.into()));
+            }
+            if action == SessionAction::Archive && id == "active-running" {
+                return Err(SessionMutateError::Invalid("session is running".into()));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_session_ok_and_not_found_and_409() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), Default::default())
+            .with_session_mutator(Some(std::sync::Arc::new(StubMutator)));
+        let _ = archive_session(State(state.clone()), Path("s1".to_string()))
+            .await
+            .expect("ok");
+        let nf = archive_session(State(state.clone()), Path("missing".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(nf.0, axum::http::StatusCode::NOT_FOUND);
+        let conflict = archive_session(State(state.clone()), Path("active-running".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(conflict.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn archive_session_without_adapter_is_501() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), Default::default()); // no mutator
+        let err = archive_session(State(state), Path("s1".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 
     use crate::session_sender::{SendError, SendMessageRequest, SessionSender};

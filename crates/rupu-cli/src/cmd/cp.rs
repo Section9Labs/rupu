@@ -94,9 +94,11 @@ pub async fn handle(action: Action) -> ExitCode {
             // Adapter for rupu-cp's DefinitionGenerator port: calls the
             // orchestrator generation core with the real resolver.
             let generator: Option<Arc<dyn rupu_cp::definition_generator::DefinitionGenerator>> =
-                Some(Arc::new(crate::cp_definition_generator::RuntimeDefinitionGenerator {
-                    global_dir: global_dir.clone(),
-                }));
+                Some(Arc::new(
+                    crate::cp_definition_generator::RuntimeDefinitionGenerator {
+                        global_dir: global_dir.clone(),
+                    },
+                ));
 
             // Repo lister for the web Run target picker.
             let repos: Option<Arc<dyn rupu_cp::repos::RepoLister>> = {
@@ -118,6 +120,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 agent_launcher,
                 session_starter,
                 generator,
+                session_mutator: None, // wired in Task 6
             })
             .await;
 
