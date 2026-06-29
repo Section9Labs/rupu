@@ -132,6 +132,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     let auth_hint = spec.auth;
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+        openai_compatible: None,
     };
     let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
         &provider_name,

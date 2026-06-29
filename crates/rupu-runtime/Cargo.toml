@@ -28,6 +28,7 @@ tracing.workspace = true
 rupu-providers = { path = "../rupu-providers" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-agent = { path = "../rupu-agent" }
+rupu-config = { path = "../rupu-config" }
 
 [dev-dependencies]
 serde_json.workspace = true
