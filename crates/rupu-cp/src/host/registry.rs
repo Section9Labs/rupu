@@ -289,7 +289,9 @@ impl HostRegistry {
                     )))
                 }
                 _ => Err(HostConnectorError::Invalid(
-                    "ssh deps not wired (call HostRegistry::with_tunnel_deps)".into(),
+                    "ssh deps not wired (call HostRegistry::with_tunnel_deps; \
+                     mirror + run_store are shared with tunnel hosts)"
+                        .into(),
                 )),
             },
         }

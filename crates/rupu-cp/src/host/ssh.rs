@@ -327,18 +327,20 @@ impl SshHostConnector {
         let exec = Arc::clone(&self.exec);
         let mirror = Arc::clone(&self.mirror);
         let host_id = self.host_id.clone();
-        let dir = format!("$HOME/.rupu/runs/{run_id}");
 
-        let tail_argv: Vec<String> = vec![
-            "tail".into(),
-            "-n".into(),
-            "+1".into(),
-            "-F".into(),
-            format!("{dir}/events.jsonl"),
-            format!("{dir}/step_results.jsonl"),
-            format!("{dir}/unit_checkpoints.jsonl"),
-        ];
-        let tail_cmd = build_remote_command(&tail_argv);
+        // $HOME must expand on the remote shell — build as raw command strings
+        // rather than through build_remote_command / shell_escape. Single-quoting
+        // every token (as build_remote_command does) would prevent $HOME from
+        // expanding, producing a literal path that never exists on the remote.
+        // run_id contains only [A-Za-z0-9_] (ULID prefix), so unquoted
+        // concatenation is safe.
+        let tail_cmd = format!(
+            "tail -n +1 -F \
+             $HOME/.rupu/runs/{run_id}/events.jsonl \
+             $HOME/.rupu/runs/{run_id}/step_results.jsonl \
+             $HOME/.rupu/runs/{run_id}/unit_checkpoints.jsonl"
+        );
+        let cat_cmd = format!("cat $HOME/.rupu/runs/{run_id}/run.json");
 
         tokio::spawn(async move {
             let mut current: Option<ArtifactFile> = None;
@@ -346,6 +348,9 @@ impl SshHostConnector {
             if let Ok(mut stream) = exec.spawn_lines(&tail_cmd) {
                 while let Some(Ok(line)) = stream.next().await {
                     if let Some(path) = parse_tail_marker(&line) {
+                        // Route subsequent lines based on filename suffix — the
+                        // expanded absolute path from `tail` still ends with the
+                        // same basename, so suffix matching is correct.
                         current = if path.ends_with("events.jsonl") {
                             Some(ArtifactFile::Events)
                         } else if path.ends_with("step_results.jsonl") {
@@ -368,8 +373,6 @@ impl SshHostConnector {
 
             // Tail ended; best-effort: read the remote run.json to sync the
             // terminal status into the local mirror.
-            let cat_argv: Vec<String> = vec!["cat".into(), format!("{dir}/run.json")];
-            let cat_cmd = build_remote_command(&cat_argv);
             if let Ok(out) = exec.run(&cat_cmd).await {
                 if out.success && !out.stdout.trim().is_empty() {
                     let _ = mirror.append(
@@ -441,11 +444,15 @@ impl HostConnector for SshHostConnector {
         let remote_cmd = build_remote_command(&argv);
         let detached = Self::detach(&remote_cmd);
 
-        let out = self
-            .exec
-            .run(&detached)
-            .await
-            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        let out = match self.exec.run(&detached).await {
+            Ok(o) => o,
+            Err(e) => {
+                // Spawn error (e.g. ssh binary not found): mirror run would
+                // be stuck Running with no executor — clean it up now.
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+                return Err(HostConnectorError::Unreachable(e.to_string()));
+            }
+        };
 
         if !out.success {
             // Best-effort cleanup: mark the mirror run failed so it doesn't
@@ -478,11 +485,14 @@ impl HostConnector for SshHostConnector {
         let remote_cmd = build_remote_command(&argv);
         let detached = Self::detach(&remote_cmd);
 
-        let out = self
-            .exec
-            .run(&detached)
-            .await
-            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        let out = match self.exec.run(&detached).await {
+            Ok(o) => o,
+            Err(e) => {
+                // Spawn error: mirror run would be stuck Running — clean up.
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+                return Err(HostConnectorError::Unreachable(e.to_string()));
+            }
+        };
 
         if !out.success {
             let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
@@ -651,6 +661,8 @@ mod tests {
         tail_lines: Vec<String>,
         fail: bool,
         fail_stderr: String,
+        /// If set, returned as stdout when `run()` is called for a `cat …` command.
+        cat_stdout: Option<String>,
     }
 
     impl FakeExec {
@@ -660,6 +672,7 @@ mod tests {
                 tail_lines,
                 fail: false,
                 fail_stderr: String::new(),
+                cat_stdout: None,
             }
         }
 
@@ -669,6 +682,19 @@ mod tests {
                 tail_lines: vec![],
                 fail: true,
                 fail_stderr: stderr.into(),
+                cat_stdout: None,
+            }
+        }
+
+        /// Variant for tail-pump tests: success dispatch, canned tail stream,
+        /// and a canned `cat run.json` response.
+        fn with_cat_stdout(tail_lines: Vec<String>, cat_stdout: impl Into<String>) -> Self {
+            Self {
+                commands: Default::default(),
+                tail_lines,
+                fail: false,
+                fail_stderr: String::new(),
+                cat_stdout: Some(cat_stdout.into()),
             }
         }
     }
@@ -684,8 +710,15 @@ mod tests {
                     success: false,
                 })
             } else {
+                // Return canned cat_stdout for the `cat …/run.json` call so the
+                // pump can read back the terminal status.
+                let stdout = if remote.starts_with("cat ") {
+                    self.cat_stdout.clone().unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 Ok(RemoteOutput {
-                    stdout: String::new(),
+                    stdout,
                     stderr: String::new(),
                     success: true,
                 })
@@ -823,6 +856,73 @@ mod tests {
         assert!(
             matches!(err, HostConnectorError::Unreachable(_)),
             "expected Unreachable, got {err:?}"
+        );
+    }
+
+    /// Verifies the tail pump:
+    ///  1. Routes lines after a `==> …/events.jsonl <==` marker to events.jsonl.
+    ///  2. Calls `mirror.finish` with the status from the canned `cat run.json`.
+    ///
+    /// Non-flaky because `FakeExec::spawn_lines` returns a finite in-memory
+    /// stream (no real I/O), so the pump task completes near-instantly. The
+    /// bounded poll (50 ms intervals, 2 s ceiling) absorbs tokio scheduling
+    /// jitter without ever blocking long in CI.
+    #[tokio::test]
+    async fn tail_pump_routes_events_and_finishes_run() {
+        let event_json = r#"{"type":"step_started","step":"s1"}"#;
+        // Expanded absolute path (as the remote `tail` would emit after $HOME
+        // expansion) — still ends with `events.jsonl`, so routing matches.
+        let tail_lines = vec![
+            "==> /home/ci/.rupu/runs/run_01TESTPUMP01/events.jsonl <==".to_string(),
+            event_json.to_string(),
+        ];
+        let run_json = r#"{"run_id":"run_01TESTPUMP01","status":"completed"}"#;
+
+        let fake = std::sync::Arc::new(FakeExec::with_cat_stdout(
+            tail_lines,
+            run_json.to_string(),
+        ));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let run_id = "run_01TESTPUMP01";
+        let spec = crate::node::protocol::RunSpec {
+            kind: crate::node::protocol::RunSpecKind::Workflow,
+            name: "test-wf".into(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        };
+        conn.mirror
+            .create_run(run_id, &conn.host_id, &spec)
+            .unwrap();
+
+        conn.spawn_tail_pump(run_id.to_string());
+
+        // Bounded poll: wait up to 2 s for the spawned pump task to finish
+        // and flip the run status to Completed.
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let rec = run_store.load(run_id).unwrap();
+            if rec.status == rupu_orchestrator::RunStatus::Completed {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for pump to finish; status={:?}",
+                    rec.status
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // The event line must have been appended to the run's events.jsonl.
+        let events_path = run_store.events_path(run_id);
+        let contents = std::fs::read_to_string(&events_path).unwrap_or_default();
+        assert!(
+            contents.contains(event_json),
+            "expected event line in events.jsonl, got: {contents:?}"
         );
     }
 }
