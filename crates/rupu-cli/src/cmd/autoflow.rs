@@ -6983,15 +6983,14 @@ fn summarize_transcript_path(
                 out.usage.input_tokens += u64::from(input_tokens);
                 out.usage.output_tokens += u64::from(output_tokens);
                 out.usage.cached_tokens += u64::from(cached_tokens);
-                let cost =
-                    rupu_config::pricing::lookup(pricing, &provider, &model, &transcript_agent)
-                        .map(|price| {
-                            price.cost_usd(
-                                u64::from(input_tokens),
-                                u64::from(output_tokens),
-                                u64::from(cached_tokens),
-                            )
-                        });
+                let cost = rupu_config::pricing::lookup(pricing, &provider, &model, &transcript_agent)
+                    .map(|price| {
+                        price.cost_usd(
+                            u64::from(input_tokens),
+                            u64::from(output_tokens),
+                            u64::from(cached_tokens),
+                        )
+                    });
                 out.usage.cost.add(cost);
             }
             _ => {}
@@ -13159,10 +13158,10 @@ steps:
                     active_step_kind: None,
                     active_step_agent: None,
                     resume_requested_at: None,
-                    resume_claimed_at: None,
-                    resume_claimed_by: None,
-                    resume_mode: None,
-                    active_step_transcript_path: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            active_step_transcript_path: None,
                 },
                 "name: controller\nsteps: []\n",
             )
@@ -13301,10 +13300,10 @@ steps:
                     active_step_kind: None,
                     active_step_agent: None,
                     resume_requested_at: None,
-                    resume_claimed_at: None,
-                    resume_claimed_by: None,
-                    resume_mode: None,
-                    active_step_transcript_path: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            active_step_transcript_path: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -13468,10 +13467,10 @@ steps:
                     active_step_kind: None,
                     active_step_agent: None,
                     resume_requested_at: None,
-                    resume_claimed_at: None,
-                    resume_claimed_by: None,
-                    resume_mode: None,
-                    active_step_transcript_path: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            active_step_transcript_path: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )

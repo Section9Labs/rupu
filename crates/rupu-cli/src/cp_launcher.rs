@@ -5,10 +5,10 @@
 //! so the web UI can navigate to the run immediately.
 
 use rupu_cp::launcher::{LaunchError, LaunchRequest, RunLauncher};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// Spawns `rupu workflow run …` children. `exe` is the path to the running
 /// `rupu` binary (resolved via `std::env::current_exe()` in `cp serve`).

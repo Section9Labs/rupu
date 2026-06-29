@@ -8,8 +8,8 @@
 // Route: /sessions/:id
 
 import { useEffect, useState } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { Archive, ArrowLeft, RotateCcw, Trash2 } from 'lucide-react';
 import { api, type SessionSummary, type SessionRunRow, type UsageTimelinePoint } from '../lib/api';
 import { cn } from '../lib/cn';
 import { absoluteTime, relativeTime } from '../lib/time';
@@ -28,9 +28,14 @@ export default function SessionDetailPage() {
   const { id = '' } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const host = searchParams.get('host') ?? undefined;
+  const navigate = useNavigate();
 
   const [session, setSession] = useState<SessionSummary | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
+
+  // Archive / restore / delete action state.
+  const [actionPending, setActionPending] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const [runs, setRuns] = useState<SessionRunRow[] | null>(null);
   const [runsError, setRunsError] = useState<string | null>(null);
@@ -120,6 +125,46 @@ export default function SessionDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, pollInterval, host]);
 
+  async function onArchive() {
+    if (actionPending) return;
+    setActionPending(true);
+    setActionError(null);
+    try {
+      await api.archiveSession(id);
+      navigate('/sessions');
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : 'Archive failed');
+      setActionPending(false);
+    }
+  }
+
+  async function onRestore() {
+    if (actionPending) return;
+    setActionPending(true);
+    setActionError(null);
+    try {
+      await api.restoreSession(id);
+      navigate('/sessions');
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : 'Restore failed');
+      setActionPending(false);
+    }
+  }
+
+  async function onDelete() {
+    if (actionPending) return;
+    if (!window.confirm('Permanently delete this session and its transcripts? This cannot be undone.')) return;
+    setActionPending(true);
+    setActionError(null);
+    try {
+      await api.deleteSession(id);
+      navigate('/sessions');
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : 'Delete failed');
+      setActionPending(false);
+    }
+  }
+
   const handleSend = () => {
     const text = prompt.trim();
     if (!id || !text || sending) return;
@@ -197,6 +242,47 @@ export default function SessionDetailPage() {
             </span>
           )}
           {session.usage && <UsageChip usage={session.usage} className="ml-auto" />}
+        </div>
+
+        {/* Archive / Restore / Delete button cluster */}
+        <div className="mt-2 flex flex-col items-end gap-1">
+          <div className="flex items-center gap-2">
+            {session.scope === 'archived' ? (
+              <Button
+                variant="secondary"
+                onClick={() => void onRestore()}
+                disabled={actionPending}
+                className="gap-1.5"
+                aria-label="Restore session"
+              >
+                <RotateCcw size={14} /> Restore
+              </Button>
+            ) : (
+              <Button
+                variant="secondary"
+                onClick={() => void onArchive()}
+                disabled={actionPending}
+                className="gap-1.5"
+                aria-label="Archive session"
+              >
+                <Archive size={14} /> Archive
+              </Button>
+            )}
+            <Button
+              variant="danger-outline"
+              onClick={() => void onDelete()}
+              disabled={actionPending}
+              className="gap-1.5"
+              aria-label="Delete session"
+            >
+              <Trash2 size={14} /> Delete
+            </Button>
+          </div>
+          {actionError && (
+            <p role="alert" className="text-ui font-medium text-err">
+              {actionError}
+            </p>
+          )}
         </div>
 
         {/* Session error banner — only shown when idle/terminal, never while a turn is in flight. */}

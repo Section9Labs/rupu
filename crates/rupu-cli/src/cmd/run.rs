@@ -161,10 +161,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     // (printed after run_id is set below)
 
     // Transcript path.
-    let run_id = args
-        .run_id
-        .clone()
-        .unwrap_or_else(|| format!("run_{}", Ulid::new()));
+    let run_id = args.run_id.clone().unwrap_or_else(|| format!("run_{}", Ulid::new()));
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts)?;
     let transcript_path = transcripts.join(format!("{run_id}.jsonl"));

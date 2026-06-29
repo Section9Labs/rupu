@@ -2,7 +2,9 @@
 
 use crate::paths;
 use clap::Subcommand;
+use rupu_cp::host::bucket::{ObjectStoreBucket, poll_bucket_run};
 use rupu_orchestrator::runs::RunStore;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -56,7 +58,13 @@ pub async fn handle(action: Action) -> ExitCode {
             let worker_handle = tokio::spawn(run_resume_worker(
                 Arc::clone(&store),
                 worker_id,
+                rupu_workspace::HostStore { root: global_dir.join("hosts") },
                 shutdown_rx,
+            ));
+            let poller_handle = tokio::spawn(run_bucket_poller(
+                Arc::clone(&store),
+                rupu_workspace::HostStore { root: global_dir.join("hosts") },
+                shutdown_tx.subscribe(),
             ));
 
             // Adapter for rupu-cp's RunLauncher port: spawns detached
@@ -84,6 +92,12 @@ pub async fn handle(action: Action) -> ExitCode {
             // binary, reusing the launcher's resolved exe.
             let session_sender: Arc<dyn rupu_cp::session_sender::SessionSender> =
                 Arc::new(crate::cp_session_sender::SubprocessSessionSender { exe: exe.clone() });
+
+            // Adapter for rupu-cp's SessionMutator port: shells
+            // `rupu session archive|restore|delete <id>` using this same binary.
+            let session_mutator: Option<Arc<dyn rupu_cp::session_mutator::SessionMutator>> = Some(
+                Arc::new(crate::cp_session_mutator::SubprocessSessionMutator { exe: exe.clone() }),
+            );
 
             // Adapter for rupu-cp's SessionStarter port: shells
             // `rupu session start <agent> … --detach` using this same binary.
@@ -120,12 +134,14 @@ pub async fn handle(action: Action) -> ExitCode {
                 agent_launcher,
                 session_starter,
                 generator,
+                session_mutator,
             })
             .await;
 
-            // Signal the worker to stop and wait for it to drain.
+            // Signal both background workers to stop and wait for them to drain.
             let _ = shutdown_tx.send(true);
             let _ = worker_handle.await;
+            let _ = poller_handle.await;
 
             serve_result
         }
@@ -136,6 +152,120 @@ pub async fn handle(action: Action) -> ExitCode {
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// How often the bucket poller wakes to check for new result objects.
+const BUCKET_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Background worker that polls each bucket host for completed result objects
+/// and mirrors them into the central [`RunStore`] via [`rupu_cp::node::NodeMirror`].
+///
+/// This is the counterpart to the tunnel read-pump: instead of streaming events
+/// over a WebSocket, the node writes artifacts into the shared object-store bucket
+/// and this poller reads them back on a fixed interval.
+///
+/// A per-`(host_id, run_id)` [`HashSet<String>`] accumulates the keys that have
+/// already been mirrored, so re-polling never double-appends.
+async fn run_bucket_poller(
+    store: Arc<RunStore>,
+    hosts: rupu_workspace::HostStore,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    // Outer key: "<host_id>\x00<run_id>", value: set of consumed bucket keys.
+    let mut consumed: HashMap<String, HashSet<String>> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(BUCKET_POLL_INTERVAL) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!("bucket poller shutting down");
+                    break;
+                }
+                continue;
+            }
+        }
+
+        let bucket_hosts: Vec<rupu_workspace::Host> = hosts
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| matches!(h.transport, rupu_workspace::HostTransport::Bucket { .. }))
+            .collect();
+
+        for host in &bucket_hosts {
+            let (url, prefix) = match &host.transport {
+                rupu_workspace::HostTransport::Bucket { url, prefix } => {
+                    (url.clone(), prefix.clone())
+                }
+                _ => continue,
+            };
+
+            let bucket = match ObjectStoreBucket::from_url(&url, prefix.as_deref()) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        host_id = %host.id,
+                        error = %e,
+                        "bucket poller: failed to build bucket from url"
+                    );
+                    continue;
+                }
+            };
+
+            let mirror = rupu_cp::node::NodeMirror::new(Arc::clone(&store));
+
+            // Find in-flight runs attributed to this bucket host.
+            let inflight: Vec<String> = match store.list() {
+                Ok(runs) => runs
+                    .into_iter()
+                    .filter(|r| {
+                        r.worker_id.as_deref() == Some(host.id.as_str())
+                            && !r.status.is_terminal()
+                    })
+                    .map(|r| r.id)
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(
+                        host_id = %host.id,
+                        error = %e,
+                        "bucket poller: RunStore::list failed"
+                    );
+                    continue;
+                }
+            };
+
+            for run_id in inflight {
+                // Compound map key avoids collisions across hosts.
+                let map_key = format!("{}\x00{}", host.id, run_id);
+
+                let poll_result = {
+                    let consumed_set = consumed.entry(map_key.clone()).or_default();
+                    poll_bucket_run(&bucket, &mirror, &host.id, &run_id, consumed_set).await
+                };
+
+                match poll_result {
+                    Ok(true) => {
+                        tracing::info!(
+                            host_id = %host.id,
+                            run_id = %run_id,
+                            "bucket poller: run finished, removing from tracking"
+                        );
+                        consumed.remove(&map_key);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host.id,
+                            run_id = %run_id,
+                            error = %e,
+                            "bucket poller: poll_bucket_run failed"
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -155,6 +285,7 @@ pub async fn handle(action: Action) -> ExitCode {
 async fn run_resume_worker(
     store: Arc<RunStore>,
     worker_id: String,
+    hosts: rupu_workspace::HostStore,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -178,7 +309,33 @@ async fn run_resume_worker(
             }
         };
 
+        // Defense-in-depth: never resume a run that belongs to a REMOTE host
+        // (tunnel, ssh, or bucket); its real run lives on that host and is resumed via
+        // the transport, not by this local worker. (Remote runs also never carry
+        // the resume_requested_at marker, so this is belt-and-suspenders.)
+        // KEY ASYMMETRY: a Tunnel run's worker_id is the node_id; an SSH run's
+        // worker_id is the host record id (host_<ULID>); a Bucket run's worker_id
+        // is also the host record id.
+        let remote_workers: std::collections::HashSet<String> = hosts
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|h| match h.transport {
+                rupu_workspace::HostTransport::Tunnel { node_id } => Some(node_id),
+                rupu_workspace::HostTransport::Ssh { .. } => Some(h.id),
+                rupu_workspace::HostTransport::Bucket { .. } => Some(h.id),
+                _ => None,
+            })
+            .collect();
+
         for run in pending {
+            if let Some(w) = run.worker_id.as_deref() {
+                if remote_workers.contains(w) {
+                    tracing::debug!(run_id = %run.id, worker = %w,
+                        "resume worker: skipping remote-host run");
+                    continue;
+                }
+            }
             let claimed = match store.claim_resume(&run.id, &worker_id, now) {
                 Ok(c) => c,
                 Err(e) => {

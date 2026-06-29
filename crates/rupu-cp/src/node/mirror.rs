@@ -218,6 +218,15 @@ impl NodeMirror {
                 incoming.workspace_id = existing.workspace_id;
                 incoming.transcript_dir = existing.transcript_dir;
                 incoming.workspace_path = existing.workspace_path;
+                // Defense-in-depth: a tunnel mirror run must never carry the
+                // resume marker that would cause the central resume worker to
+                // act on it.  Force all four resume fields to None regardless
+                // of what the node sent — the node should never set them, but
+                // this guard holds even if a future change ever does.
+                incoming.resume_requested_at = None;
+                incoming.resume_claimed_at = None;
+                incoming.resume_claimed_by = None;
+                incoming.resume_mode = None;
                 self.run_store.update(&incoming)?;
             }
         }

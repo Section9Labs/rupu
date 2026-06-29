@@ -13,8 +13,8 @@
 // calls also include the host param.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { ArrowLeft, FileText, ListOrdered, Pause, ShieldAlert } from 'lucide-react';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { Archive, ArrowLeft, FileText, ListOrdered, Pause, ShieldAlert, Trash2 } from 'lucide-react';
 import {
   api,
   ApiError,
@@ -108,6 +108,7 @@ export default function RunDetail() {
   const { id = '' } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const host = searchParams.get('host') ?? undefined;
+  const navigate = useNavigate();
 
   // Full graph state (used for both local and remote runs).
   const [graph, setGraph] = useState<RunGraphResponse | null>(null);
@@ -150,6 +151,10 @@ export default function RunDetail() {
   const [cancelPending, setCancelPending] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
 
+  // Archive / delete local state (terminal runs only).
+  const [actionPending, setActionPending] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
   // The ONE selection cursor that the tab panel follows. Null = whole run.
   const [selection, setSelection] = useState<Selection>(null);
   // Guards the one-time default seed so live model rebuilds don't override the
@@ -170,6 +175,8 @@ export default function RunDetail() {
     setApproveMode('ask');
     setCancelPending(false);
     setCancelError(null);
+    setActionPending(false);
+    setActionError(null);
     seededSelRef.current = false;
     setFindings(null);
     setFindingsError(null);
@@ -373,6 +380,33 @@ export default function RunDetail() {
     }
   }
 
+  async function onArchive() {
+    if (actionPending) return;
+    setActionPending(true);
+    setActionError(null);
+    try {
+      await api.archiveRun(id);
+      navigate('/runs');
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : 'Archive failed');
+      setActionPending(false);
+    }
+  }
+
+  async function onDelete() {
+    if (actionPending) return;
+    if (!window.confirm('Permanently delete this run and its transcripts? This cannot be undone.')) return;
+    setActionPending(true);
+    setActionError(null);
+    try {
+      await api.deleteRun(id);
+      navigate('/runs');
+    } catch (e: unknown) {
+      setActionError(e instanceof Error ? e.message : 'Delete failed');
+      setActionPending(false);
+    }
+  }
+
   async function onReject() {
     if (!run || gatePending) return;
     setGatePending(true);
@@ -503,6 +537,33 @@ export default function RunDetail() {
               {cancelError && (
                 <p className="text-note font-medium text-err" role="alert">
                   {cancelError}
+                </p>
+              )}
+            </div>
+          )}
+          {!isRunning && (
+            <div className="flex shrink-0 flex-col items-end gap-1">
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="secondary"
+                  onClick={() => void onArchive()}
+                  disabled={actionPending}
+                  className="gap-1.5"
+                >
+                  <Archive size={14} /> Archive
+                </Button>
+                <Button
+                  variant="danger-outline"
+                  onClick={() => void onDelete()}
+                  disabled={actionPending}
+                  className="gap-1.5"
+                >
+                  <Trash2 size={14} /> Delete
+                </Button>
+              </div>
+              {actionError && (
+                <p role="alert" className="text-ui font-medium text-err">
+                  {actionError}
                 </p>
               )}
             </div>

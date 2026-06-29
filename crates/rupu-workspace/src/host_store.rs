@@ -56,6 +56,26 @@ pub enum HostTransport {
     /// The node is identified by its `node_id`; the server routes to the
     /// active connection held in the `NodeRegistry`.
     Tunnel { node_id: String },
+    /// Reachable over plain SSH. The CP shells out to `ssh` to dispatch and
+    /// observe runs. `host` is an `ssh` destination (`user@hostname`) or a
+    /// `~/.ssh/config` alias. No secrets are stored — auth is whatever the
+    /// system `ssh` resolves.
+    Ssh {
+        host: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        port: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity_file: Option<std::path::PathBuf>,
+    },
+    /// Reachable only via a shared object-store bucket (dead-drop). The CP and
+    /// the node never connect; both talk to the bucket. `url` is an
+    /// object_store URL (`s3://…` / `gs://…` / `file://…`); credentials come
+    /// from the environment / cloud credential chain, never stored here.
+    Bucket {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix: Option<String>,
+    },
 }
 
 /// Runtime-derived liveness indicator (not persisted).
@@ -237,6 +257,54 @@ pub fn enroll_node(store: &HostStore, name: &str) -> Result<(Host, String), Host
     };
     store.save(&host)?;
     Ok((host, token))
+}
+
+/// Create and persist an `Ssh` host record. No secret is stored — auth is
+/// delegated to the system `ssh`.
+pub fn add_ssh_host(
+    store: &HostStore,
+    name: &str,
+    host: &str,
+    port: Option<u16>,
+    identity_file: Option<std::path::PathBuf>,
+) -> Result<Host, HostStoreError> {
+    let record = Host {
+        id: format!("host_{}", Ulid::new()),
+        name: name.to_string(),
+        transport: HostTransport::Ssh {
+            host: host.to_string(),
+            port,
+            identity_file,
+        },
+        token_hash: None,
+        created_at: Utc::now().to_rfc3339(),
+        last_seen_at: None,
+    };
+    store.save(&record)?;
+    Ok(record)
+}
+
+/// Create and persist a `Bucket` host record. No secret is stored — credentials
+/// come from the environment / cloud credential chain.
+pub fn add_bucket_host(
+    store: &HostStore,
+    name: &str,
+    url: &str,
+    prefix: Option<String>,
+) -> Result<Host, HostStoreError> {
+    let record = Host {
+        id: format!("host_{}", Ulid::new()),
+        name: name.to_string(),
+        transport: HostTransport::Bucket {
+            url: url.to_string(),
+            prefix,
+        },
+        token_hash: None,
+        created_at: Utc::now().to_rfc3339(),
+        last_seen_at: None,
+    };
+    store.save(&record)?;
+    Ok(record)
 }
 
 /// Verify a node's bearer token against the stored hash.
@@ -421,6 +489,90 @@ mod tests {
         assert_ne!(h1.id, h2.id);
         assert_ne!(t1, t2);
         assert_ne!(h1.token_hash, h2.token_hash);
+    }
+
+    #[test]
+    fn ssh_transport_serde_roundtrip() {
+        let host = Host {
+            id: "host_01ABC".to_string(),
+            name: "edge".to_string(),
+            transport: HostTransport::Ssh {
+                host: "deploy@edge.example".to_string(),
+                port: Some(2222),
+                identity_file: Some(std::path::PathBuf::from("/keys/id_ed25519")),
+            },
+            token_hash: None,
+            created_at: "2026-06-29T00:00:00Z".to_string(),
+            last_seen_at: None,
+        };
+        let toml = toml::to_string(&host).unwrap();
+        assert!(toml.contains(r#"kind = "ssh""#));
+        assert!(toml.contains(r#"host = "deploy@edge.example""#));
+        let back: Host = toml::from_str(&toml).unwrap();
+        assert_eq!(back, host);
+    }
+
+    #[test]
+    fn add_ssh_host_persists_no_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = HostStore { root: tmp.path().to_path_buf() };
+        let h = add_ssh_host(&store, "edge", "deploy@edge.example", None, None).unwrap();
+        assert!(h.id.starts_with("host_"));
+        assert!(matches!(h.transport, HostTransport::Ssh { .. }));
+        assert!(h.token_hash.is_none());
+        let loaded = store.load(&h.id).unwrap().unwrap();
+        assert_eq!(loaded.transport, h.transport);
+    }
+
+    #[test]
+    fn bucket_transport_serde_roundtrip() {
+        // With prefix
+        let host = Host {
+            id: "host_BUCKET01".to_string(),
+            name: "my-bucket".to_string(),
+            transport: HostTransport::Bucket {
+                url: "s3://my-bucket/rupu".to_string(),
+                prefix: Some("runs/".to_string()),
+            },
+            token_hash: None,
+            created_at: "2026-06-29T00:00:00Z".to_string(),
+            last_seen_at: None,
+        };
+        let toml = toml::to_string(&host).unwrap();
+        assert!(toml.contains(r#"kind = "bucket""#), "toml = {toml}");
+        assert!(toml.contains(r#"url = "s3://my-bucket/rupu""#), "toml = {toml}");
+        let back: Host = toml::from_str(&toml).unwrap();
+        assert_eq!(back, host);
+
+        // Without prefix — `prefix` key must be absent from the serialised TOML.
+        let host2 = Host {
+            id: "host_BUCKET02".to_string(),
+            name: "my-bucket-2".to_string(),
+            transport: HostTransport::Bucket {
+                url: "gs://my-gcs-bucket".to_string(),
+                prefix: None,
+            },
+            token_hash: None,
+            created_at: "2026-06-29T00:00:00Z".to_string(),
+            last_seen_at: None,
+        };
+        let toml2 = toml::to_string(&host2).unwrap();
+        assert!(toml2.contains(r#"kind = "bucket""#), "toml2 = {toml2}");
+        assert!(!toml2.contains("prefix"), "prefix should be omitted: {toml2}");
+        let back2: Host = toml::from_str(&toml2).unwrap();
+        assert_eq!(back2, host2);
+    }
+
+    #[test]
+    fn add_bucket_host_persists_no_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = HostStore { root: tmp.path().to_path_buf() };
+        let h = add_bucket_host(&store, "my-bucket", "s3://my-bucket/rupu", None).unwrap();
+        assert!(h.id.starts_with("host_"), "id = {}", h.id);
+        assert!(matches!(h.transport, HostTransport::Bucket { .. }));
+        assert!(h.token_hash.is_none());
+        let loaded = store.load(&h.id).unwrap().unwrap();
+        assert_eq!(loaded.transport, h.transport);
     }
 
     /// Tunnel variant round-trips through TOML serde without data loss.

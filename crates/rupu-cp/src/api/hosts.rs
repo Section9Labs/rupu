@@ -62,6 +62,14 @@ fn transport_fields(t: &HostTransport) -> (String, Option<String>) {
             ("http_cp".to_string(), Some(base_url.clone()))
         }
         HostTransport::Tunnel { node_id } => ("tunnel".to_string(), Some(node_id.clone())),
+        HostTransport::Ssh { host, port, .. } => {
+            let addr = match port {
+                Some(p) => format!("{host}:{p}"),
+                None => host.clone(),
+            };
+            ("ssh".to_string(), Some(addr))
+        }
+        HostTransport::Bucket { url, .. } => ("bucket".to_string(), Some(url.clone())),
     }
 }
 

@@ -286,6 +286,23 @@ pub enum Action {
         #[arg(long)]
         plain: bool,
     },
+    /// Archive a terminal run (move it out of the active list; reversible).
+    ArchiveRun {
+        /// Full run id (`run_<ULID>`).
+        run_id: String,
+    },
+    /// Restore an archived run back to the active list.
+    RestoreRun {
+        /// Full run id (`run_<ULID>`).
+        run_id: String,
+    },
+    /// Permanently delete a run and its transcripts. Requires `--force`.
+    DeleteRun {
+        /// Full run id (`run_<ULID>`).
+        run_id: String,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {
@@ -408,6 +425,9 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
             mode,
             plain,
         } => resume_run(&run_id, mode.as_deref(), plain).await,
+        Action::ArchiveRun { run_id } => archive_run(&run_id).await,
+        Action::RestoreRun { run_id } => restore_run(&run_id).await,
+        Action::DeleteRun { run_id, force } => delete_run(&run_id, force).await,
     };
     match result {
         Ok(()) => ExitCode::from(0),
@@ -428,6 +448,9 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Reject { .. } => ("workflow reject", report::TABLE_ONLY),
         Action::Cancel { .. } => ("workflow cancel", report::TABLE_ONLY),
         Action::Resume { .. } => ("workflow resume", report::TABLE_ONLY),
+        Action::ArchiveRun { .. } => ("workflow archive-run", report::TABLE_ONLY),
+        Action::RestoreRun { .. } => ("workflow restore-run", report::TABLE_ONLY),
+        Action::DeleteRun { .. } => ("workflow delete-run", report::TABLE_ONLY),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
@@ -2397,6 +2420,33 @@ fn cancel_with_store(
         })
 }
 
+async fn archive_run(run_id: &str) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    store.archive(run_id)?;
+    println!("archived run {run_id}");
+    Ok(())
+}
+
+async fn restore_run(run_id: &str) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    store.restore(run_id)?;
+    println!("restored run {run_id}");
+    Ok(())
+}
+
+async fn delete_run(run_id: &str, force: bool) -> anyhow::Result<()> {
+    if !force {
+        anyhow::bail!("run delete requires --force");
+    }
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    store.delete(run_id)?;
+    println!("deleted run {run_id}");
+    Ok(())
+}
+
 pub(crate) fn locate_workflow_in(
     global: &Path,
     project_root: Option<&Path>,
@@ -3741,6 +3791,12 @@ mod tests {
         assert_eq!(persisted.active_step_id, None);
         assert_eq!(persisted.active_step_agent, None);
         assert_eq!(persisted.active_step_transcript_path, None);
+    }
+
+    #[tokio::test]
+    async fn delete_run_requires_force() {
+        let err = delete_run("run_x", false).await.unwrap_err();
+        assert!(err.to_string().contains("--force"));
     }
 
     #[test]

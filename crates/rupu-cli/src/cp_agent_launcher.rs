@@ -1,10 +1,10 @@
 //! `cp serve` adapter for rupu-cp's `AgentLauncher`. Spawns a detached
 //! `rupu run <agent> …` child per request (own process group + null stdio).
 use rupu_cp::agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 pub struct SubprocessAgentLauncher {
     pub exe: PathBuf,
@@ -56,8 +56,7 @@ impl AgentLauncher for SubprocessAgentLauncher {
         }
         #[cfg(unix)]
         cmd.process_group(0); // own process group; detaches from cp-serve's
-        cmd.spawn()
-            .map_err(|e| AgentLaunchError::Spawn(e.to_string()))?;
+        cmd.spawn().map_err(|e| AgentLaunchError::Spawn(e.to_string()))?;
         Ok(run_id)
     }
 }
@@ -120,14 +119,7 @@ mod tests {
         };
         assert_eq!(
             build_agent_argv(&req, "run_X"),
-            vec![
-                "run",
-                "triage",
-                "--run-id",
-                "run_X",
-                "--prompt",
-                "do a security audit"
-            ]
+            vec!["run", "triage", "--run-id", "run_X", "--prompt", "do a security audit"]
         );
     }
 }

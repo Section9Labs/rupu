@@ -7,8 +7,10 @@
 //! The runtime provides `HttpHostConnector` and `HostRegistry`; later tasks add
 //! wiring into `AppState` (Task 5).
 
+pub mod bucket;
 pub mod connector;
 pub mod http;
 pub mod local;
 pub mod registry;
+pub mod ssh;
 pub mod tunnel;
