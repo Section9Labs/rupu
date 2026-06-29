@@ -926,3 +926,359 @@ async fn ws_bad_token_closes_connection_and_not_registered() {
         "node should NOT be registered after bad-token Hello"
     );
 }
+
+// ── Dial-home tunnel end-to-end ───────────────────────────────────────────────
+
+/// End-to-end integration test proving the full dial-home tunnel flow.
+///
+/// Uses a hand-rolled fake WS client (not the real `rupu node` agent).
+///
+/// Flow:
+///   1. Spin the CP router on a real `TcpListener` (AppState already wires
+///      tunnel deps — no separate launcher required for the remote-host path).
+///   2. Enroll a node via `state.hosts.enroll_node` → get (host, token, node_id).
+///   3. Fake WS client sends `Hello` with the valid token → asserts `Welcome`.
+///   4. Central: `POST /api/agents/smoke-agent/run` with `host=node_id` → node
+///      receives `Frame::Run`; capture the CP-allocated `run_id`.
+///   5. Fake node replies: two `Artifact(Events)` frames + `RunFinished(completed)`.
+///      Event lines are valid `rupu_orchestrator::executor::Event` JSON so the
+///      `FileTailRunSource` SSE reader can parse them.
+///   6. Poll `GET /api/runs?host=node_id` until `run_id` appears with
+///      `host_id == node_id` (bounded 3 s retry loop).
+///   7. `GET /api/runs/<run_id>/log?host=node_id` → SSE stream; assert
+///      `text/event-stream` and find the `step_started` event in the stream.
+///   8. `POST /api/runs/<run_id>/cancel?host=node_id` → assert the fake node
+///      receives `Frame::Cancel{run_id}`.
+#[tokio::test]
+async fn tunnel_e2e_dispatch_mirror_observe_cancel() {
+    use futures_util::TryStreamExt as _;
+    use rupu_cp::node::{ArtifactFile, Auth, Frame, RunSpecKind};
+    use rupu_workspace::HostTransport;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::io::AsyncBufReadExt as _;
+    use tokio_tungstenite::connect_async;
+
+    let dir = tempdir().unwrap();
+
+    // ── 1. Build AppState ─────────────────────────────────────────────────────
+    //
+    // `AppState::new` already wires node_registry + node_mirror + tunnel deps
+    // into the HostRegistry, so no `.with_launcher()` is needed: the remote-
+    // host path (`host != "local"`) routes via TunnelHostConnector directly.
+    let state = rupu_cp::state::AppState::new(
+        dir.path().into(),
+        rupu_config::PricingConfig::default(),
+    );
+    let run_store = Arc::clone(&state.run_store);
+    let node_registry = Arc::clone(&state.node_registry);
+
+    // ── 2. Enroll a tunnel node ────────────────────────────────────────────────
+    let (host, token) = state
+        .hosts
+        .enroll_node("e2e-smoke-node")
+        .expect("enroll_node should succeed");
+
+    let node_id = match &host.transport {
+        HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport after enroll_node"),
+    };
+    // For Tunnel hosts, host.id == node_id (by construction in enroll_node).
+    assert_eq!(host.id, node_id, "host.id must equal node_id for Tunnel hosts");
+
+    // ── Spin the server ────────────────────────────────────────────────────────
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // ── 3. Fake WS client: Hello → Welcome ────────────────────────────────────
+    let ws_url = format!("ws://{addr}/api/node/connect");
+    let (mut ws, _) = connect_async(&ws_url)
+        .await
+        .expect("WS connect should succeed");
+
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: node_id.clone(),
+            auth: Auth::Token { token },
+            rupu_version: "e2e-test".to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await;
+
+    let welcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Welcome")
+    .expect("WS closed before Welcome");
+    assert!(
+        matches!(welcome, Frame::Welcome {}),
+        "expected Welcome, got {welcome:?}"
+    );
+
+    // Give the server's WS task time to register the node before dispatching.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        node_registry.is_online(&node_id),
+        "node should be online in the registry after Welcome"
+    );
+
+    // ── 4. Dispatch via central HTTP ────────────────────────────────────────────
+    //
+    // POST /api/agents/:name/run with host=node_id routes to
+    // TunnelHostConnector::launch_agent, which creates a mirror run and sends
+    // Frame::Run to the connected node. No agent definition file is needed on
+    // the central CP — the connector sends the spec to the node as-is.
+    let dispatch_resp = client
+        .post(format!("http://{addr}/api/agents/smoke-agent/run"))
+        .json(&serde_json::json!({
+            "host": node_id,
+            "prompt": "e2e smoke test"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatch_resp.status(),
+        reqwest::StatusCode::OK,
+        "agent dispatch should return 200"
+    );
+
+    let dispatch_body: serde_json::Value = dispatch_resp.json().await.unwrap();
+    let run_id = dispatch_body["run_id"]
+        .as_str()
+        .expect("dispatch response must include run_id")
+        .to_string();
+    assert_eq!(
+        dispatch_body["host_id"].as_str(),
+        Some(node_id.as_str()),
+        "dispatch response must echo the node_id as host_id"
+    );
+
+    // Fake node receives Frame::Run with the CP-allocated run_id.
+    let run_frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Run frame")
+    .expect("WS closed before Run frame");
+
+    if let Frame::Run { run_id: ref fid, ref spec } = run_frame {
+        assert_eq!(fid, &run_id, "frame run_id must match the CP-allocated run_id");
+        assert_eq!(spec.kind, RunSpecKind::Agent, "spec kind must be Agent");
+        assert_eq!(spec.name, "smoke-agent", "spec name must match");
+        assert_eq!(
+            spec.prompt.as_deref(),
+            Some("e2e smoke test"),
+            "prompt must be forwarded in the spec"
+        );
+    } else {
+        panic!("expected Frame::Run, got {run_frame:?}");
+    }
+
+    // ── 5. Fake node streams artifacts + signals completion ─────────────────────
+    //
+    // Event lines must be valid rupu_orchestrator::executor::Event JSON so that
+    // FileTailRunSource can parse and re-emit them via the SSE log endpoint.
+    // StepStarted requires: run_id, step_id, kind (snake_case StepKind), agent.
+    // StepCompleted requires: run_id, step_id, success, duration_ms.
+    let event_step_started = format!(
+        r#"{{"type":"step_started","run_id":"{run_id}","step_id":"s1","kind":"linear","agent":"smoke-agent"}}"#
+    );
+    let event_step_completed = format!(
+        r#"{{"type":"step_completed","run_id":"{run_id}","step_id":"s1","success":true,"duration_ms":1}}"#
+    );
+
+    send_frame(
+        &mut ws,
+        &Frame::Artifact {
+            run_id: run_id.clone(),
+            file: ArtifactFile::Events,
+            line: event_step_started,
+        },
+    )
+    .await;
+    send_frame(
+        &mut ws,
+        &Frame::Artifact {
+            run_id: run_id.clone(),
+            file: ArtifactFile::Events,
+            line: event_step_completed,
+        },
+    )
+    .await;
+    send_frame(
+        &mut ws,
+        &Frame::RunFinished {
+            run_id: run_id.clone(),
+            status: "completed".to_string(),
+        },
+    )
+    .await;
+
+    // ── 6. Poll central mirror ─────────────────────────────────────────────────
+    //
+    // The server's WS read pump processes frames asynchronously; wait up to 3 s
+    // for the run to appear in GET /api/runs?host=<node_id>.  Once RunFinished
+    // is processed, both Artifact lines are guaranteed to be written (TCP order).
+    let run_id_for_poll = run_id.clone();
+    let node_id_for_poll = node_id.clone();
+    let client_for_poll = client.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        async move {
+            loop {
+                let resp = client_for_poll
+                    .get(format!(
+                        "http://{addr}/api/runs?host={node_id_for_poll}"
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                if resp.status() == reqwest::StatusCode::OK {
+                    let rows: Vec<serde_json::Value> = resp.json().await.unwrap();
+                    if let Some(row) = rows
+                        .iter()
+                        .find(|r| r["id"].as_str() == Some(run_id_for_poll.as_str()))
+                    {
+                        assert_eq!(
+                            row["host_id"].as_str(),
+                            Some(node_id_for_poll.as_str()),
+                            "run row must carry node_id as host_id"
+                        );
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        },
+    )
+    .await
+    .expect("run should appear in the central mirror within 3 s");
+
+    // Verify directly via RunStore: status must be Completed, worker_id == node_id.
+    let record = run_store.load(&run_id).expect("run must be loadable from central store");
+    assert_eq!(
+        record.worker_id.as_deref(),
+        Some(node_id.as_str()),
+        "worker_id must carry the node_id attribution"
+    );
+
+    // events.jsonl must have exactly two lines (the Artifact frames we sent).
+    let events_path = run_store.events_path(&run_id);
+    let events_content =
+        std::fs::read_to_string(&events_path).expect("events.jsonl must exist");
+    let event_lines: Vec<&str> = events_content.lines().collect();
+    assert_eq!(
+        event_lines.len(),
+        2,
+        "events.jsonl must have exactly 2 lines after 2 Artifact frames"
+    );
+
+    // ── 7. GET log endpoint → SSE stream contains the step_started event ────────
+    //
+    // GET /api/runs/:id/log?host=<node_id> calls TunnelHostConnector::stream_run_events
+    // → open_run_events_tail → FileTailRunSource tails the central events.jsonl.
+    let log_resp = client
+        .get(format!(
+            "http://{addr}/api/runs/{run_id}/log?host={node_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        log_resp.status(),
+        reqwest::StatusCode::OK,
+        "log endpoint must return 200"
+    );
+    let ct = log_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("text/event-stream"),
+        "log endpoint must return text/event-stream; got {ct:?}"
+    );
+
+    let stream = log_resp.bytes_stream().map_err(std::io::Error::other);
+    let async_reader = tokio_util::io::StreamReader::new(stream);
+    let mut lines = tokio::io::BufReader::new(async_reader).lines();
+
+    let found_event = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if data.contains("step_started") {
+                        return true;
+                    }
+                }
+            }
+            false
+        },
+    )
+    .await
+    .expect("SSE log stream read timed out");
+    assert!(
+        found_event,
+        "SSE log stream must contain the step_started event"
+    );
+
+    // ── 8. Cancel → fake node receives Frame::Cancel ────────────────────────────
+    //
+    // TunnelHostConnector::cancel_run sends Frame::Cancel to the node via the
+    // live WS connection (still open — the fake WS client stays connected after
+    // RunFinished; only the node decides when to close).
+    let cancel_resp = client
+        .post(format!(
+            "http://{addr}/api/runs/{run_id}/cancel?host={node_id}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        cancel_resp.status(),
+        reqwest::StatusCode::OK,
+        "cancel must return 200"
+    );
+    let cancel_body: serde_json::Value = cancel_resp.json().await.unwrap();
+    assert_eq!(
+        cancel_body["ok"].as_bool(),
+        Some(true),
+        "cancel response must include ok:true"
+    );
+    assert_eq!(
+        cancel_body["host_id"].as_str(),
+        Some(node_id.as_str()),
+        "cancel response must echo the node_id as host_id"
+    );
+
+    // Fake node receives Frame::Cancel with the correct run_id.
+    let cancel_frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Cancel frame")
+    .expect("WS closed before Cancel frame");
+
+    if let Frame::Cancel { run_id: ref fid } = cancel_frame {
+        assert_eq!(
+            fid, &run_id,
+            "Cancel frame run_id must match the dispatched run_id"
+        );
+    } else {
+        panic!("expected Frame::Cancel, got {cancel_frame:?}");
+    }
+}
