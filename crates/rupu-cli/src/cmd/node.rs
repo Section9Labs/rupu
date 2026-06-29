@@ -431,32 +431,26 @@ async fn connect_and_run(
             }
             Frame::Approve { run_id, mode } => {
                 info!(run_id = %run_id, "node: Approve received");
-                let argv = build_control_argv(ControlKind::Approve, &run_id, &mode, None);
-                match spawn_control(exe, &argv) {
-                    Ok(child) => {
-                        // Re-point the active child so a later Cancel kills the
-                        // resumed run, not the (already-exited) original.
-                        if let Some(state) = active.get_mut(&run_id) {
-                            state.child = child;
-                        } else {
-                            warn!(run_id = %run_id, "node: Approve for unknown run_id (spawned anyway)");
-                        }
+                if let Some(state) = active.get_mut(&run_id) {
+                    let argv = build_control_argv(ControlKind::Approve, &run_id, &mode, None);
+                    match spawn_control(exe, &argv) {
+                        Ok(child) => { state.child = child; }
+                        Err(e) => warn!(run_id = %run_id, error = %e, "node: approve spawn failed"),
                     }
-                    Err(e) => warn!(run_id = %run_id, error = %e, "node: approve spawn failed"),
+                } else {
+                    warn!(run_id = %run_id, "node: Approve for unknown run_id (ignored)");
                 }
             }
             Frame::Reject { run_id, reason } => {
                 info!(run_id = %run_id, "node: Reject received");
-                let argv = build_control_argv(ControlKind::Reject, &run_id, "", reason.as_deref());
-                match spawn_control(exe, &argv) {
-                    Ok(child) => {
-                        if let Some(state) = active.get_mut(&run_id) {
-                            state.child = child;
-                        } else {
-                            warn!(run_id = %run_id, "node: Reject for unknown run_id (spawned anyway)");
-                        }
+                if let Some(state) = active.get_mut(&run_id) {
+                    let argv = build_control_argv(ControlKind::Reject, &run_id, "", reason.as_deref());
+                    match spawn_control(exe, &argv) {
+                        Ok(child) => { state.child = child; }
+                        Err(e) => warn!(run_id = %run_id, error = %e, "node: reject spawn failed"),
                     }
-                    Err(e) => warn!(run_id = %run_id, error = %e, "node: reject spawn failed"),
+                } else {
+                    warn!(run_id = %run_id, "node: Reject for unknown run_id (ignored)");
                 }
             }
             Frame::Hello { .. }

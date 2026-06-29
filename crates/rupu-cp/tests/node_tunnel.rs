@@ -372,6 +372,79 @@ fn mirror_run_json_repins_cp_local_paths() {
     );
 }
 
+/// `RunJson` import must null all four `resume_*` fields regardless of what
+/// the node sent.  This prevents a mirrored run from ever being picked up by
+/// the central resume worker (which scans for `resume_requested_at` being
+/// `Some`).
+#[test]
+fn mirror_run_json_nulls_resume_fields() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "resume-null-test".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+
+    let run_id = "run_RESUMENULLTEST01";
+    let node_id = "node-resume-null";
+
+    mirror
+        .create_run(run_id, node_id, &spec)
+        .expect("create_run");
+
+    // Build a node-side RunRecord JSON that has all four resume_* fields set.
+    let node_run_json = serde_json::json!({
+        "id": run_id,
+        "workflow_name": "resume-null-test",
+        "status": "awaiting_approval",
+        "inputs": {},
+        "workspace_id": "node-ws",
+        "workspace_path": "/node/path",
+        "transcript_dir": "/node/path/transcripts",
+        "started_at": "2026-01-01T00:00:00Z",
+        "resume_requested_at": "2026-01-01T01:00:00Z",
+        "resume_claimed_at": "2026-01-01T01:01:00Z",
+        "resume_claimed_by": "some-worker",
+        "resume_mode": "bypass"
+    });
+    let line = serde_json::to_string(&node_run_json).expect("serialize node record");
+
+    mirror
+        .append(run_id, node_id, ArtifactFile::RunJson, &line)
+        .expect("append RunJson");
+
+    let record = store.load(run_id).expect("load after RunJson append");
+
+    assert!(
+        record.resume_requested_at.is_none(),
+        "resume_requested_at must be None after mirror RunJson import"
+    );
+    assert!(
+        record.resume_claimed_at.is_none(),
+        "resume_claimed_at must be None after mirror RunJson import"
+    );
+    assert!(
+        record.resume_claimed_by.is_none(),
+        "resume_claimed_by must be None after mirror RunJson import"
+    );
+    assert!(
+        record.resume_mode.is_none(),
+        "resume_mode must be None after mirror RunJson import"
+    );
+}
+
 // ── NodeMirror security tests (Finding 1) ─────────────────────────────────────
 
 /// A run_id containing a path-traversal sequence (`/`) must be rejected by
