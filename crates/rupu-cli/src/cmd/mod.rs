@@ -20,6 +20,7 @@ pub mod init;
 pub mod issues;
 pub mod mcp;
 pub mod models;
+pub mod node;
 pub mod repos;
 pub mod retention;
 pub mod run;
