@@ -285,6 +285,15 @@
       <span class="s">&#123;&#123; r &#125;&#125;</span>
       <span class="v">&#123;% endfor %&#125;</span></pre>
 
+    <h2>Generate one from a description</h2>
+    <p>You can also describe the pipeline in plain language and let rupu draft the YAML. <code class="inline">create</code> generates the workflow with a model — running a <strong>validate &rarr; repair</strong> loop against the real schema so the output parses — then opens it for you to refine. The same flow lives in the <a class="link" href="/docs/control-plane.html">control plane</a>&rsquo;s authoring UI (and its visual editor).</p>
+    <pre class="code"><span class="c"># AI-draft a workflow from a one-line brief</span>
+rupu workflow create nightly-audit \
+  --describe <span class="s">"Run a parallel security + performance review panel over the diff, then summarize"</span>
+
+<span class="c"># or scaffold an empty workflow to edit yourself (omit --describe)</span>
+rupu workflow create my-workflow</pre>
+
     <h2>Running a workflow</h2>
     <p>List and inspect the workflows rupu can see, then run one:</p>
     <pre class="code"><span class="c"># list every resolvable workflow (project + global scope)</span>

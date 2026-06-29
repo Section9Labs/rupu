@@ -42,7 +42,7 @@
 
   <main class="docs-main">
     <h1>Providers &amp; Auth</h1>
-    <p class="intro">rupu speaks to four model providers at once — and because every agent picks its <strong>own</strong> provider, model, and credential, a single workflow can run a planner on one model and reviewers on another in the same run.</p>
+    <p class="intro">rupu speaks to four built-in model providers at once — plus <strong>any OpenAI-compatible endpoint</strong> you register — and because every agent picks its <strong>own</strong> provider, model, and credential, a single workflow can run a planner on one model and reviewers on another in the same run.</p>
 
     <h2>The multi-provider model</h2>
     <p>rupu is not pinned to one vendor. It ships working integrations for <strong>Anthropic, OpenAI, Gemini, and GitHub Copilot</strong>, and the choice is made <em>per agent</em>, not globally. Each agent file declares its <code class="inline">provider</code>, <code class="inline">model</code>, and (optionally) <code class="inline">auth</code> mode in its YAML frontmatter — so when a workflow fans out across several agents, those agents can each talk to a different provider concurrently.</p>
@@ -75,6 +75,8 @@
         </tr>
       </tbody>
     </table>
+
+    <p>Those four are the <em>built-in</em> providers, with first-class auth flows and curated model lists. But you are not limited to them: beyond the built-ins, you can register <strong>any OpenAI-compatible HTTP endpoint</strong> as a named provider and mix it into the same workflows — see <a class="link" href="#byo">Bring your own provider</a> below.</p>
 
     <figure class="diagram">
       <svg viewBox="0 0 660 220" role="img" aria-label="One workflow run fanning three steps across three different providers">
@@ -201,6 +203,79 @@ rupu auth backend <span class="k">--use</span> file</pre>
 
     <h3>Copilot</h3>
     <p>Requires a paid Copilot Pro / Business / Enterprise subscription — a free GitHub account can't invoke the API even with a valid token. The simplest path is a GitHub PAT (<code class="inline">ghp_...</code>), or pick it up from <code class="inline">GITHUB_TOKEN</code> when <code class="inline">--key</code> is omitted. The device-code SSO flow is the same one <code class="inline">gh auth login</code> uses and is the only SSO flow that works headless. The exchanged Copilot token expires faster than the GitHub PAT; rupu re-mints it internally.</p>
+
+    <h2 id="byo">Bring your own provider (OpenAI-compatible)</h2>
+    <p>The four built-ins are not the boundary. With the <code class="inline">openai-compatible</code> provider kind you can register <strong>any HTTP server that speaks the OpenAI <code class="inline">/v1/chat/completions</code> API</strong> as a named provider, then use it from agents exactly like a built-in — and mix it with the built-ins in one workflow. That covers:</p>
+    <ul>
+      <li><strong>Local models</strong> — vLLM, llama.cpp, or Ollama running on your own machine or a GPU box.</li>
+      <li><strong>Gateways &amp; aggregators</strong> — OpenRouter, Together, Groq, Fireworks, and similar OpenAI-shaped endpoints.</li>
+      <li><strong>Private / enterprise endpoints</strong> — Oracle GenAI or an internal company gateway.</li>
+    </ul>
+    <p>Authentication is a single static <strong>Bearer API key</strong> per provider — there is no SSO flow for openai-compatible providers. The model catalog is whatever you declare in config; rupu does not call <code class="inline">/v1/models</code> on these endpoints.</p>
+
+    <h3>Configure it</h3>
+    <p>Add a <code class="inline">[providers.&lt;name&gt;]</code> table to <code class="inline">~/.rupu/config.toml</code> with <code class="inline">kind = "openai-compatible"</code>. <code class="inline">base_url</code> and <code class="inline">default_model</code> are <strong>required</strong>; <code class="inline">stream</code> is optional (defaults to <code class="inline">true</code>; set <code class="inline">false</code> for servers without an SSE endpoint). Add one <code class="inline">[[providers.&lt;name&gt;.models]]</code> block per private or fine-tuned model you want to select.</p>
+
+    <pre class="code"><span class="k">default_provider</span> = <span class="s">"oracle"</span>
+
+<span class="v">[providers.oracle]</span>
+<span class="k">kind</span> = <span class="s">"openai-compatible"</span>
+<span class="k">base_url</span> = <span class="s">"http://192.29.35.246:8080"</span>
+<span class="k">default_model</span> = <span class="s">"/raid/models/zai-org/GLM-5.2-FP8"</span>
+<span class="k">stream</span> = <span class="v">true</span>   <span class="c"># set false if the server has no SSE endpoint</span>
+
+  <span class="v">[[providers.oracle.models]]</span>
+  <span class="k">id</span> = <span class="s">"/raid/models/zai-org/GLM-5.2-FP8"</span>
+  <span class="k">context_window</span> = <span class="v">131072</span>
+  <span class="k">max_output</span> = <span class="v">8192</span></pre>
+
+    <p><code class="inline">base_url</code> may include or omit a trailing <code class="inline">/v1</code> — rupu normalises both to <code class="inline">&lt;root&gt;/v1/chat/completions</code>. Each <code class="inline">[[providers.&lt;name&gt;.models]]</code> entry requires <code class="inline">id</code>; <code class="inline">context_window</code> and <code class="inline">max_output</code> are optional (defaulting to <code class="inline">32768</code> and <code class="inline">8192</code>). Name the provider anything you like — <code class="inline">oracle</code>, <code class="inline">vllm</code>, <code class="inline">together</code> — except a <strong>reserved built-in name</strong> (<code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, <code class="inline">copilot</code>); rupu rejects the config otherwise.</p>
+
+    <h3>Authenticate</h3>
+    <p>Supply the static Bearer key with <code class="inline">rupu auth login</code> (stored in the keychain / <code class="inline">auth.json</code>, same as the built-ins), or — for CI and ephemeral environments — set the env var <code class="inline">RUPU_&lt;UPPERCASED_PROVIDER_NAME&gt;_API_KEY</code> and rupu reads it automatically.</p>
+
+    <pre class="code"><span class="c"># Interactive prompt (the key is not echoed), or pipe it on stdin</span>
+rupu auth login <span class="k">--provider</span> oracle <span class="k">--mode</span> api-key
+
+<span class="c"># Or set the env var directly — pattern: RUPU_&lt;PROVIDER&gt;_API_KEY</span>
+export RUPU_ORACLE_API_KEY=sk-...</pre>
+
+    <h3>Use it from an agent</h3>
+    <p>Point an <a class="link" href="/docs/agents.html">agent</a> at the provider by name; the <code class="inline">model:</code> can be any id the endpoint serves, including the custom <code class="inline">[[providers.&lt;name&gt;.models]]</code> entries that make private or fine-tuned models selectable.</p>
+
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="v">oracle-codereview</span>
+<span class="k">description</span>: <span class="s">Code review via Oracle GenAI.</span>
+<span class="k">provider</span>: <span class="v">oracle</span>
+<span class="k">model</span>: <span class="v">/raid/models/zai-org/GLM-5.2-FP8</span>
+<span class="c">---</span>
+
+<span class="s">You review code changes for correctness, style, and missing tests.</span></pre>
+
+    <p>Then run it like any other agent, and confirm the custom catalog with <code class="inline">rupu models list --provider oracle</code> (entries show source <code class="inline">custom</code>):</p>
+
+    <pre class="code">rupu run <span class="k">--agent</span> oracle-codereview</pre>
+
+    <h3>Example endpoints</h3>
+    <p>Any of these can be dropped into the <code class="inline">base_url</code> above. When a path detail is unknown for your deployment, the generic <code class="inline">http://host:port/v1</code> shape is a safe starting point.</p>
+
+    <table>
+      <thead>
+        <tr><th>Target</th><th>Rough <code>base_url</code></th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Ollama (local)</td><td><code>http://localhost:11434/v1</code></td></tr>
+        <tr><td>vLLM (self-hosted)</td><td><code>http://host:8000/v1</code></td></tr>
+        <tr><td>llama.cpp server</td><td><code>http://host:8080/v1</code></td></tr>
+        <tr><td>OpenRouter</td><td><code>https://openrouter.ai/api/v1</code></td></tr>
+        <tr><td>Together</td><td><code>https://api.together.xyz/v1</code></td></tr>
+        <tr><td>Groq</td><td><code>https://api.groq.com/openai/v1</code></td></tr>
+        <tr><td>Fireworks</td><td><code>https://api.fireworks.ai/inference/v1</code></td></tr>
+        <tr><td>Oracle GenAI / internal gateway</td><td><code>http://host:port</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout"><strong>Scope.</strong> openai-compatible providers report <code class="inline">$0.00</code> in cost tracking (no pricing tables), and model listing returns only what you declare under <code class="inline">[[providers.&lt;name&gt;.models]]</code> — rupu never queries <code class="inline">/v1/models</code> on these endpoints.</div>
 
     <div class="doc-nav">
       <a href="/docs/sessions.html">&#8592; Sessions</a>

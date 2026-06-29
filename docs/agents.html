@@ -249,6 +249,16 @@ rupu auth login --provider anthropic --mode api-key --key &lt;secret&gt;
 <span class="c"># SSO</span>
 rupu auth login --provider anthropic --mode sso</pre>
 
+    <h2>Generate one from a description</h2>
+    <p>Don&rsquo;t want to hand-write the frontmatter? Describe the agent in plain language and let rupu draft it for you. <code class="inline">create</code> generates the <code class="inline">.md</code> with a model (running a <strong>validate &rarr; repair</strong> loop so the result actually parses) and opens it in your editor to refine.</p>
+    <pre class="code"><span class="c"># scaffold + AI-draft an agent from a one-line brief</span>
+rupu agent create security-reviewer \
+  --describe <span class="s">"A read-only reviewer that audits a diff for OWASP Top 10 issues and returns JSON findings"</span>
+
+<span class="c"># or scaffold an empty agent and edit it yourself (omit --describe)</span>
+rupu agent create my-agent</pre>
+    <p>The same generate-from-a-description flow is available in the <a class="link" href="/docs/control-plane.html">control plane</a>&rsquo;s authoring UI.</p>
+
     <h2>Running an agent</h2>
     <p>List and inspect the agents rupu can see, then run one:</p>
     <pre class="code"><span class="c"># list every resolvable agent (project + global scope)</span>
