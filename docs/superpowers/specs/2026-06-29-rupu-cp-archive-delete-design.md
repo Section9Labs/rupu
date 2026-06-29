@@ -176,10 +176,19 @@ New API client methods in `web/src/lib/api.ts`: `archiveRun`, `restoreRun`,
 - **Sessions** (`Sessions.tsx`, has active/archived tabs): row actions in the
   existing action column — **active** rows → Archive + Delete; **archived** rows →
   Restore + Delete. Same buttons in `SessionDetail.tsx` header.
-- **Runs** (`AgentRuns.tsx` / `WorkflowRuns.tsx` / `AutoflowRuns.tsx` + `RunDetail.tsx`):
-  row actions Archive + Delete; an **Archived** filter/toggle on the run lists
-  (calls `getArchivedRuns`) where archived rows show Restore + Delete. `RunDetail`
-  header gets Archive/Restore + Delete next to the existing Cancel.
+- **Runs** — `RunDetail.tsx` header gets Archive + Delete next to the existing
+  Cancel (shown when the run is terminal), and `WorkflowRuns.tsx` gets an
+  **Archived** toggle (`getArchivedRuns('workflow')`) with per-row Archive/Delete
+  (active) and Restore/Delete (archived).
+  **Scope note (decided during implementation):** `AgentRuns.tsx` and
+  `AutoflowRuns.tsx` are intentionally *not* given archive/delete actions — their
+  list rows are not run-store-addressable (agent-run ids are not in the workflow
+  run store; autoflow rows are keyed by `cycle_id`), so `/api/runs/:id` mutations
+  don't apply to them. Consequently the archived endpoint is **kind-filtered to
+  workflow runs** (`GET /api/runs/archived?kind=workflow`) so the Workflow page's
+  archived view stays homogeneous. Archived agent/autoflow run management is out of
+  scope for this slice (the runs still exist on disk and are manageable via the CLI
+  `rupu workflow archive-run/restore-run/delete-run`).
 
 ## 6. Error handling & guards
 
