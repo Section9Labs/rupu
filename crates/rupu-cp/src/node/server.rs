@@ -62,6 +62,11 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Prevents unbounded memory growth when a slow node falls behind.
 const CHANNEL_CAPACITY: usize = 256;
 
+/// Maximum time to wait for the initial `Frame::Hello` after a WS connection
+/// is established.  Unauthenticated clients that hold the socket open without
+/// sending Hello are forcibly disconnected after this deadline.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 /// Returns the router fragment that mounts `GET /api/node/connect`.
@@ -80,14 +85,22 @@ async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Resp
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // ── 1. Receive Hello ──────────────────────────────────────────────────────
-    let first = match ws_rx.next().await {
-        Some(Ok(msg)) => msg,
-        Some(Err(e)) => {
+    // ── 1. Receive Hello (with deadline) ─────────────────────────────────────
+    //
+    // Unauthenticated clients must send Hello within HELLO_TIMEOUT; otherwise
+    // they could hold sockets open indefinitely.
+    let first = match tokio::time::timeout(HELLO_TIMEOUT, ws_rx.next()).await {
+        Err(_elapsed) => {
+            warn!("node_tunnel: Hello timeout; closing socket");
+            let _ = ws_tx.send(Message::Close(None)).await;
+            return;
+        }
+        Ok(Some(Ok(msg))) => msg,
+        Ok(Some(Err(e))) => {
             warn!(error = %e, "node_tunnel: ws error before Hello");
             return;
         }
-        None => {
+        Ok(None) => {
             warn!("node_tunnel: connection closed before Hello");
             return;
         }
@@ -244,13 +257,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     match frame {
                         Frame::Artifact { run_id, file, line } => {
-                            if let Err(e) = mirror.append(&run_id, file, &line) {
+                            if let Err(e) =
+                                mirror.append(&run_id, &node_id_r, file, &line)
+                            {
                                 warn!(error = %e, run_id,
                                       "node_tunnel: mirror.append failed");
                             }
                         }
                         Frame::RunFinished { run_id, status } => {
-                            if let Err(e) = mirror.finish(&run_id, &status) {
+                            if let Err(e) =
+                                mirror.finish(&run_id, &node_id_r, &status)
+                            {
                                 warn!(error = %e, run_id,
                                       "node_tunnel: mirror.finish failed");
                             }

@@ -229,6 +229,7 @@ fn mirror_create_append_finish_round_trip() {
     mirror
         .append(
             run_id,
+            node_id,
             ArtifactFile::Events,
             r#"{"type":"step_started","step_id":"s1"}"#,
         )
@@ -237,12 +238,13 @@ fn mirror_create_append_finish_round_trip() {
     mirror
         .append(
             run_id,
+            node_id,
             ArtifactFile::Events,
             r#"{"type":"step_completed","step_id":"s1"}"#,
         )
         .expect("append event 2");
 
-    mirror.finish(run_id, "completed").expect("finish");
+    mirror.finish(run_id, node_id, "completed").expect("finish");
 
     // Status must be Completed and worker_id must carry the node attribution.
     let record = store.load(run_id).expect("load");
@@ -323,7 +325,7 @@ fn mirror_run_json_repins_cp_local_paths() {
     let line = serde_json::to_string(&node_run_json).expect("serialize node record");
 
     mirror
-        .append(run_id, ArtifactFile::RunJson, &line)
+        .append(run_id, node_id, ArtifactFile::RunJson, &line)
         .expect("append RunJson");
 
     let record = store.load(run_id).expect("load after RunJson append");
@@ -368,6 +370,175 @@ fn mirror_run_json_repins_cp_local_paths() {
         record.workspace_id, "",
         "workspace_id must be empty (not the node id)"
     );
+}
+
+// ── NodeMirror security tests (Finding 1) ─────────────────────────────────────
+
+/// A run_id containing a path-traversal sequence (`/`) must be rejected by
+/// both `append` and `finish` before any I/O is attempted.
+#[test]
+fn mirror_traversal_run_id_rejected_before_io() {
+    use rupu_cp::node::mirror::{MirrorError, NodeMirror};
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let node_id = "node-traversal";
+    let evil_id = "run_../../etc/passwd";
+
+    // append must return InvalidRunId.
+    let err = mirror
+        .append(evil_id, node_id, ArtifactFile::Events, "line")
+        .expect_err("append with traversal id must fail");
+    assert!(
+        matches!(err, MirrorError::InvalidRunId(_)),
+        "expected InvalidRunId for append, got {err:?}"
+    );
+
+    // finish must return InvalidRunId.
+    let err = mirror
+        .finish(evil_id, node_id, "completed")
+        .expect_err("finish with traversal id must fail");
+    assert!(
+        matches!(err, MirrorError::InvalidRunId(_)),
+        "expected InvalidRunId for finish, got {err:?}"
+    );
+
+    // The run store must be completely empty — no I/O was attempted.
+    let runs = store.list().unwrap_or_default();
+    assert!(runs.is_empty(), "run store must be empty; no I/O for traversal ids");
+
+    // Smoke-check additional invalid patterns.
+    let _spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "x".into(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    for bad in &[
+        "run_../escape",
+        "run_with space",
+        "run_with.dot",
+        "no_run_prefix",
+        "",
+    ] {
+        let err = mirror
+            .append(bad, node_id, ArtifactFile::Events, "line")
+            .expect_err(&format!("append({bad}) must fail"));
+        assert!(
+            matches!(err, MirrorError::InvalidRunId(_)),
+            "append({bad}) should be InvalidRunId, got {err:?}"
+        );
+    }
+}
+
+/// A node must not be able to write into a run that belongs to a different node.
+#[test]
+fn mirror_wrong_node_id_rejected() {
+    use rupu_cp::node::mirror::{MirrorError, NodeMirror};
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::RunStore;
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let owner_node = "node-owner";
+    let intruder_node = "node-intruder";
+    let run_id = "run_SECTEST001";
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "sec-workflow".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+
+    // Run created by owner_node.
+    mirror
+        .create_run(run_id, owner_node, &spec)
+        .expect("create_run by owner");
+
+    // intruder_node tries to append — must be rejected with WrongNode.
+    let err = mirror
+        .append(run_id, intruder_node, ArtifactFile::Events, "injected line")
+        .expect_err("append by wrong node must fail");
+    assert!(
+        matches!(err, MirrorError::WrongNode(_)),
+        "expected WrongNode for append, got {err:?}"
+    );
+
+    // intruder_node tries to finish — must be rejected with WrongNode.
+    let err = mirror
+        .finish(run_id, intruder_node, "completed")
+        .expect_err("finish by wrong node must fail");
+    assert!(
+        matches!(err, MirrorError::WrongNode(_)),
+        "expected WrongNode for finish, got {err:?}"
+    );
+
+    // Verify the run still belongs to the owner and has not been tampered with.
+    let record = store.load(run_id).expect("run must still be loadable");
+    assert_eq!(
+        record.worker_id.as_deref(),
+        Some(owner_node),
+        "worker_id must still be owner_node after rejected writes"
+    );
+    // events.jsonl must NOT exist (no successful append happened).
+    let events_path = store.events_path(run_id);
+    assert!(
+        !events_path.exists(),
+        "events.jsonl must not exist after all writes were rejected"
+    );
+}
+
+/// Legitimate path: the owning node can append and finish its own run.
+#[test]
+fn mirror_legitimate_owner_can_append_and_finish() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::{RunStatus, RunStore};
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(dir.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let node_id = "node-legit";
+    let run_id = "run_LEGITPATH001";
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "legit-workflow".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+
+    mirror.create_run(run_id, node_id, &spec).expect("create_run");
+    mirror
+        .append(run_id, node_id, ArtifactFile::Events, r#"{"type":"started"}"#)
+        .expect("append by owner must succeed");
+    mirror
+        .finish(run_id, node_id, "completed")
+        .expect("finish by owner must succeed");
+
+    let record = store.load(run_id).expect("load");
+    assert_eq!(record.status, RunStatus::Completed);
+    assert_eq!(record.worker_id.as_deref(), Some(node_id));
 }
 
 // ── WS endpoint integration tests ─────────────────────────────────────────────
@@ -694,7 +865,8 @@ mod tunnel_connector {
         }
     }
 
-    /// (3) `launch_run` on an OFFLINE node → `HostConnectorError::Unreachable`.
+    /// (3) `launch_run` on an OFFLINE node → `HostConnectorError::Unreachable`
+    /// AND the run store must be empty (no orphaned Running record).
     #[tokio::test]
     async fn launch_run_offline_node_returns_unreachable() {
         let dir = tempdir().unwrap();
@@ -702,6 +874,8 @@ mod tunnel_connector {
         // Do NOT register the node → it is offline.
         let registry = Arc::new(NodeRegistry::new());
         let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        // Keep a handle so we can inspect the store after the call.
+        let run_store_check = Arc::clone(&run_store);
         let conn = TunnelHostConnector::new(
             "node-offline",
             registry,
@@ -715,6 +889,15 @@ mod tunnel_connector {
         assert!(
             matches!(err, HostConnectorError::Unreachable(_)),
             "expected Unreachable, got {err:?}"
+        );
+
+        // The run store must be completely empty — live_conn() fails before
+        // create_run() is called, so no orphaned Running record is created.
+        let runs = run_store_check.list().unwrap_or_default();
+        assert!(
+            runs.is_empty(),
+            "run store must be empty after offline launch_run; got {} run(s)",
+            runs.len()
         );
     }
 

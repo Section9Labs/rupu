@@ -111,22 +111,32 @@ impl HostConnector for TunnelHostConnector {
             target: req.target.clone(),
         };
 
+        // Verify the node is reachable BEFORE creating the mirror run.
+        // This prevents an offline node from leaving an uncancellable Running
+        // record with no executor attached.
+        let conn = self.live_conn()?;
+
         self.mirror
             .create_run(&run_id, &self.node_id, &spec)
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
-        let conn = self.live_conn()?;
-        conn.send(Frame::Run {
-            run_id: run_id.clone(),
-            spec,
-        })
-        .await
-        .map_err(|_| {
-            HostConnectorError::Unreachable(format!(
+        if conn
+            .send(Frame::Run {
+                run_id: run_id.clone(),
+                spec,
+            })
+            .await
+            .is_err()
+        {
+            // Node disconnected in the narrow window between live_conn() and
+            // send().  Best-effort: mark the orphaned mirror run cancelled so
+            // it doesn't remain stuck in Running.
+            let _ = self.mirror.finish(&run_id, &self.node_id, "cancelled");
+            return Err(HostConnectorError::Unreachable(format!(
                 "node {} disconnected before Run frame could be sent",
                 self.node_id
-            ))
-        })?;
+            )));
+        }
 
         Ok(run_id)
     }
@@ -143,22 +153,32 @@ impl HostConnector for TunnelHostConnector {
             target: req.target.clone(),
         };
 
+        // Verify the node is reachable BEFORE creating the mirror run.
+        // This prevents an offline node from leaving an uncancellable Running
+        // record with no executor attached.
+        let conn = self.live_conn()?;
+
         self.mirror
             .create_run(&run_id, &self.node_id, &spec)
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
-        let conn = self.live_conn()?;
-        conn.send(Frame::Run {
-            run_id: run_id.clone(),
-            spec,
-        })
-        .await
-        .map_err(|_| {
-            HostConnectorError::Unreachable(format!(
+        if conn
+            .send(Frame::Run {
+                run_id: run_id.clone(),
+                spec,
+            })
+            .await
+            .is_err()
+        {
+            // Node disconnected in the narrow window between live_conn() and
+            // send().  Best-effort: mark the orphaned mirror run cancelled so
+            // it doesn't remain stuck in Running.
+            let _ = self.mirror.finish(&run_id, &self.node_id, "cancelled");
+            return Err(HostConnectorError::Unreachable(format!(
                 "node {} disconnected before Run frame could be sent",
                 self.node_id
-            ))
-        })?;
+            )));
+        }
 
         Ok(run_id)
     }
