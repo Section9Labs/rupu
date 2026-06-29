@@ -756,19 +756,23 @@ async fn delete_run(
 
 /// `GET /api/runs/archived` — list archived runs, newest-first.
 ///
-/// Returns the same [`RunListRow`] shape as the local path of
-/// `GET /api/runs`, built with usage metrics via [`RunListRow::with_usage`].
-async fn list_archived_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<RunListRow>>> {
+/// Returns the same wire shape as the local path of `GET /api/runs`: each row
+/// is a [`RunListRow`] serialized to JSON with `"host_id": "local"` injected,
+/// matching the field added by [`fan_out_list_runs`] and the single-host path
+/// of `list_runs`.
+async fn list_archived_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<serde_json::Value>>> {
     let records = s
         .run_store
         .list_archived()
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(
-        records
-            .iter()
-            .map(|r| RunListRow::with_usage(r, &s.run_store, &s.pricing))
-            .collect(),
-    ))
+    let mut rows = Vec::with_capacity(records.len());
+    for r in &records {
+        let row = RunListRow::with_usage(r, &s.run_store, &s.pricing);
+        let mut v = serde_json::to_value(row).map_err(|e| ApiError::internal(e.to_string()))?;
+        v["host_id"] = serde_json::json!("local");
+        rows.push(v);
+    }
+    Ok(Json(rows))
 }
 
 #[cfg(test)]
@@ -1071,6 +1075,26 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn list_archived_runs_injects_host_id_local() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let rec = terminal_record("run_01ARCHIVEDROW");
+        s.run_store.create(rec, "name: x\n").unwrap();
+        s.run_store.archive("run_01ARCHIVEDROW").unwrap();
+
+        let resp = list_archived_runs(State(s))
+            .await
+            .expect("list_archived_runs should succeed");
+        let rows = resp.0;
+        assert_eq!(rows.len(), 1, "expected one archived row");
+        assert_eq!(
+            rows[0]["host_id"],
+            serde_json::json!("local"),
+            "archived row must carry host_id=local to match list_runs wire shape"
+        );
     }
 
     #[tokio::test]
