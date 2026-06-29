@@ -170,6 +170,12 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
 
 async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::Result<()> {
     if is_openai_compatible_name(provider) {
+        if parse_provider(provider).is_ok() {
+            anyhow::bail!(
+                "'{provider}' is a reserved built-in provider name; \
+                 choose a distinct name for an openai-compatible provider in config"
+            );
+        }
         let AuthModeArg::ApiKey = mode else {
             anyhow::bail!("openai-compatible providers only support --mode api-key");
         };
@@ -329,6 +335,18 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--provider required (or use --all)"))?;
     if is_openai_compatible_name(provider) {
+        if parse_provider(provider).is_ok() {
+            anyhow::bail!(
+                "'{provider}' is a reserved built-in provider name; \
+                 choose a distinct name for an openai-compatible provider in config"
+            );
+        }
+        if !matches!(opts.mode, None | Some(AuthModeArg::ApiKey)) {
+            anyhow::bail!(
+                "openai-compatible providers only support api-key credentials; \
+                 --mode sso is not valid"
+            );
+        }
         let resolver = rupu_auth::resolver::KeychainResolver::new();
         resolver
             .forget_named(provider, rupu_providers::AuthMode::ApiKey)
@@ -834,6 +852,9 @@ async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
         if let Ok(cfg) = rupu_config::layer_files(Some(&global_cfg), None) {
             for (name, p) in &cfg.providers {
                 if p.kind.as_deref() != Some("openai-compatible") {
+                    continue;
+                }
+                if parse_provider(name).is_ok() {
                     continue;
                 }
                 let present = resolver

@@ -105,9 +105,7 @@ struct FileOffsets {
 
 pub async fn handle(args: NodeArgs) -> ExitCode {
     let result = match args.action {
-        Some(NodeAction::Enroll { name, cp_url }) => {
-            enroll_inner(&name, cp_url.as_deref())
-        }
+        Some(NodeAction::Enroll { name, cp_url }) => enroll_inner(&name, cp_url.as_deref()),
         None => {
             let Some(cp_url) = args.cp_url else {
                 eprintln!(
@@ -149,7 +147,9 @@ pub async fn handle(args: NodeArgs) -> ExitCode {
 
 fn enroll_inner(name: &str, cp_url: Option<&str>) -> anyhow::Result<()> {
     let global = crate::paths::global_dir()?;
-    let store = HostStore { root: global.join("hosts") };
+    let store = HostStore {
+        root: global.join("hosts"),
+    };
     let (host, token) = enroll_node(&store, name).context("enroll node in host store")?;
     let cp_placeholder = cp_url.unwrap_or("wss://<cp-host>");
     println!("enrolled: {} ({})", host.name, host.id);
@@ -660,17 +660,27 @@ mod tests {
 
         // Second drain with advanced offset → nothing new.
         let more = drain_new_lines(&path, &mut offset);
-        assert!(more.is_empty(), "second drain should be empty, got: {more:?}");
+        assert!(
+            more.is_empty(),
+            "second drain should be empty, got: {more:?}"
+        );
 
         // Append 2 more lines → only those come back.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f, r#"{{"type":"ev","n":3}}"#).unwrap();
         writeln!(f, r#"{{"type":"ev","n":4}}"#).unwrap();
         f.flush().unwrap();
         drop(f);
 
         let new_lines = drain_new_lines(&path, &mut offset);
-        assert_eq!(new_lines.len(), 2, "expected 2 new lines, got: {new_lines:?}");
+        assert_eq!(
+            new_lines.len(),
+            2,
+            "expected 2 new lines, got: {new_lines:?}"
+        );
         assert!(new_lines[0].contains("\"n\":3"), "new[0]: {}", new_lines[0]);
         assert!(new_lines[1].contains("\"n\":4"), "new[1]: {}", new_lines[1]);
     }
@@ -703,7 +713,10 @@ mod tests {
         assert_eq!(offset, 0, "offset must not advance for partial line");
 
         // Append the newline → now the line is returned.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f).unwrap();
         drop(f);
 

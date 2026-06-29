@@ -1268,9 +1268,15 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
 
     let effective_prompt = args.prompt_flag.clone().or_else(|| args.prompt.clone());
     let (run_target, user_message) = match args.target.as_deref() {
-        None => (None, effective_prompt.clone().unwrap_or_else(|| "go".into())),
+        None => (
+            None,
+            effective_prompt.clone().unwrap_or_else(|| "go".into()),
+        ),
         Some(s) => match crate::run_target::parse_run_target(s) {
-            Ok(t) => (Some(t), effective_prompt.clone().unwrap_or_else(|| "go".into())),
+            Ok(t) => (
+                Some(t),
+                effective_prompt.clone().unwrap_or_else(|| "go".into()),
+            ),
             Err(_) => {
                 let combined = match effective_prompt.as_deref() {
                     Some(p) => format!("{s} {p}"),

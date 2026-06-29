@@ -276,11 +276,9 @@ fn ensure_output_format_supported(
             format,
             &[output::formats::OutputFormat::Table],
         ),
-        Cmd::Cp { .. } => output::formats::ensure_supported(
-            "cp",
-            format,
-            &[output::formats::OutputFormat::Table],
-        ),
+        Cmd::Cp { .. } => {
+            output::formats::ensure_supported("cp", format, &[output::formats::OutputFormat::Table])
+        }
         Cmd::Usage(args) => cmd::usage::ensure_output_format(args, format),
         Cmd::Watch(_) => output::formats::ensure_supported(
             "watch",

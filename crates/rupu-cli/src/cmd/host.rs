@@ -100,12 +100,9 @@ pub(crate) fn add_host(
 /// follow sorted by id (the order `HostStore::list` already returns).
 ///
 /// Returns `(id, name, transport_label)` tuples.
-pub(crate) fn list_hosts(
-    store_root: PathBuf,
-) -> anyhow::Result<Vec<(String, String, String)>> {
+pub(crate) fn list_hosts(store_root: PathBuf) -> anyhow::Result<Vec<(String, String, String)>> {
     let local = Host::local();
-    let mut rows: Vec<(String, String, String)> =
-        vec![(local.id, local.name, "local".to_string())];
+    let mut rows: Vec<(String, String, String)> = vec![(local.id, local.name, "local".to_string())];
 
     let store = HostStore { root: store_root };
     for host in store.list().context("list host records")? {
