@@ -429,7 +429,11 @@ async fn connect_and_run(
             Frame::Ping {} => {
                 send_frame(&mut sink, &Frame::Pong {}).await;
             }
-            Frame::Hello { .. }
+            // NOTE: Approve/Reject are handled for real in Slice 2.5 Task 3;
+            // this temporary pass-through keeps the workspace compiling.
+            Frame::Approve { .. }
+            | Frame::Reject { .. }
+            | Frame::Hello { .. }
             | Frame::Welcome {}
             | Frame::Pong {}
             | Frame::Artifact { .. }
