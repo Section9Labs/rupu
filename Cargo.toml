@@ -110,6 +110,12 @@ url = "2"
 # Object storage (bucket dead-drop transport for multi-host Slice 2b)
 object_store = { version = "0.14", features = ["aws", "gcp"] }
 
+# TLS crypto provider — the dependency tree enables BOTH rustls providers
+# (aws-lc-rs via object_store/reqwest, ring via octocrab/jsonwebtoken), so
+# rustls 0.23 cannot auto-select one. The CLI installs aws-lc-rs as the
+# process-level default at startup (see crates/rupu-cli/src/main.rs).
+rustls = "0.23"
+
 # Webhook receiver / control-plane (axum chosen for async-native + tower middleware)
 axum = "0.7"
 tokio-tungstenite = "0.24"

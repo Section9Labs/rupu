@@ -6475,6 +6475,7 @@ dependencies = [
  "rupu-transcript",
  "rupu-webhook",
  "rupu-workspace",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
