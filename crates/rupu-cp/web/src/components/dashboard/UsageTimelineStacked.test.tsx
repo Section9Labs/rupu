@@ -44,6 +44,25 @@ describe('toChartData', () => {
     expect(toChartData(buckets, 'cost').data[0].alpha).toBe(0);
     expect(toChartData(buckets, 'tokens').data[0].alpha).toBe(1500);
   });
+
+  it('renders an empty bucket as a continuous zero datum (gap-fill)', () => {
+    const buckets: UsageTimelineBucket[] = [
+      { bucket: '2026-06-10', rows: [brow('claude-sonnet-4-6', 0.5, 1000)] },
+      { bucket: '2026-06-11', rows: [] }, // zero-spend day (gap-filled by the backend)
+      { bucket: '2026-06-12', rows: [brow('claude-sonnet-4-6', 1.5, 3000)] },
+    ];
+
+    const { models, data } = toChartData(buckets, 'tokens');
+
+    expect(models).toEqual(['claude-sonnet-4-6']);
+    expect(data).toHaveLength(3);
+    // The empty middle bucket is present and carries an explicit 0 for the model,
+    // so the stacked area stays continuous (no gap / dropped point).
+    expect(data[1].bucket).toBe('2026-06-11');
+    expect(data[1]['claude-sonnet-4-6']).toBe(0);
+    expect(data[0]['claude-sonnet-4-6']).toBe(1000);
+    expect(data[2]['claude-sonnet-4-6']).toBe(3000);
+  });
 });
 
 describe('UsageTimelineStacked', () => {
