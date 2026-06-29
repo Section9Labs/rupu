@@ -88,6 +88,7 @@ pub fn is_builtin_provider(name: &str) -> bool {
             | "google_gemini"
             | "copilot"
             | "github_copilot"
+            | "local"
     )
 }
 
@@ -313,6 +314,7 @@ mod tests {
     fn is_builtin_recognizes_known_names() {
         assert!(is_builtin_provider("anthropic"));
         assert!(is_builtin_provider("copilot"));
+        assert!(is_builtin_provider("local"));
         assert!(!is_builtin_provider("oracle"));
     }
 }
