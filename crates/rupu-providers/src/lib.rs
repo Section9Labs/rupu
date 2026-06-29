@@ -28,6 +28,7 @@ pub mod model_registry;
 pub mod model_scorer;
 pub mod model_tier;
 pub mod openai_codex;
+pub mod openai_wire;
 pub mod provider;
 pub mod provider_id;
 pub mod registry;
