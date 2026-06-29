@@ -122,6 +122,7 @@ impl ProviderRouter {
                 request.model.starts_with("gemini")
             }
             ProviderId::GithubCopilot => true,
+            ProviderId::OpenAiCompatible => true,
         };
 
         if matches {

@@ -13,6 +13,7 @@ pub enum ProviderId {
     GoogleGeminiCli,
     GoogleAntigravity,
     GithubCopilot,
+    OpenAiCompatible,
 }
 
 impl ProviderId {
@@ -23,6 +24,7 @@ impl ProviderId {
         ProviderId::GoogleGeminiCli,
         ProviderId::GoogleAntigravity,
         ProviderId::GithubCopilot,
+        ProviderId::OpenAiCompatible,
     ];
 
     /// The key used in auth.json for this provider.
@@ -33,6 +35,7 @@ impl ProviderId {
             ProviderId::GoogleGeminiCli => "google-gemini-cli",
             ProviderId::GoogleAntigravity => "google-antigravity",
             ProviderId::GithubCopilot => "github-copilot",
+            ProviderId::OpenAiCompatible => "openai-compatible",
         }
     }
 
@@ -44,6 +47,7 @@ impl ProviderId {
             ProviderId::GoogleGeminiCli => "GOOGLE_GEMINI_API_KEY",
             ProviderId::GoogleAntigravity => "GOOGLE_ANTIGRAVITY_API_KEY",
             ProviderId::GithubCopilot => "GITHUB_TOKEN",
+            ProviderId::OpenAiCompatible => "OPENAI_COMPATIBLE_API_KEY",
         }
     }
 }
@@ -64,6 +68,7 @@ impl FromStr for ProviderId {
             "google-gemini-cli" | "gemini-cli" | "gemini" => Ok(ProviderId::GoogleGeminiCli),
             "google-antigravity" | "antigravity" => Ok(ProviderId::GoogleAntigravity),
             "github-copilot" | "copilot" => Ok(ProviderId::GithubCopilot),
+            "openai-compatible" => Ok(ProviderId::OpenAiCompatible),
             _ => Err(format!("unknown provider: {s}")),
         }
     }
