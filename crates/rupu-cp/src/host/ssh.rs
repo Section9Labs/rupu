@@ -223,6 +223,22 @@ impl RemoteExec for SshExec {
     }
 }
 
+// ── Tail pump helpers ─────────────────────────────────────────────────────────
+
+/// How often the tail pump polls the remote `run.json` for a terminal status.
+///
+/// The first tick of [`tokio::time::interval`] fires immediately, so the pump
+/// can resolve near-instantly when the run is already terminal (e.g. in tests
+/// or when the pump attaches after a fast run).
+const PUMP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Returns `true` when `status` is a terminal [`rupu_orchestrator::RunStatus`]
+/// serialized value.  Mirrors [`RunStatus::is_terminal`] using the
+/// `#[serde(rename_all = "snake_case")]` wire form.
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "rejected" | "cancelled")
+}
+
 // ── SshHostConnector ──────────────────────────────────────────────────────────
 
 /// [`HostConnector`] backed by SSH transport.
@@ -320,9 +336,25 @@ impl SshHostConnector {
     /// [`parse_tail_marker`] extracts the path, which determines which
     /// [`ArtifactFile`] variant subsequent lines belong to.
     ///
-    /// When the tail stream ends (the remote run finished and `tail -F`
-    /// received EOF on all watched files), the task reads the remote
-    /// `run.json` to call [`NodeMirror::finish`] with the terminal status.
+    /// # Termination
+    ///
+    /// `tail -F` **never exits on its own** — when the remote run finishes, the
+    /// artifact files stop growing but `tail` keeps watching.  The pump therefore
+    /// uses `tokio::select!` over two arms:
+    ///
+    /// 1. **Line arm** — routes artifact lines as before; on stream-end/error
+    ///    (e.g. SSH connection dropped) breaks and falls through to a best-effort
+    ///    cat.
+    /// 2. **Interval arm** — fires every [`PUMP_POLL_INTERVAL`] (first tick is
+    ///    immediate).  Reads the remote `run.json` and calls
+    ///    [`NodeMirror::finish`] when a terminal status is detected.  Dropping
+    ///    `stream` at that point triggers `kill_on_drop` on the `ssh` child,
+    ///    killing the remote `tail` process and freeing all resources.
+    ///
+    /// If the stream ends before a terminal status is observed (SSH drop, etc.),
+    /// a final `cat run.json` is attempted.  If the status is still non-terminal
+    /// (or unreadable), the run is finished as `"failed"` so it is never stuck
+    /// in `Running` indefinitely.
     fn spawn_tail_pump(&self, run_id: String) {
         let exec = Arc::clone(&self.exec);
         let mirror = Arc::clone(&self.mirror);
@@ -344,51 +376,125 @@ impl SshHostConnector {
 
         tokio::spawn(async move {
             let mut current: Option<ArtifactFile> = None;
+            // Set to true when the interval-poll arm observes a terminal status
+            // and calls mirror.finish.  Used below to skip the fallback cat.
+            let mut terminal_seen = false;
 
             if let Ok(mut stream) = exec.spawn_lines(&tail_cmd) {
-                while let Some(Ok(line)) = stream.next().await {
-                    if let Some(path) = parse_tail_marker(&line) {
-                        // Route subsequent lines based on filename suffix — the
-                        // expanded absolute path from `tail` still ends with the
-                        // same basename, so suffix matching is correct.
-                        current = if path.ends_with("events.jsonl") {
-                            Some(ArtifactFile::Events)
-                        } else if path.ends_with("step_results.jsonl") {
-                            Some(ArtifactFile::StepResults)
-                        } else if path.ends_with("unit_checkpoints.jsonl") {
-                            Some(ArtifactFile::UnitCheckpoints)
-                        } else {
-                            None
-                        };
-                        continue;
-                    }
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    if let Some(file) = &current {
-                        let _ = mirror.append(&run_id, &host_id, file.clone(), &line);
-                    }
-                }
-            }
-
-            // Tail ended; best-effort: read the remote run.json to sync the
-            // terminal status into the local mirror.
-            if let Ok(out) = exec.run(&cat_cmd).await {
-                if out.success && !out.stdout.trim().is_empty() {
-                    let _ = mirror.append(
-                        &run_id,
-                        &host_id,
-                        ArtifactFile::RunJson,
-                        out.stdout.trim(),
-                    );
-                    if let Ok(rec) =
-                        serde_json::from_str::<serde_json::Value>(out.stdout.trim())
-                    {
-                        if let Some(s) = rec.get("status").and_then(|v| v.as_str()) {
-                            let _ = mirror.finish(&run_id, &host_id, s);
+                let mut interval = tokio::time::interval(PUMP_POLL_INTERVAL);
+                // First tick fires immediately per tokio docs; subsequent ticks
+                // fire every PUMP_POLL_INTERVAL.
+                loop {
+                    tokio::select! {
+                        maybe_line = stream.next() => {
+                            match maybe_line {
+                                Some(Ok(line)) => {
+                                    if let Some(path) = parse_tail_marker(&line) {
+                                        // Route subsequent lines based on filename
+                                        // suffix — the expanded absolute path from
+                                        // `tail` still ends with the same basename.
+                                        current = if path.ends_with("events.jsonl") {
+                                            Some(ArtifactFile::Events)
+                                        } else if path.ends_with("step_results.jsonl") {
+                                            Some(ArtifactFile::StepResults)
+                                        } else if path.ends_with("unit_checkpoints.jsonl") {
+                                            Some(ArtifactFile::UnitCheckpoints)
+                                        } else {
+                                            None
+                                        };
+                                        continue;
+                                    }
+                                    if line.trim().is_empty() {
+                                        continue;
+                                    }
+                                    if let Some(file) = &current {
+                                        let _ = mirror.append(
+                                            &run_id, &host_id, file.clone(), &line,
+                                        );
+                                    }
+                                }
+                                // Stream ended or errored (SSH connection dropped,
+                                // remote process exited, etc.).  Break out and do
+                                // a best-effort final cat below.
+                                _ => break,
+                            }
+                        }
+                        _ = interval.tick() => {
+                            if let Ok(out) = exec.run(&cat_cmd).await {
+                                if out.success && !out.stdout.trim().is_empty() {
+                                    let trimmed = out.stdout.trim().to_string();
+                                    if let Ok(rec) =
+                                        serde_json::from_str::<serde_json::Value>(&trimmed)
+                                    {
+                                        if let Some(status) =
+                                            rec.get("status").and_then(|v| v.as_str())
+                                        {
+                                            if is_terminal_status(status) {
+                                                let status = status.to_string();
+                                                let _ = mirror.append(
+                                                    &run_id,
+                                                    &host_id,
+                                                    ArtifactFile::RunJson,
+                                                    &trimmed,
+                                                );
+                                                let _ = mirror.finish(
+                                                    &run_id, &host_id, &status,
+                                                );
+                                                terminal_seen = true;
+                                                break;
+                                                // Dropping `stream` here kills the
+                                                // ssh child via kill_on_drop.
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+                // `stream` drops here → SshLineStream::_child drops →
+                // kill_on_drop kills the remote `tail` process.
+            }
+
+            // If the stream ended before we detected a terminal status (SSH
+            // drop, spawn failure, etc.), do a best-effort final cat + finish
+            // so the run is never stuck in Running.
+            if !terminal_seen {
+                if let Ok(out) = exec.run(&cat_cmd).await {
+                    if out.success && !out.stdout.trim().is_empty() {
+                        let trimmed = out.stdout.trim().to_string();
+                        let _ = mirror.append(
+                            &run_id,
+                            &host_id,
+                            ArtifactFile::RunJson,
+                            &trimmed,
+                        );
+                        // Use the observed status only if it is terminal; a
+                        // non-terminal status (e.g. "running") would be wrong to
+                        // persist as final since the executor may still be alive.
+                        // Finish as "failed" in that case — it is better to surface
+                        // a definite failure than to leave the run in Running forever.
+                        let finish_status = if let Ok(rec) =
+                            serde_json::from_str::<serde_json::Value>(&trimmed)
+                        {
+                            if let Some(s) = rec.get("status").and_then(|v| v.as_str()) {
+                                if is_terminal_status(s) {
+                                    s.to_string()
+                                } else {
+                                    "failed".to_string()
+                                }
+                            } else {
+                                "failed".to_string()
+                            }
+                        } else {
+                            "failed".to_string()
+                        };
+                        let _ = mirror.finish(&run_id, &host_id, &finish_status);
+                        return;
+                    }
+                }
+                // cat failed entirely — mark failed so the run is not stuck.
+                let _ = mirror.finish(&run_id, &host_id, "failed");
             }
         });
     }
@@ -729,7 +835,12 @@ mod tests {
             self.commands.lock().unwrap().push(remote.to_string());
             let lines: Vec<std::io::Result<String>> =
                 self.tail_lines.iter().cloned().map(Ok).collect();
-            Ok(Box::pin(futures_util::stream::iter(lines)))
+            // Chain a forever-pending tail to simulate real `tail -F`, which
+            // never exits on its own.  The pump must terminate via the
+            // cat-poll interval, not stream-end.
+            let stream = futures_util::stream::iter(lines)
+                .chain(futures_util::stream::pending::<std::io::Result<String>>());
+            Ok(Box::pin(stream))
         }
     }
 
@@ -861,12 +972,15 @@ mod tests {
 
     /// Verifies the tail pump:
     ///  1. Routes lines after a `==> …/events.jsonl <==` marker to events.jsonl.
-    ///  2. Calls `mirror.finish` with the status from the canned `cat run.json`.
+    ///  2. Terminates via the cat-poll interval (NOT stream-end): the stream
+    ///     pends forever after the finite lines, just like real `tail -F`.
+    ///  3. Calls `mirror.finish` with the terminal status from `cat run.json`.
     ///
-    /// Non-flaky because `FakeExec::spawn_lines` returns a finite in-memory
-    /// stream (no real I/O), so the pump task completes near-instantly. The
-    /// bounded poll (50 ms intervals, 2 s ceiling) absorbs tokio scheduling
-    /// jitter without ever blocking long in CI.
+    /// `FakeExec::spawn_lines` returns `iter(lines).chain(pending())` — the
+    /// stream never ends on its own.  The pump must detect termination through
+    /// the `tokio::time::interval` arm that polls `cat run.json`.  The first
+    /// interval tick fires immediately, so the pump completes near-instantly.
+    /// The bounded poll (50 ms checks, 2 s ceiling) absorbs scheduler jitter.
     #[tokio::test]
     async fn tail_pump_routes_events_and_finishes_run() {
         let event_json = r#"{"type":"step_started","step":"s1"}"#;
