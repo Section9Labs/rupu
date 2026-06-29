@@ -3,8 +3,8 @@
 
 import { useEffect, useId, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, Workflow as WorkflowIcon } from 'lucide-react';
-import { api, type WorkflowSummary } from '../lib/api';
+import { Plus, Sparkles, Workflow as WorkflowIcon } from 'lucide-react';
+import { api, type ProviderModels, type WorkflowSummary } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import LauncherSheet from '../components/LauncherSheet';
@@ -134,6 +134,12 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [mode, setMode] = useState<'describe' | 'edit'>('describe');
+  const [description, setDescription] = useState('');
+  const [models, setModels] = useState<ProviderModels[]>([]);
+  const [genProvider, setGenProvider] = useState<string>('');
+  const [generating, setGenerating] = useState(false);
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') onClose();
@@ -141,6 +147,38 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
     document.addEventListener('keydown', onKey);
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
+
+  useEffect(() => {
+    api
+      .generateModels()
+      .then((m) => {
+        setModels(m);
+        const def = m.find((x) => x.is_default) ?? m[0];
+        if (def) setGenProvider(def.provider);
+        if (m.length === 0) setMode('edit');
+      })
+      .catch(() => setMode('edit'));
+  }, []);
+
+  async function generate() {
+    if (generating || !description.trim()) return;
+    setGenerating(true);
+    setError(null);
+    try {
+      const sel = models.find((m) => m.provider === genProvider);
+      const out = await api.generateWorkflow({
+        description,
+        provider: genProvider || undefined,
+        model: sel?.models[0],
+      });
+      setRaw(out.raw);
+      setMode('edit');
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to generate workflow');
+    } finally {
+      setGenerating(false);
+    }
+  }
 
   async function create() {
     if (creating) return;
@@ -179,17 +217,79 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
             New workflow
           </h2>
           <p className="mt-1 text-ui text-ink-dim">
-            Edit the definition below. It is validated server-side before it is saved.
+            Describe what you want, or edit the raw definition directly.
           </p>
         </div>
 
         <div className="space-y-3 px-5 py-4">
-          <CodeEditor
-            value={raw}
-            onChange={setRaw}
-            language="yaml"
-            ariaLabel="New workflow definition"
-          />
+          <div className="flex gap-1 rounded-lg border border-border p-1 text-ui">
+            <button
+              type="button"
+              onClick={() => setMode('describe')}
+              disabled={models.length === 0}
+              className={cn(
+                'flex-1 rounded-md px-3 py-1.5',
+                mode === 'describe' ? 'bg-panel-2 text-ink' : 'text-ink-dim',
+              )}
+            >
+              Describe
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('edit')}
+              className={cn(
+                'flex-1 rounded-md px-3 py-1.5',
+                mode === 'edit' ? 'bg-panel-2 text-ink' : 'text-ink-dim',
+              )}
+            >
+              Edit raw
+            </button>
+          </div>
+
+          {mode === 'describe' ? (
+            <>
+              <label htmlFor="workflow-desc" className="block text-ui text-ink-dim">
+                Describe the workflow you want
+              </label>
+              <textarea
+                id="workflow-desc"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                rows={5}
+                className="w-full rounded-lg border border-border bg-panel-2 p-2 text-ui text-ink"
+                placeholder="e.g. review changed files, then fix anything high severity"
+              />
+              <div className="flex items-center gap-2">
+                <select
+                  value={genProvider}
+                  onChange={(e) => setGenProvider(e.target.value)}
+                  className="rounded-lg border border-border bg-panel-2 px-2 py-1.5 text-ui text-ink"
+                  aria-label="Generation provider"
+                >
+                  {models.map((m) => (
+                    <option key={m.provider} value={m.provider}>
+                      {m.provider} · {m.models[0]}
+                    </option>
+                  ))}
+                </select>
+                <Button
+                  onClick={() => void generate()}
+                  disabled={generating || !description.trim()}
+                >
+                  <Sparkles size={14} />
+                  {generating ? 'Generating…' : 'Generate'}
+                </Button>
+              </div>
+            </>
+          ) : (
+            <CodeEditor
+              value={raw}
+              onChange={setRaw}
+              language="yaml"
+              ariaLabel="New workflow definition"
+            />
+          )}
+
           {error && (
             <p role="alert" className="text-ui font-medium text-err">
               {error}

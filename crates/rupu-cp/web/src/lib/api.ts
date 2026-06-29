@@ -874,6 +874,29 @@ export interface RunDiff {
 }
 
 // ---------------------------------------------------------------------------
+// AI generation
+// ---------------------------------------------------------------------------
+
+export interface GeneratedDef {
+  raw: string;
+  provider: string;
+  model: string;
+  attempts: number;
+}
+
+export interface GenerateBody {
+  description: string;
+  provider?: string;
+  model?: string;
+}
+
+export interface ProviderModels {
+  provider: string;
+  models: string[];
+  is_default: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Filesystem browse
 // ---------------------------------------------------------------------------
 
@@ -1185,6 +1208,24 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ raw }),
     });
+  },
+  /** Draft an agent definition from a description. 501 when `rupu cp serve` is not running. */
+  generateAgent(body: GenerateBody): Promise<GeneratedDef> {
+    return request<GeneratedDef>('/api/agents/generate', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+  /** Draft a workflow definition from a description. 501 when `rupu cp serve` is not running. */
+  generateWorkflow(body: GenerateBody): Promise<GeneratedDef> {
+    return request<GeneratedDef>('/api/workflows/generate', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+  /** Providers/models available for AI generation (empty when unavailable). */
+  generateModels(): Promise<ProviderModels[]> {
+    return request<ProviderModels[]>('/api/generate/models');
   },
   /** Delete a workflow definition. 404 if absent. */
   async deleteWorkflow(name: string): Promise<void> {
