@@ -1571,3 +1571,536 @@ async fn tunnel_e2e_dispatch_mirror_observe_cancel() {
         panic!("expected Frame::Cancel, got {cancel_frame:?}");
     }
 }
+
+/// End-to-end: approve a tunnel run through the real central HTTP endpoint.
+///
+/// Flow:
+///   1. Spin CP, enroll node, fake WS Hello → Welcome (reuse harness).
+///   2. Dispatch agent run → fake node reads Frame::Run, captures run_id.
+///   3. Fake node streams run.json Artifact with status "awaiting_approval".
+///   4. Poll GET /api/runs/{id}?host={node_id} until mirror shows awaiting_approval.
+///   5. POST /api/runs/{id}/approve?host={node_id}  body {"mode":"bypass"}.
+///   6. Assert fake node receives Frame::Approve { run_id, mode: "bypass" }.
+///   7. Fake node streams run.json "completed" + Frame::RunFinished "completed".
+///   8. Poll mirror until GET /api/runs/{id}?host={node_id} shows "completed".
+#[tokio::test]
+async fn e2e_approve_over_tunnel() {
+    use rupu_cp::node::{ArtifactFile, Auth, Frame, RunSpecKind};
+    use rupu_workspace::HostTransport;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio_tungstenite::connect_async;
+
+    let dir = tempdir().unwrap();
+
+    // ── 1. Build AppState & spin server ──────────────────────────────────────
+    let state = rupu_cp::state::AppState::new(
+        dir.path().into(),
+        rupu_config::PricingConfig::default(),
+    );
+    let run_store = Arc::clone(&state.run_store);
+    let node_registry = Arc::clone(&state.node_registry);
+
+    let (host, token) = state
+        .hosts
+        .enroll_node("e2e-approve-node")
+        .expect("enroll_node should succeed");
+    let node_id = match &host.transport {
+        HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport after enroll_node"),
+    };
+
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // ── 2. Fake WS: Hello → Welcome ──────────────────────────────────────────
+    let ws_url = format!("ws://{addr}/api/node/connect");
+    let (mut ws, _) = connect_async(&ws_url).await.expect("WS connect failed");
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: node_id.clone(),
+            auth: Auth::Token { token },
+            rupu_version: "e2e-approve-test".to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await;
+    let welcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Welcome")
+    .expect("WS closed before Welcome");
+    assert!(
+        matches!(welcome, Frame::Welcome {}),
+        "expected Welcome, got {welcome:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(node_registry.is_online(&node_id), "node should be online after Welcome");
+
+    // ── 3. Dispatch agent run ─────────────────────────────────────────────────
+    let dispatch_resp = client
+        .post(format!("http://{addr}/api/agents/gate-agent/run"))
+        .json(&serde_json::json!({
+            "host": node_id,
+            "prompt": "approve e2e test"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatch_resp.status(),
+        reqwest::StatusCode::OK,
+        "dispatch should return 200"
+    );
+    let dispatch_body: serde_json::Value = dispatch_resp.json().await.unwrap();
+    let run_id = dispatch_body["run_id"]
+        .as_str()
+        .expect("dispatch response must include run_id")
+        .to_string();
+
+    // Fake node reads Frame::Run.
+    let run_frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Run frame")
+    .expect("WS closed before Run frame");
+    let frame_run_id = match &run_frame {
+        Frame::Run { run_id: fid, spec } => {
+            assert_eq!(fid, &run_id, "frame run_id must match CP-allocated run_id");
+            assert_eq!(spec.kind, RunSpecKind::Agent, "spec kind must be Agent");
+            fid.clone()
+        }
+        other => panic!("expected Frame::Run, got {other:?}"),
+    };
+
+    // ── 4. Fake node streams awaiting_approval run.json ───────────────────────
+    let awaiting_json = serde_json::json!({
+        "id": frame_run_id,
+        "workflow_name": "gate-agent",
+        "status": "awaiting_approval",
+        "inputs": {},
+        "workspace_id": "",
+        "workspace_path": "/node/path",
+        "transcript_dir": "/node/path/transcripts",
+        "started_at": "2026-01-01T00:00:00Z",
+        "awaiting_step_id": "gate-step",
+        "approval_prompt": "approve this action?"
+    });
+    send_frame(
+        &mut ws,
+        &Frame::Artifact {
+            run_id: frame_run_id.clone(),
+            file: ArtifactFile::RunJson,
+            line: serde_json::to_string(&awaiting_json).unwrap(),
+        },
+    )
+    .await;
+
+    // ── 5. Poll mirror until awaiting_approval ────────────────────────────────
+    let run_id_poll = frame_run_id.clone();
+    let node_id_poll = node_id.clone();
+    let client_poll = client.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        async move {
+            loop {
+                let resp = client_poll
+                    .get(format!(
+                        "http://{addr}/api/runs/{run_id_poll}?host={node_id_poll}"
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                if resp.status() == reqwest::StatusCode::OK {
+                    let body: serde_json::Value = resp.json().await.unwrap();
+                    if body["run"]["status"].as_str() == Some("awaiting_approval") {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        },
+    )
+    .await
+    .expect("mirror should show awaiting_approval within 3 s");
+
+    // ── 6. POST /api/runs/{id}/approve?host={node_id}  body {"mode":"bypass"} ─
+    let approve_resp = client
+        .post(format!(
+            "http://{addr}/api/runs/{run_id}/approve?host={node_id}"
+        ))
+        .json(&serde_json::json!({ "mode": "bypass" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        approve_resp.status(),
+        reqwest::StatusCode::OK,
+        "approve should return 200"
+    );
+    let approve_body: serde_json::Value = approve_resp.json().await.unwrap();
+    assert_eq!(
+        approve_body["ok"].as_bool(),
+        Some(true),
+        "approve response must include ok:true"
+    );
+    assert_eq!(
+        approve_body["host_id"].as_str(),
+        Some(node_id.as_str()),
+        "approve response must echo node_id as host_id"
+    );
+
+    // ── 7. Assert fake node receives Frame::Approve ───────────────────────────
+    let approve_frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Approve frame")
+    .expect("WS closed before Approve frame");
+    match approve_frame {
+        Frame::Approve { run_id: fid, mode } => {
+            assert_eq!(fid, run_id, "Approve frame run_id must match");
+            assert_eq!(mode, "bypass", "Approve frame mode must be 'bypass'");
+        }
+        other => panic!("expected Frame::Approve, got {other:?}"),
+    }
+
+    // ── 8. Fake node streams completed run.json + RunFinished ─────────────────
+    let completed_json = serde_json::json!({
+        "id": run_id,
+        "workflow_name": "gate-agent",
+        "status": "completed",
+        "inputs": {},
+        "workspace_id": "",
+        "workspace_path": "/node/path",
+        "transcript_dir": "/node/path/transcripts",
+        "started_at": "2026-01-01T00:00:00Z"
+    });
+    send_frame(
+        &mut ws,
+        &Frame::Artifact {
+            run_id: run_id.clone(),
+            file: ArtifactFile::RunJson,
+            line: serde_json::to_string(&completed_json).unwrap(),
+        },
+    )
+    .await;
+    send_frame(
+        &mut ws,
+        &Frame::RunFinished {
+            run_id: run_id.clone(),
+            status: "completed".to_string(),
+        },
+    )
+    .await;
+
+    // ── 9. Poll mirror until completed ────────────────────────────────────────
+    let run_id_fin = run_id.clone();
+    let node_id_fin = node_id.clone();
+    let client_fin = client.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        async move {
+            loop {
+                let resp = client_fin
+                    .get(format!(
+                        "http://{addr}/api/runs/{run_id_fin}?host={node_id_fin}"
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                if resp.status() == reqwest::StatusCode::OK {
+                    let body: serde_json::Value = resp.json().await.unwrap();
+                    if body["run"]["status"].as_str() == Some("completed") {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        },
+    )
+    .await
+    .expect("mirror should show completed within 3 s");
+
+    // Verify directly from RunStore.
+    let record = run_store
+        .load(&run_id)
+        .expect("run must be loadable from central store");
+    assert_eq!(
+        record.worker_id.as_deref(),
+        Some(node_id.as_str()),
+        "worker_id must carry node_id attribution"
+    );
+}
+
+/// End-to-end: reject a tunnel run through the real central HTTP endpoint.
+///
+/// Flow:
+///   1. Spin CP, enroll node, fake WS Hello → Welcome (reuse harness).
+///   2. Dispatch agent run → fake node reads Frame::Run, captures run_id.
+///   3. Fake node streams run.json Artifact with status "awaiting_approval".
+///   4. Poll GET /api/runs/{id}?host={node_id} until mirror shows awaiting_approval.
+///   5. POST /api/runs/{id}/reject?host={node_id}  body {"reason":"nope"}.
+///   6. Assert fake node receives Frame::Reject { run_id, reason: Some("nope") }.
+///   7. Fake node streams Frame::RunFinished "rejected".
+///   8. Poll mirror until GET /api/runs/{id}?host={node_id} shows "rejected".
+#[tokio::test]
+async fn e2e_reject_over_tunnel() {
+    use rupu_cp::node::{ArtifactFile, Auth, Frame, RunSpecKind};
+    use rupu_workspace::HostTransport;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio_tungstenite::connect_async;
+
+    let dir = tempdir().unwrap();
+
+    // ── 1. Build AppState & spin server ──────────────────────────────────────
+    let state = rupu_cp::state::AppState::new(
+        dir.path().into(),
+        rupu_config::PricingConfig::default(),
+    );
+    let run_store = Arc::clone(&state.run_store);
+    let node_registry = Arc::clone(&state.node_registry);
+
+    let (host, token) = state
+        .hosts
+        .enroll_node("e2e-reject-node")
+        .expect("enroll_node should succeed");
+    let node_id = match &host.transport {
+        HostTransport::Tunnel { node_id } => node_id.clone(),
+        _ => panic!("expected Tunnel transport after enroll_node"),
+    };
+
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // ── 2. Fake WS: Hello → Welcome ──────────────────────────────────────────
+    let ws_url = format!("ws://{addr}/api/node/connect");
+    let (mut ws, _) = connect_async(&ws_url).await.expect("WS connect failed");
+    send_frame(
+        &mut ws,
+        &Frame::Hello {
+            node_id: node_id.clone(),
+            auth: Auth::Token { token },
+            rupu_version: "e2e-reject-test".to_string(),
+            capabilities: vec![],
+        },
+    )
+    .await;
+    let welcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Welcome")
+    .expect("WS closed before Welcome");
+    assert!(
+        matches!(welcome, Frame::Welcome {}),
+        "expected Welcome, got {welcome:?}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(node_registry.is_online(&node_id), "node should be online after Welcome");
+
+    // ── 3. Dispatch agent run ─────────────────────────────────────────────────
+    let dispatch_resp = client
+        .post(format!("http://{addr}/api/agents/gate-agent/run"))
+        .json(&serde_json::json!({
+            "host": node_id,
+            "prompt": "reject e2e test"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatch_resp.status(),
+        reqwest::StatusCode::OK,
+        "dispatch should return 200"
+    );
+    let dispatch_body: serde_json::Value = dispatch_resp.json().await.unwrap();
+    let run_id = dispatch_body["run_id"]
+        .as_str()
+        .expect("dispatch response must include run_id")
+        .to_string();
+
+    // Fake node reads Frame::Run.
+    let run_frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Run frame")
+    .expect("WS closed before Run frame");
+    let frame_run_id = match &run_frame {
+        Frame::Run { run_id: fid, spec } => {
+            assert_eq!(fid, &run_id, "frame run_id must match CP-allocated run_id");
+            assert_eq!(spec.kind, RunSpecKind::Agent, "spec kind must be Agent");
+            fid.clone()
+        }
+        other => panic!("expected Frame::Run, got {other:?}"),
+    };
+
+    // ── 4. Fake node streams awaiting_approval run.json ───────────────────────
+    let awaiting_json = serde_json::json!({
+        "id": frame_run_id,
+        "workflow_name": "gate-agent",
+        "status": "awaiting_approval",
+        "inputs": {},
+        "workspace_id": "",
+        "workspace_path": "/node/path",
+        "transcript_dir": "/node/path/transcripts",
+        "started_at": "2026-01-01T00:00:00Z",
+        "awaiting_step_id": "gate-step",
+        "approval_prompt": "approve or reject this action?"
+    });
+    send_frame(
+        &mut ws,
+        &Frame::Artifact {
+            run_id: frame_run_id.clone(),
+            file: ArtifactFile::RunJson,
+            line: serde_json::to_string(&awaiting_json).unwrap(),
+        },
+    )
+    .await;
+
+    // ── 5. Poll mirror until awaiting_approval ────────────────────────────────
+    let run_id_poll = frame_run_id.clone();
+    let node_id_poll = node_id.clone();
+    let client_poll = client.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        async move {
+            loop {
+                let resp = client_poll
+                    .get(format!(
+                        "http://{addr}/api/runs/{run_id_poll}?host={node_id_poll}"
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                if resp.status() == reqwest::StatusCode::OK {
+                    let body: serde_json::Value = resp.json().await.unwrap();
+                    if body["run"]["status"].as_str() == Some("awaiting_approval") {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        },
+    )
+    .await
+    .expect("mirror should show awaiting_approval within 3 s");
+
+    // ── 6. POST /api/runs/{id}/reject?host={node_id}  body {"reason":"nope"} ──
+    let reject_resp = client
+        .post(format!(
+            "http://{addr}/api/runs/{run_id}/reject?host={node_id}"
+        ))
+        .json(&serde_json::json!({ "reason": "nope" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        reject_resp.status(),
+        reqwest::StatusCode::OK,
+        "reject should return 200"
+    );
+    let reject_body: serde_json::Value = reject_resp.json().await.unwrap();
+    assert_eq!(
+        reject_body["ok"].as_bool(),
+        Some(true),
+        "reject response must include ok:true"
+    );
+    assert_eq!(
+        reject_body["host_id"].as_str(),
+        Some(node_id.as_str()),
+        "reject response must echo node_id as host_id"
+    );
+
+    // ── 7. Assert fake node receives Frame::Reject ────────────────────────────
+    let reject_frame = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        recv_frame(&mut ws),
+    )
+    .await
+    .expect("timed out waiting for Reject frame")
+    .expect("WS closed before Reject frame");
+    match reject_frame {
+        Frame::Reject { run_id: fid, reason } => {
+            assert_eq!(fid, run_id, "Reject frame run_id must match");
+            assert_eq!(
+                reason.as_deref(),
+                Some("nope"),
+                "Reject frame reason must be 'nope'"
+            );
+        }
+        other => panic!("expected Frame::Reject, got {other:?}"),
+    }
+
+    // ── 8. Fake node streams RunFinished "rejected" ───────────────────────────
+    send_frame(
+        &mut ws,
+        &Frame::RunFinished {
+            run_id: run_id.clone(),
+            status: "rejected".to_string(),
+        },
+    )
+    .await;
+
+    // ── 9. Poll mirror until rejected ─────────────────────────────────────────
+    let run_id_fin = run_id.clone();
+    let node_id_fin = node_id.clone();
+    let client_fin = client.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        async move {
+            loop {
+                let resp = client_fin
+                    .get(format!(
+                        "http://{addr}/api/runs/{run_id_fin}?host={node_id_fin}"
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                if resp.status() == reqwest::StatusCode::OK {
+                    let body: serde_json::Value = resp.json().await.unwrap();
+                    if body["run"]["status"].as_str() == Some("rejected") {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        },
+    )
+    .await
+    .expect("mirror should show rejected within 3 s");
+
+    // Verify directly from RunStore.
+    let record = run_store
+        .load(&run_id)
+        .expect("run must be loadable from central store");
+    assert_eq!(
+        record.worker_id.as_deref(),
+        Some(node_id.as_str()),
+        "worker_id must carry node_id attribution"
+    );
+}
