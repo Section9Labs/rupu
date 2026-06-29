@@ -4,6 +4,7 @@
 
 pub mod agent_launcher;
 pub mod api;
+pub mod definition_generator;
 pub mod embed;
 pub mod error;
 pub mod host;
@@ -49,6 +50,9 @@ pub struct ServeOpts {
     /// Optional session-starter adapter. rupu-cli's `cp serve` provides the
     /// subprocess-spawning impl; `None` disables session starting from the web UI.
     pub session_starter: Option<std::sync::Arc<dyn crate::session_starter::SessionStarter>>,
+    /// Optional definition-generator adapter. rupu-cli's `cp serve` provides the
+    /// orchestrator-backed impl; `None` → the generate endpoints return 501.
+    pub generator: Option<std::sync::Arc<dyn crate::definition_generator::DefinitionGenerator>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -109,7 +113,8 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .with_session_sender(opts.session_sender.clone())
         .with_repos(opts.repos)
         .with_agent_launcher(opts.agent_launcher.clone())
-        .with_session_starter(opts.session_starter.clone());
+        .with_session_starter(opts.session_starter.clone())
+        .with_generator(opts.generator);
 
     // Replace the default read-only registry with a fully-wired one that
     // holds the real launcher / sender / starter adapters.
@@ -122,7 +127,9 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         app_state.global_dir.clone(),
     )
     .with_pricing(pricing);
-    let store = rupu_workspace::HostStore { root: app_state.global_dir.join("hosts") };
+    let store = rupu_workspace::HostStore {
+        root: app_state.global_dir.join("hosts"),
+    };
     let registry = crate::host::registry::HostRegistry::new(store, std::sync::Arc::new(local));
     let app_state = app_state.with_hosts(std::sync::Arc::new(registry));
 
@@ -184,7 +191,8 @@ mod tests {
         )
         .unwrap();
         let pricing = load_pricing(&dir);
-        let p = rupu_config::pricing::lookup(&pricing, "anthropic", "claude-sonnet-4-6", "any").unwrap();
+        let p = rupu_config::pricing::lookup(&pricing, "anthropic", "claude-sonnet-4-6", "any")
+            .unwrap();
         assert_eq!(p.input_per_mtok, 99.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -196,7 +204,8 @@ mod tests {
         std::fs::write(dir.join("config.toml"), "this is not = valid = toml = [[[").unwrap();
         let pricing = load_pricing(&dir);
         assert!(pricing.models.is_empty());
-        let p = rupu_config::pricing::lookup(&pricing, "anthropic", "claude-sonnet-4-6", "any").unwrap();
+        let p = rupu_config::pricing::lookup(&pricing, "anthropic", "claude-sonnet-4-6", "any")
+            .unwrap();
         assert_eq!(p.input_per_mtok, 3.0); // builtin
         let _ = std::fs::remove_dir_all(&dir);
     }
