@@ -202,47 +202,52 @@ impl KeychainResolver {
         Ok(())
     }
 
-    pub async fn store(&self, p: ProviderId, mode: AuthMode, sc: &StoredCredential) -> Result<()> {
-        let key = key_for(p, mode);
-        let json = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+    fn write_account(&self, account: &str, payload: &str) -> Result<()> {
         match &self.storage {
             Storage::Keyring { service } => {
                 #[cfg(target_os = "macos")]
                 {
-                    rupu_keychain_acl::set_generic_password(service, &key.account, json.as_bytes())
+                    rupu_keychain_acl::set_generic_password(service, account, payload.as_bytes())
                         .map_err(|e| anyhow::anyhow!("keychain set: {e}"))?;
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
+                    let key = KeychainKey {
+                        service: service.clone(),
+                        account: account.to_string(),
+                    };
                     let entry = self.entry(&key)?;
                     entry
-                        .set_password(&json)
+                        .set_password(payload)
                         .map_err(|e| anyhow::anyhow!("keychain set: {e}"))?;
-                    crate::keyring::try_add_self_to_acl(&key.account);
+                    crate::keyring::try_add_self_to_acl(account);
                 }
             }
             Storage::JsonFile { path } => {
                 let mut map = Self::read_file_map(path)?;
-                map.insert(key.account.clone(), json);
+                map.insert(account.to_string(), payload.to_string());
                 Self::write_file_map(path, &map)?;
             }
         }
         Ok(())
     }
 
-    pub async fn forget(&self, p: ProviderId, mode: AuthMode) -> Result<()> {
-        let key = key_for(p, mode);
+    fn delete_account(&self, account: &str) -> Result<()> {
         match &self.storage {
             Storage::Keyring { service } => {
                 #[cfg(target_os = "macos")]
                 {
-                    match rupu_keychain_acl::delete_generic_password(service, &key.account) {
+                    match rupu_keychain_acl::delete_generic_password(service, account) {
                         Ok(()) | Err(rupu_keychain_acl::AclError::NotFound { .. }) => Ok(()),
                         Err(e) => Err(anyhow::anyhow!("keychain delete: {e}")),
                     }
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
+                    let key = KeychainKey {
+                        service: service.clone(),
+                        account: account.to_string(),
+                    };
                     let entry = self.entry(&key)?;
                     match entry.delete_credential() {
                         Ok(()) => Ok(()),
@@ -253,7 +258,7 @@ impl KeychainResolver {
             }
             Storage::JsonFile { path } => {
                 let mut map = Self::read_file_map(path)?;
-                if map.remove(&key.account).is_some() {
+                if map.remove(account).is_some() {
                     Self::write_file_map(path, &map)?;
                 }
                 Ok(())
@@ -261,13 +266,33 @@ impl KeychainResolver {
         }
     }
 
-    fn read(&self, p: ProviderId, mode: AuthMode) -> Result<Option<StoredCredential>> {
+    pub async fn store(&self, p: ProviderId, mode: AuthMode, sc: &StoredCredential) -> Result<()> {
         let key = key_for(p, mode);
+        let payload = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+        self.write_account(&key.account, &payload)
+    }
+
+    pub async fn forget(&self, p: ProviderId, mode: AuthMode) -> Result<()> {
+        let key = key_for(p, mode);
+        self.delete_account(&key.account)
+    }
+
+    /// Read a credential by its account *base* string (e.g. `"oracle"` or a
+    /// built-in's `as_str()`), composing the `<base>/<mode>` keychain account
+    /// exactly like [`key_for`]. The `legacy_base` (if any) is the bare
+    /// account tried for api-key entries written before the mode suffix.
+    fn read_account(
+        &self,
+        account_base: &str,
+        legacy_base: Option<&str>,
+        mode: AuthMode,
+    ) -> Result<Option<StoredCredential>> {
+        let account = format!("{account_base}/{}", mode.as_str());
         match &self.storage {
             Storage::Keyring { service } => {
                 #[cfg(target_os = "macos")]
                 {
-                    match rupu_keychain_acl::get_generic_password(service, &key.account) {
+                    match rupu_keychain_acl::get_generic_password(service, &account) {
                         Ok(bytes) => {
                             let s = String::from_utf8(bytes)
                                 .map_err(|e| anyhow::anyhow!("keychain read: {e}"))?;
@@ -275,40 +300,55 @@ impl KeychainResolver {
                         }
                         Err(rupu_keychain_acl::AclError::NotFound { .. }) => {
                             if mode == AuthMode::ApiKey {
-                                let lk = legacy_key_for(p);
-                                match rupu_keychain_acl::get_generic_password(service, &lk.account)
-                                {
-                                    Ok(bytes) => {
-                                        let s = String::from_utf8(bytes).map_err(|e| {
-                                            anyhow::anyhow!("keychain legacy read: {e}")
-                                        })?;
-                                        Ok(Some(StoredCredential::api_key(s)))
+                                if let Some(lb) = legacy_base {
+                                    match rupu_keychain_acl::get_generic_password(service, lb) {
+                                        Ok(bytes) => {
+                                            let s = String::from_utf8(bytes).map_err(|e| {
+                                                anyhow::anyhow!("keychain legacy read: {e}")
+                                            })?;
+                                            return Ok(Some(StoredCredential::api_key(s)));
+                                        }
+                                        Err(rupu_keychain_acl::AclError::NotFound { .. }) => {}
+                                        Err(e) => {
+                                            return Err(anyhow::anyhow!(
+                                                "keychain legacy read: {e}"
+                                            ))
+                                        }
                                     }
-                                    Err(rupu_keychain_acl::AclError::NotFound { .. }) => Ok(None),
-                                    Err(e) => Err(anyhow::anyhow!("keychain legacy read: {e}")),
                                 }
-                            } else {
-                                Ok(None)
                             }
+                            Ok(None)
                         }
                         Err(e) => Err(anyhow::anyhow!("keychain read: {e}")),
                     }
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
+                    let key = KeychainKey {
+                        service: service.clone(),
+                        account: account.clone(),
+                    };
                     match self.entry(&key)?.get_password() {
                         Ok(s) => Ok(Some(parse_stored_credential(&s, mode)?)),
                         Err(keyring::Error::NoEntry) => {
                             if mode == AuthMode::ApiKey {
-                                let lk = legacy_key_for(p);
-                                match self.entry(&lk)?.get_password() {
-                                    Ok(s) => Ok(Some(StoredCredential::api_key(s))),
-                                    Err(keyring::Error::NoEntry) => Ok(None),
-                                    Err(e) => Err(anyhow::anyhow!("keychain legacy read: {e}")),
+                                if let Some(lb) = legacy_base {
+                                    let lk = KeychainKey {
+                                        service: service.clone(),
+                                        account: lb.to_string(),
+                                    };
+                                    match self.entry(&lk)?.get_password() {
+                                        Ok(s) => return Ok(Some(StoredCredential::api_key(s))),
+                                        Err(keyring::Error::NoEntry) => {}
+                                        Err(e) => {
+                                            return Err(anyhow::anyhow!(
+                                                "keychain legacy read: {e}"
+                                            ))
+                                        }
+                                    }
                                 }
-                            } else {
-                                Ok(None)
                             }
+                            Ok(None)
                         }
                         Err(e) => Err(anyhow::anyhow!("keychain read: {e}")),
                     }
@@ -316,22 +356,24 @@ impl KeychainResolver {
             }
             Storage::JsonFile { path } => {
                 let map = Self::read_file_map(path)?;
-                match map.get(&key.account) {
-                    Some(s) => Ok(Some(parse_stored_credential(s, mode)?)),
-                    None => {
-                        // Same Slice-A legacy fallback as the keyring
-                        // path: try the bare provider id for api-key.
-                        if mode == AuthMode::ApiKey {
-                            let lk = legacy_key_for(p);
-                            if let Some(legacy) = map.get(&lk.account) {
-                                return Ok(Some(StoredCredential::api_key(legacy.clone())));
-                            }
+                if let Some(s) = map.get(&account) {
+                    return Ok(Some(parse_stored_credential(s, mode)?));
+                }
+                if mode == AuthMode::ApiKey {
+                    if let Some(lb) = legacy_base {
+                        if let Some(legacy) = map.get(lb) {
+                            return Ok(Some(StoredCredential::api_key(legacy.clone())));
                         }
-                        Ok(None)
                     }
                 }
+                Ok(None)
             }
         }
+    }
+
+    fn read(&self, p: ProviderId, mode: AuthMode) -> Result<Option<StoredCredential>> {
+        let legacy = legacy_key_for(p);
+        self.read_account(p.as_str(), Some(&legacy.account), mode)
     }
 
     fn parse_provider(name: &str) -> Result<ProviderId> {
@@ -352,6 +394,51 @@ impl KeychainResolver {
     /// Returns true if a credential entry exists for the given provider/mode.
     pub async fn peek(&self, p: ProviderId, mode: AuthMode) -> bool {
         self.read(p, mode).map(|o| o.is_some()).unwrap_or(false)
+    }
+
+    /// Store an api-key/SSO credential under an arbitrary provider *name*
+    /// (used for config-declared OpenAI-compatible providers).
+    pub async fn store_named(
+        &self,
+        name: &str,
+        mode: AuthMode,
+        sc: &StoredCredential,
+    ) -> Result<()> {
+        let account = format!("{name}/{}", mode.as_str());
+        let payload = serde_json::to_string(sc).map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+        self.write_account(&account, &payload)
+    }
+
+    /// Forget a named credential. No-op if absent.
+    pub async fn forget_named(&self, name: &str, mode: AuthMode) -> Result<()> {
+        let account = format!("{name}/{}", mode.as_str());
+        self.delete_account(&account)
+    }
+
+    /// True if a named credential exists for `name`/`mode`.
+    pub async fn peek_named(&self, name: &str, mode: AuthMode) -> bool {
+        self.read_account(name, Some(name), mode)
+            .map(|o| o.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Resolve a config-declared provider name to an api-key credential:
+    /// `auth.json["<name>/api-key"]` (or legacy `["<name>"]`), then
+    /// `RUPU_<UPPER_NAME>_API_KEY`.
+    async fn get_named(&self, provider: &str) -> Result<(AuthMode, AuthCredentials)> {
+        if let Some(sc) = self.read_account(provider, Some(provider), AuthMode::ApiKey)? {
+            return Ok((AuthMode::ApiKey, sc.credentials));
+        }
+        let env_name = format!("RUPU_{}_API_KEY", provider.to_ascii_uppercase());
+        if let Ok(key) = std::env::var(&env_name) {
+            if !key.is_empty() {
+                return Ok((AuthMode::ApiKey, AuthCredentials::ApiKey { key }));
+            }
+        }
+        anyhow::bail!(
+            "no credentials for '{provider}'. Run: rupu auth login --provider {provider} \
+             --mode api-key, or set {env_name}"
+        )
     }
 
     /// Returns a human-readable expiry string for an SSO token, or `None`
@@ -494,7 +581,10 @@ impl CredentialResolver for KeychainResolver {
         provider: &str,
         hint: Option<AuthMode>,
     ) -> Result<(AuthMode, AuthCredentials)> {
-        let p = Self::parse_provider(provider)?;
+        let p = match Self::parse_provider(provider) {
+            Ok(p) => p,
+            Err(_) => return self.get_named(provider).await,
+        };
         let modes: Vec<AuthMode> = match hint {
             Some(m) => vec![m],
             None => vec![AuthMode::Sso, AuthMode::ApiKey],
@@ -603,6 +693,69 @@ mod expires_in_tests {
             !rupu_providers::auth::is_token_expired(expires_ms),
             "fresh 1h token must not read as expired (got expires_ms={expires_ms})",
         );
+    }
+}
+
+#[cfg(test)]
+mod resolver_named_tests {
+    use super::*;
+    use rupu_providers::auth::AuthCredentials;
+
+    /// Serialise all env-mutating tests through a single lock so they
+    /// cannot race each other over shared process-global env vars.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard: removes the listed env vars on drop, even on panic.
+    struct EnvGuard(Vec<&'static str>);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for k in &self.0 {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn named_provider_reads_from_json_file() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{ "oracle/api-key": "sk-oracle-123" }"#).unwrap();
+        std::env::set_var("RUPU_AUTH_FILE", &path);
+        std::env::set_var("RUPU_AUTH_BACKEND", "file");
+
+        let r = KeychainResolver::new();
+        let (mode, creds) = r.get("oracle", None).await.unwrap();
+        assert_eq!(mode, rupu_providers::AuthMode::ApiKey);
+        match creds {
+            AuthCredentials::ApiKey { key } => {
+                assert_eq!(key, "sk-oracle-123")
+            }
+            _ => panic!("expected api key"),
+        }
+    }
+
+    #[tokio::test]
+    async fn named_provider_falls_back_to_env() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard(vec!["RUPU_AUTH_FILE", "RUPU_AUTH_BACKEND", "RUPU_ACME_API_KEY"]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        std::env::set_var("RUPU_AUTH_FILE", &path);
+        std::env::set_var("RUPU_AUTH_BACKEND", "file");
+        std::env::set_var("RUPU_ACME_API_KEY", "sk-env-456");
+
+        let r = KeychainResolver::new();
+        let (_mode, creds) = r.get("acme", None).await.unwrap();
+        match creds {
+            AuthCredentials::ApiKey { key } => {
+                assert_eq!(key, "sk-env-456")
+            }
+            _ => panic!("expected api key"),
+        }
     }
 }
 

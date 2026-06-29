@@ -6067,6 +6067,7 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        openai_compatible: None,
     };
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
@@ -6359,6 +6360,7 @@ async fn run_compact_request(
     let resolver = rupu_auth::KeychainResolver::new();
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        openai_compatible: None,
     };
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,
@@ -6622,6 +6624,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: session.anthropic_oauth_prefix,
+        openai_compatible: None,
     };
     let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
         &session.provider_name,

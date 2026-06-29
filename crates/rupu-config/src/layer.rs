@@ -33,6 +33,8 @@ pub enum LayerError {
         #[source]
         source: Box<toml::de::Error>,
     },
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 /// Layer global and project config files into a single [`Config`].
@@ -65,6 +67,7 @@ pub fn layer_files(global: Option<&Path>, project: Option<&Path>) -> Result<Conf
         project_path: project.map(|p| p.display().to_string()),
         source: Box::new(source),
     })?;
+    cfg.validate()?;
     Ok(cfg)
 }
 

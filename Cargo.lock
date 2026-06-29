@@ -6654,6 +6654,7 @@ dependencies = [
  "hex",
  "rupu-agent",
  "rupu-auth",
+ "rupu-config",
  "rupu-providers",
  "serde",
  "serde_json",

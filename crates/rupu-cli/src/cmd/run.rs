@@ -124,14 +124,25 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     let scm_registry = Arc::new(rupu_scm::Registry::discover(&resolver, &cfg).await);
 
     let provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
+    let oai_params = provider_factory::openai_compatible_params(&provider_name, &cfg.providers);
+    if !provider_factory::is_builtin_provider(&provider_name) && oai_params.is_none() {
+        anyhow::bail!(
+            "provider '{provider_name}' is not a built-in provider and is not declared as \
+             [providers.{provider_name}] with kind = \"openai-compatible\" in config.toml"
+        );
+    }
+    // For an openai-compatible provider, prefer its configured default_model
+    // when the agent/spec didn't pin one.
     let model = spec
         .model
         .clone()
         .or_else(|| cfg.default_model.clone())
+        .or_else(|| oai_params.as_ref().map(|p| p.default_model.clone()))
         .unwrap_or_else(|| "claude-sonnet-4-6".into());
     let auth_hint = spec.auth;
     let provider_config = provider_factory::ProviderConfig {
         anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+        openai_compatible: oai_params,
     };
     let (_resolved_auth, provider) = provider_factory::build_for_provider_with_config(
         &provider_name,

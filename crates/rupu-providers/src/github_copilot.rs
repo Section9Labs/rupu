@@ -80,7 +80,7 @@ impl GithubCopilotClient {
     /// Non-streaming send.
     pub async fn send(&mut self, request: &LlmRequest) -> Result<LlmResponse, ProviderError> {
         self.ensure_valid_token().await?;
-        let body = self.build_request_body(request, false);
+        let body = crate::openai_wire::build_chat_request_body(request, false);
         let url = format!("{}/chat/completions", self.api_url);
 
         let response = self
@@ -101,17 +101,17 @@ impl GithubCopilotClient {
         }
 
         let json: serde_json::Value = response.json().await?;
-        parse_chat_completion(&json)
+        crate::openai_wire::parse_chat_completion(&json)
     }
 
     /// Streaming send with SSE.
     pub async fn stream(
         &mut self,
         request: &LlmRequest,
-        on_event: &mut (impl FnMut(StreamEvent) + Send + ?Sized),
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<LlmResponse, ProviderError> {
         self.ensure_valid_token().await?;
-        let body = self.build_request_body(request, true);
+        let body = crate::openai_wire::build_chat_request_body(request, true);
         let url = format!("{}/chat/completions", self.api_url);
 
         let response = self
@@ -132,7 +132,7 @@ impl GithubCopilotClient {
         }
 
         let mut parser = SseParser::new();
-        let mut acc = CompletionAccumulator::new();
+        let mut acc = crate::openai_wire::CompletionAccumulator::new();
         let mut bytes_stream = response.bytes_stream();
 
         use futures_util::StreamExt;
@@ -140,7 +140,7 @@ impl GithubCopilotClient {
             let chunk = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
             let events = parser.feed(&chunk)?;
             for event in events {
-                process_completion_sse(&event, &mut acc, on_event)?;
+                crate::openai_wire::process_completion_sse(&event, &mut acc, on_event)?;
             }
         }
 
@@ -178,131 +178,6 @@ impl GithubCopilotClient {
         headers.insert("X-Initiator", "user".parse().unwrap());
         headers.insert("Openai-Intent", "conversation-edits".parse().unwrap());
         Ok(headers)
-    }
-
-    fn build_request_body(&self, request: &LlmRequest, stream: bool) -> serde_json::Value {
-        let mut messages = Vec::new();
-
-        // System message
-        if let Some(system) = &request.system {
-            messages.push(serde_json::json!({"role": "system", "content": system}));
-        }
-
-        // Conversation messages
-        for msg in &request.messages {
-            match &msg.content[..] {
-                [ContentBlock::Text { text }] => {
-                    let role = match msg.role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                    };
-                    messages.push(serde_json::json!({"role": role, "content": text}));
-                }
-                [ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    ..
-                }] => {
-                    messages.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": tool_use_id,
-                        "content": content,
-                    }));
-                }
-                blocks => {
-                    // Mixed content: text + tool_use blocks
-                    let role = match msg.role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                    };
-                    let mut text_parts = Vec::new();
-                    let mut tool_calls = Vec::new();
-
-                    for block in blocks {
-                        match block {
-                            ContentBlock::Text { text } => text_parts.push(text.clone()),
-                            ContentBlock::ToolUse { id, name, input } => {
-                                tool_calls.push(serde_json::json!({
-                                    "id": id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": input.to_string(),
-                                    }
-                                }));
-                            }
-                            ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                ..
-                            } => {
-                                messages.push(serde_json::json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_use_id,
-                                    "content": content,
-                                }));
-                                continue;
-                            }
-                        }
-                    }
-
-                    if !text_parts.is_empty() || !tool_calls.is_empty() {
-                        let mut msg_json =
-                            serde_json::json!({"role": role, "content": text_parts.join("\n")});
-                        if !tool_calls.is_empty() {
-                            msg_json["tool_calls"] = serde_json::json!(tool_calls);
-                        }
-                        messages.push(msg_json);
-                    }
-                }
-            }
-        }
-
-        let mut body = serde_json::json!({
-            "model": request.model,
-            "messages": messages,
-            "max_tokens": request.max_tokens,
-            "stream": stream,
-        });
-
-        // Tools
-        if !request.tools.is_empty() {
-            let tools: Vec<serde_json::Value> = request
-                .tools
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.input_schema,
-                        }
-                    })
-                })
-                .collect();
-            body["tools"] = serde_json::json!(tools);
-            body["tool_choice"] = serde_json::json!("auto");
-        }
-
-        // Reasoning effort (same as OpenAI). `Auto` omits the field so
-        // the model picks; Copilot's API behaves like OpenAI here.
-        if let Some(level) = &request.thinking {
-            use crate::model_tier::ThinkingLevel;
-            let effort = match level {
-                ThinkingLevel::Auto => None,
-                ThinkingLevel::Minimal => Some("minimal"),
-                ThinkingLevel::Low => Some("low"),
-                ThinkingLevel::Medium => Some("medium"),
-                ThinkingLevel::High => Some("high"),
-                ThinkingLevel::Max => Some("xhigh"),
-            };
-            if let Some(e) = effort {
-                body["reasoning_effort"] = serde_json::json!(e);
-            }
-        }
-
-        body
     }
 
     /// Exchange GitHub OAuth token for short-lived Copilot API token.
@@ -504,176 +379,6 @@ fn extract_api_url_from_token(token: &str) -> Option<String> {
     Some(format!("https://{api_host}"))
 }
 
-/// Parse a chat/completions response into LlmResponse.
-fn parse_chat_completion(json: &serde_json::Value) -> Result<LlmResponse, ProviderError> {
-    let id = json["id"].as_str().unwrap_or("").to_string();
-    let model = json["model"].as_str().unwrap_or("").to_string();
-
-    let mut content = Vec::new();
-    let mut stop_reason = Some(StopReason::EndTurn);
-
-    if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
-        if let Some(choice) = choices.first() {
-            // Text content
-            if let Some(text) = choice
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-            {
-                if !text.is_empty() {
-                    content.push(ContentBlock::Text {
-                        text: text.to_string(),
-                    });
-                }
-            }
-
-            // Tool calls
-            if let Some(tool_calls) = choice
-                .get("message")
-                .and_then(|m| m.get("tool_calls"))
-                .and_then(|t| t.as_array())
-            {
-                for tc in tool_calls {
-                    let tc_id = tc["id"].as_str().unwrap_or("").to_string();
-                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                    let args_str = tc["function"]["arguments"].as_str().unwrap_or("{}");
-                    let input: serde_json::Value = serde_json::from_str(args_str).map_err(|e| {
-                        ProviderError::Json(format!("malformed tool arguments for '{name}': {e}"))
-                    })?;
-                    content.push(ContentBlock::ToolUse {
-                        id: tc_id,
-                        name,
-                        input,
-                    });
-                    stop_reason = Some(StopReason::ToolUse);
-                }
-            }
-
-            // Finish reason
-            if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                stop_reason = Some(match reason {
-                    "stop" => StopReason::EndTurn,
-                    "length" => StopReason::MaxTokens,
-                    "tool_calls" => StopReason::ToolUse,
-                    _ => StopReason::EndTurn,
-                });
-            }
-        }
-    }
-
-    let usage = if let Some(u) = json.get("usage") {
-        Usage {
-            input_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-            output_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
-            ..Default::default()
-        }
-    } else {
-        Usage::default()
-    };
-
-    Ok(LlmResponse {
-        id,
-        model,
-        content,
-        stop_reason,
-        usage,
-    })
-}
-
-/// Process a chat/completions SSE event (OpenAI streaming format).
-fn process_completion_sse(
-    event: &crate::sse::SseEvent,
-    acc: &mut CompletionAccumulator,
-    on_event: &mut (impl FnMut(StreamEvent) + ?Sized),
-) -> Result<(), ProviderError> {
-    if event.data == "[DONE]" {
-        return Ok(());
-    }
-
-    let data: serde_json::Value = serde_json::from_str(&event.data)?;
-
-    if let Some(id) = data["id"].as_str() {
-        if acc.id.is_empty() {
-            acc.id = id.to_string();
-        }
-    }
-    if let Some(model) = data["model"].as_str() {
-        if acc.model.is_empty() {
-            acc.model = model.to_string();
-        }
-    }
-
-    if let Some(choices) = data.get("choices").and_then(|c| c.as_array()) {
-        if let Some(choice) = choices.first() {
-            let delta = &choice["delta"];
-
-            // Text delta
-            if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-                acc.text.push_str(text);
-                on_event(StreamEvent::TextDelta(text.to_string()));
-            }
-
-            // Tool call deltas
-            if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                for tc in tool_calls {
-                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
-
-                    // New tool call start
-                    if let Some(func) = tc.get("function") {
-                        if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                            let tc_id = tc["id"].as_str().unwrap_or("").to_string();
-                            // Ensure accumulator has enough slots
-                            while acc.tool_calls.len() <= idx {
-                                acc.tool_calls.push(ToolCallAcc::default());
-                            }
-                            acc.tool_calls[idx].id = tc_id.clone();
-                            acc.tool_calls[idx].name = name.to_string();
-                            on_event(StreamEvent::ToolUseStart {
-                                id: tc_id,
-                                name: name.to_string(),
-                            });
-                        }
-                        if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                            while acc.tool_calls.len() <= idx {
-                                acc.tool_calls.push(ToolCallAcc::default());
-                            }
-                            acc.tool_calls[idx].arguments.push_str(args);
-                            on_event(StreamEvent::InputJsonDelta(args.to_string()));
-                        }
-                    }
-                }
-            }
-
-            // Finish reason
-            if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-                acc.stop_reason = Some(match reason {
-                    "stop" => StopReason::EndTurn,
-                    "length" => StopReason::MaxTokens,
-                    "tool_calls" => StopReason::ToolUse,
-                    _ => StopReason::EndTurn,
-                });
-            }
-        }
-    }
-
-    // Usage (some providers send it in streaming too)
-    if let Some(u) = data.get("usage") {
-        if let Some(input) = u.get("prompt_tokens").and_then(|v| v.as_u64()) {
-            acc.input_tokens = input as u32;
-        }
-        if let Some(output) = u.get("completion_tokens").and_then(|v| v.as_u64()) {
-            acc.output_tokens = output as u32;
-        }
-        on_event(StreamEvent::UsageSnapshot(Usage {
-            input_tokens: acc.input_tokens,
-            output_tokens: acc.output_tokens,
-            cached_tokens: 0,
-        }));
-    }
-
-    Ok(())
-}
-
 /// UTF-8 safe truncation.
 fn truncate(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
@@ -687,77 +392,13 @@ fn truncate(text: &str, max_len: usize) -> String {
     }
 }
 
-// ── Accumulators ─────────────────────────────────────────────────────
-
-#[derive(Default)]
-struct ToolCallAcc {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
-struct CompletionAccumulator {
-    id: String,
-    model: String,
-    text: String,
-    tool_calls: Vec<ToolCallAcc>,
-    stop_reason: Option<StopReason>,
-    input_tokens: u32,
-    output_tokens: u32,
-}
-
-impl CompletionAccumulator {
-    fn new() -> Self {
-        Self {
-            id: String::new(),
-            model: String::new(),
-            text: String::new(),
-            tool_calls: Vec::new(),
-            stop_reason: None,
-            input_tokens: 0,
-            output_tokens: 0,
-        }
-    }
-
-    fn into_response(self) -> Option<LlmResponse> {
-        if self.id.is_empty() && self.text.is_empty() && self.tool_calls.is_empty() {
-            return None;
-        }
-
-        let mut content = Vec::new();
-        if !self.text.is_empty() {
-            content.push(ContentBlock::Text { text: self.text });
-        }
-        for tc in self.tool_calls {
-            if tc.name.is_empty() {
-                continue;
-            }
-            let input: serde_json::Value =
-                serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
-            content.push(ContentBlock::ToolUse {
-                id: tc.id,
-                name: tc.name,
-                input,
-            });
-        }
-
-        Some(LlmResponse {
-            id: self.id,
-            model: self.model,
-            content,
-            stop_reason: self.stop_reason,
-            usage: Usage {
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                ..Default::default()
-            },
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openai_wire::{
+        build_chat_request_body, parse_chat_completion, process_completion_sse,
+        CompletionAccumulator,
+    };
 
     fn test_creds() -> AuthCredentials {
         AuthCredentials::OAuth {
@@ -810,9 +451,6 @@ mod tests {
 
     #[test]
     fn test_build_request_body_basic() {
-        let mut client = GithubCopilotClient::new(test_creds(), None).unwrap();
-        client.copilot_token = "test-token".into();
-
         let request = LlmRequest {
             model: "claude-sonnet-4-6".into(),
             system: Some("Be helpful.".into()),
@@ -830,7 +468,7 @@ mod tests {
             anthropic_speed: None,
         };
 
-        let body = client.build_request_body(&request, true);
+        let body = build_chat_request_body(&request, true);
         assert_eq!(body["model"], "claude-sonnet-4-6");
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["stream"], true);
@@ -844,9 +482,6 @@ mod tests {
 
     #[test]
     fn test_build_request_body_with_tools() {
-        let mut client = GithubCopilotClient::new(test_creds(), None).unwrap();
-        client.copilot_token = "test-token".into();
-
         let request = LlmRequest {
             model: "o3".into(),
             system: None,
@@ -868,7 +503,7 @@ mod tests {
             anthropic_speed: None,
         };
 
-        let body = client.build_request_body(&request, false);
+        let body = build_chat_request_body(&request, false);
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["function"]["name"], "read_file");
@@ -877,9 +512,6 @@ mod tests {
 
     #[test]
     fn test_build_request_body_with_reasoning() {
-        let mut client = GithubCopilotClient::new(test_creds(), None).unwrap();
-        client.copilot_token = "test-token".into();
-
         let request = LlmRequest {
             model: "o3".into(),
             system: None,
@@ -897,15 +529,12 @@ mod tests {
             anthropic_speed: None,
         };
 
-        let body = client.build_request_body(&request, false);
+        let body = build_chat_request_body(&request, false);
         assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]
     fn test_build_request_body_no_tool_choice_without_tools() {
-        let mut client = GithubCopilotClient::new(test_creds(), None).unwrap();
-        client.copilot_token = "test-token".into();
-
         let request = LlmRequest {
             model: "gpt-4.1".into(),
             system: None,
@@ -923,7 +552,7 @@ mod tests {
             anthropic_speed: None,
         };
 
-        let body = client.build_request_body(&request, false);
+        let body = build_chat_request_body(&request, false);
         assert!(body.get("tool_choice").is_none());
         assert!(body.get("tools").is_none());
     }
@@ -1131,9 +760,6 @@ mod tests {
 
     #[test]
     fn test_tool_result_message() {
-        let mut client = GithubCopilotClient::new(test_creds(), None).unwrap();
-        client.copilot_token = "test-token".into();
-
         let request = LlmRequest {
             model: "gpt-4.1".into(),
             system: None,
@@ -1151,7 +777,7 @@ mod tests {
             anthropic_speed: None,
         };
 
-        let body = client.build_request_body(&request, false);
+        let body = build_chat_request_body(&request, false);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "tool");
         assert_eq!(msgs[0]["tool_call_id"], "call_1");

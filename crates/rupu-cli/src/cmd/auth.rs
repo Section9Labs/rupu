@@ -139,6 +139,20 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
     crate::output::formats::ensure_supported(command_name, format, supported)
 }
 
+/// Load layered config and return true if `name` is a declared
+/// openai-compatible provider.
+fn is_openai_compatible_name(name: &str) -> bool {
+    let Ok(global) = crate::paths::global_dir() else {
+        return false;
+    };
+    let global_cfg = global.join("config.toml");
+    let cfg = match rupu_config::layer_files(Some(&global_cfg), None) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    rupu_runtime::provider_factory::openai_compatible_params(name, &cfg.providers).is_some()
+}
+
 fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
     match s {
         "anthropic" => Ok(ProviderId::Anthropic),
@@ -155,6 +169,36 @@ fn parse_provider(s: &str) -> anyhow::Result<ProviderId> {
 }
 
 async fn login(provider: &str, mode: AuthModeArg, key: Option<&str>) -> anyhow::Result<()> {
+    if is_openai_compatible_name(provider) {
+        if parse_provider(provider).is_ok() {
+            anyhow::bail!(
+                "'{provider}' is a reserved built-in provider name; \
+                 choose a distinct name for an openai-compatible provider in config"
+            );
+        }
+        let AuthModeArg::ApiKey = mode else {
+            anyhow::bail!("openai-compatible providers only support --mode api-key");
+        };
+        let secret = match key {
+            Some(k) => k.to_string(),
+            None => {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf)?;
+                buf.trim().to_string()
+            }
+        };
+        if secret.is_empty() {
+            anyhow::bail!("empty API key");
+        }
+        let resolver = rupu_auth::resolver::KeychainResolver::new();
+        let sc = rupu_auth::stored::StoredCredential::api_key(secret);
+        resolver
+            .store_named(provider, rupu_providers::AuthMode::ApiKey, &sc)
+            .await?;
+        println!("rupu: stored {provider} api-key credential");
+        return Ok(());
+    }
     let pid = parse_provider(provider)?;
     let resolver = rupu_auth::resolver::KeychainResolver::new();
     let mode_neutral: rupu_providers::AuthMode = mode.clone().into();
@@ -290,6 +334,26 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
         .provider
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("--provider required (or use --all)"))?;
+    if is_openai_compatible_name(provider) {
+        if parse_provider(provider).is_ok() {
+            anyhow::bail!(
+                "'{provider}' is a reserved built-in provider name; \
+                 choose a distinct name for an openai-compatible provider in config"
+            );
+        }
+        if !matches!(opts.mode, None | Some(AuthModeArg::ApiKey)) {
+            anyhow::bail!(
+                "openai-compatible providers only support api-key credentials; \
+                 --mode sso is not valid"
+            );
+        }
+        let resolver = rupu_auth::resolver::KeychainResolver::new();
+        resolver
+            .forget_named(provider, rupu_providers::AuthMode::ApiKey)
+            .await?;
+        println!("rupu: forgot credential(s) for {provider}");
+        return Ok(());
+    }
     let pid = parse_provider(provider)?;
     let modes = match opts.mode {
         Some(m) => vec![m.into()],
@@ -782,6 +846,30 @@ async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
             api_key: api_present,
             sso: resolver.peek_sso(pid).await.unwrap_or_default(),
         });
+    }
+    if let Ok(global) = crate::paths::global_dir() {
+        let global_cfg = global.join("config.toml");
+        if let Ok(cfg) = rupu_config::layer_files(Some(&global_cfg), None) {
+            for (name, p) in &cfg.providers {
+                if p.kind.as_deref() != Some("openai-compatible") {
+                    continue;
+                }
+                if parse_provider(name).is_ok() {
+                    continue;
+                }
+                let present = resolver
+                    .peek_named(name, rupu_providers::AuthMode::ApiKey)
+                    .await
+                    || std::env::var(format!("RUPU_{}_API_KEY", name.to_ascii_uppercase()))
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false);
+                rows.push(AuthStatusRow {
+                    provider: name.clone(),
+                    api_key: present,
+                    sso: String::new(),
+                });
+            }
+        }
     }
     let csv_rows = rows
         .iter()

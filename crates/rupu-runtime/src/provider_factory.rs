@@ -28,6 +28,68 @@ pub struct ProviderConfig {
     /// the client-side default (currently: enabled). `Some(false)` opts
     /// the agent out — useful when the prefix corrupts persona.
     pub anthropic_oauth_system_prefix: Option<bool>,
+    /// Present when the provider name resolves to a config-declared
+    /// OpenAI-compatible endpoint. Populated by callers that have a
+    /// loaded `rupu_config::Config` (e.g. `rupu run`).
+    pub openai_compatible: Option<OpenAiCompatibleParams>,
+}
+
+/// Everything the factory needs to build an `OpenAiCompatibleClient`,
+/// resolved from a `[providers.<name>]` config entry.
+#[derive(Debug, Clone)]
+pub struct OpenAiCompatibleParams {
+    pub base_url: String,
+    pub default_model: String,
+    pub stream: bool,
+    pub models: Vec<rupu_providers::OpenAiCompatibleModel>,
+}
+
+const DEFAULT_OAI_CONTEXT_WINDOW: u32 = 32_768;
+const DEFAULT_OAI_MAX_OUTPUT: u32 = 8_192;
+
+/// Resolve `[providers.<name>]` into params iff it declares
+/// `kind = "openai-compatible"` with a `base_url`. Returns `None` otherwise.
+pub fn openai_compatible_params(
+    name: &str,
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> Option<OpenAiCompatibleParams> {
+    let p = providers.get(name)?;
+    if p.kind.as_deref() != Some("openai-compatible") {
+        return None;
+    }
+    let base_url = p.base_url.clone()?;
+    let default_model = p.default_model.clone().unwrap_or_default();
+    let models = p
+        .models
+        .iter()
+        .map(|m| rupu_providers::OpenAiCompatibleModel {
+            id: m.id.clone(),
+            context_window: m.context_window.unwrap_or(DEFAULT_OAI_CONTEXT_WINDOW),
+            max_output: m.max_output.unwrap_or(DEFAULT_OAI_MAX_OUTPUT),
+        })
+        .collect();
+    Some(OpenAiCompatibleParams {
+        base_url,
+        default_model,
+        stream: p.stream.unwrap_or(true),
+        models,
+    })
+}
+
+/// True for provider names the factory builds directly (not openai-compatible).
+pub fn is_builtin_provider(name: &str) -> bool {
+    matches!(
+        name,
+        "anthropic"
+            | "openai"
+            | "openai_codex"
+            | "codex"
+            | "gemini"
+            | "google_gemini"
+            | "copilot"
+            | "github_copilot"
+            | "local"
+    )
 }
 
 #[derive(Debug, Error)]
@@ -100,7 +162,23 @@ pub async fn build_for_provider_with_config(
         "gemini" | "google_gemini" => build_gemini(creds, model).await?,
         "copilot" | "github_copilot" => build_copilot(creds, model).await?,
         "local" => return Err(FactoryError::NotWiredInV0("local".to_string())),
-        _ => return Err(FactoryError::UnknownProvider(name.to_string())),
+        _ => {
+            if let Some(params) = &config.openai_compatible {
+                let key = match &creds {
+                    rupu_providers::auth::AuthCredentials::ApiKey { key } => key.clone(),
+                    rupu_providers::auth::AuthCredentials::OAuth { access, .. } => access.clone(),
+                };
+                Box::new(rupu_providers::OpenAiCompatibleClient::new(
+                    &params.base_url,
+                    &key,
+                    &params.default_model,
+                    params.models.clone(),
+                    params.stream,
+                )) as Box<dyn LlmProvider>
+            } else {
+                return Err(FactoryError::UnknownProvider(name.to_string()));
+            }
+        }
     };
     Ok((mode, client))
 }
@@ -197,6 +275,48 @@ async fn build_copilot(
     let client = rupu_providers::github_copilot::GithubCopilotClient::new(creds, None)
         .map_err(|e| FactoryError::Other(format!("copilot client init: {e}")))?;
     Ok(Box::new(client))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_openai_compatible_params_from_config() {
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "oracle".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://192.29.35.246:8080".into()),
+                default_model: Some("/raid/models/zai-org/GLM-5.2-FP8".into()),
+                stream: Some(false),
+                models: vec![rupu_config::CustomModel {
+                    id: "/raid/models/zai-org/GLM-5.2-FP8".into(),
+                    context_window: Some(131072),
+                    max_output: Some(8192),
+                }],
+                ..Default::default()
+            },
+        );
+        let p = openai_compatible_params("oracle", &providers).unwrap();
+        assert_eq!(p.base_url, "http://192.29.35.246:8080");
+        assert_eq!(p.default_model, "/raid/models/zai-org/GLM-5.2-FP8");
+        assert!(!p.stream);
+        assert_eq!(p.models.len(), 1);
+        assert_eq!(p.models[0].context_window, 131072);
+        // A name without kind=openai-compatible yields None.
+        assert!(openai_compatible_params("anthropic", &providers).is_none());
+    }
+
+    #[test]
+    fn is_builtin_recognizes_known_names() {
+        assert!(is_builtin_provider("anthropic"));
+        assert!(is_builtin_provider("copilot"));
+        assert!(is_builtin_provider("local"));
+        assert!(!is_builtin_provider("oracle"));
+    }
 }
 
 #[cfg(test)]
