@@ -19,7 +19,20 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
         let resolver = rupu_auth::KeychainResolver::new();
         let (provider, model) = match (req.provider, req.model) {
             (Some(p), Some(m)) => (p, m),
-            _ => rupu_orchestrator::pick_default_gen_model(&resolver)
+            (Some(p), None) => {
+                let m = rupu_orchestrator::generate::DEFAULT_GEN_MODELS
+                    .iter()
+                    .find(|(name, _)| *name == p)
+                    .map(|(_, m)| m.to_string())
+                    .ok_or_else(|| GenDefError::Failed(format!("unknown provider `{p}`")))?;
+                (p, m)
+            }
+            (None, Some(m)) => {
+                return Err(GenDefError::Failed(format!(
+                    "model `{m}` requires a provider to be set"
+                )))
+            }
+            (None, None) => rupu_orchestrator::pick_default_gen_model(&resolver)
                 .await
                 .ok_or(GenDefError::NoCredentials)?,
         };
@@ -41,7 +54,10 @@ impl DefinitionGenerator for RuntimeDefinitionGenerator {
         };
         let out = rupu_orchestrator::generate_definition(&gen_req, &resolver)
             .await
-            .map_err(|e| GenDefError::Failed(e.to_string()))?;
+            .map_err(|e| match e {
+                rupu_orchestrator::GenerateError::NoCredentials => GenDefError::NoCredentials,
+                other => GenDefError::Failed(other.to_string()),
+            })?;
         Ok(GeneratedDef {
             raw: out.content,
             provider: out.provider,
