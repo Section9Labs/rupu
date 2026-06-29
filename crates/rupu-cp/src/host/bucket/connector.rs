@@ -80,7 +80,10 @@ impl BucketHostConnector {
             .list_control(run_id)
             .await
             .map_err(bucket_err_to_unreachable)?;
-        let seq = existing.len() as u64;
+        // Use max(existing_seq) + 1 rather than len() so two concurrent
+        // put_control_envelope calls cannot race to the same seq number
+        // (len() would give both N; the second put would silently overwrite).
+        let seq = existing.iter().map(|(s, _)| *s + 1).max().unwrap_or(0);
         let bytes =
             serde_json::to_vec(&envelope).map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
         self.bucket

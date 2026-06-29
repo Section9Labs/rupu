@@ -917,6 +917,9 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                                         if let Err(e) = state.child.start_kill() {
                                             warn!(run_id = %rid, error = %e, "node pull: kill child failed");
                                         }
+                                        // Cancel: advance unconditionally — the process
+                                        // is gone (or already dead) regardless of kill() error.
+                                        state.last_ctrl_seq = Some(*seq);
                                     }
                                     "approve" => {
                                         info!(run_id = %rid, seq, "node pull: approve");
@@ -929,9 +932,14 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                                         match spawn_control(&exe, &argv) {
                                             Ok(child) => {
                                                 state.child = child;
+                                                // Advance ONLY on successful spawn so a
+                                                // transient spawn error causes a retry
+                                                // next tick instead of stranding the run.
+                                                state.last_ctrl_seq = Some(*seq);
                                             }
                                             Err(e) => {
                                                 warn!(run_id = %rid, error = %e, "node pull: approve spawn failed");
+                                                // Leave last_ctrl_seq unchanged → retry.
                                             }
                                         }
                                     }
@@ -946,20 +954,28 @@ async fn pull(args: PullArgs) -> anyhow::Result<()> {
                                         match spawn_control(&exe, &argv) {
                                             Ok(child) => {
                                                 state.child = child;
+                                                // Advance ONLY on successful spawn.
+                                                state.last_ctrl_seq = Some(*seq);
                                             }
                                             Err(e) => {
                                                 warn!(run_id = %rid, error = %e, "node pull: reject spawn failed");
+                                                // Leave last_ctrl_seq unchanged → retry.
                                             }
                                         }
                                     }
                                     other => {
                                         warn!(run_id = %rid, seq, kind = other, "node pull: unknown control kind (ignored)");
+                                        // Advance past unknown kinds so they are never
+                                        // reprocessed (the kind won't become known on retry).
+                                        state.last_ctrl_seq = Some(*seq);
                                     }
                                 }
-                                state.last_ctrl_seq = Some(*seq);
                             }
                             Err(e) => {
                                 warn!(run_id = %rid, seq, error = %e, "node pull: failed to deserialize ControlEnvelope (skipped)");
+                                // Advance past corrupt envelopes so they are never
+                                // reprocessed (the bytes won't change on retry).
+                                state.last_ctrl_seq = Some(*seq);
                             }
                         }
                     }

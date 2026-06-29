@@ -44,7 +44,13 @@ impl ObjectStoreBucket {
     pub fn from_url(url: &str, prefix: Option<&str>) -> Result<Self, BucketError> {
         let parsed = url::Url::parse(url)
             .map_err(|e| BucketError::Io(format!("invalid bucket url: {e}")))?;
-        let (store, url_path) = object_store::parse_url_opts(&parsed, std::iter::empty::<(&str, &str)>())
+        // Pass environment variables so object_store picks up the standard
+        // credential env vars: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+        // GOOGLE_SERVICE_ACCOUNT_KEY / etc.  parse_url_opts accepts
+        // IntoIterator<Item=(K: AsRef<str>, V: Into<String>)> and (String,String)
+        // satisfies both bounds.  For file:// and memory:// backends the env
+        // vars are silently ignored, so existing tests remain unaffected.
+        let (store, url_path) = object_store::parse_url_opts(&parsed, std::env::vars())
             .map_err(|e| BucketError::Io(e.to_string()))?;
         let full_prefix = match prefix {
             Some(p) if !p.is_empty() => url_path.join(p),
@@ -64,7 +70,8 @@ impl ObjectStoreBucket {
         // normalisation correctly.
         // Build path by joining each non-empty segment.
         let joined = self.prefix.as_ref().to_string() + "/" + relative;
-        Path::parse(&joined).unwrap_or_else(|_| self.prefix.clone())
+        Path::parse(&joined)
+            .expect("BUG: bucket key-layout helpers must produce valid object_store Paths")
     }
 
     /// Simple put — overwrites any existing object.

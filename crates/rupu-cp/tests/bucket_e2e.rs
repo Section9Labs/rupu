@@ -116,6 +116,93 @@ async fn poll_bucket_run_mirrors_and_finishes() {
     );
 }
 
+// ── poll_bucket_run_remirrors_run_json_each_tick ──────────────────────────────
+
+/// Regression test for C1: `run.json` must be re-mirrored on every tick even
+/// though the key is the same across ticks.
+///
+/// Without the fix, after tick 1 the key `"run.json"` is in `consumed` and
+/// tick 2 skips it — so a mid-run status update (e.g. `awaiting_approval`)
+/// never reaches the central RunStore and approve/reject from the CP silently
+/// stops working.
+#[tokio::test]
+async fn poll_bucket_run_remirrors_run_json_each_tick() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(RunStore::new(dir.path().join("runs")));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let run_id = "run_REMIRRORTEST0001";
+    let host_id = "host_REMIRROR01";
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Workflow,
+        name: "check".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: None,
+        mode: None,
+        target: None,
+    };
+    mirror.create_run(run_id, host_id, &spec).expect("create_run");
+
+    let bucket = ObjectStoreBucket::new(Arc::new(InMemory::new()), "test/host_REMIRROR01");
+
+    // ── Tick 1: put run.json with status = Running, no finished marker ────────
+
+    let mut record_v1 = store.load(run_id).unwrap();
+    record_v1.status = rupu_orchestrator::RunStatus::Running;
+    let run_json_v1 = serde_json::to_vec(&record_v1).unwrap();
+    bucket
+        .put_result(run_id, "run.json", &run_json_v1)
+        .await
+        .unwrap();
+
+    let mut consumed = HashSet::new();
+    let done1 = poll_bucket_run(&bucket, &mirror, host_id, run_id, &mut consumed)
+        .await
+        .expect("tick 1 poll must succeed");
+    assert!(!done1, "no finished marker — must return false");
+
+    // Central run should still be Running.
+    let after_tick1 = store.load(run_id).unwrap();
+    assert_eq!(
+        after_tick1.status,
+        rupu_orchestrator::RunStatus::Running,
+        "status must be Running after tick 1"
+    );
+
+    // `run.json` must NOT be in consumed after the fix so tick 2 re-mirrors it.
+    assert!(
+        !consumed.contains("run.json"),
+        "run.json must not be in consumed (fix: re-mirror each tick)"
+    );
+
+    // ── Tick 2: node OVERWRITES run.json with status = AwaitingApproval ───────
+
+    let mut record_v2 = store.load(run_id).unwrap();
+    record_v2.status = rupu_orchestrator::RunStatus::AwaitingApproval;
+    let run_json_v2 = serde_json::to_vec(&record_v2).unwrap();
+    // Overwrite the SAME key "run.json" — simulates the node re-uploading on its tick.
+    bucket
+        .put_result(run_id, "run.json", &run_json_v2)
+        .await
+        .unwrap();
+
+    // Same consumed set as tick 1 (the real poller reuses it across ticks).
+    let done2 = poll_bucket_run(&bucket, &mirror, host_id, run_id, &mut consumed)
+        .await
+        .expect("tick 2 poll must succeed");
+    assert!(!done2, "still no finished marker — must return false");
+
+    // Central run must now reflect AwaitingApproval — proving run.json was
+    // re-mirrored on tick 2 despite being the same bucket key.
+    let after_tick2 = store.load(run_id).unwrap();
+    assert_eq!(
+        after_tick2.status,
+        rupu_orchestrator::RunStatus::AwaitingApproval,
+        "status must be AwaitingApproval after tick 2 (run.json re-mirrored)"
+    );
+}
+
 // ── bucket_dead_drop_e2e ──────────────────────────────────────────────────────
 
 /// Full dead-drop path end-to-end, using a SINGLE shared in-memory bucket:

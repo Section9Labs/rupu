@@ -54,9 +54,13 @@ pub async fn poll_bucket_run(
         match file {
             ArtifactFile::RunJson => {
                 // run.json is a single JSON document, not newline-delimited.
+                // Re-mirror on EVERY tick — the node overwrites this key each
+                // tick with updated status (e.g. awaiting_approval mid-run).
+                // Do NOT add "run.json" to `consumed` so each poll picks it up.
                 mirror
                     .append(run_id, host_id, ArtifactFile::RunJson, &body_str)
                     .with_context(|| format!("mirror.append RunJson for run {run_id}"))?;
+                continue; // skip the `consumed.insert` below
             }
             _ => {
                 // JSONL: split on newline and mirror each non-empty line.
