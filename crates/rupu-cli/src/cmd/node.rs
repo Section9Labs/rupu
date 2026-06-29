@@ -238,12 +238,13 @@ async fn run_agent_loop(cp_url: &str, token: &str, node_id: &str) -> anyhow::Res
 
     let exe = std::env::current_exe().context("resolve current executable path")?;
     let mut backoff_secs: u64 = 1;
-    const BACKOFF_CAP: u64 = 60;
 
     loop {
         info!(url = %cp_url, node_id = %node_id, "node: connecting");
         match connect_and_run(cp_url, token, node_id, &exe).await {
             Ok(()) => {
+                // Clean close: reset backoff so the next attempt is prompt.
+                backoff_secs = 1;
                 warn!("node: connection closed; reconnecting in {backoff_secs}s");
             }
             Err(e) => {
@@ -251,8 +252,14 @@ async fn run_agent_loop(cp_url: &str, token: &str, node_id: &str) -> anyhow::Res
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(BACKOFF_CAP);
+        backoff_secs = next_backoff(backoff_secs);
     }
+}
+
+/// Compute the next exponential-backoff interval, capped at [`BACKOFF_CAP`].
+const BACKOFF_CAP: u64 = 60;
+fn next_backoff(current: u64) -> u64 {
+    (current * 2).min(BACKOFF_CAP)
 }
 
 // ---------------------------------------------------------------------------
@@ -800,5 +807,19 @@ mod tests {
         };
         let argv = build_argv("run_W", &spec);
         assert_eq!(argv, vec!["run", "check", "--run-id", "run_W"]);
+    }
+
+    // ------------------------------------------------------------------
+    // next_backoff
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn next_backoff_doubles() {
+        assert_eq!(next_backoff(1), 2);
+    }
+
+    #[test]
+    fn next_backoff_caps_at_60() {
+        assert_eq!(next_backoff(40), 60);
     }
 }
