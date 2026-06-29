@@ -124,12 +124,17 @@ impl HostConnector for BucketHostConnector {
             .create_run(&run_id, &self.host_id, &spec)
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
-        let bytes =
-            serde_json::to_vec(&spec).map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        let bytes = serde_json::to_vec(&spec).map_err(|e| {
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+            HostConnectorError::Invalid(e.to_string())
+        })?;
         self.bucket
             .put_job(&run_id, &bytes)
             .await
-            .map_err(bucket_err_to_unreachable)?;
+            .map_err(|e| {
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+                bucket_err_to_unreachable(e)
+            })?;
 
         Ok(run_id)
     }
@@ -150,12 +155,17 @@ impl HostConnector for BucketHostConnector {
             .create_run(&run_id, &self.host_id, &spec)
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
-        let bytes =
-            serde_json::to_vec(&spec).map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        let bytes = serde_json::to_vec(&spec).map_err(|e| {
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+            HostConnectorError::Invalid(e.to_string())
+        })?;
         self.bucket
             .put_job(&run_id, &bytes)
             .await
-            .map_err(bucket_err_to_unreachable)?;
+            .map_err(|e| {
+                let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+                bucket_err_to_unreachable(e)
+            })?;
 
         Ok(run_id)
     }
@@ -462,6 +472,102 @@ mod tests {
         assert!(
             matches!(err, HostConnectorError::Invalid(_)),
             "proxy_get_json must return Invalid"
+        );
+    }
+
+    // ── FailingBucket: test double whose put_job always fails ─────────────────
+
+    struct FailingBucket;
+
+    #[async_trait::async_trait]
+    impl Bucket for FailingBucket {
+        async fn put_job(&self, _run_id: &str, _envelope: &[u8]) -> Result<(), BucketError> {
+            Err(BucketError::Io("boom".into()))
+        }
+        async fn list_jobs(&self) -> Result<Vec<String>, BucketError> {
+            unimplemented!("FailingBucket::list_jobs")
+        }
+        async fn claim_job(&self, _run_id: &str, _worker: &str) -> Result<bool, BucketError> {
+            unimplemented!("FailingBucket::claim_job")
+        }
+        async fn get_job(&self, _run_id: &str) -> Result<Vec<u8>, BucketError> {
+            unimplemented!("FailingBucket::get_job")
+        }
+        async fn put_control(
+            &self,
+            _run_id: &str,
+            _seq: u64,
+            _envelope: &[u8],
+        ) -> Result<(), BucketError> {
+            unimplemented!("FailingBucket::put_control")
+        }
+        async fn list_control(&self, _run_id: &str) -> Result<Vec<(u64, Vec<u8>)>, BucketError> {
+            unimplemented!("FailingBucket::list_control")
+        }
+        async fn put_result(
+            &self,
+            _run_id: &str,
+            _key: &str,
+            _body: &[u8],
+        ) -> Result<(), BucketError> {
+            unimplemented!("FailingBucket::put_result")
+        }
+        async fn list_results(
+            &self,
+            _run_id: &str,
+        ) -> Result<Vec<(String, Vec<u8>)>, BucketError> {
+            unimplemented!("FailingBucket::list_results")
+        }
+        async fn put_finished(&self, _run_id: &str, _status: &str) -> Result<(), BucketError> {
+            unimplemented!("FailingBucket::put_finished")
+        }
+        async fn get_finished(&self, _run_id: &str) -> Result<Option<String>, BucketError> {
+            unimplemented!("FailingBucket::get_finished")
+        }
+        async fn probe(&self) -> Result<(), BucketError> {
+            unimplemented!("FailingBucket::probe")
+        }
+    }
+
+    #[tokio::test]
+    async fn put_job_failure_cleans_up_mirror_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_store = Arc::new(rupu_orchestrator::runs::RunStore::new(
+            tmp.path().join("runs"),
+        ));
+        let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        let bucket: Arc<dyn Bucket> = Arc::new(FailingBucket);
+        let conn = BucketHostConnector::new(
+            "host_failing",
+            bucket,
+            mirror,
+            Arc::clone(&run_store),
+            rupu_config::PricingConfig::default(),
+        );
+
+        let err = conn
+            .launch_run(LaunchRequest {
+                workflow: "wf".into(),
+                inputs: Default::default(),
+                mode: None,
+                target: None,
+                working_dir: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "put_job failure must map to Unreachable, got: {err:?}"
+        );
+
+        // The mirror run must NOT be left Running — cleanup must set it to Failed.
+        let runs = run_store.list().unwrap();
+        assert_eq!(runs.len(), 1, "exactly one run must exist in the store");
+        assert_eq!(
+            runs[0].status,
+            rupu_orchestrator::RunStatus::Failed,
+            "mirror run must be transitioned to Failed, not left Running"
         );
     }
 }
