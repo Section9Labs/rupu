@@ -14,7 +14,7 @@ use crate::model_pool::{ModelCapability, ModelCost, ModelInfo, ModelState, Model
 use crate::provider::LlmProvider;
 use crate::provider_id::ProviderId;
 use crate::sse::SseParser;
-use crate::types::{LlmRequest, LlmResponse, StreamEvent};
+use crate::types::{ContentBlock, LlmRequest, LlmResponse, StreamEvent};
 
 /// A model offered by an OpenAI-compatible endpoint, declared in config.
 #[derive(Debug, Clone)]
@@ -70,7 +70,7 @@ impl OpenAiCompatibleClient {
         crate::openai_wire::build_chat_request_body(request, stream)
     }
 
-    fn headers(&self) -> Result<reqwest::header::HeaderMap, ProviderError> {
+    fn headers(&self, stream: bool) -> Result<reqwest::header::HeaderMap, ProviderError> {
         let mut headers = reqwest::header::HeaderMap::new();
         let auth_val = format!("Bearer {}", self.api_key).parse().map_err(|_| {
             ProviderError::AuthConfig("api key contains invalid header characters".into())
@@ -80,10 +80,12 @@ impl OpenAiCompatibleClient {
             reqwest::header::CONTENT_TYPE,
             "application/json".parse().unwrap(),
         );
-        headers.insert(
-            reqwest::header::ACCEPT,
-            "text/event-stream".parse().unwrap(),
-        );
+        let accept = if stream {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        headers.insert(reqwest::header::ACCEPT, accept.parse().unwrap());
         Ok(headers)
     }
 
@@ -92,7 +94,7 @@ impl OpenAiCompatibleClient {
         let response = self
             .client
             .post(self.completions_url())
-            .headers(self.headers()?)
+            .headers(self.headers(false)?)
             .json(&body)
             .send()
             .await
@@ -121,7 +123,7 @@ impl OpenAiCompatibleClient {
         let response = self
             .client
             .post(self.completions_url())
-            .headers(self.headers()?)
+            .headers(self.headers(true)?)
             .json(&body)
             .send()
             .await
@@ -148,12 +150,16 @@ impl OpenAiCompatibleClient {
     }
 
     fn model_info(&self, m: &OpenAiCompatibleModel) -> ModelInfo {
+        let mut capabilities = vec![ModelCapability::ToolUse];
+        if self.stream {
+            capabilities.push(ModelCapability::Streaming);
+        }
         ModelInfo {
             id: m.id.clone(),
             provider: ProviderId::OpenaiCompatible,
             context_window: m.context_window,
             max_output_tokens: m.max_output,
-            capabilities: vec![ModelCapability::ToolUse, ModelCapability::Streaming],
+            capabilities,
             cost: ModelCost {
                 input_per_million: 0.0,
                 output_per_million: 0.0,
@@ -166,6 +172,29 @@ impl OpenAiCompatibleClient {
                 last_error: None,
                 consecutive_failures: 0,
             },
+        }
+    }
+}
+
+/// Emit stream events for an already-complete response, so the `stream=false`
+/// fallback produces the same event sequence a real SSE stream would.
+fn emit_response_events(
+    resp: &LlmResponse,
+    on_event: &mut (dyn FnMut(StreamEvent) + Send),
+) {
+    for block in &resp.content {
+        match block {
+            ContentBlock::Text { text } => {
+                on_event(StreamEvent::TextDelta(text.clone()));
+            }
+            ContentBlock::ToolUse { id, name, input } => {
+                on_event(StreamEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+                on_event(StreamEvent::InputJsonDelta(input.to_string()));
+            }
+            ContentBlock::ToolResult { .. } => {}
         }
     }
 }
@@ -184,12 +213,10 @@ impl LlmProvider for OpenAiCompatibleClient {
         if self.stream {
             self.stream_inner(request, on_event).await
         } else {
-            // Server doesn't support SSE — do a blocking send and emit the
-            // text as a single delta so callers see consistent events.
+            // Server doesn't support SSE — do a blocking send and synthesise
+            // the same event sequence a real SSE stream would have produced.
             let resp = self.send_inner(request).await?;
-            if let Some(text) = resp.text() {
-                on_event(StreamEvent::TextDelta(text.to_string()));
-            }
+            emit_response_events(&resp, on_event);
             Ok(resp)
         }
     }
@@ -283,5 +310,50 @@ mod tests {
             models[0].provider,
             crate::provider_id::ProviderId::OpenaiCompatible
         );
+    }
+
+    #[test]
+    fn emit_response_events_surfaces_text_and_tool_calls() {
+        use crate::types::{ContentBlock, LlmResponse, StopReason, Usage};
+        let resp = LlmResponse {
+            id: "1".into(),
+            model: "m".into(),
+            content: vec![
+                ContentBlock::Text { text: "hi".into() },
+                ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                },
+            ],
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Usage::default(),
+        };
+        let mut events = Vec::new();
+        emit_response_events(&resp, &mut |e| events.push(e));
+        assert!(matches!(events[0], StreamEvent::TextDelta(ref t) if t == "hi"));
+        assert!(
+            matches!(events[1], StreamEvent::ToolUseStart { ref name, .. } if name == "read_file")
+        );
+        assert!(matches!(events[2], StreamEvent::InputJsonDelta(_)));
+    }
+
+    #[tokio::test]
+    async fn list_models_streaming_false_omits_streaming_capability() {
+        use crate::model_pool::ModelCapability;
+        let c = OpenAiCompatibleClient::new(
+            "http://host:8080",
+            "k",
+            "m",
+            vec![OpenAiCompatibleModel {
+                id: "m".into(),
+                context_window: 4096,
+                max_output: 1024,
+            }],
+            false,
+        );
+        let models = c.list_models().await;
+        assert!(!models[0].capabilities.contains(&ModelCapability::Streaming));
+        assert!(models[0].capabilities.contains(&ModelCapability::ToolUse));
     }
 }
