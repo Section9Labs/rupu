@@ -715,6 +715,7 @@ async fn archive_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(&id)?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Archive).await
 }
 
@@ -722,6 +723,7 @@ async fn restore_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(&id)?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Restore).await
 }
 
@@ -729,6 +731,7 @@ async fn delete_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(&id)?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Delete).await
 }
 
@@ -922,6 +925,39 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// Traversal ids must be rejected with 400 BEFORE the mutator is reached.
+    /// The no-mutator state (→ 501) is never hit when the id is invalid, which
+    /// proves the guard fires first.
+    #[tokio::test]
+    async fn archive_session_traversal_id_is_bad_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), Default::default());
+        let err = archive_session(State(state), Path("../../etc".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn restore_session_traversal_id_is_bad_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), Default::default());
+        let err = restore_session(State(state), Path("../../etc".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_session_traversal_id_is_bad_request() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new(tmp.path().to_path_buf(), Default::default());
+        let err = delete_session(State(state), Path("../../etc".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
     use crate::session_sender::{SendError, SendMessageRequest, SessionSender};

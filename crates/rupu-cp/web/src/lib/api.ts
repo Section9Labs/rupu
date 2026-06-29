@@ -1068,9 +1068,10 @@ export const api = {
   async deleteRun(id: string): Promise<void> {
     await request(`/api/runs/${encodeURIComponent(id)}`, { method: 'DELETE' });
   },
-  /** List archived workflow runs (hidden from the default run list). */
-  getArchivedRuns(): Promise<RunListRow[]> {
-    return request<RunListRow[]>('/api/runs/archived');
+  /** List archived runs. Pass `kind = 'workflow'` to restrict to workflow-kind only. */
+  getArchivedRuns(kind?: string): Promise<RunListRow[]> {
+    const qs = kind ? `?kind=${encodeURIComponent(kind)}` : '';
+    return request<RunListRow[]>(`/api/runs/archived${qs}`);
   },
   getRunUsageTimeline(id: string, opts?: { host?: string }): Promise<UsageTimelinePoint[]> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';

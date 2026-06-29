@@ -86,7 +86,7 @@ export default function WorkflowRuns() {
     setRefreshing(true);
     try {
       if (archived) {
-        const data = await api.getArchivedRuns();
+        const data = await api.getArchivedRuns('workflow');
         setRuns(data);
         setHasMore(false);
       } else {

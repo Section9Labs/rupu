@@ -678,6 +678,19 @@ async fn get_run_usage_timeline(
     ))
 }
 
+/// Reject any `id` that could be used as a path-traversal vector.
+///
+/// The axum `Path` extractor percent-decodes the segment, so `..%2F..%2Fx`
+/// arrives as `../../x`. We refuse ids that are empty or that contain `/`,
+/// `\`, or the `..` component — a valid ULID-style run id never contains any
+/// of those characters.
+pub(crate) fn validate_id(id: &str) -> Result<(), ApiError> {
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(ApiError::bad_request(format!("invalid run id: {id:?}")));
+    }
+    Ok(())
+}
+
 /// Map a [`RunStoreError`] to an [`ApiError`]:
 /// - `NotFound` → 404
 /// - `NotTerminal` / `AlreadyExists` → 409
@@ -704,6 +717,7 @@ async fn archive_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_id(&id)?;
     s.run_store
         .archive(&id)
         .map_err(|e| map_run_store_err(&id, e))?;
@@ -719,6 +733,7 @@ async fn restore_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_id(&id)?;
     s.run_store
         .restore(&id)
         .map_err(|e| map_run_store_err(&id, e))?;
@@ -737,6 +752,7 @@ async fn delete_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    validate_id(&id)?;
     // Guard: refuse to delete a non-terminal active run.
     // `load` only checks the active scope; archived runs are always terminal.
     if let Ok(rec) = s.run_store.load(&id) {
@@ -754,17 +770,35 @@ async fn delete_run(
     ))
 }
 
-/// `GET /api/runs/archived` — list archived runs, newest-first.
+/// Optional `?kind=<workflow|…>` filter for `GET /api/runs/archived`.
+/// Absent → return all archived runs (backward-compatible).
+#[derive(serde::Deserialize, Default)]
+struct ArchivedQuery {
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// `GET /api/runs/archived[?kind=workflow]` — list archived runs, newest-first.
 ///
 /// Returns the same wire shape as the local path of `GET /api/runs`: each row
 /// is a [`RunListRow`] serialized to JSON with `"host_id": "local"` injected,
 /// matching the field added by [`fan_out_list_runs`] and the single-host path
 /// of `list_runs`.
-async fn list_archived_runs(State(s): State<AppState>) -> ApiResult<Json<Vec<serde_json::Value>>> {
-    let records = s
+///
+/// When `?kind=workflow` is present, only manually-dispatched runs (no event
+/// payload and no cron wake id) are returned — mirroring the predicate used by
+/// `list_workflow_runs` / `query_run_rows(workflow_only = true)`.
+async fn list_archived_runs(
+    State(s): State<AppState>,
+    Query(q): Query<ArchivedQuery>,
+) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let mut records = s
         .run_store
         .list_archived()
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    if q.kind.as_deref() == Some("workflow") {
+        records.retain(|r| r.event.is_none() && r.source_wake_id.is_none());
+    }
     let mut rows = Vec::with_capacity(records.len());
     for r in &records {
         let row = RunListRow::with_usage(r, &s.run_store, &s.pricing);
@@ -1085,7 +1119,7 @@ mod tests {
         s.run_store.create(rec, "name: x\n").unwrap();
         s.run_store.archive("run_01ARCHIVEDROW").unwrap();
 
-        let resp = list_archived_runs(State(s))
+        let resp = list_archived_runs(State(s), Query(ArchivedQuery { kind: None }))
             .await
             .expect("list_archived_runs should succeed");
         let rows = resp.0;
@@ -1095,6 +1129,73 @@ mod tests {
             serde_json::json!("local"),
             "archived row must carry host_id=local to match list_runs wire shape"
         );
+    }
+
+    #[tokio::test]
+    async fn list_archived_runs_kind_workflow_excludes_event_runs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        // Workflow run (event: None, source_wake_id: None) — must be returned.
+        let wf = terminal_record("run_01WF");
+        s.run_store.create(wf, "name: x\n").unwrap();
+        s.run_store.archive("run_01WF").unwrap();
+
+        // Non-workflow run (event payload set) — must be excluded.
+        let mut ev = terminal_record("run_01EV");
+        ev.event = Some(serde_json::json!({"type": "push"}));
+        s.run_store.create(ev, "name: x\n").unwrap();
+        s.run_store.archive("run_01EV").unwrap();
+
+        // Without kind filter: both rows.
+        let all = list_archived_runs(State(s.clone()), Query(ArchivedQuery { kind: None }))
+            .await
+            .expect("no-filter should succeed");
+        assert_eq!(all.0.len(), 2, "unfiltered should return both");
+
+        // With kind=workflow: only the workflow run.
+        let wf_only = list_archived_runs(
+            State(s),
+            Query(ArchivedQuery {
+                kind: Some("workflow".into()),
+            }),
+        )
+        .await
+        .expect("kind=workflow should succeed");
+        assert_eq!(wf_only.0.len(), 1, "kind=workflow should exclude event run");
+        assert_eq!(wf_only.0[0]["id"], serde_json::json!("run_01WF"));
+    }
+
+    #[tokio::test]
+    async fn archive_run_traversal_id_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let err = archive_run(State(s.clone()), Path("../../etc".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        // No filesystem side-effects: archive dir stays empty.
+        assert_eq!(s.run_store.list_archived().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn restore_run_traversal_id_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let err = restore_run(State(s), Path("../../etc".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn delete_run_traversal_id_is_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        let err = delete_run(State(s), Path("../../etc".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
