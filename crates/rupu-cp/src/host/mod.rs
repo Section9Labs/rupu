@@ -11,4 +11,5 @@ pub mod connector;
 pub mod http;
 pub mod local;
 pub mod registry;
+pub mod ssh;
 pub mod tunnel;
