@@ -78,7 +78,7 @@ impl ProviderRegistry {
                 info!(provider = "github-copilot", "provider created");
                 Ok(Box::new(client))
             }
-            ProviderId::OpenAiCompatible => Err(ProviderError::NotImplemented {
+            ProviderId::OpenaiCompatible => Err(ProviderError::NotImplemented {
                 provider:
                     "openai-compatible (built via runtime provider factory, not the OAuth registry)"
                         .to_string(),

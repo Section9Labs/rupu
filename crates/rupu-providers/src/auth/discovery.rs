@@ -33,7 +33,7 @@ pub fn discover(provider: ProviderId) -> Option<DiscoveredCredential> {
             discover_google("google-antigravity", ProviderId::GoogleAntigravity)
         }
         ProviderId::GithubCopilot => discover_github_copilot(),
-        ProviderId::OpenAiCompatible => None,
+        ProviderId::OpenaiCompatible => None,
     }
 }
 

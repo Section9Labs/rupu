@@ -108,7 +108,7 @@ impl ModelMap {
                 deep_think: "o3",
                 code: "claude-sonnet-4-6",
             },
-            ProviderId::OpenAiCompatible => Self {
+            ProviderId::OpenaiCompatible => Self {
                 provider: id,
                 fast: "",
                 default: "",
