@@ -29,7 +29,7 @@ pub use poller::poll_bucket_run;
 /// Both the connector (T3) and the node agent (T6) use this SAME type so
 /// there is no wire-format drift between the two ends of the protocol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct ControlEnvelope {
+pub struct ControlEnvelope {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
