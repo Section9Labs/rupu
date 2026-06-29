@@ -124,7 +124,13 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     )
     .with_pricing(pricing);
     let store = rupu_workspace::HostStore { root: app_state.global_dir.join("hosts") };
-    let registry = crate::host::registry::HostRegistry::new(store, std::sync::Arc::new(local));
+    let registry = crate::host::registry::HostRegistry::new(store, std::sync::Arc::new(local))
+        .with_tunnel_deps(
+            std::sync::Arc::clone(&app_state.node_registry),
+            std::sync::Arc::clone(&app_state.node_mirror),
+            std::sync::Arc::clone(&app_state.run_store),
+            app_state.pricing.clone(),
+        );
     let app_state = app_state.with_hosts(std::sync::Arc::new(registry));
 
     let app = server::router(app_state, opts.token);

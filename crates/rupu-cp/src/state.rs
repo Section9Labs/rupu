@@ -44,6 +44,10 @@ impl AppState {
         let workspace_dir =
             std::env::current_dir().unwrap_or_else(|_| global_dir.clone());
 
+        // Build tunnel deps first so they can be wired into the host registry.
+        let node_registry = Arc::new(crate::node::NodeRegistry::new());
+        let node_mirror = Arc::new(crate::node::NodeMirror::new(Arc::clone(&run_store)));
+
         // Build a read-only local-only registry. All launchers are `None` so
         // write-path operations return `HostConnectorError::Invalid`; list/get
         // run queries work fine because they only need `run_store`.
@@ -57,13 +61,14 @@ impl AppState {
         )
         .with_pricing(pricing.clone());
         let store = rupu_workspace::HostStore { root: global_dir.join("hosts") };
-        let hosts = Arc::new(crate::host::registry::HostRegistry::new(
-            store,
-            Arc::new(local),
-        ));
-
-        let node_registry = Arc::new(crate::node::NodeRegistry::new());
-        let node_mirror = Arc::new(crate::node::NodeMirror::new(Arc::clone(&run_store)));
+        let hosts = Arc::new(
+            crate::host::registry::HostRegistry::new(store, Arc::new(local)).with_tunnel_deps(
+                Arc::clone(&node_registry),
+                Arc::clone(&node_mirror),
+                Arc::clone(&run_store),
+                pricing.clone(),
+            ),
+        );
 
         Self {
             global_dir,

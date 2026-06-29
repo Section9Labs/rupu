@@ -9,10 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use futures_util::StreamExt as _;
 use rupu_orchestrator::{
-    executor::FileTailRunSource,
     runs::{CancelError, RunStore},
     ApprovalError, RunStoreError,
 };
@@ -21,8 +18,8 @@ use crate::{
     agent_launcher::{AgentLaunchRequest, AgentLauncher},
     api::runs::{query_run_detail, query_run_rows},
     host::connector::{
-        EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind,
-        RunListQuery,
+        open_run_events_tail, read_transcript_file, EventByteStream, HostCapabilities,
+        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
     },
     launcher::{LaunchRequest, RunLauncher},
     session_sender::{SendMessageRequest, SessionSender},
@@ -169,6 +166,7 @@ impl HostConnector for LocalHostConnector {
             params.limit,
             params.lifecycle.as_deref(),
             workflow_only,
+            None, // local host shows all runs regardless of worker_id
             &self.pricing,
         )
         .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
@@ -226,19 +224,7 @@ impl HostConnector for LocalHostConnector {
             .load(run_id)
             .map_err(|e| map_store_err(run_id, e))?;
 
-        let events_path = self.run_store.events_path(run_id);
-        let source = FileTailRunSource::open(&events_path)
-            .await
-            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
-
-        let stream = source.map(|ev| {
-            let json = serde_json::to_string(&ev)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let frame = format!("data: {json}\n\n");
-            Ok::<Bytes, std::io::Error>(Bytes::from(frame.into_bytes()))
-        });
-
-        Ok(Box::pin(stream))
+        open_run_events_tail(&self.run_store, run_id).await
     }
 
     async fn proxy_get_json(
@@ -258,26 +244,6 @@ impl HostConnector for LocalHostConnector {
         &self,
         path: &str,
     ) -> Result<serde_json::Value, HostConnectorError> {
-        use std::path::Path;
-        let p = Path::new(path);
-        // Basic safety: no traversal, must be .jsonl
-        if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            return Err(HostConnectorError::Invalid("not a .jsonl file".into()));
-        }
-        if p.components().any(|c| c == std::path::Component::ParentDir) {
-            return Err(HostConnectorError::Invalid(
-                "path must not contain ..".into(),
-            ));
-        }
-        if !p.exists() {
-            return Ok(serde_json::json!({ "events": [], "summary": null }));
-        }
-        let events: Vec<rupu_transcript::Event> =
-            rupu_transcript::JsonlReader::iter(p)
-                .map_err(|e| HostConnectorError::Invalid(e.to_string()))?
-                .filter_map(Result::ok)
-                .collect();
-        let summary = rupu_transcript::JsonlReader::summary(p).ok();
-        Ok(serde_json::json!({ "events": events, "summary": summary }))
+        read_transcript_file(path)
     }
 }

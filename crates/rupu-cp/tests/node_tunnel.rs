@@ -579,6 +579,296 @@ async fn ws_valid_hello_receives_welcome_and_is_online() {
     );
 }
 
+// ── TunnelHostConnector ───────────────────────────────────────────────────────
+
+mod tunnel_connector {
+    use rupu_cp::{
+        host::connector::{HostConnector, HostConnectorError, RunKind, RunListQuery},
+        host::tunnel::TunnelHostConnector,
+        node::{mirror::NodeMirror, protocol::RunSpec, protocol::RunSpecKind, Frame, NodeRegistry},
+    };
+    use rupu_orchestrator::runs::RunStore;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::mpsc;
+
+    fn make_spec(name: &str) -> RunSpec {
+        RunSpec {
+            kind: RunSpecKind::Workflow,
+            name: name.to_string(),
+            inputs: BTreeMap::new(),
+            prompt: None,
+            mode: None,
+            target: None,
+        }
+    }
+
+    fn make_launch_req(workflow: &str) -> rupu_cp::launcher::LaunchRequest {
+        rupu_cp::launcher::LaunchRequest {
+            workflow: workflow.to_string(),
+            inputs: BTreeMap::new(),
+            mode: None,
+            target: None,
+            working_dir: None,
+        }
+    }
+
+    fn make_agent_req(agent: &str) -> rupu_cp::agent_launcher::AgentLaunchRequest {
+        rupu_cp::agent_launcher::AgentLaunchRequest {
+            agent: agent.to_string(),
+            prompt: Some("do the thing".to_string()),
+            mode: None,
+            target: None,
+            working_dir: None,
+        }
+    }
+
+    /// Register a fake node with a channel we hold onto, and return the
+    /// connector + the receiver so tests can observe frames.
+    fn setup(
+        node_id: &str,
+        dir: &std::path::Path,
+    ) -> (TunnelHostConnector, mpsc::Receiver<Frame>, Arc<RunStore>) {
+        let (tx, rx) = mpsc::channel(16);
+        let run_store = Arc::new(RunStore::new(dir.join("runs")));
+        let registry = Arc::new(NodeRegistry::new());
+        registry.register(node_id, tx);
+        let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        let conn = TunnelHostConnector::new(
+            node_id,
+            registry,
+            mirror,
+            Arc::clone(&run_store),
+            rupu_config::PricingConfig::default(),
+        );
+        (conn, rx, run_store)
+    }
+
+    /// (1) `launch_run` on an ONLINE node creates a mirror run AND the node
+    /// receives `Frame::Run` with the allocated run_id.
+    #[tokio::test]
+    async fn launch_run_online_creates_mirror_and_sends_frame() {
+        let dir = tempdir().unwrap();
+        let node_id = "node-tunnel-1";
+        let (conn, mut rx, run_store) = setup(node_id, dir.path());
+
+        let req = make_launch_req("my-workflow");
+        let run_id = conn.launch_run(req).await.expect("launch_run should succeed");
+
+        // The mirror must have a record for this run_id.
+        let record = run_store.load(&run_id).expect("run should be in mirror store");
+        assert_eq!(record.worker_id.as_deref(), Some(node_id));
+        assert_eq!(record.workflow_name, "my-workflow");
+
+        // The node must have received a Run frame with that run_id.
+        let frame = rx.recv().await.expect("should receive a frame");
+        match frame {
+            Frame::Run { run_id: fid, spec } => {
+                assert_eq!(fid, run_id, "frame run_id must match allocated run_id");
+                assert_eq!(spec.name, "my-workflow");
+                assert_eq!(spec.kind, RunSpecKind::Workflow);
+            }
+            other => panic!("expected Frame::Run, got {other:?}"),
+        }
+    }
+
+    /// (2) `cancel_run` sends `Frame::Cancel` with the correct run_id.
+    #[tokio::test]
+    async fn cancel_run_sends_cancel_frame() {
+        let dir = tempdir().unwrap();
+        let node_id = "node-tunnel-2";
+        let (conn, mut rx, _store) = setup(node_id, dir.path());
+
+        // `cancel_run` sends the frame regardless of whether the run exists in the
+        // mirror; the node decides what to do with it.
+        let run_id = "run_CANCEL001";
+        conn.cancel_run(run_id).await.expect("cancel_run should succeed");
+
+        let frame = rx.recv().await.expect("should receive a frame");
+        match frame {
+            Frame::Cancel { run_id: fid } => {
+                assert_eq!(fid, run_id);
+            }
+            other => panic!("expected Frame::Cancel, got {other:?}"),
+        }
+    }
+
+    /// (3) `launch_run` on an OFFLINE node → `HostConnectorError::Unreachable`.
+    #[tokio::test]
+    async fn launch_run_offline_node_returns_unreachable() {
+        let dir = tempdir().unwrap();
+        let run_store = Arc::new(RunStore::new(dir.path().join("runs")));
+        // Do NOT register the node → it is offline.
+        let registry = Arc::new(NodeRegistry::new());
+        let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        let conn = TunnelHostConnector::new(
+            "node-offline",
+            registry,
+            mirror,
+            run_store,
+            rupu_config::PricingConfig::default(),
+        );
+
+        let req = make_launch_req("some-wf");
+        let err = conn.launch_run(req).await.expect_err("should fail when node is offline");
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    /// (4) `list_runs` returns this node's mirrored runs and excludes other
+    /// nodes' runs.
+    #[tokio::test]
+    async fn list_runs_scoped_to_node() {
+        let dir = tempdir().unwrap();
+        let run_store = Arc::new(RunStore::new(dir.path().join("runs")));
+        let mirror = Arc::new(NodeMirror::new(Arc::clone(&run_store)));
+        let registry = Arc::new(NodeRegistry::new());
+
+        let my_node = "node-mine";
+        let other_node = "node-other";
+
+        // Seed two runs for my_node and one for other_node.
+        let my_spec = make_spec("mine-wf");
+        mirror.create_run("run_MINE001", my_node, &my_spec).unwrap();
+        mirror.create_run("run_MINE002", my_node, &my_spec).unwrap();
+        let other_spec = make_spec("other-wf");
+        mirror.create_run("run_OTHER001", other_node, &other_spec).unwrap();
+
+        // Register my_node (online) so the connector can be built; list_runs
+        // doesn't require a live connection.
+        let (tx, _rx) = mpsc::channel(1);
+        registry.register(my_node, tx);
+
+        let conn = TunnelHostConnector::new(
+            my_node,
+            registry,
+            mirror,
+            Arc::clone(&run_store),
+            rupu_config::PricingConfig::default(),
+        );
+
+        let params = RunListQuery {
+            kind: RunKind::All,
+            offset: 0,
+            limit: 100,
+            lifecycle: None,
+        };
+        let rows = conn.list_runs(params).await.expect("list_runs should succeed");
+
+        assert_eq!(rows.len(), 2, "should return exactly 2 runs for my_node");
+        for row in &rows {
+            let id = row["id"].as_str().unwrap_or("");
+            assert!(
+                id.starts_with("run_MINE"),
+                "unexpected run in list: {id}"
+            );
+        }
+    }
+
+    /// `info()` returns `reachable = true` when the node is online.
+    #[tokio::test]
+    async fn info_reachable_when_online() {
+        let dir = tempdir().unwrap();
+        let (conn, _rx, _store) = setup("node-info", dir.path());
+        let info = conn.info().await.expect("info should succeed");
+        assert!(info.reachable, "node should be reachable when registered");
+    }
+
+    /// `info()` returns `reachable = false` when the node is offline.
+    #[tokio::test]
+    async fn info_not_reachable_when_offline() {
+        let dir = tempdir().unwrap();
+        let run_store = Arc::new(RunStore::new(dir.path().join("runs")));
+        let conn = TunnelHostConnector::new(
+            "node-gone",
+            Arc::new(NodeRegistry::new()),
+            Arc::new(NodeMirror::new(Arc::clone(&run_store))),
+            run_store,
+            rupu_config::PricingConfig::default(),
+        );
+        let info = conn.info().await.expect("info should succeed");
+        assert!(!info.reachable, "node should not be reachable when unregistered");
+    }
+
+    /// `start_session` and `send_session_turn` return `Invalid` (unsupported).
+    #[tokio::test]
+    async fn unsupported_session_ops_return_invalid() {
+        let dir = tempdir().unwrap();
+        let (conn, _rx, _store) = setup("node-unsup", dir.path());
+
+        let err = conn
+            .start_session(rupu_cp::session_starter::SessionStartRequest {
+                agent: "a".into(),
+                prompt: None,
+                mode: None,
+                target: None,
+                working_dir: None,
+            })
+            .await
+            .expect_err("start_session should fail");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+
+        let err = conn
+            .send_session_turn(rupu_cp::session_sender::SendMessageRequest {
+                session_id: "s".into(),
+                prompt: "hi".into(),
+            })
+            .await
+            .expect_err("send_session_turn should fail");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    /// `approve_run` and `reject_run` return `Invalid` (unsupported).
+    #[tokio::test]
+    async fn unsupported_approval_ops_return_invalid() {
+        let dir = tempdir().unwrap();
+        let (conn, _rx, _store) = setup("node-noapprove", dir.path());
+
+        let err = conn
+            .approve_run("run_x", "bypass")
+            .await
+            .expect_err("approve_run should fail");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+
+        let err = conn
+            .reject_run("run_x", None)
+            .await
+            .expect_err("reject_run should fail");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    /// `launch_agent` creates a mirror run with `RunSpecKind::Agent`.
+    #[tokio::test]
+    async fn launch_agent_online_creates_mirror_and_sends_frame() {
+        let dir = tempdir().unwrap();
+        let node_id = "node-agent-1";
+        let (conn, mut rx, run_store) = setup(node_id, dir.path());
+
+        let req = make_agent_req("my-agent");
+        let run_id = conn
+            .launch_agent(req)
+            .await
+            .expect("launch_agent should succeed");
+
+        let record = run_store.load(&run_id).unwrap();
+        assert_eq!(record.worker_id.as_deref(), Some(node_id));
+        assert_eq!(record.workflow_name, "my-agent");
+
+        let frame = rx.recv().await.expect("should receive a frame");
+        match frame {
+            Frame::Run { run_id: fid, spec } => {
+                assert_eq!(fid, run_id);
+                assert_eq!(spec.kind, RunSpecKind::Agent);
+                assert_eq!(spec.prompt.as_deref(), Some("do the thing"));
+            }
+            other => panic!("expected Frame::Run, got {other:?}"),
+        }
+    }
+}
+
 /// A `Hello` with a wrong token → server closes the connection and the node
 /// is NOT registered.
 #[tokio::test]

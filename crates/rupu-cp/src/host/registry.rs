@@ -6,15 +6,20 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use rupu_orchestrator::runs::RunStore;
 use rupu_workspace::{
     delete_host_token, get_host_token, set_host_token, Host, HostStore, HostStoreError,
     HostTransport,
 };
 use ulid::Ulid;
 
-use crate::host::{
-    connector::{HostConnector, HostConnectorError},
-    http::HttpHostConnector,
+use crate::{
+    host::{
+        connector::{HostConnector, HostConnectorError},
+        http::HttpHostConnector,
+        tunnel::TunnelHostConnector,
+    },
+    node::{NodeMirror, NodeRegistry},
 };
 
 // ── Error mapping ─────────────────────────────────────────────────────────────
@@ -30,6 +35,10 @@ impl From<HostStoreError> for HostConnectorError {
 /// Resolves a `host_id` string to a live `HostConnector`.
 ///
 /// - `"local"` always maps to the in-process `LocalHostConnector`.
+/// - `Tunnel` hosts resolve to a [`TunnelHostConnector`] when tunnel deps have
+///   been wired in via [`HostRegistry::with_tunnel_deps`]; otherwise they
+///   return an [`HostConnectorError::Invalid`] placeholder until Task 7 wires
+///   the deps.
 /// - All other IDs are looked up in the [`HostStore`], and an
 ///   [`HttpHostConnector`] is built from the stored transport + keychain token.
 /// - Resolved connectors are cached in a `Mutex<HashMap>` so repeated calls
@@ -39,19 +48,49 @@ pub struct HostRegistry {
     store: HostStore,
     local: Arc<dyn HostConnector>,
     cache: Mutex<HashMap<String, Arc<dyn HostConnector>>>,
+    /// Deps required to build a [`TunnelHostConnector`].  Set via
+    /// [`Self::with_tunnel_deps`]; `None` until wired by the caller (Task 7).
+    node_registry: Option<Arc<NodeRegistry>>,
+    node_mirror: Option<Arc<NodeMirror>>,
+    run_store: Option<Arc<RunStore>>,
+    pricing: rupu_config::PricingConfig,
 }
 
 impl HostRegistry {
     /// Create a new registry.
     ///
     /// `local` is the host[0] connector (always a `LocalHostConnector` in
-    /// production; may be any `HostConnector` in tests).
+    /// production; may be any `HostConnector` in tests).  Tunnel deps are not
+    /// present by default; call [`Self::with_tunnel_deps`] to enable tunnel
+    /// host resolution.
     pub fn new(store: HostStore, local: Arc<dyn HostConnector>) -> Self {
         Self {
             store,
             local,
             cache: Mutex::new(HashMap::new()),
+            node_registry: None,
+            node_mirror: None,
+            run_store: None,
+            pricing: rupu_config::PricingConfig::default(),
         }
+    }
+
+    /// Wire the deps needed to build [`TunnelHostConnector`] instances.
+    ///
+    /// Call this once after construction to enable resolution of `Tunnel`
+    /// transport hosts.  Can be chained: `HostRegistry::new(…).with_tunnel_deps(…)`.
+    pub fn with_tunnel_deps(
+        mut self,
+        node_registry: Arc<NodeRegistry>,
+        node_mirror: Arc<NodeMirror>,
+        run_store: Arc<RunStore>,
+        pricing: rupu_config::PricingConfig,
+    ) -> Self {
+        self.node_registry = Some(node_registry);
+        self.node_mirror = Some(node_mirror);
+        self.run_store = Some(run_store);
+        self.pricing = pricing;
+        self
     }
 
     /// Resolve `host_id` to a connector.
@@ -195,9 +234,22 @@ impl HostRegistry {
                 Ok(Arc::new(HttpHostConnector::new(base_url.clone(), token)))
             }
             HostTransport::Local => Ok(Arc::clone(&self.local)),
-            HostTransport::Tunnel { .. } => Err(HostConnectorError::Invalid(
-                "tunnel hosts are not yet resolvable via HostRegistry".to_string(),
-            )),
+            HostTransport::Tunnel { node_id } => {
+                match (&self.node_registry, &self.node_mirror, &self.run_store) {
+                    (Some(reg), Some(mir), Some(store)) => {
+                        Ok(Arc::new(TunnelHostConnector::new(
+                            node_id.clone(),
+                            Arc::clone(reg),
+                            Arc::clone(mir),
+                            Arc::clone(store),
+                            self.pricing.clone(),
+                        )))
+                    }
+                    _ => Err(HostConnectorError::Invalid(
+                        "tunnel deps not wired (call HostRegistry::with_tunnel_deps)".to_string(),
+                    )),
+                }
+            }
         }
     }
 }
