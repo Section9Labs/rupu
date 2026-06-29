@@ -268,6 +268,9 @@ impl HostRegistry {
                     )),
                 }
             }
+            HostTransport::Ssh { .. } => Err(HostConnectorError::Invalid(
+                "ssh transport not yet wired (slice 2c task 5)".to_string(),
+            )),
         }
     }
 }

@@ -113,6 +113,10 @@ pub(crate) fn list_hosts(
             HostTransport::Local => "local".to_string(),
             HostTransport::HttpCp { base_url } => base_url.clone(),
             HostTransport::Tunnel { node_id } => format!("tunnel:{node_id}"),
+            HostTransport::Ssh { host, port, .. } => match port {
+                Some(p) => format!("ssh:{host}:{p}"),
+                None => format!("ssh:{host}"),
+            },
         };
         rows.push((host.id, host.name, label));
     }
