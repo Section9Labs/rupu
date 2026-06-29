@@ -8,7 +8,7 @@
 
 use anyhow::Context;
 use clap::Subcommand;
-use rupu_workspace::{delete_host_token, set_host_token, Host, HostStore, HostTransport};
+use rupu_workspace::{add_ssh_host, delete_host_token, set_host_token, Host, HostStore, HostTransport};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,9 +32,20 @@ pub struct AddArgs {
     /// Display name for the host.
     pub name: String,
     /// Base URL of the remote rupu-cp instance (e.g. https://rupu.example.com).
+    /// Mutually exclusive with `--ssh`.
+    #[arg(long, conflicts_with = "ssh", required_unless_present = "ssh")]
+    pub url: Option<String>,
+    /// SSH destination: `user@host` or an `~/.ssh/config` alias. Selects the
+    /// Ssh transport. Mutually exclusive with `--url`.
     #[arg(long)]
-    pub url: String,
-    /// API token. Mutually exclusive with `--token-stdin`.
+    pub ssh: Option<String>,
+    /// SSH port override (default: 22). Only relevant with `--ssh`.
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Path to an SSH identity file. Only relevant with `--ssh`.
+    #[arg(long)]
+    pub identity: Option<PathBuf>,
+    /// API token. Mutually exclusive with `--token-stdin`. Only relevant with `--url`.
     #[arg(long, conflicts_with = "token_stdin")]
     pub token: Option<String>,
     /// Read the API token from stdin (one line). Mutually exclusive with `--token`.
@@ -96,6 +107,22 @@ pub(crate) fn add_host(
     Ok(id)
 }
 
+/// Add an SSH host. Returns the newly-minted host id.
+///
+/// No secret is stored — authentication is delegated to the system `ssh`.
+pub(crate) fn add_ssh_host_cli(
+    store_root: PathBuf,
+    name: String,
+    host: String,
+    port: Option<u16>,
+    identity_file: Option<PathBuf>,
+) -> anyhow::Result<String> {
+    let store = HostStore { root: store_root };
+    let record = add_ssh_host(&store, &name, &host, port, identity_file)
+        .context("save ssh host record")?;
+    Ok(record.id)
+}
+
 /// List all hosts. The implicit `local` entry is always first; remote hosts
 /// follow sorted by id (the order `HostStore::list` already returns).
 ///
@@ -153,19 +180,27 @@ fn hosts_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn add_inner(args: AddArgs) -> anyhow::Result<()> {
-    let token = if args.token_stdin {
-        let mut buf = String::new();
-        io::stdin().read_to_string(&mut buf)?;
-        let t = buf.trim().to_string();
-        if t.is_empty() {
-            anyhow::bail!("--token-stdin: no token received on stdin");
-        }
-        Some(t)
+    if let Some(ssh_dest) = args.ssh {
+        // SSH transport — no token involved.
+        let id = add_ssh_host_cli(hosts_dir()?, args.name, ssh_dest, args.port, args.identity)?;
+        println!("{id}");
     } else {
-        args.token
-    };
-    let id = add_host(hosts_dir()?, args.name, args.url, token)?;
-    println!("{id}");
+        // HttpCp transport.
+        let url = args.url.expect("clap requires --url when --ssh is absent");
+        let token = if args.token_stdin {
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf)?;
+            let t = buf.trim().to_string();
+            if t.is_empty() {
+                anyhow::bail!("--token-stdin: no token received on stdin");
+            }
+            Some(t)
+        } else {
+            args.token
+        };
+        let id = add_host(hosts_dir()?, args.name, url, token)?;
+        println!("{id}");
+    }
     Ok(())
 }
 
@@ -244,5 +279,74 @@ mod tests {
         assert_eq!(rows.len(), 1, "should have exactly one row (local)");
         assert_eq!(rows[0].0, "local");
         assert_eq!(rows[0].2, "local");
+    }
+
+    #[test]
+    fn ssh_add_roundtrip() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("hosts");
+
+        // -- add SSH host (no port, no identity) --
+        let id = add_ssh_host_cli(
+            root.clone(),
+            "edge".into(),
+            "deploy@edge.example".into(),
+            None,
+            None,
+        )
+        .expect("add_ssh_host_cli failed");
+        assert!(id.starts_with("host_"), "id should start with host_: {id}");
+
+        // -- host record must persist with correct Ssh transport --
+        let store = HostStore { root: root.clone() };
+        let hosts = store.list().expect("store.list failed");
+        let h = hosts
+            .iter()
+            .find(|h| h.id == id)
+            .expect("ssh host not found in store");
+        assert_eq!(h.name, "edge");
+        assert!(h.token_hash.is_none(), "Ssh hosts must not store a token");
+        match &h.transport {
+            HostTransport::Ssh { host, port, identity_file } => {
+                assert_eq!(host, "deploy@edge.example");
+                assert!(port.is_none(), "port should be None");
+                assert!(identity_file.is_none(), "identity_file should be None");
+            }
+            other => panic!("expected Ssh transport, got {other:?}"),
+        }
+
+        // -- add SSH host with port + identity --
+        let identity_path = PathBuf::from("/home/deploy/.ssh/id_ed25519");
+        let id2 = add_ssh_host_cli(
+            root.clone(),
+            "edge-custom".into(),
+            "deploy@edge2.example".into(),
+            Some(2222),
+            Some(identity_path.clone()),
+        )
+        .expect("add_ssh_host_cli with port+identity failed");
+
+        let hosts2 = store.list().expect("store.list 2 failed");
+        let h2 = hosts2
+            .iter()
+            .find(|h| h.id == id2)
+            .expect("second ssh host not found");
+        match &h2.transport {
+            HostTransport::Ssh { host, port, identity_file } => {
+                assert_eq!(host, "deploy@edge2.example");
+                assert_eq!(*port, Some(2222));
+                assert_eq!(identity_file.as_deref(), Some(identity_path.as_path()));
+            }
+            other => panic!("expected Ssh transport for id2, got {other:?}"),
+        }
+
+        // -- both appear in list with correct labels --
+        let rows = list_hosts(root.clone()).expect("list_hosts failed");
+        let found1 = rows.iter().find(|(i, _, _)| i == &id);
+        let found2 = rows.iter().find(|(i, _, _)| i == &id2);
+        assert!(found1.is_some(), "host {id} missing from list");
+        assert!(found2.is_some(), "host {id2} missing from list");
+        assert_eq!(found1.unwrap().2, "ssh:deploy@edge.example");
+        assert_eq!(found2.unwrap().2, "ssh:deploy@edge2.example:2222");
     }
 }
