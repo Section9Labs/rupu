@@ -14,8 +14,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-pub(crate) mod connector;
-pub(crate) use connector::BucketHostConnector;
+pub mod connector;
+pub use connector::BucketHostConnector;
 pub(crate) mod object_store_bucket;
 pub use object_store_bucket::ObjectStoreBucket;
 pub mod poller;

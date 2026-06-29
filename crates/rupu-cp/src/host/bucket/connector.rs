@@ -40,7 +40,7 @@ use crate::{
 /// Control operations (cancel/approve/reject) are queued as [`ControlEnvelope`]
 /// objects in the bucket's control prefix.  Observation reads back from the
 /// shared [`NodeMirror`] / [`RunStore`], identical to the tunnel connector.
-pub(crate) struct BucketHostConnector {
+pub struct BucketHostConnector {
     host_id: String,
     bucket: Arc<dyn Bucket>,
     mirror: Arc<NodeMirror>,
@@ -50,7 +50,7 @@ pub(crate) struct BucketHostConnector {
 
 impl BucketHostConnector {
     /// Construct a new connector.
-    pub(crate) fn new(
+    pub fn new(
         host_id: impl Into<String>,
         bucket: Arc<dyn Bucket>,
         mirror: Arc<NodeMirror>,
