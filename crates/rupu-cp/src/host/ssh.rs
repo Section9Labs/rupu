@@ -7,9 +7,29 @@
 
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::stream::Stream;
+use futures_util::StreamExt as _;
+use rupu_orchestrator::runs::RunStore;
+use ulid::Ulid;
+
+use crate::{
+    agent_launcher::AgentLaunchRequest,
+    host::connector::{
+        mirror_get_run, mirror_list_runs, mirror_stream_run_events, read_transcript_file,
+        EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
+        RunListQuery,
+    },
+    launcher::LaunchRequest,
+    node::{
+        protocol::{ArtifactFile, RunSpec, RunSpecKind},
+        NodeMirror,
+    },
+    session_sender::SendMessageRequest,
+    session_starter::SessionStartRequest,
+};
 
 // ── Pure builder functions ────────────────────────────────────────────────────
 
@@ -203,6 +223,356 @@ impl RemoteExec for SshExec {
     }
 }
 
+// ── SshHostConnector ──────────────────────────────────────────────────────────
+
+/// [`HostConnector`] backed by SSH transport.
+///
+/// Dispatches workflow/agent runs as detached remote processes via
+/// `setsid … </dev/null >/dev/null 2>&1 &`, mirrors their artifact files
+/// via an `ssh tail -f` pump that routes `==>` file headers to the right
+/// [`ArtifactFile`] variant, and issues control operations as one-shot
+/// remote `rupu workflow` commands.  Auth is entirely delegated to the
+/// system `ssh`; rupu stores no key material.
+pub(crate) struct SshHostConnector {
+    pub host_id: String,
+    pub exec: Arc<dyn RemoteExec>,
+    pub mirror: Arc<NodeMirror>,
+    pub run_store: Arc<RunStore>,
+    pub pricing: rupu_config::PricingConfig,
+}
+
+impl SshHostConnector {
+    /// Construct a new connector.
+    pub fn new(
+        host_id: impl Into<String>,
+        exec: Arc<dyn RemoteExec>,
+        mirror: Arc<NodeMirror>,
+        run_store: Arc<RunStore>,
+        pricing: rupu_config::PricingConfig,
+    ) -> Self {
+        Self {
+            host_id: host_id.into(),
+            exec,
+            mirror,
+            run_store,
+            pricing,
+        }
+    }
+
+    /// Build the remote argv for a workflow run.
+    fn workflow_argv(req: &LaunchRequest, run_id: &str) -> Vec<String> {
+        let mut a = vec![
+            "rupu".into(),
+            "workflow".into(),
+            "run".into(),
+            req.workflow.clone(),
+        ];
+        if let Some(t) = &req.target {
+            a.push(t.clone());
+        }
+        a.push("--run-id".into());
+        a.push(run_id.to_string());
+        a.push("--plain".into());
+        for (k, v) in &req.inputs {
+            a.push("--input".into());
+            a.push(format!("{k}={v}"));
+        }
+        if let Some(m) = &req.mode {
+            a.push("--mode".into());
+            a.push(m.clone());
+        }
+        a
+    }
+
+    /// Build the remote argv for an agent run.
+    fn agent_argv(req: &AgentLaunchRequest, run_id: &str) -> Vec<String> {
+        let mut a = vec!["rupu".into(), "run".into(), req.agent.clone()];
+        if let Some(t) = &req.target {
+            a.push(t.clone());
+        }
+        a.push("--run-id".into());
+        a.push(run_id.to_string());
+        if let Some(m) = &req.mode {
+            a.push("--mode".into());
+            a.push(m.clone());
+        }
+        if let Some(p) = &req.prompt {
+            a.push("--prompt".into());
+            a.push(p.clone());
+        }
+        if req.target.is_some() {
+            a.push("--tmp".into());
+        }
+        a
+    }
+
+    /// Wrap a shell-escaped remote command so the run is detached and
+    /// survives the SSH session closing.
+    fn detach(remote_cmd: &str) -> String {
+        format!("setsid {remote_cmd} </dev/null >/dev/null 2>&1 &")
+    }
+
+    /// Spawn a background tokio task that tails the JSONL artifact files
+    /// for `run_id` on the remote host and feeds each line to
+    /// [`NodeMirror::append`].
+    ///
+    /// `tail -n +1 -F` emits `==> <path> <==` headers when switching files;
+    /// [`parse_tail_marker`] extracts the path, which determines which
+    /// [`ArtifactFile`] variant subsequent lines belong to.
+    ///
+    /// When the tail stream ends (the remote run finished and `tail -F`
+    /// received EOF on all watched files), the task reads the remote
+    /// `run.json` to call [`NodeMirror::finish`] with the terminal status.
+    fn spawn_tail_pump(&self, run_id: String) {
+        let exec = Arc::clone(&self.exec);
+        let mirror = Arc::clone(&self.mirror);
+        let host_id = self.host_id.clone();
+        let dir = format!("$HOME/.rupu/runs/{run_id}");
+
+        let tail_argv: Vec<String> = vec![
+            "tail".into(),
+            "-n".into(),
+            "+1".into(),
+            "-F".into(),
+            format!("{dir}/events.jsonl"),
+            format!("{dir}/step_results.jsonl"),
+            format!("{dir}/unit_checkpoints.jsonl"),
+        ];
+        let tail_cmd = build_remote_command(&tail_argv);
+
+        tokio::spawn(async move {
+            let mut current: Option<ArtifactFile> = None;
+
+            if let Ok(mut stream) = exec.spawn_lines(&tail_cmd) {
+                while let Some(Ok(line)) = stream.next().await {
+                    if let Some(path) = parse_tail_marker(&line) {
+                        current = if path.ends_with("events.jsonl") {
+                            Some(ArtifactFile::Events)
+                        } else if path.ends_with("step_results.jsonl") {
+                            Some(ArtifactFile::StepResults)
+                        } else if path.ends_with("unit_checkpoints.jsonl") {
+                            Some(ArtifactFile::UnitCheckpoints)
+                        } else {
+                            None
+                        };
+                        continue;
+                    }
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(file) = &current {
+                        let _ = mirror.append(&run_id, &host_id, file.clone(), &line);
+                    }
+                }
+            }
+
+            // Tail ended; best-effort: read the remote run.json to sync the
+            // terminal status into the local mirror.
+            let cat_argv: Vec<String> = vec!["cat".into(), format!("{dir}/run.json")];
+            let cat_cmd = build_remote_command(&cat_argv);
+            if let Ok(out) = exec.run(&cat_cmd).await {
+                if out.success && !out.stdout.trim().is_empty() {
+                    let _ = mirror.append(
+                        &run_id,
+                        &host_id,
+                        ArtifactFile::RunJson,
+                        out.stdout.trim(),
+                    );
+                    if let Ok(rec) =
+                        serde_json::from_str::<serde_json::Value>(out.stdout.trim())
+                    {
+                        if let Some(s) = rec.get("status").and_then(|v| v.as_str()) {
+                            let _ = mirror.finish(&run_id, &host_id, s);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Issue a one-shot `rupu workflow <tail...>` command on the remote host.
+    ///
+    /// Used by [`cancel_run`], [`approve_run`], and [`reject_run`].
+    async fn remote_workflow(&self, tail: &[&str]) -> Result<(), HostConnectorError> {
+        let mut argv: Vec<String> = vec!["rupu".into(), "workflow".into()];
+        argv.extend(tail.iter().map(|s| s.to_string()));
+        let cmd = build_remote_command(&argv);
+        let out = self
+            .exec
+            .run(&cmd)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success {
+            return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl HostConnector for SshHostConnector {
+    async fn info(&self) -> Result<HostInfo, HostConnectorError> {
+        let probe = build_remote_command(&["true".to_string()]);
+        let reachable = matches!(self.exec.run(&probe).await, Ok(o) if o.success);
+        Ok(HostInfo {
+            reachable,
+            version: None,
+            capabilities: HostCapabilities::default(),
+        })
+    }
+
+    async fn launch_run(&self, req: LaunchRequest) -> Result<String, HostConnectorError> {
+        let run_id = format!("run_{}", Ulid::new());
+
+        let spec = RunSpec {
+            kind: RunSpecKind::Workflow,
+            name: req.workflow.clone(),
+            inputs: req.inputs.clone(),
+            prompt: None,
+            mode: req.mode.clone(),
+            target: req.target.clone(),
+        };
+
+        self.mirror
+            .create_run(&run_id, &self.host_id, &spec)
+            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+
+        let argv = Self::workflow_argv(&req, &run_id);
+        let remote_cmd = build_remote_command(&argv);
+        let detached = Self::detach(&remote_cmd);
+
+        let out = self
+            .exec
+            .run(&detached)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+
+        if !out.success {
+            // Best-effort cleanup: mark the mirror run failed so it doesn't
+            // stay stuck in Running with no executor attached.
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+            return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+
+        self.spawn_tail_pump(run_id.clone());
+        Ok(run_id)
+    }
+
+    async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError> {
+        let run_id = format!("run_{}", Ulid::new());
+
+        let spec = RunSpec {
+            kind: RunSpecKind::Agent,
+            name: req.agent.clone(),
+            inputs: std::collections::BTreeMap::new(),
+            prompt: req.prompt.clone(),
+            mode: req.mode.clone(),
+            target: req.target.clone(),
+        };
+
+        self.mirror
+            .create_run(&run_id, &self.host_id, &spec)
+            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+
+        let argv = Self::agent_argv(&req, &run_id);
+        let remote_cmd = build_remote_command(&argv);
+        let detached = Self::detach(&remote_cmd);
+
+        let out = self
+            .exec
+            .run(&detached)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+
+        if !out.success {
+            let _ = self.mirror.finish(&run_id, &self.host_id, "failed");
+            return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+
+        self.spawn_tail_pump(run_id.clone());
+        Ok(run_id)
+    }
+
+    async fn start_session(
+        &self,
+        _req: SessionStartRequest,
+    ) -> Result<String, HostConnectorError> {
+        Err(HostConnectorError::Invalid(
+            "sessions not supported over ssh (slice 2c)".into(),
+        ))
+    }
+
+    async fn send_session_turn(
+        &self,
+        _req: SendMessageRequest,
+    ) -> Result<String, HostConnectorError> {
+        Err(HostConnectorError::Invalid(
+            "sessions not supported over ssh (slice 2c)".into(),
+        ))
+    }
+
+    async fn list_runs(
+        &self,
+        params: RunListQuery,
+    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        mirror_list_runs(&self.run_store, &self.host_id, &params, &self.pricing)
+    }
+
+    async fn get_run(&self, run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+        mirror_get_run(&self.run_store, &self.host_id, run_id, &self.pricing)
+    }
+
+    async fn approve_run(&self, run_id: &str, mode: &str) -> Result<(), HostConnectorError> {
+        if mode.is_empty() {
+            self.remote_workflow(&["approve", run_id]).await
+        } else {
+            self.remote_workflow(&["approve", run_id, "--mode", mode])
+                .await
+        }
+    }
+
+    async fn reject_run(
+        &self,
+        run_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), HostConnectorError> {
+        match reason {
+            Some(r) => {
+                self.remote_workflow(&["reject", run_id, "--reason", r])
+                    .await
+            }
+            None => self.remote_workflow(&["reject", run_id]).await,
+        }
+    }
+
+    async fn cancel_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.remote_workflow(&["cancel", run_id]).await
+    }
+
+    async fn stream_run_events(
+        &self,
+        run_id: &str,
+    ) -> Result<EventByteStream, HostConnectorError> {
+        mirror_stream_run_events(&self.run_store, &self.host_id, run_id).await
+    }
+
+    async fn get_transcript(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        read_transcript_file(path)
+    }
+
+    async fn proxy_get_json(
+        &self,
+        _path_and_query: &str,
+    ) -> Result<serde_json::Value, HostConnectorError> {
+        Err(HostConnectorError::Invalid(
+            "proxy_get_json is not supported for ssh hosts".into(),
+        ))
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -270,5 +640,189 @@ mod tests {
         );
         assert_eq!(parse_tail_marker(r#"{"some":"json"}"#), None);
         assert_eq!(parse_tail_marker(""), None);
+    }
+
+    // ── SshHostConnector tests ────────────────────────────────────────────────
+
+    use crate::host::connector::HostConnectorError;
+
+    struct FakeExec {
+        commands: std::sync::Mutex<Vec<String>>,
+        tail_lines: Vec<String>,
+        fail: bool,
+        fail_stderr: String,
+    }
+
+    impl FakeExec {
+        fn ok(tail_lines: Vec<String>) -> Self {
+            Self {
+                commands: Default::default(),
+                tail_lines,
+                fail: false,
+                fail_stderr: String::new(),
+            }
+        }
+
+        fn offline(stderr: impl Into<String>) -> Self {
+            Self {
+                commands: Default::default(),
+                tail_lines: vec![],
+                fail: true,
+                fail_stderr: stderr.into(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteExec for FakeExec {
+        async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+            self.commands.lock().unwrap().push(remote.to_string());
+            if self.fail {
+                Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: self.fail_stderr.clone(),
+                    success: false,
+                })
+            } else {
+                Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+        }
+
+        fn spawn_lines(&self, remote: &str) -> Result<LineStream, RemoteExecError> {
+            self.commands.lock().unwrap().push(remote.to_string());
+            let lines: Vec<std::io::Result<String>> =
+                self.tail_lines.iter().cloned().map(Ok).collect();
+            Ok(Box::pin(futures_util::stream::iter(lines)))
+        }
+    }
+
+    fn make_conn(
+        fake: std::sync::Arc<FakeExec>,
+    ) -> (
+        SshHostConnector,
+        std::sync::Arc<rupu_orchestrator::RunStore>,
+        tempfile::TempDir,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(
+            tmp.path().join("runs"),
+        ));
+        let mirror = std::sync::Arc::new(crate::node::NodeMirror::new(
+            std::sync::Arc::clone(&run_store),
+        ));
+        let conn = SshHostConnector::new(
+            "host_abc",
+            fake,
+            mirror,
+            std::sync::Arc::clone(&run_store),
+            rupu_config::PricingConfig::default(),
+        );
+        (conn, run_store, tmp)
+    }
+
+    #[tokio::test]
+    async fn launch_run_mints_creates_mirror_and_dispatches() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let run_id = conn
+            .launch_run(crate::launcher::LaunchRequest {
+                workflow: "deploy".into(),
+                inputs: Default::default(),
+                mode: Some("bypass".into()),
+                target: None,
+                working_dir: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(run_id.starts_with("run_"), "run_id must start with run_");
+
+        // Mirror run exists, attributed to host_abc.
+        let rec = run_store.load(&run_id).unwrap();
+        assert_eq!(rec.worker_id.as_deref(), Some("host_abc"));
+
+        // Dispatched a detached remote `rupu workflow run … --run-id <id> --plain`.
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'run'")
+                && c.contains(&format!("'{run_id}'"))
+                && c.contains("'--plain'")),
+            "dispatch command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.contains("setsid") || c.contains("nohup")),
+            "command must be wrapped for detachment: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_approve_reject_issue_remote_commands() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        // run_id only needs to be a valid shell token for the assertion;
+        // cancel/approve/reject never touch the local store.
+        let run_id = "run_01TESTCONTROLOK";
+
+        conn.cancel_run(run_id).await.unwrap();
+        conn.approve_run(run_id, "bypass").await.unwrap();
+        conn.reject_run(run_id, Some("nope")).await.unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'cancel'")
+                && c.contains(&format!("'{run_id}'"))),
+            "cancel command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'approve'")
+                && c.contains(&format!("'{run_id}'"))
+                && c.contains("'--mode'")
+                && c.contains("'bypass'")),
+            "approve command not found in: {cmds:?}"
+        );
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'reject'")
+                && c.contains(&format!("'{run_id}'"))
+                && c.contains("'--reason'")
+                && c.contains("'nope'")),
+            "reject command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_host_run_failure_surfaces_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline("connection refused"));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        // info() reports unreachable but does not error.
+        let info = conn.info().await.unwrap();
+        assert!(!info.reachable, "offline host should report reachable: false");
+
+        // launch_run maps a failed ssh dispatch to Unreachable.
+        let err = conn
+            .launch_run(crate::launcher::LaunchRequest {
+                workflow: "deploy".into(),
+                inputs: Default::default(),
+                mode: None,
+                target: None,
+                working_dir: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
     }
 }
