@@ -7,6 +7,7 @@
 
 pub mod cmd;
 pub mod cp_agent_launcher;
+pub mod fleet_unit_dispatcher;
 pub mod cp_definition_generator;
 pub mod cp_launcher;
 pub mod cp_repos;

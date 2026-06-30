@@ -13,6 +13,7 @@
 
 use crate::cmd::completers::workflow_names;
 use crate::cmd::ui::LiveViewMode;
+use crate::fleet_unit_dispatcher::build_dispatcher_if_needed;
 use crate::output::formats::OutputFormat;
 use crate::output::palette::{self, Status as UiStatus, BRAND, DIM};
 use crate::output::printer::{visible_len, wrap_with_ansi};
@@ -2259,6 +2260,9 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
     // Clone the workflow for the live view before `opts` consumes it.
     let view_workflow = workflow.clone();
 
+    let unit_dispatcher =
+        build_dispatcher_if_needed(&workflow, &global, Arc::clone(&store), cfg.pricing.clone());
+
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -2275,7 +2279,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
         run_id_override: None,
         strict_templates: false,
         event_sink: event_sink_for_resume,
-        unit_dispatcher: None,
+        unit_dispatcher,
     };
 
     println!("rupu: resuming run {run_id}");
@@ -3367,6 +3371,13 @@ async fn execute_workflow_invocation(
         }
     };
 
+    let unit_dispatcher = build_dispatcher_if_needed(
+        &workflow,
+        &global,
+        Arc::clone(&run_store),
+        cfg.pricing.clone(),
+    );
+
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -3383,7 +3394,7 @@ async fn execute_workflow_invocation(
         run_id_override: Some(run_id.clone()),
         strict_templates,
         event_sink: event_sink_for_run,
-        unit_dispatcher: None,
+        unit_dispatcher,
     };
 
     // Opt-in live three-zone view (dashboard + git-graph spine + focus
@@ -3539,6 +3550,12 @@ async fn execute_workflow_invocation(
                             }
                         }
                     };
+                    let resume_unit_dispatcher = build_dispatcher_if_needed(
+                        &workflow_for_resume,
+                        &global,
+                        Arc::clone(&run_store_for_resume),
+                        cfg.pricing.clone(),
+                    );
                     let resume_opts = OrchestratorRunOpts {
                         workflow: workflow_for_resume.clone(),
                         inputs: inputs_for_resume.clone(),
@@ -3555,7 +3572,7 @@ async fn execute_workflow_invocation(
                         run_id_override: None,
                         strict_templates,
                         event_sink: resume_event_sink,
-                        unit_dispatcher: None,
+                        unit_dispatcher: resume_unit_dispatcher,
                     };
                     current_runner = tokio::spawn(run_workflow(resume_opts));
                     current_run_id = result.run_id.clone();
