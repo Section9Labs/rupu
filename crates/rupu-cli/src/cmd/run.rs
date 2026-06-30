@@ -469,27 +469,40 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    // Await the agent task to propagate any error.
-    let result = agent_task
+    // Await the agent task; flatten only the JoinError so run.json is written
+    // for both success and failure before propagating.
+    let run_result = agent_task
         .await
-        .map_err(|e| anyhow::anyhow!("agent task panicked: {e}"))??;
+        .map_err(|e| anyhow::anyhow!("agent task panicked: {e}"))?;
+    let success = run_result.is_ok();
 
     // Write run.json so the run is observable via RunStore and the mirror
     // can carry final_output back to the central control-plane.
     {
         let runs_root = global.join("runs");
         let store = rupu_orchestrator::RunStore::new(runs_root);
-        let final_output = rupu_orchestrator::read_final_assistant_text(
-            &transcript_path,
-            true,
-            &run_id,
-            "agent",
-        );
+        let final_output = if success {
+            Some(rupu_orchestrator::read_final_assistant_text(
+                &transcript_path,
+                true,
+                &run_id,
+                "agent",
+            ))
+        } else {
+            None
+        };
         let finished_at = chrono::Utc::now();
+        // RunStatus is Copy so `status` remains usable after the struct literal.
+        let status = if success {
+            rupu_orchestrator::RunStatus::Completed
+        } else {
+            rupu_orchestrator::RunStatus::Failed
+        };
+        let error_message = run_result.as_ref().err().map(|e| e.to_string());
         let rec = rupu_orchestrator::RunRecord {
             id: run_id.clone(),
             workflow_name: format!("agent:{}", spec.name),
-            status: rupu_orchestrator::RunStatus::Completed,
+            status,
             inputs: std::collections::BTreeMap::new(),
             event: None,
             workspace_id: ws.id.clone(),
@@ -497,8 +510,8 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
             transcript_dir: transcripts.clone(),
             started_at,
             finished_at: Some(finished_at),
-            final_output: Some(final_output.clone()),
-            error_message: None,
+            final_output: final_output.clone(),
+            error_message: error_message.clone(),
             awaiting_step_id: None,
             approval_prompt: None,
             awaiting_since: None,
@@ -506,7 +519,9 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
             issue_ref: None,
             issue: None,
             parent_run_id: None,
-            backend_id: Some("local_checkout".to_string()),
+            // "local_checkout" is intentional for standalone agent runs;
+            // workflow runs use "local_worktree".
+            backend_id: Some(metadata.backend_id.clone()),
             worker_id: Some(worker_record.worker_id.clone()),
             artifact_manifest_path: None,
             runner_pid: None,
@@ -527,9 +542,10 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
                 // update it in-place with the terminal status + final_output.
                 match store.load(&run_id) {
                     Ok(mut loaded) => {
-                        loaded.status = rupu_orchestrator::RunStatus::Completed;
+                        loaded.status = status;
                         loaded.finished_at = Some(finished_at);
-                        loaded.final_output = Some(final_output);
+                        loaded.final_output = final_output;
+                        loaded.error_message = error_message;
                         if let Err(e) = store.update(&loaded) {
                             warn!(error = %e, "failed to update agent run.json");
                         }
@@ -543,7 +559,8 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
 
     // Print a brief footer.
     println!("transcript: {}", transcript_path.display());
-    let _ = result;
+    // Propagate agent failure so the CLI exits non-zero on a failed run.
+    run_result?;
     Ok(())
 }
 
