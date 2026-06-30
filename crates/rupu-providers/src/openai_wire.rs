@@ -88,6 +88,14 @@ pub(crate) fn build_chat_request_body(request: &LlmRequest, stream: bool) -> ser
         "stream": stream,
     });
 
+    // Ask the server to emit a final usage chunk on streamed responses.
+    // OpenAI-compatible endpoints (vLLM, OpenAI, Copilot, …) omit usage from
+    // SSE unless `stream_options.include_usage` is set, which otherwise leaves
+    // token/cost accounting at zero for every streamed run.
+    if stream {
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
+
     if !request.tools.is_empty() {
         let tools: Vec<serde_json::Value> = request
             .tools
@@ -348,4 +356,42 @@ pub(crate) fn process_completion_sse(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sse::SseEvent;
+
+    fn ev(data: &str) -> SseEvent {
+        SseEvent {
+            event_type: "message".into(),
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn streamed_usage_chunk_is_recorded_into_the_response() {
+        // A content chunk followed by an OpenAI-style usage-only final chunk
+        // (`choices: []`, `usage: {...}`) — the shape a server emits once
+        // `stream_options.include_usage` is requested.
+        let mut acc = CompletionAccumulator::new();
+        let mut sink = |_e: StreamEvent| {};
+        process_completion_sse(
+            &ev(r#"{"id":"cmpl_1","model":"glm","choices":[{"index":0,"delta":{"content":"hello"}}]}"#),
+            &mut acc,
+            &mut sink,
+        )
+        .unwrap();
+        process_completion_sse(
+            &ev(r#"{"id":"cmpl_1","model":"glm","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}"#),
+            &mut acc,
+            &mut sink,
+        )
+        .unwrap();
+
+        let resp = acc.into_response().expect("response");
+        assert_eq!(resp.usage.input_tokens, 11);
+        assert_eq!(resp.usage.output_tokens, 7);
+    }
 }

@@ -178,10 +178,7 @@ impl OpenAiCompatibleClient {
 
 /// Emit stream events for an already-complete response, so the `stream=false`
 /// fallback produces the same event sequence a real SSE stream would.
-fn emit_response_events(
-    resp: &LlmResponse,
-    on_event: &mut (dyn FnMut(StreamEvent) + Send),
-) {
+fn emit_response_events(resp: &LlmResponse, on_event: &mut (dyn FnMut(StreamEvent) + Send)) {
     for block in &resp.content {
         match block {
             ContentBlock::Text { text } => {
@@ -287,6 +284,26 @@ mod tests {
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");
         assert_eq!(body["stream"], false);
+        // Non-streaming requests must not carry stream_options.
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn streaming_request_asks_server_to_include_usage() {
+        // OpenAI-compatible servers (vLLM, OpenAI, …) only emit the final
+        // usage chunk on a streamed response when the request sets
+        // `stream_options.include_usage = true`. Without it, token accounting
+        // for streamed runs comes back zero.
+        let c = client();
+        let req = LlmRequest {
+            model: "/raid/models/zai-org/GLM-5.2-FP8".into(),
+            messages: vec![Message::user("hi")],
+            max_tokens: 2048,
+            ..Default::default()
+        };
+        let body = c.request_body(&req, true);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
     #[test]
