@@ -161,6 +161,10 @@ export interface StepWorkingEvent extends RunEventBase {
   type: 'step_working';
   step_id: string;
   note?: string | null;
+  /** Transcript file for this (running) step. Emitted once the step's
+   *  sub-run transcript path is known, so the live UI can select and tail
+   *  it before any persisted step_result exists. Absent on tool-call pings. */
+  transcript_path?: string | null;
 }
 
 export interface StepAwaitingApprovalEvent extends RunEventBase {

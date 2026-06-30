@@ -1045,6 +1045,22 @@ async fn run_linear_step(
     let run_id = format!("run_{}", Ulid::new());
     let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
     persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
+    // Announce the running step's transcript path on the live event stream.
+    // A linear step generates this path lazily (after the outer-loop
+    // `StepStarted`), so the UI has no way to learn it until the step
+    // completes and a `step_result` is persisted — surface it now so the
+    // run view can select and tail the file in real time.
+    if let Some(sink) = opts.event_sink.as_ref() {
+        sink.emit(
+            workflow_run_id,
+            &crate::executor::Event::StepWorking {
+                run_id: workflow_run_id.to_string(),
+                step_id: step.id.clone(),
+                note: None,
+                transcript_path: Some(transcript_path.clone()),
+            },
+        );
+    }
 
     let (output, success) = match step.host.as_deref() {
         Some(host) => {
@@ -1073,6 +1089,7 @@ async fn run_linear_step(
                                 run_id: wf_run_id.clone(),
                                 step_id: step_id.clone(),
                                 note: Some(tool_name.to_string()),
+                                transcript_path: None,
                             },
                         );
                     }) as rupu_agent::OnToolCallCallback
