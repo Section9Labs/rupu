@@ -35,6 +35,13 @@ pub enum Event {
         run_id: String,
         step_id: String,
         note: Option<String>,
+        /// Transcript file for this running step, emitted once its sub-run
+        /// path is known (a linear step generates it lazily, after
+        /// `StepStarted`). Lets the live UI select and tail the file before
+        /// any persisted `step_result` exists. `None` on tool-call pings;
+        /// absent in older event logs (serde default restores `None`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transcript_path: Option<PathBuf>,
     },
     StepAwaitingApproval {
         run_id: String,
@@ -199,6 +206,31 @@ mod tests {
             back,
             Event::StepStarted { host: Some(ref h), .. } if h == "worker-1"
         ));
+    }
+
+    #[test]
+    fn step_working_transcript_path_round_trips() {
+        let ev = Event::StepWorking {
+            run_id: "r1".into(),
+            step_id: "build".into(),
+            note: None,
+            transcript_path: Some(PathBuf::from("/t/run_X.jsonl")),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains(r#""transcript_path":"/t/run_X.jsonl""#), "json: {json}");
+        let back: Event = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            back,
+            Event::StepWorking { transcript_path: Some(ref p), .. } if p == &PathBuf::from("/t/run_X.jsonl")
+        ));
+    }
+
+    #[test]
+    fn step_working_transcript_path_defaults_to_none_when_absent() {
+        // Older event logs / tool-call pings without the field still deserialize.
+        let json = r#"{"type":"step_working","run_id":"r1","step_id":"build","note":null}"#;
+        let back: Event = serde_json::from_str(json).expect("deserialize legacy");
+        assert!(matches!(back, Event::StepWorking { transcript_path: None, .. }));
     }
 
     #[test]

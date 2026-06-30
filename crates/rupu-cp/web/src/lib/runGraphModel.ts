@@ -174,7 +174,15 @@ export function buildRunGraphModel(
       case 'step_started':
       case 'step_working': {
         const node = nodeMap.get(ev.step_id);
-        if (node) node.state = 'running';
+        if (node) {
+          node.state = 'running';
+          // A running linear step has no persisted step_result yet, so its
+          // transcript path arrives live on step_working — adopt it so the
+          // panel can select and tail the file in real time.
+          if (ev.type === 'step_working' && ev.transcript_path) {
+            node.transcriptPath = ev.transcript_path;
+          }
+        }
         break;
       }
       case 'step_awaiting_approval': {

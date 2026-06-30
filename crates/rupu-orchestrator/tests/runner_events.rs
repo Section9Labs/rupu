@@ -139,23 +139,35 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
     );
 
     // For a two-step linear workflow the expected sequence is:
-    // RunStarted, StepStarted(alpha), StepCompleted(alpha),
-    // StepStarted(beta), StepCompleted(beta), RunCompleted.
+    // RunStarted,
+    // StepStarted(alpha), StepWorking(alpha, transcript_path), StepCompleted(alpha),
+    // StepStarted(beta),  StepWorking(beta, transcript_path),  StepCompleted(beta),
+    // RunCompleted.
+    // Each linear step emits a StepWorking carrying its (lazily-generated)
+    // transcript path so the live UI can tail the file while the step runs.
     assert_eq!(
         events.len(),
-        6,
-        "expected 6 events for a two-step run, got {:?}",
+        8,
+        "expected 8 events for a two-step run, got {:?}",
         events.iter().map(|e| format!("{e:?}")).collect::<Vec<_>>()
     );
 
-    // Verify ordering: StepStarted always precedes its StepCompleted.
+    // Verify ordering: StepStarted → StepWorking(path) → StepCompleted per step.
     assert!(matches!(events[1], Event::StepStarted { step_id: ref s, .. } if s == "alpha"));
     assert!(
-        matches!(events[2], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "alpha")
+        matches!(events[2], Event::StepWorking { step_id: ref s, transcript_path: Some(_), .. } if s == "alpha"),
+        "alpha StepWorking must carry a transcript_path, got {:?}",
+        events[2]
     );
-    assert!(matches!(events[3], Event::StepStarted { step_id: ref s, .. } if s == "beta"));
     assert!(
-        matches!(events[4], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "beta")
+        matches!(events[3], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "alpha")
+    );
+    assert!(matches!(events[4], Event::StepStarted { step_id: ref s, .. } if s == "beta"));
+    assert!(
+        matches!(events[5], Event::StepWorking { step_id: ref s, transcript_path: Some(_), .. } if s == "beta")
+    );
+    assert!(
+        matches!(events[6], Event::StepCompleted { step_id: ref s, success: true, .. } if s == "beta")
     );
 }
 

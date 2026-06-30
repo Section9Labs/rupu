@@ -144,6 +144,25 @@ describe('live events win over step_results', () => {
     expect(model.nodeById('a')!.state).toBe('running');
   });
 
+  it('step_working carries transcript_path for a running single step (no result yet)', () => {
+    // A running linear step has no persisted step_result, so its transcript
+    // path arrives only via the live step_working event. Without it the panel
+    // has nothing to select/tail.
+    const g = makeGraph();
+    const events: RunEvent[] = [
+      { type: 'step_started', run_id: runId(), step_id: 'a', kind: 'step' },
+      {
+        type: 'step_working',
+        run_id: runId(),
+        step_id: 'a',
+        transcript_path: '/tmp/transcripts/run_X.jsonl',
+      },
+    ];
+    const model = buildRunGraphModel(g, events);
+    expect(model.nodeById('a')!.state).toBe('running');
+    expect(model.nodeById('a')!.transcriptPath).toBe('/tmp/transcripts/run_X.jsonl');
+  });
+
   it('step_awaiting_approval → awaiting_approval', () => {
     const g = makeGraph({
       step_results: [{ run_id: runId(), step_id: 'c', success: false }],
