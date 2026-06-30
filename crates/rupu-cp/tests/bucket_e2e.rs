@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use object_store::memory::InMemory;
 use rupu_cp::host::bucket::{
-    Bucket, BucketHostConnector, ControlEnvelope, ObjectStoreBucket, poll_bucket_run,
+    poll_bucket_run, Bucket, BucketHostConnector, ControlEnvelope, ObjectStoreBucket,
 };
 use rupu_cp::host::connector::HostConnector;
 use rupu_cp::launcher::LaunchRequest;
@@ -45,7 +45,9 @@ async fn poll_bucket_run_mirrors_and_finishes() {
         mode: None,
         target: None,
     };
-    mirror.create_run(run_id, host_id, &spec).expect("create_run");
+    mirror
+        .create_run(run_id, host_id, &spec)
+        .expect("create_run");
 
     // Build an in-memory bucket (no cloud required).
     let bucket = ObjectStoreBucket::new(Arc::new(InMemory::new()), "test/host_BUCKET01");
@@ -77,7 +79,10 @@ async fn poll_bucket_run_mirrors_and_finishes() {
         .await
         .expect("first poll must succeed");
 
-    assert!(done, "poll must return true when finished marker is present");
+    assert!(
+        done,
+        "poll must return true when finished marker is present"
+    );
 
     // events.jsonl must have exactly 1 line.
     let events_path = store.events_path(run_id);
@@ -105,7 +110,10 @@ async fn poll_bucket_run_mirrors_and_finishes() {
         .await
         .expect("second poll must succeed");
 
-    assert!(done2, "second poll must still return true (finished marker persists)");
+    assert!(
+        done2,
+        "second poll must still return true (finished marker persists)"
+    );
 
     // Line count must be unchanged — no double-append.
     let content2 = std::fs::read_to_string(&events_path).unwrap();
@@ -142,7 +150,9 @@ async fn poll_bucket_run_remirrors_run_json_each_tick() {
         mode: None,
         target: None,
     };
-    mirror.create_run(run_id, host_id, &spec).expect("create_run");
+    mirror
+        .create_run(run_id, host_id, &spec)
+        .expect("create_run");
 
     let bucket = ObjectStoreBucket::new(Arc::new(InMemory::new()), "test/host_REMIRROR01");
 
@@ -290,7 +300,10 @@ async fn bucket_dead_drop_e2e() {
         .claim_job(&run_id, "node-y")
         .await
         .expect("second claim_job must not error");
-    assert!(!second_claim, "second claim_job must return false (already claimed)");
+    assert!(
+        !second_claim,
+        "second claim_job must return false (already claimed)"
+    );
 
     // Node writes a valid events.jsonl line — a proper executor::Event JSON.
     let event = rupu_orchestrator::executor::Event::StepStarted {
@@ -298,9 +311,9 @@ async fn bucket_dead_drop_e2e() {
         step_id: "step1".into(),
         kind: StepKind::Linear,
         agent: Some("test-agent".into()),
+        host: None,
     };
-    let event_line =
-        serde_json::to_string(&event).expect("Event::StepStarted must serialize");
+    let event_line = serde_json::to_string(&event).expect("Event::StepStarted must serialize");
     shared_bucket
         .put_result(&run_id, "events.0001.jsonl", event_line.as_bytes())
         .await
@@ -380,8 +393,8 @@ async fn bucket_dead_drop_e2e() {
         !controls.is_empty(),
         "cancel_run must write a control envelope into the bucket"
     );
-    let cancel_env: ControlEnvelope = serde_json::from_slice(&controls[0].1)
-        .expect("control envelope must be valid JSON");
+    let cancel_env: ControlEnvelope =
+        serde_json::from_slice(&controls[0].1).expect("control envelope must be valid JSON");
     assert_eq!(
         cancel_env.kind, "cancel",
         "control envelope kind must be 'cancel'"

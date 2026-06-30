@@ -24,6 +24,12 @@ pub enum Event {
         step_id: String,
         kind: StepKind,
         agent: Option<String>,
+        /// Host that ran this step. `None` = local (same host as the
+        /// orchestrator). `Some(name)` = a remote fleet host (multi-host
+        /// `host:` placement). Absent in older event logs; serde default
+        /// restores `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
     },
     StepWorking {
         run_id: String,
@@ -40,6 +46,10 @@ pub enum Event {
         step_id: String,
         success: bool,
         duration_ms: u64,
+        /// Host that ran this step. `None` = local. `Some(name)` = remote.
+        /// Absent in older event logs; serde default restores `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
     },
     StepFailed {
         run_id: String,
@@ -166,10 +176,37 @@ mod tests {
             step_id: "classify_input".into(),
             success: true,
             duration_ms: 312,
+            host: None,
         };
         let json = serde_json::to_string(&ev).expect("serialize");
         assert!(json.contains(r#""type":"step_completed""#));
         assert!(json.contains(r#""step_id":"classify_input""#));
+    }
+
+    #[test]
+    fn step_started_host_round_trips() {
+        let ev = Event::StepStarted {
+            run_id: "r1".into(),
+            step_id: "build".into(),
+            kind: StepKind::Linear,
+            agent: Some("builder".into()),
+            host: Some("worker-1".into()),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"host\":\"worker-1\""), "json: {json}");
+        let back: Event = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            back,
+            Event::StepStarted { host: Some(ref h), .. } if h == "worker-1"
+        ));
+    }
+
+    #[test]
+    fn step_completed_host_defaults_to_none_when_absent() {
+        // Older event logs without `host` must still deserialize.
+        let json = r#"{"type":"step_completed","run_id":"r1","step_id":"build","success":true,"duration_ms":5}"#;
+        let back: Event = serde_json::from_str(json).expect("deserialize legacy");
+        assert!(matches!(back, Event::StepCompleted { host: None, .. }));
     }
 
     #[test]

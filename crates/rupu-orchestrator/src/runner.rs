@@ -66,11 +66,7 @@ pub struct UnitOutcome {
 #[async_trait]
 pub trait UnitDispatcher: Send + Sync {
     /// Run one unit (an agent invocation) on `host` and return its output.
-    async fn dispatch_unit(
-        &self,
-        unit: UnitDispatch,
-        host: &str,
-    ) -> Result<UnitOutcome, RunError>;
+    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError>;
 }
 
 #[derive(Debug, Error)]
@@ -753,6 +749,7 @@ async fn run_steps_inner(
                     step_id: step.id.clone(),
                     kind: step_kind,
                     agent: step.agent.clone(),
+                    host: step.host.clone(),
                 },
             );
         }
@@ -780,6 +777,7 @@ async fn run_steps_inner(
                             step_id: step.id.clone(),
                             success: result.success,
                             duration_ms,
+                            host: step.host.clone(),
                         },
                     );
                 }
@@ -943,6 +941,82 @@ fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id:
     }
 }
 
+/// Run a host-placed linear step as a single remote unit through the
+/// [`UnitDispatcher`] port (index 0). Mirrors the fan-out remote path:
+/// `Ok(success:true)` → that output; `Ok(success:false)` or `Err` → a
+/// failed step honoring `continue_on_error`. There is **no reassignment**
+/// — a single named host has no alternate. Absence of a dispatcher is a
+/// hard configuration error (coordinator without fleet access), surfaced
+/// clearly with no silent local fallback.
+async fn dispatch_placed_step(
+    host: &str,
+    step: &Step,
+    agent_name: &str,
+    rendered: &str,
+    run_id: &str,
+    opts: &OrchestratorRunOpts,
+    continue_on_error: bool,
+) -> Result<(String, bool), RunWorkflowError> {
+    let Some(dispatcher) = opts.unit_dispatcher.as_ref() else {
+        let source =
+            RunError::Provider("host placement requires fleet access — run via the CP".into());
+        let output = source.to_string();
+        return placed_failure(step, host, output, source, continue_on_error);
+    };
+    let unit = UnitDispatch {
+        step_id: step.id.clone(),
+        agent: agent_name.to_string(),
+        rendered_prompt: rendered.to_string(),
+        index: 0,
+        run_id: run_id.to_string(),
+    };
+    match dispatcher.dispatch_unit(unit, host).await {
+        Ok(outcome) if outcome.success => Ok((outcome.output, true)),
+        Ok(outcome) => {
+            // Agent ran but reported failure: preserve its output, but
+            // synthesize a raw error so the abort below fires — symmetric
+            // with the fan-out remote path.
+            let source = RunError::Provider(
+                outcome
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "remote step failed".into()),
+            );
+            placed_failure(step, host, outcome.output, source, continue_on_error)
+        }
+        Err(source) => {
+            let output = source.to_string();
+            placed_failure(step, host, output, source, continue_on_error)
+        }
+    }
+}
+
+/// Apply `continue_on_error` to a failed placement: tolerate (record a
+/// failed `(output, false)`) or abort with the same `RunWorkflowError::Agent`
+/// a local step failure produces.
+fn placed_failure(
+    step: &Step,
+    host: &str,
+    output: String,
+    source: RunError,
+    continue_on_error: bool,
+) -> Result<(String, bool), RunWorkflowError> {
+    if continue_on_error {
+        warn!(
+            step = %step.id,
+            host = %host,
+            error = %source,
+            "placed step failed but continue_on_error is set; proceeding"
+        );
+        Ok((output, false))
+    } else {
+        Err(RunWorkflowError::Agent {
+            step: step.id.clone(),
+            source,
+        })
+    }
+}
+
 /// Single-shot linear step: render the prompt, build agent opts via
 /// the factory, run the agent, capture final assistant text, return
 /// a `StepResult`.
@@ -972,56 +1046,75 @@ async fn run_linear_step(
     let transcript_path = opts.transcript_dir.join(format!("{run_id}.jsonl"));
     persist_active_step(opts, workflow_run_id, step, Some(transcript_path.clone()));
 
-    let on_tool_call: Option<rupu_agent::OnToolCallCallback> =
-        opts.event_sink.as_ref().map(|sink| {
-            let sink = sink.clone();
-            let wf_run_id = workflow_run_id.to_string();
-            let step_id = step.id.clone();
-            std::sync::Arc::new(move |_caller_step_id: &str, tool_name: &str| {
-                sink.emit(
-                    &wf_run_id,
-                    &crate::executor::Event::StepWorking {
-                        run_id: wf_run_id.clone(),
-                        step_id: step_id.clone(),
-                        note: Some(tool_name.to_string()),
-                    },
-                );
-            }) as rupu_agent::OnToolCallCallback
-        });
-
-    let outcome = dispatch_one(
-        &opts.factory,
-        &step.id,
-        agent_name,
-        rendered.clone(),
-        run_id.clone(),
-        opts.workspace_id.clone(),
-        opts.workspace_path.clone(),
-        transcript_path.clone(),
-        on_tool_call,
-    )
-    .await;
-
-    let success = match outcome {
-        Ok(_) => true,
-        Err(source) => {
-            if continue_on_error {
-                warn!(
-                    step = %step.id,
-                    error = %source,
-                    "step failed but continue_on_error is set; proceeding"
-                );
-                false
-            } else {
-                return Err(RunWorkflowError::Agent {
-                    step: step.id.clone(),
-                    source,
+    let (output, success) = match step.host.as_deref() {
+        Some(host) => {
+            dispatch_placed_step(
+                host,
+                step,
+                agent_name,
+                &rendered,
+                &run_id,
+                opts,
+                continue_on_error,
+            )
+            .await?
+        }
+        None => {
+            // --- Existing local (inline) path — UNCHANGED ---
+            let on_tool_call: Option<rupu_agent::OnToolCallCallback> =
+                opts.event_sink.as_ref().map(|sink| {
+                    let sink = sink.clone();
+                    let wf_run_id = workflow_run_id.to_string();
+                    let step_id = step.id.clone();
+                    std::sync::Arc::new(move |_caller_step_id: &str, tool_name: &str| {
+                        sink.emit(
+                            &wf_run_id,
+                            &crate::executor::Event::StepWorking {
+                                run_id: wf_run_id.clone(),
+                                step_id: step_id.clone(),
+                                note: Some(tool_name.to_string()),
+                            },
+                        );
+                    }) as rupu_agent::OnToolCallCallback
                 });
-            }
+
+            let outcome = dispatch_one(
+                &opts.factory,
+                &step.id,
+                agent_name,
+                rendered.clone(),
+                run_id.clone(),
+                opts.workspace_id.clone(),
+                opts.workspace_path.clone(),
+                transcript_path.clone(),
+                on_tool_call,
+            )
+            .await;
+
+            let success = match outcome {
+                Ok(_) => true,
+                Err(source) => {
+                    if continue_on_error {
+                        warn!(
+                            step = %step.id,
+                            error = %source,
+                            "step failed but continue_on_error is set; proceeding"
+                        );
+                        false
+                    } else {
+                        return Err(RunWorkflowError::Agent {
+                            step: step.id.clone(),
+                            source,
+                        });
+                    }
+                }
+            };
+
+            let output = read_final_assistant_text(&transcript_path, success, &run_id, &step.id);
+            (output, success)
         }
     };
 
-    let output = read_final_assistant_text(&transcript_path, success, &run_id, &step.id);
     Ok(StepResult {
         step_id: step.id.clone(),
         rendered_prompt: rendered,
@@ -1166,8 +1259,7 @@ async fn run_fanout_step(
         .to_string();
     // Pre-extract distribute hosts (if any) so we can compute per-unit
     // placement and fallback host before entering each spawned task.
-    let distribute_hosts: Option<Vec<String>> =
-        step.distribute.as_ref().map(|d| d.hosts.clone());
+    let distribute_hosts: Option<Vec<String>> = step.distribute.as_ref().map(|d| d.hosts.clone());
     // Clone the dispatcher Arc once; each spawned task gets its own ref.
     let unit_dispatcher = opts.unit_dispatcher.clone();
     let mut handles = Vec::with_capacity(total);
@@ -1180,9 +1272,9 @@ async fn run_fanout_step(
         // Fallback host for the single retry on primary-host failure.
         // Computed eagerly outside the task to avoid capturing the full
         // hosts list in every closure.
-        let fallback_host: Option<String> = distribute_hosts.as_ref().map(|hosts| {
-            hosts[(idx + 1) % hosts.len()].clone()
-        });
+        let fallback_host: Option<String> = distribute_hosts
+            .as_ref()
+            .map(|hosts| hosts[(idx + 1) % hosts.len()].clone());
         let permit_sem = semaphore.clone();
         let factory = Arc::clone(&opts.factory);
         let step_id = step.id.clone();
@@ -1274,9 +1366,7 @@ async fn run_fanout_step(
                             }
                             Err(first_err) => {
                                 // Reassign once to the next host and retry.
-                                let retry_host = fallback_host
-                                    .as_deref()
-                                    .unwrap_or(&host);
+                                let retry_host = fallback_host.as_deref().unwrap_or(&host);
                                 let retry_unit = UnitDispatch {
                                     step_id: step_id.clone(),
                                     agent: agent_name.clone(),
@@ -1292,10 +1382,7 @@ async fn run_fanout_step(
                                     error = %first_err,
                                     "unit dispatch failed; retrying on next host"
                                 );
-                                match dispatcher
-                                    .dispatch_unit(retry_unit, retry_host)
-                                    .await
-                                {
+                                match dispatcher.dispatch_unit(retry_unit, retry_host).await {
                                     Ok(outcome) => {
                                         // Same fix as primary path: synthesize
                                         // raw_error for a failed-but-Ok outcome.
@@ -2600,6 +2687,150 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Placed linear step tests
+    // -----------------------------------------------------------------------
+
+    const WF_PLACED: &str = r#"
+name: placed-test
+steps:
+  - id: build
+    agent: builder
+    prompt: "build {{ inputs.what }}"
+    host: worker-1
+"#;
+
+    const WF_PLACED_TWO_STEP: &str = r#"
+name: placed-chain
+steps:
+  - id: build
+    agent: builder
+    prompt: "build it"
+    host: worker-1
+  - id: report
+    agent: reporter
+    prompt: "summarize {{ steps.build.output }}"
+    host: worker-2
+"#;
+
+    #[tokio::test]
+    async fn placed_linear_step_dispatched_through_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::new());
+        let wf = Workflow::parse(WF_PLACED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
+        opts.inputs.insert("what".into(), "rupu".into());
+
+        let result = run_workflow(opts).await.expect("run ok");
+
+        // The dispatcher saw exactly one unit at index 0 on worker-1.
+        let calls = dispatcher.calls.lock().unwrap().clone();
+        assert_eq!(calls, vec![(0, "worker-1".to_string())]);
+
+        // The UnitOutcome.output became the step output.
+        let sr = &result.step_results[0];
+        assert_eq!(sr.step_id, "build");
+        assert!(sr.success);
+        assert_eq!(sr.output, "out-0-on-worker-1");
+    }
+
+    #[tokio::test]
+    async fn placed_step_output_feeds_downstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::new());
+        let wf = Workflow::parse(WF_PLACED_TWO_STEP).unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), dispatcher.clone());
+
+        let result = run_workflow(opts).await.expect("run ok");
+
+        // Step 2 ran on worker-2, and its rendered prompt embedded step 1's output.
+        let calls = dispatcher.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![(0, "worker-1".to_string()), (0, "worker-2".to_string())]
+        );
+        assert_eq!(result.step_results.len(), 2);
+        assert_eq!(
+            result.step_results[1].rendered_prompt,
+            "summarize out-0-on-worker-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn placed_step_remote_err_aborts_without_continue_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::with_failing_host("worker-1"));
+        let wf = Workflow::parse(WF_PLACED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        opts.inputs.insert("what".into(), "rupu".into());
+
+        let err = run_workflow(opts).await.expect_err("must abort");
+        assert!(matches!(err, RunWorkflowError::Agent { ref step, .. } if step == "build"));
+    }
+
+    #[tokio::test]
+    async fn placed_step_remote_err_tolerated_with_continue_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::with_failing_host("worker-1"));
+        let yaml = r#"
+name: placed-tolerant
+steps:
+  - id: build
+    agent: builder
+    prompt: "build it"
+    host: worker-1
+    continue_on_error: true
+"#;
+        let wf = Workflow::parse(yaml).unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+
+        let result = run_workflow(opts).await.expect("tolerated");
+        assert!(!result.step_results[0].success);
+    }
+
+    #[tokio::test]
+    async fn placed_step_failed_outcome_aborts() {
+        // Agent ran but reported success=false → still aborts under
+        // continue_on_error:false (symmetric with the fan-out path).
+        let dir = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(AlwaysFailedOutcomeDispatcher);
+        let wf = Workflow::parse(WF_PLACED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), dispatcher);
+        opts.inputs.insert("what".into(), "rupu".into());
+
+        let err = run_workflow(opts)
+            .await
+            .expect_err("must abort on success=false");
+        assert!(matches!(err, RunWorkflowError::Agent { ref step, .. } if step == "build"));
+    }
+
+    #[tokio::test]
+    async fn placed_step_without_dispatcher_errors_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_PLACED).unwrap();
+        // make_opts requires a dispatcher; build opts with None directly.
+        let mut opts = make_opts(
+            wf,
+            dir.path().to_path_buf(),
+            Arc::new(FakeUnitDispatcher::new()),
+        );
+        opts.unit_dispatcher = None;
+        opts.inputs.insert("what".into(), "rupu".into());
+
+        let err = run_workflow(opts)
+            .await
+            .expect_err("must error without fleet");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fleet"),
+            "expected clear fleet-access error, got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Distributed fan-out tests
+    // -----------------------------------------------------------------------
+
     const WF_DISTRIBUTED: &str = r#"
 name: distributed-test
 steps:
@@ -2679,8 +2910,7 @@ steps:
         // Unit 0: first call to h1 (fails), then retry to h2 (succeeds).
         // Unit 1: single call to h2 (succeeds).
         // Total calls = 3.
-        let unit0_calls: Vec<&(usize, String)> =
-            calls.iter().filter(|(i, _)| *i == 0).collect();
+        let unit0_calls: Vec<&(usize, String)> = calls.iter().filter(|(i, _)| *i == 0).collect();
         assert_eq!(
             unit0_calls.len(),
             2,
@@ -2694,8 +2924,7 @@ steps:
         assert_eq!(step.items[0].output, "out-0-on-h2");
 
         // Unit 1 succeeded on h2 directly.
-        let unit1_calls: Vec<&(usize, String)> =
-            calls.iter().filter(|(i, _)| *i == 1).collect();
+        let unit1_calls: Vec<&(usize, String)> = calls.iter().filter(|(i, _)| *i == 1).collect();
         assert_eq!(unit1_calls.len(), 1, "unit 1 needs only one call");
         assert_eq!(unit1_calls[0].1, "h2");
         assert!(step.items[1].success);

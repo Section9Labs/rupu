@@ -28,6 +28,7 @@ fn step_started_flips_node_to_active() {
         step_id: "s1".into(),
         kind: StepKind::Linear,
         agent: None,
+        host: None,
     });
     assert_eq!(model.nodes.get("s1"), Some(&NodeStatus::Active));
     assert_eq!(model.active_step.as_deref(), Some("s1"));
@@ -41,6 +42,7 @@ fn step_working_flips_node_to_working() {
             step_id: "s1".into(),
             kind: StepKind::Linear,
             agent: None,
+            host: None,
         })
         .apply(&Event::StepWorking {
             run_id: "r1".into(),
@@ -58,12 +60,14 @@ fn step_completed_flips_node_to_complete() {
             step_id: "s1".into(),
             kind: StepKind::Linear,
             agent: None,
+            host: None,
         })
         .apply(&Event::StepCompleted {
             run_id: "r1".into(),
             step_id: "s1".into(),
             success: true,
             duration_ms: 42,
+            host: None,
         });
     assert_eq!(model.nodes.get("s1"), Some(&NodeStatus::Complete));
 }
