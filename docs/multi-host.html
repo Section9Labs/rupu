@@ -340,7 +340,9 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
         <strong>Fleet &#8594; Hosts.</strong> A new top-level surface listing every
         host (name, transport, status, version, active runs, last seen), with
         <code class="inline">local</code> pinned first and an <strong>Add Host</strong>
-        form. Each host's status is probed live; a host's detail view scopes the
+        form that registers <strong>HTTP, SSH, and bucket</strong> hosts right from
+        the browser (tunnel nodes enroll via the CLI). Each host's status is probed
+        live; a host's detail view scopes the
         run list to that one host plus its connection and health info.
       </li>
       <li>
@@ -386,6 +388,25 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
       control them.
     </div>
 
+    <h2>Distribute work across the fleet</h2>
+    <p>
+      Beyond running a whole workflow on one host, a single workflow run can
+      <strong>spread a <code class="inline">for_each</code> step's units across the
+      fleet</strong>. Add a <code class="inline">distribute:</code> block naming the
+      hosts; rupu assigns the units <strong>round-robin</strong>, dispatches each to
+      its host, attributes the unit's run to that host, and aggregates the results
+      back into the step — partial failures honored per
+      <code class="inline">continue_on_error</code>. It works over every transport
+      (HTTP / SSH / tunnel / bucket).
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">review_each</span>
+    <span class="k">agent</span>: <span class="v">code-reviewer</span>
+    <span class="k">for_each</span>: <span class="s">"&#123;&#123; inputs.files &#125;&#125;"</span>
+    <span class="k">distribute</span>:
+      <span class="k">hosts</span>: [<span class="v">gpu-box</span>, <span class="v">build-box</span>]
+    <span class="k">prompt</span>: <span class="s">"Review &#123;&#123; item &#125;&#125;."</span></pre>
+    <p>See <a class="link" href="/docs/workflows.html">Workflows</a> for the step format. Host-placement of individual file-mutating steps (which needs cross-host workspace sync) is still in progress — see below.</p>
+
     <h2>Choosing a transport</h2>
     <p>
       All five transports satisfy the same port, so pick by how the host can be
@@ -426,8 +447,8 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
       </thead>
       <tbody>
         <tr>
-          <td>Distributed workflow steps</td>
-          <td>Workflow steps that <strong>target a host or host-set</strong>, with <strong>cross-host fan-out</strong> and per-host result aggregation.</td>
+          <td>Per-step host placement &amp; workspace sync</td>
+          <td>A <code class="inline">host:</code> on an individual (non-fan-out) step, plus cross-host <strong>workspace / file sync</strong> so file-mutating steps can run remotely. (Distributing a <code class="inline">for_each</code> step's units across hosts already ships — see <em>Distribute work across the fleet</em> above.)</td>
         </tr>
         <tr>
           <td>Auto-placement</td>

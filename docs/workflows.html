@@ -208,6 +208,17 @@
       </tbody>
     </table>
 
+    <h2>Distribute a step across the fleet</h2>
+    <p>A <code class="inline">for_each</code> step can spread its units across multiple <a class="link" href="/docs/multi-host.html">hosts</a> with a <code class="inline">distribute:</code> block — units are assigned <strong>round-robin</strong> to the named fleet hosts, run there, and their results aggregate back exactly like a local fan-out. Omit <code class="inline">distribute:</code> and the step runs locally, unchanged.</p>
+    <pre class="code"><span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">review_each</span>
+    <span class="k">agent</span>: <span class="v">code-reviewer</span>
+    <span class="k">for_each</span>: <span class="s">"&#123;&#123; inputs.files &#125;&#125;"</span>
+    <span class="k">distribute</span>:
+      <span class="k">hosts</span>: [<span class="v">gpu-box</span>, <span class="v">build-box</span>]   <span class="c"># round-robin across fleet hosts</span>
+    <span class="k">prompt</span>: <span class="s">"Review &#123;&#123; item &#125;&#125;."</span></pre>
+    <div class="callout"><strong>Valid only on <code class="inline">for_each</code> steps</strong>, and <code class="inline">hosts</code> must be non-empty. Each unit's run is attributed to the host it ran on (visible in the control plane), and a remote unit failure is handled per the step's <code class="inline">continue_on_error</code>. Register the hosts first — see <a class="link" href="/docs/multi-host.html">Multi-host</a>.</div>
+
     <h2>Template expressions</h2>
     <p>
       Prompts, <code class="inline">when:</code> conditions, and <code class="inline">for_each:</code> lists are

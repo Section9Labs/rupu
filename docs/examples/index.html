@@ -293,6 +293,7 @@ rupu host add build-box --url <span class="s">https://build.internal</span> --to
 rupu host list</pre>
 
     <p><strong>Then operate from the Control Plane.</strong> Open <code class="inline">rupu cp serve</code> on the central machine, pick a host in the launcher, and launch any of the workflows above on it — for example the parallel review panel on the build box. Cross-host launch is a Control-Plane action (the host selector); see <a class="link" href="/docs/multi-host.html">Multi-host</a> for the full picture and the transport roadmap.</p>
+    <p><strong>Scale a single run across the fleet.</strong> Add a <code class="inline">distribute: { hosts: [gpu-box, build-box] }</code> block to a <code class="inline">for_each</code> step and its units fan out round-robin across those hosts — one workflow, the whole fleet doing the work. See <a class="link" href="/docs/workflows.html">Distribute a step across the fleet</a>.</p>
 
     <figure class="diagram">
       <svg viewBox="0 0 640 220" role="img" aria-label="A central control plane federates over HTTP to local and remote hosts">
