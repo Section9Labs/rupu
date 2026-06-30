@@ -21,28 +21,50 @@ const TRANSPORT_CLASS: Record<HostTransportKind, string> = {
   local:   'bg-surface text-ink-dim ring-border',
   http_cp: 'bg-info-bg text-info ring-info/30',
   tunnel:  'bg-warn-bg text-warn ring-warn/30',
+  ssh:     'bg-ok-bg text-ok ring-ok/30',
+  bucket:  'bg-surface text-ink-dim ring-border',
 };
 
 const TRANSPORT_LABEL: Record<HostTransportKind, string> = {
   local: 'local',
   http_cp: 'http-cp',
   tunnel: 'tunnel',
+  ssh: 'SSH',
+  bucket: 'Bucket',
 };
 
 // ---------------------------------------------------------------------------
 // Add-host form state
 // ---------------------------------------------------------------------------
 
-type AddMode = 'http_cp' | 'tunnel';
+type AddMode = 'http_cp' | 'tunnel' | 'ssh' | 'bucket';
 
 interface AddForm {
   mode: AddMode;
   name: string;
+  // http_cp fields
   base_url: string;
   token: string;
+  // ssh fields
+  ssh_host: string;
+  ssh_port: string;
+  ssh_identity: string;
+  // bucket fields
+  bucket_url: string;
+  bucket_prefix: string;
 }
 
-const EMPTY_FORM: AddForm = { mode: 'http_cp', name: '', base_url: '', token: '' };
+const EMPTY_FORM: AddForm = {
+  mode: 'http_cp',
+  name: '',
+  base_url: '',
+  token: '',
+  ssh_host: '',
+  ssh_port: '',
+  ssh_identity: '',
+  bucket_url: '',
+  bucket_prefix: '',
+};
 
 /// One-time enrollment result shown after a successful tunnel node enroll.
 interface EnrollResult {
@@ -209,6 +231,52 @@ export default function Hosts() {
       return;
     }
 
+    if (form.mode === 'ssh') {
+      if (!form.ssh_host.trim()) {
+        setSubmitting(false);
+        return;
+      }
+      const rawPort = parseInt(form.ssh_port.trim(), 10);
+      try {
+        await api.addSshHost({
+          name: form.name.trim(),
+          host: form.ssh_host.trim(),
+          port: Number.isNaN(rawPort) ? undefined : rawPort,
+          identity_file: form.ssh_identity.trim() || undefined,
+        });
+        setForm(EMPTY_FORM);
+        setShowAdd(false);
+        void load();
+      } catch (e: unknown) {
+        setAddError(e instanceof Error ? e.message : 'Failed to add SSH host');
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
+    if (form.mode === 'bucket') {
+      if (!form.bucket_url.trim()) {
+        setSubmitting(false);
+        return;
+      }
+      try {
+        await api.addBucketHost({
+          name: form.name.trim(),
+          url: form.bucket_url.trim(),
+          prefix: form.bucket_prefix.trim() || undefined,
+        });
+        setForm(EMPTY_FORM);
+        setShowAdd(false);
+        void load();
+      } catch (e: unknown) {
+        setAddError(e instanceof Error ? e.message : 'Failed to add bucket host');
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
     // HTTP CP mode.
     if (!form.base_url.trim()) {
       setSubmitting(false);
@@ -329,7 +397,7 @@ export default function Hosts() {
           {/* Transport type selector */}
           <fieldset className="flex flex-col gap-1">
             <legend className="text-note font-medium text-ink-dim mb-1">Type</legend>
-            <div className="flex gap-4">
+            <div className="flex gap-4 flex-wrap">
               <label className="flex items-center gap-1.5 text-sm text-ink cursor-pointer">
                 <input
                   type="radio"
@@ -352,6 +420,28 @@ export default function Hosts() {
                 />
                 Tunnel node
               </label>
+              <label className="flex items-center gap-1.5 text-sm text-ink cursor-pointer">
+                <input
+                  type="radio"
+                  name="host-mode"
+                  value="ssh"
+                  checked={form.mode === 'ssh'}
+                  onChange={() => setForm((f) => ({ ...f, mode: 'ssh' }))}
+                  className="accent-brand-600"
+                />
+                SSH host
+              </label>
+              <label className="flex items-center gap-1.5 text-sm text-ink cursor-pointer">
+                <input
+                  type="radio"
+                  name="host-mode"
+                  value="bucket"
+                  checked={form.mode === 'bucket'}
+                  onChange={() => setForm((f) => ({ ...f, mode: 'bucket' }))}
+                  className="accent-brand-600"
+                />
+                Bucket (dead-drop)
+              </label>
             </div>
           </fieldset>
 
@@ -365,7 +455,12 @@ export default function Hosts() {
               type="text"
               value={form.name}
               onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))}
-              placeholder={form.mode === 'tunnel' ? 'my-box' : 'prod-east'}
+              placeholder={
+                form.mode === 'tunnel' ? 'my-box'
+                : form.mode === 'ssh' ? 'prod-ssh'
+                : form.mode === 'bucket' ? 'drop-bucket'
+                : 'prod-east'
+              }
               required
               className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
             />
@@ -409,6 +504,94 @@ export default function Hosts() {
             </>
           )}
 
+          {form.mode === 'ssh' && (
+            <>
+              <div className="flex flex-col gap-1">
+                <label htmlFor="host-ssh-host" className="text-note font-medium text-ink-dim">
+                  Destination
+                </label>
+                <input
+                  id="host-ssh-host"
+                  type="text"
+                  value={form.ssh_host}
+                  onChange={(e) => setForm((f) => ({ ...f, ssh_host: e.target.value }))}
+                  placeholder="user@hostname"
+                  required
+                  className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label htmlFor="host-ssh-port" className="text-note font-medium text-ink-dim">
+                  Port <span className="font-normal text-ink-mute">(optional, default 22)</span>
+                </label>
+                <input
+                  id="host-ssh-port"
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={form.ssh_port}
+                  onChange={(e) => setForm((f) => ({ ...f, ssh_port: e.target.value }))}
+                  placeholder="22"
+                  className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label htmlFor="host-ssh-identity" className="text-note font-medium text-ink-dim">
+                  Identity file <span className="font-normal text-ink-mute">(optional)</span>
+                </label>
+                <input
+                  id="host-ssh-identity"
+                  type="text"
+                  value={form.ssh_identity}
+                  onChange={(e) => setForm((f) => ({ ...f, ssh_identity: e.target.value }))}
+                  placeholder="~/.ssh/id_ed25519"
+                  className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
+                />
+                <p className="text-note text-ink-mute">
+                  Authentication uses the system SSH / ssh-agent. No password or key is stored here.
+                </p>
+              </div>
+            </>
+          )}
+
+          {form.mode === 'bucket' && (
+            <>
+              <div className="flex flex-col gap-1">
+                <label htmlFor="host-bucket-url" className="text-note font-medium text-ink-dim">
+                  Bucket URL
+                </label>
+                <input
+                  id="host-bucket-url"
+                  type="text"
+                  value={form.bucket_url}
+                  onChange={(e) => setForm((f) => ({ ...f, bucket_url: e.target.value }))}
+                  placeholder="s3://my-bucket  /  gs://my-bucket  /  file:///tmp/drop"
+                  required
+                  className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label htmlFor="host-bucket-prefix" className="text-note font-medium text-ink-dim">
+                  Prefix <span className="font-normal text-ink-mute">(optional)</span>
+                </label>
+                <input
+                  id="host-bucket-prefix"
+                  type="text"
+                  value={form.bucket_prefix}
+                  onChange={(e) => setForm((f) => ({ ...f, bucket_prefix: e.target.value }))}
+                  placeholder="rupu/drops/"
+                  className="rounded border border-border bg-bg px-3 py-1.5 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-400"
+                />
+                <p className="text-note text-ink-mute">
+                  Credentials come from the environment (AWS_*, GOOGLE_APPLICATION_CREDENTIALS, etc.) — no secrets are stored here.
+                </p>
+              </div>
+            </>
+          )}
+
           {form.mode === 'tunnel' && (
             <p className="text-xs text-ink-dim">
               A one-time token and connection command will be shown after enrollment.
@@ -424,7 +607,10 @@ export default function Hosts() {
             >
               {submitting
                 ? (form.mode === 'tunnel' ? 'Enrolling…' : 'Adding…')
-                : (form.mode === 'tunnel' ? 'Enroll node' : 'Add host')}
+                : (form.mode === 'tunnel' ? 'Enroll node'
+                  : form.mode === 'ssh' ? 'Add SSH host'
+                  : form.mode === 'bucket' ? 'Add bucket host'
+                  : 'Add host')}
             </button>
             <button
               type="button"

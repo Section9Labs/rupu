@@ -548,7 +548,7 @@ export interface SessionRunRow {
 // Hosts
 // ---------------------------------------------------------------------------
 
-export type HostTransportKind = 'local' | 'http_cp' | 'tunnel';
+export type HostTransportKind = 'local' | 'http_cp' | 'tunnel' | 'ssh' | 'bucket';
 export type HostStatus = 'online' | 'offline' | 'stale';
 
 export interface HostCapabilities {
@@ -1357,6 +1357,29 @@ export const api = {
    */
   enrollNode(body: { name: string }): Promise<{ host: HostView; command: string; token: string }> {
     return request<{ host: HostView; command: string; token: string }>('/api/hosts/node', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+  /** Register a new SSH host. `port` and `identity_file` are optional. */
+  addSshHost(body: {
+    name: string;
+    host: string;
+    port?: number;
+    identity_file?: string;
+  }): Promise<HostView> {
+    return request<HostView>('/api/hosts/ssh', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  },
+  /** Register a new bucket (dead-drop) host. `prefix` is optional. */
+  addBucketHost(body: {
+    name: string;
+    url: string;
+    prefix?: string;
+  }): Promise<HostView> {
+    return request<HostView>('/api/hosts/bucket', {
       method: 'POST',
       body: JSON.stringify(body),
     });
