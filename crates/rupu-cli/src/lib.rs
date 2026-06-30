@@ -7,7 +7,6 @@
 
 pub mod cmd;
 pub mod cp_agent_launcher;
-pub mod fleet_unit_dispatcher;
 pub mod cp_definition_generator;
 pub mod cp_launcher;
 pub mod cp_repos;
@@ -15,6 +14,7 @@ pub mod cp_session_mutator;
 pub mod cp_session_sender;
 pub mod cp_session_starter;
 pub mod crash;
+pub mod fleet_unit_dispatcher;
 pub mod logging;
 pub mod output;
 pub mod paths;

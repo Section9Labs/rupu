@@ -112,15 +112,25 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 .await
                 .map_err(host_err_to_run_err)?;
 
-            let status = rec["status"].as_str().unwrap_or("").to_string();
+            // All HostConnector::get_run impls return the query_run_detail
+            // envelope: {"run": <RunRecord>, "steps": [...], "usage": {...}}.
+            // Read from the nested "run" object, not the top-level envelope.
+            let run = &rec["run"];
+            let status = run["status"].as_str().unwrap_or("").to_string();
 
             if is_terminal_status(&status) {
-                let output = rec["final_output"].as_str().unwrap_or("").to_string();
+                let output = run["final_output"].as_str().unwrap_or("").to_string();
                 let success = status == "completed";
+                let error = (!success).then(|| {
+                    run["error_message"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| status.clone())
+                });
                 return Ok(UnitOutcome {
                     output,
                     success,
-                    error: if success { None } else { Some(status) },
+                    error,
                 });
             }
         }
@@ -200,9 +210,24 @@ mod tests {
         fn completed() -> Self {
             Self {
                 run_id: "run_x",
+                // Real envelope shape: {"run": <RunRecord>, "steps": [...], "usage": {...}}
                 get_run_response: serde_json::json!({
-                    "status": "completed",
-                    "final_output": "fake-out"
+                    "run": {
+                        "status": "completed",
+                        "final_output": "fake-out"
+                    }
+                }),
+            }
+        }
+
+        fn failed() -> Self {
+            Self {
+                run_id: "run_y",
+                get_run_response: serde_json::json!({
+                    "run": {
+                        "status": "failed",
+                        "error_message": "boom"
+                    }
                 }),
             }
         }
@@ -370,8 +395,9 @@ mod tests {
 
     // ── Tests ─────────────────────────────────────────────────────────────────
 
-    /// `from_connector` with a fake that returns `{"status":"completed","final_output":"fake-out"}`
-    /// on the first `get_run` poll → output "fake-out", success true.
+    /// `from_connector` with a fake that returns the real envelope
+    /// `{"run":{"status":"completed","final_output":"fake-out"}}` on the
+    /// first `get_run` poll → output "fake-out", success true.
     #[tokio::test]
     async fn fleet_dispatch_reads_final_output_from_mirror() {
         let conn = Arc::new(FakeConnector::completed());
@@ -380,6 +406,19 @@ mod tests {
         assert_eq!(out.output, "fake-out");
         assert!(out.success);
         assert!(out.error.is_none());
+    }
+
+    /// `from_connector` with a fake that returns a failed envelope
+    /// `{"run":{"status":"failed","error_message":"boom"}}` → success false,
+    /// error contains "boom" (prefers error_message over status literal).
+    #[tokio::test]
+    async fn fleet_dispatch_failed_run_surfaces_error_message() {
+        let conn = Arc::new(FakeConnector::failed());
+        let d = FleetUnitDispatcher::from_connector(conn);
+        let out = d.dispatch_unit(make_unit(), "h1").await.unwrap();
+        assert!(!out.success);
+        let err = out.error.expect("failed run must have an error field");
+        assert!(err.contains("boom"), "expected 'boom' in error, got: {err}");
     }
 
     /// `from_connector` with a fake whose `launch_agent` returns `Unreachable`
