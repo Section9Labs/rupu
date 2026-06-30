@@ -56,6 +56,12 @@ pub struct DefaultStepFactory {
     /// this alongside the factory so it has access to the same
     /// run_store + factory + agent loader.
     pub dispatcher: Option<Arc<dyn AgentDispatcher>>,
+    /// OpenAI-compatible provider params resolved from `config.toml`, keyed by
+    /// provider name. Lets workflow steps build custom providers (e.g.
+    /// `oracle`) the same way `rupu run` does. Empty when no
+    /// `[providers.<name>] kind = "openai-compatible"` is declared.
+    pub openai_compatible:
+        std::collections::HashMap<String, provider_factory::OpenAiCompatibleParams>,
 }
 
 /// Resolve a step's agent spec from a `load_agent` result. On success the
@@ -142,44 +148,60 @@ impl StepFactory for DefaultStepFactory {
         // provider/model. (Previously a step naming a nonexistent agent ran on
         // `anthropic`/`claude-sonnet-4-6` and billed it.) A present agent that
         // merely omits `provider:`/`model:` still defaults, as before.
-        let (provider_name, model) = if load_err.is_some() {
-            ("unresolved".to_string(), "-".to_string())
-        } else {
-            (
-                spec.provider.clone().unwrap_or_else(|| "anthropic".into()),
-                spec.model
-                    .clone()
-                    .unwrap_or_else(|| "claude-sonnet-4-6".into()),
-            )
-        };
         let auth_hint = spec.auth;
-        // Build the provider; on a load error OR a build failure (missing
-        // credential, bad auth config, etc.) substitute a stub provider that
-        // returns the error on first call. The runner's existing
-        // `RunComplete { status: Error }` path then surfaces it as a clean
-        // `✗ <step_id>` line via the line printer — no panic, no crash log,
-        // no provider call. (See `provider_build_error_stub` below.)
+        // Build the provider. On a load error OR a build failure substitute a
+        // stub provider that returns the error on first call; the runner's
+        // `RunComplete { status: Error }` path surfaces it as a clean
+        // `✗ <step_id>` line — no panic, no crash log, no provider call.
+        // Custom OpenAI-compatible providers (declared as
+        // `[providers.<name>] kind = "openai-compatible"`) are resolved from
+        // the config-derived `openai_compatible` map and built via
+        // `build_for_provider_with_config` — the same path `rupu run` uses, so
+        // a workflow step on e.g. `oracle` reaches the configured endpoint
+        // instead of failing with "unknown provider".
+        let provider_name: String;
+        let model: String;
         let provider: Box<dyn rupu_providers::LlmProvider> = match load_err {
-            Some(msg) => Box::new(provider_build_error_stub(
-                provider_name.clone(),
-                model.clone(),
-                msg,
-            )),
-            None => match provider_factory::build_for_provider(
-                &provider_name,
-                &model,
-                auth_hint,
-                self.resolver.as_ref(),
-            )
-            .await
-            {
-                Ok((_resolved_auth, p)) => p,
-                Err(e) => Box::new(provider_build_error_stub(
+            Some(msg) => {
+                provider_name = "unresolved".to_string();
+                model = "-".to_string();
+                Box::new(provider_build_error_stub(
                     provider_name.clone(),
                     model.clone(),
-                    e.to_string(),
-                )),
-            },
+                    msg,
+                ))
+            }
+            None => {
+                provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
+                let oai_params = self.openai_compatible.get(&provider_name).cloned();
+                // Prefer the agent's pinned model; for an openai-compatible
+                // provider fall back to its configured default_model.
+                model = spec
+                    .model
+                    .clone()
+                    .or_else(|| oai_params.as_ref().map(|p| p.default_model.clone()))
+                    .unwrap_or_else(|| "claude-sonnet-4-6".into());
+                let provider_config = provider_factory::ProviderConfig {
+                    anthropic_oauth_system_prefix: spec.anthropic_oauth_prefix,
+                    openai_compatible: oai_params,
+                };
+                match provider_factory::build_for_provider_with_config(
+                    &provider_name,
+                    &model,
+                    auth_hint,
+                    self.resolver.as_ref(),
+                    &provider_config,
+                )
+                .await
+                {
+                    Ok((_resolved_auth, p)) => p,
+                    Err(e) => Box::new(provider_build_error_stub(
+                        provider_name.clone(),
+                        model.clone(),
+                        e.to_string(),
+                    )),
+                }
+            }
         };
 
         let agent_system_prompt = match self.system_prompt_suffix.as_deref() {
