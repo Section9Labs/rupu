@@ -20,6 +20,8 @@ const TRANSPORT_LABEL: Record<HostTransportKind, string> = {
   local: 'local',
   http_cp: 'http-cp',
   tunnel: 'tunnel',
+  ssh: 'SSH',
+  bucket: 'Bucket',
 };
 
 // ---------------------------------------------------------------------------

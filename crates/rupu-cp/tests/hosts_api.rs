@@ -354,3 +354,178 @@ async fn post_hosts_node_enrolls_and_appears_in_list() {
     assert_eq!(node_host["transport_kind"], "tunnel");
     assert_eq!(node_host["name"], "my-test-node");
 }
+
+// ── SSH host enrollment ───────────────────────────────────────────────────────
+
+/// `POST /api/hosts/ssh` without a launcher → 501.
+#[tokio::test]
+async fn post_hosts_ssh_without_launcher_returns_501() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server(tmp.path()).await; // no launcher
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/api/hosts/ssh"))
+        .json(&serde_json::json!({
+            "name": "edge",
+            "host": "deploy@edge.example"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+/// `POST /api/hosts/ssh` with a launcher → 200; `transport_kind == "ssh"`;
+/// host appears in `GET /api/hosts` as offline.
+#[tokio::test]
+async fn post_hosts_ssh_with_launcher_adds_host_and_appears_in_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server_serve(tmp.path()).await;
+
+    let client = reqwest::Client::new();
+
+    // POST — add the SSH host.
+    let post_resp = client
+        .post(format!("http://{addr}/api/hosts/ssh"))
+        .json(&serde_json::json!({
+            "name": "edge",
+            "host": "deploy@edge.example",
+            "port": 2222
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        post_resp.status(),
+        StatusCode::OK,
+        "POST /api/hosts/ssh should return 200"
+    );
+
+    let added: serde_json::Value = post_resp.json().await.unwrap();
+    assert_eq!(added["name"], "edge");
+    assert_eq!(added["transport_kind"], "ssh", "response must be ssh transport");
+    // address field (base_url in HostView) carries host:port
+    let addr_field = added["base_url"].as_str().expect("base_url should be present");
+    assert!(
+        addr_field.contains("edge.example"),
+        "base_url should contain the hostname, got {addr_field:?}"
+    );
+    assert_eq!(added["status"], "offline");
+
+    let added_id = added["id"].as_str().expect("id should be a string").to_string();
+    assert!(
+        added_id.starts_with("host_"),
+        "id should be a host_ ULID, got {added_id:?}"
+    );
+
+    // GET — the host must appear in the list.
+    let get_resp = client
+        .get(format!("http://{addr}/api/hosts"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let hosts: Vec<serde_json::Value> = get_resp.json().await.unwrap();
+    assert_eq!(hosts.len(), 2, "list should have local + the new SSH host");
+
+    let ssh_host = hosts
+        .iter()
+        .find(|h| h["id"] == added_id)
+        .expect("added SSH host should be in GET /api/hosts");
+
+    assert_eq!(ssh_host["transport_kind"], "ssh");
+    assert_eq!(ssh_host["name"], "edge");
+    assert_eq!(ssh_host["status"], "offline");
+}
+
+// ── Bucket host enrollment ────────────────────────────────────────────────────
+
+/// `POST /api/hosts/bucket` without a launcher → 501.
+#[tokio::test]
+async fn post_hosts_bucket_without_launcher_returns_501() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server(tmp.path()).await; // no launcher
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{addr}/api/hosts/bucket"))
+        .json(&serde_json::json!({
+            "name": "my-bucket",
+            "url": "s3://my-bucket/rupu"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+/// `POST /api/hosts/bucket` with a launcher → 200; `transport_kind == "bucket"`;
+/// host appears in `GET /api/hosts` as offline.
+#[tokio::test]
+async fn post_hosts_bucket_with_launcher_adds_host_and_appears_in_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn_server_serve(tmp.path()).await;
+
+    let client = reqwest::Client::new();
+
+    // POST — add the bucket host.
+    let post_resp = client
+        .post(format!("http://{addr}/api/hosts/bucket"))
+        .json(&serde_json::json!({
+            "name": "my-bucket",
+            "url": "s3://my-bucket/rupu",
+            "prefix": "runs/"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        post_resp.status(),
+        StatusCode::OK,
+        "POST /api/hosts/bucket should return 200"
+    );
+
+    let added: serde_json::Value = post_resp.json().await.unwrap();
+    assert_eq!(added["name"], "my-bucket");
+    assert_eq!(
+        added["transport_kind"], "bucket",
+        "response must be bucket transport"
+    );
+    // base_url carries the bucket URL.
+    assert_eq!(added["base_url"], "s3://my-bucket/rupu");
+    assert_eq!(added["status"], "offline");
+
+    let added_id = added["id"].as_str().expect("id should be a string").to_string();
+    assert!(
+        added_id.starts_with("host_"),
+        "id should be a host_ ULID, got {added_id:?}"
+    );
+
+    // GET — the host must appear in the list.
+    let get_resp = client
+        .get(format!("http://{addr}/api/hosts"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(get_resp.status(), StatusCode::OK);
+
+    let hosts: Vec<serde_json::Value> = get_resp.json().await.unwrap();
+    assert_eq!(hosts.len(), 2, "list should have local + the new bucket host");
+
+    let bucket_host = hosts
+        .iter()
+        .find(|h| h["id"] == added_id)
+        .expect("added bucket host should be in GET /api/hosts");
+
+    assert_eq!(bucket_host["transport_kind"], "bucket");
+    assert_eq!(bucket_host["name"], "my-bucket");
+    assert_eq!(bucket_host["status"], "offline");
+}
