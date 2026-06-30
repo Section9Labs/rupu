@@ -83,6 +83,7 @@ mod tests {
                 step_id: "s1".into(),
                 kind: StepKind::Linear,
                 agent: None,
+                host: None,
             },
         );
         sink.emit(
@@ -92,6 +93,7 @@ mod tests {
                 step_id: "s1".into(),
                 success: true,
                 duration_ms: 17,
+                host: None,
             },
         );
         drop(sink);
@@ -115,6 +117,7 @@ mod tests {
                 step_id: "s1".into(),
                 kind: StepKind::Linear,
                 agent: Some("classifier".into()),
+                host: None,
             },
         );
         drop(sink);

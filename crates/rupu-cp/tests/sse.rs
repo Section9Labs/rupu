@@ -64,13 +64,13 @@ fn make_events() -> Vec<Event> {
             step_id: "step_a".into(),
             kind: StepKind::Linear,
             agent: Some("rupu-agent".into()),
+            host: None,
         },
     ]
 }
 
 async fn spawn_server(dir: &std::path::Path) -> std::net::SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
+    let state = rupu_cp::state::AppState::new(dir.into(), rupu_config::PricingConfig::default());
     let app = rupu_cp::server::router(state, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -112,7 +112,10 @@ async fn run_log_known_run_streams_events() {
     let run_id = "sse_test_run";
     let store = RunStore::new(tmp.path().join("runs"));
     store
-        .create(seed_run(run_id, RunStatus::Running), "name: test\nsteps: []\n")
+        .create(
+            seed_run(run_id, RunStatus::Running),
+            "name: test\nsteps: []\n",
+        )
         .unwrap();
     // Pre-populate events.jsonl with two events.
     write_events_jsonl(&store, run_id, &make_events());
@@ -141,9 +144,7 @@ async fn run_log_known_run_streams_events() {
     let stream = resp2.bytes_stream();
     // Collect bytes line-by-line via a small async reader
     use futures_util::TryStreamExt as _;
-    let async_reader = tokio_util::io::StreamReader::new(
-        stream.map_err(std::io::Error::other),
-    );
+    let async_reader = tokio_util::io::StreamReader::new(stream.map_err(std::io::Error::other));
     let mut lines = tokio::io::BufReader::new(async_reader).lines();
 
     let first_data_line = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -157,8 +158,7 @@ async fn run_log_known_run_streams_events() {
     .await
     .expect("timed out waiting for first SSE data line");
 
-    let data =
-        first_data_line.expect("no data: line received within timeout");
+    let data = first_data_line.expect("no data: line received within timeout");
     // Parse back to a JSON value and confirm it contains the expected type.
     let v: serde_json::Value = serde_json::from_str(&data).expect("data line is JSON");
     assert_eq!(
@@ -201,7 +201,10 @@ async fn events_stream_explicit_run_streams_events() {
     let run_id = "sse_global_run";
     let store = RunStore::new(tmp.path().join("runs"));
     store
-        .create(seed_run(run_id, RunStatus::Running), "name: test\nsteps: []\n")
+        .create(
+            seed_run(run_id, RunStatus::Running),
+            "name: test\nsteps: []\n",
+        )
         .unwrap();
 
     // Build events with the correct run_id.
@@ -257,7 +260,10 @@ async fn events_stream_multiplexes_active_runs() {
 
     for run_id in ["mux_run_a", "mux_run_b"] {
         store
-            .create(seed_run(run_id, RunStatus::Running), "name: test\nsteps: []\n")
+            .create(
+                seed_run(run_id, RunStatus::Running),
+                "name: test\nsteps: []\n",
+            )
             .unwrap();
         let events = vec![Event::RunStarted {
             event_version: 1,
@@ -315,7 +321,10 @@ async fn events_stream_auto_selects_run() {
     let run_id = "sse_auto_run";
     let store = RunStore::new(tmp.path().join("runs"));
     store
-        .create(seed_run(run_id, RunStatus::Running), "name: test\nsteps: []\n")
+        .create(
+            seed_run(run_id, RunStatus::Running),
+            "name: test\nsteps: []\n",
+        )
         .unwrap();
     let events = vec![Event::RunStarted {
         event_version: 1,
