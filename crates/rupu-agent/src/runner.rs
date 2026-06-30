@@ -39,6 +39,45 @@ struct CoverageBundle {
 
 const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 
+/// Maximum times a single provider call is retried on a transient error
+/// (network/decode/SSE/5xx/rate-limit) before the step is failed. The run
+/// itself continues or aborts per the workflow's `continue_on_error`.
+const MAX_HTTP_RETRIES: u32 = 10;
+
+/// Capped exponential backoff for transient-error retries: 250ms, 500ms,
+/// 1s, 2s, 4s, then 8s for every further attempt.
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    let shift = attempt.saturating_sub(1).min(5);
+    std::time::Duration::from_millis(250u64 * (1u64 << shift))
+}
+
+/// Whether a provider error is worth retrying. Transient failures —
+/// network/transport, response-decode, SSE-parse, unexpected stream end,
+/// token-refresh blips, rate limits, and 429/5xx API errors — are retried.
+/// Config/auth/client errors (unknown provider, unauthorized, bad request,
+/// model unavailable, …) fail fast so we don't spin on a permanent problem.
+fn is_retryable_provider_error(e: &rupu_providers::ProviderError) -> bool {
+    use rupu_providers::ProviderError as E;
+    match e {
+        E::Http(_)
+        | E::SseParse(_)
+        | E::Json(_)
+        | E::UnexpectedEndOfStream
+        | E::TokenRefreshFailed(_)
+        | E::RateLimited { .. }
+        | E::Transient(_) => true,
+        E::Api { status, .. } => *status == 429 || *status >= 500,
+        E::MissingAuth { .. }
+        | E::AuthConfig(_)
+        | E::Unauthorized { .. }
+        | E::QuotaExceeded { .. }
+        | E::NotImplemented { .. }
+        | E::BadRequest { .. }
+        | E::ModelUnavailable { .. }
+        | E::Other(_) => false,
+    }
+}
+
 /// Default per-request output-token budget when an agent doesn't set
 /// `maxTokens`. 4096 was too low for output-heavy agents (it truncated
 /// responses before a tool call could be emitted, especially with extended
@@ -773,6 +812,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                 anthropic_speed: opts.anthropic_speed,
             };
             let mut trim_attempts = 0u32;
+            let mut http_retries = 0u32;
             let resp: LlmResponse = loop {
                 let send_result: Result<LlmResponse, rupu_providers::ProviderError> = if opts
                     .no_stream
@@ -845,12 +885,38 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             writer.flush()?;
                             return Err(RunError::ContextOverflow { turn: turn_idx });
                         }
+                        // Transient provider errors (network/decode/SSE/5xx/
+                        // rate-limit) are retried with backoff before the step
+                        // is failed — a single dropped or malformed response
+                        // shouldn't kill the run.
+                        if is_retryable_provider_error(&e) && http_retries < MAX_HTTP_RETRIES {
+                            http_retries += 1;
+                            let backoff = retry_backoff(http_retries);
+                            writer.write(&Event::AssistantDelta {
+                                content: format!(
+                                    "[transient provider error (retry {http_retries}/{MAX_HTTP_RETRIES}): {e_str}]\n"
+                                ),
+                            })?;
+                            writer.flush()?;
+                            tracing::warn!(
+                                "transient provider error, retry {http_retries}/{MAX_HTTP_RETRIES}: {e_str}"
+                            );
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
                         writer.write(&Event::RunComplete {
                             run_id: opts.run_id.clone(),
                             status: RunStatus::Error,
                             total_tokens: total_in + total_out,
                             duration_ms: started.elapsed().as_millis() as u64,
-                            error: Some(format!("provider: {e_str}")),
+                            error: Some(format!(
+                                "provider: {e_str}{}",
+                                if http_retries > 0 {
+                                    format!(" (after {http_retries} retries)")
+                                } else {
+                                    String::new()
+                                }
+                            )),
                         })?;
                         writer.flush()?;
                         return Err(RunError::Provider(e_str));
@@ -1496,6 +1562,60 @@ mod tool_result_clamp_tests {
         let clamped = clamp_tool_result_text(&raw);
         assert!(clamped.len() < raw.len());
         assert!(clamped.contains("[truncated "));
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::{is_retryable_provider_error, retry_backoff, MAX_HTTP_RETRIES};
+    use rupu_providers::ProviderError as E;
+
+    #[test]
+    fn transient_errors_are_retried() {
+        assert!(is_retryable_provider_error(&E::Http(
+            "error decoding response body".into()
+        )));
+        assert!(is_retryable_provider_error(&E::UnexpectedEndOfStream));
+        assert!(is_retryable_provider_error(&E::SseParse(
+            "bad chunk".into()
+        )));
+        assert!(is_retryable_provider_error(&E::Json("truncated".into())));
+        assert!(is_retryable_provider_error(&E::Api {
+            status: 503,
+            message: "unavailable".into()
+        }));
+        assert!(is_retryable_provider_error(&E::Api {
+            status: 429,
+            message: "slow down".into()
+        }));
+    }
+
+    #[test]
+    fn config_and_client_errors_fail_fast() {
+        // The oracle "unknown provider" case is AuthConfig — must NOT spin.
+        assert!(!is_retryable_provider_error(&E::AuthConfig(
+            "oracle: unknown provider: oracle".into()
+        )));
+        assert!(!is_retryable_provider_error(&E::BadRequest {
+            message: "max_tokens too large".into()
+        }));
+        assert!(!is_retryable_provider_error(&E::Api {
+            status: 400,
+            message: "bad request".into()
+        }));
+        assert!(!is_retryable_provider_error(&E::Api {
+            status: 404,
+            message: "no model".into()
+        }));
+    }
+
+    #[test]
+    fn backoff_is_capped_exponential() {
+        assert_eq!(retry_backoff(1).as_millis(), 250);
+        assert_eq!(retry_backoff(2).as_millis(), 500);
+        assert_eq!(retry_backoff(6).as_millis(), 8000);
+        // Capped: all further attempts stay at 8s.
+        assert_eq!(retry_backoff(MAX_HTTP_RETRIES).as_millis(), 8000);
     }
 }
 
