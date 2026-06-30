@@ -12,7 +12,7 @@ use crate::{
     agent_launcher::AgentLaunchRequest,
     host::connector::{
         EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo, RunKind,
-        RunListQuery,
+        RunListQuery, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     session_sender::SendMessageRequest,
@@ -164,10 +164,7 @@ impl HostConnector for HttpHostConnector {
         extract_string_field(resp.json().await, "run_id")
     }
 
-    async fn start_session(
-        &self,
-        req: SessionStartRequest,
-    ) -> Result<String, HostConnectorError> {
+    async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError> {
         let body = serde_json::json!({
             "prompt": req.prompt,
             "mode": req.mode,
@@ -210,17 +207,14 @@ impl HostConnector for HttpHostConnector {
             RunKind::Workflow => "/api/runs/workflows",
         };
 
-        let mut req = self
-            .client
-            .get(self.url(path))
-            .query(&[
-                ("offset", params.offset.to_string()),
-                ("limit", params.limit.to_string()),
-                // Scope the remote CP to its own local runs so we don't get
-                // recursive fan-out in multi-hop topologies (remote CPs are
-                // host-aware and would otherwise fan out across *their* hosts).
-                ("host", "local".to_string()),
-            ]);
+        let mut req = self.client.get(self.url(path)).query(&[
+            ("offset", params.offset.to_string()),
+            ("limit", params.limit.to_string()),
+            // Scope the remote CP to its own local runs so we don't get
+            // recursive fan-out in multi-hop topologies (remote CPs are
+            // host-aware and would otherwise fan out across *their* hosts).
+            ("host", "local".to_string()),
+        ]);
 
         if let Some(lc) = &params.lifecycle {
             req = req.query(&[("lifecycle", lc.as_str())]);
@@ -279,10 +273,7 @@ impl HostConnector for HttpHostConnector {
         .map(|_| ())
     }
 
-    async fn stream_run_events(
-        &self,
-        run_id: &str,
-    ) -> Result<EventByteStream, HostConnectorError> {
+    async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         let req = self
             .client
             .get(self.url("/api/events/stream"))
@@ -291,15 +282,14 @@ impl HostConnector for HttpHostConnector {
 
         let resp = self.send(req).await?;
 
-        let stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+        let stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other));
 
         Ok(Box::pin(stream))
     }
 
-    async fn get_transcript(
-        &self,
-        path: &str,
-    ) -> Result<serde_json::Value, HostConnectorError> {
+    async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
         let resp = self
             .send(
                 self.client
@@ -325,6 +315,45 @@ impl HostConnector for HttpHostConnector {
         resp.json()
             .await
             .map_err(|e| HostConnectorError::Remote(0, e.to_string()))
+    }
+
+    /// POST the wire-encoded payload to the remote CP's `/api/workspace/stage`;
+    /// the remote stages it under its own cache and returns `{working_dir}`.
+    async fn stage_workspace(&self, payload: Vec<u8>) -> Result<String, HostConnectorError> {
+        if payload.len() > MAX_WORKSPACE_BYTES {
+            return Err(HostConnectorError::Invalid(format!(
+                "workspace payload {} bytes exceeds limit {MAX_WORKSPACE_BYTES}",
+                payload.len()
+            )));
+        }
+        let resp = self
+            .send(
+                self.client
+                    .post(self.url("/api/workspace/stage"))
+                    .header("Content-Type", "application/octet-stream")
+                    .body(payload),
+            )
+            .await?;
+        extract_string_field(resp.json().await, "working_dir")
+    }
+
+    /// GET the wire-encoded delta from `/api/workspace/delta?dir=<working_dir>`.
+    async fn collect_workspace_delta(
+        &self,
+        working_dir: &str,
+    ) -> Result<Vec<u8>, HostConnectorError> {
+        let resp = self
+            .send(
+                self.client
+                    .get(self.url("/api/workspace/delta"))
+                    .query(&[("dir", working_dir)]),
+            )
+            .await?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
+        Ok(bytes.to_vec())
     }
 }
 
