@@ -82,11 +82,7 @@ impl FleetUnitDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for FleetUnitDispatcher {
-    async fn dispatch_unit(
-        &self,
-        unit: UnitDispatch,
-        host: &str,
-    ) -> Result<UnitOutcome, RunError> {
+    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
         let conn = self.resolver.resolve(host)?;
 
         // Launch the agent run on the remote host.
@@ -107,10 +103,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
 
-            let rec = conn
-                .get_run(&run_id)
-                .await
-                .map_err(host_err_to_run_err)?;
+            let rec = conn.get_run(&run_id).await.map_err(host_err_to_run_err)?;
 
             // All HostConnector::get_run impls return the query_run_detail
             // envelope: {"run": <RunRecord>, "steps": [...], "usage": {...}}.
@@ -146,17 +139,21 @@ impl UnitDispatcher for FleetUnitDispatcher {
 
 /// Build a `FleetUnitDispatcher` only when the workflow needs one.
 ///
-/// Returns `None` when the workflow has no `distribute:` step (fast path —
-/// avoids constructing the registry).  When a dispatcher is returned, it is
-/// wired to `run_store` so mirrored unit runs appear in the same store the
-/// coordinator reads.
+/// Returns `None` when the workflow has no `distribute:` or `host:` step
+/// (fast path — avoids constructing the registry).  When a dispatcher is
+/// returned, it is wired to `run_store` so mirrored unit runs appear in the
+/// same store the coordinator reads.
 pub fn build_dispatcher_if_needed(
     workflow: &rupu_orchestrator::Workflow,
     global: &Path,
     run_store: Arc<rupu_orchestrator::runs::RunStore>,
     pricing: rupu_config::PricingConfig,
 ) -> Option<Arc<dyn UnitDispatcher>> {
-    if !workflow.steps.iter().any(|s| s.distribute.is_some()) {
+    if !workflow
+        .steps
+        .iter()
+        .any(|s| s.distribute.is_some() || s.host.is_some())
+    {
         return None;
     }
 
@@ -268,11 +265,7 @@ mod tests {
         async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
             Ok(self.get_run_response.clone())
         }
-        async fn approve_run(
-            &self,
-            _run_id: &str,
-            _mode: &str,
-        ) -> Result<(), HostConnectorError> {
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
             unimplemented!()
         }
         async fn reject_run(
@@ -344,11 +337,7 @@ mod tests {
         async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
             unimplemented!()
         }
-        async fn approve_run(
-            &self,
-            _run_id: &str,
-            _mode: &str,
-        ) -> Result<(), HostConnectorError> {
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
             unimplemented!()
         }
         async fn reject_run(

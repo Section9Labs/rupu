@@ -1680,6 +1680,7 @@ mod tests {
             step_id: "report".into(),
             kind: StepKind::Linear,
             agent: Some("reporter".into()),
+            host: None,
         });
         assert_eq!(state.active.step_id.as_deref(), Some("report"));
         assert_eq!(state.active.agent.as_deref(), Some("reporter"));
@@ -1695,6 +1696,7 @@ mod tests {
             step_id: "understand".into(),
             success: true,
             duration_ms: 18_000,
+            host: None,
         });
         let step = state.steps.iter().find(|s| s.id == "understand").unwrap();
         assert_eq!(step.status, NodeStatus::Complete);
