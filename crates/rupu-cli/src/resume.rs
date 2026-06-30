@@ -117,6 +117,7 @@ pub async fn resume_run(
         Arc::clone(&store_arc),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
@@ -126,6 +127,7 @@ pub async fn resume_run(
         mcp_registry,
         system_prompt_suffix: None,
         dispatcher: Some(dispatcher_dyn),
+        openai_compatible,
     });
 
     let resume = rupu_orchestrator::ResumeState::from_approval(

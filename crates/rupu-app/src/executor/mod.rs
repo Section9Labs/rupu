@@ -106,6 +106,10 @@ impl AppExecutor {
             mcp_registry: Arc::clone(&self.config.mcp_registry),
             system_prompt_suffix: None,
             dispatcher: None,
+            // TODO: thread config-declared openai-compatible providers here too
+            // (the GUI workflow path doesn't yet, so a custom provider like
+            // `oracle` fails loudly with "unknown provider" — same as before).
+            openai_compatible: std::collections::HashMap::new(),
         });
 
         let handle = self

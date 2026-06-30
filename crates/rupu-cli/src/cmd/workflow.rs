@@ -2227,6 +2227,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
         Arc::clone(&store),
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
+    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
@@ -2236,6 +2237,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
         mcp_registry,
         system_prompt_suffix: None,
         dispatcher: Some(dispatcher_dyn),
+        openai_compatible,
     });
 
     let already_done_steps: Vec<String> = done_step_ids.iter().cloned().collect();
@@ -3336,6 +3338,7 @@ async fn execute_workflow_invocation(
     );
     let dispatcher_dyn: Arc<dyn rupu_tools::AgentDispatcher> = dispatcher;
 
+    let openai_compatible = rupu_runtime::provider_factory::openai_compatible_map(&cfg.providers);
     let factory = Arc::new(DefaultStepFactory {
         workflow: workflow.clone(),
         global: global.clone(),
@@ -3345,6 +3348,7 @@ async fn execute_workflow_invocation(
         mcp_registry,
         system_prompt_suffix: ctx.system_prompt_suffix.clone(),
         dispatcher: Some(dispatcher_dyn),
+        openai_compatible,
     });
 
     let workflow_for_resume = workflow.clone();

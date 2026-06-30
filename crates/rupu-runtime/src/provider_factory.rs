@@ -76,6 +76,18 @@ pub fn openai_compatible_params(
     })
 }
 
+/// Resolve every `[providers.<name>] kind = "openai-compatible"` entry into a
+/// map keyed by provider name. Used by the workflow runner to give each step
+/// the same custom-provider params `rupu run` resolves for one-shot agents.
+pub fn openai_compatible_map(
+    providers: &std::collections::BTreeMap<String, rupu_config::ProviderConfig>,
+) -> std::collections::HashMap<String, OpenAiCompatibleParams> {
+    providers
+        .keys()
+        .filter_map(|name| openai_compatible_params(name, providers).map(|p| (name.clone(), p)))
+        .collect()
+}
+
 /// True for provider names the factory builds directly (not openai-compatible).
 pub fn is_builtin_provider(name: &str) -> bool {
     matches!(
@@ -316,6 +328,34 @@ mod tests {
         assert!(is_builtin_provider("copilot"));
         assert!(is_builtin_provider("local"));
         assert!(!is_builtin_provider("oracle"));
+    }
+
+    #[test]
+    fn map_collects_only_openai_compatible_providers() {
+        use std::collections::BTreeMap;
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "oracle".to_string(),
+            rupu_config::ProviderConfig {
+                kind: Some("openai-compatible".into()),
+                base_url: Some("http://host:8080".into()),
+                default_model: Some("glm".into()),
+                ..Default::default()
+            },
+        );
+        // A plain (built-in) provider entry without kind=openai-compatible is excluded.
+        providers.insert(
+            "anthropic".to_string(),
+            rupu_config::ProviderConfig {
+                default_model: Some("claude-sonnet-4-6".into()),
+                ..Default::default()
+            },
+        );
+        let map = openai_compatible_map(&providers);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("oracle"));
+        assert!(!map.contains_key("anthropic"));
+        assert_eq!(map["oracle"].base_url, "http://host:8080");
     }
 }
 
