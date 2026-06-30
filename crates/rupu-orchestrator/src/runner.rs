@@ -1210,6 +1210,10 @@ async fn run_fanout_step(
                 .acquire_owned()
                 .await
                 .expect("semaphore not closed");
+            // Save placement before the `if let Some(host) = placement`
+            // branch consumes it, so both events and FanoutItemOutcome
+            // carry the same host attribution.
+            let placement_host = placement.clone();
             if let Some(sink) = event_sink.as_ref() {
                 sink.emit(
                     &workflow_run_id,
@@ -1220,6 +1224,7 @@ async fn run_fanout_step(
                         unit_key: unit_key.clone(),
                         agent: Some(unit_agent.clone()),
                         transcript_path: transcript_clone.clone(),
+                        host: placement_host.clone(),
                     },
                 );
             }
@@ -1353,6 +1358,7 @@ async fn run_fanout_step(
                         success,
                         tokens_in: 0,
                         tokens_out: 0,
+                        host: placement_host.clone(),
                     },
                 );
             }
@@ -1366,6 +1372,7 @@ async fn run_fanout_step(
                 success,
                 error: error_str,
                 raw_error,
+                host: placement_host,
             }
         }));
     }
@@ -1408,6 +1415,7 @@ async fn run_fanout_step(
                     output: o.output.clone(),
                     success: o.success,
                     finished_at: chrono::Utc::now(),
+                    host: o.host.clone(),
                 };
                 if let Err(e) = store.append_unit_checkpoint(workflow_run_id, &checkpoint) {
                     warn!(step = %step.id, index = o.idx, error = %e, "failed to append unit checkpoint");
@@ -1670,6 +1678,10 @@ struct FanoutItemOutcome {
     #[allow(dead_code)]
     error: Option<String>,
     raw_error: Option<RunError>,
+    /// Host placement for this unit (`None` = local). Threaded through
+    /// from the per-unit `placement` computed in `run_fanout_step` so
+    /// the checkpoint writer can record it without re-computing it.
+    host: Option<String>,
 }
 
 /// Build the agent opts via the factory and dispatch one agent run.
@@ -2120,6 +2132,7 @@ async fn dispatch_fixer(
                 unit_key: unit_key.clone(),
                 agent: Some(fixer_agent.to_string()),
                 transcript_path: transcript_path.clone(),
+                host: None,
             },
         );
     }
@@ -2147,6 +2160,7 @@ async fn dispatch_fixer(
                 success,
                 tokens_in: 0,
                 tokens_out: 0,
+                host: None,
             },
         );
     }
@@ -2252,6 +2266,7 @@ async fn run_panel_iteration(
                         unit_key: unit_key.clone(),
                         agent: Some(unit_agent.clone()),
                         transcript_path: transcript_clone.clone(),
+                        host: None,
                     },
                 );
             }
@@ -2288,6 +2303,7 @@ async fn run_panel_iteration(
                         success,
                         tokens_in: 0,
                         tokens_out: 0,
+                        host: None,
                     },
                 );
             }

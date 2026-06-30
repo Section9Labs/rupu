@@ -105,6 +105,7 @@ fn seed_unit(run_id: &str, step_id: &str) -> UnitCheckpoint {
         output: "unit done".into(),
         success: true,
         finished_at: Utc::now(),
+        host: None,
     }
 }
 

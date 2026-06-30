@@ -1742,6 +1742,7 @@ mod tests {
             unit_key: "app-gw".into(),
             agent: Some("oracle-assessor".into()),
             transcript_path: path.clone(),
+            host: None,
         });
         let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
         assert_eq!(step.units[2].status, NodeStatus::Working);
@@ -1772,6 +1773,7 @@ mod tests {
             success: true,
             tokens_in: 1000,
             tokens_out: 250,
+            host: None,
         });
         let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
         assert_eq!(step.units[3].status, NodeStatus::Complete);
@@ -1795,6 +1797,7 @@ mod tests {
             success: false,
             tokens_in: 0,
             tokens_out: 0,
+            host: None,
         });
         let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
         assert_eq!(step.units[2].status, NodeStatus::Failed);
@@ -1814,6 +1817,7 @@ mod tests {
             unit_key: "rtc".into(),
             agent: Some("oracle-assessor".into()),
             transcript_path: std::path::PathBuf::from("/runs/u3.jsonl"),
+            host: None,
         });
         let step = state.steps.iter().find(|s| s.id == "assess").unwrap();
         assert_eq!(step.units.len(), 4);
