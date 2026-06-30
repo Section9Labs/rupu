@@ -147,7 +147,7 @@ impl WorkflowExecutor for InProcessExecutor {
             run_id_override: Some(run_id.clone()),
             strict_templates: false,
             event_sink: Some(fan_out as Arc<dyn EventSink>),
-                    unit_dispatcher: None,
+            unit_dispatcher: None,
         };
 
         // 6. Stash state before spawning (so tail() works immediately).

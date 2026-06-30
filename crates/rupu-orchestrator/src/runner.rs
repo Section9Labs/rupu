@@ -1237,7 +1237,8 @@ async fn run_fanout_step(
                             "distribute requires fleet access — run via the CP".into(),
                         );
                         let msg = err.to_string();
-                        (msg, false, Some("distribute requires fleet access — run via the CP".to_string()), Some(err))
+                        // Minor 3: reuse `msg` instead of duplicating the literal.
+                        (msg.clone(), false, Some(msg), Some(err))
                     }
                     Some(dispatcher) => {
                         let unit = UnitDispatch {
@@ -1249,8 +1250,22 @@ async fn run_fanout_step(
                         };
                         match dispatcher.dispatch_unit(unit, &host).await {
                             Ok(outcome) => {
+                                // Important fix: when the agent ran but failed
+                                // (success=false), synthesize a raw_error so
+                                // the continue_on_error:false abort below fires
+                                // — symmetric with the local Err path.
                                 let err_str = outcome.error.clone();
-                                (outcome.output, outcome.success, err_str, None)
+                                let raw = if !outcome.success {
+                                    Some(RunError::Provider(
+                                        outcome
+                                            .error
+                                            .clone()
+                                            .unwrap_or_else(|| "remote unit failed".into()),
+                                    ))
+                                } else {
+                                    None
+                                };
+                                (outcome.output, outcome.success, err_str, raw)
                             }
                             Err(first_err) => {
                                 // Reassign once to the next host and retry.
@@ -1277,8 +1292,20 @@ async fn run_fanout_step(
                                     .await
                                 {
                                     Ok(outcome) => {
+                                        // Same fix as primary path: synthesize
+                                        // raw_error for a failed-but-Ok outcome.
                                         let err_str = outcome.error.clone();
-                                        (outcome.output, outcome.success, err_str, None)
+                                        let raw = if !outcome.success {
+                                            Some(RunError::Provider(
+                                                outcome
+                                                    .error
+                                                    .clone()
+                                                    .unwrap_or_else(|| "remote unit failed".into()),
+                                            ))
+                                        } else {
+                                            None
+                                        };
+                                        (outcome.output, outcome.success, err_str, raw)
                                     }
                                     Err(second_err) => {
                                         let msg = second_err.to_string();
@@ -2656,6 +2683,105 @@ steps:
         assert_eq!(unit1_calls.len(), 1, "unit 1 needs only one call");
         assert_eq!(unit1_calls[0].1, "h2");
         assert!(step.items[1].success);
+    }
+
+    // -----------------------------------------------------------------------
+    // Minor 1 — no dispatcher + distribute → clear error
+    // -----------------------------------------------------------------------
+
+    /// A workflow with `distribute:` but no `UnitDispatcher` must return a
+    /// clear "distribute requires fleet access" error rather than silently
+    /// completing or panicking.
+    #[tokio::test]
+    async fn distributed_fanout_no_dispatcher_returns_clear_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_DISTRIBUTED).unwrap();
+        // Build opts directly (without `make_opts`) so we can set
+        // `unit_dispatcher: None`.
+        let opts = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_test".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().to_path_buf(),
+            factory: Arc::new(PanicFactory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: None,
+        };
+
+        let err = run_workflow(opts)
+            .await
+            .expect_err("should fail — distribute without fleet access");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("distribute requires fleet access"),
+            "expected 'distribute requires fleet access' in error; got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Minor 2 — KEY regression test: Ok(UnitOutcome{success:false}) aborts
+    // -----------------------------------------------------------------------
+
+    /// A fake dispatcher that always returns a successful `Ok` envelope but
+    /// with `success: false` inside — the "agent ran but failed" case.
+    struct AlwaysFailedOutcomeDispatcher;
+
+    #[async_trait]
+    impl UnitDispatcher for AlwaysFailedOutcomeDispatcher {
+        async fn dispatch_unit(
+            &self,
+            _unit: UnitDispatch,
+            _host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            Ok(UnitOutcome {
+                output: String::new(),
+                success: false,
+                error: Some("boom".into()),
+            })
+        }
+    }
+
+    // `continue_on_error` is absent → defaults to false.
+    const WF_DISTRIBUTED_NO_COE: &str = r#"
+name: distributed-fail-abort-test
+steps:
+  - id: process
+    for_each: "a\nb"
+    agent: dummy
+    prompt: "Process {{ item }}"
+    max_parallel: 2
+    distribute:
+      hosts: [h1, h2]
+"#;
+
+    /// When a remote unit returns `Ok(UnitOutcome{success:false, …})` and
+    /// `continue_on_error` is not set (defaults to false), the workflow must
+    /// ABORT — not silently complete.  This is the regression test for the
+    /// `raw_error` synthesis fix above.
+    #[tokio::test]
+    async fn distributed_fanout_failed_outcome_aborts_under_continue_on_error_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(AlwaysFailedOutcomeDispatcher);
+        let wf = Workflow::parse(WF_DISTRIBUTED_NO_COE).unwrap();
+        let opts = make_opts(wf, tmp.path().to_path_buf(), dispatcher);
+
+        let err = run_workflow(opts)
+            .await
+            .expect_err("workflow must abort — remote unit failed and continue_on_error is false");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("boom") || msg.contains("remote unit failed"),
+            "error should surface the unit failure reason; got: {msg}"
+        );
     }
 }
 

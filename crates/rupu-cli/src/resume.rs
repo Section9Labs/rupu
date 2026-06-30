@@ -161,7 +161,7 @@ pub async fn resume_run(
         run_id_override: None,
         strict_templates: false,
         event_sink: event_sink_for_resume,
-                unit_dispatcher: None,
+        unit_dispatcher: None,
     };
 
     let result = run_workflow(opts).await?;
