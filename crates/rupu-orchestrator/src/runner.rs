@@ -148,6 +148,10 @@ pub enum RunWorkflowError {
         #[source]
         source: tokio::task::JoinError,
     },
+    #[error(
+        "resuming a workflow with a `workspace: sync` step is not supported (v1): re-run from the start instead"
+    )]
+    ResumeWithWorkspaceSync,
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -412,6 +416,25 @@ pub async fn run_workflow(
     std::fs::create_dir_all(&opts.transcript_dir)?;
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
     let workflow_default_continue = opts.workflow.defaults.continue_on_error.unwrap_or(false);
+
+    // Guard: checkpoint-resuming a workflow that has a `workspace: sync` step
+    // is not supported in v1.  Replaying from disk checkpoints restores only
+    // the unit's OUTPUT, not its workspace delta, so already-succeeded units'
+    // file edits would be silently lost.  Refuse loudly rather than let the
+    // caller believe the coordinator workspace is up-to-date.
+    //
+    // This check fires only on the checkpoint-resume path (`resume_from`
+    // is Some).  The non-resume path and resume of non-sync workflows are
+    // unaffected.
+    if opts.resume_from.is_some()
+        && opts
+            .workflow
+            .steps
+            .iter()
+            .any(|s| effective_workspace_mode(s, &opts.workflow.defaults) == WorkspaceMode::Sync)
+    {
+        return Err(RunWorkflowError::ResumeWithWorkspaceSync);
+    }
 
     // Persistent run-state setup. Two paths:
     //
@@ -3356,6 +3379,36 @@ steps:
         let opts = make_opts(wf, dir.path().to_path_buf(), disp);
         let res = run_workflow(opts).await.expect("tolerated");
         assert!(!res.step_results[0].success);
+    }
+
+    // -----------------------------------------------------------------------
+    // T6 — resume-with-workspace-sync guard
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resume_of_workspace_sync_workflow_is_refused() {
+        // A workflow with a host-placed workspace:sync step.  Attempting to
+        // checkpoint-resume it must return ResumeWithWorkspaceSync, not silently
+        // drop the already-succeeded unit's file edits.
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::new());
+        let wf = Workflow::parse(WF_PLACED_SYNC).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), disp);
+        // Simulate a checkpoint resume (prior_step_results is empty — the guard
+        // fires before any step runs, so the content doesn't matter).
+        opts.resume_from = Some(ResumeState {
+            run_id: "run_test_resume".into(),
+            prior_step_results: Vec::new(),
+            approved_step_id: String::new(),
+            completed_units: std::collections::BTreeMap::new(),
+        });
+        let err = run_workflow(opts)
+            .await
+            .expect_err("resume of sync workflow must be refused");
+        assert!(
+            matches!(err, RunWorkflowError::ResumeWithWorkspaceSync),
+            "expected ResumeWithWorkspaceSync, got: {err:?}"
+        );
     }
 }
 

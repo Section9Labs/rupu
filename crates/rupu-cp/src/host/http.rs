@@ -353,6 +353,14 @@ impl HostConnector for HttpHostConnector {
             .bytes()
             .await
             .map_err(|e| HostConnectorError::Remote(0, e.to_string()))?;
+        // Cap the download symmetrically with the upload limit so a compromised
+        // or misbehaving host cannot push an unbounded delta payload.
+        if bytes.len() > MAX_WORKSPACE_BYTES {
+            return Err(HostConnectorError::Invalid(format!(
+                "collect-delta response {} bytes exceeds limit {MAX_WORKSPACE_BYTES}",
+                bytes.len()
+            )));
+        }
         Ok(bytes.to_vec())
     }
 }
