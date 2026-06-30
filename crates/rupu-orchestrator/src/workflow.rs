@@ -117,6 +117,10 @@ pub enum WorkflowParseError {
     DistributeWithoutForEach { step: String },
     #[error("step `{step}`: `distribute.hosts` must be non-empty")]
     DistributeEmptyHosts { step: String },
+    #[error("step `{step}`: `host:` is only valid on a linear step (agent + prompt), not on `for_each:`/`parallel:`/`panel:`")]
+    HostOnNonLinearStep { step: String },
+    #[error("step `{step}`: `host:` must not be empty")]
+    HostEmpty { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -609,6 +613,15 @@ pub struct Step {
     /// `for_each:`. Ignored when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distribute: Option<Distribute>,
+    /// Optional fleet host placement for a **linear** step. When present,
+    /// the whole step's agent runs on the named host (via the
+    /// `UnitDispatcher` port) instead of locally, and its output feeds
+    /// downstream steps exactly as a local step would. Valid only on a
+    /// linear step (`agent` + `prompt`; not `for_each`/`parallel`/`panel`)
+    /// and not together with `distribute:` (which is `for_each`-only).
+    /// Absent ⇒ runs locally (backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 /// One sub-step inside a `parallel:` block. Same surface as a linear
@@ -888,6 +901,24 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
         }
         if dist.hosts.is_empty() {
             return Err(WorkflowParseError::DistributeEmptyHosts {
+                step: step.id.clone(),
+            });
+        }
+    }
+
+    // Validate host placement: only valid on a linear step (not panel /
+    // parallel / for_each), non-empty, and never alongside `distribute:`
+    // (which is for_each-only — structurally exclusive with a linear host
+    // step, but assert it for a clear message).
+    if let Some(host) = &step.host {
+        let is_linear = step.panel.is_none() && step.parallel.is_none() && step.for_each.is_none();
+        if !is_linear || step.distribute.is_some() {
+            return Err(WorkflowParseError::HostOnNonLinearStep {
+                step: step.id.clone(),
+            });
+        }
+        if host.trim().is_empty() {
+            return Err(WorkflowParseError::HostEmpty {
                 step: step.id.clone(),
             });
         }
@@ -1216,15 +1247,17 @@ distribute:
 
     #[test]
     fn distribute_omitted_is_none() {
-        let step: Step = serde_yaml::from_str("id: s\nfor_each: \"x\"\nagent: a\nprompt: p\n").unwrap();
+        let step: Step =
+            serde_yaml::from_str("id: s\nfor_each: \"x\"\nagent: a\nprompt: p\n").unwrap();
         assert!(step.distribute.is_none());
     }
 
     #[test]
     fn validate_rejects_distribute_without_for_each() {
         // a linear step (agent+prompt, no for_each) with distribute → validation error
-        let step: Step = serde_yaml::from_str(
-            "id: s\nagent: a\nprompt: hi\ndistribute:\n  hosts: [h1]\n").unwrap();
+        let step: Step =
+            serde_yaml::from_str("id: s\nagent: a\nprompt: hi\ndistribute:\n  hosts: [h1]\n")
+                .unwrap();
         let err = validate_step_shape(&step).unwrap_err();
         assert!(err.to_string().contains("distribute"));
     }
@@ -1232,8 +1265,125 @@ distribute:
     #[test]
     fn validate_rejects_empty_hosts() {
         let step: Step = serde_yaml::from_str(
-            "id: s\nfor_each: \"x\"\nagent: a\nprompt: p\ndistribute:\n  hosts: []\n").unwrap();
+            "id: s\nfor_each: \"x\"\nagent: a\nprompt: p\ndistribute:\n  hosts: []\n",
+        )
+        .unwrap();
         assert!(validate_step_shape(&step).is_err());
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn host_parses_on_linear_step() {
+        let yaml = r#"
+name: placed
+steps:
+  - id: build
+    agent: builder
+    prompt: "do it"
+    host: worker-1
+"#;
+        let wf = Workflow::parse(yaml).expect("valid");
+        assert_eq!(wf.steps[0].host.as_deref(), Some("worker-1"));
+    }
+
+    #[test]
+    fn host_absent_is_none() {
+        let yaml = r#"
+name: local
+steps:
+  - id: build
+    agent: builder
+    prompt: "do it"
+"#;
+        let wf = Workflow::parse(yaml).expect("valid");
+        assert_eq!(wf.steps[0].host, None);
+    }
+
+    #[test]
+    fn host_round_trips_skipping_none() {
+        let yaml = r#"
+name: local
+steps:
+  - id: build
+    agent: builder
+    prompt: "do it"
+"#;
+        let wf = Workflow::parse(yaml).expect("valid");
+        let out = serde_yaml::to_string(&wf).expect("serialize");
+        assert!(!out.contains("host"), "None host must be skipped: {out}");
+    }
+
+    #[test]
+    fn host_rejected_on_for_each() {
+        let yaml = r#"
+name: bad
+steps:
+  - id: fan
+    for_each: "a\nb"
+    agent: a
+    prompt: "p"
+    host: worker-1
+"#;
+        let err = Workflow::parse(yaml).expect_err("for_each + host invalid");
+        assert!(matches!(
+            err,
+            WorkflowParseError::HostOnNonLinearStep { .. }
+        ));
+    }
+
+    #[test]
+    fn host_rejected_on_parallel() {
+        let yaml = r#"
+name: bad
+steps:
+  - id: par
+    host: worker-1
+    parallel:
+      - id: s1
+        agent: a
+        prompt: p
+"#;
+        let err = Workflow::parse(yaml).expect_err("parallel + host invalid");
+        assert!(matches!(
+            err,
+            WorkflowParseError::HostOnNonLinearStep { .. }
+        ));
+    }
+
+    #[test]
+    fn host_rejected_on_panel() {
+        let yaml = r#"
+name: bad
+steps:
+  - id: pan
+    host: worker-1
+    panel:
+      panelists: [reviewer]
+      subject: "{{ inputs.x }}"
+"#;
+        let err = Workflow::parse(yaml).expect_err("panel + host invalid");
+        assert!(matches!(
+            err,
+            WorkflowParseError::HostOnNonLinearStep { .. }
+        ));
+    }
+
+    #[test]
+    fn empty_host_rejected() {
+        let yaml = r#"
+name: bad
+steps:
+  - id: build
+    agent: builder
+    prompt: "do it"
+    host: ""
+"#;
+        let err = Workflow::parse(yaml).expect_err("empty host invalid");
+        assert!(matches!(err, WorkflowParseError::HostEmpty { .. }));
     }
 }
 
