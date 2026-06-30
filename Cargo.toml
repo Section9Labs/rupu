@@ -140,6 +140,8 @@ assert_cmd = "2"
 predicates = "3"
 httpmock = "0.7"
 serial_test = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 # Native macOS app (Slice D)
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "1a2e50e3f222ae7d223acf718d2e8384a9b7fbe6" }

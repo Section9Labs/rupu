@@ -613,11 +613,13 @@ steps:
         unit.workspace_path = Some(ws.path().to_path_buf());
         let err = d.dispatch_unit(unit, "h1").await.unwrap_err();
         let msg = err.to_string();
+        // `UnreachableConnector` inherits the default `stage_workspace` impl
+        // which returns `HostConnectorError::Unsupported("workspace sync")`.
+        // The dispatcher must surface that — NOT silently fall through to the
+        // launch step before staging is complete.
         assert!(
-            msg.contains("workspace sync")
-                || msg.contains("unsupported")
-                || msg.contains("unreachable"),
-            "got: {msg}"
+            msg.contains("workspace sync") || msg.contains("unsupported"),
+            "expected unsupported-workspace-sync error, got: {msg}"
         );
     }
 
@@ -643,5 +645,36 @@ steps:
         d.apply_workspace_deltas(ws.path(), &[a, b]).await.unwrap();
         assert!(ws.path().join("a.txt").exists());
         assert!(ws.path().join("b.txt").exists());
+    }
+
+    /// Two deltas that both touch the same path → `WorkspaceConflict` whose
+    /// `paths` name the conflicting file.  Validates the bridge's
+    /// `SyncError::Conflict → WorkspaceConflict` mapping.
+    #[tokio::test]
+    async fn apply_workspace_deltas_conflict_on_overlapping_paths() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(conn);
+        let ws = tempfile::tempdir().unwrap();
+        // Two deltas that both claim to change "shared.txt".
+        let a = rupu_orchestrator::runner::WorkspaceDelta {
+            changed: vec!["shared.txt".into()],
+            deleted: vec![],
+            payload: tar_one("shared.txt", "from-unit-A"),
+        };
+        let b = rupu_orchestrator::runner::WorkspaceDelta {
+            changed: vec!["shared.txt".into()],
+            deleted: vec![],
+            payload: tar_one("shared.txt", "from-unit-B"),
+        };
+        let err = d
+            .apply_workspace_deltas(ws.path(), &[a, b])
+            .await
+            .expect_err("overlapping deltas must conflict");
+        // The conflict error must name the colliding path.
+        let WorkspaceConflict(paths) = err;
+        assert!(
+            paths.iter().any(|p| p.contains("shared.txt")),
+            "conflict paths must include 'shared.txt', got: {paths:?}"
+        );
     }
 }
