@@ -124,6 +124,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     output,
                     success,
                     error,
+                    workspace_delta: None,
                 });
             }
         }
@@ -379,6 +380,7 @@ mod tests {
             rendered_prompt: "p".to_string(),
             index: 0,
             run_id: "r".to_string(),
+            workspace_path: None,
         }
     }
 
@@ -437,7 +439,9 @@ steps:
 "#,
         )
         .unwrap();
-        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(dir.path().join("runs")));
+        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(
+            dir.path().join("runs"),
+        ));
         let got = build_dispatcher_if_needed(
             &wf,
             dir.path(),
@@ -462,7 +466,9 @@ steps:
 "#,
         )
         .unwrap();
-        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(dir.path().join("runs")));
+        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(
+            dir.path().join("runs"),
+        ));
         let got = build_dispatcher_if_needed(
             &wf,
             dir.path(),

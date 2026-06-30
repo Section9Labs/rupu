@@ -120,6 +120,7 @@ impl UnitDispatcher for RecordingDispatcher {
             output: format!("REMOTE[{}]", unit.rendered_prompt),
             success: true,
             error: None,
+            workspace_delta: None,
         })
     }
 }

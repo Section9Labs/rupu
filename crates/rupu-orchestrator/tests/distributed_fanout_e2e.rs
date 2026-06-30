@@ -145,11 +145,7 @@ impl RecordingDispatcher {
 
 #[async_trait]
 impl UnitDispatcher for RecordingDispatcher {
-    async fn dispatch_unit(
-        &self,
-        unit: UnitDispatch,
-        host: &str,
-    ) -> Result<UnitOutcome, RunError> {
+    async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
         self.calls
             .lock()
             .unwrap()
@@ -158,6 +154,7 @@ impl UnitDispatcher for RecordingDispatcher {
             output: format!("out-{}-on-{host}", unit.index),
             success: true,
             error: None,
+            workspace_delta: None,
         })
     }
 }
@@ -225,7 +222,9 @@ async fn distributed_fanout_round_robin_results_and_host_persisted() {
         unit_dispatcher: Some(dispatcher.clone()),
     };
 
-    let res = run_workflow(opts).await.expect("distributed workflow should succeed");
+    let res = run_workflow(opts)
+        .await
+        .expect("distributed workflow should succeed");
 
     // --- (1) Round-robin host dispatch ---
     let calls = dispatcher.calls_sorted();
@@ -252,12 +251,17 @@ async fn distributed_fanout_round_robin_results_and_host_persisted() {
 
     // --- (3) One run, status Completed ---
     assert!(!res.run_id.is_empty(), "run_id should be populated");
-    let record = store
-        .load(&res.run_id)
-        .expect("run record should exist");
-    assert_eq!(record.status, RunStatus::Completed, "run should be Completed");
+    let record = store.load(&res.run_id).expect("run record should exist");
+    assert_eq!(
+        record.status,
+        RunStatus::Completed,
+        "run should be Completed"
+    );
     assert!(record.finished_at.is_some(), "finished_at should be set");
-    assert!(record.error_message.is_none(), "no error_message on success");
+    assert!(
+        record.error_message.is_none(),
+        "no error_message on success"
+    );
 
     // --- (4) Per-unit host persisted in unit_checkpoints.jsonl ---
     let mut checkpoints = store
@@ -308,7 +312,9 @@ async fn local_fanout_control_produces_results_with_no_host_attribution() {
         unit_dispatcher: None,
     };
 
-    let res = run_workflow(opts).await.expect("local workflow should succeed");
+    let res = run_workflow(opts)
+        .await
+        .expect("local workflow should succeed");
 
     // The step has 4 items processed in declared order.
     assert_eq!(res.step_results.len(), 1);
@@ -339,9 +345,7 @@ async fn local_fanout_control_produces_results_with_no_host_attribution() {
 
     // --- One run, status Completed ---
     assert!(!res.run_id.is_empty(), "run_id should be populated");
-    let record = store
-        .load(&res.run_id)
-        .expect("run record should exist");
+    let record = store.load(&res.run_id).expect("run record should exist");
     assert_eq!(record.status, RunStatus::Completed);
     assert!(record.finished_at.is_some());
     assert!(record.error_message.is_none());
@@ -355,8 +359,7 @@ async fn local_fanout_control_produces_results_with_no_host_attribution() {
     assert_eq!(checkpoints.len(), 4, "one checkpoint per unit");
     for (i, cp) in checkpoints.iter().enumerate() {
         assert_eq!(
-            cp.host,
-            None,
+            cp.host, None,
             "local unit {i} should have host=None; got: {:?}",
             cp.host
         );

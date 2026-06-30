@@ -38,6 +38,24 @@ use ulid::Ulid;
 // Remote unit dispatch port
 // ---------------------------------------------------------------------------
 
+/// Opaque file-change set a synced unit returns. The orchestrator never
+/// interprets `payload` — a self-describing git patch/bundle or tar delta
+/// produced by the workspace codec. `changed` / `deleted` are the affected
+/// repo-relative paths, carried for observability/logging only.
+#[derive(Debug, Clone)]
+pub struct WorkspaceDelta {
+    pub changed: Vec<String>,
+    pub deleted: Vec<String>,
+    pub payload: Vec<u8>,
+}
+
+/// Returned by `apply_workspace_deltas` when two units' changes conflict —
+/// overlapping files (tar mode) or a conflicting hunk (git mode). Surfaced
+/// as a step failure honoring `continue_on_error`.
+#[derive(Debug, Error)]
+#[error("workspace conflict on: {0:?}")]
+pub struct WorkspaceConflict(pub Vec<String>);
+
 /// Payload for one unit dispatched to a remote host.
 #[derive(Debug)]
 pub struct UnitDispatch {
@@ -46,6 +64,9 @@ pub struct UnitDispatch {
     pub rendered_prompt: String,
     pub index: usize,
     pub run_id: String,
+    /// Set to `Some(coordinator workspace path)` when this unit's effective
+    /// workspace mode is `Sync`. `None` ⇒ self-contained (unchanged).
+    pub workspace_path: Option<PathBuf>,
 }
 
 /// Outcome of one unit dispatched to a remote host.
@@ -54,6 +75,9 @@ pub struct UnitOutcome {
     pub output: String,
     pub success: bool,
     pub error: Option<String>,
+    /// The unit's file changes when it ran with a synced workspace; `None`
+    /// for a self-contained unit.
+    pub workspace_delta: Option<WorkspaceDelta>,
 }
 
 /// Port that remote-fleet implementations plug into.
@@ -67,6 +91,18 @@ pub struct UnitOutcome {
 pub trait UnitDispatcher: Send + Sync {
     /// Run one unit (an agent invocation) on `host` and return its output.
     async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError>;
+
+    /// Apply collected unit workspace deltas to the coordinator workspace at
+    /// `workspace_path`. Mode-aware (git 3-way merge / tar disjoint-copy);
+    /// conflicts return `WorkspaceConflict`. Default is a no-op for
+    /// dispatchers without workspace support.
+    async fn apply_workspace_deltas(
+        &self,
+        _workspace_path: &Path,
+        _deltas: &[WorkspaceDelta],
+    ) -> Result<(), WorkspaceConflict> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -969,6 +1005,7 @@ async fn dispatch_placed_step(
         rendered_prompt: rendered.to_string(),
         index: 0,
         run_id: run_id.to_string(),
+        workspace_path: None,
     };
     match dispatcher.dispatch_unit(unit, host).await {
         Ok(outcome) if outcome.success => Ok((outcome.output, true)),
@@ -1344,6 +1381,7 @@ async fn run_fanout_step(
                             rendered_prompt: rendered_clone.clone(),
                             index: idx,
                             run_id: run_id_clone.clone(),
+                            workspace_path: None,
                         };
                         match dispatcher.dispatch_unit(unit, &host).await {
                             Ok(outcome) => {
@@ -1373,6 +1411,7 @@ async fn run_fanout_step(
                                     rendered_prompt: rendered_clone.clone(),
                                     index: idx,
                                     run_id: run_id_clone.clone(),
+                                    workspace_path: None,
                                 };
                                 warn!(
                                     step = %step_id,
@@ -2654,6 +2693,7 @@ mod tests {
                 output: format!("out-{}-on-{host}", unit.index),
                 success: true,
                 error: None,
+                workspace_delta: None,
             })
         }
     }
@@ -2991,6 +3031,7 @@ steps:
                 output: String::new(),
                 success: false,
                 error: Some("boom".into()),
+                workspace_delta: None,
             })
         }
     }
@@ -3027,6 +3068,33 @@ steps:
             msg.contains("boom") || msg.contains("remote unit failed"),
             "error should surface the unit failure reason; got: {msg}"
         );
+    }
+
+    #[test]
+    fn workspace_delta_carries_paths_and_payload() {
+        let d = WorkspaceDelta {
+            changed: vec!["src/lib.rs".into()],
+            deleted: vec!["old.txt".into()],
+            payload: vec![1, 2, 3],
+        };
+        assert_eq!(d.changed, vec!["src/lib.rs".to_string()]);
+        assert_eq!(d.deleted, vec!["old.txt".to_string()]);
+        assert_eq!(d.payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn workspace_conflict_displays_paths() {
+        let c = WorkspaceConflict(vec!["src/shared.rs".into()]);
+        assert!(c.to_string().contains("src/shared.rs"));
+    }
+
+    #[tokio::test]
+    async fn default_apply_workspace_deltas_is_noop_ok() {
+        // The 3a FakeUnitDispatcher does not override apply; the default is Ok.
+        let d = FakeUnitDispatcher::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let res = d.apply_workspace_deltas(tmp.path(), &[]).await;
+        assert!(res.is_ok());
     }
 }
 
