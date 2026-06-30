@@ -110,6 +110,10 @@ url = "2"
 # Object storage (bucket dead-drop transport for multi-host Slice 2b)
 object_store = { version = "0.14", features = ["aws", "gcp"] }
 
+# Workspace sync (multi-host Slice 3c) — tar fallback + gitignore-aware walk
+tar = "0.4"
+ignore = "0.4"
+
 # TLS crypto provider — the dependency tree enables BOTH rustls providers
 # (aws-lc-rs via object_store/reqwest, ring via octocrab/jsonwebtoken), so
 # rustls 0.23 cannot auto-select one. The CLI installs aws-lc-rs as the

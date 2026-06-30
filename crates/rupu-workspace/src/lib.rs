@@ -20,9 +20,10 @@ pub mod worktree_layout;
 // stage. The function signatures of `discover` and `upsert` will not
 // change between skeleton and implementation.
 pub mod discover;
-pub mod store;
 pub mod host_store;
+pub mod store;
 pub mod worker_store;
+pub mod workspace_sync;
 
 pub use autoflow_claim::{AutoflowClaimRecord, AutoflowContender, ClaimStatus, PendingDispatch};
 pub use autoflow_claim_store::{
@@ -32,14 +33,18 @@ pub use autoflow_worktree::{
     ensure_issue_worktree, remove_issue_worktree, AutoflowWorktree, AutoflowWorktreeError,
 };
 pub use discover::{discover, DiscoverError, Discovery};
+pub use host_store::{
+    add_bucket_host, add_ssh_host, delete_host_token, enroll_node, get_host_token, set_host_token,
+    verify_node_token, Host, HostStatus, HostStore, HostStoreError, HostTransport,
+};
 pub use record::{new_id, Workspace};
 pub use repo_record::TrackedRepo;
 pub use repo_store::{repo_ref_key, RepoRegistryStore, RepoStoreError};
 pub use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};
 pub use store::{upsert, StoreError, WorkspaceStore};
-pub use host_store::{
-    add_bucket_host, add_ssh_host, delete_host_token, enroll_node, get_host_token, set_host_token,
-    verify_node_token, Host, HostStoreError, HostStatus, HostStore, HostTransport,
-};
 pub use worker_store::{WorkerStore, WorkerStoreError};
+pub use workspace_sync::{
+    apply_deltas, collect_delta, detect_mode, pack, stage, Baseline, Delta, Payload, SyncError,
+    SyncMode,
+};
 pub use worktree_layout::{issue_dir_name, issue_worktree_path, repo_dir_name};
