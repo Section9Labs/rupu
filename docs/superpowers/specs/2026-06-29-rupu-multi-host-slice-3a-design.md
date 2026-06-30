@@ -54,13 +54,21 @@ case that does not require workspace sync.
    registry-backed `UnitDispatcher`. No need to move orchestration into
    `cp serve`. Without fleet access / without `distribute:`, everything runs
    local (unchanged).
-4. **Uniform unit-output retrieval via the mirror.** A remote unit's transcript
-   is not mirrored today (only `run.json`/events/step_results are). So 3a records
-   the agent run's **final output text** on its `RunRecord` (a new
-   `final_output` field, populated on agent-run completion), which **every**
-   transport already mirrors. The remote `UnitDispatcher` reads
-   `final_output` + status from the mirrored run after it reaches terminal —
-   uniform across all five transports, no per-transport transcript relay.
+4. **Uniform unit-output retrieval via the mirror — agent runs gain a `run.json`.**
+   Verified: a bare `rupu run <agent> --run-id <id>` writes only a transcript +
+   metadata file — it produces **no** `runs/<run_id>/` artifacts. So today a
+   remotely-dispatched agent run's *output* is not retrievable centrally (the
+   mirror tails the run dir, which is empty for agent runs; only a `create_run`
+   stub + terminal status come back — a latent Slice-2 gap). 3a closes this: make
+   `rupu run --run-id` write a **minimal `run.json`** (a `RunRecord` with
+   terminal status + a new `final_output: Option<String>` = the final assistant
+   text) under `<global>/runs/<run_id>/` on completion. The node-tail / CP poller
+   already stream `run.json` (the `RunJson` artifact) on **every** transport, so
+   the mirror carries `final_output` back uniformly. The remote `UnitDispatcher`
+   reads `final_output` + status from the mirrored run after terminal — no
+   per-transport transcript relay, and dispatch stays `launch_agent` (agents are
+   shared definitions; dispatching a synthetic 1-step workflow would require
+   shipping a workflow def to the host).
 5. **Self-contained units only (the crux guardrail).** A distributed unit must be
    computable from its `item` + prior-step **string** context — no dependence on
    the shared file workspace being present on the remote host. Units that need
@@ -160,14 +168,23 @@ port.
 local dispatcher / `None`). Coordinator runs on a host with fleet reachability
 (the CP host).
 
-### 4. Agent-run `final_output` (uniform retrieval)
+### 4. Agent runs become run-dir-backed (`run.json` + `final_output`)
 
-Populate `RunRecord.final_output: Option<String>` (new field) on agent-run
-completion (the `rupu run` / agent-run terminal path writes it from the final
-assistant text). Because every transport's mirror persists `run.json`, the
-coordinator reads a remote unit's output uniformly from the mirrored record — no
-transport-specific transcript fetch. `final_output` is additive and
-backward-compatible (absent on old records).
+Add `RunRecord.final_output: Option<String>` (additive, backward-compatible).
+Then make `rupu run <agent> --run-id <id>` (`crates/rupu-cli/src/cmd/run.rs`)
+write a minimal `run.json` under `<global>/runs/<run_id>/` on completion: a
+`RunRecord` with `status` (Completed/Failed), `started_at`/`finished_at`, and
+`final_output` set from the transcript's final assistant text (the same
+`read_final_assistant_text` logic the orchestrator uses locally). The agent run
+keeps writing its transcript as today; this just adds the run-dir record.
+
+Because the node-tail (`tunnel`/`ssh` via the run-dir tail, `bucket` via the
+pull agent) and the CP poller already stream `run.json` as the `RunJson`
+artifact, this `final_output` rides the **existing** mirror back to the central
+RunStore on every transport — no new per-transport plumbing. The remote
+`UnitDispatcher` then reads `final_output` from `get_run(run_id)` (the mirrored
+record) once the run is terminal. This also makes remote **agent** runs (not
+just workflow runs) observable centrally, closing a latent Slice-2 gap.
 
 ### 5. Placement + retry in `run_fanout_step`
 
