@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rupu docs — Examples</title>
-<meta name="description" content="Three end-to-end rupu workflow examples — a specialist review panel, a sequential investigate-then-fix loop, and a parallel per-file review fan-out — shown with their real bundled YAML.">
+<meta name="description" content="End-to-end rupu examples — a specialist review panel, investigate-then-fix, a parallel per-file fan-out, running a multi-host fleet, and a distributed fan-out across hosts.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
 </head>
@@ -42,9 +42,9 @@
 
   <main class="docs-main">
     <h1>Examples</h1>
-    <p class="intro">Three complete, real-world workflows. Every one of these ships with <code class="inline">rupu init</code>, so you can run them the moment your project is set up — no extra files to write.</p>
+    <p class="intro">Complete, real-world scenarios — from a single-machine review panel to a job fanned across a whole fleet.</p>
 
-    <p>Each scenario below is a workflow template that rupu drops into <code class="inline">.rupu/workflows/</code>. The YAML is quoted verbatim from the bundled templates, the agents it calls live in <code class="inline">.rupu/agents/</code>, and the run command is built from the workflow's own declared inputs. Pick the shape that matches your problem and adapt it.</p>
+    <p>The first three are workflow templates that ship with <code class="inline">rupu init</code> (dropped into <code class="inline">.rupu/workflows/</code>, with their agents in <code class="inline">.rupu/agents/</code>) — quoted verbatim, runnable the moment your project is set up. The last two show multi-host operation: running a fleet, and distributing one run across it. Pick the shape that matches your problem and adapt it.</p>
 
     <div class="callout"><strong>Before you start.</strong> Run <code class="inline">rupu init</code> in your repo once. It writes the agents and workflows referenced here. List what you have with <code class="inline">rupu workflow list</code>, and inspect any one with <code class="inline">rupu workflow show &lt;name&gt;</code>.</div>
 
@@ -272,7 +272,7 @@ rupu workflow run review-changed-files \
       <figcaption>One input list fans out to N concurrent reviewers; <code class="inline">steps.review_each.results</code> aggregates into a single summary.</figcaption>
     </figure>
 
-    <h2>4 · Run a fleet — one control plane, many hosts</h2>
+    <h2 id="fleet">4 · Run a fleet — one control plane, many hosts</h2>
     <p><strong>Goal.</strong> Drive rupu running on several machines (a build box, a GPU host, a teammate's server) from a single Control Plane — launch work on a chosen host and watch every run in one browser. <span class="chip accent" style="vertical-align:middle">Multi-host · Slice 1</span></p>
 
     <p><strong>How it works.</strong></p>
@@ -293,7 +293,7 @@ rupu host add build-box --url <span class="s">https://build.internal</span> --to
 rupu host list</pre>
 
     <p><strong>Then operate from the Control Plane.</strong> Open <code class="inline">rupu cp serve</code> on the central machine, pick a host in the launcher, and launch any of the workflows above on it — for example the parallel review panel on the build box. Cross-host launch is a Control-Plane action (the host selector); see <a class="link" href="/docs/multi-host.html">Multi-host</a> for the full picture and the transport roadmap.</p>
-    <p><strong>Scale a single run across the fleet.</strong> Add a <code class="inline">distribute: { hosts: [gpu-box, build-box] }</code> block to a <code class="inline">for_each</code> step and its units fan out round-robin across those hosts — one workflow, the whole fleet doing the work. See <a class="link" href="/docs/workflows.html">Distribute a step across the fleet</a>.</p>
+    <p><strong>Scale a single run across the fleet.</strong> Add a <code class="inline">distribute: { hosts: [gpu-box, build-box] }</code> block to a <code class="inline">for_each</code> step and its units fan out round-robin across those hosts — one workflow, the whole fleet doing the work. See the <a class="link" href="#distributed-fanout">distributed fan-out example</a> below.</p>
 
     <figure class="diagram">
       <svg viewBox="0 0 640 220" role="img" aria-label="A central control plane federates over HTTP to local and remote hosts">
@@ -320,6 +320,78 @@ rupu host list</pre>
         <text class="d-sub" x="530" y="186" text-anchor="middle">rupu cp serve</text>
       </svg>
       <figcaption>One central control plane live-queries local + remote hosts over HTTP; launch and observe across the fleet from one browser.</figcaption>
+    </figure>
+
+    <h2 id="distributed-fanout">5 · Distributed fan-out across the fleet</h2>
+    <p><strong>Goal.</strong> Same idea as #3 — review every changed file in parallel — but spread the units across <strong>multiple hosts</strong> so a big batch finishes in a fraction of the wall-clock time. One workflow, the whole fleet doing the work. <span class="chip accent" style="vertical-align:middle">Multi-host · distribute</span></p>
+
+    <p><strong>How it works.</strong></p>
+    <ol>
+      <li>The <code class="inline">review_each</code> step adds a <code class="inline">distribute:</code> block naming the fleet hosts. rupu assigns the <code class="inline">for_each</code> units <strong>round-robin</strong> across them (file 1 &rarr; <code class="inline">gpu-box</code>, file 2 &rarr; <code class="inline">build-box</code>, file 3 &rarr; <code class="inline">gpu-box</code>, &hellip;) and dispatches each to its host.</li>
+      <li>Each unit&rsquo;s run is <strong>attributed to the host</strong> it ran on (visible in the control plane), and <code class="inline">max_parallel</code> still caps total concurrency.</li>
+      <li>Results stream back and aggregate into <code class="inline">steps.review_each.results</code> exactly like a local fan-out, so the <code class="inline">summarize</code> step is unchanged. A remote unit failure is handled per the step&rsquo;s <code class="inline">continue_on_error</code>.</li>
+      <li>Drop the <code class="inline">distribute:</code> block and the very same workflow runs entirely on the local host — fully backward compatible.</li>
+    </ol>
+
+    <pre class="code"><span class="k">name</span>: <span class="s">fleet-review</span>
+<span class="k">description</span>: <span class="s">Review every changed file, fanned across the fleet.</span>
+<span class="k">inputs</span>:
+  <span class="k">files</span>:
+    <span class="k">type</span>: <span class="v">string</span>
+    <span class="k">required</span>: <span class="v">true</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">review_each</span>
+    <span class="k">agent</span>: <span class="v">code-reviewer</span>
+    <span class="k">for_each</span>: <span class="s">"&#123;&#123; inputs.files &#125;&#125;"</span>
+    <span class="k">distribute</span>:
+      <span class="k">hosts</span>: [<span class="v">gpu-box</span>, <span class="v">build-box</span>]   <span class="c"># round-robin across these fleet hosts</span>
+    <span class="k">max_parallel</span>: <span class="v">8</span>
+    <span class="k">prompt</span>: |
+      <span class="s">Review file &#123;&#123; item &#125;&#125; (&#123;&#123; loop.index &#125;&#125; of &#123;&#123; loop.length &#125;&#125;).</span>
+      <span class="s">Return either `no issues` or a short bulleted list.</span>
+
+  - <span class="k">id</span>: <span class="v">summarize</span>
+    <span class="k">agent</span>: <span class="v">writer</span>
+    <span class="k">prompt</span>: |
+      <span class="s">Combine these per-file reviews into one engineering summary.</span>
+
+      <span class="v">&#123;&#37; for r in steps.review_each.results &#37;&#125;</span>
+      <span class="s">---</span>
+      <span class="s">&#123;&#123; r &#125;&#125;</span>
+      <span class="v">&#123;&#37; endfor &#37;&#125;</span></pre>
+
+    <p><strong>Run it.</strong> Register the hosts once (see <a class="link" href="#fleet">the fleet example above</a> / <a class="link" href="/docs/multi-host.html">Multi-host</a>), then launch as normal — the <code class="inline">distribute:</code> block does the rest:</p>
+    <pre class="code"><span class="c"># the host names in distribute: must match `rupu host list`</span>
+rupu workflow run fleet-review \
+  --input files=<span class="s">"$(git diff --name-only main...HEAD)"</span></pre>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 240" role="img" aria-label="A for_each step's units fan round-robin across two hosts, then aggregate into one summary">
+        <defs>
+          <marker id="ar5" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box" x="10" y="94" width="116" height="52" rx="10"></rect>
+        <text class="d-label" x="68" y="116" text-anchor="middle">files</text>
+        <text class="d-sub" x="68" y="132" text-anchor="middle">for_each · distribute</text>
+        <line class="d-edge" x1="126" y1="118" x2="244" y2="64" marker-end="url(#ar5)"></line>
+        <line class="d-edge" x1="126" y1="118" x2="244" y2="174" marker-end="url(#ar5)"></line>
+        <rect class="d-box-accent" x="244" y="28" width="190" height="72" rx="10"></rect>
+        <text class="d-label" x="339" y="52" text-anchor="middle">gpu-box</text>
+        <text class="d-sub" x="339" y="70" text-anchor="middle">code-reviewer</text>
+        <text class="d-sub" x="339" y="86" text-anchor="middle">units 1 · 3 · 5 …</text>
+        <rect class="d-box-accent" x="244" y="140" width="190" height="72" rx="10"></rect>
+        <text class="d-label" x="339" y="164" text-anchor="middle">build-box</text>
+        <text class="d-sub" x="339" y="182" text-anchor="middle">code-reviewer</text>
+        <text class="d-sub" x="339" y="198" text-anchor="middle">units 2 · 4 · 6 …</text>
+        <line class="d-edge" x1="434" y1="64" x2="494" y2="112" marker-end="url(#ar5)"></line>
+        <line class="d-edge" x1="434" y1="176" x2="494" y2="128" marker-end="url(#ar5)"></line>
+        <rect class="d-box" x="494" y="94" width="136" height="52" rx="10"></rect>
+        <text class="d-label" x="562" y="116" text-anchor="middle">summarize</text>
+        <text class="d-sub" x="562" y="132" text-anchor="middle">writer · .results</text>
+      </svg>
+      <figcaption>Round-robin distribution: <code class="inline">for_each</code> units split across <code class="inline">gpu-box</code> and <code class="inline">build-box</code>, then aggregate into one summary — host-attributed end to end.</figcaption>
     </figure>
 
     <!-- ───────────────────────── Make your own ───────────────────────── -->
