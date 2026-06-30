@@ -58,6 +58,52 @@ pub struct DefaultStepFactory {
     pub dispatcher: Option<Arc<dyn AgentDispatcher>>,
 }
 
+/// Resolve a step's agent spec from a `load_agent` result. On success the
+/// spec passes through. On failure (the agent file is missing or unparseable)
+/// return a minimal spec carrying NO provider/model plus a loud, actionable
+/// error message — the caller then wires an error-stub provider so the step
+/// fails immediately instead of silently substituting the default
+/// provider/model (which previously billed `anthropic` for a step that named
+/// a nonexistent agent).
+fn resolve_step_agent_spec(
+    load: Result<rupu_agent::AgentSpec, String>,
+    agent_name: &str,
+    rendered_prompt: &str,
+) -> (rupu_agent::AgentSpec, Option<String>) {
+    match load {
+        Ok(spec) => (spec, None),
+        Err(e) => (
+            rupu_agent::AgentSpec {
+                name: agent_name.to_string(),
+                description: None,
+                provider: None,
+                model: None,
+                auth: None,
+                tools: None,
+                max_turns: Some(50),
+                permission_mode: None,
+                anthropic_oauth_prefix: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                dispatchable_agents: None,
+                concerns: None,
+                max_tokens: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                system_prompt: rendered_prompt.to_string(),
+                raw: rendered_prompt.to_string(),
+            },
+            Some(format!(
+                "agent `{agent_name}` not found or failed to load: {e}"
+            )),
+        ),
+    }
+}
+
 #[async_trait]
 impl StepFactory for DefaultStepFactory {
     async fn build_opts_for_step(
@@ -86,54 +132,40 @@ impl StepFactory for DefaultStepFactory {
         // project layer that's `<project>/.rupu`; the global layer is
         // `<global>` directly (which already contains `agents/`).
         let project_agents_parent = self.project_root.as_ref().map(|p| p.join(".rupu"));
-        let spec =
+        let load =
             rupu_agent::load_agent(&self.global, project_agents_parent.as_deref(), agent_name)
-                .unwrap_or_else(|_| {
-                    // Fallback: synthesize a minimal AgentSpec with the
-                    // rendered prompt as system prompt so the factory contract
-                    // is honored even when the agent file is missing. The
-                    // agent loop will surface the failure via run_complete{
-                    // status: Error}.
-                    rupu_agent::AgentSpec {
-                        name: agent_name.to_string(),
-                        description: None,
-                        provider: Some("anthropic".to_string()),
-                        model: Some("claude-sonnet-4-6".to_string()),
-                        auth: None,
-                        tools: None,
-                        max_turns: Some(50),
-                        permission_mode: Some(self.mode_str.clone()),
-                        anthropic_oauth_prefix: None,
-                        effort: None,
-                        context_window: None,
-                        output_format: None,
-                        anthropic_task_budget: None,
-                        anthropic_context_management: None,
-                        anthropic_speed: None,
-                        dispatchable_agents: None,
-                        concerns: None,
-                        max_tokens: None,
-                        context_window_tokens: None,
-                        compact_at_percent: None,
-                        system_prompt: rendered_prompt.clone(),
-                        raw: rendered_prompt.clone(),
-                    }
-                });
+                .map_err(|e| e.to_string());
+        let (spec, load_err) = resolve_step_agent_spec(load, agent_name, &rendered_prompt);
 
-        let provider_name = spec.provider.clone().unwrap_or_else(|| "anthropic".into());
-        let model = spec
-            .model
-            .clone()
-            .unwrap_or_else(|| "claude-sonnet-4-6".into());
+        // A missing or unparseable agent file is a hard error: fail loudly via
+        // the error-stub provider instead of silently running on the default
+        // provider/model. (Previously a step naming a nonexistent agent ran on
+        // `anthropic`/`claude-sonnet-4-6` and billed it.) A present agent that
+        // merely omits `provider:`/`model:` still defaults, as before.
+        let (provider_name, model) = if load_err.is_some() {
+            ("unresolved".to_string(), "-".to_string())
+        } else {
+            (
+                spec.provider.clone().unwrap_or_else(|| "anthropic".into()),
+                spec.model
+                    .clone()
+                    .unwrap_or_else(|| "claude-sonnet-4-6".into()),
+            )
+        };
         let auth_hint = spec.auth;
-        // Build the provider; on failure (missing credential, bad
-        // auth config, etc.) substitute a stub provider that returns
-        // the same error on first call. The runner's existing
-        // `RunComplete { status: Error }` path then surfaces it as a
-        // clean `✗ <step_id>` line via the line printer — no panic,
-        // no crash log. (See `ProviderBuildErrorStub` below.)
-        let provider: Box<dyn rupu_providers::LlmProvider> =
-            match provider_factory::build_for_provider(
+        // Build the provider; on a load error OR a build failure (missing
+        // credential, bad auth config, etc.) substitute a stub provider that
+        // returns the error on first call. The runner's existing
+        // `RunComplete { status: Error }` path then surfaces it as a clean
+        // `✗ <step_id>` line via the line printer — no panic, no crash log,
+        // no provider call. (See `provider_build_error_stub` below.)
+        let provider: Box<dyn rupu_providers::LlmProvider> = match load_err {
+            Some(msg) => Box::new(provider_build_error_stub(
+                provider_name.clone(),
+                model.clone(),
+                msg,
+            )),
+            None => match provider_factory::build_for_provider(
                 &provider_name,
                 &model,
                 auth_hint,
@@ -147,7 +179,8 @@ impl StepFactory for DefaultStepFactory {
                     model.clone(),
                     e.to_string(),
                 )),
-            };
+            },
+        };
 
         let agent_system_prompt = match self.system_prompt_suffix.as_deref() {
             Some(suffix) => format!("{}\n\n## Run target\n\n{}", spec.system_prompt, suffix),
@@ -453,5 +486,43 @@ mod concerns_resolution_tests {
             Some("my-workflow"),
             "scope_name must equal the workflow's name"
         );
+    }
+}
+
+#[cfg(test)]
+mod missing_agent_tests {
+    use super::resolve_step_agent_spec;
+    use rupu_agent::AgentSpec;
+
+    #[test]
+    fn present_agent_passes_through_without_error() {
+        let spec =
+            AgentSpec::parse("---\nname: real\nprovider: oracle\nmodel: glm\n---\nbody\n").unwrap();
+        let (out, err) = resolve_step_agent_spec(Ok(spec), "real", "prompt");
+        assert!(err.is_none());
+        assert_eq!(out.provider.as_deref(), Some("oracle"));
+        assert_eq!(out.model.as_deref(), Some("glm"));
+    }
+
+    #[test]
+    fn missing_agent_fails_loudly_without_defaulting_to_anthropic() {
+        let (out, err) = resolve_step_agent_spec(
+            Err("agents/oracle-enumerator-glm.md: no such file".to_string()),
+            "oracle-enumerator-glm",
+            "prompt",
+        );
+        let msg = err.expect("a missing agent must produce a loud error");
+        assert!(msg.contains("oracle-enumerator-glm"), "msg: {msg}");
+        assert!(
+            msg.to_lowercase().contains("not found") || msg.contains("failed to load"),
+            "msg should be actionable: {msg}"
+        );
+        // The whole point: do NOT silently substitute the default provider/model.
+        assert_ne!(out.provider.as_deref(), Some("anthropic"));
+        assert!(
+            out.provider.is_none(),
+            "missing agent must not carry a provider"
+        );
+        assert!(out.model.is_none(), "missing agent must not carry a model");
     }
 }
