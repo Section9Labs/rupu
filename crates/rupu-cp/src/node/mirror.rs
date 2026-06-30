@@ -127,6 +127,7 @@ impl NodeMirror {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            final_output: None,
         };
 
         // Empty workflow YAML: node runs don't carry a local workflow snapshot.

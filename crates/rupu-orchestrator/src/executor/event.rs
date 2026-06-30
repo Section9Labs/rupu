@@ -63,6 +63,12 @@ pub enum Event {
         unit_key: String,
         agent: Option<String>,
         transcript_path: PathBuf,
+        /// Host that ran this unit. `None` = local (same host as the
+        /// orchestrator). `Some(name)` = a remote fleet host (multi-host
+        /// `distribute:` placement). Absent in older event logs; serde
+        /// default restores `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
     },
     /// One fan-out unit finished. `tokens_in` / `tokens_out` are
     /// best-effort: the runner's per-unit dispatch result does not carry
@@ -76,6 +82,10 @@ pub enum Event {
         success: bool,
         tokens_in: u64,
         tokens_out: u64,
+        /// Host that ran this unit. `None` = local. `Some(name)` = remote.
+        /// Absent in older event logs; serde default restores `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
     },
     /// Emitted at the start of each gate-loop iteration in a panel step.
     /// Allows the live view to display a live round counter (e.g. "Round 2 / 5").

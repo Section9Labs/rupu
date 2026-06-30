@@ -14,6 +14,7 @@ pub mod cp_session_mutator;
 pub mod cp_session_sender;
 pub mod cp_session_starter;
 pub mod crash;
+pub mod fleet_unit_dispatcher;
 pub mod logging;
 pub mod output;
 pub mod paths;

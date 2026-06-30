@@ -71,6 +71,7 @@ fn seed_scoped_run(id: &str, ws_id: &str, proj_path: &Path, status: RunStatus) -
         active_step_kind: None,
         active_step_agent: None,
         active_step_transcript_path: None,
+        final_output: None,
     }
 }
 

@@ -445,6 +445,72 @@ fn mirror_run_json_nulls_resume_fields() {
     );
 }
 
+/// A `RunJson` artifact whose record carries `final_output` must have that
+/// field preserved after the mirror re-pins CP-local identity fields.
+/// `final_output` is a run-state field (not a location / identity field), so
+/// the mirror must pass it through from the node's record unchanged.
+#[test]
+fn mirror_run_json_preserves_final_output() {
+    use rupu_cp::node::mirror::NodeMirror;
+    use rupu_cp::node::protocol::{ArtifactFile, RunSpec, RunSpecKind};
+    use rupu_orchestrator::{RunStatus, RunStore};
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+
+    let tmp = tempdir().expect("tempdir");
+    let store = Arc::new(RunStore::new(tmp.path().to_path_buf()));
+    let mirror = NodeMirror::new(Arc::clone(&store));
+
+    let spec = RunSpec {
+        kind: RunSpecKind::Agent,
+        name: "my-agent".to_string(),
+        inputs: BTreeMap::new(),
+        prompt: Some("do the thing".to_string()),
+        mode: None,
+        target: None,
+    };
+
+    let run_id = "run_FINALOUTPUTTEST1";
+    let node_id = "node-fo";
+
+    mirror.create_run(run_id, node_id, &spec).expect("create_run");
+
+    // Build a node-side RunRecord JSON with final_output set and status=completed.
+    let node_run_json = serde_json::json!({
+        "id": run_id,
+        "workflow_name": "my-agent",
+        "status": "completed",
+        "inputs": {},
+        "workspace_id": "node-ws-id",
+        "workspace_path": "/node/only/path",
+        "transcript_dir": "/node/only/path/transcripts",
+        "started_at": "2026-01-01T00:00:00Z",
+        "worker_id": "node-fo",
+        "final_output": "hello out"
+    });
+    let line = serde_json::to_string(&node_run_json).expect("serialize node record");
+
+    mirror
+        .append(run_id, node_id, ArtifactFile::RunJson, &line)
+        .expect("append RunJson");
+
+    let record = store.load(run_id).expect("load after RunJson append");
+
+    // Run-state: status must reflect the node's completed value.
+    assert_eq!(
+        record.status,
+        RunStatus::Completed,
+        "status should come from the node RunJson"
+    );
+
+    // final_output must be preserved exactly as sent by the node.
+    assert_eq!(
+        record.final_output.as_deref(),
+        Some("hello out"),
+        "final_output must survive the mirror RunJson re-pin"
+    );
+}
+
 // ── NodeMirror security tests (Finding 1) ─────────────────────────────────────
 
 /// A run_id containing a path-traversal sequence (`/`) must be rejected by
@@ -1221,6 +1287,7 @@ fn mirrored_awaiting_run_is_not_pending_resume() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        final_output: None,
     };
     store.create(rec, "").unwrap();
 
@@ -1279,6 +1346,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_ssh_host() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        final_output: None,
     };
     store.create(rec, "").unwrap();
 
@@ -1332,6 +1400,7 @@ fn mirrored_awaiting_run_is_not_pending_resume_bucket_host() {
         resume_claimed_at: None,
         resume_claimed_by: None,
         resume_mode: None,
+        final_output: None,
     };
     store.create(rec, "").unwrap();
 

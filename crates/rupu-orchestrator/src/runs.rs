@@ -217,6 +217,11 @@ pub struct RunRecord {
     /// [`RunStore::clear_resume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_mode: Option<String>,
+    /// Final assistant text for an agent run (set by `rupu run`); `None` for
+    /// workflow runs and older records. Carried by the mirror so a remotely
+    /// dispatched unit's output is retrievable centrally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_output: Option<String>,
 }
 
 /// Workflow-step shape, persisted alongside the result so the
@@ -327,6 +332,12 @@ pub struct UnitCheckpoint {
     pub output: String,
     pub success: bool,
     pub finished_at: DateTime<Utc>,
+    /// Host that executed this unit. `None` = local (same host as the
+    /// orchestrator). `Some(name)` = a remote fleet host placed by a
+    /// `distribute:` step. Absent in checkpoints written before this field
+    /// was added; serde default restores `None` on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 impl From<&StepResult> for StepResultRecord {
@@ -1309,6 +1320,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            final_output: None,
         }
     }
 
@@ -1527,6 +1539,7 @@ mod tests {
             output: "reviewed a".into(),
             success: true,
             finished_at: Utc::now(),
+            host: None,
         };
         let cp1 = UnitCheckpoint {
             step_id: "review_each".into(),
@@ -1537,6 +1550,7 @@ mod tests {
             output: String::new(),
             success: false,
             finished_at: Utc::now(),
+            host: None,
         };
         store.append_unit_checkpoint(&rec.id, &cp0).unwrap();
         store.append_unit_checkpoint(&rec.id, &cp1).unwrap();
@@ -2141,5 +2155,52 @@ mod tests {
             Err(RunStoreError::NotFound(_)) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    /// Task 4: `UnitCheckpoint` round-trips `host: Some(...)` through JSON
+    /// without loss, and `host: None` is omitted from the serialized form
+    /// (backward-compatible with older checkpoint files that lack the field).
+    #[test]
+    fn unit_checkpoint_host_serde_round_trip() {
+        let cp = UnitCheckpoint {
+            step_id: "scan_each".into(),
+            index: 0,
+            item: serde_json::json!("src/lib.rs"),
+            run_id: "run_host_test".into(),
+            transcript_path: PathBuf::from("/tmp/run_host_test.jsonl"),
+            output: "done".into(),
+            success: true,
+            finished_at: Utc::now(),
+            host: Some("h1".into()),
+        };
+
+        // Serializes with the host field present.
+        let val = serde_json::to_value(&cp).expect("serialize");
+        assert_eq!(
+            val["host"].as_str(),
+            Some("h1"),
+            "host should round-trip through JSON"
+        );
+
+        // Deserializes back with host intact.
+        let back: UnitCheckpoint = serde_json::from_value(val).expect("deserialize");
+        assert_eq!(back.host.as_deref(), Some("h1"));
+        assert_eq!(back.index, 0);
+        assert_eq!(back.step_id, "scan_each");
+
+        // None host: field is absent from JSON (skip_serializing_if).
+        let cp_local = UnitCheckpoint {
+            host: None,
+            ..cp
+        };
+        let val_local = serde_json::to_value(&cp_local).expect("serialize local");
+        assert!(
+            val_local.get("host").is_none(),
+            "host field must be absent when None"
+        );
+        // Old checkpoint without `host` key deserializes to None.
+        let back_local: UnitCheckpoint =
+            serde_json::from_value(val_local).expect("deserialize local");
+        assert_eq!(back_local.host, None);
     }
 }

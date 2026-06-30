@@ -113,6 +113,10 @@ pub enum WorkflowParseError {
         referenced_step: String,
         field: String,
     },
+    #[error("step `{step}`: `distribute:` is only valid on a `for_each:` step")]
+    DistributeWithoutForEach { step: String },
+    #[error("step `{step}`: `distribute.hosts` must be non-empty")]
+    DistributeEmptyHosts { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -516,6 +520,14 @@ pub struct WorkflowDefaults {
     pub continue_on_error: Option<bool>,
 }
 
+/// Fleet placement for a `for_each:` step — spreads units across hosts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Distribute {
+    /// Fleet host ids/names to spread this step's units across (round-robin).
+    pub hosts: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -591,6 +603,12 @@ pub struct Step {
     /// remain authoritative for runtime validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<StepContract>,
+    /// Optional fleet placement for a `for_each:` step. When present,
+    /// the step's units are spread across the named hosts (round-robin).
+    /// Only valid on `for_each:` steps; an error if present without
+    /// `for_each:`. Ignored when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribute: Option<Distribute>,
 }
 
 /// One sub-step inside a `parallel:` block. Same surface as a linear
@@ -860,6 +878,21 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
             });
         }
     }
+
+    // Validate distribute: only valid on for_each steps, and hosts must be non-empty.
+    if let Some(dist) = &step.distribute {
+        if step.for_each.is_none() {
+            return Err(WorkflowParseError::DistributeWithoutForEach {
+                step: step.id.clone(),
+            });
+        }
+        if dist.hosts.is_empty() {
+            return Err(WorkflowParseError::DistributeEmptyHosts {
+                step: step.id.clone(),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -1160,6 +1193,47 @@ pub(crate) fn yaml_scalar_to_string(v: &serde_yaml::Value) -> String {
             .unwrap_or_default()
             .trim()
             .into(),
+    }
+}
+
+#[cfg(test)]
+mod distribute_tests {
+    use super::*;
+
+    #[test]
+    fn distribute_parses_on_for_each() {
+        let yaml = r#"
+id: scan
+for_each: "{{ steps.list.results }}"
+agent: scanner
+distribute:
+  hosts: [edge-1, edge-2]
+"#;
+        let step: Step = serde_yaml::from_str(yaml).unwrap();
+        let d = step.distribute.expect("distribute present");
+        assert_eq!(d.hosts, vec!["edge-1".to_string(), "edge-2".to_string()]);
+    }
+
+    #[test]
+    fn distribute_omitted_is_none() {
+        let step: Step = serde_yaml::from_str("id: s\nfor_each: \"x\"\nagent: a\nprompt: p\n").unwrap();
+        assert!(step.distribute.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_distribute_without_for_each() {
+        // a linear step (agent+prompt, no for_each) with distribute → validation error
+        let step: Step = serde_yaml::from_str(
+            "id: s\nagent: a\nprompt: hi\ndistribute:\n  hosts: [h1]\n").unwrap();
+        let err = validate_step_shape(&step).unwrap_err();
+        assert!(err.to_string().contains("distribute"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_hosts() {
+        let step: Step = serde_yaml::from_str(
+            "id: s\nfor_each: \"x\"\nagent: a\nprompt: p\ndistribute:\n  hosts: []\n").unwrap();
+        assert!(validate_step_shape(&step).is_err());
     }
 }
 
