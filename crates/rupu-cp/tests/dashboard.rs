@@ -51,6 +51,7 @@ fn seed_run(id: &str, status: RunStatus, started_offset_secs: i64) -> RunRecord 
         active_step_kind: None,
         active_step_agent: None,
         active_step_transcript_path: None,
+        final_output: None,
     }
 }
 

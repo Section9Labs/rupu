@@ -12480,6 +12480,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             active_step_transcript_path: None,
+            final_output: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -12625,6 +12626,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             active_step_transcript_path: None,
+            final_output: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -12755,6 +12757,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             active_step_transcript_path: None,
+            final_output: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -12900,6 +12903,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             active_step_transcript_path: None,
+            final_output: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -13035,6 +13039,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             active_step_transcript_path: None,
+            final_output: None,
         };
         store.create(run, "name: controller\nsteps: []\n").unwrap();
         store
@@ -13162,6 +13167,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             active_step_transcript_path: None,
+                    final_output: None,
                 },
                 "name: controller\nsteps: []\n",
             )
@@ -13304,6 +13310,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             active_step_transcript_path: None,
+                    final_output: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )
@@ -13471,6 +13478,7 @@ steps:
             resume_claimed_by: None,
             resume_mode: None,
             active_step_transcript_path: None,
+                    final_output: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
             )

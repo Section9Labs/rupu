@@ -389,6 +389,10 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     let run_id_for_printer = run_id.clone();
     let spec_name_for_printer = spec.name.clone();
 
+    // Capture the run start time before spawning so run.json has an accurate
+    // started_at regardless of how long setup takes.
+    let started_at = chrono::Utc::now();
+
     // Run the agent. The printer reads from the JSONL transcript file;
     // since the agent is async and the printer is sync, we run the
     // printer in a background thread that polls the transcript while
@@ -469,6 +473,73 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
     let result = agent_task
         .await
         .map_err(|e| anyhow::anyhow!("agent task panicked: {e}"))??;
+
+    // Write run.json so the run is observable via RunStore and the mirror
+    // can carry final_output back to the central control-plane.
+    {
+        let runs_root = global.join("runs");
+        let store = rupu_orchestrator::RunStore::new(runs_root);
+        let final_output = rupu_orchestrator::read_final_assistant_text(
+            &transcript_path,
+            true,
+            &run_id,
+            "agent",
+        );
+        let finished_at = chrono::Utc::now();
+        let rec = rupu_orchestrator::RunRecord {
+            id: run_id.clone(),
+            workflow_name: format!("agent:{}", spec.name),
+            status: rupu_orchestrator::RunStatus::Completed,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: ws.id.clone(),
+            workspace_path: workspace_path.clone(),
+            transcript_dir: transcripts.clone(),
+            started_at,
+            finished_at: Some(finished_at),
+            final_output: Some(final_output.clone()),
+            error_message: None,
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: Some("local_checkout".to_string()),
+            worker_id: Some(worker_record.worker_id.clone()),
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+        };
+        match store.create(rec, "") {
+            Ok(_) => {}
+            Err(rupu_orchestrator::RunStoreError::AlreadyExists(_)) => {
+                // --run-id was pre-assigned and create already wrote the stub;
+                // update it in-place with the terminal status + final_output.
+                match store.load(&run_id) {
+                    Ok(mut loaded) => {
+                        loaded.status = rupu_orchestrator::RunStatus::Completed;
+                        loaded.finished_at = Some(finished_at);
+                        loaded.final_output = Some(final_output);
+                        if let Err(e) = store.update(&loaded) {
+                            warn!(error = %e, "failed to update agent run.json");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "failed to load agent run for update"),
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to write agent run.json"),
+        }
+    }
 
     // Print a brief footer.
     println!("transcript: {}", transcript_path.display());

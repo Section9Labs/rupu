@@ -401,6 +401,7 @@ pub async fn run_workflow(
                 resume_claimed_at: None,
                 resume_claimed_by: None,
                 resume_mode: None,
+                final_output: None,
             };
             Some(store.create(record, yaml).map_err(map_run_store_err)?)
         } else {
@@ -1545,7 +1546,7 @@ async fn dispatch_one(
 /// robust against half-written transcripts. We do this even on
 /// failure so partial output is observable to downstream `when:`
 /// gates.
-fn read_final_assistant_text(
+pub fn read_final_assistant_text(
     transcript_path: &Path,
     success: bool,
     run_id: &str,

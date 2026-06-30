@@ -217,6 +217,11 @@ pub struct RunRecord {
     /// [`RunStore::clear_resume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_mode: Option<String>,
+    /// Final assistant text for an agent run (set by `rupu run`); `None` for
+    /// workflow runs and older records. Carried by the mirror so a remotely
+    /// dispatched unit's output is retrievable centrally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_output: Option<String>,
 }
 
 /// Workflow-step shape, persisted alongside the result so the
@@ -1309,6 +1314,7 @@ mod tests {
             resume_claimed_at: None,
             resume_claimed_by: None,
             resume_mode: None,
+            final_output: None,
         }
     }
 
