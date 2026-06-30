@@ -421,4 +421,54 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unreachable") || msg.contains("h1 is down"));
     }
+
+    /// A plain workflow (no `distribute:` / `host:` step) needs no fleet
+    /// dispatcher — the fast path returns `None` without building a registry.
+    #[test]
+    fn build_dispatcher_none_for_plain_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = rupu_orchestrator::Workflow::parse(
+            r#"
+name: plain
+steps:
+  - id: a
+    agent: x
+    prompt: "p"
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(dir.path().join("runs")));
+        let got = build_dispatcher_if_needed(
+            &wf,
+            dir.path(),
+            store,
+            rupu_config::PricingConfig::default(),
+        );
+        assert!(got.is_none(), "plain workflow must not get a dispatcher");
+    }
+
+    /// A workflow with a host-placed linear step needs a fleet dispatcher.
+    #[test]
+    fn build_dispatcher_some_for_host_placed_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = rupu_orchestrator::Workflow::parse(
+            r#"
+name: placed
+steps:
+  - id: a
+    agent: x
+    prompt: "p"
+    host: worker-1
+"#,
+        )
+        .unwrap();
+        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(dir.path().join("runs")));
+        let got = build_dispatcher_if_needed(
+            &wf,
+            dir.path(),
+            store,
+            rupu_config::PricingConfig::default(),
+        );
+        assert!(got.is_some(), "host-placed workflow must get a dispatcher");
+    }
 }
