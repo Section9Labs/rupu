@@ -32,7 +32,7 @@ pub use generate::{
 pub use runner::{
     read_final_assistant_text, resolve_inputs, run_workflow, AwaitingInfo, Finding, ItemResult,
     OrchestratorRunOpts, OrchestratorRunResult, ResumeState, RunWorkflowError, StepFactory,
-    StepResult,
+    StepResult, UnitDispatch, UnitDispatcher, UnitOutcome,
 };
 pub use runs::{
     ApprovalDecision, ApprovalError, FindingRecord, ItemResultRecord, RunRecord, RunStatus,

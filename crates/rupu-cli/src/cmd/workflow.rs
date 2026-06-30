@@ -2275,6 +2275,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
         run_id_override: None,
         strict_templates: false,
         event_sink: event_sink_for_resume,
+                unit_dispatcher: None,
     };
 
     println!("rupu: resuming run {run_id}");
@@ -3382,6 +3383,7 @@ async fn execute_workflow_invocation(
         run_id_override: Some(run_id.clone()),
         strict_templates,
         event_sink: event_sink_for_run,
+                unit_dispatcher: None,
     };
 
     // Opt-in live three-zone view (dashboard + git-graph spine + focus
@@ -3553,6 +3555,7 @@ async fn execute_workflow_invocation(
                         run_id_override: None,
                         strict_templates,
                         event_sink: resume_event_sink,
+                                unit_dispatcher: None,
                     };
                     current_runner = tokio::spawn(run_workflow(resume_opts));
                     current_run_id = result.run_id.clone();

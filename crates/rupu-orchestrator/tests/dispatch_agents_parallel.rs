@@ -255,6 +255,7 @@ async fn parent_step_fans_out_two_children_and_aggregates() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
+                unit_dispatcher: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -311,6 +312,7 @@ async fn one_child_failure_marks_all_succeeded_false_but_parent_continues() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
+                unit_dispatcher: None,
     };
 
     let res = run_workflow(opts).await.expect("workflow runs");
@@ -359,6 +361,7 @@ async fn allowlist_violation_blocks_dispatch_at_the_parallel_layer() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
+                unit_dispatcher: None,
     };
 
     run_workflow(opts).await.expect("workflow runs");

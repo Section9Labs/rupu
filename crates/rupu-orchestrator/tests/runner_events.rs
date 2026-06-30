@@ -121,6 +121,7 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+                unit_dispatcher: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -194,6 +195,7 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+                unit_dispatcher: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -249,6 +251,7 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+                unit_dispatcher: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -422,6 +425,7 @@ steps:
         run_id_override: None,
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
+                unit_dispatcher: None,
     };
 
     run_workflow(opts).await.unwrap();
@@ -474,6 +478,7 @@ async fn no_event_sink_does_not_emit_any_events() {
         run_id_override: None,
         strict_templates: false,
         event_sink: None,
+                unit_dispatcher: None,
     };
 
     let res = run_workflow(opts).await.unwrap();

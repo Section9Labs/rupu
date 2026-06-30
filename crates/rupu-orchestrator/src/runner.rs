@@ -34,6 +34,45 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+// ---------------------------------------------------------------------------
+// Remote unit dispatch port
+// ---------------------------------------------------------------------------
+
+/// Payload for one unit dispatched to a remote host.
+#[derive(Debug)]
+pub struct UnitDispatch {
+    pub step_id: String,
+    pub agent: String,
+    pub rendered_prompt: String,
+    pub index: usize,
+    pub run_id: String,
+}
+
+/// Outcome of one unit dispatched to a remote host.
+#[derive(Debug)]
+pub struct UnitOutcome {
+    pub output: String,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+/// Port that remote-fleet implementations plug into.
+///
+/// The orchestrator calls this when a `for_each:` step has a
+/// `distribute:` placement. Each unit is dispatched to the named host;
+/// results are aggregated exactly like local (inline) units. Local units
+/// that have no placement NEVER go through this trait — they keep the
+/// existing `dispatch_one` + `read_final_assistant_text` path unchanged.
+#[async_trait]
+pub trait UnitDispatcher: Send + Sync {
+    /// Run one unit (an agent invocation) on `host` and return its output.
+    async fn dispatch_unit(
+        &self,
+        unit: UnitDispatch,
+        host: &str,
+    ) -> Result<UnitOutcome, RunError>;
+}
+
 #[derive(Debug, Error)]
 pub enum RunWorkflowError {
     #[error("parse: {0}")]
@@ -159,6 +198,11 @@ pub struct OrchestratorRunOpts {
     /// transition. When `None`, behavior is unchanged (back-compat for
     /// any direct caller).
     pub event_sink: Option<std::sync::Arc<dyn crate::executor::EventSink>>,
+    /// Optional remote unit dispatcher. When a `for_each:` step has
+    /// `distribute:`, units are routed to hosts through this. `None` ⇒
+    /// all units run locally (a `distribute:` step with `None` is a run
+    /// error surfaced as a failed unit).
+    pub unit_dispatcher: Option<Arc<dyn UnitDispatcher>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1120,8 +1164,25 @@ async fn run_fanout_step(
         .as_deref()
         .expect("validate_step_shape guarantees agent for for_each steps")
         .to_string();
+    // Pre-extract distribute hosts (if any) so we can compute per-unit
+    // placement and fallback host before entering each spawned task.
+    let distribute_hosts: Option<Vec<String>> =
+        step.distribute.as_ref().map(|d| d.hosts.clone());
+    // Clone the dispatcher Arc once; each spawned task gets its own ref.
+    let unit_dispatcher = opts.unit_dispatcher.clone();
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
+        // Compute host placement for this unit. `None` → local inline path
+        // (unchanged). `Some(host)` → remote dispatch via `UnitDispatcher`.
+        let placement: Option<String> = distribute_hosts
+            .as_ref()
+            .map(|hosts| hosts[idx % hosts.len()].clone());
+        // Fallback host for the single retry on primary-host failure.
+        // Computed eagerly outside the task to avoid capturing the full
+        // hosts list in every closure.
+        let fallback_host: Option<String> = distribute_hosts.as_ref().map(|hosts| {
+            hosts[(idx + 1) % hosts.len()].clone()
+        });
         let permit_sem = semaphore.clone();
         let factory = Arc::clone(&opts.factory);
         let step_id = step.id.clone();
@@ -1140,6 +1201,7 @@ async fn run_fanout_step(
         let workflow_run_id = workflow_run_id.to_string();
         let unit_key = fanout_unit_key(&item_value);
         let unit_agent = agent_name_root.clone();
+        let dispatcher_for_task = unit_dispatcher.clone();
 
         handles.push(tokio::spawn(async move {
             // Held for the duration of this item's run; dropping it
@@ -1161,24 +1223,95 @@ async fn run_fanout_step(
                     },
                 );
             }
-            let outcome = dispatch_one(
-                &factory,
-                &step_id,
-                &agent_name,
-                rendered_clone.clone(),
-                run_id_clone.clone(),
-                workspace_id,
-                workspace_path,
-                transcript_clone.clone(),
-                None,
-            )
-            .await;
-            let (success, error_str, raw_error) = match outcome {
-                Ok(()) => (true, None, None),
-                Err(e) => (false, Some(e.to_string()), Some(e)),
+
+            // Branch: remote (placed) vs local (inline) path.
+            let (output, success, error_str, raw_error) = if let Some(host) = placement {
+                // --- Remote dispatch path ---
+                //
+                // `distribute:` requires a `UnitDispatcher`. Its absence is a
+                // configuration error — the caller must supply one when running
+                // a workflow with `distribute:`.
+                match dispatcher_for_task {
+                    None => {
+                        let err = RunError::Provider(
+                            "distribute requires fleet access — run via the CP".into(),
+                        );
+                        let msg = err.to_string();
+                        (msg, false, Some("distribute requires fleet access — run via the CP".to_string()), Some(err))
+                    }
+                    Some(dispatcher) => {
+                        let unit = UnitDispatch {
+                            step_id: step_id.clone(),
+                            agent: agent_name.clone(),
+                            rendered_prompt: rendered_clone.clone(),
+                            index: idx,
+                            run_id: run_id_clone.clone(),
+                        };
+                        match dispatcher.dispatch_unit(unit, &host).await {
+                            Ok(outcome) => {
+                                let err_str = outcome.error.clone();
+                                (outcome.output, outcome.success, err_str, None)
+                            }
+                            Err(first_err) => {
+                                // Reassign once to the next host and retry.
+                                let retry_host = fallback_host
+                                    .as_deref()
+                                    .unwrap_or(&host);
+                                let retry_unit = UnitDispatch {
+                                    step_id: step_id.clone(),
+                                    agent: agent_name.clone(),
+                                    rendered_prompt: rendered_clone.clone(),
+                                    index: idx,
+                                    run_id: run_id_clone.clone(),
+                                };
+                                warn!(
+                                    step = %step_id,
+                                    index = idx,
+                                    host = %host,
+                                    retry = %retry_host,
+                                    error = %first_err,
+                                    "unit dispatch failed; retrying on next host"
+                                );
+                                match dispatcher
+                                    .dispatch_unit(retry_unit, retry_host)
+                                    .await
+                                {
+                                    Ok(outcome) => {
+                                        let err_str = outcome.error.clone();
+                                        (outcome.output, outcome.success, err_str, None)
+                                    }
+                                    Err(second_err) => {
+                                        let msg = second_err.to_string();
+                                        (msg.clone(), false, Some(msg), Some(second_err))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // --- Existing local (inline) path — UNCHANGED ---
+                let outcome = dispatch_one(
+                    &factory,
+                    &step_id,
+                    &agent_name,
+                    rendered_clone.clone(),
+                    run_id_clone.clone(),
+                    workspace_id,
+                    workspace_path,
+                    transcript_clone.clone(),
+                    None,
+                )
+                .await;
+                let (suc, err_str, raw) = match outcome {
+                    Ok(()) => (true, None, None),
+                    Err(e) => (false, Some(e.to_string()), Some(e)),
+                };
+                let out =
+                    read_final_assistant_text(&transcript_clone, suc, &run_id_clone, &step_id);
+                (out, suc, err_str, raw)
             };
-            let output =
-                read_final_assistant_text(&transcript_clone, success, &run_id_clone, &step_id);
+
             if let Some(sink) = event_sink.as_ref() {
                 // Tokens are not available from the dispatch result
                 // (`dispatch_one` returns `Result<()>`); emit 0 — the live
@@ -2313,6 +2446,216 @@ impl RawFindingsBag {
                 body: f.body,
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — distributed fan-out
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    // A factory that panics if actually called.  For distributed fan-out
+    // tests every unit has a host placement, so `dispatch_one` (and
+    // therefore `build_opts_for_step`) must never be invoked.
+    struct PanicFactory;
+
+    #[async_trait]
+    impl StepFactory for PanicFactory {
+        async fn build_opts_for_step(
+            &self,
+            _step_id: &str,
+            _agent_name: &str,
+            _rendered_prompt: String,
+            _run_id: String,
+            _workspace_id: String,
+            _workspace_path: PathBuf,
+            _transcript_path: PathBuf,
+            _on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> rupu_agent::AgentRunOpts {
+            panic!("PanicFactory: build_opts_for_step must not be called for distributed units")
+        }
+    }
+
+    /// Fake `UnitDispatcher` for tests.
+    ///
+    /// Records every `(unit.index, host)` pair it receives.  When
+    /// `fail_first_host` is set, the first dispatch to that host returns
+    /// `Err(RunError::Provider("host down"))`.
+    struct FakeUnitDispatcher {
+        calls: Mutex<Vec<(usize, String)>>,
+        fail_first_host: Option<String>,
+    }
+
+    impl FakeUnitDispatcher {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail_first_host: None,
+            }
+        }
+
+        fn with_failing_host(host: impl Into<String>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail_first_host: Some(host.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl UnitDispatcher for FakeUnitDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((unit.index, host.to_string()));
+            if self.fail_first_host.as_deref() == Some(host) {
+                return Err(RunError::Provider("host down".into()));
+            }
+            Ok(UnitOutcome {
+                output: format!("out-{}-on-{host}", unit.index),
+                success: true,
+                error: None,
+            })
+        }
+    }
+
+    /// Build the minimal `OrchestratorRunOpts` for a distributed fan-out
+    /// test.  Mirrors the pattern used by the integration tests in
+    /// `tests/linear_runner.rs` but keeps `run_store: None` (no disk
+    /// persistence) and injects a `UnitDispatcher`.
+    fn make_opts(
+        wf: Workflow,
+        transcript_dir: PathBuf,
+        dispatcher: Arc<dyn UnitDispatcher>,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_test".into(),
+            workspace_path: transcript_dir.clone(),
+            transcript_dir,
+            factory: Arc::new(PanicFactory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: None,
+            unit_dispatcher: Some(dispatcher),
+        }
+    }
+
+    const WF_DISTRIBUTED: &str = r#"
+name: distributed-test
+steps:
+  - id: process
+    for_each: "a\nb\nc\nd"
+    agent: dummy
+    prompt: "Process {{ item }}"
+    max_parallel: 4
+    distribute:
+      hosts: [h1, h2]
+"#;
+
+    #[tokio::test]
+    async fn distributed_fanout_round_robins_and_aggregates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::new());
+        let wf = Workflow::parse(WF_DISTRIBUTED).unwrap();
+        let opts = make_opts(wf, tmp.path().to_path_buf(), dispatcher.clone());
+
+        let res = run_workflow(opts).await.expect("workflow should succeed");
+
+        assert_eq!(res.step_results.len(), 1);
+        let step = &res.step_results[0];
+        assert!(step.success, "all units succeeded → step success");
+
+        // Round-robin host assignment: idx 0→h1, 1→h2, 2→h1, 3→h2.
+        let calls = dispatcher.calls.lock().unwrap().clone();
+        let mut sorted = calls.clone();
+        sorted.sort_by_key(|(idx, _)| *idx);
+        assert_eq!(
+            sorted,
+            vec![
+                (0, "h1".to_string()),
+                (1, "h2".to_string()),
+                (2, "h1".to_string()),
+                (3, "h2".to_string()),
+            ],
+            "units dispatched round-robin by index; got: {sorted:?}"
+        );
+
+        // Aggregated results in index order.
+        assert_eq!(step.items.len(), 4);
+        assert_eq!(step.items[0].output, "out-0-on-h1");
+        assert_eq!(step.items[1].output, "out-1-on-h2");
+        assert_eq!(step.items[2].output, "out-2-on-h1");
+        assert_eq!(step.items[3].output, "out-3-on-h2");
+    }
+
+    const WF_DISTRIBUTED_2: &str = r#"
+name: distributed-retry-test
+steps:
+  - id: process
+    for_each: "a\nb"
+    agent: dummy
+    prompt: "Process {{ item }}"
+    max_parallel: 2
+    continue_on_error: true
+    distribute:
+      hosts: [h1, h2]
+"#;
+
+    #[tokio::test]
+    async fn distributed_fanout_reassigns_once_on_host_failure() {
+        // h1 always returns an error.  Unit 0 is assigned h1 (idx=0 % 2),
+        // should be retried on h2 (fallback = (0+1)%2=h2) and succeed.
+        // Unit 1 is assigned h2 directly and succeeds on the first try.
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = Arc::new(FakeUnitDispatcher::with_failing_host("h1"));
+        let wf = Workflow::parse(WF_DISTRIBUTED_2).unwrap();
+        let opts = make_opts(wf, tmp.path().to_path_buf(), dispatcher.clone());
+
+        let res = run_workflow(opts).await.expect("workflow should complete");
+        let step = &res.step_results[0];
+
+        let calls = dispatcher.calls.lock().unwrap().clone();
+
+        // Unit 0: first call to h1 (fails), then retry to h2 (succeeds).
+        // Unit 1: single call to h2 (succeeds).
+        // Total calls = 3.
+        let unit0_calls: Vec<&(usize, String)> =
+            calls.iter().filter(|(i, _)| *i == 0).collect();
+        assert_eq!(
+            unit0_calls.len(),
+            2,
+            "unit 0 should be called twice (primary + retry); got {calls:?}"
+        );
+        assert_eq!(unit0_calls[0].1, "h1", "first call for unit 0 must be h1");
+        assert_eq!(unit0_calls[1].1, "h2", "retry call for unit 0 must be h2");
+
+        // After the retry, unit 0's output should come from h2.
+        assert!(step.items[0].success, "unit 0 should succeed after retry");
+        assert_eq!(step.items[0].output, "out-0-on-h2");
+
+        // Unit 1 succeeded on h2 directly.
+        let unit1_calls: Vec<&(usize, String)> =
+            calls.iter().filter(|(i, _)| *i == 1).collect();
+        assert_eq!(unit1_calls.len(), 1, "unit 1 needs only one call");
+        assert_eq!(unit1_calls[0].1, "h2");
+        assert!(step.items[1].success);
     }
 }
 
