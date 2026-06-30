@@ -6,7 +6,7 @@
 
 #![deny(clippy::all)]
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{
     error::{ApiError, ApiResult},
@@ -27,6 +27,8 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/hosts", get(list_hosts).post(add_host))
         .route("/api/hosts/node", post(enroll_node_handler))
+        .route("/api/hosts/ssh", post(add_ssh_host_handler))
+        .route("/api/hosts/bucket", post(add_bucket_host_handler))
         .route("/api/hosts/:id", delete(remove_host))
 }
 
@@ -291,6 +293,99 @@ async fn enroll_node_handler(
         },
         command,
         token,
+    }))
+}
+
+// ── SSH host ──────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AddSshHostBody {
+    name: String,
+    host: String,
+    port: Option<u16>,
+    /// Path to an SSH identity file on the local machine (optional).
+    /// No credential is stored; the path is metadata only.
+    identity_file: Option<String>,
+}
+
+/// `POST /api/hosts/ssh` — register a new SSH host.
+///
+/// Requires the `cp serve` launcher adapter (501 if absent — read-only deploy).
+/// No secrets are accepted or stored; auth is delegated to the system `ssh`.
+async fn add_ssh_host_handler(
+    State(s): State<AppState>,
+    Json(body): Json<AddSshHostBody>,
+) -> ApiResult<Json<HostView>> {
+    s.launcher
+        .as_ref()
+        .ok_or_else(|| ApiError::not_available("managing hosts requires `rupu cp serve`"))?;
+
+    let host = s
+        .hosts
+        .add_ssh_host(
+            &body.name,
+            &body.host,
+            body.port,
+            body.identity_file.map(PathBuf::from),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let (transport_kind, base_url) = transport_fields(&host.transport);
+
+    Ok(Json(HostView {
+        id: host.id,
+        name: host.name,
+        transport_kind,
+        base_url,
+        // Newly added: not yet probed.
+        status: "offline".to_string(),
+        version: None,
+        capabilities: None,
+        active_run_count: 0,
+        last_seen_at: host.last_seen_at,
+    }))
+}
+
+// ── Bucket host ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AddBucketHostBody {
+    name: String,
+    url: String,
+    prefix: Option<String>,
+}
+
+/// `POST /api/hosts/bucket` — register a new bucket (dead-drop) host.
+///
+/// Requires the `cp serve` launcher adapter (501 if absent — read-only deploy).
+/// No credentials are accepted or stored; auth comes from the environment /
+/// cloud credential chain.
+async fn add_bucket_host_handler(
+    State(s): State<AppState>,
+    Json(body): Json<AddBucketHostBody>,
+) -> ApiResult<Json<HostView>> {
+    s.launcher
+        .as_ref()
+        .ok_or_else(|| ApiError::not_available("managing hosts requires `rupu cp serve`"))?;
+
+    let host = s
+        .hosts
+        .add_bucket_host(&body.name, &body.url, body.prefix)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let (transport_kind, base_url) = transport_fields(&host.transport);
+
+    Ok(Json(HostView {
+        id: host.id,
+        name: host.name,
+        transport_kind,
+        base_url,
+        // Newly added: not yet probed.
+        status: "offline".to_string(),
+        version: None,
+        capabilities: None,
+        active_run_count: 0,
+        last_seen_at: host.last_seen_at,
     }))
 }
 

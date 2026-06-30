@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use rupu_orchestrator::runs::RunStore;
 use rupu_workspace::{
-    delete_host_token, get_host_token, set_host_token, Host, HostStore, HostStoreError,
-    HostTransport,
+    add_bucket_host, add_ssh_host, delete_host_token, get_host_token, set_host_token, Host,
+    HostStore, HostStoreError, HostTransport,
 };
 use ulid::Ulid;
 
@@ -188,6 +188,40 @@ impl HostRegistry {
         self.cache.lock().unwrap().remove(&id);
 
         Ok(host)
+    }
+
+    /// Persist a new SSH host record.
+    ///
+    /// Delegates to [`rupu_workspace::add_ssh_host`].  No secret is stored —
+    /// auth is delegated to the system `ssh` agent / `~/.ssh/config`.
+    pub fn add_ssh_host(
+        &self,
+        name: &str,
+        host: &str,
+        port: Option<u16>,
+        identity_file: Option<std::path::PathBuf>,
+    ) -> Result<Host, HostConnectorError> {
+        let h = add_ssh_host(&self.store, name, host, port, identity_file)?;
+        // Invalidate any stale cache entry (no entry should exist for a new id,
+        // but safe to remove anyway — mirrors add_host).
+        self.cache.lock().unwrap().remove(&h.id);
+        Ok(h)
+    }
+
+    /// Persist a new Bucket (dead-drop) host record.
+    ///
+    /// Delegates to [`rupu_workspace::add_bucket_host`].  No credentials are
+    /// stored — auth comes from the environment / cloud credential chain.
+    pub fn add_bucket_host(
+        &self,
+        name: &str,
+        url: &str,
+        prefix: Option<String>,
+    ) -> Result<Host, HostConnectorError> {
+        let h = add_bucket_host(&self.store, name, url, prefix)?;
+        // Invalidate any stale cache entry — mirrors add_host.
+        self.cache.lock().unwrap().remove(&h.id);
+        Ok(h)
     }
 
     /// Enroll a new tunnel node.
