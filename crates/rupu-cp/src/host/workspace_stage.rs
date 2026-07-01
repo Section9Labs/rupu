@@ -34,23 +34,26 @@ pub fn stage_to_dir(payload: &[u8], cache_root: &Path) -> Result<String, HostCon
 
 /// Reload the baseline, diff the working dir, return the encoded delta, and
 /// remove the scratch. `working_dir` is confined under `<cache_root>/workspace-sync`.
+/// The scratch `base` dir is removed unconditionally once resolved, whether
+/// the delta build succeeds or fails, so a bad baseline / collect error never
+/// leaks the scratch dir.
 pub fn collect_from_dir(
     working_dir: &str,
     cache_root: &Path,
 ) -> Result<Vec<u8>, HostConnectorError> {
     let sync_root = cache_root.join("workspace-sync");
-    let work = confine(Path::new(working_dir), &sync_root)?;
-    let base = work
-        .parent()
-        .ok_or_else(|| HostConnectorError::Invalid("invalid working dir".into()))?;
-    let baseline_bytes = std::fs::read(base.join("baseline.json"))
-        .map_err(|e| HostConnectorError::Invalid(format!("baseline missing: {e}")))?;
-    let baseline = deserialize_baseline(&baseline_bytes)?;
-    let delta = rupu_workspace::collect_delta(&work, &baseline)
-        .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
-    let bytes = encode_delta(&delta);
-    let _ = std::fs::remove_dir_all(base);
-    Ok(bytes)
+    let base = resolve_confined_base(working_dir, &sync_root)?;
+    let result = (|| {
+        let baseline_bytes = std::fs::read(base.join("baseline.json"))
+            .map_err(|e| HostConnectorError::Invalid(format!("baseline missing: {e}")))?;
+        let baseline = deserialize_baseline(&baseline_bytes)?;
+        let work = base.join("work");
+        let delta = rupu_workspace::collect_delta(&work, &baseline)
+            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        Ok(encode_delta(&delta))
+    })();
+    let _ = std::fs::remove_dir_all(&base);
+    result
 }
 
 /// Best-effort discard of a staged workspace scratch dir. Used when the unit
@@ -60,12 +63,22 @@ pub fn collect_from_dir(
 /// `<cache_root>/workspace-sync`, same as [`collect_from_dir`].
 pub fn discard_from_dir(working_dir: &str, cache_root: &Path) -> Result<(), HostConnectorError> {
     let sync_root = cache_root.join("workspace-sync");
-    let work = confine(Path::new(working_dir), &sync_root)?;
-    let base = work
-        .parent()
-        .ok_or_else(|| HostConnectorError::Invalid("invalid working dir".into()))?;
-    let _ = std::fs::remove_dir_all(base);
+    let base = resolve_confined_base(working_dir, &sync_root)?;
+    let _ = std::fs::remove_dir_all(&base);
     Ok(())
+}
+
+/// Confine `working_dir` under `sync_root` and return its parent (the
+/// per-request scratch `base` dir holding `work/` and `baseline.json`).
+/// Shared by [`collect_from_dir`] and [`discard_from_dir`].
+fn resolve_confined_base(
+    working_dir: &str,
+    sync_root: &Path,
+) -> Result<PathBuf, HostConnectorError> {
+    let work = confine(Path::new(working_dir), sync_root)?;
+    work.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| HostConnectorError::Invalid("invalid working dir".into()))
 }
 
 /// Canonicalize `path` and confirm it stays under `root`. Rejects `..`/absolute
@@ -222,6 +235,31 @@ mod tests {
 
         assert!(!base.exists(), "scratch base dir must be removed");
         assert!(!std::path::Path::new(&work).exists());
+    }
+
+    /// A `collect_from_dir` that fails partway through (here: the
+    /// `baseline.json` sidecar is missing) must still remove the scratch
+    /// `base` dir — otherwise every failed collect leaks a directory under
+    /// `<cache_root>/workspace-sync` forever.
+    #[test]
+    fn collect_removes_scratch_even_on_error() {
+        let ws = tempfile::tempdir().unwrap();
+        fs::write(ws.path().join("a.txt"), "orig").unwrap();
+        let payload = rupu_workspace::pack(ws.path()).unwrap();
+        let encoded = crate::host::connector::encode_payload(&payload);
+
+        let cache = tempfile::tempdir().unwrap();
+        let work = stage_to_dir(&encoded, cache.path()).unwrap();
+        let base = std::path::Path::new(&work).parent().unwrap().to_path_buf();
+        assert!(base.exists());
+
+        // Sabotage the baseline sidecar so collect_from_dir errors before it
+        // ever gets to rupu_workspace::collect_delta.
+        std::fs::remove_file(base.join("baseline.json")).unwrap();
+
+        let err = collect_from_dir(&work, cache.path());
+        assert!(matches!(err, Err(HostConnectorError::Invalid(_))));
+        assert!(!base.exists(), "scratch base dir must be removed on error");
     }
 
     #[test]
