@@ -2256,6 +2256,8 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
         prior_step_results,
         approved_step_id: String::new(),
         completed_units,
+        reason: rupu_orchestrator::PauseReason::Approval,
+        paused_step: None,
     };
 
     let event_sink_for_resume = {
@@ -2292,6 +2294,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
         strict_templates: false,
         event_sink: event_sink_for_resume,
         unit_dispatcher,
+        pause: None,
     };
 
     println!("rupu: resuming run {run_id}");
@@ -3410,6 +3413,7 @@ async fn execute_workflow_invocation(
         strict_templates,
         event_sink: event_sink_for_run,
         unit_dispatcher,
+        pause: None,
     };
 
     // Opt-in live three-zone view (dashboard + git-graph spine + focus
@@ -3588,6 +3592,7 @@ async fn execute_workflow_invocation(
                         strict_templates,
                         event_sink: resume_event_sink,
                         unit_dispatcher: resume_unit_dispatcher,
+                        pause: None,
                     };
                     current_runner = tokio::spawn(run_workflow(resume_opts));
                     current_run_id = result.run_id.clone();

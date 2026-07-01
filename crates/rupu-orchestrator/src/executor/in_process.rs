@@ -164,6 +164,7 @@ impl WorkflowExecutor for InProcessExecutor {
             strict_templates: false,
             event_sink: Some(fan_out as Arc<dyn EventSink>),
             unit_dispatcher: None,
+            pause: None,
         };
 
         // 6. Stash state before spawning (so tail() works immediately).

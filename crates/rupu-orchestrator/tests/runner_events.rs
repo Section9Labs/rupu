@@ -123,7 +123,8 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -209,7 +210,8 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -265,7 +267,8 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -440,7 +443,8 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -493,7 +497,8 @@ async fn no_event_sink_does_not_emit_any_events() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);
