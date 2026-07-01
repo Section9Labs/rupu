@@ -6,23 +6,22 @@
 //! the shared builders in `crate::api::runs` so the JSON shape is identical to
 //! what the HTTP API serves.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rupu_orchestrator::{
     runs::{CancelError, RunStore},
     ApprovalError, RunStoreError,
 };
-use ulid::Ulid;
 
 use crate::{
     agent_launcher::{AgentLaunchRequest, AgentLauncher},
     api::runs::{query_run_detail, query_run_rows},
     host::connector::{
-        decode_payload, deserialize_baseline, encode_delta, open_run_events_tail,
-        read_transcript_file, serialize_baseline, EventByteStream, HostCapabilities, HostConnector,
-        HostConnectorError, HostInfo, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
+        open_run_events_tail, read_transcript_file, EventByteStream, HostCapabilities,
+        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
     },
+    host::workspace_stage::{collect_from_dir, discard_from_dir, stage_to_dir},
     launcher::{LaunchRequest, RunLauncher},
     session_sender::{SendMessageRequest, SessionSender},
     session_starter::{SessionStartRequest, SessionStarter},
@@ -243,23 +242,7 @@ impl HostConnector for LocalHostConnector {
     /// stage-time baseline is persisted to a `baseline.json` sidecar one level up
     /// (OUTSIDE `work`, so `collect_workspace_delta`'s tree hash never sees it).
     async fn stage_workspace(&self, payload: Vec<u8>) -> Result<String, HostConnectorError> {
-        if payload.len() > MAX_WORKSPACE_BYTES {
-            return Err(HostConnectorError::Invalid(format!(
-                "workspace payload {} bytes exceeds limit {MAX_WORKSPACE_BYTES}",
-                payload.len()
-            )));
-        }
-        let decoded = decode_payload(&payload)?;
-        let base = self
-            .global_dir
-            .join("workspace-sync")
-            .join(Ulid::new().to_string());
-        let work = base.join("work");
-        let baseline = rupu_workspace::stage(&decoded, &work)
-            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
-        std::fs::write(base.join("baseline.json"), serialize_baseline(&baseline)?)
-            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
-        Ok(work.to_string_lossy().into_owned())
+        stage_to_dir(&payload, &self.global_dir)
     }
 
     /// Reload the staged baseline, diff the working dir, and return the encoded
@@ -268,18 +251,14 @@ impl HostConnector for LocalHostConnector {
         &self,
         working_dir: &str,
     ) -> Result<Vec<u8>, HostConnectorError> {
-        let work = Path::new(working_dir);
-        let base = work
-            .parent()
-            .ok_or_else(|| HostConnectorError::Invalid("invalid working dir".into()))?;
-        let baseline_bytes = std::fs::read(base.join("baseline.json"))
-            .map_err(|e| HostConnectorError::Invalid(format!("baseline missing: {e}")))?;
-        let baseline = deserialize_baseline(&baseline_bytes)?;
-        let delta = rupu_workspace::collect_delta(work, &baseline)
-            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
-        let bytes = encode_delta(&delta);
-        let _ = std::fs::remove_dir_all(base);
-        Ok(bytes)
+        collect_from_dir(working_dir, &self.global_dir)
+    }
+
+    /// Best-effort discard of a staged workspace scratch dir — called when the
+    /// unit that consumed it failed between stage and collect (launch failure
+    /// or poll timeout), so `collect_workspace_delta` never ran.
+    async fn discard_workspace(&self, working_dir: &str) -> Result<(), HostConnectorError> {
+        discard_from_dir(working_dir, &self.global_dir)
     }
 }
 
@@ -287,6 +266,7 @@ impl HostConnector for LocalHostConnector {
 mod workspace_sync_tests {
     use super::*;
     use crate::host::connector::{decode_delta, encode_payload};
+    use std::path::Path;
 
     fn local(global_dir: PathBuf) -> LocalHostConnector {
         let run_store = Arc::new(RunStore::new(global_dir.join("runs")));

@@ -363,6 +363,21 @@ impl HostConnector for HttpHostConnector {
         }
         Ok(bytes.to_vec())
     }
+
+    /// DELETE the staged scratch dir via `/api/workspace/discard?dir=<working_dir>`.
+    ///
+    /// Best-effort: called by a coordinator when it gave up on a unit between
+    /// staging and collecting (launch failure, poll timeout) so the remote
+    /// scratch is not left to leak until the next best-effort sweep.
+    async fn discard_workspace(&self, working_dir: &str) -> Result<(), HostConnectorError> {
+        self.send(
+            self.client
+                .delete(self.url("/api/workspace/discard"))
+                .query(&[("dir", working_dir)]),
+        )
+        .await
+        .map(|_| ())
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

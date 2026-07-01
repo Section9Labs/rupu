@@ -14,3 +14,4 @@ pub mod local;
 pub mod registry;
 pub mod ssh;
 pub mod tunnel;
+pub(crate) mod workspace_stage;

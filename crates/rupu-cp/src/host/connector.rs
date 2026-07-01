@@ -184,6 +184,19 @@ pub trait HostConnector: Send + Sync {
     ) -> Result<Vec<u8>, HostConnectorError> {
         Err(HostConnectorError::Unsupported("workspace sync".into()))
     }
+
+    /// Best-effort discard of a staged workspace scratch dir.
+    ///
+    /// Called by a coordinator when the unit that consumed the staged tree
+    /// failed *between* `stage_workspace` and `collect_workspace_delta` (e.g.
+    /// `launch_agent` errored, or the run poll timed out) — so
+    /// `collect_workspace_delta` never ran and the scratch would otherwise
+    /// leak indefinitely. The default no-op impl is correct for transports
+    /// that don't support workspace sync at all; every transport that
+    /// implements `stage_workspace` should also implement this.
+    async fn discard_workspace(&self, _working_dir: &str) -> Result<(), HostConnectorError> {
+        Ok(())
+    }
 }
 
 // ── Workspace-sync wire codec ─────────────────────────────────────────────────
