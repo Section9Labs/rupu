@@ -43,6 +43,7 @@ rupu-transcript = { path = "../rupu-transcript" }
 [dev-dependencies]
 chrono.workspace = true
 tempfile.workspace = true
+git2.workspace = true
 rupu-config = { path = "../rupu-config" }
 rupu-transcript = { path = "../rupu-transcript" }
 httpmock.workspace = true

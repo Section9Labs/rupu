@@ -116,6 +116,51 @@ mod tests {
         assert!(!std::path::Path::new(&work).exists());
     }
 
+    /// Mirrors `git_init` in `rupu_workspace::workspace_sync`'s git tests: a
+    /// minimal repo with one committed file, so `rupu_workspace::pack` detects
+    /// git mode and the staged baseline carries a `git_commit: Some(..)`
+    /// sidecar rather than the tar-mode snapshot.
+    fn git_init(dir: &std::path::Path) {
+        let repo = git2::Repository::init(dir).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "t").unwrap();
+        cfg.set_str("user.email", "t@e").unwrap();
+        fs::write(dir.join("a.txt"), "line1\nline2\nline3\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("a.txt")).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn stage_then_collect_round_trips_git() {
+        // build a git payload via rupu_workspace::pack (auto-detects git mode
+        // from the repo's baseline commit) so the shared core is exercised on
+        // the `git_commit: Some(..)` sidecar path, not just tar.
+        let ws = tempfile::tempdir().unwrap();
+        git_init(ws.path());
+        let payload = rupu_workspace::pack(ws.path()).unwrap();
+        assert_eq!(payload.mode, rupu_workspace::SyncMode::Git);
+        let encoded = crate::host::connector::encode_payload(&payload);
+
+        let cache = tempfile::tempdir().unwrap();
+        let work = stage_to_dir(&encoded, cache.path()).unwrap();
+        // simulate a remote edit
+        fs::write(
+            std::path::Path::new(&work).join("a.txt"),
+            "line1\nEDITED\nline3\n",
+        )
+        .unwrap();
+        let delta_bytes = collect_from_dir(&work, cache.path()).unwrap();
+        let delta = crate::host::connector::decode_delta(&delta_bytes).unwrap();
+        assert!(delta.changed.iter().any(|p| p == "a.txt"));
+        // scratch cleaned
+        assert!(!std::path::Path::new(&work).exists());
+    }
+
     #[test]
     fn confine_rejects_traversal() {
         let root = tempfile::tempdir().unwrap();
@@ -128,14 +173,38 @@ mod tests {
         assert!(confine(&escape, &root.path().join("workspace-sync")).is_err());
     }
 
+    /// `confine` must reject a `working_dir` that canonicalizes successfully
+    /// but sits outside `root` — the real containment branch — not merely a
+    /// path whose `root` fails to canonicalize because it doesn't exist yet.
+    #[test]
+    fn confine_rejects_real_sibling_outside_root() {
+        let cache = tempfile::tempdir().unwrap();
+        let root = cache.path().join("workspace-sync");
+        fs::create_dir_all(&root).unwrap();
+        // sibling of `root`, not a descendant: root itself canonicalizes fine,
+        // so a failure here can only come from the `starts_with` check.
+        assert!(matches!(
+            confine(cache.path(), &root),
+            Err(HostConnectorError::Invalid(_))
+        ));
+
+        let inside = root.join("some-ulid").join("work");
+        fs::create_dir_all(&inside).unwrap();
+        assert!(confine(&inside, &root).is_ok());
+    }
+
     #[test]
     fn collect_rejects_working_dir_outside_cache() {
         let cache = tempfile::tempdir().unwrap();
+        // ensure `<cache>/workspace-sync` exists so `confine`'s `root.canonicalize()`
+        // succeeds and the rejection below actually comes from the `starts_with`
+        // containment check, not a canonicalize failure on a missing root.
+        fs::create_dir_all(cache.path().join("workspace-sync")).unwrap();
         let other = tempfile::tempdir().unwrap();
         let outside = other.path().join("work");
         std::fs::create_dir_all(&outside).unwrap();
         let err = collect_from_dir(outside.to_str().unwrap(), cache.path());
-        assert!(err.is_err());
+        assert!(matches!(err, Err(HostConnectorError::Invalid(_))));
     }
 
     /// Simulates a launch failure after a real stage: `stage_to_dir` succeeds,
@@ -164,10 +233,14 @@ mod tests {
     #[test]
     fn discard_rejects_working_dir_outside_cache() {
         let cache = tempfile::tempdir().unwrap();
+        // same fix as `collect_rejects_working_dir_outside_cache`: the
+        // workspace-sync root must exist so the rejection is proven to come
+        // from the containment check rather than a canonicalize failure.
+        fs::create_dir_all(cache.path().join("workspace-sync")).unwrap();
         let other = tempfile::tempdir().unwrap();
         let outside = other.path().join("work");
         std::fs::create_dir_all(&outside).unwrap();
         let err = discard_from_dir(outside.to_str().unwrap(), cache.path());
-        assert!(err.is_err());
+        assert!(matches!(err, Err(HostConnectorError::Invalid(_))));
     }
 }
