@@ -141,6 +141,26 @@ pub trait HostConnector: Send + Sync {
     /// Cancel an in-flight run.
     async fn cancel_run(&self, run_id: &str) -> Result<(), HostConnectorError>;
 
+    /// Cooperatively pause an in-flight (`Pending`/`Running`) run, leaving it
+    /// non-terminal and resumable via [`resume_run`](Self::resume_run).
+    ///
+    /// Distinct from [`cancel_run`](Self::cancel_run) (terminal). The
+    /// default impl returns [`HostConnectorError::Unsupported`] so
+    /// transports that haven't wired pause reach (Bucket / Tunnel) compile
+    /// unchanged; Local / SSH / HttpCp override it.
+    async fn pause_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("pause".into()))
+    }
+
+    /// Resume a `Paused` run. Requires the full `cp serve` runtime (the
+    /// background resume worker that re-enters `run_workflow` lives there —
+    /// see `RunStore::list_pending_resume`); callers gate this on the host's
+    /// launcher being configured. The default impl returns
+    /// [`HostConnectorError::Unsupported`].
+    async fn resume_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+        Err(HostConnectorError::Unsupported("pause".into()))
+    }
+
     /// Open a live SSE byte stream of `events.jsonl` for the given run. Each
     /// `Ok(Bytes)` item is a `data: {json}\n\n` SSE frame. See Task 8 for
     /// host-aware observation built on top of this.

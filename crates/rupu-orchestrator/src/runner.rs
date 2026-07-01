@@ -645,6 +645,13 @@ pub async fn run_workflow(
                 record.active_step_kind = None;
                 record.active_step_agent = None;
                 record.active_step_transcript_path = None;
+                // Defensive: a completed run has no further use for a
+                // paused-step seed (there shouldn't be one, but a stale
+                // sidecar from an earlier pause/resume cycle must not
+                // leak into a future, unrelated pause).
+                if let Err(e) = store.clear_paused_seed(&record.id) {
+                    warn!(error = %e, "failed to clear paused-step seed on completion");
+                }
             }
             Ok(InnerOutcome::Paused {
                 step_id,
@@ -673,6 +680,16 @@ pub async fn run_workflow(
                 record.active_step_kind = None;
                 record.active_step_agent = None;
                 record.active_step_transcript_path = None;
+                // Persist the mid-step seed transcript (if any) so a resume
+                // in a fresh process (the CP-driven resume worker spawns a
+                // new `rupu workflow resume` subprocess) can reconstruct
+                // `ResumeState::paused_step` from disk. Empty for approval
+                // and step-boundary pauses — nothing to persist.
+                if *reason == PauseReason::Manual && !seed.is_empty() {
+                    if let Err(e) = store.write_paused_seed(&record.id, seed) {
+                        warn!(error = %e, "failed to persist paused-step seed");
+                    }
+                }
                 // Don't set finished_at — the run hasn't ended.
                 awaiting = Some(AwaitingInfo {
                     step_id: step_id.clone(),
@@ -691,6 +708,9 @@ pub async fn run_workflow(
                 record.active_step_kind = None;
                 record.active_step_agent = None;
                 record.active_step_transcript_path = None;
+                if let Err(e) = store.clear_paused_seed(&record.id) {
+                    warn!(error = %e, "failed to clear paused-step seed on failure");
+                }
             }
         }
         if let Err(persist_err) = store.update(record) {

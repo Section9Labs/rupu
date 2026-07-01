@@ -11,7 +11,7 @@ use axum::{
 };
 use futures_util::future::join_all;
 use rupu_orchestrator::{
-    runs::{CancelError, CancelOutcome},
+    runs::{CancelError, CancelOutcome, PauseError},
     ApprovalError, RunRecord, RunStatus, RunStoreError,
 };
 use std::sync::Arc;
@@ -27,6 +27,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id/approve", post(approve_run))
         .route("/api/runs/:id/reject", post(reject_run))
         .route("/api/runs/:id/cancel", post(cancel_run))
+        .route("/api/runs/:id/pause", post(pause_run))
+        .route("/api/runs/:id/resume", post(resume_run))
         .route("/api/runs/:id/archive", post(archive_run))
         .route("/api/runs/:id/restore", post(restore_run))
 }
@@ -211,6 +213,114 @@ async fn cancel_run(
         .run_store
         .cancel(&id, "web", &reason, now)
         .map_err(|e| map_cancel_err(&id, e))?;
+    let mut resp = run_response(&s, &id)?;
+    resp.0["host_id"] = serde_json::json!("local");
+    Ok(resp)
+}
+
+/// Map a [`rupu_orchestrator::runs::PauseError`] from `RunStore::pause` to
+/// an [`ApiError`]:
+/// - `NotFound` → 404
+/// - `AlreadyTerminal` / `NotRunning` → 409 (the run isn't in a state that
+///   can be cooperatively paused)
+/// - `Store` → 500
+fn map_pause_err(id: &str, e: PauseError) -> ApiError {
+    match e {
+        PauseError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        PauseError::AlreadyTerminal(_) | PauseError::NotRunning(_) => {
+            ApiError::conflict(format!("run {id} is not running"))
+        }
+        PauseError::Store(msg) => ApiError::internal(msg),
+    }
+}
+
+/// `POST /api/runs/:id/pause[?host=<id>]` — cooperatively pause an
+/// in-flight run.
+///
+/// Without `?host=` (or `?host=local`): a `Pending`/`Running` run is marked
+/// `Paused` (non-terminal — resumable via `/resume`). Any other status
+/// (already paused, awaiting approval, or terminal) yields 409.
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::pause_run`] and
+/// returns `{ "ok": true, "host_id": "<id>" }`.
+async fn pause_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        conn.pause_run(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::conflict(m),
+            HostConnectorError::Unsupported(m) => ApiError::not_available(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
+    }
+    // Local path: mirrors cancel_run's local branch — operate on the store
+    // directly rather than through the connector.
+    let now = chrono::Utc::now();
+    s.run_store
+        .pause(&id, now)
+        .map_err(|e| map_pause_err(&id, e))?;
+    let mut resp = run_response(&s, &id)?;
+    resp.0["host_id"] = serde_json::json!("local");
+    Ok(resp)
+}
+
+/// `POST /api/runs/:id/resume[?host=<id>]` — resume a `Paused` run.
+///
+/// **Launcher-gated** (501 on a read-only deploy): the actual re-entry into
+/// `run_workflow` happens in a background worker that only runs inside
+/// `rupu cp serve`, so a deploy with no `RunLauncher` configured has no way
+/// to ever consume the resume request — reporting success there would be a
+/// silent no-op.
+///
+/// Without `?host=` (or `?host=local`): a `Paused` run gets its
+/// `resume_requested_at` marker set (mirrors `approve`'s marker-only
+/// design) for the background worker to pick up and re-enter
+/// `run_workflow` with the persisted checkpoint (+ mid-step seed, when
+/// present). Any other status yields 409.
+///
+/// With `?host=<remote-id>`: proxies via [`HostConnector::resume_run`] and
+/// returns `{ "ok": true, "host_id": "<id>" }`.
+async fn resume_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    s.launcher
+        .as_ref()
+        .ok_or_else(|| ApiError::not_available("resuming a paused run requires `rupu cp serve`"))?;
+
+    let host = q.host.as_deref().unwrap_or("local");
+    if host != "local" {
+        let conn = resolve_host(&s, host)?;
+        conn.resume_run(&id).await.map_err(|e| match e {
+            HostConnectorError::NotFound(m) => ApiError::not_found(m),
+            HostConnectorError::Invalid(m) => ApiError::conflict(m),
+            HostConnectorError::Unsupported(m) => ApiError::not_available(m),
+            other => ApiError::internal(other.to_string()),
+        })?;
+        return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
+    }
+    // Local path.
+    let record = s.run_store.load(&id).map_err(|e| match e {
+        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        other => ApiError::internal(other.to_string()),
+    })?;
+    if record.status != RunStatus::Paused {
+        return Err(ApiError::conflict(format!(
+            "run {id} is `{}`, not `paused`",
+            record.status.as_str()
+        )));
+    }
+    let now = chrono::Utc::now();
+    s.run_store
+        .request_resume_approval(&id, "web", None, now)
+        .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id)?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
@@ -1073,6 +1183,173 @@ mod tests {
         )
         .await
         .expect_err("cancel on missing run should 404");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Never actually invoked in these tests — `resume_run`'s launcher gate
+    /// only checks `launcher.is_some()`. Mirrors `api/config.rs`'s
+    /// `DummyLauncher` / `api/workflows.rs`'s `MockLauncher`.
+    struct DummyLauncher;
+
+    #[async_trait::async_trait]
+    impl crate::launcher::RunLauncher for DummyLauncher {
+        async fn launch(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, crate::launcher::LaunchError> {
+            Ok("run_dummy".into())
+        }
+    }
+
+    /// A `test_state` with a launcher installed — marks the deployment as a
+    /// writable `cp serve` so launcher-gated endpoints (like `resume`) pass
+    /// the gate.
+    fn writable_state(tmp: &tempfile::TempDir) -> AppState {
+        test_state(tmp).with_launcher(Some(Arc::new(DummyLauncher)))
+    }
+
+    /// A `Running` run record, suitable as the target of a `pause` test.
+    fn running_record(id: &str) -> RunRecord {
+        let mut rec = awaiting_record(id, "gate");
+        rec.status = RunStatus::Running;
+        rec.awaiting_step_id = None;
+        rec.approval_prompt = None;
+        rec.awaiting_since = None;
+        rec
+    }
+
+    /// A `Paused` run record, suitable as the target of a `resume` test.
+    fn paused_record(id: &str, step_id: &str) -> RunRecord {
+        let mut rec = awaiting_record(id, step_id);
+        rec.status = RunStatus::Paused;
+        rec.approval_prompt = None;
+        rec
+    }
+
+    #[tokio::test]
+    async fn pause_running_local_run_sets_paused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(running_record("run_pause"), "name: x\n")
+            .unwrap();
+
+        let resp = pause_run(
+            State(s.clone()),
+            Path("run_pause".into()),
+            Query(RunControlQuery { host: None }),
+        )
+        .await
+        .expect("pause should succeed");
+        assert_eq!(resp.0["run"]["status"], serde_json::json!("paused"));
+        assert_eq!(resp.0["host_id"], "local");
+
+        let loaded = s.run_store.load("run_pause").unwrap();
+        assert_eq!(loaded.status, RunStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn pause_terminal_run_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        s.run_store
+            .create(terminal_record("run_pause_done"), "name: x\n")
+            .unwrap();
+
+        let err = pause_run(
+            State(s),
+            Path("run_pause_done".into()),
+            Query(RunControlQuery { host: None }),
+        )
+        .await
+        .expect_err("pausing a completed run should fail");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn resume_requires_launcher() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No launcher installed — read-only deploy.
+        let s = test_state(&tmp);
+        s.run_store
+            .create(paused_record("run_resume_nolauncher", "gate"), "name: x\n")
+            .unwrap();
+
+        let err = resume_run(
+            State(s),
+            Path("run_resume_nolauncher".into()),
+            Query(RunControlQuery { host: None }),
+        )
+        .await
+        .expect_err("resume without a launcher should be unavailable");
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn resume_non_paused_run_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = writable_state(&tmp);
+        s.run_store
+            .create(running_record("run_resume_running"), "name: x\n")
+            .unwrap();
+
+        let err = resume_run(
+            State(s),
+            Path("run_resume_running".into()),
+            Query(RunControlQuery { host: None }),
+        )
+        .await
+        .expect_err("resuming a running (non-paused) run should conflict");
+        assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn resume_paused_run_sets_marker_and_stays_paused() {
+        // With a launcher present, resuming a genuinely `Paused` run is
+        // marker-only (mirrors `approve`'s design) — the background worker
+        // (a separate process/tokio task, not exercised by this unit test)
+        // is what actually re-enters `run_workflow`. This test locks the
+        // marker-setting contract so a future regression doesn't silently
+        // turn `/resume` into a no-op.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = writable_state(&tmp);
+        s.run_store
+            .create(paused_record("run_resume_ok", "gate"), "name: x\n")
+            .unwrap();
+
+        let resp = resume_run(
+            State(s.clone()),
+            Path("run_resume_ok".into()),
+            Query(RunControlQuery { host: None }),
+        )
+        .await
+        .expect("resume should succeed");
+        assert_eq!(resp.0["run"]["status"], serde_json::json!("paused"));
+        assert_eq!(resp.0["host_id"], "local");
+
+        let loaded = s.run_store.load("run_resume_ok").unwrap();
+        assert_eq!(loaded.status, RunStatus::Paused);
+        assert!(loaded.resume_requested_at.is_some());
+        // A background worker's `list_pending_resume` (rupu-orchestrator) is
+        // what actually picks this up and spawns `rupu workflow resume` —
+        // exercised at the orchestrator layer (see
+        // `rupu-orchestrator/src/runs.rs`'s `list_pending_resume` tests) and
+        // end-to-end in a later task (T9); not re-driven here.
+        let pending = s.run_store.list_pending_resume(chrono::Utc::now()).unwrap();
+        assert!(pending.iter().any(|r| r.id == "run_resume_ok"));
+    }
+
+    #[tokio::test]
+    async fn resume_unknown_run_is_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = writable_state(&tmp);
+        let err = resume_run(
+            State(s),
+            Path("ghost".into()),
+            Query(RunControlQuery { host: None }),
+        )
+        .await
+        .expect_err("resume on missing run should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 

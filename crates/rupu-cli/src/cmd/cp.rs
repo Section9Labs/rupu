@@ -349,20 +349,31 @@ async fn run_resume_worker(
             }
             tracing::info!(run_id = %run.id, worker_id = %worker_id, "resume worker: claimed run");
 
-            // Spawn the approve subprocess off-thread so claiming the next
+            // Spawn the resuming subprocess off-thread so claiming the next
             // run doesn't block on process creation. Move owned data in.
+            // Which subcommand to spawn depends on the run's CURRENT status
+            // (captured from `list_pending_resume`, still fresh — the claim
+            // lease above prevents a concurrent worker from racing it):
+            // `AwaitingApproval` → `workflow approve` (approval-gate resume,
+            // unchanged); `Paused` → `workflow resume` (cooperative-pause
+            // resume, T4 — that command now also accepts `Paused` and reads
+            // the persisted mid-step seed via `RunStore::read_paused_seed`).
+            let subcommand = match run.status {
+                rupu_orchestrator::RunStatus::Paused => "resume",
+                _ => "approve",
+            };
             let store = Arc::clone(&store);
             let run_id = run.id.clone();
             tokio::spawn(async move {
                 let now2 = chrono::Utc::now();
                 // Capture the requested resume mode while the marker is still
                 // present, then hand the run off to a detached
-                // `rupu workflow approve <run_id> [--mode <m>]` child. The
-                // child does `store.approve` + the in-process resume in ITS
-                // OWN process, so the resumed run is independently killable
-                // (Cancel) and a resume crash can't take down `cp serve`.
-                // The web marker leaves the run AwaitingApproval, so the
-                // child's `store.approve` precondition holds.
+                // `rupu workflow <subcommand> <run_id> [--mode <m>]` child.
+                // The child does `store.approve`/the checkpoint-resume flip +
+                // the in-process resume in ITS OWN process, so the resumed
+                // run is independently killable (Cancel) and a resume crash
+                // can't take down `cp serve`. The web marker leaves the run
+                // AwaitingApproval/Paused, so the child's precondition holds.
                 let mode = store.load(&run_id).ok().and_then(|r| r.resume_mode.clone());
 
                 let exe = match std::env::current_exe() {
@@ -376,7 +387,7 @@ async fn run_resume_worker(
                     }
                 };
 
-                let mut argv: Vec<&str> = vec!["workflow", "approve", &run_id];
+                let mut argv: Vec<&str> = vec!["workflow", subcommand, &run_id];
                 if let Some(m) = mode.as_deref() {
                     argv.push("--mode");
                     argv.push(m);
@@ -386,7 +397,7 @@ async fn run_resume_worker(
                     Ok(_child) => {
                         // Detached: do NOT wait. The child now owns the run;
                         // clear the marker so we don't re-claim it.
-                        tracing::info!(run_id = %run_id, "spawned workflow-approve subprocess to resume");
+                        tracing::info!(run_id = %run_id, subcommand, "spawned workflow subprocess to resume");
                         if let Err(ce) = store.clear_resume(&run_id, now2) {
                             tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
                         } else {
@@ -395,7 +406,7 @@ async fn run_resume_worker(
                     }
                     Err(e) => {
                         // Don't retry a poisoned spawn forever; clear marker.
-                        tracing::error!(run_id = %run_id, error = %e, "resume worker: spawn workflow-approve failed; clearing marker");
+                        tracing::error!(run_id = %run_id, subcommand, error = %e, "resume worker: spawn workflow subprocess failed; clearing marker");
                         if let Err(ce) = store.clear_resume(&run_id, now2) {
                             tracing::warn!(run_id = %run_id, error = %ce, "resume worker: clear_resume failed");
                         }

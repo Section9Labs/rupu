@@ -2081,12 +2081,20 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resume a terminal (`failed` / `cancelled` / `rejected`) run,
-/// re-running only the agent runs that didn't already succeed.
-/// Completed steps are skipped wholesale (their `step_results.jsonl`
-/// rows are replayed into context); a partially-completed fan-out
-/// step re-runs but its already-succeeded units are replayed from the
-/// `unit_checkpoints.jsonl` instead of re-dispatched.
+/// Resume a terminal (`failed` / `cancelled` / `rejected`) run, or a
+/// cooperatively-`paused` one, re-running only the agent runs that didn't
+/// already succeed. Completed steps are skipped wholesale (their
+/// `step_results.jsonl` rows are replayed into context); a
+/// partially-completed fan-out step re-runs but its already-succeeded units
+/// are replayed from the `unit_checkpoints.jsonl` instead of re-dispatched.
+///
+/// A `Paused` run additionally carries a persisted mid-step seed transcript
+/// (`RunStore::read_paused_seed`) when the pause landed inside a linear
+/// step's agent turn (see `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md`
+/// Task 4) — when present it seeds `ResumeState::paused_step` so the exact
+/// paused step re-runs from where the agent left off instead of from
+/// scratch. A step-boundary pause (no seed) just replays like a terminal
+/// resume.
 async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
@@ -2103,6 +2111,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
     // Guard: don't double-run an in-flight run, and don't re-run a
     // run that already completed.
     use rupu_orchestrator::RunStatus;
+    let original_status = record.status;
     match record.status {
         RunStatus::Running | RunStatus::Pending => {
             anyhow::bail!(
@@ -2118,18 +2127,9 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
                 "run {run_id} is awaiting approval — use `rupu workflow approve {run_id}` (or `reject`) instead of `resume`"
             );
         }
-        RunStatus::Paused => {
-            // This command replays from `step_results.jsonl` checkpoints —
-            // correct for a terminal failure state, but not for a
-            // cooperative mid-step pause (that resume path lands in a
-            // follow-up; see docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md).
-            anyhow::bail!(
-                "run {run_id} is paused, not failed — `rupu workflow resume` replays from a \
-                 terminal-failure checkpoint and cannot yet resume a cooperative pause"
-            );
-        }
-        // Resume applies to terminal failure states.
-        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => {}
+        // Resume applies to terminal failure states AND a cooperatively
+        // paused run (non-terminal, but equally "not currently running").
+        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled | RunStatus::Paused => {}
     }
 
     // Rebuild context from disk: workflow YAML snapshot + prior step
@@ -2250,14 +2250,42 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
         openai_compatible,
     });
 
+    // A cooperatively-paused run may carry a persisted mid-step seed
+    // transcript (written by `run_workflow` when a linear step's agent
+    // paused mid-turn — see `RunStore::write_paused_seed`). Read + clear it
+    // now, before the resumed run potentially pauses again and writes a
+    // fresh one. `None`/empty for a step-boundary pause or a terminal
+    // (Failed/Rejected/Cancelled) resume — those replay from
+    // `step_results.jsonl` alone, same as today.
+    let (reason, paused_step) = if original_status == RunStatus::Paused {
+        let seed = store.read_paused_seed(run_id).unwrap_or_default();
+        if let Err(e) = store.clear_paused_seed(run_id) {
+            tracing::warn!(run_id, error = %e, "failed to clear persisted paused-step seed");
+        }
+        let paused_step = if seed.is_empty() {
+            None
+        } else {
+            record
+                .awaiting_step_id
+                .clone()
+                .map(|step_id| rupu_orchestrator::PausedStep {
+                    step_id,
+                    seed_messages: seed,
+                })
+        };
+        (rupu_orchestrator::PauseReason::Manual, paused_step)
+    } else {
+        (rupu_orchestrator::PauseReason::Approval, None)
+    };
+
     let already_done_steps: Vec<String> = done_step_ids.iter().cloned().collect();
     let resume = rupu_orchestrator::ResumeState {
         run_id: run_id.to_string(),
         prior_step_results,
         approved_step_id: String::new(),
         completed_units,
-        reason: rupu_orchestrator::PauseReason::Approval,
-        paused_step: None,
+        reason,
+        paused_step,
     };
 
     let event_sink_for_resume = {
