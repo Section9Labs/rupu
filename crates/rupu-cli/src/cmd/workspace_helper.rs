@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::Subcommand;
 
-use rupu_cp::host::workspace_stage::{collect_from_dir, stage_to_dir};
+use rupu_cp::host::workspace_stage::{collect_from_dir, discard_from_dir, stage_to_dir};
 
 #[derive(Subcommand, Debug)]
 pub enum WorkspaceHelperAction {
@@ -17,6 +17,8 @@ pub enum WorkspaceHelperAction {
     Stage,
     /// Collect the change-delta from a staged working dir; write it to stdout.
     Collect { working_dir: String },
+    /// Best-effort discard of a staged working dir's scratch (no stdout).
+    Discard { working_dir: String },
 }
 
 pub async fn handle(action: WorkspaceHelperAction) -> ExitCode {
@@ -40,6 +42,9 @@ fn handle_inner(action: WorkspaceHelperAction) -> anyhow::Result<()> {
             std::io::stdout().write_all(&delta)?;
             std::io::stdout().flush()?;
         }
+        WorkspaceHelperAction::Discard { working_dir } => {
+            discard_bytes(&working_dir, &cache_root)?;
+        }
     }
     Ok(())
 }
@@ -50,6 +55,10 @@ fn stage_bytes(stdin: &[u8], cache_root: &Path) -> anyhow::Result<String> {
 
 fn collect_bytes(working_dir: &str, cache_root: &Path) -> anyhow::Result<Vec<u8>> {
     collect_from_dir(working_dir, cache_root).map_err(|e| anyhow::anyhow!(e.to_string()))
+}
+
+fn discard_bytes(working_dir: &str, cache_root: &Path) -> anyhow::Result<()> {
+    discard_from_dir(working_dir, cache_root).map_err(|e| anyhow::anyhow!(e.to_string()))
 }
 
 /// The rupu global/cache dir — the SAME base the Local transport stages under
@@ -83,5 +92,26 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let huge = vec![0u8; rupu_cp::host::connector::MAX_WORKSPACE_BYTES + 1];
         assert!(stage_bytes(&huge, cache.path()).is_err());
+    }
+
+    /// `stage` then `discard` (the remote-cleanup action, T4) removes the
+    /// scratch dir entirely — mirrors the stage-then-collect round trip but
+    /// exercises the discard action added for the dispatcher cleanup paths.
+    #[test]
+    fn helper_stage_then_discard_removes_scratch() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "orig").unwrap();
+        let payload = rupu_workspace::pack(ws.path()).unwrap();
+        let encoded = rupu_cp::host::connector::encode_payload(&payload);
+
+        let cache = tempfile::tempdir().unwrap();
+        let work = stage_bytes(&encoded, cache.path()).unwrap();
+        let base = std::path::Path::new(&work).parent().unwrap().to_path_buf();
+        assert!(base.exists());
+
+        discard_bytes(&work, cache.path()).unwrap();
+
+        assert!(!base.exists(), "scratch base dir must be removed");
+        assert!(!std::path::Path::new(&work).exists());
     }
 }

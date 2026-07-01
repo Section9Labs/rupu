@@ -58,10 +58,7 @@ pub fn collect_from_dir(
 /// failure, poll timeout) so `collect_from_dir` never ran and the scratch
 /// would otherwise leak forever. `working_dir` is confined under
 /// `<cache_root>/workspace-sync`, same as [`collect_from_dir`].
-pub(crate) fn discard_from_dir(
-    working_dir: &str,
-    cache_root: &Path,
-) -> Result<(), HostConnectorError> {
+pub fn discard_from_dir(working_dir: &str, cache_root: &Path) -> Result<(), HostConnectorError> {
     let sync_root = cache_root.join("workspace-sync");
     let work = confine(Path::new(working_dir), &sync_root)?;
     let base = work

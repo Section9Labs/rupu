@@ -20,7 +20,7 @@ use crate::{
     host::connector::{
         mirror_get_run, mirror_list_runs, mirror_stream_run_events, read_transcript_file,
         EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
-        RunListQuery,
+        RunListQuery, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     node::{
@@ -299,6 +299,19 @@ const PUMP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2
 /// `#[serde(rename_all = "snake_case")]` wire form.
 fn is_terminal_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "rejected" | "cancelled")
+}
+
+/// Map a [`RemoteExecError`] from `run_bytes` to the corresponding
+/// [`HostConnectorError`]: a spawn/connection failure (ssh binary missing,
+/// no route to host, etc.) is `Unreachable`; a nonzero exit from the remote
+/// `rupu __workspace` helper is `Remote(code, stderr)`.
+fn map_remote_err(e: RemoteExecError) -> HostConnectorError {
+    match e {
+        RemoteExecError::Spawn(m) => HostConnectorError::Unreachable(m),
+        RemoteExecError::NonZero { code, stderr } => {
+            HostConnectorError::Remote(code.unwrap_or(-1) as u16, stderr)
+        }
+    }
 }
 
 // ── SshHostConnector ──────────────────────────────────────────────────────────
@@ -735,35 +748,73 @@ impl HostConnector for SshHostConnector {
         ))
     }
 
-    // ── Workspace sync (DEFERRED) ─────────────────────────────────────────────
+    // ── Workspace sync ─────────────────────────────────────────────────────────
     //
-    // A correct SSH staging impl ships the wire-encoded payload to the host and
-    // runs the codec via the *remote* `rupu` binary (the host needs no git/tar
-    // of its own — the codec lives in the binary). That requires a hidden
-    // remote helper subcommand (`rupu __workspace stage|collect`) which is a
-    // cross-crate change to rupu-cli's dispatcher; it is intentionally deferred
-    // to a follow-up rather than shipped as a silent self-contained fallback.
-    // Until then SSH hosts explicitly report the capability as unsupported, so
-    // a workspace-sync fan-out to an SSH host fails loudly instead of silently
-    // dropping the unit's changes. Local and HttpCp transports are fully wired.
-    async fn stage_workspace(&self, _payload: Vec<u8>) -> Result<String, HostConnectorError> {
-        tracing::warn!(
-            host = %self.host_id,
-            "workspace sync over SSH is not yet implemented (deferred); \
-             returning Unsupported"
-        );
-        Err(HostConnectorError::Unsupported(
-            "workspace sync over ssh (deferred)".into(),
-        ))
+    // The wire-encoded payload/delta are shipped as raw stdin/stdout bytes to
+    // the remote `rupu __workspace` helper via `RemoteExec::run_bytes`, which
+    // runs the codec via the *remote* `rupu` binary — the host needs no
+    // git/tar of its own, and the bytes never pass through a lossy UTF-8
+    // decode. Only the single trailing "working dir" line printed by `stage`
+    // is text, so it alone goes through `from_utf8_lossy`.
+    async fn stage_workspace(&self, payload: Vec<u8>) -> Result<String, HostConnectorError> {
+        if payload.len() > MAX_WORKSPACE_BYTES {
+            return Err(HostConnectorError::Invalid(format!(
+                "workspace payload {} bytes exceeds limit {MAX_WORKSPACE_BYTES}",
+                payload.len()
+            )));
+        }
+        let cmd = build_remote_command(&["rupu".into(), "__workspace".into(), "stage".into()]);
+        let out = self
+            .exec
+            .run_bytes(&cmd, Some(payload))
+            .await
+            .map_err(map_remote_err)?;
+        let line = String::from_utf8_lossy(&out);
+        let dir = line.trim();
+        if dir.is_empty() {
+            return Err(HostConnectorError::Invalid(
+                "remote stage returned no working dir".into(),
+            ));
+        }
+        Ok(dir.to_string())
     }
 
     async fn collect_workspace_delta(
         &self,
-        _working_dir: &str,
+        working_dir: &str,
     ) -> Result<Vec<u8>, HostConnectorError> {
-        Err(HostConnectorError::Unsupported(
-            "workspace sync over ssh (deferred)".into(),
-        ))
+        let cmd = build_remote_command(&[
+            "rupu".into(),
+            "__workspace".into(),
+            "collect".into(),
+            working_dir.to_string(),
+        ]);
+        let bytes = self
+            .exec
+            .run_bytes(&cmd, None)
+            .await
+            .map_err(map_remote_err)?;
+        if bytes.len() > MAX_WORKSPACE_BYTES {
+            return Err(HostConnectorError::Invalid(format!(
+                "workspace delta {} bytes exceeds limit {MAX_WORKSPACE_BYTES}",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+
+    async fn discard_workspace(&self, working_dir: &str) -> Result<(), HostConnectorError> {
+        let cmd = build_remote_command(&[
+            "rupu".into(),
+            "__workspace".into(),
+            "discard".into(),
+            working_dir.to_string(),
+        ]);
+        self.exec
+            .run_bytes(&cmd, None)
+            .await
+            .map_err(map_remote_err)?;
+        Ok(())
     }
 }
 
@@ -1191,5 +1242,123 @@ mod tests {
             contents.contains(event_json),
             "expected event line in events.jsonl, got: {contents:?}"
         );
+    }
+
+    // ── Workspace sync (stage/collect/discard) tests ─────────────────────────
+
+    #[tokio::test]
+    async fn ssh_stage_returns_working_dir_line() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(
+            b"/cache/workspace-sync/x/work\n".to_vec(),
+        ));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let dir = conn.stage_workspace(b"PAYLOAD".to_vec()).await.unwrap();
+        assert_eq!(dir, "/cache/workspace-sync/x/work");
+
+        let (cmd, stdin) = fake.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert!(cmd.contains("__workspace") && cmd.contains("stage"));
+        assert_eq!(stdin.as_deref(), Some(&b"PAYLOAD"[..]));
+    }
+
+    #[tokio::test]
+    async fn ssh_stage_nonzero_maps_to_remote_error() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(1),
+            stderr: "helper failed".into(),
+        }));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn.stage_workspace(b"x".to_vec()).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Remote(1, _)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn ssh_stage_spawn_failure_maps_to_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::Spawn(
+            "no route".into(),
+        )));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn.stage_workspace(b"x".to_vec()).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn ssh_stage_oversize_payload_rejected() {
+        // No run_bytes call is expected to reach the exec — the size guard
+        // must reject before spawning ssh — but script an Ok anyway so a
+        // regression that skips the guard fails loudly on the assertion
+        // below rather than panicking on an un-scripted FakeExec.
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(Vec::new()));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let huge = vec![0u8; MAX_WORKSPACE_BYTES + 1];
+        let err = conn.stage_workspace(huge).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+        assert!(
+            fake.last_bytes_call.lock().unwrap().is_none(),
+            "oversize payload must be rejected before touching run_bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_collect_returns_delta_bytes() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(b"DELTA-BYTES".to_vec()));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let bytes = conn
+            .collect_workspace_delta("/cache/workspace-sync/x/work")
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"DELTA-BYTES");
+
+        let (cmd, stdin) = fake.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert!(cmd.contains("__workspace") && cmd.contains("collect"));
+        assert!(stdin.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_collect_oversize_rejected() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(vec![0u8; MAX_WORKSPACE_BYTES + 1]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn
+            .collect_workspace_delta("/cache/workspace-sync/x/work")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn ssh_discard_issues_remote_discard_command() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(Vec::new()));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        conn.discard_workspace("/cache/workspace-sync/x/work")
+            .await
+            .unwrap();
+
+        let (cmd, stdin) = fake.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert!(cmd.contains("__workspace") && cmd.contains("discard"));
+        assert!(stdin.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_discard_maps_remote_failure() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(3),
+            stderr: "already gone".into(),
+        }));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        // discard_workspace itself still surfaces a mapped error — the
+        // dispatcher (not this connector) is what treats it as best-effort by
+        // ignoring the `Result`.
+        let err = conn
+            .discard_workspace("/cache/workspace-sync/x/work")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Remote(3, _)), "{err:?}");
     }
 }
