@@ -69,10 +69,25 @@ async fn stage_workspace(
     State(s): State<AppState>,
     body: Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Configurable cap at the HTTP boundary: `[cp].max_workspace_bytes` if the
+    // operator set one, else the compiled default. The route's
+    // `DefaultBodyLimit` still caps the body at the compiled
+    // `MAX_WORKSPACE_BYTES` before we get here; this guard lets an operator
+    // tighten (or, since it's read from the resolved config, apply) a
+    // narrower limit without recompiling.
+    let limit = crate::config_write::effective_max_workspace_bytes(
+        &s.config.read().map(|c| c.cp.clone()).unwrap_or_default(),
+    );
+    if body.len() > limit {
+        return Err(ApiError::bad_request(format!(
+            "workspace payload {} bytes exceeds limit {limit}",
+            body.len()
+        )));
+    }
     // Delegate to the shared staging core (identical to the in-process local
     // connector): size-guard + decode + stage under `<global_dir>/workspace-sync`
-    // + write the baseline sidecar. The route's `DefaultBodyLimit` still caps
-    // the body at `MAX_WORKSPACE_BYTES` before we get here.
+    // + write the baseline sidecar. `stage_to_dir` also enforces the compiled
+    // `MAX_WORKSPACE_BYTES` const as a backstop.
     let work = stage_to_dir(&body, &s.global_dir).map_err(to_api_err)?;
     Ok(Json(serde_json::json!({ "working_dir": work })))
 }

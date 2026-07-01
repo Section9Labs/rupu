@@ -1,6 +1,6 @@
 use rupu_orchestrator::runs::RunStore;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -11,6 +11,9 @@ pub struct AppState {
     pub workspace_dir: PathBuf,
     pub run_store: Arc<RunStore>,
     pub pricing: rupu_config::PricingConfig,
+    /// The resolved global config snapshot, reloaded after a config write so
+    /// newly-started runs see updated values. Read via `config.read()`.
+    pub config: Arc<RwLock<rupu_config::Config>>,
     /// Optional run-launcher port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess-spawning adapter via [`AppState::with_launcher`].
     pub launcher: Option<Arc<dyn crate::launcher::RunLauncher>>,
@@ -77,11 +80,14 @@ impl AppState {
             ),
         );
 
+        let config = Arc::new(RwLock::new(Self::resolve_global_config(&global_dir)));
+
         Self {
             global_dir,
             workspace_dir,
             run_store,
             pricing,
+            config,
             launcher: None,
             session_sender: None,
             repos: None,
@@ -168,5 +174,32 @@ impl AppState {
     pub fn with_workspace_dir(mut self, p: PathBuf) -> Self {
         self.workspace_dir = p;
         self
+    }
+
+    /// Resolve the global config from `<global_dir>/config.toml` (no project
+    /// layer — the CP is a global-scope process). Falls back to
+    /// `Config::default()` if the file is absent, unparseable, or invalid, so
+    /// a broken config never blocks CP startup — it just serves defaults
+    /// until fixed.
+    fn resolve_global_config(global_dir: &std::path::Path) -> rupu_config::Config {
+        let path = global_dir.join("config.toml");
+        match rupu_config::resolve(Some(&path), None, &std::collections::BTreeMap::new()) {
+            Ok(r) => r.config,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to resolve global config; using defaults");
+                rupu_config::Config::default()
+            }
+        }
+    }
+
+    /// Re-resolve the global config from disk and swap it into the snapshot.
+    /// Called after a successful global-config write so already-running
+    /// handlers (and newly-started runs) observe the update without a
+    /// process restart.
+    pub fn reload_config(&self) {
+        let resolved = Self::resolve_global_config(&self.global_dir);
+        if let Ok(mut w) = self.config.write() {
+            *w = resolved;
+        }
     }
 }

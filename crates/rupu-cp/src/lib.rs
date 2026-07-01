@@ -4,6 +4,7 @@
 
 pub mod agent_launcher;
 pub mod api;
+pub mod config_write;
 pub mod definition_generator;
 pub mod embed;
 pub mod error;
