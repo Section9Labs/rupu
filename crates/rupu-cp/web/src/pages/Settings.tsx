@@ -659,6 +659,7 @@ export default function Settings() {
   const [pendingPatch, setPendingPatch] = useState<Record<string, unknown>>({});
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveInfo, setSaveInfo] = useState<string | null>(null);
   const [readOnly, setReadOnly] = useState(false);
   const [lockList, setLockList] = useState<string[]>([]);
   const [lockError, setLockError] = useState<string | null>(null);
@@ -688,7 +689,25 @@ export default function Settings() {
   }
 
   function handleFieldChange(key: string, value: unknown) {
-    setPendingPatch((prev) => ({ ...prev, [key]: value }));
+    // Clearing a field (select "—" / emptying a text or number input) yields
+    // `undefined`. The write path (`PUT /api/config/global`) has no way to
+    // UNSET a key in v1 — sending `null` 400s server-side, and
+    // `JSON.stringify` silently drops `undefined`-valued keys, which would
+    // otherwise produce an empty (or partial) patch that "succeeds" as a
+    // silent no-op. So an `undefined` transition is never staged as an edit;
+    // drop the key from the pending patch instead, which reverts the field's
+    // displayed value back to its current resolved value (see `fieldValue`).
+    // Unsetting a key is only possible via the Raw TOML tab.
+    setSaveInfo(null);
+    setPendingPatch((prev) => {
+      if (value === undefined) {
+        if (!(key in prev)) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return { ...prev, [key]: value };
+    });
   }
 
   async function handleToggleLock(key: string) {
@@ -707,11 +726,25 @@ export default function Settings() {
 
   async function handleSave() {
     if (Object.keys(pendingPatch).length === 0) return;
+    // Defensive: `handleFieldChange` already keeps `undefined`-valued entries
+    // out of `pendingPatch`, but never send one to the wire even if that
+    // invariant is somehow violated — `JSON.stringify` drops `undefined`
+    // keys, which would otherwise turn into a silently-successful no-op patch.
+    const effectivePatch = Object.fromEntries(
+      Object.entries(pendingPatch).filter(([, v]) => v !== undefined),
+    );
+    if (Object.keys(effectivePatch).length === 0) {
+      setSaveError(null);
+      setSaveInfo('No changes to save.');
+      setPendingPatch({});
+      return;
+    }
     setSaving(true);
     setSaveError(null);
+    setSaveInfo(null);
     setReadOnly(false);
     try {
-      await api.putGlobalConfig({ patch: pendingPatch });
+      await api.putGlobalConfig({ patch: effectivePatch });
       setPendingPatch({});
       await reload();
     } catch (e: unknown) {
@@ -775,6 +808,11 @@ export default function Settings() {
       {saveError && (
         <div role="alert" className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
           {saveError}
+        </div>
+      )}
+      {saveInfo && (
+        <div className="rounded-lg border border-border bg-surface px-4 py-3 text-sm text-ink-dim">
+          {saveInfo}
         </div>
       )}
       {lockError && (

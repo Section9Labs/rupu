@@ -172,6 +172,46 @@ describe('Settings page', () => {
     });
   });
 
+  it('clearing a field never produces a silent no-op save', async () => {
+    // Regression test for the "silent no-op" bug: clearing a text/select
+    // field called onChange(key, undefined); pendingPatch stored the
+    // `undefined`, Save looked "dirty", and `JSON.stringify` silently
+    // dropped the undefined-valued key — so the PUT sent an empty (or
+    // partial) patch, the backend no-op'd it, and the UI reported success
+    // with nothing actually changed. A cleared field must never register as
+    // an unsaved change, and Save must never call putGlobalConfig with an
+    // empty effective patch.
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+    const putSpy = vi.spyOn(api, 'putGlobalConfig').mockResolvedValue({ ok: true, restart_required: [] });
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    const modelInput = (await screen.findByLabelText('Default model')) as HTMLInputElement;
+    expect(modelInput.value).toBe('claude-sonnet-4-6');
+
+    // Clear the field — the change handler receives `undefined`.
+    fireEvent.change(modelInput, { target: { value: '' } });
+
+    // Must NOT register as a pending edit.
+    expect(screen.queryByText(/unsaved change/i)).not.toBeInTheDocument();
+    // The displayed value reverts to the still-resolved value, not blank.
+    expect(modelInput.value).toBe('claude-sonnet-4-6');
+
+    const saveButton = screen.getByRole('button', { name: /save changes/i }) as HTMLButtonElement;
+    expect(saveButton.disabled).toBe(true);
+
+    fireEvent.click(saveButton);
+    await Promise.resolve();
+
+    // No silent success: the backend patch endpoint is never invoked with
+    // an empty/no-op patch.
+    expect(putSpy).not.toHaveBeenCalled();
+  });
+
   it('surfaces a 400 validation error inline', async () => {
     vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
     vi.spyOn(api, 'putGlobalConfig').mockRejectedValue(
