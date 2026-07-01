@@ -6983,14 +6983,15 @@ fn summarize_transcript_path(
                 out.usage.input_tokens += u64::from(input_tokens);
                 out.usage.output_tokens += u64::from(output_tokens);
                 out.usage.cached_tokens += u64::from(cached_tokens);
-                let cost = rupu_config::pricing::lookup(pricing, &provider, &model, &transcript_agent)
-                    .map(|price| {
-                        price.cost_usd(
-                            u64::from(input_tokens),
-                            u64::from(output_tokens),
-                            u64::from(cached_tokens),
-                        )
-                    });
+                let cost =
+                    rupu_config::pricing::lookup(pricing, &provider, &model, &transcript_agent)
+                        .map(|price| {
+                            price.cost_usd(
+                                u64::from(input_tokens),
+                                u64::from(output_tokens),
+                                u64::from(cached_tokens),
+                            )
+                        });
                 out.usage.cost.add(cost);
             }
             _ => {}
@@ -9931,7 +9932,7 @@ pub(crate) fn reconcile_claim_from_last_run(
                 .or_else(|| Some(run.status.as_str().to_string()));
             claim.updated_at = chrono::Utc::now().to_rfc3339();
         }
-        RunStatus::Pending | RunStatus::Running => {}
+        RunStatus::Pending | RunStatus::Running | RunStatus::Paused => {}
     }
     Ok(())
 }
@@ -9960,7 +9961,7 @@ fn apply_terminal_run_to_claim(
             claim.updated_at = chrono::Utc::now().to_rfc3339();
             return Ok(());
         }
-        RunStatus::Pending | RunStatus::Running => {
+        RunStatus::Pending | RunStatus::Running | RunStatus::Paused => {
             claim.status = ClaimStatus::Running;
             claim.updated_at = chrono::Utc::now().to_rfc3339();
             return Ok(());
@@ -13163,10 +13164,10 @@ steps:
                     active_step_kind: None,
                     active_step_agent: None,
                     resume_requested_at: None,
-            resume_claimed_at: None,
-            resume_claimed_by: None,
-            resume_mode: None,
-            active_step_transcript_path: None,
+                    resume_claimed_at: None,
+                    resume_claimed_by: None,
+                    resume_mode: None,
+                    active_step_transcript_path: None,
                     final_output: None,
                 },
                 "name: controller\nsteps: []\n",
@@ -13306,10 +13307,10 @@ steps:
                     active_step_kind: None,
                     active_step_agent: None,
                     resume_requested_at: None,
-            resume_claimed_at: None,
-            resume_claimed_by: None,
-            resume_mode: None,
-            active_step_transcript_path: None,
+                    resume_claimed_at: None,
+                    resume_claimed_by: None,
+                    resume_mode: None,
+                    active_step_transcript_path: None,
                     final_output: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",
@@ -13474,10 +13475,10 @@ steps:
                     active_step_kind: None,
                     active_step_agent: None,
                     resume_requested_at: None,
-            resume_claimed_at: None,
-            resume_claimed_by: None,
-            resume_mode: None,
-            active_step_transcript_path: None,
+                    resume_claimed_at: None,
+                    resume_claimed_by: None,
+                    resume_mode: None,
+                    active_step_transcript_path: None,
                     final_output: None,
                 },
                 "name: issue-supervisor-dispatch\nsteps: []\n",

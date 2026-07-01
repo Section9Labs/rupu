@@ -21,4 +21,14 @@ pub enum ExecutorError {
 
     #[error("internal executor error: {0}")]
     Internal(String),
+
+    /// The requested operation is not implementable in this executor
+    /// context. Used by [`crate::executor::WorkflowExecutor::resume`]
+    /// on `InProcessExecutor`: resuming needs the original
+    /// `StepFactory` the run was started with, which isn't retained
+    /// past `start()` returning. A launcher-gated caller (e.g. `rupu
+    /// workflow resume` / the CP resume worker) re-enters
+    /// `run_workflow` directly with a freshly built factory instead.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }

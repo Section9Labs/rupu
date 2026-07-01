@@ -365,6 +365,26 @@ impl LiveRunState {
                 self.status = RunStatus::Failed;
                 self.finished_at = Some(*finished_at);
             }
+            WfEvent::RunPaused { .. } => {
+                self.status = RunStatus::Paused;
+            }
+            WfEvent::RunResumed { .. } => {
+                self.status = RunStatus::Running;
+            }
+            WfEvent::StepPaused { step_id, .. } => {
+                // No dedicated `NodeStatus::Paused` glyph yet (tracked for
+                // the CP web Paused-node work); reuse `Awaiting`'s pause
+                // glyph (`⏸`, see `node_glyph`) as the closest visual match
+                // until that lands.
+                if let Some(step) = self.step_mut(step_id) {
+                    step.status = NodeStatus::Awaiting;
+                }
+            }
+            WfEvent::StepResumed { step_id, .. } => {
+                if let Some(step) = self.step_mut(step_id) {
+                    step.status = NodeStatus::Working;
+                }
+            }
             // PanelRound drives the web Control Plane's live round
             // counter; the CLI live view does not render it, so no
             // per-step state change is needed here.
@@ -475,6 +495,7 @@ impl LiveRunState {
             RunStatus::Rejected => ("rejected", FAILED),
             RunStatus::Cancelled => ("cancelled", FAILED),
             RunStatus::Pending => ("pending", DIM),
+            RunStatus::Paused => ("paused", palette::AWAITING),
         }
     }
 }

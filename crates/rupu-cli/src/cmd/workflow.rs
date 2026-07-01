@@ -2118,6 +2118,16 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
                 "run {run_id} is awaiting approval — use `rupu workflow approve {run_id}` (or `reject`) instead of `resume`"
             );
         }
+        RunStatus::Paused => {
+            // This command replays from `step_results.jsonl` checkpoints —
+            // correct for a terminal failure state, but not for a
+            // cooperative mid-step pause (that resume path lands in a
+            // follow-up; see docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md).
+            anyhow::bail!(
+                "run {run_id} is paused, not failed — `rupu workflow resume` replays from a \
+                 terminal-failure checkpoint and cannot yet resume a cooperative pause"
+            );
+        }
         // Resume applies to terminal failure states.
         RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => {}
     }
@@ -3226,6 +3236,7 @@ fn run_result_status(status: rupu_orchestrator::RunStatus) -> RunResultStatus {
         | rupu_orchestrator::RunStatus::Cancelled => RunResultStatus::Failed,
         rupu_orchestrator::RunStatus::Pending
         | rupu_orchestrator::RunStatus::Running
+        | rupu_orchestrator::RunStatus::Paused
         | rupu_orchestrator::RunStatus::Completed => RunResultStatus::Completed,
     }
 }

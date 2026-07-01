@@ -48,6 +48,10 @@ use thiserror::Error;
 /// - `Pending`/`Running` → `Cancelled` on `rupu workflow cancel` (or
 ///   the web/CP cancel control): a deliberate operator stop, distinct
 ///   from `Failed` (a run that errored on its own).
+/// - `Running` → `Paused` on an operator-requested pause (distinct
+///   from `Cancelled`: a paused run is expected to `resume` later
+///   from its checkpoint rather than being abandoned). `Paused` is
+///   **not** terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -59,6 +63,7 @@ pub enum RunStatus {
     AwaitingApproval,
     Rejected,
     Cancelled,
+    Paused,
 }
 
 impl RunStatus {
@@ -71,11 +76,14 @@ impl RunStatus {
             Self::AwaitingApproval => "awaiting_approval",
             Self::Rejected => "rejected",
             Self::Cancelled => "cancelled",
+            Self::Paused => "paused",
         }
     }
 
     /// True when no further state transitions are expected. Used by
     /// `rupu workflow runs` to bucket terminal vs in-flight rows.
+    /// `Paused` is deliberately excluded: a paused run is expected to
+    /// resume.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -1207,7 +1215,7 @@ impl RunStore {
                     })?;
                 Ok(CancelOutcome::RejectedAwaitingApproval)
             }
-            RunStatus::Pending | RunStatus::Running => {
+            RunStatus::Pending | RunStatus::Running | RunStatus::Paused => {
                 let pid = record.runner_pid;
                 let was_running = pid.is_some_and(pid_is_running);
                 // Only signal a pid that is live AND is NOT our own
@@ -1286,6 +1294,16 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
+
+    #[test]
+    fn paused_status_serializes_and_is_non_terminal() {
+        assert_eq!(RunStatus::Paused.as_str(), "paused");
+        // round-trip through the record's serde
+        let j = serde_json::to_string(&RunStatus::Paused).unwrap();
+        let back: RunStatus = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, RunStatus::Paused);
+        assert!(!RunStatus::Paused.is_terminal());
+    }
 
     fn sample_record(id: &str) -> RunRecord {
         RunRecord {
@@ -2189,10 +2207,7 @@ mod tests {
         assert_eq!(back.step_id, "scan_each");
 
         // None host: field is absent from JSON (skip_serializing_if).
-        let cp_local = UnitCheckpoint {
-            host: None,
-            ..cp
-        };
+        let cp_local = UnitCheckpoint { host: None, ..cp };
         let val_local = serde_json::to_value(&cp_local).expect("serialize local");
         assert!(
             val_local.get("host").is_none(),
