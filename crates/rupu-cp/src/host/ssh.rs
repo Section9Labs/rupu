@@ -1050,8 +1050,8 @@ mod tests {
         }
     }
 
-    fn make_conn(
-        fake: std::sync::Arc<FakeExec>,
+    fn make_conn<E: RemoteExec + 'static>(
+        fake: std::sync::Arc<E>,
     ) -> (
         SshHostConnector,
         std::sync::Arc<rupu_orchestrator::RunStore>,
@@ -1063,9 +1063,10 @@ mod tests {
         let mirror = std::sync::Arc::new(crate::node::NodeMirror::new(std::sync::Arc::clone(
             &run_store,
         )));
+        let exec: std::sync::Arc<dyn RemoteExec> = fake;
         let conn = SshHostConnector::new(
             "host_abc",
-            fake,
+            exec,
             mirror,
             std::sync::Arc::clone(&run_store),
             rupu_config::PricingConfig::default(),
@@ -1360,5 +1361,179 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HostConnectorError::Remote(3, _)), "{err:?}");
+    }
+
+    // ── End-to-end SSH workspace-sync parity (ssh-ws T5) ─────────────────────
+    //
+    // `RemoteExec` and `SshHostConnector` are `pub(crate)`, so this e2e cannot
+    // live in `crates/rupu-cp/tests/` as an integration test — it is a unit
+    // test here instead, mirroring where the existing `FakeExec` SSH tests
+    // live. `HelperExec` is a `RemoteExec` double that, unlike `FakeExec`
+    // above (which returns scripted bytes), actually calls the *real* shared
+    // staging core (`workspace_stage::stage_to_dir` / `collect_from_dir`)
+    // against a tempdir standing in for the remote cache root. This proves
+    // the SSH connector's command-building + byte-piping wiring end-to-end
+    // against the same core the Local/HttpCp transports use (3c's
+    // `workspace_sync_e2e.rs`), for both a git and a non-git (tar) workspace.
+    mod e2e_workspace_sync {
+        use super::*;
+        use crate::host::workspace_stage::{collect_from_dir, stage_to_dir};
+
+        /// A `RemoteExec` double that dispatches on the remote command string
+        /// and runs the *real* shared staging core against `self.cache`
+        /// (standing in for the remote host's cache root). Stateful — unlike
+        /// `FakeExec`'s single-shot scripted `run_bytes`, this must serve both
+        /// a stage call and a collect call for the same test.
+        struct HelperExec {
+            cache: tempfile::TempDir,
+        }
+
+        impl HelperExec {
+            fn new() -> Self {
+                Self {
+                    cache: tempfile::tempdir().unwrap(),
+                }
+            }
+        }
+
+        /// Extract the last single-quoted token from a `build_remote_command`
+        /// output, e.g. `'rupu' '__workspace' 'collect' '/cache/.../work'` ->
+        /// `/cache/.../work`. Good enough for test-generated paths, which
+        /// never contain an embedded `'`.
+        fn last_quoted_arg(cmd: &str) -> String {
+            let trimmed = cmd.trim_end();
+            let body = trimmed
+                .strip_suffix('\'')
+                .expect("remote command must end with a quoted arg");
+            let start = body.rfind('\'').expect("expected an opening quote") + 1;
+            body[start..].to_string()
+        }
+
+        #[async_trait::async_trait]
+        impl RemoteExec for HelperExec {
+            async fn run(&self, _remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+                unimplemented!("HelperExec only exercises run_bytes for workspace sync")
+            }
+
+            fn spawn_lines(&self, _remote_command: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("HelperExec only exercises run_bytes for workspace sync")
+            }
+
+            async fn run_bytes(
+                &self,
+                remote_command: &str,
+                stdin: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                if remote_command.contains("__workspace") && remote_command.contains("stage") {
+                    let payload = stdin.unwrap_or_default();
+                    let dir = stage_to_dir(&payload, self.cache.path()).map_err(|e| {
+                        RemoteExecError::NonZero {
+                            code: Some(1),
+                            stderr: e.to_string(),
+                        }
+                    })?;
+                    let mut out = dir.into_bytes();
+                    out.push(b'\n');
+                    Ok(out)
+                } else if remote_command.contains("__workspace")
+                    && remote_command.contains("collect")
+                {
+                    let dir = last_quoted_arg(remote_command);
+                    collect_from_dir(&dir, self.cache.path()).map_err(|e| {
+                        RemoteExecError::NonZero {
+                            code: Some(1),
+                            stderr: e.to_string(),
+                        }
+                    })
+                } else {
+                    panic!("HelperExec: unexpected remote command: {remote_command}");
+                }
+            }
+        }
+
+        /// Build a coordinator workspace: a plain non-git dir when `use_git`
+        /// is `false`, or a minimal git repo with one committed file when
+        /// `true` — mirrors `workspace_stage::tests::git_init`.
+        fn build_workspace(dir: &std::path::Path, use_git: bool) {
+            std::fs::write(dir.join("a.txt"), "orig").unwrap();
+            if use_git {
+                let repo = git2::Repository::init(dir).unwrap();
+                let mut cfg = repo.config().unwrap();
+                cfg.set_str("user.name", "t").unwrap();
+                cfg.set_str("user.email", "t@e").unwrap();
+                let mut idx = repo.index().unwrap();
+                idx.add_path(std::path::Path::new("a.txt")).unwrap();
+                idx.write().unwrap();
+                let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+                let sig = repo.signature().unwrap();
+                repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                    .unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn ssh_workspace_sync_round_trips_git_and_tar() {
+            for use_git in [true, false] {
+                // 1. Build the coordinator workspace and pack it.
+                let coordinator = tempfile::tempdir().unwrap();
+                build_workspace(coordinator.path(), use_git);
+                let payload = rupu_workspace::pack(coordinator.path()).unwrap();
+                assert_eq!(
+                    payload.mode,
+                    if use_git {
+                        rupu_workspace::SyncMode::Git
+                    } else {
+                        rupu_workspace::SyncMode::Tar
+                    },
+                    "use_git={use_git}"
+                );
+                let encoded = crate::host::connector::encode_payload(&payload);
+
+                // 2. SshHostConnector wired to a HelperExec backed by a fresh
+                // tempdir cache root standing in for the remote host.
+                let fake = std::sync::Arc::new(HelperExec::new());
+                let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+                // 3. Stage: connector pipes the encoded payload over
+                // `run_bytes`, HelperExec runs the real `stage_to_dir`.
+                let dir = conn.stage_workspace(encoded).await.unwrap_or_else(|e| {
+                    panic!("stage_workspace failed (use_git={use_git}): {e:?}")
+                });
+
+                // 4. Simulate the remote agent editing a file under `dir`.
+                std::fs::write(std::path::Path::new(&dir).join("a.txt"), "EDITED").unwrap();
+
+                // 5. Collect: connector issues the collect command, HelperExec
+                // runs the real `collect_from_dir`, returns the encoded delta.
+                let delta_bytes = conn
+                    .collect_workspace_delta(&dir)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("collect_workspace_delta failed (use_git={use_git}): {e:?}")
+                    });
+                let delta = crate::host::connector::decode_delta(&delta_bytes).unwrap();
+                assert!(
+                    delta.changed.iter().any(|p| p == "a.txt"),
+                    "use_git={use_git}: expected a.txt in changed set, got {:?}",
+                    delta.changed
+                );
+
+                // 6. Apply the delta to a FRESH copy of the coordinator
+                // workspace (not the one that was packed) and assert the
+                // edit landed — proving parity with the Local/HttpCp path
+                // over the SSH command/pipe wiring.
+                let fresh = tempfile::tempdir().unwrap();
+                build_workspace(fresh.path(), use_git);
+                rupu_workspace::apply_deltas(fresh.path(), std::slice::from_ref(&delta)).unwrap();
+                let applied = std::fs::read_to_string(fresh.path().join("a.txt")).unwrap();
+                assert_eq!(
+                    applied, "EDITED",
+                    "use_git={use_git}: edit must land on the fresh coordinator copy"
+                );
+
+                // Scratch dir is cleaned up by collect_from_dir.
+                assert!(!std::path::Path::new(&dir).exists());
+            }
+        }
     }
 }
