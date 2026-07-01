@@ -202,6 +202,32 @@ async fn put_policy(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// Validate a user-controlled workspace id (from the `:id` path segment or
+/// `?project=` query param) BEFORE it is ever used to build a filesystem
+/// path. `WorkspaceStore::load` joins the id verbatim as
+/// `<global_dir>/workspaces/<id>.toml` (see `rupu_workspace::store`'s
+/// `record_path`), so an unvalidated id is a straightforward path-traversal
+/// vector (`../foo`, `..`, an absolute path, a percent-decoded `..%2Ffoo`
+/// that axum's extractors already decoded to a literal `/` by the time it
+/// reaches us, embedded NULs, etc.) — any of these could make `load` read (or
+/// a future write path persist) a `.toml` outside `<global_dir>/workspaces`.
+///
+/// Real workspace ids are ULID-like tokens (see `api/findings.rs` /
+/// `api/coverage.rs` usage), so a conservative allowlist — non-empty ASCII
+/// alphanumerics plus `-`/`_` only — is sufficient and rejects every
+/// traversal shape above without needing to special-case `..` or separators.
+fn validate_ws_id(id: &str) -> ApiResult<()> {
+    let valid = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(format!("invalid project id `{id}`")))
+    }
+}
+
 /// Resolve a project's `.rupu/config.toml` path from its workspace id and
 /// confine it under the workspace's own recorded root.
 ///
@@ -212,8 +238,14 @@ async fn put_policy(
 /// `.rupu/config.toml` still starts with that canonical root is defense in
 /// depth against a workspace record steering a config write outside the
 /// project tree, mirroring `host::workspace_stage::confine`'s guard for
-/// staged workspace dirs.
+/// staged workspace dirs. Note this `starts_with` check is ALSO
+/// defense-in-depth, not the primary guard: `validate_ws_id` below is what
+/// actually stops a traversal id, since `root_canon` here is always the
+/// canonicalized base that `candidate` was just joined onto (the
+/// `starts_with` alone would be vacuous against a hostile `id` — the real
+/// stop is refusing to load the record for a malformed id at all).
 fn project_config_path(s: &AppState, id: &str) -> ApiResult<PathBuf> {
+    validate_ws_id(id)?;
     let store = rupu_workspace::WorkspaceStore {
         root: s.global_dir.join("workspaces"),
     };
@@ -259,6 +291,15 @@ fn flatten_toml_keys(v: &toml::Value, prefix: &str, out: &mut Vec<String>) {
 /// global-only resolved snapshot (`resolve(global, None, ..)`), which is
 /// exactly where locks are sourced from.
 fn reject_locked_project_keys(s: &AppState, candidate_toml: &str) -> ApiResult<()> {
+    // `unwrap_or_default()` fails OPEN on a poisoned RwLock (empty lock list,
+    // so this pre-write check would let the candidate through). That's safe,
+    // not a bypass: `rupu_config::resolve` re-enforces the lock list at
+    // RESOLUTION time from the global layer regardless of what a project
+    // file contains, so a project key that slips past this check on a
+    // poisoned lock is merely an inert value on disk — resolution still
+    // ignores it in favor of the locked global value. This check exists only
+    // to give the operator an early, clear write-time error; it is not the
+    // enforcement boundary.
     let lock = s
         .config
         .read()
@@ -499,6 +540,80 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Regression for the vacuous `candidate.starts_with(&root_canon)` guard
+    /// that used to be the only confinement check in `project_config_path`:
+    /// since `candidate` is always built by joining onto `root_canon`, that
+    /// check could never fail, so a traversal `:id` (`../evil`, `..`, an
+    /// absolute path) was never rejected before reaching
+    /// `WorkspaceStore::load`. `validate_ws_id` must reject these ids
+    /// up front — this test would fail if that validation were removed,
+    /// regardless of what any real workspace record on disk says.
+    #[tokio::test]
+    async fn project_id_traversal_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+
+        // A real record at `<global>/workspaces/evil.toml` that a traversal
+        // id `../evil` would resolve to (`store.record_path` joins
+        // `format!("{id}.toml")` onto its root) if id validation were
+        // skipped. Its presence proves any rejection is due to the id
+        // format, not merely a missing file.
+        let evil_root = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "evil", evil_root.path());
+        std::fs::create_dir_all(evil_root.path().join(".rupu")).unwrap();
+        std::fs::write(evil_root.path().join(".rupu/config.toml"), "x = 1\n").unwrap();
+
+        for traversal_id in ["../evil", "..", "/etc/evil", "a/../../evil", "a/b"] {
+            // GET ?project=<traversal id>
+            let err = match get_config(
+                State(test_state(&tmp)),
+                Query(ProjectQuery {
+                    project: Some(traversal_id.into()),
+                }),
+            )
+            .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("GET must reject id `{traversal_id}`"),
+            };
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "id `{traversal_id}`: {}",
+                err.1
+            );
+
+            // PUT /project/<traversal id>
+            let body = ConfigWriteBody {
+                raw: Some("default_model = \"x\"\n".into()),
+                patch: None,
+            };
+            let err = match put_project(
+                State(writable_state(&tmp)),
+                AxPath(traversal_id.into()),
+                Json(body),
+            )
+            .await
+            {
+                Err(e) => e,
+                Ok(_) => panic!("PUT must reject id `{traversal_id}`"),
+            };
+            assert_eq!(
+                err.0,
+                axum::http::StatusCode::BAD_REQUEST,
+                "id `{traversal_id}`: {}",
+                err.1
+            );
+        }
+
+        // Nothing was ever written to the escaped/legitimate-looking target.
+        assert_eq!(
+            std::fs::read_to_string(evil_root.path().join(".rupu/config.toml")).unwrap(),
+            "x = 1\n",
+            "traversal must not reach the file a `../evil`-style id resolves to"
+        );
     }
 
     #[tokio::test]
