@@ -270,6 +270,144 @@ describe('Settings page', () => {
     );
   });
 
+  // ── Raw TOML tab (T5) ────────────────────────────────────────────────────
+
+  it('Raw tab shows raw_global highlighted and in an editable textarea', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+
+    // Highlighted, read-only preview of the current file.
+    const highlighted = document.querySelector('code.hljs');
+    expect(highlighted).not.toBeNull();
+    expect(highlighted!.textContent).toContain(MOCK_CONFIG.raw_global);
+
+    // Separate editable textarea, seeded with the same text.
+    const editor = screen.getByLabelText(/edit raw toml/i) as HTMLTextAreaElement;
+    expect(editor.value).toBe(MOCK_CONFIG.raw_global);
+  });
+
+  it('editing the Raw tab and clicking Save posts { raw } to putGlobalConfig', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+    const putSpy = vi.spyOn(api, 'putGlobalConfig').mockResolvedValue({ ok: true, restart_required: [] });
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+
+    const editor = screen.getByLabelText(/edit raw toml/i) as HTMLTextAreaElement;
+    const nextRaw = 'default_model = "claude-opus-4-6"\n';
+    fireEvent.change(editor, { target: { value: nextRaw } });
+
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+
+    await waitFor(() => expect(putSpy).toHaveBeenCalledTimes(1));
+    expect(putSpy.mock.calls[0][0]).toEqual({ raw: nextRaw });
+  });
+
+  it('surfaces a 400 validation error inline in the raw editor', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+    vi.spyOn(api, 'putGlobalConfig').mockRejectedValue(
+      new ApiError(400, 'invalid TOML: expected an equals, found a newline at line 1 column 5'),
+    );
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+
+    const editor = screen.getByLabelText(/edit raw toml/i) as HTMLTextAreaElement;
+    fireEvent.change(editor, { target: { value: 'not valid toml =' } });
+    fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
+
+    expect(await screen.findByText(/invalid toml/i)).toBeInTheDocument();
+  });
+
+  // ── Policy tab (T5) ──────────────────────────────────────────────────────
+
+  it('Policy tab reflects provenance[key].locked and Save calls putPolicy with the updated list', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+    const policySpy = vi.spyOn(api, 'putPolicy').mockResolvedValue({ ok: true });
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Policy' }));
+
+    const permCheckbox = screen.getByRole('checkbox', { name: /^permission_mode$/i }) as HTMLInputElement;
+    const modelCheckbox = screen.getByRole('checkbox', { name: /^default_model$/i }) as HTMLInputElement;
+    expect(permCheckbox.checked).toBe(true);
+    expect(modelCheckbox.checked).toBe(false);
+
+    fireEvent.click(modelCheckbox);
+    fireEvent.click(screen.getByRole('button', { name: /save policy/i }));
+
+    await waitFor(() => expect(policySpy).toHaveBeenCalledTimes(1));
+    expect(policySpy.mock.calls[0][0]).toEqual(
+      expect.arrayContaining(['permission_mode', 'default_model']),
+    );
+    expect((policySpy.mock.calls[0][0] as string[]).length).toBe(2);
+  });
+
+  // ── Runtime status tab (T5) ──────────────────────────────────────────────
+
+  it('Runtime status tab shows bind, a masked token, and the restart-required note', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Runtime status' }));
+
+    expect(await screen.findByText('127.0.0.1:7878')).toBeInTheDocument();
+    expect(screen.getByText('not set')).toBeInTheDocument();
+    expect(screen.queryByText('•••')).not.toBeInTheDocument();
+    expect(screen.getByText(/requires restarting/i)).toBeInTheDocument();
+    expect(screen.getByText('bind, token')).toBeInTheDocument();
+  });
+
+  it('Runtime status tab shows "••• set" (never a value) when token_set is true', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue({
+      ...MOCK_CONFIG,
+      status: { ...MOCK_CONFIG.status, token_set: true },
+    });
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Runtime status' }));
+
+    expect(await screen.findByText('••• set')).toBeInTheDocument();
+  });
+
   it('shows loading state before data arrives', () => {
     vi.spyOn(api, 'getConfig').mockImplementation(() => new Promise(() => {}));
 

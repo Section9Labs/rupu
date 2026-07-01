@@ -11,12 +11,24 @@
 // `status.token_set: bool` (Bearer token row on the CP-Runtime tab), and it is
 // never editable from this form.
 //
-// The Raw / Policy / Runtime-status tabs are scaffolded as placeholders —
-// Task 5 fills them in (raw TOML editor, lock-list editor, richer runtime
-// detail). This page owns General/Providers/Autoflow/SCM-Issues/Pricing/
-// CP-Runtime only.
+// Three more tabs round out the page:
+//  - Raw: the global `config.toml` shown highlighted (read-only reference)
+//    plus an editable textarea seeded from `raw_global`. Save posts the full
+//    text as `{ raw }` to `PUT /api/config/global`, which validates against
+//    the typed schema before writing anything — there is no separate
+//    non-persisting "validate" endpoint on the backend, so Save both
+//    validates and persists in one step; a 400 renders the server's message
+//    inline next to the editor.
+//  - Policy: a consolidated view of every dotted key with known provenance,
+//    each with a lock checkbox seeded from `provenance[key].locked`. Edits
+//    are staged locally and committed together via a Save button that PUTs
+//    the whole updated lock list — independent of (and functionally
+//    overlapping with) the per-field lock toggle above.
+//  - Runtime status: read-only — bind address, the bearer token masked as
+//    `••• set` / `not set` (never a value), and which keys need a process
+//    restart to take effect.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   Cpu,
@@ -32,6 +44,7 @@ import { api, ApiError, type ConfigRuntimeStatus, type ConfigView, type KeyProve
 import { TabBar, TabButton } from '../components/TabBar';
 import { Chip } from '../components/ui/Chip';
 import { Button } from '../components/ui/Button';
+import CodeHighlight from '../components/CodeHighlight';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -49,6 +62,13 @@ function getPath(obj: unknown, dotted: string): unknown {
 
 function asRecord(v: unknown): Record<string, unknown> {
   return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+}
+
+/** Order-independent set equality for two string arrays (lock lists). */
+function sameSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sa = new Set(a);
+  return b.every((k) => sa.has(k));
 }
 
 const SOURCE_CLASS: Record<KeyProvenance['source'], string> = {
@@ -650,6 +670,164 @@ function CpRuntimeTab({
 }
 
 // ---------------------------------------------------------------------------
+// Raw TOML tab
+// ---------------------------------------------------------------------------
+
+const RAW_TEXTAREA_CLS =
+  'mt-1 h-72 w-full resize-y rounded-md border border-border bg-panel px-2.5 py-1.5 font-mono text-ui ' +
+  'leading-relaxed text-ink placeholder:text-ink-mute focus:border-brand-500 focus:outline-none';
+
+function RawTab({
+  savedRaw,
+  draft,
+  onChangeDraft,
+  onSave,
+  saving,
+  error,
+}: {
+  savedRaw: string;
+  draft: string;
+  onChangeDraft: (v: string) => void;
+  onSave: () => void;
+  saving: boolean;
+  error: string | null;
+}) {
+  const dirty = draft !== savedRaw;
+  return (
+    <div className="space-y-4">
+      <div>
+        <h3 className="mb-2 text-sm font-semibold text-ink">
+          Current <span className="font-mono">~/.rupu/config.toml</span>
+        </h3>
+        <CodeHighlight code={savedRaw || '# empty — no global config.toml written yet\n'} language="toml" />
+      </div>
+
+      <div>
+        <label htmlFor="raw-toml-editor" className={labelCls}>
+          Edit raw TOML
+        </label>
+        <textarea
+          id="raw-toml-editor"
+          value={draft}
+          onChange={(e) => onChangeDraft(e.target.value)}
+          spellCheck={false}
+          className={RAW_TEXTAREA_CLS}
+        />
+      </div>
+
+      {error && (
+        <div role="alert" className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
+          {error}
+        </div>
+      )}
+
+      <div className="flex items-center justify-end gap-2">
+        <Button variant="secondary" onClick={() => onChangeDraft(savedRaw)} disabled={saving || !dirty}>
+          Reset
+        </Button>
+        <Button onClick={onSave} disabled={saving || !dirty}>
+          {saving ? 'Saving…' : 'Save'}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Policy tab
+// ---------------------------------------------------------------------------
+
+function PolicyTab({
+  keys,
+  locks,
+  onToggle,
+  onSave,
+  saving,
+  error,
+  dirty,
+}: {
+  keys: string[];
+  locks: string[];
+  onToggle: (key: string) => void;
+  onSave: () => void;
+  saving: boolean;
+  error: string | null;
+  dirty: boolean;
+}) {
+  if (keys.length === 0) {
+    return <EmptyTabState text="No resolved keys yet — nothing to lock." />;
+  }
+  return (
+    <div>
+      <p className="mb-3 text-sm text-ink-dim">
+        Keys enforced by the GLOBAL policy lock — a locked key can never be overridden by a project
+        layer. Consolidated view of every key from the General / Providers / Autoflow / SCM-Issues /
+        Pricing / CP-Runtime tabs; toggling here is equivalent to the lock glyph on those tabs.
+      </p>
+      <ul className="divide-y divide-border/60">
+        {keys.map((key) => (
+          <li key={key} className="flex items-center gap-2 py-2">
+            <input
+              id={`policy-lock-${key}`}
+              type="checkbox"
+              checked={locks.includes(key)}
+              onChange={() => onToggle(key)}
+              aria-label={key}
+              className="accent-brand-600"
+            />
+            <label htmlFor={`policy-lock-${key}`} className="font-mono text-sm text-ink">
+              {key}
+            </label>
+          </li>
+        ))}
+      </ul>
+
+      {error && (
+        <div role="alert" className="mt-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
+          {error}
+        </div>
+      )}
+
+      <div className="mt-4 flex justify-end">
+        <Button onClick={onSave} disabled={saving || !dirty}>
+          {saving ? 'Saving…' : 'Save policy'}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime status tab
+// ---------------------------------------------------------------------------
+
+function RuntimeStatusTab({ status }: { status: ConfigRuntimeStatus }) {
+  return (
+    <div className="space-y-4">
+      <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div>
+          <dt className="text-note font-medium uppercase tracking-wide text-ink-dim">Bind address</dt>
+          <dd className="mt-0.5 font-mono text-sm text-ink">{status.bind}</dd>
+        </div>
+        <div>
+          <dt className="text-note font-medium uppercase tracking-wide text-ink-dim">CP bearer token</dt>
+          <dd className="mt-0.5 text-sm text-ink">{status.token_set ? '••• set' : 'not set'}</dd>
+        </div>
+      </dl>
+
+      {status.restart_required_keys.length > 0 ? (
+        <div className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-3 text-sm text-warn">
+          Requires restarting <code className="font-mono">rupu cp serve</code> to apply changes to:{' '}
+          <span className="font-mono">{status.restart_required_keys.join(', ')}</span>.
+        </div>
+      ) : (
+        <p className="text-sm text-ink-dim">No pending changes require a restart.</p>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -665,13 +843,48 @@ export default function Settings() {
   const [lockError, setLockError] = useState<string | null>(null);
   const [tab, setTab] = useState<SettingsTab>('general');
 
+  // ── Raw TOML tab state ──────────────────────────────────────────────────
+  // `rawBaselineRef` tracks the last raw text known from the server. On
+  // reload, the draft is only replaced with the fresh `raw_global` when it
+  // still matches that baseline (i.e. the user has no in-flight, unsaved
+  // edit) — otherwise an unrelated Save (e.g. a form-tab patch, which also
+  // rewrites the file) would silently clobber the Raw tab's draft.
+  const [rawDraft, setRawDraft] = useState('');
+  const [rawSaving, setRawSaving] = useState(false);
+  const [rawError, setRawError] = useState<string | null>(null);
+  const rawBaselineRef = useRef('');
+
+  // ── Policy tab state ────────────────────────────────────────────────────
+  // `null` means "no staged edits yet" — the checkboxes mirror `lockList`
+  // directly until the operator toggles one, at which point edits accumulate
+  // here and are committed together via the Policy tab's own Save button.
+  const [policyDraft, setPolicyDraft] = useState<string[] | null>(null);
+  const [policySaving, setPolicySaving] = useState(false);
+  const [policySaveError, setPolicySaveError] = useState<string | null>(null);
+  const policyBaselineRef = useRef<string[]>([]);
+
   function reload(): Promise<void> {
     return api
       .getConfig()
       .then((data) => {
         setConfigView(data);
         const locks = getPath(data.effective, 'policy.lock');
-        setLockList(Array.isArray(locks) ? (locks.filter((l): l is string => typeof l === 'string')) : []);
+        const nextLocks = Array.isArray(locks) ? locks.filter((l): l is string => typeof l === 'string') : [];
+        setLockList(nextLocks);
+        // Capture the OLD baseline before overwriting the ref below — the
+        // functional updaters run later (React's render phase), by which
+        // point the ref would already hold the NEW value if reassigned first,
+        // making the "still in sync" comparison always false.
+        const prevRawBaseline = rawBaselineRef.current;
+        setRawDraft((prevDraft) => (prevDraft === prevRawBaseline ? data.raw_global : prevDraft));
+        rawBaselineRef.current = data.raw_global;
+        // Only clear staged Policy-tab edits when they're still in sync with
+        // the previously-known lock list — an unrelated reload (e.g. a
+        // General-tab Save, which rewrites the same file) must not discard an
+        // in-progress, unsaved Policy edit.
+        const prevPolicyBaseline = policyBaselineRef.current;
+        setPolicyDraft((prevDraft) => (prevDraft === null || sameSet(prevDraft, prevPolicyBaseline) ? null : prevDraft));
+        policyBaselineRef.current = nextLocks;
         setLoadError(null);
       })
       .catch((e: unknown) => {
@@ -755,6 +968,44 @@ export default function Settings() {
       }
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleRawSave() {
+    setRawSaving(true);
+    setRawError(null);
+    setReadOnly(false);
+    try {
+      await api.putGlobalConfig({ raw: rawDraft });
+      await reload();
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.status === 501) {
+        setReadOnly(true);
+      } else {
+        setRawError(e instanceof Error ? e.message : 'Failed to save raw config');
+      }
+    } finally {
+      setRawSaving(false);
+    }
+  }
+
+  function handlePolicyToggle(key: string) {
+    const current = policyDraft ?? lockList;
+    const next = current.includes(key) ? current.filter((k) => k !== key) : [...current, key];
+    setPolicyDraft(next);
+  }
+
+  async function handlePolicySave() {
+    const next = policyDraft ?? lockList;
+    setPolicySaving(true);
+    setPolicySaveError(null);
+    try {
+      await api.putPolicy(next);
+      await reload();
+    } catch (e: unknown) {
+      setPolicySaveError(e instanceof Error ? e.message : 'Failed to update lock policy');
+    } finally {
+      setPolicySaving(false);
     }
   }
 
@@ -901,13 +1152,28 @@ export default function Settings() {
             status={configView.status}
           />
         )}
-        {(tab === 'raw' || tab === 'policy' || tab === 'runtime-status') && (
-          <div className="py-10 text-center text-sm text-ink-dim">
-            {tab === 'raw' && 'Raw TOML editor — coming in Task 5.'}
-            {tab === 'policy' && 'Policy lock-list editor — coming in Task 5.'}
-            {tab === 'runtime-status' && 'Runtime status detail — coming in Task 5.'}
-          </div>
+        {tab === 'raw' && (
+          <RawTab
+            savedRaw={configView.raw_global}
+            draft={rawDraft}
+            onChangeDraft={setRawDraft}
+            onSave={() => void handleRawSave()}
+            saving={rawSaving}
+            error={rawError}
+          />
         )}
+        {tab === 'policy' && (
+          <PolicyTab
+            keys={Object.keys(prov).sort()}
+            locks={policyDraft ?? lockList}
+            onToggle={handlePolicyToggle}
+            onSave={() => void handlePolicySave()}
+            saving={policySaving}
+            error={policySaveError}
+            dirty={policyDraft !== null && !sameSet(policyDraft, lockList)}
+          />
+        )}
+        {tab === 'runtime-status' && <RuntimeStatusTab status={configView.status} />}
       </section>
     </div>
   );
