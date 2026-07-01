@@ -13,9 +13,13 @@ pub mod config;
 // that the lib re-export shape is stable from skeleton onward.
 pub mod layer;
 
+pub mod policy_config;
+
 pub mod pricing;
 
 pub mod pricing_config;
+
+pub mod resolve;
 
 pub mod provider_config;
 
@@ -27,8 +31,10 @@ pub mod triggers_config;
 pub use autoflow_config::{AutoflowCheckout, AutoflowConfig};
 pub use config::{BashConfig, Config, RetryConfig, UiConfig, UiPaletteConfig, UiSyntaxConfig};
 pub use layer::{layer_files, LayerError};
+pub use policy_config::{CpConfig, PolicyConfig};
 pub use pricing_config::{ModelPricing, PricingConfig};
 pub use provider_config::{CustomModel, ProviderConfig};
+pub use resolve::{resolve, KeyProvenance, KeySource, Resolved};
 pub use scm_config::{IssuesDefault, IssuesSection, ScmDefault, ScmPlatformConfig, ScmSection};
 pub use storage_config::StorageConfig;
 pub use triggers_config::{PollSourceEntry, PollSourceSpec, TriggersConfig};
