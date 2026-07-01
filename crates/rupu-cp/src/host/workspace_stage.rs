@@ -92,7 +92,7 @@ pub(crate) fn confine(path: &Path, root: &Path) -> Result<PathBuf, HostConnector
         .map_err(|e| HostConnectorError::Invalid(format!("root: {e}")))?;
     if !canon.starts_with(&root_canon) {
         return Err(HostConnectorError::Invalid(format!(
-            "path escapes workspace-sync root: {}",
+            "path is outside the workspace-sync root: {}",
             canon.display()
         )));
     }
