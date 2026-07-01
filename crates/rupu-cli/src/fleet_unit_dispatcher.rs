@@ -136,7 +136,7 @@ impl UnitDispatcher for FleetUnitDispatcher {
 
         // Launch the agent run on the remote host (against the staged dir, when
         // workspace sync is active).
-        let run_id = conn
+        let run_id = match conn
             .launch_agent(AgentLaunchRequest {
                 agent: unit.agent,
                 prompt: Some(unit.rendered_prompt),
@@ -145,7 +145,26 @@ impl UnitDispatcher for FleetUnitDispatcher {
                 working_dir: working_dir.clone(),
             })
             .await
-            .map_err(host_err_to_run_err)?;
+        {
+            Ok(id) => id,
+            Err(e) => {
+                // Staging succeeded but the launch never happened, so
+                // `collect_workspace_delta` will never run for this unit —
+                // discard the remote scratch now or it leaks forever.
+                // Best-effort: the launch error is what the caller sees.
+                if let Some(dir) = &working_dir {
+                    if let Err(discard_err) = conn.discard_workspace(dir).await {
+                        tracing::warn!(
+                            host,
+                            dir,
+                            error = %discard_err,
+                            "best-effort workspace discard failed after launch_agent error"
+                        );
+                    }
+                }
+                return Err(host_err_to_run_err(e));
+            }
+        };
 
         // Poll the mirrored run until a terminal status is reached.
         for attempt in 0..POLL_MAX_ATTEMPTS {
@@ -198,6 +217,21 @@ impl UnitDispatcher for FleetUnitDispatcher {
                     error,
                     workspace_delta,
                 });
+            }
+        }
+
+        // The poll loop exhausted its attempts without seeing a terminal
+        // status, so `collect_workspace_delta` above never ran for this unit
+        // either — discard the remote scratch here for the same reason as the
+        // `launch_agent` error arm above.
+        if let Some(dir) = &working_dir {
+            if let Err(discard_err) = conn.discard_workspace(dir).await {
+                tracing::warn!(
+                    host,
+                    dir,
+                    error = %discard_err,
+                    "best-effort workspace discard failed after poll timeout"
+                );
             }
         }
 
@@ -675,6 +709,268 @@ steps:
         assert!(
             paths.iter().any(|p| p.contains("shared.txt")),
             "conflict paths must include 'shared.txt', got: {paths:?}"
+        );
+    }
+
+    // ── Workspace-sync scratch-cleanup tests (T4, deferred from T2) ──────────
+    //
+    // `stage_workspace` succeeded (the unit has remote scratch on disk) but
+    // the unit never reaches `collect_workspace_delta` — either because
+    // `launch_agent` errors right after staging, or because the poll loop
+    // times out. Both are leak paths unless the dispatcher calls
+    // `discard_workspace` before returning the error.
+
+    /// Fake connector: `stage_workspace` succeeds (returns a fixed dir),
+    /// `launch_agent` always fails, and `discard_workspace` records whether
+    /// it was called and with which dir — the launch-failure leak path.
+    struct StageOkLaunchFailsConnector {
+        staged_dir: &'static str,
+        discard_called_with: std::sync::Mutex<Option<String>>,
+    }
+
+    impl StageOkLaunchFailsConnector {
+        fn new(staged_dir: &'static str) -> Self {
+            Self {
+                staged_dir,
+                discard_called_with: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HostConnector for StageOkLaunchFailsConnector {
+        async fn info(&self) -> Result<HostInfo, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn launch_run(&self, _req: LaunchRequest) -> Result<String, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn launch_agent(
+            &self,
+            _req: AgentLaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            Err(HostConnectorError::Unreachable(
+                "launch failed after staging".to_string(),
+            ))
+        }
+        async fn start_session(
+            &self,
+            _req: SessionStartRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn send_session_turn(
+            &self,
+            _req: SendMessageRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn list_runs(
+            &self,
+            _params: RunListQuery,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
+            unimplemented!()
+        }
+        async fn reject_run(
+            &self,
+            _run_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), HostConnectorError> {
+            unimplemented!()
+        }
+        async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+            unimplemented!()
+        }
+        async fn stream_run_events(
+            &self,
+            _run_id: &str,
+        ) -> Result<EventByteStream, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn get_transcript(
+            &self,
+            _path: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn proxy_get_json(
+            &self,
+            _path_and_query: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn stage_workspace(&self, _payload: Vec<u8>) -> Result<String, HostConnectorError> {
+            Ok(self.staged_dir.to_string())
+        }
+        async fn collect_workspace_delta(
+            &self,
+            _working_dir: &str,
+        ) -> Result<Vec<u8>, HostConnectorError> {
+            unimplemented!("collect must never run when launch_agent fails before it")
+        }
+        async fn discard_workspace(&self, working_dir: &str) -> Result<(), HostConnectorError> {
+            *self.discard_called_with.lock().unwrap() = Some(working_dir.to_string());
+            Ok(())
+        }
+    }
+
+    /// After a successful `stage_workspace`, a `launch_agent` failure must
+    /// trigger `discard_workspace(&staged_dir)` before the dispatcher returns
+    /// its error — otherwise the remote scratch dir leaks forever since
+    /// `collect_workspace_delta` never runs.
+    #[tokio::test]
+    async fn launch_failure_after_stage_discards_scratch() {
+        let conn = Arc::new(StageOkLaunchFailsConnector::new(
+            "/cache/workspace-sync/leak-1/work",
+        ));
+        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+
+        let mut unit = make_unit();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
+        unit.workspace_path = Some(ws.path().to_path_buf());
+
+        let err = d.dispatch_unit(unit, "h1").await.unwrap_err();
+        assert!(err.to_string().contains("launch failed after staging"));
+
+        assert_eq!(
+            conn.discard_called_with.lock().unwrap().as_deref(),
+            Some("/cache/workspace-sync/leak-1/work"),
+            "discard_workspace must be called with the staged dir after launch_agent fails"
+        );
+    }
+
+    /// Fake connector: `stage_workspace` and `launch_agent` succeed, but
+    /// `get_run` always reports a non-terminal status — forcing the poll
+    /// loop to exhaust `POLL_MAX_ATTEMPTS` and time out. `discard_workspace`
+    /// records whether it was called — the poll-timeout leak path.
+    struct StageOkPollNeverTerminalConnector {
+        staged_dir: &'static str,
+        discard_called_with: std::sync::Mutex<Option<String>>,
+    }
+
+    impl StageOkPollNeverTerminalConnector {
+        fn new(staged_dir: &'static str) -> Self {
+            Self {
+                staged_dir,
+                discard_called_with: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HostConnector for StageOkPollNeverTerminalConnector {
+        async fn info(&self) -> Result<HostInfo, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn launch_run(&self, _req: LaunchRequest) -> Result<String, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn launch_agent(
+            &self,
+            _req: AgentLaunchRequest,
+        ) -> Result<String, HostConnectorError> {
+            Ok("run_timeout".to_string())
+        }
+        async fn start_session(
+            &self,
+            _req: SessionStartRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn send_session_turn(
+            &self,
+            _req: SendMessageRequest,
+        ) -> Result<String, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn list_runs(
+            &self,
+            _params: RunListQuery,
+        ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
+            Ok(serde_json::json!({ "run": { "status": "running" } }))
+        }
+        async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
+            unimplemented!()
+        }
+        async fn reject_run(
+            &self,
+            _run_id: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), HostConnectorError> {
+            unimplemented!()
+        }
+        async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
+            unimplemented!()
+        }
+        async fn stream_run_events(
+            &self,
+            _run_id: &str,
+        ) -> Result<EventByteStream, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn get_transcript(
+            &self,
+            _path: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn proxy_get_json(
+            &self,
+            _path_and_query: &str,
+        ) -> Result<serde_json::Value, HostConnectorError> {
+            unimplemented!()
+        }
+        async fn stage_workspace(&self, _payload: Vec<u8>) -> Result<String, HostConnectorError> {
+            Ok(self.staged_dir.to_string())
+        }
+        async fn collect_workspace_delta(
+            &self,
+            _working_dir: &str,
+        ) -> Result<Vec<u8>, HostConnectorError> {
+            unimplemented!("collect must never run when the poll loop times out")
+        }
+        async fn discard_workspace(&self, working_dir: &str) -> Result<(), HostConnectorError> {
+            *self.discard_called_with.lock().unwrap() = Some(working_dir.to_string());
+            Ok(())
+        }
+    }
+
+    /// After a successful stage + launch, a poll loop that never observes a
+    /// terminal status must discard the staged scratch before surfacing the
+    /// timeout error — same leak-prevention contract as the launch-failure
+    /// arm above. Runs with tokio's paused virtual clock so the 120 ×
+    /// 500 ms poll budget (60 s of real time) resolves instantly: with no
+    /// other work pending, tokio auto-advances virtual time past each
+    /// `sleep`.
+    #[tokio::test(start_paused = true)]
+    async fn poll_timeout_after_stage_discards_scratch() {
+        let conn = Arc::new(StageOkPollNeverTerminalConnector::new(
+            "/cache/workspace-sync/leak-2/work",
+        ));
+        let d = FleetUnitDispatcher::from_connector(Arc::clone(&conn) as Arc<dyn HostConnector>);
+
+        let mut unit = make_unit();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
+        unit.workspace_path = Some(ws.path().to_path_buf());
+
+        let err = d.dispatch_unit(unit, "h1").await.unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+
+        assert_eq!(
+            conn.discard_called_with.lock().unwrap().as_deref(),
+            Some("/cache/workspace-sync/leak-2/work"),
+            "discard_workspace must be called with the staged dir after a poll timeout"
         );
     }
 }

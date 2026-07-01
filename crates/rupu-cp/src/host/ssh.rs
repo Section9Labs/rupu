@@ -20,7 +20,7 @@ use crate::{
     host::connector::{
         mirror_get_run, mirror_list_runs, mirror_stream_run_events, read_transcript_file,
         EventByteStream, HostCapabilities, HostConnector, HostConnectorError, HostInfo,
-        RunListQuery,
+        RunListQuery, MAX_WORKSPACE_BYTES,
     },
     launcher::LaunchRequest,
     node::{
@@ -115,6 +115,8 @@ pub(crate) struct RemoteOutput {
 pub(crate) enum RemoteExecError {
     #[error("ssh spawn failed: {0}")]
     Spawn(String),
+    #[error("remote command exited with {code:?}: {stderr}")]
+    NonZero { code: Option<i32>, stderr: String },
 }
 
 /// A pinned, boxed stream of lines from a remote command.
@@ -133,6 +135,16 @@ pub(crate) trait RemoteExec: Send + Sync {
     /// The ssh child is kept alive for the stream's duration. When the stream
     /// is dropped the child is killed via `kill_on_drop(true)`.
     fn spawn_lines(&self, remote_command: &str) -> Result<LineStream, RemoteExecError>;
+
+    /// Run `remote_command`, writing `stdin` to it (if any), and return its
+    /// raw stdout bytes. Binary-safe — unlike `run`, which lossily decodes
+    /// UTF-8. A spawn/connection failure is `Spawn`; a nonzero remote exit is
+    /// `NonZero { code, stderr }`.
+    async fn run_bytes(
+        &self,
+        remote_command: &str,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, RemoteExecError>;
 }
 
 // ── Internal stream wrapper ───────────────────────────────────────────────────
@@ -221,6 +233,56 @@ impl RemoteExec for SshExec {
         };
         Ok(Box::pin(stream))
     }
+
+    async fn run_bytes(
+        &self,
+        remote_command: &str,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, RemoteExecError> {
+        use tokio::io::AsyncWriteExt;
+        let argv = ssh_argv(
+            &self.host,
+            self.port,
+            self.identity_file.as_deref(),
+            remote_command,
+        );
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&argv)
+            .stdin(if stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
+        if let Some(bytes) = stdin {
+            let mut si = child
+                .stdin
+                .take()
+                .ok_or_else(|| RemoteExecError::Spawn("no stdin pipe".into()))?;
+            si.write_all(&bytes)
+                .await
+                .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
+            si.shutdown()
+                .await
+                .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
+            drop(si);
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
+        if !out.status.success() {
+            return Err(RemoteExecError::NonZero {
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        Ok(out.stdout)
+    }
 }
 
 // ── Tail pump helpers ─────────────────────────────────────────────────────────
@@ -237,6 +299,19 @@ const PUMP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2
 /// `#[serde(rename_all = "snake_case")]` wire form.
 fn is_terminal_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "rejected" | "cancelled")
+}
+
+/// Map a [`RemoteExecError`] from `run_bytes` to the corresponding
+/// [`HostConnectorError`]: a spawn/connection failure (ssh binary missing,
+/// no route to host, etc.) is `Unreachable`; a nonzero exit from the remote
+/// `rupu __workspace` helper is `Remote(code, stderr)`.
+fn map_remote_err(e: RemoteExecError) -> HostConnectorError {
+    match e {
+        RemoteExecError::Spawn(m) => HostConnectorError::Unreachable(m),
+        RemoteExecError::NonZero { code, stderr } => {
+            HostConnectorError::Remote(code.unwrap_or(-1) as u16, stderr)
+        }
+    }
 }
 
 // ── SshHostConnector ──────────────────────────────────────────────────────────
@@ -673,35 +748,73 @@ impl HostConnector for SshHostConnector {
         ))
     }
 
-    // ── Workspace sync (DEFERRED) ─────────────────────────────────────────────
+    // ── Workspace sync ─────────────────────────────────────────────────────────
     //
-    // A correct SSH staging impl ships the wire-encoded payload to the host and
-    // runs the codec via the *remote* `rupu` binary (the host needs no git/tar
-    // of its own — the codec lives in the binary). That requires a hidden
-    // remote helper subcommand (`rupu __workspace stage|collect`) which is a
-    // cross-crate change to rupu-cli's dispatcher; it is intentionally deferred
-    // to a follow-up rather than shipped as a silent self-contained fallback.
-    // Until then SSH hosts explicitly report the capability as unsupported, so
-    // a workspace-sync fan-out to an SSH host fails loudly instead of silently
-    // dropping the unit's changes. Local and HttpCp transports are fully wired.
-    async fn stage_workspace(&self, _payload: Vec<u8>) -> Result<String, HostConnectorError> {
-        tracing::warn!(
-            host = %self.host_id,
-            "workspace sync over SSH is not yet implemented (deferred); \
-             returning Unsupported"
-        );
-        Err(HostConnectorError::Unsupported(
-            "workspace sync over ssh (deferred)".into(),
-        ))
+    // The wire-encoded payload/delta are shipped as raw stdin/stdout bytes to
+    // the remote `rupu __workspace` helper via `RemoteExec::run_bytes`, which
+    // runs the codec via the *remote* `rupu` binary — the host needs no
+    // git/tar of its own, and the bytes never pass through a lossy UTF-8
+    // decode. Only the single trailing "working dir" line printed by `stage`
+    // is text, so it alone goes through `from_utf8_lossy`.
+    async fn stage_workspace(&self, payload: Vec<u8>) -> Result<String, HostConnectorError> {
+        if payload.len() > MAX_WORKSPACE_BYTES {
+            return Err(HostConnectorError::Invalid(format!(
+                "workspace payload {} bytes exceeds limit {MAX_WORKSPACE_BYTES}",
+                payload.len()
+            )));
+        }
+        let cmd = build_remote_command(&["rupu".into(), "__workspace".into(), "stage".into()]);
+        let out = self
+            .exec
+            .run_bytes(&cmd, Some(payload))
+            .await
+            .map_err(map_remote_err)?;
+        let line = String::from_utf8_lossy(&out);
+        let dir = line.trim();
+        if dir.is_empty() {
+            return Err(HostConnectorError::Invalid(
+                "remote stage returned no working dir".into(),
+            ));
+        }
+        Ok(dir.to_string())
     }
 
     async fn collect_workspace_delta(
         &self,
-        _working_dir: &str,
+        working_dir: &str,
     ) -> Result<Vec<u8>, HostConnectorError> {
-        Err(HostConnectorError::Unsupported(
-            "workspace sync over ssh (deferred)".into(),
-        ))
+        let cmd = build_remote_command(&[
+            "rupu".into(),
+            "__workspace".into(),
+            "collect".into(),
+            working_dir.to_string(),
+        ]);
+        let bytes = self
+            .exec
+            .run_bytes(&cmd, None)
+            .await
+            .map_err(map_remote_err)?;
+        if bytes.len() > MAX_WORKSPACE_BYTES {
+            return Err(HostConnectorError::Invalid(format!(
+                "workspace delta {} bytes exceeds limit {MAX_WORKSPACE_BYTES}",
+                bytes.len()
+            )));
+        }
+        Ok(bytes)
+    }
+
+    async fn discard_workspace(&self, working_dir: &str) -> Result<(), HostConnectorError> {
+        let cmd = build_remote_command(&[
+            "rupu".into(),
+            "__workspace".into(),
+            "discard".into(),
+            working_dir.to_string(),
+        ]);
+        self.exec
+            .run_bytes(&cmd, None)
+            .await
+            .map_err(map_remote_err)?;
+        Ok(())
     }
 }
 
@@ -772,6 +885,35 @@ mod tests {
         assert_eq!(parse_tail_marker(""), None);
     }
 
+    #[tokio::test]
+    async fn run_bytes_pipes_stdin_and_returns_stdout_bytes() {
+        let exec = FakeExec::with_bytes_ok(b"DELTA".to_vec());
+        let out = exec
+            .run_bytes("rupu __workspace stage", Some(b"PAYLOAD".to_vec()))
+            .await
+            .expect("ok");
+        assert_eq!(out, b"DELTA");
+        let (cmd, stdin) = exec.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert_eq!(cmd, "rupu __workspace stage");
+        assert_eq!(stdin.as_deref(), Some(&b"PAYLOAD"[..]));
+    }
+
+    #[tokio::test]
+    async fn run_bytes_nonzero_exit_is_error() {
+        let exec = FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(2),
+            stderr: "boom".into(),
+        });
+        let err = exec
+            .run_bytes("rupu __workspace collect /x", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RemoteExecError::NonZero { code: Some(2), .. }
+        ));
+    }
+
     // ── SshHostConnector tests ────────────────────────────────────────────────
 
     use crate::host::connector::HostConnectorError;
@@ -783,6 +925,10 @@ mod tests {
         fail_stderr: String,
         /// If set, returned as stdout when `run()` is called for a `cat …` command.
         cat_stdout: Option<String>,
+        /// Scripted result for `run_bytes`, taken on first call.
+        run_bytes_out: std::sync::Mutex<Option<Result<Vec<u8>, RemoteExecError>>>,
+        /// Records the `(remote_command, stdin)` of the last `run_bytes` call.
+        last_bytes_call: std::sync::Mutex<Option<(String, Option<Vec<u8>>)>>,
     }
 
     impl FakeExec {
@@ -793,6 +939,8 @@ mod tests {
                 fail: false,
                 fail_stderr: String::new(),
                 cat_stdout: None,
+                run_bytes_out: Default::default(),
+                last_bytes_call: Default::default(),
             }
         }
 
@@ -803,6 +951,8 @@ mod tests {
                 fail: true,
                 fail_stderr: stderr.into(),
                 cat_stdout: None,
+                run_bytes_out: Default::default(),
+                last_bytes_call: Default::default(),
             }
         }
 
@@ -815,6 +965,35 @@ mod tests {
                 fail: false,
                 fail_stderr: String::new(),
                 cat_stdout: Some(cat_stdout.into()),
+                run_bytes_out: Default::default(),
+                last_bytes_call: Default::default(),
+            }
+        }
+
+        /// Variant for `run_bytes` tests: scripts a successful stdout-bytes
+        /// response.
+        fn with_bytes_ok(bytes: Vec<u8>) -> Self {
+            Self {
+                commands: Default::default(),
+                tail_lines: vec![],
+                fail: false,
+                fail_stderr: String::new(),
+                cat_stdout: None,
+                run_bytes_out: std::sync::Mutex::new(Some(Ok(bytes))),
+                last_bytes_call: Default::default(),
+            }
+        }
+
+        /// Variant for `run_bytes` tests: scripts a failing response.
+        fn with_bytes_err(err: RemoteExecError) -> Self {
+            Self {
+                commands: Default::default(),
+                tail_lines: vec![],
+                fail: false,
+                fail_stderr: String::new(),
+                cat_stdout: None,
+                run_bytes_out: std::sync::Mutex::new(Some(Err(err))),
+                last_bytes_call: Default::default(),
             }
         }
     }
@@ -856,10 +1035,23 @@ mod tests {
                 .chain(futures_util::stream::pending::<std::io::Result<String>>());
             Ok(Box::pin(stream))
         }
+
+        async fn run_bytes(
+            &self,
+            remote_command: &str,
+            stdin: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            *self.last_bytes_call.lock().unwrap() = Some((remote_command.to_string(), stdin));
+            self.run_bytes_out
+                .lock()
+                .unwrap()
+                .take()
+                .expect("run_bytes_out not scripted")
+        }
     }
 
-    fn make_conn(
-        fake: std::sync::Arc<FakeExec>,
+    fn make_conn<E: RemoteExec + 'static>(
+        fake: std::sync::Arc<E>,
     ) -> (
         SshHostConnector,
         std::sync::Arc<rupu_orchestrator::RunStore>,
@@ -871,9 +1063,10 @@ mod tests {
         let mirror = std::sync::Arc::new(crate::node::NodeMirror::new(std::sync::Arc::clone(
             &run_store,
         )));
+        let exec: std::sync::Arc<dyn RemoteExec> = fake;
         let conn = SshHostConnector::new(
             "host_abc",
-            fake,
+            exec,
             mirror,
             std::sync::Arc::clone(&run_store),
             rupu_config::PricingConfig::default(),
@@ -1050,5 +1243,297 @@ mod tests {
             contents.contains(event_json),
             "expected event line in events.jsonl, got: {contents:?}"
         );
+    }
+
+    // ── Workspace sync (stage/collect/discard) tests ─────────────────────────
+
+    #[tokio::test]
+    async fn ssh_stage_returns_working_dir_line() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(
+            b"/cache/workspace-sync/x/work\n".to_vec(),
+        ));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let dir = conn.stage_workspace(b"PAYLOAD".to_vec()).await.unwrap();
+        assert_eq!(dir, "/cache/workspace-sync/x/work");
+
+        let (cmd, stdin) = fake.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert!(cmd.contains("__workspace") && cmd.contains("stage"));
+        assert_eq!(stdin.as_deref(), Some(&b"PAYLOAD"[..]));
+    }
+
+    #[tokio::test]
+    async fn ssh_stage_nonzero_maps_to_remote_error() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(1),
+            stderr: "helper failed".into(),
+        }));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn.stage_workspace(b"x".to_vec()).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Remote(1, _)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn ssh_stage_spawn_failure_maps_to_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::Spawn(
+            "no route".into(),
+        )));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn.stage_workspace(b"x".to_vec()).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn ssh_stage_oversize_payload_rejected() {
+        // No run_bytes call is expected to reach the exec — the size guard
+        // must reject before spawning ssh — but script an Ok anyway so a
+        // regression that skips the guard fails loudly on the assertion
+        // below rather than panicking on an un-scripted FakeExec.
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(Vec::new()));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let huge = vec![0u8; MAX_WORKSPACE_BYTES + 1];
+        let err = conn.stage_workspace(huge).await.unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+        assert!(
+            fake.last_bytes_call.lock().unwrap().is_none(),
+            "oversize payload must be rejected before touching run_bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_collect_returns_delta_bytes() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(b"DELTA-BYTES".to_vec()));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let bytes = conn
+            .collect_workspace_delta("/cache/workspace-sync/x/work")
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"DELTA-BYTES");
+
+        let (cmd, stdin) = fake.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert!(cmd.contains("__workspace") && cmd.contains("collect"));
+        assert!(stdin.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_collect_oversize_rejected() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(vec![0u8; MAX_WORKSPACE_BYTES + 1]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn
+            .collect_workspace_delta("/cache/workspace-sync/x/work")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Invalid(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn ssh_discard_issues_remote_discard_command() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_ok(Vec::new()));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        conn.discard_workspace("/cache/workspace-sync/x/work")
+            .await
+            .unwrap();
+
+        let (cmd, stdin) = fake.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert!(cmd.contains("__workspace") && cmd.contains("discard"));
+        assert!(stdin.is_none());
+    }
+
+    #[tokio::test]
+    async fn ssh_discard_maps_remote_failure() {
+        let fake = std::sync::Arc::new(FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(3),
+            stderr: "already gone".into(),
+        }));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        // discard_workspace itself still surfaces a mapped error — the
+        // dispatcher (not this connector) is what treats it as best-effort by
+        // ignoring the `Result`.
+        let err = conn
+            .discard_workspace("/cache/workspace-sync/x/work")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostConnectorError::Remote(3, _)), "{err:?}");
+    }
+
+    // ── End-to-end SSH workspace-sync parity (ssh-ws T5) ─────────────────────
+    //
+    // `RemoteExec` and `SshHostConnector` are `pub(crate)`, so this e2e cannot
+    // live in `crates/rupu-cp/tests/` as an integration test — it is a unit
+    // test here instead, mirroring where the existing `FakeExec` SSH tests
+    // live. `HelperExec` is a `RemoteExec` double that, unlike `FakeExec`
+    // above (which returns scripted bytes), actually calls the *real* shared
+    // staging core (`workspace_stage::stage_to_dir` / `collect_from_dir`)
+    // against a tempdir standing in for the remote cache root. This proves
+    // the SSH connector's command-building + byte-piping wiring end-to-end
+    // against the same core the Local/HttpCp transports use (3c's
+    // `workspace_sync_e2e.rs`), for both a git and a non-git (tar) workspace.
+    mod e2e_workspace_sync {
+        use super::*;
+        use crate::host::workspace_stage::{collect_from_dir, stage_to_dir};
+
+        /// A `RemoteExec` double that dispatches on the remote command string
+        /// and runs the *real* shared staging core against `self.cache`
+        /// (standing in for the remote host's cache root). Stateful — unlike
+        /// `FakeExec`'s single-shot scripted `run_bytes`, this must serve both
+        /// a stage call and a collect call for the same test.
+        struct HelperExec {
+            cache: tempfile::TempDir,
+        }
+
+        impl HelperExec {
+            fn new() -> Self {
+                Self {
+                    cache: tempfile::tempdir().unwrap(),
+                }
+            }
+        }
+
+        /// Extract the last single-quoted token from a `build_remote_command`
+        /// output, e.g. `'rupu' '__workspace' 'collect' '/cache/.../work'` ->
+        /// `/cache/.../work`. Good enough for test-generated paths, which
+        /// never contain an embedded `'`.
+        fn last_quoted_arg(cmd: &str) -> String {
+            let trimmed = cmd.trim_end();
+            let body = trimmed
+                .strip_suffix('\'')
+                .expect("remote command must end with a quoted arg");
+            let start = body.rfind('\'').expect("expected an opening quote") + 1;
+            body[start..].to_string()
+        }
+
+        #[async_trait::async_trait]
+        impl RemoteExec for HelperExec {
+            async fn run(&self, _remote_command: &str) -> Result<RemoteOutput, RemoteExecError> {
+                unimplemented!("HelperExec only exercises run_bytes for workspace sync")
+            }
+
+            fn spawn_lines(&self, _remote_command: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("HelperExec only exercises run_bytes for workspace sync")
+            }
+
+            async fn run_bytes(
+                &self,
+                remote_command: &str,
+                stdin: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                if remote_command.contains("__workspace") && remote_command.contains("stage") {
+                    let payload = stdin.unwrap_or_default();
+                    let dir = stage_to_dir(&payload, self.cache.path()).map_err(|e| {
+                        RemoteExecError::NonZero {
+                            code: Some(1),
+                            stderr: e.to_string(),
+                        }
+                    })?;
+                    let mut out = dir.into_bytes();
+                    out.push(b'\n');
+                    Ok(out)
+                } else if remote_command.contains("__workspace")
+                    && remote_command.contains("collect")
+                {
+                    let dir = last_quoted_arg(remote_command);
+                    collect_from_dir(&dir, self.cache.path()).map_err(|e| {
+                        RemoteExecError::NonZero {
+                            code: Some(1),
+                            stderr: e.to_string(),
+                        }
+                    })
+                } else {
+                    panic!("HelperExec: unexpected remote command: {remote_command}");
+                }
+            }
+        }
+
+        /// Build a coordinator workspace: a plain non-git dir when `use_git`
+        /// is `false`, or a minimal git repo with one committed file when
+        /// `true` — mirrors `workspace_stage::tests::git_init`.
+        fn build_workspace(dir: &std::path::Path, use_git: bool) {
+            std::fs::write(dir.join("a.txt"), "orig").unwrap();
+            if use_git {
+                let repo = git2::Repository::init(dir).unwrap();
+                let mut cfg = repo.config().unwrap();
+                cfg.set_str("user.name", "t").unwrap();
+                cfg.set_str("user.email", "t@e").unwrap();
+                let mut idx = repo.index().unwrap();
+                idx.add_path(std::path::Path::new("a.txt")).unwrap();
+                idx.write().unwrap();
+                let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+                let sig = repo.signature().unwrap();
+                repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                    .unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn ssh_workspace_sync_round_trips_git_and_tar() {
+            for use_git in [true, false] {
+                // 1. Build the coordinator workspace and pack it.
+                let coordinator = tempfile::tempdir().unwrap();
+                build_workspace(coordinator.path(), use_git);
+                let payload = rupu_workspace::pack(coordinator.path()).unwrap();
+                assert_eq!(
+                    payload.mode,
+                    if use_git {
+                        rupu_workspace::SyncMode::Git
+                    } else {
+                        rupu_workspace::SyncMode::Tar
+                    },
+                    "use_git={use_git}"
+                );
+                let encoded = crate::host::connector::encode_payload(&payload);
+
+                // 2. SshHostConnector wired to a HelperExec backed by a fresh
+                // tempdir cache root standing in for the remote host.
+                let fake = std::sync::Arc::new(HelperExec::new());
+                let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+                // 3. Stage: connector pipes the encoded payload over
+                // `run_bytes`, HelperExec runs the real `stage_to_dir`.
+                let dir = conn.stage_workspace(encoded).await.unwrap_or_else(|e| {
+                    panic!("stage_workspace failed (use_git={use_git}): {e:?}")
+                });
+
+                // 4. Simulate the remote agent editing a file under `dir`.
+                std::fs::write(std::path::Path::new(&dir).join("a.txt"), "EDITED").unwrap();
+
+                // 5. Collect: connector issues the collect command, HelperExec
+                // runs the real `collect_from_dir`, returns the encoded delta.
+                let delta_bytes = conn
+                    .collect_workspace_delta(&dir)
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("collect_workspace_delta failed (use_git={use_git}): {e:?}")
+                    });
+                let delta = crate::host::connector::decode_delta(&delta_bytes).unwrap();
+                assert!(
+                    delta.changed.iter().any(|p| p == "a.txt"),
+                    "use_git={use_git}: expected a.txt in changed set, got {:?}",
+                    delta.changed
+                );
+
+                // 6. Apply the delta to a FRESH copy of the coordinator
+                // workspace (not the one that was packed) and assert the
+                // edit landed — proving parity with the Local/HttpCp path
+                // over the SSH command/pipe wiring.
+                let fresh = tempfile::tempdir().unwrap();
+                build_workspace(fresh.path(), use_git);
+                rupu_workspace::apply_deltas(fresh.path(), std::slice::from_ref(&delta)).unwrap();
+                let applied = std::fs::read_to_string(fresh.path().join("a.txt")).unwrap();
+                assert_eq!(
+                    applied, "EDITED",
+                    "use_git={use_git}: edit must land on the fresh coordinator copy"
+                );
+
+                // Scratch dir is cleaned up by collect_from_dir.
+                assert!(!std::path::Path::new(&dir).exists());
+            }
+        }
     }
 }

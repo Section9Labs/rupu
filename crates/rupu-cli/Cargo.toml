@@ -70,3 +70,6 @@ assert_cmd = { workspace = true }
 predicates.workspace = true
 httpmock.workspace = true
 tar.workspace = true
+# test-util only (paused virtual clock) — layered on the same workspace
+# `tokio` dependency already pulled in normally; only affects test builds.
+tokio = { workspace = true, features = ["test-util"] }

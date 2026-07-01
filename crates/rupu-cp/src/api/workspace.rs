@@ -1,7 +1,8 @@
 //! Workspace-sync HTTP endpoints (multi-host Slice 3c).
 //!
 //! Backs the [`HttpHostConnector`](crate::host::http::HttpHostConnector)'s
-//! `stage_workspace` / `collect_workspace_delta` over the wire:
+//! `stage_workspace` / `collect_workspace_delta` / `discard_workspace` over the
+//! wire:
 //!
 //! - `POST /api/workspace/stage` — body is a wire-encoded
 //!   [`rupu_workspace::Payload`]; stages it under `<global_dir>/workspace-sync/`
@@ -9,17 +10,23 @@
 //! - `GET  /api/workspace/delta?dir=<working_dir>` — diffs the staged working
 //!   dir against its baseline sidecar and returns the wire-encoded
 //!   [`rupu_workspace::Delta`] as `application/octet-stream`.
+//! - `DELETE /api/workspace/discard?dir=<working_dir>` — best-effort removal
+//!   of a staged scratch dir when the coordinator failed between stage and
+//!   collect (launch failure, poll timeout) and never called the delta
+//!   endpoint. Returns `{ "ok": true }`.
 //!
-//! Both are backed by `rupu_workspace::{stage,collect_delta}` plus the shared
-//! baseline sidecar codec in [`crate::host::connector`], so a CP host serves
-//! exactly the same staging mechanism the in-process local connector uses.
+//! `stage`/`delta` are backed by `rupu_workspace::{stage,collect_delta}` plus
+//! the shared baseline sidecar codec in [`crate::host::connector`], so a CP
+//! host serves exactly the same staging mechanism the in-process local
+//! connector uses. `discard` shares the confinement guard + scratch-removal
+//! logic in [`crate::host::workspace_stage`] with the local connector.
 
 #![deny(clippy::all)]
 
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Query, State},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -30,6 +37,7 @@ use crate::{
     host::connector::{
         decode_payload, deserialize_baseline, encode_delta, serialize_baseline, MAX_WORKSPACE_BYTES,
     },
+    host::workspace_stage::discard_from_dir,
     state::AppState,
 };
 
@@ -44,6 +52,7 @@ pub fn routes() -> Router<AppState> {
             post(stage_workspace).layer(DefaultBodyLimit::max(MAX_WORKSPACE_BYTES)),
         )
         .route("/api/workspace/delta", get(collect_workspace_delta))
+        .route("/api/workspace/discard", delete(discard_workspace))
 }
 
 /// Root under which all staged workspaces live. The `dir` query param of the
@@ -112,6 +121,19 @@ async fn collect_workspace_delta(
     // Best-effort scratch cleanup once the delta has been read out.
     let _ = std::fs::remove_dir_all(base);
     Ok(bytes)
+}
+
+/// `DELETE /api/workspace/discard?dir=<working_dir>` — best-effort removal of
+/// a staged scratch dir the coordinator abandoned (launch failure or poll
+/// timeout) without ever calling `collect_workspace_delta`. Shares the
+/// confinement guard + removal logic in [`crate::host::workspace_stage`] with
+/// [`crate::host::local::LocalHostConnector::discard_workspace`].
+async fn discard_workspace(
+    State(s): State<AppState>,
+    Query(q): Query<DeltaQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    discard_from_dir(&q.dir, &s.global_dir).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -269,5 +291,67 @@ mod tests {
             msg.contains("outside"),
             "error message must mention 'outside', got: {msg}"
         );
+    }
+
+    // ── discard endpoint ──────────────────────────────────────────────────────
+
+    /// `DELETE /api/workspace/discard?dir=<staged>` removes the scratch dir
+    /// without ever collecting a delta — simulating a coordinator that gave up
+    /// after a launch failure.
+    #[tokio::test]
+    async fn discard_removes_staged_scratch_without_collecting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = test_state(&tmp);
+
+        let body = axum::body::Bytes::from(tar_payload("hello.txt", b"world"));
+        let stage_resp = stage_workspace(State(state.clone()), body)
+            .await
+            .expect("stage must succeed");
+        let working_dir = stage_resp
+            .0
+            .get("working_dir")
+            .and_then(|v| v.as_str())
+            .expect("response must contain working_dir")
+            .to_string();
+        let base = std::path::Path::new(&working_dir)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert!(base.exists(), "scratch base must exist after staging");
+
+        discard_workspace(
+            State(state),
+            Query(DeltaQuery {
+                dir: working_dir.clone(),
+            }),
+        )
+        .await
+        .expect("discard must succeed");
+
+        assert!(!base.exists(), "scratch base must be removed by discard");
+    }
+
+    /// `DELETE /api/workspace/discard?dir=<outside>` must reject paths outside
+    /// the sync root, same as the delta endpoint.
+    #[tokio::test]
+    async fn discard_rejects_working_dir_outside_sync_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = test_state(&tmp);
+
+        let sync_root = tmp.path().join("workspace-sync");
+        std::fs::create_dir_all(&sync_root).unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+
+        let result = discard_workspace(
+            State(state),
+            Query(DeltaQuery {
+                dir: outside.path().to_string_lossy().into_owned(),
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "path outside sync root must be rejected");
+        let crate::error::ApiError(status, _msg) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
