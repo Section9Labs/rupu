@@ -82,6 +82,7 @@ impl StepFactory for FakeFactory {
             surface_tag: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            pause: None,
         }
     }
 }
@@ -401,6 +402,7 @@ async fn panel_gate_emits_panel_round_events() {
                 surface_tag: None,
                 context_window_tokens: None,
                 compact_at_percent: None,
+                pause: None,
             }
         }
     }

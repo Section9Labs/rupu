@@ -6761,6 +6761,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // matches the spec's per-session derivation.
         scope_name: Some(session.session_id.clone()),
         surface_tag: Some("session".to_string()),
+        pause: None,
     };
 
     let outcome = rupu_agent::run_agent(opts).await;

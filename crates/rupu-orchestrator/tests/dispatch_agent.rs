@@ -201,6 +201,7 @@ impl StepFactory for DispatchFactory {
             surface_tag: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            pause: None,
         }
     }
 }
@@ -365,6 +366,7 @@ async fn dispatch_to_unlisted_agent_is_blocked_by_allowlist() {
                 surface_tag: None,
                 context_window_tokens: None,
                 compact_at_percent: None,
+                pause: None,
             }
         }
     }

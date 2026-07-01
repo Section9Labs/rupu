@@ -456,6 +456,7 @@ mod tests {
                 surface_tag: None,
                 context_window_tokens: None,
                 compact_at_percent: None,
+                pause: None,
             }
         }
     }

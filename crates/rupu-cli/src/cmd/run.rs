@@ -381,6 +381,7 @@ async fn run_inner(args: Args) -> anyhow::Result<()> {
         surface_tag: None,
         context_window_tokens: spec.context_window_tokens,
         compact_at_percent: spec.compact_at_percent,
+        pause: None,
     };
 
     // Spawn the agent in a background task and tail the transcript with
