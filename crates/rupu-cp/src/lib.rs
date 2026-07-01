@@ -4,6 +4,7 @@
 
 pub mod agent_launcher;
 pub mod api;
+pub mod config_write;
 pub mod definition_generator;
 pub mod embed;
 pub mod error;
@@ -121,7 +122,9 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .with_agent_launcher(opts.agent_launcher.clone())
         .with_session_starter(opts.session_starter.clone())
         .with_generator(opts.generator)
-        .with_session_mutator(opts.session_mutator.clone());
+        .with_session_mutator(opts.session_mutator.clone())
+        .with_bind(opts.bind.to_string())
+        .with_token_set(opts.token.is_some());
 
     // Replace the default read-only registry with a fully-wired one that
     // holds the real launcher / sender / starter adapters.

@@ -1,7 +1,8 @@
 // Project detail — tabbed shell. Loads the project bundle once, paints the
 // persistent identity header + 5 rollup tiles, then a TabBar that routes
-// between five tab bodies (Overview / Runs / Findings / Sessions / Coverage).
-// The active tab is driven by the `tab` prop, set per-route in App.tsx.
+// between six tab bodies (Overview / Runs / Findings / Sessions / Coverage /
+// Config). The active tab is driven by the `tab` prop, set per-route in
+// App.tsx.
 
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
@@ -12,6 +13,7 @@ import {
   LayoutDashboard,
   ListOrdered,
   MessageSquare,
+  Settings as SettingsIcon,
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react';
@@ -26,10 +28,11 @@ import ProjectRunsTab from '../components/project/ProjectRunsTab';
 import ProjectFindingsTab from '../components/project/ProjectFindingsTab';
 import ProjectSessionsTab from '../components/project/ProjectSessionsTab';
 import ProjectCoverageTab from '../components/project/ProjectCoverageTab';
+import ProjectConfigTab from '../components/project/ProjectConfigTab';
 import { relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 
-export type ProjectTab = 'overview' | 'runs' | 'findings' | 'sessions' | 'coverage';
+export type ProjectTab = 'overview' | 'runs' | 'findings' | 'sessions' | 'coverage' | 'config';
 
 // ---------------------------------------------------------------------------
 // Rollup tile
@@ -275,6 +278,12 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
             icon={ShieldCheck}
             label="Coverage"
           />
+          <TabButton
+            active={tab === 'config'}
+            onClick={() => navigate(`/projects/${encodedId}/config`)}
+            icon={SettingsIcon}
+            label="Config"
+          />
         </TabBar>
       </div>
 
@@ -286,6 +295,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       {tab === 'findings' && <ProjectFindingsTab wsId={p.ws_id} />}
       {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
       {tab === 'coverage' && <ProjectCoverageTab wsId={p.ws_id} />}
+      {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} />}
     </div>
   );
 }

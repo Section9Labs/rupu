@@ -82,7 +82,7 @@ fn read_toml_file(path: &Path) -> Result<Value, LayerError> {
     })
 }
 
-fn read_optional_toml(path: Option<&Path>) -> Result<Option<Value>, LayerError> {
+pub(crate) fn read_optional_toml(path: Option<&Path>) -> Result<Option<Value>, LayerError> {
     let Some(path) = path else { return Ok(None) };
     match read_toml_file(path) {
         Ok(v) => Ok(Some(v)),

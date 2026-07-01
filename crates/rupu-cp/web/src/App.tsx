@@ -82,12 +82,13 @@ export default function App() {
             {/* Projects */}
             <Route path="/projects" element={<Suspense fallback={<PageFallback />}><Projects /></Suspense>} />
             {/* Static scoped sub-pages MUST come before the :wsId wildcard.
-                The tabbed shell renders for overview + 4 tab routes; only
+                The tabbed shell renders for overview + 5 tab routes; only
                 Definitions stays a standalone page. */}
             <Route path="/projects/:wsId/runs" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="runs" /></Suspense>} />
             <Route path="/projects/:wsId/findings" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="findings" /></Suspense>} />
             <Route path="/projects/:wsId/sessions" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="sessions" /></Suspense>} />
             <Route path="/projects/:wsId/coverage" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="coverage" /></Suspense>} />
+            <Route path="/projects/:wsId/config" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="config" /></Suspense>} />
             <Route path="/projects/:wsId/definitions" element={<Suspense fallback={<PageFallback />}><ProjectDefinitions /></Suspense>} />
             <Route path="/projects/:wsId" element={<Suspense fallback={<PageFallback />}><ProjectDetail tab="overview" /></Suspense>} />
           </Route>

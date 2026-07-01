@@ -43,6 +43,10 @@ pub struct Config {
     pub pricing: PricingConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub policy: crate::policy_config::PolicyConfig,
+    #[serde(default)]
+    pub cp: crate::policy_config::CpConfig,
 }
 
 /// Terminal-output rendering preferences. Consumed by

@@ -30,6 +30,9 @@ reqwest = { workspace = true, features = ["json", "stream"] }
 ulid.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
+toml.workspace = true
+toml_edit = { workspace = true }
+fs2 = { workspace = true }
 
 # In-workspace
 rupu-orchestrator = { path = "../rupu-orchestrator" }

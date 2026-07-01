@@ -1,16 +1,20 @@
 /**
  * CodeHighlight — read-only syntax highlighting for definition files in the
- * Build section (workflows / agents / autoflows).
+ * Build section (workflows / agents / autoflows) and for the CP Settings Raw
+ * tab's TOML preview.
  *
- * Uses highlight.js core with only `yaml` and `markdown` registered to keep the
- * bundle lean, reusing the same GitHub light theme as the transcript markdown
- * renderer. Highlighted markup is injected via `dangerouslySetInnerHTML`; the
- * input is trusted local definition-file text and highlight.js escapes its own
- * output.
+ * Uses highlight.js core with only `yaml`, `markdown`, and `ini` registered to
+ * keep the bundle lean, reusing the same GitHub light theme as the transcript
+ * markdown renderer. `ini`'s grammar ships a built-in `toml` alias — TOML's
+ * `key = value` / `[section]` syntax highlights correctly under it without
+ * pulling in a dedicated TOML grammar/dependency. Highlighted markup is
+ * injected via `dangerouslySetInnerHTML`; the input is trusted local
+ * definition/config text and highlight.js escapes its own output.
  *
  * Two modes:
  *  - `<CodeHighlight code={yaml} language="yaml" />` — highlight the whole
- *    string as one language (workflows / autoflows, which are pure YAML).
+ *    string as one language (workflows / autoflows, which are pure YAML; the
+ *    Settings Raw tab passes `language="toml"`).
  *  - `<CodeHighlight code={raw} frontmatter />` — detect a leading YAML
  *    frontmatter block, highlight it as YAML and the rest as markdown (agent
  *    `.md` definition files).
@@ -19,6 +23,7 @@
 import hljs from 'highlight.js/lib/core';
 import yaml from 'highlight.js/lib/languages/yaml';
 import markdown from 'highlight.js/lib/languages/markdown';
+import ini from 'highlight.js/lib/languages/ini';
 
 // Light GitHub-style theme — matches the transcript markdown renderer; the CP
 // is light-only so no dark-mode switching is needed.
@@ -26,8 +31,10 @@ import 'highlight.js/styles/github.css';
 
 hljs.registerLanguage('yaml', yaml);
 hljs.registerLanguage('markdown', markdown);
+// Registers the `toml` alias too (see module doc above).
+hljs.registerLanguage('ini', ini);
 
-type Language = 'yaml' | 'markdown';
+type Language = 'yaml' | 'markdown' | 'toml';
 
 // Matches a leading `---` … `---` frontmatter fence. The body capture keeps its
 // original line endings; an unterminated fence simply doesn't match.

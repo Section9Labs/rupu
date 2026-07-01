@@ -1,6 +1,6 @@
 use rupu_orchestrator::runs::RunStore;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -11,6 +11,9 @@ pub struct AppState {
     pub workspace_dir: PathBuf,
     pub run_store: Arc<RunStore>,
     pub pricing: rupu_config::PricingConfig,
+    /// The resolved global config snapshot, reloaded after a config write so
+    /// newly-started runs see updated values. Read via `config.read()`.
+    pub config: Arc<RwLock<rupu_config::Config>>,
     /// Optional run-launcher port. Defaults to `None`; rupu-cli's `cp serve`
     /// installs a subprocess-spawning adapter via [`AppState::with_launcher`].
     pub launcher: Option<Arc<dyn crate::launcher::RunLauncher>>,
@@ -42,6 +45,19 @@ pub struct AppState {
     /// Mirror writer: streams artifact frames from tunnel nodes into the
     /// central [`RunStore`] so node runs appear as first-class runs.
     pub node_mirror: Arc<crate::node::NodeMirror>,
+    /// The `--bind` address `rupu cp serve` was started with, as a display
+    /// string (e.g. `127.0.0.1:7878`). Surfaced read-only via
+    /// `GET /api/config`'s `status.bind` so the settings UI can show it next
+    /// to the `restart_required` keys that change requires a restart to
+    /// apply. Defaults to the CLI's documented default bind for tests / a
+    /// bare `AppState::new`.
+    pub bind: String,
+    /// Whether `rupu cp serve` was started with a bearer token configured.
+    /// A bool ONLY — the token value itself is never stored on `AppState`
+    /// (the bearer-check middleware in `server::router` closes over the raw
+    /// token directly), so it can never be echoed back through the config
+    /// API.
+    pub token_set: bool,
 }
 
 impl AppState {
@@ -77,11 +93,14 @@ impl AppState {
             ),
         );
 
+        let config = Arc::new(RwLock::new(Self::resolve_global_config(&global_dir)));
+
         Self {
             global_dir,
             workspace_dir,
             run_store,
             pricing,
+            config,
             launcher: None,
             session_sender: None,
             repos: None,
@@ -92,6 +111,8 @@ impl AppState {
             hosts,
             node_registry,
             node_mirror,
+            bind: "127.0.0.1:7878".to_string(),
+            token_set: false,
         }
     }
 
@@ -168,5 +189,47 @@ impl AppState {
     pub fn with_workspace_dir(mut self, p: PathBuf) -> Self {
         self.workspace_dir = p;
         self
+    }
+
+    /// Record the bind address `rupu cp serve` was started with, as a
+    /// display string. Purely informational (`GET /api/config`'s
+    /// `status.bind`) — changing it here does not rebind the listener.
+    pub fn with_bind(mut self, bind: String) -> Self {
+        self.bind = bind;
+        self
+    }
+
+    /// Record whether a bearer token was configured at `cp serve` startup.
+    /// The token value itself is never threaded through `AppState`.
+    pub fn with_token_set(mut self, token_set: bool) -> Self {
+        self.token_set = token_set;
+        self
+    }
+
+    /// Resolve the global config from `<global_dir>/config.toml` (no project
+    /// layer — the CP is a global-scope process). Falls back to
+    /// `Config::default()` if the file is absent, unparseable, or invalid, so
+    /// a broken config never blocks CP startup — it just serves defaults
+    /// until fixed.
+    fn resolve_global_config(global_dir: &std::path::Path) -> rupu_config::Config {
+        let path = global_dir.join("config.toml");
+        match rupu_config::resolve(Some(&path), None, &std::collections::BTreeMap::new()) {
+            Ok(r) => r.config,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to resolve global config; using defaults");
+                rupu_config::Config::default()
+            }
+        }
+    }
+
+    /// Re-resolve the global config from disk and swap it into the snapshot.
+    /// Called after a successful global-config write so already-running
+    /// handlers (and newly-started runs) observe the update without a
+    /// process restart.
+    pub fn reload_config(&self) {
+        let resolved = Self::resolve_global_config(&self.global_dir);
+        if let Ok(mut w) = self.config.write() {
+            *w = resolved;
+        }
     }
 }
