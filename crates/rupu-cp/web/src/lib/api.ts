@@ -878,6 +878,58 @@ export interface RunDiff {
 }
 
 // ---------------------------------------------------------------------------
+// Config (CP Settings)
+// ---------------------------------------------------------------------------
+
+/** Provenance source for one resolved config key — mirrors `rupu_config::KeySource`. */
+export type KeySource = 'global' | 'project' | 'env' | 'default';
+
+/** Mirrors `rupu_config::KeyProvenance` — where a resolved key's value came
+ *  from, and whether it is enforced by the global `[policy].lock` list. */
+export interface KeyProvenance {
+  source: KeySource;
+  locked: boolean;
+}
+
+/** Runtime status block on `GET /api/config` — no secret VALUE is ever
+ *  present, only `token_set: bool`. */
+export interface ConfigRuntimeStatus {
+  bind: string;
+  token_set: boolean;
+  restart_required_keys: string[];
+}
+
+/**
+ * `GET /api/config` response. `effective` is the resolved `rupu_config::Config`
+ * serialized loosely (the UI reads only the dotted keys it renders);
+ * `provenance` is keyed by the same dotted paths used in a `patch` body.
+ * `raw_global` / `raw_project` are the raw TOML text for each layer (used by
+ * the Task 5 Raw tab); `raw_project` is `null` when no `?project=` was given
+ * or that layer has no file yet.
+ */
+export interface ConfigView {
+  effective: Record<string, unknown>;
+  provenance: Record<string, KeyProvenance>;
+  raw_global: string;
+  raw_project: string | null;
+  cp: Record<string, unknown>;
+  status: ConfigRuntimeStatus;
+}
+
+/** Body for `PUT /api/config/global` and `PUT /api/config/project/:id` — either
+ *  the full raw TOML text, or a flat `dotted.key -> value` patch. Exactly one
+ *  should be set. */
+export interface ConfigWriteBody {
+  raw?: string;
+  patch?: Record<string, unknown>;
+}
+
+export interface ConfigWriteResult {
+  ok: boolean;
+  restart_required?: string[];
+}
+
+// ---------------------------------------------------------------------------
 // AI generation
 // ---------------------------------------------------------------------------
 
@@ -1510,6 +1562,38 @@ export const api = {
     return request<ProjectAssessedPct>(
       `/api/projects/${encodeURIComponent(wsId)}/coverage/assessed`,
     );
+  },
+
+  // --- Config (CP Settings) ---
+
+  /** Effective resolved config + per-key provenance. Pass `project` (a
+   *  workspace id) to also merge that project's `.rupu/config.toml` layer. */
+  getConfig(project?: string): Promise<ConfigView> {
+    const qs = project ? `?project=${encodeURIComponent(project)}` : '';
+    return request<ConfigView>(`/api/config${qs}`);
+  },
+  /**
+   * Persist a global config edit — either `{ raw }` (full TOML text) or
+   * `{ patch }` (flat `dotted.key -> value` edits merged onto the existing
+   * file). Reloads `AppState.config` server-side on success, so no restart is
+   * needed to observe the change. Throws `ApiError` with the validation
+   * message on 400 (unknown key / type mismatch), or 501 when this deploy has
+   * no launcher (`rupu cp serve` not running).
+   */
+  putGlobalConfig(body: ConfigWriteBody): Promise<ConfigWriteResult> {
+    return request<ConfigWriteResult>('/api/config/global', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
+  /** Set the GLOBAL `[policy].lock` enforced-key list (replaces it wholesale —
+   *  pass the full updated list, not a delta). 501 when this deploy has no
+   *  launcher. */
+  putPolicy(lock: string[]): Promise<{ ok: boolean }> {
+    return request<{ ok: boolean }>('/api/config/policy', {
+      method: 'PUT',
+      body: JSON.stringify({ lock }),
+    });
   },
 
   // --- Repos ---
