@@ -115,6 +115,8 @@ pub(crate) struct RemoteOutput {
 pub(crate) enum RemoteExecError {
     #[error("ssh spawn failed: {0}")]
     Spawn(String),
+    #[error("remote command exited with {code:?}: {stderr}")]
+    NonZero { code: Option<i32>, stderr: String },
 }
 
 /// A pinned, boxed stream of lines from a remote command.
@@ -133,6 +135,16 @@ pub(crate) trait RemoteExec: Send + Sync {
     /// The ssh child is kept alive for the stream's duration. When the stream
     /// is dropped the child is killed via `kill_on_drop(true)`.
     fn spawn_lines(&self, remote_command: &str) -> Result<LineStream, RemoteExecError>;
+
+    /// Run `remote_command`, writing `stdin` to it (if any), and return its
+    /// raw stdout bytes. Binary-safe — unlike `run`, which lossily decodes
+    /// UTF-8. A spawn/connection failure is `Spawn`; a nonzero remote exit is
+    /// `NonZero { code, stderr }`.
+    async fn run_bytes(
+        &self,
+        remote_command: &str,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, RemoteExecError>;
 }
 
 // ── Internal stream wrapper ───────────────────────────────────────────────────
@@ -220,6 +232,56 @@ impl RemoteExec for SshExec {
             inner: Box::pin(lines),
         };
         Ok(Box::pin(stream))
+    }
+
+    async fn run_bytes(
+        &self,
+        remote_command: &str,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, RemoteExecError> {
+        use tokio::io::AsyncWriteExt;
+        let argv = ssh_argv(
+            &self.host,
+            self.port,
+            self.identity_file.as_deref(),
+            remote_command,
+        );
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&argv)
+            .stdin(if stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
+        if let Some(bytes) = stdin {
+            let mut si = child
+                .stdin
+                .take()
+                .ok_or_else(|| RemoteExecError::Spawn("no stdin pipe".into()))?;
+            si.write_all(&bytes)
+                .await
+                .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
+            si.shutdown()
+                .await
+                .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
+            drop(si);
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| RemoteExecError::Spawn(e.to_string()))?;
+        if !out.status.success() {
+            return Err(RemoteExecError::NonZero {
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        Ok(out.stdout)
     }
 }
 
@@ -772,6 +834,35 @@ mod tests {
         assert_eq!(parse_tail_marker(""), None);
     }
 
+    #[tokio::test]
+    async fn run_bytes_pipes_stdin_and_returns_stdout_bytes() {
+        let exec = FakeExec::with_bytes_ok(b"DELTA".to_vec());
+        let out = exec
+            .run_bytes("rupu __workspace stage", Some(b"PAYLOAD".to_vec()))
+            .await
+            .expect("ok");
+        assert_eq!(out, b"DELTA");
+        let (cmd, stdin) = exec.last_bytes_call.lock().unwrap().clone().unwrap();
+        assert_eq!(cmd, "rupu __workspace stage");
+        assert_eq!(stdin.as_deref(), Some(&b"PAYLOAD"[..]));
+    }
+
+    #[tokio::test]
+    async fn run_bytes_nonzero_exit_is_error() {
+        let exec = FakeExec::with_bytes_err(RemoteExecError::NonZero {
+            code: Some(2),
+            stderr: "boom".into(),
+        });
+        let err = exec
+            .run_bytes("rupu __workspace collect /x", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RemoteExecError::NonZero { code: Some(2), .. }
+        ));
+    }
+
     // ── SshHostConnector tests ────────────────────────────────────────────────
 
     use crate::host::connector::HostConnectorError;
@@ -783,6 +874,10 @@ mod tests {
         fail_stderr: String,
         /// If set, returned as stdout when `run()` is called for a `cat …` command.
         cat_stdout: Option<String>,
+        /// Scripted result for `run_bytes`, taken on first call.
+        run_bytes_out: std::sync::Mutex<Option<Result<Vec<u8>, RemoteExecError>>>,
+        /// Records the `(remote_command, stdin)` of the last `run_bytes` call.
+        last_bytes_call: std::sync::Mutex<Option<(String, Option<Vec<u8>>)>>,
     }
 
     impl FakeExec {
@@ -793,6 +888,8 @@ mod tests {
                 fail: false,
                 fail_stderr: String::new(),
                 cat_stdout: None,
+                run_bytes_out: Default::default(),
+                last_bytes_call: Default::default(),
             }
         }
 
@@ -803,6 +900,8 @@ mod tests {
                 fail: true,
                 fail_stderr: stderr.into(),
                 cat_stdout: None,
+                run_bytes_out: Default::default(),
+                last_bytes_call: Default::default(),
             }
         }
 
@@ -815,6 +914,35 @@ mod tests {
                 fail: false,
                 fail_stderr: String::new(),
                 cat_stdout: Some(cat_stdout.into()),
+                run_bytes_out: Default::default(),
+                last_bytes_call: Default::default(),
+            }
+        }
+
+        /// Variant for `run_bytes` tests: scripts a successful stdout-bytes
+        /// response.
+        fn with_bytes_ok(bytes: Vec<u8>) -> Self {
+            Self {
+                commands: Default::default(),
+                tail_lines: vec![],
+                fail: false,
+                fail_stderr: String::new(),
+                cat_stdout: None,
+                run_bytes_out: std::sync::Mutex::new(Some(Ok(bytes))),
+                last_bytes_call: Default::default(),
+            }
+        }
+
+        /// Variant for `run_bytes` tests: scripts a failing response.
+        fn with_bytes_err(err: RemoteExecError) -> Self {
+            Self {
+                commands: Default::default(),
+                tail_lines: vec![],
+                fail: false,
+                fail_stderr: String::new(),
+                cat_stdout: None,
+                run_bytes_out: std::sync::Mutex::new(Some(Err(err))),
+                last_bytes_call: Default::default(),
             }
         }
     }
@@ -855,6 +983,19 @@ mod tests {
             let stream = futures_util::stream::iter(lines)
                 .chain(futures_util::stream::pending::<std::io::Result<String>>());
             Ok(Box::pin(stream))
+        }
+
+        async fn run_bytes(
+            &self,
+            remote_command: &str,
+            stdin: Option<Vec<u8>>,
+        ) -> Result<Vec<u8>, RemoteExecError> {
+            *self.last_bytes_call.lock().unwrap() = Some((remote_command.to_string(), stdin));
+            self.run_bytes_out
+                .lock()
+                .unwrap()
+                .take()
+                .expect("run_bytes_out not scripted")
         }
     }
 
