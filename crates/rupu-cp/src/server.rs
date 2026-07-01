@@ -50,6 +50,7 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         .merge(crate::api::autoflows::routes())
         .merge(crate::api::autoflow_claims::routes())
         .merge(crate::api::projects::routes())
+        .merge(crate::api::config::routes())
         .merge(crate::api::runs::routes())
         .merge(crate::api::agents::routes())
         .merge(crate::api::workflows::routes())

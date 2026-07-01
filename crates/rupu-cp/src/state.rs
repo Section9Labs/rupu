@@ -45,6 +45,19 @@ pub struct AppState {
     /// Mirror writer: streams artifact frames from tunnel nodes into the
     /// central [`RunStore`] so node runs appear as first-class runs.
     pub node_mirror: Arc<crate::node::NodeMirror>,
+    /// The `--bind` address `rupu cp serve` was started with, as a display
+    /// string (e.g. `127.0.0.1:7878`). Surfaced read-only via
+    /// `GET /api/config`'s `status.bind` so the settings UI can show it next
+    /// to the `restart_required` keys that change requires a restart to
+    /// apply. Defaults to the CLI's documented default bind for tests / a
+    /// bare `AppState::new`.
+    pub bind: String,
+    /// Whether `rupu cp serve` was started with a bearer token configured.
+    /// A bool ONLY — the token value itself is never stored on `AppState`
+    /// (the bearer-check middleware in `server::router` closes over the raw
+    /// token directly), so it can never be echoed back through the config
+    /// API.
+    pub token_set: bool,
 }
 
 impl AppState {
@@ -98,6 +111,8 @@ impl AppState {
             hosts,
             node_registry,
             node_mirror,
+            bind: "127.0.0.1:7878".to_string(),
+            token_set: false,
         }
     }
 
@@ -173,6 +188,21 @@ impl AppState {
     /// launched with an explicit `--workspace` argument.
     pub fn with_workspace_dir(mut self, p: PathBuf) -> Self {
         self.workspace_dir = p;
+        self
+    }
+
+    /// Record the bind address `rupu cp serve` was started with, as a
+    /// display string. Purely informational (`GET /api/config`'s
+    /// `status.bind`) — changing it here does not rebind the listener.
+    pub fn with_bind(mut self, bind: String) -> Self {
+        self.bind = bind;
+        self
+    }
+
+    /// Record whether a bearer token was configured at `cp serve` startup.
+    /// The token value itself is never threaded through `AppState`.
+    pub fn with_token_set(mut self, token_set: bool) -> Self {
+        self.token_set = token_set;
         self
     }
 

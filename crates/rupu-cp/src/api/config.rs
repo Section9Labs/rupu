@@ -1,0 +1,538 @@
+//! `rupu-cp` config read/write API (CP Settings).
+//!
+//! - `GET /api/config` (+ `?project=<ws_id>`) returns the effective resolved
+//!   config, per-key provenance, and the raw global/project TOML text so the
+//!   settings UI can offer both a form view and a raw editor.
+//! - `PUT /api/config/global` / `PUT /api/config/project/:id` persist an edit
+//!   (raw text or a flat form patch) after validating it against the typed
+//!   schema, then (for global) reload `AppState.config` so already-running
+//!   handlers observe the change without a process restart.
+//! - `PUT /api/config/policy` sets the GLOBAL `[policy].lock` list — the
+//!   enforced-key allowlist a project layer can never override (see
+//!   `rupu_config::resolve`).
+//!
+//! All writes require an installed [`crate::launcher::RunLauncher`] (the
+//! `cp serve` deployment marker) — a read-only `rupu cp` deploy with no
+//! launcher returns 501 for every `PUT` here, mirroring the host-add gate.
+//!
+//! Secrets are never echoed: `Config` has no token/secret field to begin
+//! with, and the bearer token `cp serve` was started with is never threaded
+//! onto `AppState` at all — only a `token_set: bool` is.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use axum::{
+    extract::{Path as AxPath, Query, State},
+    routing::{get, put},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    config_write::{apply_form_patch, validate_toml, write_atomic},
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/config", get(get_config))
+        .route("/api/config/global", put(put_global))
+        .route("/api/config/project/:id", put(put_project))
+        .route("/api/config/policy", put(put_policy))
+}
+
+#[derive(Deserialize)]
+struct ProjectQuery {
+    project: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RuntimeStatus {
+    bind: String,
+    token_set: bool,
+    restart_required_keys: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ConfigView {
+    effective: serde_json::Value,
+    provenance: BTreeMap<String, rupu_config::KeyProvenance>,
+    raw_global: String,
+    raw_project: Option<String>,
+    cp: serde_json::Value,
+    status: RuntimeStatus,
+}
+
+/// `GET /api/config` (+ `?project=<ws_id>`) — effective config + provenance +
+/// raw TOML text for both layers.
+async fn get_config(
+    State(s): State<AppState>,
+    Query(q): Query<ProjectQuery>,
+) -> ApiResult<Json<ConfigView>> {
+    let global = s.global_dir.join("config.toml");
+    let project_path = match &q.project {
+        Some(id) => Some(project_config_path(&s, id)?),
+        None => None,
+    };
+    let resolved = rupu_config::resolve(Some(&global), project_path.as_deref(), &BTreeMap::new())
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let raw_global = std::fs::read_to_string(&global).unwrap_or_default();
+    let raw_project = project_path
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    Ok(Json(ConfigView {
+        effective: serde_json::to_value(&resolved.config).unwrap_or(serde_json::Value::Null),
+        provenance: resolved.provenance,
+        raw_global,
+        raw_project,
+        cp: serde_json::to_value(&resolved.config.cp).unwrap_or(serde_json::Value::Null),
+        status: RuntimeStatus {
+            bind: s.bind.clone(),
+            token_set: s.token_set,
+            restart_required_keys: vec!["bind".into(), "token".into()],
+        },
+    }))
+}
+
+#[derive(Deserialize)]
+struct ConfigWriteBody {
+    raw: Option<String>,
+    patch: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct PolicyBody {
+    lock: Vec<String>,
+}
+
+/// Writes require an installed `RunLauncher` — the same "is this a `cp
+/// serve` deployment" marker every other write-path gate in this crate uses
+/// (see `api/hosts.rs`'s host-add gate).
+fn require_writable(s: &AppState) -> ApiResult<()> {
+    s.launcher
+        .as_ref()
+        .map(|_| ())
+        .ok_or_else(|| ApiError::not_available("editing config requires `rupu cp serve`"))
+}
+
+/// Materialize the write body into candidate TOML text (form patch merged
+/// onto `existing`, or the raw text verbatim) and validate it against the
+/// typed schema. Does not touch disk.
+fn candidate_toml(body: &ConfigWriteBody, existing: &str) -> ApiResult<String> {
+    let cand = match (&body.raw, &body.patch) {
+        (Some(raw), _) => raw.clone(),
+        (None, Some(patch)) => {
+            apply_form_patch(existing, patch).map_err(|e| ApiError::bad_request(e.to_string()))?
+        }
+        (None, None) => return Err(ApiError::bad_request("body needs `raw` or `patch`")),
+    };
+    validate_toml(&cand).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(cand)
+}
+
+/// Run `write_atomic` on a blocking worker thread. `write_atomic` takes an
+/// `fs2` exclusive file lock (`lock_exclusive`, which BLOCKS) — calling it
+/// directly from an async handler would stall the Tokio worker it runs on
+/// for as long as the lock is held. `spawn_blocking` moves the write onto the
+/// blocking thread pool; the handler `.await`s the join and maps a panicked
+/// task to `ApiError::internal`.
+async fn write_atomic_blocking(path: PathBuf, contents: String) -> ApiResult<()> {
+    tokio::task::spawn_blocking(move || write_atomic(&path, &contents))
+        .await
+        .map_err(|e| ApiError::internal(format!("config write task panicked: {e}")))?
+        .map_err(|e| ApiError::internal(e.to_string()))
+}
+
+/// `PUT /api/config/global` — persist a global config edit, then reload
+/// `AppState.config` so already-running handlers observe the update without
+/// a process restart.
+async fn put_global(
+    State(s): State<AppState>,
+    Json(body): Json<ConfigWriteBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_writable(&s)?;
+    let path = s.global_dir.join("config.toml");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let cand = candidate_toml(&body, &existing)?;
+    write_atomic_blocking(path, cand).await?;
+    s.reload_config();
+    Ok(Json(
+        serde_json::json!({ "ok": true, "restart_required": [] }),
+    ))
+}
+
+/// `PUT /api/config/project/:id` — persist a project-layer config edit under
+/// `<workspace path>/.rupu/config.toml`. Rejects an edit that would set a key
+/// enforced by the GLOBAL `[policy].lock` list (a project layer can never
+/// override a locked key at resolution time anyway; rejecting the write up
+/// front gives the operator a clear error instead of a silently-ignored
+/// setting).
+async fn put_project(
+    State(s): State<AppState>,
+    AxPath(id): AxPath<String>,
+    Json(body): Json<ConfigWriteBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_writable(&s)?;
+    let path = project_config_path(&s, &id)?;
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let cand = candidate_toml(&body, &existing)?;
+    reject_locked_project_keys(&s, &cand)?;
+    write_atomic_blocking(path, cand).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// `PUT /api/config/policy` — set the GLOBAL `[policy].lock` enforced-key
+/// list. Always operates on the global layer: locks are only ever read from
+/// there (see `rupu_config::resolve`'s doc comment).
+async fn put_policy(
+    State(s): State<AppState>,
+    Json(body): Json<PolicyBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_writable(&s)?;
+    let path = s.global_dir.join("config.toml");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let patch = serde_json::json!({ "policy.lock": body.lock });
+    let cand =
+        apply_form_patch(&existing, &patch).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    validate_toml(&cand).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    write_atomic_blocking(path, cand).await?;
+    s.reload_config();
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Resolve a project's `.rupu/config.toml` path from its workspace id and
+/// confine it under the workspace's own recorded root.
+///
+/// The workspace's `path` field is documented as "canonical absolute path"
+/// (set via `Path::canonicalize` at workspace-registration time), but this
+/// loads it back off disk as plain TOML — a corrupted or hand-edited record
+/// could point anywhere. Canonicalizing it here and checking the joined
+/// `.rupu/config.toml` still starts with that canonical root is defense in
+/// depth against a workspace record steering a config write outside the
+/// project tree, mirroring `host::workspace_stage::confine`'s guard for
+/// staged workspace dirs.
+fn project_config_path(s: &AppState, id: &str) -> ApiResult<PathBuf> {
+    let store = rupu_workspace::WorkspaceStore {
+        root: s.global_dir.join("workspaces"),
+    };
+    let ws = match store.load(id) {
+        Ok(Some(w)) => w,
+        Ok(None) => return Err(ApiError::not_found(format!("project {id} not found"))),
+        Err(e) => return Err(ApiError::internal(e.to_string())),
+    };
+    let root = Path::new(&ws.path);
+    let root_canon = root
+        .canonicalize()
+        .map_err(|e| ApiError::bad_request(format!("project path invalid: {e}")))?;
+    let candidate = root_canon.join(".rupu").join("config.toml");
+    if !candidate.starts_with(&root_canon) {
+        return Err(ApiError::bad_request("config path escapes project root"));
+    }
+    Ok(candidate)
+}
+
+/// Flatten a parsed TOML value to dotted leaf-key paths (tables recurse;
+/// scalars and arrays are leaves). Mirrors `rupu_config::resolve`'s private
+/// `flatten` helper, duplicated here because that one isn't exported — used
+/// only to check candidate project keys against the global lock list, not
+/// for the actual layered-merge semantics.
+fn flatten_toml_keys(v: &toml::Value, prefix: &str, out: &mut Vec<String>) {
+    if let toml::Value::Table(t) = v {
+        for (k, vv) in t {
+            let key = if prefix.is_empty() {
+                k.clone()
+            } else {
+                format!("{prefix}.{k}")
+            };
+            match vv {
+                toml::Value::Table(_) => flatten_toml_keys(vv, &key, out),
+                _ => out.push(key),
+            }
+        }
+    }
+}
+
+/// Reject a project-layer candidate that sets a key enforced by the GLOBAL
+/// `[policy].lock` list. Reads the lock list from `AppState.config` — the
+/// global-only resolved snapshot (`resolve(global, None, ..)`), which is
+/// exactly where locks are sourced from.
+fn reject_locked_project_keys(s: &AppState, candidate_toml: &str) -> ApiResult<()> {
+    let lock = s
+        .config
+        .read()
+        .map(|c| c.policy.lock.clone())
+        .unwrap_or_default();
+    if lock.is_empty() {
+        return Ok(());
+    }
+    let value: toml::Value =
+        toml::from_str(candidate_toml).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let mut keys = Vec::new();
+    flatten_toml_keys(&value, "", &mut keys);
+    for key in &keys {
+        if lock.iter().any(|l| l == key) {
+            return Err(ApiError::bad_request(format!(
+                "key `{key}` is enforced by global policy"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn test_state(tmp: &tempfile::TempDir) -> AppState {
+        AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+    }
+
+    /// Never actually invoked in these tests — `require_writable` only
+    /// checks `launcher.is_some()`. Its presence marks the deployment as a
+    /// writable `cp serve`, mirroring how `api/workflows.rs`'s tests inject a
+    /// `MockLauncher`.
+    struct DummyLauncher;
+
+    #[async_trait::async_trait]
+    impl crate::launcher::RunLauncher for DummyLauncher {
+        async fn launch(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, crate::launcher::LaunchError> {
+            Ok("run_dummy".into())
+        }
+    }
+
+    fn writable_state(tmp: &tempfile::TempDir) -> AppState {
+        test_state(tmp).with_launcher(Some(Arc::new(DummyLauncher)))
+    }
+
+    /// Register a workspace record `<global_dir>/workspaces/<id>.toml` whose
+    /// `path` points at `project_root`.
+    fn register_workspace(tmp: &tempfile::TempDir, id: &str, project_root: &Path) {
+        std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        std::fs::write(
+            tmp.path().join("workspaces").join(format!("{id}.toml")),
+            format!(
+                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                project_root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_config_returns_effective_and_masks_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = test_state(&tmp);
+
+        let view = get_config(State(s), Query(ProjectQuery { project: None }))
+            .await
+            .expect("get_config ok")
+            .0;
+
+        assert_eq!(view.effective["default_model"], "opus");
+        let prov = view
+            .provenance
+            .get("default_model")
+            .expect("provenance for default_model");
+        assert!(matches!(prov.source, rupu_config::KeySource::Global));
+        assert!(!prov.locked);
+
+        // Runtime status masks the token to a bool; no launcher/token was
+        // installed on this test AppState, so token_set is false.
+        assert!(!view.status.token_set);
+        assert_eq!(view.status.bind, "127.0.0.1:7878");
+
+        // No secret VALUE anywhere in the serialized view — Config has no
+        // token/secret field to begin with, and status only ever carries the
+        // bool.
+        let rendered = serde_json::to_string(&view).unwrap();
+        assert!(!rendered.contains("\"token\":\""), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn get_config_with_project_merges_project_layer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = test_state(&tmp);
+
+        let proj = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "ws_proj", proj.path());
+        std::fs::create_dir_all(proj.path().join(".rupu")).unwrap();
+        std::fs::write(
+            proj.path().join(".rupu/config.toml"),
+            "default_model = \"sonnet\"\n",
+        )
+        .unwrap();
+
+        let view = get_config(
+            State(s),
+            Query(ProjectQuery {
+                project: Some("ws_proj".into()),
+            }),
+        )
+        .await
+        .expect("get_config ok")
+        .0;
+
+        assert_eq!(view.effective["default_model"], "sonnet");
+        assert_eq!(
+            view.raw_project.as_deref(),
+            Some("default_model = \"sonnet\"\n")
+        );
+        let prov = view.provenance.get("default_model").unwrap();
+        assert!(matches!(prov.source, rupu_config::KeySource::Project));
+    }
+
+    #[tokio::test]
+    async fn put_global_persists_and_reloads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = writable_state(&tmp);
+
+        let body = ConfigWriteBody {
+            raw: Some("default_model = \"sonnet\"\n".into()),
+            patch: None,
+        };
+        let resp = put_global(State(s.clone()), Json(body))
+            .await
+            .expect("put_global ok");
+        assert_eq!(resp.0["ok"], true);
+
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(on_disk.contains("sonnet"), "{on_disk}");
+
+        // Reloaded in place — no restart needed to observe the new value.
+        assert_eq!(
+            s.config.read().unwrap().default_model.as_deref(),
+            Some("sonnet")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_global_rejects_unknown_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = writable_state(&tmp);
+
+        let body = ConfigWriteBody {
+            raw: Some("bogus_key = 1\n".into()),
+            patch: None,
+        };
+        let err = put_global(State(s), Json(body)).await.unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+
+        let on_disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(
+            on_disk.contains("opus"),
+            "file must be unchanged: {on_disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_without_launcher_is_501() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = test_state(&tmp); // no launcher installed
+
+        let body = ConfigWriteBody {
+            raw: Some("default_model = \"sonnet\"\n".into()),
+            patch: None,
+        };
+        let err = put_global(State(s), Json(body)).await.unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn put_project_rejects_locked_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            "permission_mode = \"ask\"\n[policy]\nlock = [\"permission_mode\"]\n",
+        )
+        .unwrap();
+        let s = writable_state(&tmp);
+
+        let proj = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "ws_locked", proj.path());
+
+        let body = ConfigWriteBody {
+            raw: Some("permission_mode = \"bypass\"\n".into()),
+            patch: None,
+        };
+        let err = put_project(State(s), AxPath("ws_locked".into()), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("enforced by global policy"), "{}", err.1);
+
+        // Nothing was written.
+        assert!(!proj.path().join(".rupu/config.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn put_project_confines_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = writable_state(&tmp);
+
+        // A workspace record whose `path` doesn't resolve to a real,
+        // canonicalizable directory — simulating a corrupted/malicious
+        // record trying to steer the write somewhere unexpected. The
+        // confinement guard in `project_config_path` must reject this before
+        // any write is attempted, not 500 or silently write elsewhere.
+        register_workspace(&tmp, "ws_missing", &tmp.path().join("does-not-exist"));
+
+        let body = ConfigWriteBody {
+            raw: Some("default_model = \"x\"\n".into()),
+            patch: None,
+        };
+        let err = put_project(State(s), AxPath("ws_missing".into()), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_project_unknown_id_is_404() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = writable_state(&tmp);
+
+        let body = ConfigWriteBody {
+            raw: Some("default_model = \"x\"\n".into()),
+            patch: None,
+        };
+        let err = put_project(State(s), AxPath("ws_nope".into()), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn put_policy_sets_global_lock_list() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "default_model = \"opus\"\n").unwrap();
+        let s = writable_state(&tmp);
+
+        let body = PolicyBody {
+            lock: vec!["permission_mode".to_string()],
+        };
+        let resp = put_policy(State(s.clone()), Json(body))
+            .await
+            .expect("put_policy ok");
+        assert_eq!(resp.0["ok"], true);
+        assert_eq!(
+            s.config.read().unwrap().policy.lock,
+            vec!["permission_mode".to_string()]
+        );
+    }
+}
