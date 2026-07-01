@@ -650,4 +650,161 @@ mod tests {
             vec!["permission_mode".to_string()]
         );
     }
+
+    // ── Task 7: end-to-end — round-trip + lock enforcement ─────────────────
+    //
+    // These two tests exercise the FULL write→reload→resolve chain (not just
+    // one handler in isolation, as the tests above do): an edit made through
+    // the API must (a) persist to disk, (b) be visible through a follow-up
+    // `GET` without a process restart, AND (c) be visible to a fresh,
+    // independent `rupu_config::resolve()` call reading the same file off
+    // disk — proving the write actually took effect for any consumer, not
+    // just the one `AppState` handle that made it.
+    //
+    // Handlers here (`get_config`/`put_global`/`put_project`) are private to
+    // this module, so — per the harness note above this `mod tests` block —
+    // these live in-module rather than in `tests/config_e2e.rs`, reusing
+    // `test_state`/`writable_state`/`register_workspace` exactly as the unit
+    // tests above do.
+
+    /// Full round trip for a global edit: raw PUT → 200 → GET reflects the
+    /// reload → a fresh on-disk `resolve()` (independent of the `AppState`
+    /// that made the write) also sees the new value. Then a form-patch PUT
+    /// on top of a hand-commented file: the patched key persists AND the
+    /// pre-existing comment survives (`toml_edit`'s comment/layout
+    /// preservation, exercised end-to-end through the real handler + real
+    /// file on disk, not just the `config_write` unit test).
+    #[tokio::test]
+    async fn edit_persists_reloads_and_takes_effect() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global_path = tmp.path().join("config.toml");
+        std::fs::write(&global_path, "default_model = \"opus\"\n").unwrap();
+        let s = writable_state(&tmp);
+
+        // ── 1. Raw PUT: default_model opus -> sonnet ────────────────────────
+        let body = ConfigWriteBody {
+            raw: Some("default_model = \"sonnet\"\n".into()),
+            patch: None,
+        };
+        let resp = put_global(State(s.clone()), Json(body))
+            .await
+            .expect("put_global ok");
+        assert_eq!(resp.0["ok"], true);
+
+        // ── 2. GET reflects the reload without a restart ────────────────────
+        let view = get_config(State(s.clone()), Query(ProjectQuery { project: None }))
+            .await
+            .expect("get_config ok")
+            .0;
+        assert_eq!(view.effective["default_model"], "sonnet");
+
+        // ── 3. A fresh, independent on-disk resolve() also sees it ──────────
+        // This is the "took effect" assertion: it does not touch `s` at all,
+        // it just re-reads the file the handler wrote, the same way any
+        // other process (a `rupu` CLI invocation, a fresh `cp serve`) would.
+        let resolved = rupu_config::resolve(Some(&global_path), None, &BTreeMap::new())
+            .expect("on-disk resolve ok");
+        assert_eq!(resolved.config.default_model.as_deref(), Some("sonnet"));
+
+        // ── 4. Hand-add a comment, then form-patch a DIFFERENT key ──────────
+        // Simulates an operator who has hand-edited the file with their own
+        // comment; the settings UI's form editor must not clobber it.
+        let commented = format!(
+            "# operator note: do not remove\n{}",
+            std::fs::read_to_string(&global_path).unwrap()
+        );
+        std::fs::write(&global_path, &commented).unwrap();
+
+        let patch_body = ConfigWriteBody {
+            raw: None,
+            patch: Some(serde_json::json!({ "log_level": "debug" })),
+        };
+        let resp2 = put_global(State(s.clone()), Json(patch_body))
+            .await
+            .expect("put_global patch ok");
+        assert_eq!(resp2.0["ok"], true);
+
+        let on_disk = std::fs::read_to_string(&global_path).unwrap();
+        assert!(
+            on_disk.contains("# operator note: do not remove"),
+            "comment must survive a form-patch write: {on_disk}"
+        );
+        assert!(on_disk.contains("sonnet"), "{on_disk}");
+        assert!(on_disk.contains("log_level"), "{on_disk}");
+
+        let view2 = get_config(State(s), Query(ProjectQuery { project: None }))
+            .await
+            .expect("get_config ok")
+            .0;
+        assert_eq!(view2.effective["log_level"], "debug");
+        assert_eq!(view2.effective["default_model"], "sonnet");
+    }
+
+    /// A key in the GLOBAL `[policy].lock` list wins over a project's
+    /// override AT RESOLUTION — both via a direct `rupu_config::resolve()`
+    /// call over the two on-disk files, and via the read API (`GET
+    /// /api/config?project=`). Attempting to persist the override through
+    /// the WRITE API (`PUT /api/config/project/:id`) is rejected up front
+    /// with a message naming the enforcing policy, and nothing is written.
+    #[tokio::test]
+    async fn global_lock_overrides_project_at_resolution() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &global_path,
+            "permission_mode = \"ask\"\n[policy]\nlock = [\"permission_mode\"]\n",
+        )
+        .unwrap();
+        let s = writable_state(&tmp);
+
+        let proj = tempfile::TempDir::new().unwrap();
+        register_workspace(&tmp, "ws_e2e_lock", proj.path());
+        std::fs::create_dir_all(proj.path().join(".rupu")).unwrap();
+        let project_path = proj.path().join(".rupu/config.toml");
+        std::fs::write(&project_path, "permission_mode = \"bypass\"\n").unwrap();
+
+        // ── 1. Direct resolve(): locked global wins, provenance says so ─────
+        let resolved =
+            rupu_config::resolve(Some(&global_path), Some(&project_path), &BTreeMap::new())
+                .expect("resolve ok");
+        assert_eq!(resolved.config.permission_mode.as_deref(), Some("ask"));
+        let prov = resolved
+            .provenance
+            .get("permission_mode")
+            .expect("provenance for permission_mode");
+        assert!(matches!(prov.source, rupu_config::KeySource::Global));
+        assert!(prov.locked);
+
+        // ── 2. Same enforcement visible through the read API ────────────────
+        let view = get_config(
+            State(s.clone()),
+            Query(ProjectQuery {
+                project: Some("ws_e2e_lock".into()),
+            }),
+        )
+        .await
+        .expect("get_config ok")
+        .0;
+        assert_eq!(view.effective["permission_mode"], "ask");
+        let view_prov = view.provenance.get("permission_mode").unwrap();
+        assert!(matches!(view_prov.source, rupu_config::KeySource::Global));
+        assert!(view_prov.locked);
+
+        // ── 3. The write API refuses to persist the (moot) override ─────────
+        let body = ConfigWriteBody {
+            raw: Some("permission_mode = \"bypass\"\n".into()),
+            patch: None,
+        };
+        let err = put_project(State(s), AxPath("ws_e2e_lock".into()), Json(body))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("enforced by global policy"), "{}", err.1);
+
+        // Nothing was written — the on-disk project file is unchanged.
+        assert_eq!(
+            std::fs::read_to_string(&project_path).unwrap(),
+            "permission_mode = \"bypass\"\n"
+        );
+    }
 }
