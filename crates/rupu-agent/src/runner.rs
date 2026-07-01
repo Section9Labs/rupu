@@ -830,7 +830,18 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     let tool_defs = registry.to_tool_definitions();
 
     let mut messages: Vec<Message> = opts.initial_messages.clone();
-    messages.push(Message::user(&opts.user_message));
+    // Conditional user-turn append. An EMPTY `user_message` means "seed-only":
+    // the caller has supplied a complete, ready-to-send transcript via
+    // `initial_messages` (e.g. the orchestrator resuming a tool-boundary pause,
+    // where the seed already ends in a `tool_result` that pairs with the
+    // preceding assistant `tool_use`). Appending a fresh user turn there would
+    // either double the user turn or — worse — strand the assistant's
+    // `tool_use` with no matching `tool_result`, which real Anthropic rejects
+    // with a 400. So we only append when there is an actual message to add.
+    // Every existing caller passes a non-empty `user_message` and is unaffected.
+    if !opts.user_message.is_empty() {
+        messages.push(Message::user(&opts.user_message));
+    }
     let mut turn_idx: u32 = opts.turn_index_offset;
     let initial_turn_idx = turn_idx;
     let mut total_in: u64 = 0;
@@ -2714,6 +2725,76 @@ mod pause_tests {
             captured.lock().unwrap().len(),
             1,
             "resume must issue exactly one fresh provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_user_message_seeds_transcript_without_appending() {
+        // Seed-only contract: when `user_message` is empty, `run_agent` must
+        // NOT append a fresh user turn — the caller (the orchestrator resuming a
+        // tool-boundary pause) has supplied a complete, ready-to-send seed via
+        // `initial_messages`. The outbound request messages must equal the seed
+        // exactly. A tool-boundary seed ends in a `tool_result` paired with the
+        // preceding assistant `tool_use`; an extra user turn (or, worse, a
+        // flattened tool_result) would strand that tool_use and trigger a
+        // provider 400.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+
+        let seed = vec![
+            Message::user("do work"),
+            Message {
+                role: rupu_providers::types::Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({ "path": "x" }),
+                }],
+            },
+            Message::tool_result("toolu_1", "contents", false),
+        ];
+
+        let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "final".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let captured = provider.captured.clone();
+        let opts = opts_for(
+            Box::new(provider),
+            None,
+            tmp.path(),
+            transcript_path,
+            seed.clone(),
+            "", // empty → seed-only, no appended user turn
+        );
+        let result = run_agent(opts).await.expect("run completes");
+        assert_eq!(result.status, RunStatus::Ok);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "exactly one fresh provider request");
+        let msgs = &reqs[0].messages;
+        assert_eq!(
+            msgs.len(),
+            seed.len(),
+            "request messages must equal the seed (no appended user turn)"
+        );
+        // Roles match position-for-position and the trailing tool_result is
+        // preserved as a ToolResult block (not flattened / not doubled).
+        for (got, want) in msgs.iter().zip(seed.iter()) {
+            assert_eq!(got.role, want.role);
+        }
+        let last_is_tool_result = msgs
+            .last()
+            .unwrap()
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "toolu_1"));
+        assert!(
+            last_is_tool_result,
+            "trailing tool_result must survive intact, got {:?}",
+            msgs.last().unwrap().content
         );
     }
 

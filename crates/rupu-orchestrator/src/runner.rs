@@ -28,7 +28,7 @@ use crate::workflow::{
 };
 use async_trait::async_trait;
 use rupu_agent::{run_agent, AgentRunOpts, RunError, RunResult};
-use rupu_providers::types::{ContentBlock, Message, Role};
+use rupu_providers::types::Message;
 use rupu_transcript::{Event, JsonlReader};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -800,42 +800,29 @@ enum LinearStepOutcome {
 }
 
 /// Split a paused agent's seed transcript into `(initial_messages, user_message)`
-/// so that re-seeding a resumed [`run_agent`] preserves role alternation.
+/// for a resumed [`run_agent`].
 ///
-/// `run_agent` UNCONDITIONALLY appends `Message::user(user_message)` on top of
-/// `initial_messages`. A paused transcript ends at the last complete message —
-/// which, at a pause boundary, is a *user*-role message (the seed prompt, or a
-/// tool result, which is encoded as a user message). Feeding the whole seed as
-/// `initial_messages` AND a non-empty `user_message` would produce two
-/// consecutive user turns, which real providers reject. So we peel the trailing
-/// user message off and hand its text back as `user_message`; `run_agent`
-/// re-appends it, reconstructing the exact paused state with correct
-/// alternation and issuing one fresh provider request.
+/// `run_agent` appends `Message::user(user_message)` on top of
+/// `initial_messages` ONLY when `user_message` is non-empty (an empty message
+/// is treated as "seed-only" — the transcript is already complete). We exploit
+/// that here: the resumed agent is seeded with the FULL paused transcript
+/// AS-IS and handed an EMPTY `user_message`, so exactly one fresh provider
+/// request is issued from the intact transcript with no extra turn.
 ///
-/// (Limitation: a trailing `tool_result` is flattened to its text here — the
-/// mid-tool-boundary resume case is not fully modeled in v1. The common
-/// mid-stream pause ends in a plain text user message, which round-trips
-/// losslessly.)
-fn split_seed_for_resume(mut seed: Vec<Message>) -> (Vec<Message>, String) {
-    let ends_in_user = seed.last().map(|m| m.role == Role::User).unwrap_or(false);
-    if ends_in_user {
-        let last = seed.pop().expect("checked non-empty");
-        let text = last
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.clone()),
-                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
-                ContentBlock::ToolUse { .. } => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        (seed, text)
-    } else {
-        // Ends in an assistant message (or is empty): appending a user message
-        // still alternates correctly. Nothing to peel.
-        (seed, String::new())
-    }
+/// This is lossless for BOTH pause shapes:
+///   * mid-stream pause — the seed ends in a plain-text user message (the seed
+///     prompt; partial assistant text was discarded on pause). Replaying it
+///     verbatim preserves role alternation.
+///   * tool-boundary pause — the seed ends in a user message carrying a
+///     `ToolResult` that pairs with the `ToolUse` block in the immediately
+///     preceding assistant message. Replaying it verbatim keeps the
+///     `tool_use`/`tool_result` pair intact — no dangling `tool_use`, so no
+///     Anthropic 400 "tool_use ids without tool_result blocks".
+///
+/// (If the seed instead ends in an assistant message, or is empty, an empty
+/// `user_message` likewise appends nothing and the request still alternates.)
+fn split_seed_for_resume(seed: Vec<Message>) -> (Vec<Message>, String) {
+    (seed, String::new())
 }
 
 /// Inner loop's terminal state. Distinguishes "ran to completion"
@@ -3740,7 +3727,9 @@ steps:
         CapturingMockProvider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS,
     };
     use rupu_agent::{AgentRunOpts, BypassDecider};
-    use rupu_providers::types::{LlmRequest, LlmResponse, Role, StopReason, StreamEvent};
+    use rupu_providers::types::{
+        ContentBlock, LlmRequest, LlmResponse, Role, StopReason, StreamEvent,
+    };
     use rupu_providers::{LlmProvider, ProviderError, ProviderId};
     use std::time::Duration;
 
@@ -4129,12 +4118,12 @@ steps:
 
     #[tokio::test]
     async fn resume_seed_preserves_role_alternation() {
-        // NOTE 3: a paused-incomplete step re-runs seeded from its transcript.
-        // `run_agent` unconditionally appends `Message::user(user_message)`, so
-        // if the seed already ends in a user message a naive resume would send
-        // two consecutive user turns (which real providers reject). The resume
-        // path must peel the trailing user message off. This asserts the
-        // resumed request's messages strictly alternate.
+        // NOTE 3 (mid-stream pause): a paused-incomplete step re-runs seeded
+        // from its transcript. `run_agent` appends a fresh user turn only when
+        // `user_message` is non-empty; the resume path seeds the FULL transcript
+        // as-is with an EMPTY `user_message`, so no extra turn is appended and
+        // the seed replays verbatim. This asserts the resumed request's messages
+        // reconstruct the seed exactly and strictly alternate.
         let dir = tempfile::tempdir().unwrap();
         let wf = Workflow::parse(WF_SOLO).unwrap();
 
@@ -4185,8 +4174,121 @@ steps:
                 msgs.iter().map(|m| &m.role).collect::<Vec<_>>()
             );
         }
-        // Last turn is the peeled-and-re-appended user message.
+        // Last turn is the replayed trailing user message.
         assert_eq!(msgs.last().unwrap().role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn resume_seed_preserves_tool_boundary_pairing() {
+        // Tool-boundary pause: T2 lets a running tool finish, records its
+        // `tool_result`, THEN pauses — so the seed transcript ends in a USER
+        // message carrying a `ToolResult` block, preceded by an ASSISTANT
+        // message whose `ToolUse` block it answers. The resume must replay this
+        // pair INTACT: flattening the trailing `tool_result` to plain text (the
+        // old behavior) would strip it and strand the assistant's `tool_use`
+        // with no matching `tool_result` → real Anthropic returns 400
+        // "tool_use ids without tool_result blocks". This asserts the
+        // reconstructed request preserves the tool_use/tool_result pair, adds
+        // no doubled user turn, and keeps valid role/tool pairing.
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_SOLO).unwrap();
+
+        // Seed shape: user prompt → assistant(tool_use) → user(tool_result).
+        let seed = vec![
+            Message::user("do work"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_abc".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({ "path": "README.md" }),
+                }],
+            },
+            Message::tool_result("toolu_abc", "file contents here", false),
+        ];
+
+        let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "final".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let captured = provider.captured.clone();
+        let factory = Arc::new(OneShotFactory::new(Box::new(provider)));
+        let sink = Arc::new(CollectingSink::default());
+        let mut opts = pause_opts(wf, dir.path().to_path_buf(), factory, sink);
+        opts.resume_from = Some(ResumeState {
+            run_id: String::new(),
+            prior_step_results: Vec::new(),
+            approved_step_id: String::new(),
+            completed_units: std::collections::BTreeMap::new(),
+            reason: PauseReason::Manual,
+            paused_step: Some(PausedStep {
+                step_id: "solo".into(),
+                seed_messages: seed.clone(),
+            }),
+        });
+
+        run_workflow(opts).await.expect("resume completes");
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "resume issues exactly one fresh request");
+        let msgs = &reqs[0].messages;
+
+        // No doubled user turn: the request is the seed verbatim.
+        assert_eq!(
+            msgs.len(),
+            seed.len(),
+            "resumed request reconstructs the seed exactly (no doubled user turn)"
+        );
+
+        // The trailing tool_result is preserved as a ToolResult block (NOT
+        // flattened to plain text) and still references its tool_use id.
+        let tool_result_id = msgs.last().unwrap().content.iter().find_map(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            tool_result_id.as_deref(),
+            Some("toolu_abc"),
+            "trailing tool_result must survive intact, got {:?}",
+            msgs.last().unwrap().content
+        );
+
+        // The assistant tool_use it pairs with is still present — no dangling
+        // tool_use. Every tool_use id must have a matching tool_result.
+        let tool_use_ids: Vec<String> = msgs
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let tool_result_ids: Vec<String> = msgs
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_use_ids, vec!["toolu_abc".to_string()]);
+        for id in &tool_use_ids {
+            assert!(
+                tool_result_ids.contains(id),
+                "tool_use {id} has no matching tool_result (dangling tool_use)"
+            );
+        }
+
+        // Role/tool pairing is valid: strict alternation holds.
+        for pair in msgs.windows(2) {
+            assert!(
+                pair[0].role != pair[1].role,
+                "messages must strictly alternate roles; got {:?}",
+                msgs.iter().map(|m| &m.role).collect::<Vec<_>>()
+            );
+        }
     }
 }
 
