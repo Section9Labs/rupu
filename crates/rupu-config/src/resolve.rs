@@ -55,21 +55,31 @@ fn flatten(prefix: &str, v: &Value, out: &mut BTreeMap<String, Value>) {
 }
 
 /// Rebuild a nested TOML table from dotted leaf keys.
-fn unflatten(flat: &BTreeMap<String, Value>) -> Value {
+///
+/// Fallible: when the same top-level name appears as a scalar leaf in one
+/// layer and a table parent in another (e.g. global `default_model = "x"`
+/// vs project `[default_model]\nk = "y"`), the winners map holds both
+/// `"default_model"` and `"default_model.k"`. Rebuilding then tries to
+/// descend through a scalar, which is a structural conflict — return a
+/// `LayerError` instead of panicking on user-editable config.
+fn unflatten(flat: &BTreeMap<String, Value>) -> Result<Value, LayerError> {
     let mut root = toml::value::Table::new();
     for (dotted, val) in flat {
         let mut cur = &mut root;
         let parts: Vec<&str> = dotted.split('.').collect();
         for p in &parts[..parts.len() - 1] {
-            cur = cur
+            let entry = cur
                 .entry(p.to_string())
-                .or_insert_with(|| Value::Table(toml::value::Table::new()))
-                .as_table_mut()
-                .expect("intermediate must be a table");
+                .or_insert_with(|| Value::Table(toml::value::Table::new()));
+            cur = entry.as_table_mut().ok_or_else(|| {
+                LayerError::Invalid(format!(
+                    "config key `{dotted}` conflicts: `{p}` is used as both a value and a table"
+                ))
+            })?;
         }
         cur.insert(parts[parts.len() - 1].to_string(), val.clone());
     }
-    Value::Table(root)
+    Ok(Value::Table(root))
 }
 
 pub fn resolve(
@@ -135,15 +145,30 @@ pub fn resolve(
         }
     }
 
-    let merged = unflatten(&winners);
-    let config: Config = merged
-        .clone()
-        .try_into()
-        .map_err(|source| LayerError::Layered {
-            global_path: global.map(|p| p.display().to_string()),
-            project_path: project.map(|p| p.display().to_string()),
-            source: Box::new(source),
-        })?;
+    let merged = unflatten(&winners)?;
+    let mut config: Config = merged.try_into().map_err(|source| LayerError::Layered {
+        global_path: global.map(|p| p.display().to_string()),
+        project_path: project.map(|p| p.display().to_string()),
+        source: Box::new(source),
+    })?;
+
+    // The `policy.lock` list is itself an unlocked key, so a project's
+    // `[policy].lock` would otherwise land in the resolved config and mislead
+    // consumers (e.g. the CP UI reading `config.policy.lock` for lock badges,
+    // or a project appearing to clear locks). Pin the resolved lock list to
+    // the GLOBAL-derived enforced list and mark its provenance Global so no
+    // consumer ever trusts a project-supplied lock list.
+    config.policy.lock = lock.clone();
+    if winners.contains_key("policy.lock") || !lock.is_empty() {
+        provenance.insert(
+            "policy.lock".to_string(),
+            KeyProvenance {
+                source: KeySource::Global,
+                locked: is_locked("policy.lock"),
+            },
+        );
+    }
+
     config.validate()?;
     Ok(Resolved { config, provenance })
 }
@@ -229,6 +254,46 @@ mod tests {
         let g2 = write_toml(d.path(), "g2.toml", "default_model = \"x\"\n");
         let r2 = resolve(Some(&g2), None, &BTreeMap::new()).unwrap();
         assert_eq!(r2.config.cp.max_workspace_bytes, None);
+    }
+
+    #[test]
+    fn resolve_scalar_vs_table_conflict_errors_not_panics() {
+        // Global uses `default_model` as a scalar; project redeclares it as a
+        // table. The winners map then holds both `default_model` and
+        // `default_model.k`, which cannot be rebuilt into one TOML tree.
+        // resolve must return Err rather than panic on user-editable config.
+        let d = tempfile::tempdir().unwrap();
+        let g = write_toml(d.path(), "g.toml", "default_model = \"x\"\n");
+        let p = write_toml(d.path(), "p.toml", "[default_model]\nk = \"y\"\n");
+        let r = resolve(Some(&g), Some(&p), &BTreeMap::new());
+        assert!(r.is_err(), "expected Err, got {r:?}");
+    }
+
+    #[test]
+    fn project_cannot_override_resolved_lock_list() {
+        let d = tempfile::tempdir().unwrap();
+        let g = write_toml(
+            d.path(),
+            "g.toml",
+            "permission_mode = \"ask\"\n[policy]\nlock = [\"permission_mode\"]\n",
+        );
+        // Project attempts to clear the lock list AND override the locked key.
+        let p = write_toml(
+            d.path(),
+            "p.toml",
+            "permission_mode = \"bypass\"\n[policy]\nlock = []\n",
+        );
+        let r = resolve(Some(&g), Some(&p), &BTreeMap::new()).unwrap();
+        // The resolved lock list reflects the GLOBAL list, not the project's.
+        assert_eq!(r.config.policy.lock, vec!["permission_mode".to_string()]);
+        // Provenance for policy.lock must be Global.
+        assert!(matches!(
+            r.provenance.get("policy.lock").unwrap().source,
+            KeySource::Global
+        ));
+        // Enforcement still holds: permission_mode is locked to the global value.
+        assert_eq!(r.config.permission_mode.as_deref(), Some("ask"));
+        assert!(r.provenance.get("permission_mode").unwrap().locked);
     }
 
     #[test]
