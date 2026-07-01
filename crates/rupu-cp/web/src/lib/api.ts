@@ -1595,6 +1595,19 @@ export const api = {
       body: JSON.stringify({ lock }),
     });
   },
+  /**
+   * Persist a PROJECT config edit (that workspace's `.rupu/config.toml`) —
+   * either `{ raw }` (full TOML text) or `{ patch }` (flat `dotted.key ->
+   * value` edits). Mirrors `putGlobalConfig`, but REJECTS (400) a write that
+   * would set a key already enforced by the GLOBAL `[policy].lock` list —
+   * locking is a global-only concept the project layer cannot override.
+   */
+  putProjectConfig(id: string, body: ConfigWriteBody): Promise<ConfigWriteResult> {
+    return request<ConfigWriteResult>(`/api/config/project/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    });
+  },
 
   // --- Repos ---
 
