@@ -13,10 +13,7 @@ use crate::host::connector::{
 
 /// Stage a packed workspace under `<cache_root>/workspace-sync/<ulid>/work`,
 /// persisting the baseline sidecar one level up. Returns the `work` path.
-pub(crate) fn stage_to_dir(
-    payload: &[u8],
-    cache_root: &Path,
-) -> Result<String, HostConnectorError> {
+pub fn stage_to_dir(payload: &[u8], cache_root: &Path) -> Result<String, HostConnectorError> {
     if payload.len() > MAX_WORKSPACE_BYTES {
         return Err(HostConnectorError::Invalid(format!(
             "workspace payload {} bytes exceeds limit {MAX_WORKSPACE_BYTES}",
@@ -37,7 +34,7 @@ pub(crate) fn stage_to_dir(
 
 /// Reload the baseline, diff the working dir, return the encoded delta, and
 /// remove the scratch. `working_dir` is confined under `<cache_root>/workspace-sync`.
-pub(crate) fn collect_from_dir(
+pub fn collect_from_dir(
     working_dir: &str,
     cache_root: &Path,
 ) -> Result<Vec<u8>, HostConnectorError> {

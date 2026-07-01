@@ -147,6 +147,12 @@ pub enum Cmd {
     },
     /// Dial-home tunnel agent + node enrollment.
     Node(cmd::node::NodeArgs),
+    /// Internal: remote workspace stage/collect helper (SSH workspace sync).
+    #[command(name = "__workspace", hide = true)]
+    Workspace {
+        #[command(subcommand)]
+        action: cmd::workspace_helper::WorkspaceHelperAction,
+    },
 }
 
 /// Testable entrypoint. Parses `args` (typically from `std::env::args`),
@@ -232,6 +238,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Completions { action } => cmd::completions::handle(action).await,
         Cmd::Host { action } => cmd::host::handle(action).await,
         Cmd::Node(args) => cmd::node::handle(args).await,
+        Cmd::Workspace { action } => cmd::workspace_helper::handle(action).await,
     }
 }
 
@@ -299,6 +306,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::Node(_) => output::formats::ensure_supported(
             "node",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::Workspace { .. } => output::formats::ensure_supported(
+            "__workspace",
             format,
             &[output::formats::OutputFormat::Table],
         ),
