@@ -22,7 +22,10 @@ use crate::templates::{
     render_step_prompt, render_when_expression, LoopInfo, RenderError, RenderMode, StepContext,
     StepOutput,
 };
-use crate::workflow::{yaml_scalar_to_string, InputType, Step, Workflow, WorkflowParseError};
+use crate::workflow::{
+    effective_workspace_mode, yaml_scalar_to_string, InputType, Step, Workflow, WorkflowParseError,
+    WorkspaceMode,
+};
 use async_trait::async_trait;
 use rupu_agent::{run_agent, AgentRunOpts, RunError};
 use rupu_transcript::{Event, JsonlReader};
@@ -38,6 +41,24 @@ use ulid::Ulid;
 // Remote unit dispatch port
 // ---------------------------------------------------------------------------
 
+/// Opaque file-change set a synced unit returns. The orchestrator never
+/// interprets `payload` — a self-describing git patch/bundle or tar delta
+/// produced by the workspace codec. `changed` / `deleted` are the affected
+/// repo-relative paths, carried for observability/logging only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDelta {
+    pub changed: Vec<String>,
+    pub deleted: Vec<String>,
+    pub payload: Vec<u8>,
+}
+
+/// Returned by `apply_workspace_deltas` when two units' changes conflict —
+/// overlapping files (tar mode) or a conflicting hunk (git mode). Surfaced
+/// as a step failure honoring `continue_on_error`.
+#[derive(Debug, Error)]
+#[error("workspace conflict on: {0:?}")]
+pub struct WorkspaceConflict(pub Vec<String>);
+
 /// Payload for one unit dispatched to a remote host.
 #[derive(Debug)]
 pub struct UnitDispatch {
@@ -46,6 +67,9 @@ pub struct UnitDispatch {
     pub rendered_prompt: String,
     pub index: usize,
     pub run_id: String,
+    /// Set to `Some(coordinator workspace path)` when this unit's effective
+    /// workspace mode is `Sync`. `None` ⇒ self-contained (unchanged).
+    pub workspace_path: Option<PathBuf>,
 }
 
 /// Outcome of one unit dispatched to a remote host.
@@ -54,6 +78,9 @@ pub struct UnitOutcome {
     pub output: String,
     pub success: bool,
     pub error: Option<String>,
+    /// The unit's file changes when it ran with a synced workspace; `None`
+    /// for a self-contained unit.
+    pub workspace_delta: Option<WorkspaceDelta>,
 }
 
 /// Port that remote-fleet implementations plug into.
@@ -67,6 +94,18 @@ pub struct UnitOutcome {
 pub trait UnitDispatcher: Send + Sync {
     /// Run one unit (an agent invocation) on `host` and return its output.
     async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError>;
+
+    /// Apply collected unit workspace deltas to the coordinator workspace at
+    /// `workspace_path`. Mode-aware (git 3-way merge / tar disjoint-copy);
+    /// conflicts return `WorkspaceConflict`. Default is a no-op for
+    /// dispatchers without workspace support.
+    async fn apply_workspace_deltas(
+        &self,
+        _workspace_path: &Path,
+        _deltas: &[WorkspaceDelta],
+    ) -> Result<(), WorkspaceConflict> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -109,6 +148,10 @@ pub enum RunWorkflowError {
         #[source]
         source: tokio::task::JoinError,
     },
+    #[error(
+        "resuming a workflow with a `workspace: sync` step is not supported (v1): re-run from the start instead"
+    )]
+    ResumeWithWorkspaceSync,
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -373,6 +416,25 @@ pub async fn run_workflow(
     std::fs::create_dir_all(&opts.transcript_dir)?;
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
     let workflow_default_continue = opts.workflow.defaults.continue_on_error.unwrap_or(false);
+
+    // Guard: checkpoint-resuming a workflow that has a `workspace: sync` step
+    // is not supported in v1.  Replaying from disk checkpoints restores only
+    // the unit's OUTPUT, not its workspace delta, so already-succeeded units'
+    // file edits would be silently lost.  Refuse loudly rather than let the
+    // caller believe the coordinator workspace is up-to-date.
+    //
+    // This check fires only on the checkpoint-resume path (`resume_from`
+    // is Some).  The non-resume path and resume of non-sync workflows are
+    // unaffected.
+    if opts.resume_from.is_some()
+        && opts
+            .workflow
+            .steps
+            .iter()
+            .any(|s| effective_workspace_mode(s, &opts.workflow.defaults) == WorkspaceMode::Sync)
+    {
+        return Err(RunWorkflowError::ResumeWithWorkspaceSync);
+    }
 
     // Persistent run-state setup. Two paths:
     //
@@ -948,6 +1010,7 @@ fn clear_active_step(opts: &OrchestratorRunOpts, workflow_run_id: &str, step_id:
 /// — a single named host has no alternate. Absence of a dispatcher is a
 /// hard configuration error (coordinator without fleet access), surfaced
 /// clearly with no silent local fallback.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_placed_step(
     host: &str,
     step: &Step,
@@ -956,6 +1019,7 @@ async fn dispatch_placed_step(
     run_id: &str,
     opts: &OrchestratorRunOpts,
     continue_on_error: bool,
+    sync: bool,
 ) -> Result<(String, bool), RunWorkflowError> {
     let Some(dispatcher) = opts.unit_dispatcher.as_ref() else {
         let source =
@@ -963,15 +1027,43 @@ async fn dispatch_placed_step(
         let output = source.to_string();
         return placed_failure(step, host, output, source, continue_on_error);
     };
+    // When sync mode is active, pass the coordinator workspace to the unit so
+    // the remote side can mount / apply it. None ⇒ self-contained (unchanged).
+    let workspace_path_opt = sync.then(|| opts.workspace_path.clone());
     let unit = UnitDispatch {
         step_id: step.id.clone(),
         agent: agent_name.to_string(),
         rendered_prompt: rendered.to_string(),
         index: 0,
         run_id: run_id.to_string(),
+        workspace_path: workspace_path_opt.clone(),
     };
     match dispatcher.dispatch_unit(unit, host).await {
-        Ok(outcome) if outcome.success => Ok((outcome.output, true)),
+        Ok(outcome) if outcome.success => {
+            let output = outcome.output;
+            let ws_delta = outcome.workspace_delta;
+            // Apply the unit's workspace delta back to the coordinator before
+            // the step is considered complete. Guard on both sync mode (workspace_path_opt
+            // is Some) and a dispatcher being present (always true here, but keeps
+            // the guard symmetric with the fan-out path).
+            if let Some(delta) = ws_delta {
+                if let (Some(disp), Some(ws)) =
+                    (opts.unit_dispatcher.as_ref(), workspace_path_opt.as_ref())
+                {
+                    if let Err(conflict) = disp.apply_workspace_deltas(ws, &[delta]).await {
+                        let src = RunError::Provider(conflict.to_string());
+                        return placed_failure(
+                            step,
+                            host,
+                            conflict.to_string(),
+                            src,
+                            continue_on_error,
+                        );
+                    }
+                }
+            }
+            Ok((output, true))
+        }
         Ok(outcome) => {
             // Agent ran but reported failure: preserve its output, but
             // synthesize a raw error so the abort below fires — symmetric
@@ -1064,6 +1156,8 @@ async fn run_linear_step(
 
     let (output, success) = match step.host.as_deref() {
         Some(host) => {
+            let sync =
+                effective_workspace_mode(step, &opts.workflow.defaults) == WorkspaceMode::Sync;
             dispatch_placed_step(
                 host,
                 step,
@@ -1072,6 +1166,7 @@ async fn run_linear_step(
                 &run_id,
                 opts,
                 continue_on_error,
+                sync,
             )
             .await?
         }
@@ -1188,6 +1283,10 @@ async fn run_fanout_step(
     let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let total = items.len();
+    // Effective workspace mode for this step — if Sync, units receive the
+    // coordinator workspace path and return deltas that are applied once
+    // after all units finish.
+    let sync = effective_workspace_mode(step, &opts.workflow.defaults) == WorkspaceMode::Sync;
 
     // Resume: units that already SUCCEEDED in a prior run are replayed
     // from disk rather than re-dispatched. `completed_units[step.id]`
@@ -1311,6 +1410,9 @@ async fn run_fanout_step(
         let unit_key = fanout_unit_key(&item_value);
         let unit_agent = agent_name_root.clone();
         let dispatcher_for_task = unit_dispatcher.clone();
+        // Workspace path forwarded to the remote unit when sync mode is active.
+        // None ⇒ self-contained; Some ⇒ unit mounts this path and returns a delta.
+        let unit_workspace_path = sync.then(|| opts.workspace_path.clone());
 
         handles.push(tokio::spawn(async move {
             // Held for the duration of this item's run; dropping it
@@ -1339,7 +1441,9 @@ async fn run_fanout_step(
             }
 
             // Branch: remote (placed) vs local (inline) path.
-            let (output, success, error_str, raw_error) = if let Some(host) = placement {
+            let (output, success, error_str, raw_error, workspace_delta) = if let Some(host) =
+                placement
+            {
                 // --- Remote dispatch path ---
                 //
                 // `distribute:` requires a `UnitDispatcher`. Its absence is a
@@ -1352,7 +1456,7 @@ async fn run_fanout_step(
                         );
                         let msg = err.to_string();
                         // Minor 3: reuse `msg` instead of duplicating the literal.
-                        (msg.clone(), false, Some(msg), Some(err))
+                        (msg.clone(), false, Some(msg), Some(err), None)
                     }
                     Some(dispatcher) => {
                         let unit = UnitDispatch {
@@ -1361,6 +1465,7 @@ async fn run_fanout_step(
                             rendered_prompt: rendered_clone.clone(),
                             index: idx,
                             run_id: run_id_clone.clone(),
+                            workspace_path: unit_workspace_path.clone(),
                         };
                         match dispatcher.dispatch_unit(unit, &host).await {
                             Ok(outcome) => {
@@ -1379,7 +1484,8 @@ async fn run_fanout_step(
                                 } else {
                                     None
                                 };
-                                (outcome.output, outcome.success, err_str, raw)
+                                let ws_delta = outcome.workspace_delta;
+                                (outcome.output, outcome.success, err_str, raw, ws_delta)
                             }
                             Err(first_err) => {
                                 // Reassign once to the next host and retry.
@@ -1390,6 +1496,7 @@ async fn run_fanout_step(
                                     rendered_prompt: rendered_clone.clone(),
                                     index: idx,
                                     run_id: run_id_clone.clone(),
+                                    workspace_path: unit_workspace_path.clone(),
                                 };
                                 warn!(
                                     step = %step_id,
@@ -1414,11 +1521,12 @@ async fn run_fanout_step(
                                         } else {
                                             None
                                         };
-                                        (outcome.output, outcome.success, err_str, raw)
+                                        let ws_delta = outcome.workspace_delta;
+                                        (outcome.output, outcome.success, err_str, raw, ws_delta)
                                     }
                                     Err(second_err) => {
                                         let msg = second_err.to_string();
-                                        (msg.clone(), false, Some(msg), Some(second_err))
+                                        (msg.clone(), false, Some(msg), Some(second_err), None)
                                     }
                                 }
                             }
@@ -1445,7 +1553,7 @@ async fn run_fanout_step(
                 };
                 let out =
                     read_final_assistant_text(&transcript_clone, suc, &run_id_clone, &step_id);
-                (out, suc, err_str, raw)
+                (out, suc, err_str, raw, None)
             };
 
             if let Some(sink) = event_sink.as_ref() {
@@ -1477,6 +1585,7 @@ async fn run_fanout_step(
                 error: error_str,
                 raw_error,
                 host: placement_host,
+                workspace_delta,
             }
         }));
     }
@@ -1562,7 +1671,7 @@ async fn run_fanout_step(
     items_vec.sort_by_key(|i| i.index);
     let outputs: Vec<String> = items_vec.iter().map(|i| i.output.clone()).collect();
     let aggregate_output = serde_json::to_string(&outputs).unwrap_or_else(|_| "[]".into());
-    let success = items_vec.iter().all(|i| i.success);
+    let mut success = items_vec.iter().all(|i| i.success);
 
     if !success {
         warn!(
@@ -1571,6 +1680,37 @@ async fn run_fanout_step(
             total,
             "fan-out completed with failed items (continue_on_error tolerated)"
         );
+    }
+
+    // Apply workspace deltas once (after all units finish) when sync mode is
+    // active. Deltas are collected in unit-index order from the sorted outcomes.
+    if sync {
+        let deltas: Vec<WorkspaceDelta> = item_outcomes
+            .iter()
+            .filter_map(|o| o.workspace_delta.clone())
+            .collect();
+        if !deltas.is_empty() {
+            if let Some(dispatcher) = &opts.unit_dispatcher {
+                if let Err(conflict) = dispatcher
+                    .apply_workspace_deltas(&opts.workspace_path, &deltas)
+                    .await
+                {
+                    let src = RunError::Provider(conflict.to_string());
+                    if !continue_on_error {
+                        return Err(RunWorkflowError::Agent {
+                            step: step.id.clone(),
+                            source: src,
+                        });
+                    }
+                    warn!(
+                        step = %step.id,
+                        error = %conflict,
+                        "workspace conflict on fan-out but continue_on_error is set; marking step failed"
+                    );
+                    success = false;
+                }
+            }
+        }
     }
 
     Ok(StepResult {
@@ -1786,6 +1926,9 @@ struct FanoutItemOutcome {
     /// from the per-unit `placement` computed in `run_fanout_step` so
     /// the checkpoint writer can record it without re-computing it.
     host: Option<String>,
+    /// File-change set returned by a sync-mode unit. `None` for local
+    /// (non-sync) units or when the unit returned no delta.
+    workspace_delta: Option<WorkspaceDelta>,
 }
 
 /// Build the agent opts via the factory and dispatch one agent run.
@@ -2671,6 +2814,7 @@ mod tests {
                 output: format!("out-{}-on-{host}", unit.index),
                 success: true,
                 error: None,
+                workspace_delta: None,
             })
         }
     }
@@ -3008,6 +3152,7 @@ steps:
                 output: String::new(),
                 success: false,
                 error: Some("boom".into()),
+                workspace_delta: None,
             })
         }
     }
@@ -3043,6 +3188,243 @@ steps:
         assert!(
             msg.contains("boom") || msg.contains("remote unit failed"),
             "error should surface the unit failure reason; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn workspace_delta_carries_paths_and_payload() {
+        let d = WorkspaceDelta {
+            changed: vec!["src/lib.rs".into()],
+            deleted: vec!["old.txt".into()],
+            payload: vec![1, 2, 3],
+        };
+        assert_eq!(d.changed, vec!["src/lib.rs".to_string()]);
+        assert_eq!(d.deleted, vec!["old.txt".to_string()]);
+        assert_eq!(d.payload, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn workspace_conflict_displays_paths() {
+        let c = WorkspaceConflict(vec!["src/shared.rs".into()]);
+        assert!(c.to_string().contains("src/shared.rs"));
+    }
+
+    #[tokio::test]
+    async fn default_apply_workspace_deltas_is_noop_ok() {
+        // The 3a FakeUnitDispatcher does not override apply; the default is Ok.
+        let d = FakeUnitDispatcher::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let res = d.apply_workspace_deltas(tmp.path(), &[]).await;
+        assert!(res.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // T5 — workspace-sync routing tests
+    // -----------------------------------------------------------------------
+
+    /// A `UnitDispatcher` that:
+    /// - Records whether each dispatched unit's `workspace_path` was `Some`.
+    /// - Always returns a `UnitOutcome` with `workspace_delta: Some(...)`.
+    /// - Records the number of deltas passed to each `apply_workspace_deltas` call.
+    /// - When built with `with_conflict()`, returns `Err(WorkspaceConflict)`
+    ///   from `apply_workspace_deltas`.
+    struct WorkspaceFakeDispatcher {
+        saw_ws_path: Mutex<Vec<bool>>,
+        applied_counts: Mutex<Vec<usize>>,
+        conflict_mode: bool,
+    }
+
+    impl WorkspaceFakeDispatcher {
+        fn new() -> Self {
+            Self {
+                saw_ws_path: Mutex::new(Vec::new()),
+                applied_counts: Mutex::new(Vec::new()),
+                conflict_mode: false,
+            }
+        }
+
+        fn with_conflict() -> Self {
+            Self {
+                saw_ws_path: Mutex::new(Vec::new()),
+                applied_counts: Mutex::new(Vec::new()),
+                conflict_mode: true,
+            }
+        }
+
+        fn saw_workspace_path(&self) -> Vec<bool> {
+            self.saw_ws_path.lock().unwrap().clone()
+        }
+
+        fn applied_delta_counts(&self) -> Vec<usize> {
+            self.applied_counts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl UnitDispatcher for WorkspaceFakeDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            _host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            self.saw_ws_path
+                .lock()
+                .unwrap()
+                .push(unit.workspace_path.is_some());
+            Ok(UnitOutcome {
+                output: format!("out-{}", unit.index),
+                success: true,
+                error: None,
+                workspace_delta: Some(WorkspaceDelta {
+                    changed: vec![format!("u{}.txt", unit.index)],
+                    deleted: vec![],
+                    payload: vec![],
+                }),
+            })
+        }
+
+        async fn apply_workspace_deltas(
+            &self,
+            _workspace_path: &std::path::Path,
+            deltas: &[WorkspaceDelta],
+        ) -> Result<(), WorkspaceConflict> {
+            self.applied_counts.lock().unwrap().push(deltas.len());
+            if self.conflict_mode {
+                Err(WorkspaceConflict(vec!["shared".into()]))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    const WF_PLACED_SYNC: &str = r#"
+name: placed-sync
+steps:
+  - id: edit
+    agent: coder
+    prompt: "edit"
+    host: worker-1
+    workspace: sync
+"#;
+
+    #[tokio::test]
+    async fn placed_sync_step_sends_workspace_and_applies_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::new());
+        let wf = Workflow::parse(WF_PLACED_SYNC).unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), disp.clone());
+        let res = run_workflow(opts).await.expect("ok");
+        assert!(res.step_results[0].success);
+        // dispatched WITH a workspace_path
+        assert_eq!(disp.saw_workspace_path(), vec![true]);
+        // applied exactly one delta set (single writer)
+        assert_eq!(disp.applied_delta_counts(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn no_sync_step_sends_no_workspace_path() {
+        // WF_PLACED (host: but no workspace:) must not set workspace_path.
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::new());
+        let wf = Workflow::parse(WF_PLACED).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), disp.clone());
+        opts.inputs.insert("what".into(), "x".into());
+        run_workflow(opts).await.expect("ok");
+        assert_eq!(disp.saw_workspace_path(), vec![false]);
+        // apply never called when workspace_path is None
+        assert!(disp.applied_delta_counts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fanout_sync_collects_all_deltas_and_applies_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::new());
+        let wf = Workflow::parse(
+            r#"
+name: fan-sync
+steps:
+  - id: edit
+    for_each: "a\nb\nc"
+    agent: coder
+    prompt: "edit {{ item }}"
+    max_parallel: 3
+    workspace: sync
+    distribute:
+      hosts: [w1, w2]
+"#,
+        )
+        .unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), disp.clone());
+        let res = run_workflow(opts).await.expect("ok");
+        assert!(res.step_results[0].success);
+        // every unit saw a workspace_path (all 3 dispatches)
+        assert_eq!(disp.saw_workspace_path(), vec![true, true, true]);
+        // applied once, with all 3 deltas together
+        assert_eq!(disp.applied_delta_counts(), vec![3]);
+    }
+
+    #[tokio::test]
+    async fn workspace_conflict_aborts_without_continue_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::with_conflict());
+        let wf = Workflow::parse(WF_PLACED_SYNC).unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), disp);
+        let err = run_workflow(opts).await.expect_err("conflict must abort");
+        assert!(
+            matches!(err, RunWorkflowError::Agent { ref step, .. } if step == "edit"),
+            "expected Agent error for step 'edit', got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_conflict_tolerated_with_continue_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::with_conflict());
+        let wf = Workflow::parse(
+            r#"
+name: placed-sync-tol
+steps:
+  - id: edit
+    agent: coder
+    prompt: "edit"
+    host: worker-1
+    workspace: sync
+    continue_on_error: true
+"#,
+        )
+        .unwrap();
+        let opts = make_opts(wf, dir.path().to_path_buf(), disp);
+        let res = run_workflow(opts).await.expect("tolerated");
+        assert!(!res.step_results[0].success);
+    }
+
+    // -----------------------------------------------------------------------
+    // T6 — resume-with-workspace-sync guard
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resume_of_workspace_sync_workflow_is_refused() {
+        // A workflow with a host-placed workspace:sync step.  Attempting to
+        // checkpoint-resume it must return ResumeWithWorkspaceSync, not silently
+        // drop the already-succeeded unit's file edits.
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::new());
+        let wf = Workflow::parse(WF_PLACED_SYNC).unwrap();
+        let mut opts = make_opts(wf, dir.path().to_path_buf(), disp);
+        // Simulate a checkpoint resume (prior_step_results is empty — the guard
+        // fires before any step runs, so the content doesn't matter).
+        opts.resume_from = Some(ResumeState {
+            run_id: "run_test_resume".into(),
+            prior_step_results: Vec::new(),
+            approved_step_id: String::new(),
+            completed_units: std::collections::BTreeMap::new(),
+        });
+        let err = run_workflow(opts)
+            .await
+            .expect_err("resume of sync workflow must be refused");
+        assert!(
+            matches!(err, RunWorkflowError::ResumeWithWorkspaceSync),
+            "expected ResumeWithWorkspaceSync, got: {err:?}"
         );
     }
 }

@@ -463,32 +463,26 @@ impl SshHostConnector {
                 if let Ok(out) = exec.run(&cat_cmd).await {
                     if out.success && !out.stdout.trim().is_empty() {
                         let trimmed = out.stdout.trim().to_string();
-                        let _ = mirror.append(
-                            &run_id,
-                            &host_id,
-                            ArtifactFile::RunJson,
-                            &trimmed,
-                        );
+                        let _ = mirror.append(&run_id, &host_id, ArtifactFile::RunJson, &trimmed);
                         // Use the observed status only if it is terminal; a
                         // non-terminal status (e.g. "running") would be wrong to
                         // persist as final since the executor may still be alive.
                         // Finish as "failed" in that case — it is better to surface
                         // a definite failure than to leave the run in Running forever.
-                        let finish_status = if let Ok(rec) =
-                            serde_json::from_str::<serde_json::Value>(&trimmed)
-                        {
-                            if let Some(s) = rec.get("status").and_then(|v| v.as_str()) {
-                                if is_terminal_status(s) {
-                                    s.to_string()
+                        let finish_status =
+                            if let Ok(rec) = serde_json::from_str::<serde_json::Value>(&trimmed) {
+                                if let Some(s) = rec.get("status").and_then(|v| v.as_str()) {
+                                    if is_terminal_status(s) {
+                                        s.to_string()
+                                    } else {
+                                        "failed".to_string()
+                                    }
                                 } else {
                                     "failed".to_string()
                                 }
                             } else {
                                 "failed".to_string()
-                            }
-                        } else {
-                            "failed".to_string()
-                        };
+                            };
                         let _ = mirror.finish(&run_id, &host_id, &finish_status);
                         return;
                     }
@@ -609,10 +603,7 @@ impl HostConnector for SshHostConnector {
         Ok(run_id)
     }
 
-    async fn start_session(
-        &self,
-        _req: SessionStartRequest,
-    ) -> Result<String, HostConnectorError> {
+    async fn start_session(&self, _req: SessionStartRequest) -> Result<String, HostConnectorError> {
         Err(HostConnectorError::Invalid(
             "sessions not supported over ssh (slice 2c)".into(),
         ))
@@ -665,17 +656,11 @@ impl HostConnector for SshHostConnector {
         self.remote_workflow(&["cancel", run_id]).await
     }
 
-    async fn stream_run_events(
-        &self,
-        run_id: &str,
-    ) -> Result<EventByteStream, HostConnectorError> {
+    async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         mirror_stream_run_events(&self.run_store, &self.host_id, run_id).await
     }
 
-    async fn get_transcript(
-        &self,
-        path: &str,
-    ) -> Result<serde_json::Value, HostConnectorError> {
+    async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
         read_transcript_file(path)
     }
 
@@ -685,6 +670,37 @@ impl HostConnector for SshHostConnector {
     ) -> Result<serde_json::Value, HostConnectorError> {
         Err(HostConnectorError::Invalid(
             "proxy_get_json is not supported for ssh hosts".into(),
+        ))
+    }
+
+    // ── Workspace sync (DEFERRED) ─────────────────────────────────────────────
+    //
+    // A correct SSH staging impl ships the wire-encoded payload to the host and
+    // runs the codec via the *remote* `rupu` binary (the host needs no git/tar
+    // of its own — the codec lives in the binary). That requires a hidden
+    // remote helper subcommand (`rupu __workspace stage|collect`) which is a
+    // cross-crate change to rupu-cli's dispatcher; it is intentionally deferred
+    // to a follow-up rather than shipped as a silent self-contained fallback.
+    // Until then SSH hosts explicitly report the capability as unsupported, so
+    // a workspace-sync fan-out to an SSH host fails loudly instead of silently
+    // dropping the unit's changes. Local and HttpCp transports are fully wired.
+    async fn stage_workspace(&self, _payload: Vec<u8>) -> Result<String, HostConnectorError> {
+        tracing::warn!(
+            host = %self.host_id,
+            "workspace sync over SSH is not yet implemented (deferred); \
+             returning Unsupported"
+        );
+        Err(HostConnectorError::Unsupported(
+            "workspace sync over ssh (deferred)".into(),
+        ))
+    }
+
+    async fn collect_workspace_delta(
+        &self,
+        _working_dir: &str,
+    ) -> Result<Vec<u8>, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "workspace sync over ssh (deferred)".into(),
         ))
     }
 }
@@ -729,9 +745,7 @@ mod tests {
             "'true'",
         );
         // BatchMode present as two args: -o BatchMode=yes
-        assert!(argv
-            .windows(2)
-            .any(|w| w == ["-o", "BatchMode=yes"]));
+        assert!(argv.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
         assert!(argv.iter().any(|a| a == "-i") && argv.iter().any(|a| a == "/k/id"));
         assert!(argv.iter().any(|a| a == "-p") && argv.iter().any(|a| a == "2222"));
         assert_eq!(argv.last().unwrap(), "'true'");
@@ -852,12 +866,11 @@ mod tests {
         tempfile::TempDir,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let run_store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(
-            tmp.path().join("runs"),
-        ));
-        let mirror = std::sync::Arc::new(crate::node::NodeMirror::new(
-            std::sync::Arc::clone(&run_store),
-        ));
+        let run_store =
+            std::sync::Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let mirror = std::sync::Arc::new(crate::node::NodeMirror::new(std::sync::Arc::clone(
+            &run_store,
+        )));
         let conn = SshHostConnector::new(
             "host_abc",
             fake,
@@ -951,7 +964,10 @@ mod tests {
 
         // info() reports unreachable but does not error.
         let info = conn.info().await.unwrap();
-        assert!(!info.reachable, "offline host should report reachable: false");
+        assert!(
+            !info.reachable,
+            "offline host should report reachable: false"
+        );
 
         // launch_run maps a failed ssh dispatch to Unreachable.
         let err = conn
@@ -992,10 +1008,7 @@ mod tests {
         ];
         let run_json = r#"{"run_id":"run_01TESTPUMP01","status":"completed"}"#;
 
-        let fake = std::sync::Arc::new(FakeExec::with_cat_stdout(
-            tail_lines,
-            run_json.to_string(),
-        ));
+        let fake = std::sync::Arc::new(FakeExec::with_cat_stdout(tail_lines, run_json.to_string()));
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
 
         let run_id = "run_01TESTPUMP01";
@@ -1015,8 +1028,7 @@ mod tests {
 
         // Bounded poll: wait up to 2 s for the spawned pump task to finish
         // and flip the run status to Completed.
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let rec = run_store.load(run_id).unwrap();
             if rec.status == rupu_orchestrator::RunStatus::Completed {

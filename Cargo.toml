@@ -110,6 +110,10 @@ url = "2"
 # Object storage (bucket dead-drop transport for multi-host Slice 2b)
 object_store = { version = "0.14", features = ["aws", "gcp"] }
 
+# Workspace sync (multi-host Slice 3c) — tar fallback + gitignore-aware walk
+tar = "0.4"
+ignore = "0.4"
+
 # TLS crypto provider — the dependency tree enables BOTH rustls providers
 # (aws-lc-rs via object_store/reqwest, ring via octocrab/jsonwebtoken), so
 # rustls 0.23 cannot auto-select one. The CLI installs aws-lc-rs as the
@@ -136,6 +140,8 @@ assert_cmd = "2"
 predicates = "3"
 httpmock = "0.7"
 serial_test = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 # Native macOS app (Slice D)
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "1a2e50e3f222ae7d223acf718d2e8384a9b7fbe6" }

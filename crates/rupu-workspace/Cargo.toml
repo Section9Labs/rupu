@@ -20,6 +20,9 @@ tracing.workspace = true
 keyring = { workspace = true }
 sha2.workspace = true
 rand.workspace = true
+tar = { workspace = true }
+ignore = { workspace = true }
+git2 = { workspace = true }
 hex.workspace = true
 subtle.workspace = true
 rupu-runtime = { path = "../rupu-runtime" }

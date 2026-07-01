@@ -2,6 +2,7 @@
 //! implement, plus the shared types and free helper functions used by multiple
 //! connector implementations.
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -11,10 +12,8 @@ use rupu_orchestrator::{executor::FileTailRunSource, runs::RunStore};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent_launcher::AgentLaunchRequest,
-    launcher::LaunchRequest,
-    session_sender::SendMessageRequest,
-    session_starter::SessionStartRequest,
+    agent_launcher::AgentLaunchRequest, launcher::LaunchRequest,
+    session_sender::SendMessageRequest, session_starter::SessionStartRequest,
 };
 
 // ── Byte-stream alias ─────────────────────────────────────────────────────────
@@ -22,8 +21,7 @@ use crate::{
 /// A pinned, boxed byte stream of SSE-formatted event frames, returned by
 /// `stream_run_events`. Each `Ok(Bytes)` item is a complete `data: …\n\n`
 /// chunk. Used by both the local tail and the HTTP proxy pass-through.
-pub type EventByteStream =
-    Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+pub type EventByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
 
 // ── Info / capabilities ───────────────────────────────────────────────────────
 
@@ -87,6 +85,10 @@ pub enum HostConnectorError {
     /// A bad request or a local precondition failure (no launcher, wrong mode).
     #[error("invalid: {0}")]
     Invalid(String),
+    /// The operation is not supported on this transport (e.g. workspace sync
+    /// over a Bucket/Tunnel host).
+    #[error("unsupported on this transport: {0}")]
+    Unsupported(String),
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -106,10 +108,7 @@ pub trait HostConnector: Send + Sync {
     async fn launch_agent(&self, req: AgentLaunchRequest) -> Result<String, HostConnectorError>;
 
     /// Start a new agent session; returns the new session id.
-    async fn start_session(
-        &self,
-        req: SessionStartRequest,
-    ) -> Result<String, HostConnectorError>;
+    async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError>;
 
     /// Send a prompt turn to a live session; returns the resulting run id.
     async fn send_session_turn(
@@ -145,10 +144,7 @@ pub trait HostConnector: Send + Sync {
     /// Open a live SSE byte stream of `events.jsonl` for the given run. Each
     /// `Ok(Bytes)` item is a `data: {json}\n\n` SSE frame. See Task 8 for
     /// host-aware observation built on top of this.
-    async fn stream_run_events(
-        &self,
-        run_id: &str,
-    ) -> Result<EventByteStream, HostConnectorError>;
+    async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError>;
 
     /// Fetch the parsed events + summary for a transcript JSONL path.
     ///
@@ -156,10 +152,7 @@ pub trait HostConnector: Send + Sync {
     /// `GET /api/transcript` produces. For the local connector, `path` must be
     /// a `.jsonl` file with no `..` components; for the HTTP connector the
     /// request is forwarded to the remote's `/api/transcript?path=<path>`.
-    async fn get_transcript(
-        &self,
-        path: &str,
-    ) -> Result<serde_json::Value, HostConnectorError>;
+    async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError>;
 
     /// Generic GET passthrough: issue `GET {base_url}{path_and_query}` (bearer
     /// token attached) and return the parsed JSON body.
@@ -171,6 +164,169 @@ pub trait HostConnector: Send + Sync {
         &self,
         path_and_query: &str,
     ) -> Result<serde_json::Value, HostConnectorError>;
+
+    /// Stage a packed workspace on the host; returns the remote working dir.
+    ///
+    /// `payload` is a wire-encoded [`rupu_workspace::Payload`] (see
+    /// [`encode_payload`]). The default impl returns [`HostConnectorError::Unsupported`]
+    /// so transports without workspace sync (Bucket / Tunnel) compile unchanged.
+    async fn stage_workspace(&self, _payload: Vec<u8>) -> Result<String, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("workspace sync".into()))
+    }
+
+    /// Collect the workspace change-delta from a staged working dir.
+    ///
+    /// Returns a wire-encoded [`rupu_workspace::Delta`] (see [`encode_delta`]).
+    /// The default impl returns [`HostConnectorError::Unsupported`].
+    async fn collect_workspace_delta(
+        &self,
+        _working_dir: &str,
+    ) -> Result<Vec<u8>, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("workspace sync".into()))
+    }
+}
+
+// ── Workspace-sync wire codec ─────────────────────────────────────────────────
+//
+// The connector boundary moves opaque bytes: `stage_workspace` takes an encoded
+// [`rupu_workspace::Payload`]; `collect_workspace_delta` returns an encoded
+// [`rupu_workspace::Delta`]. These free functions define that self-describing
+// wire format so both the coordinator (rupu-cli's dispatcher) and every
+// transport impl agree on it.
+
+/// Upper bound on a packed workspace payload accepted by `stage_workspace`.
+/// Over-limit payloads are rejected with [`HostConnectorError::Invalid`] before
+/// any disk work, guarding both the coordinator and the host.
+pub const MAX_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
+
+fn mode_to_u8(m: rupu_workspace::SyncMode) -> u8 {
+    match m {
+        rupu_workspace::SyncMode::Tar => 0,
+        rupu_workspace::SyncMode::Git => 1,
+    }
+}
+
+fn u8_to_mode(b: u8) -> Result<rupu_workspace::SyncMode, HostConnectorError> {
+    match b {
+        0 => Ok(rupu_workspace::SyncMode::Tar),
+        1 => Ok(rupu_workspace::SyncMode::Git),
+        other => Err(HostConnectorError::Invalid(format!(
+            "unknown workspace sync mode tag {other}"
+        ))),
+    }
+}
+
+/// Encode a [`rupu_workspace::Payload`] as `[mode:1][raw bytes…]`.
+pub fn encode_payload(p: &rupu_workspace::Payload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(p.bytes.len() + 1);
+    out.push(mode_to_u8(p.mode));
+    out.extend_from_slice(&p.bytes);
+    out
+}
+
+/// Decode a payload produced by [`encode_payload`].
+pub fn decode_payload(bytes: &[u8]) -> Result<rupu_workspace::Payload, HostConnectorError> {
+    let (&mode, rest) = bytes
+        .split_first()
+        .ok_or_else(|| HostConnectorError::Invalid("empty workspace payload".into()))?;
+    Ok(rupu_workspace::Payload {
+        mode: u8_to_mode(mode)?,
+        bytes: rest.to_vec(),
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeltaWireHeader {
+    mode: u8,
+    changed: Vec<String>,
+    deleted: Vec<String>,
+}
+
+/// Encode a [`rupu_workspace::Delta`] as
+/// `[hdr_len:4 LE][serde_json header][raw delta bytes]`. The header carries the
+/// mode tag plus the changed/deleted path lists; the trailing bytes are the
+/// codec's opaque tar/patch payload.
+pub fn encode_delta(d: &rupu_workspace::Delta) -> Vec<u8> {
+    let hdr = DeltaWireHeader {
+        mode: mode_to_u8(d.mode),
+        changed: d.changed.clone(),
+        deleted: d.deleted.clone(),
+    };
+    let hdr_bytes = serde_json::to_vec(&hdr).unwrap_or_default();
+    let mut out = Vec::with_capacity(4 + hdr_bytes.len() + d.bytes.len());
+    out.extend_from_slice(&(hdr_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&hdr_bytes);
+    out.extend_from_slice(&d.bytes);
+    out
+}
+
+/// Decode a delta produced by [`encode_delta`].
+pub fn decode_delta(bytes: &[u8]) -> Result<rupu_workspace::Delta, HostConnectorError> {
+    if bytes.len() < 4 {
+        return Err(HostConnectorError::Invalid(
+            "workspace delta too short".into(),
+        ));
+    }
+    let hdr_len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let rest = &bytes[4..];
+    if rest.len() < hdr_len {
+        return Err(HostConnectorError::Invalid(
+            "workspace delta header truncated".into(),
+        ));
+    }
+    let (hdr_bytes, payload) = rest.split_at(hdr_len);
+    let hdr: DeltaWireHeader = serde_json::from_slice(hdr_bytes)
+        .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+    Ok(rupu_workspace::Delta {
+        mode: u8_to_mode(hdr.mode)?,
+        changed: hdr.changed,
+        deleted: hdr.deleted,
+        bytes: payload.to_vec(),
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+struct BaselineWire {
+    mode: u8,
+    manifest: BTreeMap<String, Vec<u8>>,
+    git_commit: Option<String>,
+}
+
+/// Serialize a stage-time [`rupu_workspace::Baseline`] to JSON for the sidecar
+/// file persisted between `stage_workspace` and `collect_workspace_delta`.
+pub(crate) fn serialize_baseline(
+    b: &rupu_workspace::Baseline,
+) -> Result<Vec<u8>, HostConnectorError> {
+    let wire = BaselineWire {
+        mode: mode_to_u8(b.mode),
+        manifest: b
+            .tar_manifest
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_vec()))
+            .collect(),
+        git_commit: b.git_commit.clone(),
+    };
+    serde_json::to_vec(&wire).map_err(|e| HostConnectorError::Invalid(e.to_string()))
+}
+
+/// Reload a baseline written by [`serialize_baseline`].
+pub(crate) fn deserialize_baseline(
+    bytes: &[u8],
+) -> Result<rupu_workspace::Baseline, HostConnectorError> {
+    let wire: BaselineWire =
+        serde_json::from_slice(bytes).map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+    let mut manifest = BTreeMap::new();
+    for (k, v) in wire.manifest {
+        let arr: [u8; 32] = v
+            .try_into()
+            .map_err(|_| HostConnectorError::Invalid("bad baseline hash length".into()))?;
+        manifest.insert(k, arr);
+    }
+    Ok(rupu_workspace::Baseline {
+        mode: u8_to_mode(wire.mode)?,
+        tar_manifest: manifest,
+        git_commit: wire.git_commit,
+    })
 }
 
 // ── Shared read helpers ───────────────────────────────────────────────────────
@@ -225,10 +381,7 @@ pub(crate) fn mirror_list_runs(
     .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
 
     rows.iter()
-        .map(|r| {
-            serde_json::to_value(r)
-                .map_err(|e| HostConnectorError::Invalid(e.to_string()))
-        })
+        .map(|r| serde_json::to_value(r).map_err(|e| HostConnectorError::Invalid(e.to_string())))
         .collect()
 }
 
@@ -285,9 +438,7 @@ pub(crate) async fn mirror_stream_run_events(
 /// tunnel connector.  Basic path safety (no `..` components, must be `.jsonl`)
 /// is enforced here; callers that accept user-supplied paths must also apply
 /// their own `allowed_roots` checks before delegating.
-pub(crate) fn read_transcript_file(
-    path: &str,
-) -> Result<serde_json::Value, HostConnectorError> {
+pub(crate) fn read_transcript_file(path: &str) -> Result<serde_json::Value, HostConnectorError> {
     use std::path::Path;
     let p = Path::new(path);
     if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
@@ -301,11 +452,65 @@ pub(crate) fn read_transcript_file(
     if !p.exists() {
         return Ok(serde_json::json!({ "events": [], "summary": null }));
     }
-    let events: Vec<rupu_transcript::Event> =
-        rupu_transcript::JsonlReader::iter(p)
-            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?
-            .filter_map(Result::ok)
-            .collect();
+    let events: Vec<rupu_transcript::Event> = rupu_transcript::JsonlReader::iter(p)
+        .map_err(|e| HostConnectorError::Invalid(e.to_string()))?
+        .filter_map(Result::ok)
+        .collect();
     let summary = rupu_transcript::JsonlReader::summary(p).ok();
     Ok(serde_json::json!({ "events": events, "summary": summary }))
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    #[test]
+    fn payload_wire_round_trip() {
+        let p = rupu_workspace::Payload {
+            mode: rupu_workspace::SyncMode::Tar,
+            bytes: b"hello payload".to_vec(),
+        };
+        let decoded = decode_payload(&encode_payload(&p)).unwrap();
+        assert_eq!(decoded.mode, rupu_workspace::SyncMode::Tar);
+        assert_eq!(decoded.bytes, p.bytes);
+    }
+
+    #[test]
+    fn delta_wire_round_trip() {
+        let d = rupu_workspace::Delta {
+            mode: rupu_workspace::SyncMode::Git,
+            changed: vec!["a.txt".into(), "dir/b.txt".into()],
+            deleted: vec!["gone.txt".into()],
+            bytes: b"raw patch bytes".to_vec(),
+        };
+        let decoded = decode_delta(&encode_delta(&d)).unwrap();
+        assert_eq!(decoded.mode, rupu_workspace::SyncMode::Git);
+        assert_eq!(decoded.changed, d.changed);
+        assert_eq!(decoded.deleted, d.deleted);
+        assert_eq!(decoded.bytes, d.bytes);
+    }
+
+    #[test]
+    fn baseline_sidecar_round_trip() {
+        let mut manifest = BTreeMap::new();
+        manifest.insert("a.txt".to_string(), [7u8; 32]);
+        let b = rupu_workspace::Baseline {
+            mode: rupu_workspace::SyncMode::Tar,
+            tar_manifest: manifest,
+            git_commit: None,
+        };
+        let reloaded = deserialize_baseline(&serialize_baseline(&b).unwrap()).unwrap();
+        assert_eq!(reloaded.mode, rupu_workspace::SyncMode::Tar);
+        assert_eq!(reloaded.tar_manifest.get("a.txt"), Some(&[7u8; 32]));
+        assert!(reloaded.git_commit.is_none());
+    }
+
+    #[test]
+    fn decode_rejects_short_and_unknown_mode() {
+        assert!(decode_payload(&[]).is_err());
+        assert!(decode_payload(&[9]).is_err()); // unknown mode tag
+        assert!(decode_delta(&[0, 0]).is_err()); // shorter than 4-byte header len
+    }
 }

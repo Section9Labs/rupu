@@ -11,11 +11,15 @@ use rupu_agent::RunError;
 use rupu_cp::{
     agent_launcher::AgentLaunchRequest,
     host::{
-        connector::{HostConnector, HostConnectorError},
+        connector::{
+            decode_delta, encode_delta, encode_payload, HostConnector, HostConnectorError,
+        },
         registry::HostRegistry,
     },
 };
-use rupu_orchestrator::runner::{UnitDispatch, UnitDispatcher, UnitOutcome};
+use rupu_orchestrator::runner::{
+    UnitDispatch, UnitDispatcher, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
+};
 
 // ── Poll constants ─────────────────────────────────────────────────────────────
 
@@ -32,6 +36,34 @@ fn is_terminal_status(status: &str) -> bool {
 
 fn host_err_to_run_err(e: HostConnectorError) -> RunError {
     RunError::Provider(e.to_string())
+}
+
+// ── Workspace-delta bridge ──────────────────────────────────────────────────
+//
+// The orchestrator's `WorkspaceDelta` is opaque: `payload` is whatever the
+// dispatcher chooses, and `changed`/`deleted` are mirrored for observability.
+// We define the bridge here so the orchestrator never sees the codec types.
+// The chosen payload encoding IS the connector wire encoding (`encode_delta` /
+// `decode_delta`), so the same self-describing bytes flow coordinator→host and
+// host→coordinator without a second format.
+
+/// Convert a codec [`rupu_workspace::Delta`] into the orchestrator's opaque
+/// [`WorkspaceDelta`]: mirror `changed`/`deleted` for logging, and stash the
+/// wire-encoded delta as the opaque `payload`.
+fn to_orchestrator_delta(d: &rupu_workspace::Delta) -> WorkspaceDelta {
+    WorkspaceDelta {
+        changed: d.changed.clone(),
+        deleted: d.deleted.clone(),
+        payload: encode_delta(d),
+    }
+}
+
+/// Decode an orchestrator [`WorkspaceDelta`] back into a codec
+/// [`rupu_workspace::Delta`] for `apply_deltas`.
+fn from_orchestrator_delta(
+    wd: &WorkspaceDelta,
+) -> Result<rupu_workspace::Delta, HostConnectorError> {
+    decode_delta(&wd.payload)
 }
 
 // ── Resolver — production vs. test seam ───────────────────────────────────────
@@ -85,14 +117,32 @@ impl UnitDispatcher for FleetUnitDispatcher {
     async fn dispatch_unit(&self, unit: UnitDispatch, host: &str) -> Result<UnitOutcome, RunError> {
         let conn = self.resolver.resolve(host)?;
 
-        // Launch the agent run on the remote host.
+        // When the unit runs in `Sync` mode, pack the coordinator workspace and
+        // stage it on the host BEFORE launching, so the agent runs against the
+        // staged tree. `None` ⇒ self-contained: byte-for-byte the prior path.
+        let working_dir = match &unit.workspace_path {
+            Some(ws) => {
+                let payload =
+                    rupu_workspace::pack(ws).map_err(|e| RunError::Provider(e.to_string()))?;
+                let encoded = encode_payload(&payload);
+                let dir = conn
+                    .stage_workspace(encoded)
+                    .await
+                    .map_err(host_err_to_run_err)?;
+                Some(dir)
+            }
+            None => None,
+        };
+
+        // Launch the agent run on the remote host (against the staged dir, when
+        // workspace sync is active).
         let run_id = conn
             .launch_agent(AgentLaunchRequest {
                 agent: unit.agent,
                 prompt: Some(unit.rendered_prompt),
                 mode: None,
                 target: None,
-                working_dir: None,
+                working_dir: working_dir.clone(),
             })
             .await
             .map_err(host_err_to_run_err)?;
@@ -120,10 +170,33 @@ impl UnitDispatcher for FleetUnitDispatcher {
                         .map(str::to_string)
                         .unwrap_or_else(|| status.clone())
                 });
+
+                // Collect the workspace delta when staging was active. On a
+                // successful unit, surface collect/decode failures (losing the
+                // delta would silently drop the unit's work). On a failed unit,
+                // still collect best-effort so the host scratch is cleaned up,
+                // but carry no delta.
+                let workspace_delta = match (&working_dir, success) {
+                    (Some(dir), true) => {
+                        let bytes = conn
+                            .collect_workspace_delta(dir)
+                            .await
+                            .map_err(host_err_to_run_err)?;
+                        let delta = decode_delta(&bytes).map_err(host_err_to_run_err)?;
+                        Some(to_orchestrator_delta(&delta))
+                    }
+                    (Some(dir), false) => {
+                        let _ = conn.collect_workspace_delta(dir).await;
+                        None
+                    }
+                    (None, _) => None,
+                };
+
                 return Ok(UnitOutcome {
                     output,
                     success,
                     error,
+                    workspace_delta,
                 });
             }
         }
@@ -132,6 +205,29 @@ impl UnitDispatcher for FleetUnitDispatcher {
             "timed out waiting for remote unit run {run_id} on host {host} \
              after {POLL_MAX_ATTEMPTS} polls"
         )))
+    }
+
+    /// Bridge the orchestrator's opaque deltas to the `rupu-workspace` codec and
+    /// apply them to the coordinator workspace. Conflicts (overlapping tar files
+    /// or conflicting git hunks) become [`WorkspaceConflict`]; any other codec
+    /// failure is surfaced as a conflict-class step failure too.
+    async fn apply_workspace_deltas(
+        &self,
+        workspace_path: &Path,
+        deltas: &[WorkspaceDelta],
+    ) -> Result<(), WorkspaceConflict> {
+        let mut codec = Vec::with_capacity(deltas.len());
+        for wd in deltas {
+            match from_orchestrator_delta(wd) {
+                Ok(d) => codec.push(d),
+                Err(e) => return Err(WorkspaceConflict(vec![e.to_string()])),
+            }
+        }
+        match rupu_workspace::apply_deltas(workspace_path, &codec) {
+            Ok(()) => Ok(()),
+            Err(rupu_workspace::SyncError::Conflict(paths)) => Err(WorkspaceConflict(paths)),
+            Err(e) => Err(WorkspaceConflict(vec![e.to_string()])),
+        }
     }
 }
 
@@ -379,6 +475,7 @@ mod tests {
             rendered_prompt: "p".to_string(),
             index: 0,
             run_id: "r".to_string(),
+            workspace_path: None,
         }
     }
 
@@ -437,7 +534,9 @@ steps:
 "#,
         )
         .unwrap();
-        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(dir.path().join("runs")));
+        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(
+            dir.path().join("runs"),
+        ));
         let got = build_dispatcher_if_needed(
             &wf,
             dir.path(),
@@ -462,7 +561,9 @@ steps:
 "#,
         )
         .unwrap();
-        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(dir.path().join("runs")));
+        let store = Arc::new(rupu_orchestrator::runs::RunStore::new(
+            dir.path().join("runs"),
+        ));
         let got = build_dispatcher_if_needed(
             &wf,
             dir.path(),
@@ -470,5 +571,110 @@ steps:
             rupu_config::PricingConfig::default(),
         );
         assert!(got.is_some(), "host-placed workflow must get a dispatcher");
+    }
+
+    // ── Workspace-sync tests ──────────────────────────────────────────────────
+
+    /// Build a one-file tar and wrap it in the dispatcher's wire encoding — the
+    /// SAME `encode_delta` path `apply_workspace_deltas` decodes. The resulting
+    /// bytes go into the orchestrator `WorkspaceDelta.payload`.
+    fn tar_one(path: &str, body: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            b.append_data(&mut header, path, body.as_bytes()).unwrap();
+            b.finish().unwrap();
+        }
+        let delta = rupu_workspace::Delta {
+            mode: rupu_workspace::SyncMode::Tar,
+            changed: vec![path.to_string()],
+            deleted: vec![],
+            bytes: buf,
+        };
+        rupu_cp::host::connector::encode_delta(&delta)
+    }
+
+    /// A transport that does not support workspace sync (default trait impls)
+    /// surfaces a clear Unsupported error through the dispatcher.
+    #[tokio::test]
+    async fn workspace_sync_on_unsupported_transport_errors() {
+        // UnreachableConnector inherits the default stage_workspace = Unsupported.
+        let conn = Arc::new(UnreachableConnector);
+        let d = FleetUnitDispatcher::from_connector(conn);
+        let mut unit = make_unit();
+        // Use a real dir so `pack` succeeds and `stage_workspace` (the default
+        // Unsupported impl) is the genuine failure point.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("f.txt"), "hi").unwrap();
+        unit.workspace_path = Some(ws.path().to_path_buf());
+        let err = d.dispatch_unit(unit, "h1").await.unwrap_err();
+        let msg = err.to_string();
+        // `UnreachableConnector` inherits the default `stage_workspace` impl
+        // which returns `HostConnectorError::Unsupported("workspace sync")`.
+        // The dispatcher must surface that — NOT silently fall through to the
+        // launch step before staging is complete.
+        assert!(
+            msg.contains("workspace sync") || msg.contains("unsupported"),
+            "expected unsupported-workspace-sync error, got: {msg}"
+        );
+    }
+
+    /// apply_workspace_deltas bridges to the rupu-workspace tar codec: two
+    /// disjoint tar deltas apply cleanly.
+    #[tokio::test]
+    async fn apply_bridges_to_workspace_codec() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(conn);
+        let ws = tempfile::tempdir().unwrap();
+        // Build two disjoint tar-mode orchestrator deltas via the same encode
+        // path the dispatcher uses (payload = wire-encoded one-file tar delta).
+        let a = rupu_orchestrator::runner::WorkspaceDelta {
+            changed: vec!["a.txt".into()],
+            deleted: vec![],
+            payload: tar_one("a.txt", "A"),
+        };
+        let b = rupu_orchestrator::runner::WorkspaceDelta {
+            changed: vec!["b.txt".into()],
+            deleted: vec![],
+            payload: tar_one("b.txt", "B"),
+        };
+        d.apply_workspace_deltas(ws.path(), &[a, b]).await.unwrap();
+        assert!(ws.path().join("a.txt").exists());
+        assert!(ws.path().join("b.txt").exists());
+    }
+
+    /// Two deltas that both touch the same path → `WorkspaceConflict` whose
+    /// `paths` name the conflicting file.  Validates the bridge's
+    /// `SyncError::Conflict → WorkspaceConflict` mapping.
+    #[tokio::test]
+    async fn apply_workspace_deltas_conflict_on_overlapping_paths() {
+        let conn = Arc::new(FakeConnector::completed());
+        let d = FleetUnitDispatcher::from_connector(conn);
+        let ws = tempfile::tempdir().unwrap();
+        // Two deltas that both claim to change "shared.txt".
+        let a = rupu_orchestrator::runner::WorkspaceDelta {
+            changed: vec!["shared.txt".into()],
+            deleted: vec![],
+            payload: tar_one("shared.txt", "from-unit-A"),
+        };
+        let b = rupu_orchestrator::runner::WorkspaceDelta {
+            changed: vec!["shared.txt".into()],
+            deleted: vec![],
+            payload: tar_one("shared.txt", "from-unit-B"),
+        };
+        let err = d
+            .apply_workspace_deltas(ws.path(), &[a, b])
+            .await
+            .expect_err("overlapping deltas must conflict");
+        // The conflict error must name the colliding path.
+        let WorkspaceConflict(paths) = err;
+        assert!(
+            paths.iter().any(|p| p.contains("shared.txt")),
+            "conflict paths must include 'shared.txt', got: {paths:?}"
+        );
     }
 }

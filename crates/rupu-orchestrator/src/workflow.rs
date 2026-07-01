@@ -121,6 +121,8 @@ pub enum WorkflowParseError {
     HostOnNonLinearStep { step: String },
     #[error("step `{step}`: `host:` must not be empty")]
     HostEmpty { step: String },
+    #[error("step `{step}`: `workspace: sync` is only valid on a remote step (`host:` or `distribute:`)")]
+    WorkspaceSyncOnLocalStep { step: String },
 }
 
 /// How a workflow gets kicked off. Manual is the existing behavior
@@ -522,6 +524,23 @@ pub struct WorkflowDefaults {
     /// false — but `Some(false)` is preserved for round-trip clarity.
     #[serde(default)]
     pub continue_on_error: Option<bool>,
+    /// Workflow-wide default workspace mode for remote steps. A step's
+    /// `workspace:` overrides this. Absent ⇒ `None` (self-contained).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMode>,
+}
+
+/// Whether a step's file workspace is synced to the remote host it runs on.
+/// `None` (the default) keeps the self-contained behavior of Slices 3a/3b:
+/// the remote step sees only its rendered prompt + prior-step string outputs.
+/// `Sync` makes the coordinator's workspace available on the host and brings
+/// the file changes back (Slice 3c). Only meaningful on a remote step
+/// (`host:` or `distribute:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceMode {
+    Sync,
+    None,
 }
 
 /// Fleet placement for a `for_each:` step — spreads units across hosts.
@@ -622,6 +641,12 @@ pub struct Step {
     /// Absent ⇒ runs locally (backward compatible).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Per-step workspace mode override. When the effective mode (this, else
+    /// `defaults.workspace`, else `None`) is `Sync`, the coordinator's
+    /// workspace is synced to the remote host this step runs on. Valid only
+    /// on a remote step (`host:` or `distribute:`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMode>,
 }
 
 /// One sub-step inside a `parallel:` block. Same surface as a linear
@@ -825,6 +850,14 @@ fn validate_cron_expression(expr: &str) -> Result<(), WorkflowParseError> {
     Ok(())
 }
 
+/// Resolve a step's effective workspace mode: the step's own `workspace`,
+/// else the workflow `defaults.workspace`, else `WorkspaceMode::None`.
+pub fn effective_workspace_mode(step: &Step, defaults: &WorkflowDefaults) -> WorkspaceMode {
+    step.workspace
+        .or(defaults.workspace)
+        .unwrap_or(WorkspaceMode::None)
+}
+
 /// Validate per-step shape constraints. The four shapes (linear,
 /// `for_each:`, `parallel:`, `panel:`) are mutually exclusive, and
 /// each carries its own set of required fields.
@@ -922,6 +955,18 @@ fn validate_step_shape(step: &Step) -> Result<(), WorkflowParseError> {
                 step: step.id.clone(),
             });
         }
+    }
+
+    // `workspace: sync` is only meaningful on a remote step — one with `host:`
+    // (3b) or `distribute:` (3a). On a purely-local step it would be a no-op
+    // and signals author confusion, so reject it.
+    if step.workspace == Some(WorkspaceMode::Sync)
+        && step.host.is_none()
+        && step.distribute.is_none()
+    {
+        return Err(WorkflowParseError::WorkspaceSyncOnLocalStep {
+            step: step.id.clone(),
+        });
     }
 
     Ok(())
@@ -1384,6 +1429,133 @@ steps:
 "#;
         let err = Workflow::parse(yaml).expect_err("empty host invalid");
         assert!(matches!(err, WorkflowParseError::HostEmpty { .. }));
+    }
+}
+
+#[cfg(test)]
+mod workspace_mode_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_parses_on_placed_step() {
+        let wf = Workflow::parse(
+            r#"
+name: ws
+steps:
+  - id: build
+    agent: a
+    prompt: p
+    host: worker-1
+    workspace: sync
+"#,
+        )
+        .unwrap();
+        assert_eq!(wf.steps[0].workspace, Some(WorkspaceMode::Sync));
+    }
+
+    #[test]
+    fn workspace_default_and_override_resolve() {
+        let wf = Workflow::parse(
+            r#"
+name: ws
+defaults:
+  workspace: sync
+steps:
+  - id: a
+    agent: a
+    prompt: p
+    host: w1
+  - id: b
+    agent: a
+    prompt: p
+    host: w2
+    workspace: none
+"#,
+        )
+        .unwrap();
+        // step a inherits the default; step b overrides to none.
+        assert_eq!(
+            effective_workspace_mode(&wf.steps[0], &wf.defaults),
+            WorkspaceMode::Sync
+        );
+        assert_eq!(
+            effective_workspace_mode(&wf.steps[1], &wf.defaults),
+            WorkspaceMode::None
+        );
+    }
+
+    #[test]
+    fn workspace_absent_resolves_to_none() {
+        let wf = Workflow::parse(
+            r#"
+name: ws
+steps:
+  - id: a
+    agent: a
+    prompt: p
+    host: w1
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            effective_workspace_mode(&wf.steps[0], &wf.defaults),
+            WorkspaceMode::None
+        );
+        assert_eq!(wf.steps[0].workspace, None);
+    }
+
+    #[test]
+    fn workspace_none_skipped_in_serialize() {
+        let wf = Workflow::parse(
+            r#"
+name: ws
+steps:
+  - id: a
+    agent: a
+    prompt: p
+"#,
+        )
+        .unwrap();
+        let out = serde_yaml::to_string(&wf).unwrap();
+        assert!(!out.contains("workspace"), "None must be skipped: {out}");
+    }
+
+    #[test]
+    fn workspace_sync_rejected_on_local_step() {
+        let err = Workflow::parse(
+            r#"
+name: ws
+steps:
+  - id: a
+    agent: a
+    prompt: p
+    workspace: sync
+"#,
+        )
+        .expect_err("sync on a local step is invalid");
+        assert!(matches!(
+            err,
+            WorkflowParseError::WorkspaceSyncOnLocalStep { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_sync_allowed_on_distribute_step() {
+        // distribute => remote => sync is valid.
+        Workflow::parse(
+            r#"
+name: ws
+steps:
+  - id: a
+    for_each: "x\ny"
+    agent: a
+    prompt: p
+    workspace: sync
+    distribute:
+      hosts: [w1, w2]
+"#,
+        )
+        .expect("sync on a distribute step is valid");
     }
 }
 

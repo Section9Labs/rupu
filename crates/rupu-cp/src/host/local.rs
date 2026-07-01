@@ -6,20 +6,22 @@
 //! the shared builders in `crate::api::runs` so the JSON shape is identical to
 //! what the HTTP API serves.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rupu_orchestrator::{
     runs::{CancelError, RunStore},
     ApprovalError, RunStoreError,
 };
+use ulid::Ulid;
 
 use crate::{
     agent_launcher::{AgentLaunchRequest, AgentLauncher},
     api::runs::{query_run_detail, query_run_rows},
     host::connector::{
-        open_run_events_tail, read_transcript_file, EventByteStream, HostCapabilities,
-        HostConnector, HostConnectorError, HostInfo, RunKind, RunListQuery,
+        decode_payload, deserialize_baseline, encode_delta, open_run_events_tail,
+        read_transcript_file, serialize_baseline, EventByteStream, HostCapabilities, HostConnector,
+        HostConnectorError, HostInfo, RunKind, RunListQuery, MAX_WORKSPACE_BYTES,
     },
     launcher::{LaunchRequest, RunLauncher},
     session_sender::{SendMessageRequest, SessionSender},
@@ -36,10 +38,8 @@ pub struct LocalHostConnector {
     session_starter: Option<Arc<dyn SessionStarter>>,
     session_sender: Option<Arc<dyn SessionSender>>,
     run_store: Arc<RunStore>,
-    /// Global rupu directory (e.g. `~/.rupu` or the project-level dir).
-    /// Not yet consumed in this slice; retained for Task 5 (AppState wiring)
-    /// and Task 9 (host-aware launch).
-    #[allow(dead_code)]
+    /// Global rupu directory (e.g. `~/.rupu` or the project-level dir). Workspace
+    /// staging scratch dirs live under `<global_dir>/workspace-sync/`.
     global_dir: PathBuf,
     pricing: rupu_config::PricingConfig,
 }
@@ -129,10 +129,7 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| HostConnectorError::Invalid(e.to_string()))
     }
 
-    async fn start_session(
-        &self,
-        req: SessionStartRequest,
-    ) -> Result<String, HostConnectorError> {
+    async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError> {
         let starter = self.session_starter.as_ref().ok_or_else(|| {
             HostConnectorError::Invalid("no session starter configured for this host".to_string())
         })?;
@@ -174,8 +171,7 @@ impl HostConnector for LocalHostConnector {
         // across local and HTTP connectors.
         rows.iter()
             .map(|r| {
-                serde_json::to_value(r)
-                    .map_err(|e| HostConnectorError::Invalid(e.to_string()))
+                serde_json::to_value(r).map_err(|e| HostConnectorError::Invalid(e.to_string()))
             })
             .collect()
     }
@@ -215,10 +211,7 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| map_cancel_err(run_id, e))
     }
 
-    async fn stream_run_events(
-        &self,
-        run_id: &str,
-    ) -> Result<EventByteStream, HostConnectorError> {
+    async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         // Verify the run exists before opening the tail.
         self.run_store
             .load(run_id)
@@ -240,10 +233,101 @@ impl HostConnector for LocalHostConnector {
     // transcript handler enforces allowed_roots before reaching a connector;
     // this method does NOT. Do not resolve("local") + get_transcript with
     // user input.
-    async fn get_transcript(
-        &self,
-        path: &str,
-    ) -> Result<serde_json::Value, HostConnectorError> {
+    async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
         read_transcript_file(path)
+    }
+
+    /// Stage a packed workspace into a fresh scratch dir under the CP cache.
+    ///
+    /// Layout: `<global_dir>/workspace-sync/<ulid>/work` is the working dir; the
+    /// stage-time baseline is persisted to a `baseline.json` sidecar one level up
+    /// (OUTSIDE `work`, so `collect_workspace_delta`'s tree hash never sees it).
+    async fn stage_workspace(&self, payload: Vec<u8>) -> Result<String, HostConnectorError> {
+        if payload.len() > MAX_WORKSPACE_BYTES {
+            return Err(HostConnectorError::Invalid(format!(
+                "workspace payload {} bytes exceeds limit {MAX_WORKSPACE_BYTES}",
+                payload.len()
+            )));
+        }
+        let decoded = decode_payload(&payload)?;
+        let base = self
+            .global_dir
+            .join("workspace-sync")
+            .join(Ulid::new().to_string());
+        let work = base.join("work");
+        let baseline = rupu_workspace::stage(&decoded, &work)
+            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        std::fs::write(base.join("baseline.json"), serialize_baseline(&baseline)?)
+            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        Ok(work.to_string_lossy().into_owned())
+    }
+
+    /// Reload the staged baseline, diff the working dir, and return the encoded
+    /// delta. The scratch tree is removed (best-effort) before returning.
+    async fn collect_workspace_delta(
+        &self,
+        working_dir: &str,
+    ) -> Result<Vec<u8>, HostConnectorError> {
+        let work = Path::new(working_dir);
+        let base = work
+            .parent()
+            .ok_or_else(|| HostConnectorError::Invalid("invalid working dir".into()))?;
+        let baseline_bytes = std::fs::read(base.join("baseline.json"))
+            .map_err(|e| HostConnectorError::Invalid(format!("baseline missing: {e}")))?;
+        let baseline = deserialize_baseline(&baseline_bytes)?;
+        let delta = rupu_workspace::collect_delta(work, &baseline)
+            .map_err(|e| HostConnectorError::Invalid(e.to_string()))?;
+        let bytes = encode_delta(&delta);
+        let _ = std::fs::remove_dir_all(base);
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod workspace_sync_tests {
+    use super::*;
+    use crate::host::connector::{decode_delta, encode_payload};
+
+    fn local(global_dir: PathBuf) -> LocalHostConnector {
+        let run_store = Arc::new(RunStore::new(global_dir.join("runs")));
+        LocalHostConnector::new(None, None, None, None, run_store, global_dir)
+    }
+
+    /// The Local override stages a packed payload, lets the "agent" mutate the
+    /// staged tree, then collects a delta that round-trips through the wire
+    /// codec — and cleans up its scratch dir afterwards.
+    #[tokio::test]
+    async fn local_stage_collect_round_trip() {
+        // Coordinator workspace (non-git temp dir → tar mode).
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(ws.path().join("mod.txt"), "before").unwrap();
+
+        let payload = rupu_workspace::pack(ws.path()).unwrap();
+        assert_eq!(payload.mode, rupu_workspace::SyncMode::Tar);
+
+        let global = tempfile::tempdir().unwrap();
+        let conn = local(global.path().to_path_buf());
+
+        let working_dir = conn
+            .stage_workspace(encode_payload(&payload))
+            .await
+            .unwrap();
+        let work = Path::new(&working_dir);
+        assert!(work.join("keep.txt").exists());
+
+        // "remote agent" edits + creates files in the staged tree.
+        std::fs::write(work.join("mod.txt"), "after").unwrap();
+        std::fs::write(work.join("new.txt"), "created").unwrap();
+
+        let base = work.parent().unwrap().to_path_buf();
+        let delta_bytes = conn.collect_workspace_delta(&working_dir).await.unwrap();
+        let delta = decode_delta(&delta_bytes).unwrap();
+        assert!(delta.changed.contains(&"mod.txt".to_string()));
+        assert!(delta.changed.contains(&"new.txt".to_string()));
+        assert!(!delta.changed.contains(&"keep.txt".to_string()));
+
+        // Scratch base dir is removed after collect.
+        assert!(!base.exists(), "scratch dir should be cleaned up");
     }
 }
