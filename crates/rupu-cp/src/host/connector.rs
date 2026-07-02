@@ -178,6 +178,28 @@ pub trait HostConnector: Send + Sync {
         Err(HostConnectorError::Unsupported("session listing".into()))
     }
 
+    /// List standalone/agent runs on this host (`GET /api/runs/agents`).
+    /// The SSH connector shells `rupu transcript list --format json`. Default
+    /// errors so transports without agent-run enumeration compile unchanged.
+    async fn list_agent_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("agent-run listing".into()))
+    }
+
+    /// List autoflow cycle summaries on this host (`GET /api/runs/autoflows`).
+    async fn list_autoflow_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "autoflow-run listing".into(),
+        ))
+    }
+
+    /// List recent autoflow events on this host
+    /// (`GET /api/runs/autoflows/events`).
+    async fn list_autoflow_events(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        Err(HostConnectorError::Unsupported(
+            "autoflow-event listing".into(),
+        ))
+    }
+
     /// Stage a packed workspace on the host; returns the remote working dir.
     ///
     /// `payload` is a wire-encoded [`rupu_workspace::Payload`] (see

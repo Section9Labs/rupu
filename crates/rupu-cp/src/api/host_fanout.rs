@@ -10,83 +10,68 @@
 use futures_util::future::join_all;
 use std::sync::Arc;
 
-/// Concurrently proxy `GET list_path` to every registered **remote** host,
-/// tag each returned row JSON object with `"host_id": "<that host's id>"`,
-/// and return the combined list (`local_values` + all remote rows).
-///
-/// `local_values` should already have `"host_id": "local"` set on each element.
-///
-/// Per-host failures emit a `tracing::warn` and contribute nothing — the
-/// caller always gets a 200 even when some hosts are offline.
-pub(crate) async fn fan_out_rows(
+/// Generic tolerant fan-out over structured connector methods: run `f(conn)`
+/// on every remote host, tag each returned row with its `host_id`, and merge
+/// with `local_values`. Per-host failures warn (tagged `what`) and contribute
+/// nothing. Used by the run-list views (agents / autoflows / autoflow events)
+/// so SSH hosts — which can't serve `proxy_get_json` — still contribute rows.
+pub(crate) async fn fan_out_via<F, Fut>(
     hosts: &Arc<crate::host::registry::HostRegistry>,
-    list_path: &str,
     local_values: Vec<serde_json::Value>,
-) -> Vec<serde_json::Value> {
-    let all_hosts = hosts.list_hosts();
-    let remote_hosts: Vec<_> = all_hosts.into_iter().filter(|h| h.id != "local").collect();
-
+    what: &'static str,
+    f: F,
+) -> Vec<serde_json::Value>
+where
+    F: Fn(Arc<dyn crate::host::connector::HostConnector>) -> Fut + Clone + Send + Sync,
+    Fut: std::future::Future<
+            Output = Result<Vec<serde_json::Value>, crate::host::connector::HostConnectorError>,
+        > + Send,
+{
+    let remote_hosts: Vec<_> = hosts
+        .list_hosts()
+        .into_iter()
+        .filter(|h| h.id != "local")
+        .collect();
     if remote_hosts.is_empty() {
         return local_values;
     }
-
     let futs: Vec<_> = remote_hosts
         .into_iter()
         .map(|h| {
             let registry = Arc::clone(hosts);
-            let path = list_path.to_string();
+            let f = f.clone();
             async move {
                 let conn = match registry.resolve(&h.id) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::warn!(
-                            host_id = %h.id,
-                            error = %e,
-                            "fan_out_rows: could not resolve connector; skipping"
-                        );
-                        return Vec::<serde_json::Value>::new();
+                        tracing::warn!(host_id = %h.id, error = %e, "fan_out_via({what}): resolve failed; skipping");
+                        return Vec::new();
                     }
                 };
-                match conn.proxy_get_json(&path).await {
-                    Ok(v) => {
-                        let arr = match v.as_array() {
-                            Some(a) => a.clone(),
-                            None => {
-                                tracing::warn!(
-                                    host_id = %h.id,
-                                    "fan_out_rows: remote returned non-array JSON; skipping"
-                                );
-                                return Vec::new();
-                            }
-                        };
+                match f(conn).await {
+                    Ok(rows) => {
                         let host_id = h.id;
-                        arr.into_iter()
-                            .map(|mut row| {
-                                row["host_id"] = serde_json::json!(&host_id);
-                                row
+                        rows.into_iter()
+                            .map(|mut r| {
+                                r["host_id"] = serde_json::json!(&host_id);
+                                r
                             })
                             .collect()
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            host_id = %h.id,
-                            error = %e,
-                            "fan_out_rows: proxy_get_json failed; skipping"
-                        );
+                        tracing::warn!(host_id = %h.id, error = %e, "fan_out_via({what}): fetch failed; skipping");
                         Vec::new()
                     }
                 }
             }
         })
         .collect();
-
-    let remote_results = join_all(futs).await;
     let mut all = local_values;
-    all.extend(remote_results.into_iter().flatten());
+    all.extend(join_all(futs).await.into_iter().flatten());
     all
 }
 
-/// Like [`fan_out_rows`] but for sessions: calls the structured
+/// Like [`fan_out_via`] but specialized for sessions: calls the structured
 /// `list_sessions(scope)` on each remote host instead of `proxy_get_json`, so
 /// SSH hosts (which can't serve a generic GET) contribute their sessions
 /// instead of being silently skipped. Per-host failures warn and contribute
