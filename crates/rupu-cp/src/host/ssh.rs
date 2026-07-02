@@ -801,11 +801,30 @@ impl SshHostConnector {
 #[async_trait::async_trait]
 impl HostConnector for SshHostConnector {
     async fn info(&self) -> Result<HostInfo, HostConnectorError> {
+        // Reachability: can we execute anything over ssh? (`true` exits 0; ssh
+        // itself exits nonzero on a connection failure.)
         let probe = build_remote_command(&["true".to_string()]);
         let reachable = matches!(self.exec.run(&probe).await, Ok(o) if o.success);
+        // Version: best-effort `rupu --version` (prints e.g. "rupu 0.35.2"),
+        // taking the trailing version token to match the bare-semver format the
+        // local/HTTP connectors report. Only attempted when reachable.
+        let version = if reachable {
+            let vc = build_remote_command(&["rupu".to_string(), "--version".to_string()]);
+            match self.exec.run(&vc).await {
+                Ok(o) if o.success => o
+                    .stdout
+                    .split_whitespace()
+                    .last()
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty()),
+                _ => None,
+            }
+        } else {
+            None
+        };
         Ok(HostInfo {
             reachable,
-            version: None,
+            version,
             capabilities: HostCapabilities::default(),
         })
     }
@@ -1471,6 +1490,75 @@ mod tests {
         assert_eq!(c2["workflow_count"], 0);
         assert_eq!(c2["run_ids"].as_array().unwrap().len(), 0);
         assert_eq!(c2["ran_cycles"], 0);
+    }
+
+    #[tokio::test]
+    async fn info_reports_remote_rupu_version() {
+        struct VerExec;
+        #[async_trait::async_trait]
+        impl RemoteExec for VerExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                let stdout = if remote.contains("--version") {
+                    "rupu 0.35.2\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok(RemoteOutput {
+                    stdout,
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!()
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!()
+            }
+        }
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(VerExec));
+        let info = conn.info().await.unwrap();
+        assert!(info.reachable);
+        assert_eq!(info.version.as_deref(), Some("0.35.2"));
+    }
+
+    #[tokio::test]
+    async fn info_reachable_but_version_none_when_rupu_missing() {
+        // `true` succeeds (ssh works) but `rupu --version` exits nonzero.
+        struct NoRupuExec;
+        #[async_trait::async_trait]
+        impl RemoteExec for NoRupuExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                let success = !remote.contains("--version");
+                Ok(RemoteOutput {
+                    stdout: String::new(),
+                    stderr: if success {
+                        String::new()
+                    } else {
+                        "rupu: command not found".into()
+                    },
+                    success,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!()
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!()
+            }
+        }
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(NoRupuExec));
+        let info = conn.info().await.unwrap();
+        assert!(info.reachable, "ssh works even if rupu is missing");
+        assert!(info.version.is_none());
     }
 
     #[tokio::test]
