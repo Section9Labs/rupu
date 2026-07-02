@@ -1,4 +1,4 @@
-use crate::api::host_fanout::{fan_out_rows, sort_values_newest_first};
+use crate::api::host_fanout::{fan_out_sessions, sort_values_newest_first};
 use crate::{
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
@@ -244,27 +244,19 @@ async fn list_sessions(
     // ── Single remote host ─────────────────────────────────────────────────────
     if host != "local" && host != "all" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        let path = {
-            let mut p = "/api/sessions?host=local".to_string();
-            if let Some(scope) = &q.scope {
-                p.push_str("&scope=");
-                p.push_str(scope);
-            }
-            if let Some(off) = q.offset {
-                p.push_str(&format!("&offset={off}"));
-            }
-            if let Some(lim) = q.limit {
-                p.push_str(&format!("&limit={lim}"));
-            }
-            p
-        };
-        let v = conn
-            .proxy_get_json(&path)
+        // Structured session listing — works for SSH hosts (which can't serve
+        // the generic `proxy_get_json` GET) by shelling `rupu session list`.
+        let rows = conn
+            .list_sessions(q.scope.as_deref())
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
-        let arr = v.as_array().cloned().unwrap_or_default();
+        let page = crate::pagination::PageQuery {
+            offset: q.offset,
+            limit: q.limit,
+        };
         return Ok(Json(
-            arr.into_iter()
+            crate::pagination::paginate(rows, &page)
+                .into_iter()
                 .map(|mut row| {
                     row["host_id"] = serde_json::json!(host);
                     row
@@ -306,16 +298,7 @@ async fn list_sessions(
         })
         .collect();
 
-    let remote_path = {
-        let mut p = "/api/sessions?host=local&limit=10000".to_string();
-        if let Some(scope) = &q.scope {
-            p.push_str("&scope=");
-            p.push_str(scope);
-        }
-        p
-    };
-
-    let mut all_values = fan_out_rows(&s.hosts, &remote_path, local_values).await;
+    let mut all_values = fan_out_sessions(&s.hosts, q.scope.as_deref(), local_values).await;
 
     // Sort newest-first by updated_at (most recently active sessions first).
     sort_values_newest_first(&mut all_values, "updated_at");

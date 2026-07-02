@@ -165,6 +165,19 @@ pub trait HostConnector: Send + Sync {
         path_and_query: &str,
     ) -> Result<serde_json::Value, HostConnectorError>;
 
+    /// List sessions on this host, optionally filtered by `scope`
+    /// (`"active"` | `"archived"`). The structured counterpart to
+    /// `proxy_get_json("/api/sessions")`, so non-HTTP transports (SSH) can
+    /// enumerate sessions too — the SSH connector shells `rupu session list
+    /// --format json` over `ssh`. The default errors so transports without
+    /// session enumeration compile unchanged.
+    async fn list_sessions(
+        &self,
+        _scope: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("session listing".into()))
+    }
+
     /// Stage a packed workspace on the host; returns the remote working dir.
     ///
     /// `payload` is a wire-encoded [`rupu_workspace::Payload`] (see

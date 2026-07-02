@@ -317,6 +317,19 @@ impl HostConnector for HttpHostConnector {
             .map_err(|e| HostConnectorError::Remote(0, e.to_string()))
     }
 
+    async fn list_sessions(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let mut path = "/api/sessions?host=local".to_string();
+        if let Some(sc) = scope {
+            path.push_str("&scope=");
+            path.push_str(sc);
+        }
+        let v = self.proxy_get_json(&path).await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
     /// POST the wire-encoded payload to the remote CP's `/api/workspace/stage`;
     /// the remote stages it under its own cache and returns `{working_dir}`.
     async fn stage_workspace(&self, payload: Vec<u8>) -> Result<String, HostConnectorError> {
