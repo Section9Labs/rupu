@@ -41,13 +41,13 @@ pub use runs::{
 };
 pub use step_factory::DefaultStepFactory;
 pub use templates::{
-    render_step_prompt, render_when_expression, LoopInfo, RenderError, StepContext, StepOutput,
-    SubResult,
+    pr_event_context, render_step_prompt, render_when_expression, LoopInfo, RenderError,
+    StepContext, StepOutput, SubResult,
 };
 pub use workflow::{
-    Approval, Autoflow, AutoflowClaim, AutoflowClaimKey, AutoflowEntity, AutoflowIssueState,
-    AutoflowOutcomeRef, AutoflowSelector, AutoflowWorkspace, AutoflowWorkspaceStrategy,
-    ContractFormat, Contracts, InputDef, InputType, Panel, PanelGate, Severity, Step, StepContract,
-    SubStep, Trigger, TriggerKind, Workflow, WorkflowDefaults, WorkflowOutputContract,
-    WorkflowParseError,
+    author_allowed, Approval, AuthorScope, Autoflow, AutoflowClaim, AutoflowClaimKey,
+    AutoflowEntity, AutoflowIssueState, AutoflowOutcomeRef, AutoflowSelector, AutoflowWorkspace,
+    AutoflowWorkspaceStrategy, ContractFormat, Contracts, DraftFilter, InputDef, InputType, Panel,
+    PanelGate, Severity, SkipAction, Step, StepContract, SubStep, Trigger, TriggerKind, Workflow,
+    WorkflowDefaults, WorkflowOutputContract, WorkflowParseError,
 };

@@ -1545,6 +1545,7 @@ async fn list(
                 scope: entry.scope.clone(),
                 entity: match autoflow.entity {
                     rupu_orchestrator::AutoflowEntity::Issue => "issue".into(),
+                    rupu_orchestrator::AutoflowEntity::PullRequest => "pull_request".into(),
                 },
                 source: autoflow.source.clone().unwrap_or_else(|| "-".into()),
                 priority: autoflow.priority,
@@ -1601,6 +1602,7 @@ fn build_autoflow_show_output(
         description: entry.workflow.description.clone(),
         entity: match autoflow.entity {
             rupu_orchestrator::AutoflowEntity::Issue => "issue".to_string(),
+            rupu_orchestrator::AutoflowEntity::PullRequest => "pull_request".to_string(),
         },
         source: autoflow
             .source
@@ -7526,6 +7528,7 @@ fn render_autoflow_show_summary(
 
     let entity = match autoflow.entity {
         rupu_orchestrator::AutoflowEntity::Issue => "issue",
+        rupu_orchestrator::AutoflowEntity::PullRequest => "pull_request",
     };
     let source = autoflow
         .source
