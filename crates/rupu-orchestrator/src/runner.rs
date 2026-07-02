@@ -1128,6 +1128,14 @@ async fn run_steps_inner(
             // checkpoint carrying the seed.
             match run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await {
                 Ok(LinearStepOutcome::Paused { step_id, seed }) => {
+                    // A `workspace: sync` workflow is refused loudly here too
+                    // — checkpointing mid-step would drop in-flight deltas
+                    // the same way a step-boundary/fan-out pause would.
+                    // Mirrors the step-boundary guard above and the fan-out
+                    // guard in `run_fanout_step`.
+                    if workflow_has_sync_step(opts) {
+                        return Err(RunWorkflowError::PauseWithWorkspaceSync);
+                    }
                     info!(step = %step_id, "cooperative pause mid-step");
                     if let Some(sink) = opts.event_sink.as_ref() {
                         sink.emit(
@@ -4330,6 +4338,53 @@ steps:
         let err = run_workflow(opts)
             .await
             .expect_err("pause of a workspace:sync workflow must be refused");
+        assert!(
+            matches!(err, RunWorkflowError::PauseWithWorkspaceSync),
+            "expected PauseWithWorkspaceSync, got: {err:?}"
+        );
+    }
+
+    /// A workflow whose FIRST step is a plain local (non-placed) linear step
+    /// and whose SECOND step is a placed `workspace: sync` step. The pause
+    /// token is cancelled mid-first-step (via `BlockingProvider`, same
+    /// mechanism as `agent_run_pauses_and_resumes`) — a step BOUNDARY was
+    /// never crossed, so only the mid-linear-step pause path
+    /// (`run_steps_inner`'s `LinearStepOutcome::Paused` arm) can catch this.
+    /// `workflow_has_sync_step` looks at every step in the workflow, not just
+    /// the currently-running one, so it still refuses.
+    const WF_SOLO_THEN_SYNC: &str = r#"
+name: pause-solo-then-sync
+steps:
+  - id: solo
+    agent: worker
+    prompt: "do work"
+  - id: edit
+    agent: coder
+    prompt: "edit"
+    host: worker-1
+    workspace: sync
+"#;
+
+    #[tokio::test]
+    async fn workspace_sync_workflow_mid_linear_step_pause_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_SOLO_THEN_SYNC).unwrap();
+
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            token2.cancel();
+        });
+        let sink = Arc::new(CollectingSink::default());
+        let factory = Arc::new(OneShotFactory::new(Box::new(BlockingProvider)));
+        let mut opts = pause_opts(wf, dir.path().to_path_buf(), factory, sink);
+        opts.unit_dispatcher = Some(Arc::new(WorkspaceFakeDispatcher::new()));
+        opts.pause = Some(token);
+
+        let err = run_workflow(opts).await.expect_err(
+            "a mid-linear-step pause of a workflow containing a workspace:sync step must be refused",
+        );
         assert!(
             matches!(err, RunWorkflowError::PauseWithWorkspaceSync),
             "expected PauseWithWorkspaceSync, got: {err:?}"

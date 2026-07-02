@@ -260,11 +260,19 @@ async fn pause_run(
         return Ok(Json(serde_json::json!({ "ok": true, "host_id": host })));
     }
     // Local path: mirrors cancel_run's local branch — operate on the store
-    // directly rather than through the connector.
+    // directly rather than through the connector. Unlike cancel, a
+    // cooperative pause also needs the marker file written so a *detached*
+    // `rupu workflow run <id>` subprocess (the shape `cp serve` launches)
+    // actually learns it was paused — the subprocess polls the marker, it
+    // does not re-read its own record status. Mirrors
+    // `LocalHostConnector::pause_run`.
     let now = chrono::Utc::now();
     s.run_store
         .pause(&id, now)
         .map_err(|e| map_pause_err(&id, e))?;
+    s.run_store
+        .set_pause_marker(&id)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let mut resp = run_response(&s, &id)?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
@@ -619,7 +627,10 @@ fn in_lifecycle(status: RunStatus, group: Option<&str>) -> bool {
     match group {
         Some("active") => matches!(
             status,
-            RunStatus::Running | RunStatus::Pending | RunStatus::AwaitingApproval
+            RunStatus::Running
+                | RunStatus::Pending
+                | RunStatus::AwaitingApproval
+                | RunStatus::Paused
         ),
         Some("completed") => matches!(status, RunStatus::Completed),
         Some("failed") => matches!(
@@ -1246,6 +1257,10 @@ mod tests {
 
         let loaded = s.run_store.load("run_pause").unwrap();
         assert_eq!(loaded.status, RunStatus::Paused);
+        // The marker is the ONLY delivery channel to a detached subprocess
+        // (it polls the marker, it does not re-read its own record status) —
+        // without it this would be a fake pause that runs to completion.
+        assert!(s.run_store.pause_marker_exists("run_pause"));
     }
 
     #[tokio::test]
@@ -1517,6 +1532,7 @@ mod tests {
     #[test]
     fn in_lifecycle_groups_statuses() {
         assert!(in_lifecycle(RunStatus::Running, Some("active")));
+        assert!(in_lifecycle(RunStatus::Paused, Some("active")));
         assert!(in_lifecycle(RunStatus::Completed, Some("completed")));
         assert!(in_lifecycle(RunStatus::Failed, Some("failed")));
         assert!(in_lifecycle(RunStatus::Rejected, Some("failed")));

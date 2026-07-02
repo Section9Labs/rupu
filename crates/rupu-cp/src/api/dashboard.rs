@@ -74,7 +74,7 @@ async fn get_dashboard(State(s): State<AppState>) -> ApiResult<Json<DashboardRes
         .list()
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    // All six RunStatus variants must always be present (even when 0).
+    // All eight RunStatus variants must always be present (even when 0).
     let statuses: &[RunStatus] = &[
         RunStatus::Pending,
         RunStatus::Running,
@@ -82,6 +82,8 @@ async fn get_dashboard(State(s): State<AppState>) -> ApiResult<Json<DashboardRes
         RunStatus::Failed,
         RunStatus::AwaitingApproval,
         RunStatus::Rejected,
+        RunStatus::Cancelled,
+        RunStatus::Paused,
     ];
     let mut by_status: HashMap<&'static str, usize> = statuses
         .iter()
