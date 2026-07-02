@@ -731,6 +731,52 @@ impl HostConnector for SshHostConnector {
         self.remote_workflow(&["cancel", run_id]).await
     }
 
+    /// Cooperatively pause a remote in-flight run.
+    ///
+    /// Same mechanism as [`cancel_run`](Self::cancel_run): a one-shot,
+    /// blocking `rupu workflow pause <run_id>` on the remote host. That
+    /// command (the exact primitive `LocalHostConnector::pause_run` uses
+    /// in-process) flips the remote's own `RunStore` record to `Paused` and
+    /// writes the pause marker the *already-running* detached
+    /// `rupu workflow run`/`rupu run` process polls (~every 250ms) — so the
+    /// remote's own in-process executor genuinely honors the pause at its
+    /// next safe boundary. Quick, like `cancel`/`approve`/`reject` — no
+    /// detach needed.
+    async fn pause_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.remote_workflow(&["pause", run_id]).await
+    }
+
+    /// Resume a `Paused` remote run.
+    ///
+    /// Unlike `cancel`/`pause` (a quick status flip on an already-live or
+    /// already-stopped process), resuming re-enters `run_workflow` from the
+    /// persisted checkpoint — the same shape as [`launch_run`](Self::launch_run),
+    /// not a fast operation. So this dispatches the existing
+    /// `rupu workflow resume <run_id>` command (which already accepts a
+    /// `Paused` run — see the T4 commit) as a **detached** remote process
+    /// (`Self::detach`, the same wrapping `launch_run` uses) rather than
+    /// through `remote_workflow`'s blocking exec, which would otherwise tie
+    /// up this call until the entire resumed workflow finished.
+    async fn resume_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        let argv = vec![
+            "rupu".to_string(),
+            "workflow".to_string(),
+            "resume".to_string(),
+            run_id.to_string(),
+        ];
+        let remote_cmd = build_remote_command(&argv);
+        let detached = Self::detach(&remote_cmd);
+        let out = self
+            .exec
+            .run(&detached)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success {
+            return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+        Ok(())
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         mirror_stream_run_events(&self.run_store, &self.host_id, run_id).await
     }
@@ -1147,6 +1193,68 @@ mod tests {
                 && c.contains("'--reason'")
                 && c.contains("'nope'")),
             "reject command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_pause_run_invokes_remote() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let run_id = "run_01TESTPAUSEOK";
+
+        conn.pause_run(run_id).await.unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'pause'")
+                && c.contains(&format!("'{run_id}'"))),
+            "pause command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_pause_run_offline_surfaces_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline("connection refused"));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn.pause_run("run_01TESTPAUSEOFFLINE").await.unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_resume_run_dispatches_detached_remote_resume() {
+        let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+        let run_id = "run_01TESTRESUMEOK";
+
+        conn.resume_run(run_id).await.unwrap();
+
+        let cmds = fake.commands.lock().unwrap();
+        assert!(
+            cmds.iter().any(|c| c.contains("'workflow'")
+                && c.contains("'resume'")
+                && c.contains(&format!("'{run_id}'"))
+                && (c.contains("setsid") || c.contains("nohup"))),
+            "detached resume command not found in: {cmds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_resume_run_offline_surfaces_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline("connection refused"));
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
+
+        let err = conn
+            .resume_run("run_01TESTRESUMEOFFLINE")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostConnectorError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
         );
     }
 

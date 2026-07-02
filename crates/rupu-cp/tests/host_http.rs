@@ -118,6 +118,43 @@ async fn cancel_run_posts_to_cancel_endpoint() {
 }
 
 #[tokio::test]
+async fn http_pause_resume_round_trip() {
+    let server = httpmock::MockServer::start_async().await;
+    let pause_mock = server.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_p/pause");
+        then.status(200)
+            .json_body(serde_json::json!({"run": {"id": "run_p", "status": "paused"}}));
+    });
+    let resume_mock = server.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_p/resume");
+        then.status(200)
+            .json_body(serde_json::json!({"run": {"id": "run_p", "status": "running"}}));
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    c.pause_run("run_p").await.unwrap();
+    c.resume_run("run_p").await.unwrap();
+    pause_mock.assert();
+    resume_mock.assert();
+}
+
+#[tokio::test]
+async fn resume_run_surfaces_launcher_gated_501() {
+    // A read-only remote deploy (no `RunLauncher`) answers `/resume` with a
+    // 501 — must surface as a `Remote` error, not a silent success.
+    let server = httpmock::MockServer::start_async().await;
+    server.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_ro/resume");
+        then.status(501)
+            .body("resuming a paused run requires `rupu cp serve`");
+    });
+    let c = HttpHostConnector::new(server.base_url(), None);
+    assert!(matches!(
+        c.resume_run("run_ro").await,
+        Err(HostConnectorError::Remote(501, _))
+    ));
+}
+
+#[tokio::test]
 async fn stream_run_events_smoke() {
     let server = httpmock::MockServer::start_async().await;
     let m = server.mock(|when, then| {

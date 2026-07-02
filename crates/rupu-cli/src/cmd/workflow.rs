@@ -24,7 +24,7 @@ use clap_complete::ArgValueCompleter;
 use rupu_agent::load_agents as load_agent_specs;
 use rupu_app_canvas::{render_rows as render_graph_rows, GraphCell, NodeStatus};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts};
-use rupu_orchestrator::runs::{CancelError, CancelOutcome};
+use rupu_orchestrator::runs::{CancelError, CancelOutcome, PauseError};
 use rupu_orchestrator::{DefaultStepFactory, RunWorkflowError};
 use rupu_runtime::{
     ArtifactKind, ArtifactManifest, ArtifactRef, AutoflowEnvelope, ExecutionBackend,
@@ -331,6 +331,17 @@ pub enum Action {
         /// `rupu workflow run`.
         run_id: String,
     },
+    /// Cooperatively pause a running workflow run at its next safe boundary,
+    /// leaving it non-terminal and resumable via `rupu workflow resume`.
+    ///
+    /// This is the primitive a remote transport (SSH) reaches over `ssh` the
+    /// same way it reaches `cancel`/`approve`/`reject` — see
+    /// `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md` Task 5.
+    Pause {
+        /// Full run id (`run_<ULID>`) as printed by
+        /// `rupu workflow run`.
+        run_id: String,
+    },
     /// Resume a failed/cancelled run, re-running only the agent runs
     /// that didn't succeed.
     Resume {
@@ -478,6 +489,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
         Action::Cancel { run_id } => cancel(&run_id).await,
+        Action::Pause { run_id } => pause(&run_id).await,
         Action::Resume {
             run_id,
             mode,
@@ -505,6 +517,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Approve { .. } => ("workflow approve", report::TABLE_ONLY),
         Action::Reject { .. } => ("workflow reject", report::TABLE_ONLY),
         Action::Cancel { .. } => ("workflow cancel", report::TABLE_ONLY),
+        Action::Pause { .. } => ("workflow pause", report::TABLE_ONLY),
         Action::Resume { .. } => ("workflow resume", report::TABLE_ONLY),
         Action::ArchiveRun { .. } => ("workflow archive-run", report::TABLE_ONLY),
         Action::RestoreRun { .. } => ("workflow restore-run", report::TABLE_ONLY),
@@ -2571,6 +2584,54 @@ fn cancel_with_store(
         })
 }
 
+/// Cooperatively pause a `Pending`/`Running` run: flips the persisted record
+/// to `Paused` ([`rupu_orchestrator::RunStore::pause`]) then writes the
+/// pause marker ([`rupu_orchestrator::RunStore::set_pause_marker`]) that a
+/// *detached* `rupu workflow run <id>` subprocess polls (~every 250ms) to
+/// cooperatively stop at its next safe boundary.
+///
+/// This is the exact mechanism `LocalHostConnector::pause_run` uses
+/// in-process; exposing it as a bare CLI command gives the SSH transport a
+/// one-shot remote command to reach it (mirrors how `rupu workflow cancel`
+/// gives `cancel_run` its remote reach) — see
+/// `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md` Task 5.
+async fn pause(run_id: &str) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    pause_with_store(&store, run_id)?;
+    println!(
+        "rupu: pause requested for run {run_id} (resume with `rupu workflow resume {run_id}`)"
+    );
+    Ok(())
+}
+
+/// Delegates to [`rupu_orchestrator::RunStore::pause`] (Pending/Running →
+/// `Paused`; already-paused/awaiting-approval → `PauseError::NotRunning`;
+/// terminal → `PauseError::AlreadyTerminal`), then writes the pause marker
+/// so a detached runner process cooperatively stops at its next safe
+/// boundary. Maps the library's [`PauseError`] onto an `anyhow::Error` with
+/// a stable user-facing message shape (mirrors `cancel_with_store`).
+fn pause_with_store(store: &rupu_orchestrator::RunStore, run_id: &str) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    store.pause(run_id, now).map_err(|e| match e {
+        PauseError::AlreadyTerminal(status) => {
+            anyhow::anyhow!("run {run_id} is already terminal ({})", status.as_str())
+        }
+        PauseError::NotRunning(status) => {
+            anyhow::anyhow!(
+                "run {run_id} is `{}` — only a running run can be paused",
+                status.as_str()
+            )
+        }
+        PauseError::NotFound(_) => anyhow::anyhow!("load run record: {e}"),
+        PauseError::Store(_) => anyhow::anyhow!("pause run: {e}"),
+    })?;
+    // Deliver the pause to the detached runner process via the marker.
+    store
+        .set_pause_marker(run_id)
+        .map_err(|e| anyhow::anyhow!("set pause marker: {e}"))
+}
+
 async fn archive_run(run_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
@@ -4065,5 +4126,48 @@ mod tests {
             persisted.error_message.as_deref(),
             Some("rejected: cancelled by operator")
         );
+    }
+
+    #[test]
+    fn pause_with_store_marks_running_run_paused_and_writes_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::Running, Some(999_999));
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        pause_with_store(&store, "run_test_cancel").unwrap();
+
+        let persisted = store.load("run_test_cancel").unwrap();
+        assert_eq!(persisted.status, RunStatus::Paused);
+        assert!(
+            store.pause_marker_exists("run_test_cancel"),
+            "pause_with_store must deliver the marker so a detached runner honors it"
+        );
+    }
+
+    #[test]
+    fn pause_with_store_rejects_terminal_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::Completed, None);
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        let err = pause_with_store(&store, "run_test_cancel").unwrap_err();
+        assert!(err.to_string().contains("already terminal"));
+        assert!(
+            !store.pause_marker_exists("run_test_cancel"),
+            "a rejected pause must not write the marker"
+        );
+    }
+
+    #[test]
+    fn pause_with_store_rejects_already_paused_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::Paused, None);
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        let err = pause_with_store(&store, "run_test_cancel").unwrap_err();
+        assert!(err.to_string().contains("only a running run can be paused"));
     }
 }
