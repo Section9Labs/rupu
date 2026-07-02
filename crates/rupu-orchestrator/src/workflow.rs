@@ -79,6 +79,13 @@ pub enum WorkflowParseError {
     #[error("autoflow outcome references unknown workflow output `{output}`")]
     AutoflowOutcomeUnknownOutput { output: String },
     #[error(
+        "autoflow.selector.{field} is only valid when `entity: pull_request` (this workflow declares `entity: {entity}`)"
+    )]
+    AutoflowSelectorFieldWrongEntity {
+        field: &'static str,
+        entity: &'static str,
+    },
+    #[error(
         "workflow output `{output}` and step `{step}` contract disagree on `{field}`: workflow declares `{workflow_declared}`, step declares `{step_declared}`"
     )]
     ContractStepMismatch {
@@ -263,6 +270,16 @@ pub struct Autoflow {
 pub enum AutoflowEntity {
     #[default]
     Issue,
+    PullRequest,
+}
+
+impl AutoflowEntity {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pull_request",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -278,6 +295,28 @@ pub struct AutoflowSelector {
     pub labels_none: Vec<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Filter on draft status. Only meaningful for `entity:
+    /// pull_request`; rejected on `entity: issue` (see
+    /// [`WorkflowParseError::AutoflowSelectorFieldWrongEntity`]).
+    #[serde(default)]
+    pub draft: Option<DraftFilter>,
+    /// Restrict to pull requests targeting this base branch (e.g.
+    /// `main`). Only meaningful for `entity: pull_request`; rejected
+    /// on `entity: issue`.
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+/// Draft-status filter for `entity: pull_request` autoflows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftFilter {
+    /// Match both draft and ready-for-review pull requests.
+    Include,
+    /// Match only ready-for-review pull requests (exclude drafts).
+    Exclude,
+    /// Match only draft pull requests.
+    Only,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -301,6 +340,7 @@ pub struct AutoflowClaim {
 pub enum AutoflowClaimKey {
     #[default]
     Issue,
+    PrHeadSha,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1233,6 +1273,20 @@ fn validate_autoflow(wf: &Workflow) -> Result<(), WorkflowParseError> {
             });
         }
     }
+    if autoflow.entity != AutoflowEntity::PullRequest {
+        if autoflow.selector.draft.is_some() {
+            return Err(WorkflowParseError::AutoflowSelectorFieldWrongEntity {
+                field: "draft",
+                entity: autoflow.entity.name(),
+            });
+        }
+        if autoflow.selector.base.is_some() {
+            return Err(WorkflowParseError::AutoflowSelectorFieldWrongEntity {
+                field: "base",
+                entity: autoflow.entity.name(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1593,5 +1647,44 @@ steps:
 "#;
         let wf = Workflow::parse(yaml).expect("should parse");
         assert!(wf.concerns.is_none(), "concerns should be None by default");
+    }
+}
+
+#[cfg(test)]
+mod pull_request_autoflow_tests {
+    use super::*;
+
+    #[test]
+    fn pull_request_entity_and_selector_parse() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: pull_request\n  selector:\n    states: [open]\n    draft: exclude\n    base: main\n  claim:\n    key: pr_head_sha\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        let wf = Workflow::parse(y).unwrap();
+        let af = wf.autoflow.unwrap();
+        assert_eq!(af.entity, AutoflowEntity::PullRequest);
+        assert_eq!(af.selector.base.as_deref(), Some("main"));
+        assert_eq!(af.selector.draft, Some(DraftFilter::Exclude));
+        assert_eq!(af.claim.unwrap().key, AutoflowClaimKey::PrHeadSha);
+    }
+
+    #[test]
+    fn draft_filter_on_issue_entity_is_rejected() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: issue\n  selector:\n    draft: exclude\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        assert!(Workflow::parse(y).is_err());
+    }
+
+    #[test]
+    fn base_on_issue_entity_is_rejected() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: issue\n  selector:\n    base: main\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        assert!(Workflow::parse(y).is_err());
+    }
+
+    #[test]
+    fn issue_autoflow_without_pr_fields_still_parses() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: issue\n  selector:\n    states: [open]\n    labels_all: [triaged]\n  claim:\n    key: issue\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        let wf = Workflow::parse(y).unwrap();
+        let af = wf.autoflow.unwrap();
+        assert_eq!(af.entity, AutoflowEntity::Issue);
+        assert!(af.selector.draft.is_none());
+        assert!(af.selector.base.is_none());
+        assert_eq!(af.claim.unwrap().key, AutoflowClaimKey::Issue);
     }
 }
