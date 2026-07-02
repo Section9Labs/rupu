@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 
 use crate::connectors::RepoConnector;
-use crate::error::ScmError;
+use crate::error::{classify_scm_error, ScmError};
 use crate::platform::Platform;
 use crate::types::{
     Branch, Comment, CreatePr, Diff, FileContent, Pr, PrFilter, PrRef, Repo, RepoRef,
@@ -371,6 +371,36 @@ impl RepoConnector for GithubRepoConnector {
             })
             .await?;
         Ok(pr_from_octocrab(repo_ref, pr))
+    }
+
+    async fn is_collaborator(&self, r: &RepoRef, login: &str) -> Result<bool, ScmError> {
+        let _permit = self.client.permit().await;
+        let path = format!("/repos/{}/{}/collaborators/{}", r.owner, r.repo, login);
+        let inner = self.client.inner.clone();
+        self.client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let path = path.clone();
+                async move {
+                    // Don't route through `map_github_error`: GitHub uses a
+                    // bodyless 204/404 pair to signal true/false here, and
+                    // `map_github_error` would treat the 404 as a hard error.
+                    let response = inner
+                        ._get_with_headers(&path as &str, None)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    match response.status().as_u16() {
+                        204 => Ok(true),
+                        404 => Ok(false),
+                        other => {
+                            let headers = response.headers().clone();
+                            let body = inner.body_to_string(response).await.unwrap_or_default();
+                            Err(classify_scm_error(Platform::Github, other, &body, &headers))
+                        }
+                    }
+                }
+            })
+            .await
     }
 
     async fn clone_to(&self, r: &RepoRef, dir: &std::path::Path) -> Result<(), ScmError> {

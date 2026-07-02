@@ -46,6 +46,24 @@ pub trait RepoConnector: Send + Sync {
     /// Clone the repo to a local directory using the platform's
     /// HTTPS clone URL with the connector's stored credential.
     async fn clone_to(&self, r: &RepoRef, dir: &Path) -> Result<(), ScmError>;
+
+    /// Is `login` a collaborator on `r`? Backs the autoflow
+    /// author-allowlist (dogfood autoflows spec): a workflow trigger
+    /// fired by a PR/issue author who isn't a collaborator is dropped
+    /// rather than run with elevated trust.
+    ///
+    /// Default is unimplemented — `ScmError` has no dedicated
+    /// "unsupported operation" variant, so this returns the closest
+    /// existing one (`BadRequest`, which is non-recoverable and won't
+    /// get silently retried). Only GitHub implements this for now;
+    /// platforms without an override fail closed rather than allowing
+    /// an unverified author through.
+    async fn is_collaborator(&self, r: &RepoRef, login: &str) -> Result<bool, ScmError> {
+        let _ = (r, login);
+        Err(ScmError::BadRequest {
+            message: format!("is_collaborator is not supported by {}", self.platform()),
+        })
+    }
 }
 
 #[async_trait]
