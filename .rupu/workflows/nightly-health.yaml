@@ -1,0 +1,78 @@
+name: nightly-health
+description: >
+  Nightly build/test/clippy health check over the whole workspace, using
+  the repo's pinned toolchain. Opens or updates a rolling "CI health" issue
+  on failure (dedup by exact title), and closes/comments it once green.
+autoflow:
+  enabled: true
+trigger:
+  on: cron
+  cron: "0 6 * * *"
+steps:
+  - id: health_check
+    agent: repo-investigator
+    actions: []
+    prompt: |
+      Run this repo's CI health checks using the repo's PINNED toolchain
+      declared in `rust-toolchain.toml` at the repo root — do NOT override
+      it with `+stable`, `+nightly`, or any other explicit toolchain
+      selector. Running plain `cargo ...` from inside the repo already
+      picks up the pinned toolchain via rustup's directory override, so
+      just invoke `cargo` normally from the repo root.
+
+      Run, from the repo root, in this exact order:
+      1. `cargo build --workspace`
+      2. `cargo test --workspace`
+      3. `cargo clippy --workspace --no-deps`
+
+      Do NOT run `cargo fmt --check` — this repo's main branch is known to
+      be fmt-dirty under the pinned rustfmt version, so a fmt gate would be
+      permanently red and is out of scope for this check.
+
+      For each command, capture: exit status, and — if non-zero — enough of
+      the failing output to diagnose it (command name, first error(s),
+      offending file:line). Do not modify any files; this is a read-only
+      health check.
+
+      Final response must start with exactly one of these two lines:
+      `HEALTH: pass`
+      `HEALTH: fail`
+      followed by a per-command PASS/FAIL line, and for any FAIL, the
+      captured failing output.
+
+  - id: report_health
+    agent: repo-investigator
+    actions: []
+    prompt: |
+      You have a `bash` tool. The `gh` CLI is installed and authenticated
+      against this repo's GitHub remote. Do not modify any repository files
+      and do not open a pull request; this step only reads/writes GitHub
+      issues based on the health check result below.
+
+      Rolling issue title (must match exactly, character for character):
+      CI health: nightly build/test/clippy
+
+      Health check result from the previous step:
+      {{ steps.health_check.output }}
+
+      1. Run `gh issue list --state open --search "\"CI health: nightly build/test/clippy\" in:title" --json number,title`
+         and check whether an open issue with that *exact* title already exists.
+      2. If the health check result starts with `HEALTH: fail`:
+         - Compose a comment/issue body naming the failing command(s) and
+           including the captured failing output.
+         - If a matching open issue exists, post the body as a comment
+           (`gh issue comment <number> --body-file -`).
+           Otherwise create it
+           (`gh issue create --title "CI health: nightly build/test/clippy" --body-file - --label nightly,ci-health`,
+           omit `--label` if label creation would fail).
+      3. If the health check result starts with `HEALTH: pass`:
+         - If a matching open issue exists, post a short comment noting the
+           workspace is green again, then close it
+           (`gh issue comment <number> --body "..."` followed by
+           `gh issue close <number>`).
+         - If no matching open issue exists, do nothing further — do not
+           open a new issue on a passing run.
+
+      Final response must state: pass or fail, whether a matching issue was
+      found (and its number), and whatever `gh` command(s) were actually run
+      (or that nothing was needed).
