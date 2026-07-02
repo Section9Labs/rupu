@@ -63,8 +63,20 @@ async fn run_graph(
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     // 3. Parse the snapshot and build the DAG DTO.
-    let wf = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
-    let dag = to_step_dag(&wf);
+    //
+    // A bare agent run (`rupu run <agent>`) has no workflow, so its snapshot
+    // is empty and `workflow_name` is `agent:<name>`. Parsing an empty
+    // document as a `Workflow` fails with "missing field `name`", which used
+    // to 500 the whole run-detail page (the frontend derives the run record
+    // from this endpoint). Synthesize a single-node DAG instead so the page
+    // renders. The `yaml.trim().is_empty()` arm is a defensive fallback for
+    // any empty snapshot, not only the `agent:` prefix.
+    let dag = if run.workflow_name.starts_with("agent:") || yaml.trim().is_empty() {
+        agent_run_dag(&run.workflow_name)
+    } else {
+        let wf = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
+        to_step_dag(&wf)
+    };
 
     // 4. Step results and unit checkpoints — missing files = empty vecs.
     let step_results = s.run_store.read_step_results(&id).unwrap_or_default();
@@ -231,6 +243,27 @@ pub struct GateDto {
 
 // ── Mapper ───────────────────────────────────────────────────────────────
 
+/// Synthesize a single-node [`StepDag`] for a bare agent run (no workflow).
+///
+/// An agent run's `workflow_name` is `agent:<name>`; there is no workflow
+/// snapshot to parse. The node is a linear `step` carrying the agent name so
+/// the run-detail graph shows the agent instead of failing to parse an empty
+/// document.
+pub fn agent_run_dag(workflow_name: &str) -> StepDag {
+    let agent = workflow_name.strip_prefix("agent:").map(str::to_string);
+    StepDag {
+        steps: vec![StepNodeDto {
+            id: "agent".to_string(),
+            kind: "step".to_string(),
+            agent,
+            for_each: None,
+            parallel: None,
+            panelists: None,
+            gate: None,
+        }],
+    }
+}
+
 /// Convert a parsed [`Workflow`] into a slim [`StepDag`] DTO.
 ///
 /// The mapping is purely functional — no I/O, no fallibility.
@@ -301,5 +334,96 @@ fn map_step(step: &rupu_orchestrator::Step) -> StepNodeDto {
         parallel: None,
         panelists: None,
         gate: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `RunRecord` from JSON — optional fields fill via serde defaults,
+    /// mirroring the on-disk `run.json` shape.
+    fn run_record(id: &str, workflow_name: &str) -> rupu_orchestrator::runs::RunRecord {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "workflow_name": workflow_name,
+            "status": "completed",
+            "inputs": {},
+            "workspace_id": "ws_1",
+            "workspace_path": "/tmp/proj",
+            "transcript_dir": "/tmp/proj/.rupu/transcripts",
+            "started_at": "2026-06-30T21:07:19Z",
+        }))
+        .expect("run record from json")
+    }
+
+    #[test]
+    fn agent_run_dag_extracts_agent_name() {
+        let dag = agent_run_dag("agent:oracle-assessor-glm");
+        assert_eq!(dag.steps.len(), 1);
+        assert_eq!(dag.steps[0].kind, "step");
+        assert_eq!(dag.steps[0].agent.as_deref(), Some("oracle-assessor-glm"));
+    }
+
+    /// Regression: a bare agent run has an empty workflow snapshot; the graph
+    /// endpoint must NOT 500 with "missing field `name`" (it used to, which
+    /// killed the whole run-detail page). It returns a single-node DAG.
+    #[tokio::test]
+    async fn run_graph_for_agent_run_returns_single_node_not_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf());
+        // Agent run: empty snapshot, exactly as `rupu run <agent>` persists.
+        s.run_store
+            .create(run_record("run_agent", "agent:oracle-assessor-glm"), "")
+            .unwrap();
+
+        let resp = run_graph(
+            State(s),
+            Path("run_agent".to_string()),
+            Query(RunDetailQuery { host: None }),
+        )
+        .await
+        .expect("agent-run graph must not error");
+
+        let body = resp.0;
+        let steps = body["workflow"]["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["kind"], "step");
+        assert_eq!(steps[0]["agent"], "oracle-assessor-glm");
+        assert_eq!(body["run"]["id"], "run_agent");
+    }
+
+    /// A real workflow run still parses its snapshot into the full DAG.
+    #[tokio::test]
+    async fn run_graph_for_workflow_run_parses_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf());
+        s.run_store
+            .create(
+                run_record("run_wf", "my-flow"),
+                "name: my-flow\nsteps:\n  - id: s1\n    agent: alpha\n    prompt: go\n",
+            )
+            .unwrap();
+
+        let resp = run_graph(
+            State(s),
+            Path("run_wf".to_string()),
+            Query(RunDetailQuery { host: None }),
+        )
+        .await
+        .expect("workflow-run graph must not error");
+
+        let steps = resp.0["workflow"]["steps"].as_array().unwrap().clone();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["id"], "s1");
+        assert_eq!(steps[0]["agent"], "alpha");
     }
 }
