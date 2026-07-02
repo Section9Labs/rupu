@@ -403,6 +403,36 @@ impl RepoConnector for GithubRepoConnector {
             .await
     }
 
+    async fn add_pr_labels(&self, p: &PrRef, labels: &[String]) -> Result<(), ScmError> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = p.repo.owner.clone();
+        let repo = p.repo.repo.clone();
+        let number = p.number;
+        let labels = labels.to_vec();
+        self.client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let labels = labels.clone();
+                async move {
+                    // PR labels are managed through the shared issues
+                    // endpoint (`POST /repos/{o}/{r}/issues/{n}/labels`).
+                    inner
+                        .issues(&owner, &repo)
+                        .add_labels(number as u64, &labels)
+                        .await
+                        .map(|_| ())
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await
+    }
+
     async fn clone_to(&self, r: &RepoRef, dir: &std::path::Path) -> Result<(), ScmError> {
         let token = self.client.token.clone();
         let owner = r.owner.clone();

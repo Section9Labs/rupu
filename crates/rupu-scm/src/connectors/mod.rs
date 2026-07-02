@@ -64,6 +64,20 @@ pub trait RepoConnector: Send + Sync {
             message: format!("is_collaborator is not supported by {}", self.platform()),
         })
     }
+
+    /// Add labels to a pull request. Backs the autoflow author-allowlist
+    /// `on_skip: label_needs_human` action, which flags a PR from a
+    /// non-collaborator for human attention rather than running an agent
+    /// on it. Default is unimplemented (returns the closest existing
+    /// `ScmError`); only platforms that override it can label. Callers
+    /// treat an `Err` here as a best-effort miss (log + still skip the
+    /// PR) — labeling never gates the safety skip.
+    async fn add_pr_labels(&self, p: &PrRef, labels: &[String]) -> Result<(), ScmError> {
+        let _ = (p, labels);
+        Err(ScmError::BadRequest {
+            message: format!("add_pr_labels is not supported by {}", self.platform()),
+        })
+    }
 }
 
 #[async_trait]
