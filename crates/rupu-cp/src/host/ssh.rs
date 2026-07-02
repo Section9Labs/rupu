@@ -748,6 +748,45 @@ impl HostConnector for SshHostConnector {
         ))
     }
 
+    /// Enumerate remote sessions by shelling `rupu session list --format json`
+    /// over `ssh` (sessions aren't mirrored to a local store the way runs are).
+    /// Returns the `rows` array from the CLI report.
+    async fn list_sessions(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let mut argv: Vec<String> = vec![
+            "rupu".into(),
+            "session".into(),
+            "list".into(),
+            "--format".into(),
+            "json".into(),
+        ];
+        match scope {
+            // The CLI lists active sessions by default; `--archived` restricts
+            // to the archived scope. "active"/None → default (no flag).
+            Some("archived") => argv.push("--archived".into()),
+            _ => {}
+        }
+        let cmd = build_remote_command(&argv);
+        let out = self
+            .exec
+            .run(&cmd)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success {
+            return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).map_err(|e| {
+            HostConnectorError::Remote(0, format!("parse `rupu session list` output: {e}"))
+        })?;
+        Ok(parsed
+            .get("rows")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     // ── Workspace sync ─────────────────────────────────────────────────────────
     //
     // The wire-encoded payload/delta are shipped as raw stdin/stdout bytes to
@@ -1072,6 +1111,63 @@ mod tests {
             rupu_config::PricingConfig::default(),
         );
         (conn, run_store, tmp)
+    }
+
+    #[tokio::test]
+    async fn list_sessions_shells_rupu_session_list_and_parses_rows() {
+        struct StubExec {
+            json: String,
+            last_cmd: std::sync::Mutex<String>,
+        }
+        #[async_trait::async_trait]
+        impl RemoteExec for StubExec {
+            async fn run(&self, remote: &str) -> Result<RemoteOutput, RemoteExecError> {
+                *self.last_cmd.lock().unwrap() = remote.to_string();
+                Ok(RemoteOutput {
+                    stdout: self.json.clone(),
+                    stderr: String::new(),
+                    success: true,
+                })
+            }
+            fn spawn_lines(&self, _r: &str) -> Result<LineStream, RemoteExecError> {
+                unimplemented!("not used by list_sessions")
+            }
+            async fn run_bytes(
+                &self,
+                _c: &str,
+                _s: Option<Vec<u8>>,
+            ) -> Result<Vec<u8>, RemoteExecError> {
+                unimplemented!("not used by list_sessions")
+            }
+        }
+
+        let json = r#"{"kind":"session_list","version":1,"rows":[
+            {"session_id":"ses_1","agent":"oracle-assessor","scope":"active","status":"idle"},
+            {"session_id":"ses_2","agent":"rupuso","scope":"active","status":"failed"}
+        ]}"#;
+        let stub = std::sync::Arc::new(StubExec {
+            json: json.into(),
+            last_cmd: std::sync::Mutex::new(String::new()),
+        });
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&stub));
+
+        // Active scope → shells `rupu session list --format json` (no --archived).
+        let rows = conn.list_sessions(Some("active")).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["session_id"], "ses_1");
+        let cmd = stub.last_cmd.lock().unwrap().clone();
+        assert!(
+            cmd.contains("session") && cmd.contains("list") && cmd.contains("json"),
+            "cmd: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--archived"),
+            "active scope must not pass --archived: {cmd}"
+        );
+
+        // Archived scope → adds --archived.
+        conn.list_sessions(Some("archived")).await.unwrap();
+        assert!(stub.last_cmd.lock().unwrap().contains("--archived"));
     }
 
     #[tokio::test]

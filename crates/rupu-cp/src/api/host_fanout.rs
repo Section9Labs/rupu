@@ -86,6 +86,63 @@ pub(crate) async fn fan_out_rows(
     all
 }
 
+/// Like [`fan_out_rows`] but for sessions: calls the structured
+/// `list_sessions(scope)` on each remote host instead of `proxy_get_json`, so
+/// SSH hosts (which can't serve a generic GET) contribute their sessions
+/// instead of being silently skipped. Per-host failures warn and contribute
+/// nothing; the caller always gets a 200.
+pub(crate) async fn fan_out_sessions(
+    hosts: &Arc<crate::host::registry::HostRegistry>,
+    scope: Option<&str>,
+    local_values: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let remote_hosts: Vec<_> = hosts
+        .list_hosts()
+        .into_iter()
+        .filter(|h| h.id != "local")
+        .collect();
+    if remote_hosts.is_empty() {
+        return local_values;
+    }
+
+    let scope_owned = scope.map(|s| s.to_string());
+    let futs: Vec<_> = remote_hosts
+        .into_iter()
+        .map(|h| {
+            let registry = Arc::clone(hosts);
+            let scope_owned = scope_owned.clone();
+            async move {
+                let conn = match registry.resolve(&h.id) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(host_id = %h.id, error = %e, "fan_out_sessions: could not resolve connector; skipping");
+                        return Vec::<serde_json::Value>::new();
+                    }
+                };
+                match conn.list_sessions(scope_owned.as_deref()).await {
+                    Ok(rows) => {
+                        let host_id = h.id;
+                        rows.into_iter()
+                            .map(|mut row| {
+                                row["host_id"] = serde_json::json!(&host_id);
+                                row
+                            })
+                            .collect()
+                    }
+                    Err(e) => {
+                        tracing::warn!(host_id = %h.id, error = %e, "fan_out_sessions: list_sessions failed; skipping");
+                        Vec::new()
+                    }
+                }
+            }
+        })
+        .collect();
+
+    let mut all = local_values;
+    all.extend(join_all(futs).await.into_iter().flatten());
+    all
+}
+
 /// Sort a `Vec<Value>` newest-first using the string field named `time_field`.
 /// Missing / null values sort after present values.
 pub(crate) fn sort_values_newest_first(values: &mut [serde_json::Value], time_field: &str) {
