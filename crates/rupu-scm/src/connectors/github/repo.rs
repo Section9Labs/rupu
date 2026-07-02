@@ -452,6 +452,14 @@ fn pr_from_octocrab(repo: RepoRef, pr: octocrab::models::pulls::PullRequest) -> 
         },
         head_branch: pr.head.ref_field,
         base_branch: pr.base.ref_field,
+        head_sha: pr.head.sha,
+        draft: pr.draft.unwrap_or(false),
+        labels: pr
+            .labels
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| l.name)
+            .collect(),
         author: pr.user.map(|u| u.login).unwrap_or_default(),
         created_at: pr.created_at.unwrap_or_else(chrono::Utc::now),
         updated_at: pr.updated_at.unwrap_or_else(chrono::Utc::now),

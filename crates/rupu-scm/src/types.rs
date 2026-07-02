@@ -197,6 +197,22 @@ pub struct Pr {
     pub state: PrState,
     pub head_branch: String,
     pub base_branch: String,
+    /// Head commit SHA. Backs the autoflow PR claim key `(repo,
+    /// pr_number, head_sha)` (dogfood autoflows spec): a new head SHA is
+    /// a fresh claim (re-review on push), an unchanged SHA is
+    /// already-claimed (skip). Populated by the GitHub connector from
+    /// `head.sha`; GitLab from the MR `sha`. Serde-default empty so
+    /// pre-existing persisted `Pr`s deserialize unchanged.
+    #[serde(default)]
+    pub head_sha: String,
+    /// Whether the PR is a draft. Backs the autoflow PR selector's
+    /// `draft` filter. Serde-default `false` for backward compatibility.
+    #[serde(default)]
+    pub draft: bool,
+    /// Label names attached to the PR. Backs the autoflow PR selector's
+    /// label filters (`labels_all/any/none`). Serde-default empty.
+    #[serde(default)]
+    pub labels: Vec<String>,
     pub author: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

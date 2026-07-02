@@ -53,6 +53,8 @@ async fn get_pr_translates() {
     assert_eq!(p.title, "fix: streaming tokens");
     assert_eq!(p.head_branch, "feat/stream");
     assert_eq!(p.base_branch, "main");
+    assert_eq!(p.head_sha, "deadbeef");
+    assert!(!p.draft);
     assert_eq!(p.author, "matias");
 }
 
