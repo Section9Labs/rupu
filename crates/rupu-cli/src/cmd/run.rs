@@ -9,7 +9,7 @@ use crate::paths;
 use crate::standalone_run_metadata::{
     metadata_path_for_run, write_metadata, StandaloneRunMetadata,
 };
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser};
 use rupu_agent::runner::{AgentRunOpts, BypassDecider, PermissionDecider};
 use rupu_agent::{load_agent, parse_mode, resolve_mode, PermissionDecision};
 use rupu_runtime::provider_factory;
@@ -62,21 +62,53 @@ pub struct Args {
     pub run_id: Option<String>,
 }
 
-/// `rupu run <subcommand>`.
+/// `rupu run <agent> [target] [prompt] …` — OR `rupu run pause|resume
+/// <run_id> …` — dispatched from a RAW-ARGV pre-pass, not a clap
+/// `#[command(subcommand)]` enum.
 ///
-/// `rupu run` is a launcher (`rupu run <agent> [target] [prompt] …`), not
-/// a bare enum of named actions — the agent name occupies the same
-/// positional slot a subcommand name would. `Pause`/`Resume` are real
-/// named subcommands; `Launch` is clap's `external_subcommand` catch-all
-/// that captures everything else (i.e. an agent-run invocation) as raw
-/// argv, re-parsed into [`Args`] by [`parse_launch_args`].
+/// ## Why not a clap subcommand (T7 regression, fixed here)
+///
+/// Task 7 originally modeled this as `Cmd::Run { action: RunCommand }`
+/// where `RunCommand` was a `Subcommand` enum with named `Pause`/`Resume`
+/// variants plus an `external_subcommand` catch-all (`Launch(Vec<String>)`)
+/// for the agent-run case. That broke every FLAG-FIRST launcher
+/// invocation — `rupu run --tmp github:owner/repo`, `rupu run --mode
+/// bypass echo hi`, etc. — with `error: unexpected argument '--tmp'
+/// found`.
+///
+/// Root cause: clap's derived subcommand dispatcher decides whether a
+/// token is "a subcommand name" or "an option of the current command"
+/// BEFORE the `external_subcommand` catch-all ever runs, and it makes
+/// that call by looking at the token's syntax, not its position. A
+/// leading `--flag` is always tried against the parent's own arg set
+/// first; since the `Run` variant that held `action: RunCommand` had no
+/// args of its own, `--tmp` had nothing to match and was rejected
+/// outright. This reproduces identically even with `RunCommand` parsed
+/// as its own top-level `Parser` (verified directly) — it isn't an
+/// artifact of nesting under `Cmd::Run`, it's how clap resolves
+/// subcommand-vs-option for any hyphen-leading token, full stop. No
+/// arrangement of `Subcommand`/`external_subcommand` fixes this while
+/// `pause`/`resume` remain real subcommand variants sharing the dispatch
+/// point with the launcher.
+///
+/// ## The fix
+///
+/// `Cmd::Run` (see `lib.rs`) now captures its trailing tokens as a raw,
+/// unparsed `Vec<String>` (`trailing_var_arg = true, allow_hyphen_values
+/// = true` — verified this accepts a leading `--flag` fine, since it
+/// isn't matched against any of the parent's own args). [`classify`]
+/// then inspects those raw tokens *before* any clap re-parse: if the
+/// first token is exactly `pause` or `resume`, it's the corresponding
+/// control action; otherwise it's the launcher, re-parsed into [`Args`]
+/// by [`parse_launch_args`] with byte-for-byte pre-Task-7 semantics
+/// (agent-first AND flag-first).
 ///
 /// Reserved-name caveat (mirrors `cargo`'s reserved subcommand names):
 /// an agent literally named `pause` or `resume` cannot be launched via
 /// `rupu run pause`/`rupu run resume` — those tokens always resolve to
-/// the control subcommands below.
-#[derive(Subcommand, Debug)]
-pub enum RunCommand {
+/// the control actions below.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RunAction {
     /// Cooperatively pause a running standalone-agent or workflow run at
     /// its next safe boundary. Delegates to the exact same primitive as
     /// `rupu workflow pause <run_id>` ([`crate::cmd::workflow::pause`]:
@@ -96,21 +128,20 @@ pub enum RunCommand {
         run_id: String,
         /// Override permission mode for the resumed run
         /// (`ask` | `bypass` | `readonly`).
-        #[arg(long)]
         mode: Option<String>,
         /// Use the plain line printer instead of the live graph view.
-        #[arg(long)]
         plain: bool,
     },
     /// One-shot agent run: `rupu run <agent> [target] [prompt] …` (the
     /// default `rupu run` behavior — see [`Args`] for the full flag set).
-    #[command(external_subcommand)]
+    /// Carries the raw argv so the caller can re-parse it into [`Args`]
+    /// via [`parse_launch_args`].
     Launch(Vec<String>),
 }
 
 /// Wrapper so [`Args`] (a `clap::Args` flatten target, not itself a
 /// `clap::Parser`) can be parsed standalone from the raw argv captured
-/// by `RunCommand::Launch`.
+/// by [`RunAction::Launch`].
 #[derive(Parser, Debug)]
 #[command(name = "rupu run")]
 struct LaunchParser {
@@ -118,36 +149,86 @@ struct LaunchParser {
     args: Args,
 }
 
-/// Re-parse the argv captured by `RunCommand::Launch` (subcommand name +
-/// trailing args, per clap's `external_subcommand` contract) into
-/// [`Args`] — identical positional/flag semantics to the pre-Task-7
-/// `rupu run <agent> …` parse.
-fn parse_launch_args(argv: Vec<String>) -> Result<Args, clap::Error> {
+/// Re-parse the argv captured by [`RunAction::Launch`] into [`Args`] —
+/// identical positional/flag semantics to the pre-Task-7 `rupu run
+/// <agent> …` parse (agent-first AND flag-first both work, since `Args`
+/// is plain `clap::Args`, not a subcommand).
+pub(crate) fn parse_launch_args(argv: Vec<String>) -> Result<Args, clap::Error> {
     LaunchParser::try_parse_from(std::iter::once("rupu run".to_string()).chain(argv))
         .map(|wrapper| wrapper.args)
 }
 
-pub async fn handle(cmd: RunCommand) -> ExitCode {
-    match cmd {
-        RunCommand::Launch(argv) => match parse_launch_args(argv) {
+/// Standalone parser for just the `resume` control action's flags,
+/// re-parsed from the tail of the raw argv by [`classify`].
+#[derive(Parser, Debug)]
+#[command(name = "rupu run resume")]
+struct ResumeArgsParser {
+    run_id: String,
+    #[arg(long)]
+    mode: Option<String>,
+    #[arg(long)]
+    plain: bool,
+}
+
+/// Classify the raw argv captured by `Cmd::Run` (everything after the
+/// `run` token — see the module doc above for why this is a raw
+/// pre-pass rather than a clap subcommand). Pure / no I/O, so it's
+/// unit-testable exactly like the arg-parse tests were pre-fix.
+pub fn classify(argv: Vec<String>) -> Result<RunAction, clap::Error> {
+    match argv.first().map(String::as_str) {
+        Some("pause") => {
+            // Reuses `Args`-style clap parsing for just `<run_id>` so
+            // arity/help/error messages stay consistent with the rest
+            // of the CLI, without dragging `Args`'s much larger flag
+            // set into the pause path.
+            #[derive(Parser, Debug)]
+            #[command(name = "rupu run pause")]
+            struct PauseArgsParser {
+                run_id: String,
+            }
+            let parsed = PauseArgsParser::try_parse_from(
+                std::iter::once("rupu run pause".to_string()).chain(argv.into_iter().skip(1)),
+            )?;
+            Ok(RunAction::Pause {
+                run_id: parsed.run_id,
+            })
+        }
+        Some("resume") => {
+            let parsed = ResumeArgsParser::try_parse_from(
+                std::iter::once("rupu run resume".to_string()).chain(argv.into_iter().skip(1)),
+            )?;
+            Ok(RunAction::Resume {
+                run_id: parsed.run_id,
+                mode: parsed.mode,
+                plain: parsed.plain,
+            })
+        }
+        _ => Ok(RunAction::Launch(argv)),
+    }
+}
+
+pub async fn handle(argv: Vec<String>) -> ExitCode {
+    match classify(argv) {
+        Ok(RunAction::Launch(argv)) => match parse_launch_args(argv) {
             Ok(args) => match run_inner(args).await {
                 Ok(()) => ExitCode::from(0),
                 Err(e) => crate::output::diag::fail(e),
             },
             Err(e) => e.exit(),
         },
-        RunCommand::Pause { run_id } => match crate::cmd::workflow::pause(&run_id).await {
+        Ok(RunAction::Pause { run_id }) => match crate::cmd::workflow::pause(&run_id).await {
             Ok(()) => ExitCode::from(0),
             Err(e) => crate::output::diag::fail(e),
         },
-        RunCommand::Resume {
+        Ok(RunAction::Resume {
             run_id,
             mode,
             plain,
-        } => match crate::cmd::workflow::resume_run(&run_id, mode.as_deref(), plain).await {
+        }) => match crate::cmd::workflow::resume_run(&run_id, mode.as_deref(), plain).await {
             Ok(()) => ExitCode::from(0),
             Err(e) => crate::output::diag::fail(e),
         },
+        Err(e) => e.exit(),
     }
 }
 

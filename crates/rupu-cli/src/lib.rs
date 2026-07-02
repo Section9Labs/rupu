@@ -45,10 +45,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// One-shot agent run, or `pause`/`resume` a run by id.
+    /// One-shot agent run, or `pause`/`resume` a run by id. NOT a clap
+    /// `#[command(subcommand)]` — see `cmd::run`'s module doc for why:
+    /// nesting `pause`/`resume` as named subcommand variants alongside
+    /// the agent-run launcher broke flag-first invocations (`rupu run
+    /// --tmp <ref>`). Instead this captures its trailing tokens
+    /// verbatim (`trailing_var_arg` + `allow_hyphen_values`, so a
+    /// leading `--flag` is captured rather than rejected as an
+    /// unexpected argument of an argless variant) and hands them to
+    /// `cmd::run::classify` for the actual pause/resume-vs-launch
+    /// decision.
     Run {
-        #[command(subcommand)]
-        action: cmd::run::RunCommand,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        argv: Vec<String>,
     },
     /// Manage agents.
     Agent {
@@ -217,7 +226,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     }
 
     match cli.command {
-        Cmd::Run { action } => cmd::run::handle(action).await,
+        Cmd::Run { argv } => cmd::run::handle(argv).await,
         Cmd::Agent { action } => cmd::agent::handle(action, cli.format).await,
         Cmd::Workflow { action } => cmd::workflow::handle(action, cli.format).await,
         Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
@@ -320,52 +329,57 @@ fn ensure_output_format_supported(
     }
 }
 
-/// Arg-parse tests (Task 7): `rupu run pause|resume <id>` and `rupu
-/// workflow pause|resume <id>` parse to the expected typed variants.
-/// These are pure clap-derive checks — no I/O, no run-store — so they
-/// stay fast and independent of the heavier end-to-end tests in
-/// `tests/cli_run.rs` / `tests/cli_workflow.rs`.
+/// Arg-parse tests (Task 7, fixed): `rupu run pause|resume <id>` and
+/// `rupu workflow pause|resume <id>` parse to the expected typed
+/// variants. These are pure clap-derive + `cmd::run::classify` checks —
+/// no I/O, no run-store — so they stay fast and independent of the
+/// heavier end-to-end tests in `tests/cli_run.rs` / `tests/cli_workflow.rs`.
+///
+/// The `run_*` tests here cover the T7 regression directly: `Cmd::Run`
+/// captures raw argv (not a clap subcommand — see `cmd::run`'s module
+/// doc), so both the pause/resume routing AND flag-first launcher
+/// parsing are exercised as two stages (`Cli::try_parse_from` captures
+/// raw tokens, then `cmd::run::classify` + `parse_launch_args` do the
+/// real interpretation).
 #[cfg(test)]
 mod arg_parse_tests {
     use super::*;
 
+    /// Parse `rupu run <argv...>` down to the raw `Cmd::Run { argv }`
+    /// tokens, mirroring exactly what `cmd::run::handle` receives.
+    fn parse_run_argv(tail: &[&str]) -> Vec<String> {
+        let mut full = vec!["rupu", "run"];
+        full.extend_from_slice(tail);
+        let cli = Cli::try_parse_from(full).unwrap();
+        match cli.command {
+            Cmd::Run { argv } => argv,
+            other => panic!("expected Cmd::Run, got {other:?}"),
+        }
+    }
+
     #[test]
     fn run_pause_parses_run_id() {
-        let cli = Cli::try_parse_from(["rupu", "run", "pause", "run_01ABC"]).unwrap();
-        match cli.command {
-            Cmd::Run {
-                action: cmd::run::RunCommand::Pause { run_id },
-            } => assert_eq!(run_id, "run_01ABC"),
-            other => panic!("expected Run(Pause), got {other:?}"),
+        let argv = parse_run_argv(&["pause", "run_01ABC"]);
+        match cmd::run::classify(argv).unwrap() {
+            cmd::run::RunAction::Pause { run_id } => assert_eq!(run_id, "run_01ABC"),
+            other => panic!("expected RunAction::Pause, got {other:?}"),
         }
     }
 
     #[test]
     fn run_resume_parses_run_id_and_flags() {
-        let cli = Cli::try_parse_from([
-            "rupu",
-            "run",
-            "resume",
-            "run_01ABC",
-            "--mode",
-            "bypass",
-            "--plain",
-        ])
-        .unwrap();
-        match cli.command {
-            Cmd::Run {
-                action:
-                    cmd::run::RunCommand::Resume {
-                        run_id,
-                        mode,
-                        plain,
-                    },
+        let argv = parse_run_argv(&["resume", "run_01ABC", "--mode", "bypass", "--plain"]);
+        match cmd::run::classify(argv).unwrap() {
+            cmd::run::RunAction::Resume {
+                run_id,
+                mode,
+                plain,
             } => {
                 assert_eq!(run_id, "run_01ABC");
                 assert_eq!(mode.as_deref(), Some("bypass"));
                 assert!(plain);
             }
-            other => panic!("expected Run(Resume), got {other:?}"),
+            other => panic!("expected RunAction::Resume, got {other:?}"),
         }
     }
 
@@ -373,17 +387,69 @@ mod arg_parse_tests {
     fn run_launch_still_captures_agent_invocation() {
         // Back-compat: `rupu run <agent> ...` (agent name != "pause"/"resume")
         // must still fall through to the launcher, unchanged from before
-        // Task 7 introduced the `pause`/`resume` subcommands.
-        let cli =
-            Cli::try_parse_from(["rupu", "run", "echo", "--mode", "bypass", "say hi"]).unwrap();
-        match cli.command {
-            Cmd::Run {
-                action: cmd::run::RunCommand::Launch(argv),
-            } => {
+        // Task 7 introduced the `pause`/`resume` control actions.
+        let argv = parse_run_argv(&["echo", "--mode", "bypass", "say hi"]);
+        match cmd::run::classify(argv).unwrap() {
+            cmd::run::RunAction::Launch(argv) => {
                 assert_eq!(argv, vec!["echo", "--mode", "bypass", "say hi"]);
             }
-            other => panic!("expected Run(Launch), got {other:?}"),
+            other => panic!("expected RunAction::Launch, got {other:?}"),
         }
+    }
+
+    /// THE T7 regression this task fixes: flag-first launcher
+    /// invocations must parse (not hard-fail with "unexpected
+    /// argument"), exactly as they did before Task 7 restructured
+    /// `Cmd::Run` into a clap subcommand enum. `--tmp`/`--mode`/`--view`/
+    /// `--no-stream` all need to land in the fully-parsed `Args`, with
+    /// `agent` populated from wherever it falls in argv.
+    #[test]
+    fn run_flag_first_tmp_parses_into_launcher_args() {
+        let argv = parse_run_argv(&["--tmp", "github:owner/repo"]);
+        let args = match cmd::run::classify(argv).unwrap() {
+            cmd::run::RunAction::Launch(argv) => cmd::run::parse_launch_args(argv)
+                .unwrap_or_else(|e| panic!("flag-first `--tmp` should parse, got: {e}")),
+            other => panic!("expected RunAction::Launch, got {other:?}"),
+        };
+        assert!(args.tmp);
+        assert_eq!(args.agent, "github:owner/repo");
+    }
+
+    #[test]
+    fn run_flag_first_mode_parses_into_launcher_args() {
+        let argv = parse_run_argv(&["--mode", "bypass", "echo"]);
+        let args = match cmd::run::classify(argv).unwrap() {
+            cmd::run::RunAction::Launch(argv) => cmd::run::parse_launch_args(argv)
+                .unwrap_or_else(|e| panic!("flag-first `--mode` should parse, got: {e}")),
+            other => panic!("expected RunAction::Launch, got {other:?}"),
+        };
+        assert_eq!(args.mode.as_deref(), Some("bypass"));
+        assert_eq!(args.agent, "echo");
+    }
+
+    #[test]
+    fn run_flag_first_view_parses_into_launcher_args() {
+        let argv = parse_run_argv(&["--view", "full", "echo"]);
+        let args = match cmd::run::classify(argv).unwrap() {
+            cmd::run::RunAction::Launch(argv) => cmd::run::parse_launch_args(argv)
+                .unwrap_or_else(|e| panic!("flag-first `--view` should parse, got: {e}")),
+            other => panic!("expected RunAction::Launch, got {other:?}"),
+        };
+        assert_eq!(args.view, Some(cmd::ui::LiveViewMode::Full));
+        assert_eq!(args.agent, "echo");
+    }
+
+    #[test]
+    fn run_flag_first_no_stream_parses_into_launcher_args() {
+        let argv = parse_run_argv(&["--no-stream", "echo", "hi there"]);
+        let args = match cmd::run::classify(argv).unwrap() {
+            cmd::run::RunAction::Launch(argv) => cmd::run::parse_launch_args(argv)
+                .unwrap_or_else(|e| panic!("flag-first `--no-stream` should parse, got: {e}")),
+            other => panic!("expected RunAction::Launch, got {other:?}"),
+        };
+        assert!(args.no_stream);
+        assert_eq!(args.agent, "echo");
+        assert_eq!(args.target.as_deref(), Some("hi there"));
     }
 
     #[test]
