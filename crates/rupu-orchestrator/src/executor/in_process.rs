@@ -146,7 +146,15 @@ impl WorkflowExecutor for InProcessExecutor {
         }
         let fan_out = Arc::new(FanOutSink::new(fan_sinks));
 
-        // 5. Build OrchestratorRunOpts.
+        // 5. Cooperative-pause token — created here so it can be threaded
+        // into both `OrchestratorRunOpts.pause` (the run task honors it) and
+        // `RunState.pause` (what `InProcessExecutor::pause()` trips). No
+        // marker file is needed for the in-process path: the token is a
+        // direct in-memory handle to the running task.
+        let cancel = CancellationToken::new();
+        let pause = CancellationToken::new();
+
+        // 6. Build OrchestratorRunOpts.
         let orchestrator_opts = OrchestratorRunOpts {
             workflow,
             inputs: opts.vars.clone(),
@@ -164,12 +172,10 @@ impl WorkflowExecutor for InProcessExecutor {
             strict_templates: false,
             event_sink: Some(fan_out as Arc<dyn EventSink>),
             unit_dispatcher: None,
-            pause: None,
+            pause: Some(pause.clone()),
         };
 
-        // 6. Stash state before spawning (so tail() works immediately).
-        let cancel = CancellationToken::new();
-        let pause = CancellationToken::new();
+        // 7. Stash state before spawning (so tail() works immediately).
         let state = Arc::new(RunState {
             in_memory,
             jsonl,
@@ -184,7 +190,7 @@ impl WorkflowExecutor for InProcessExecutor {
             runs.insert(run_id.clone(), state.clone());
         }
 
-        // 7. Spawn the runner task.
+        // 8. Spawn the runner task.
         let join: JoinHandle<()> = tokio::spawn(async move {
             if let Err(e) = run_workflow(orchestrator_opts).await {
                 tracing::error!(error = %e, "InProcessExecutor: run_workflow failed");
@@ -509,6 +515,60 @@ steps:
         assert!(
             !state.cancel.is_cancelled(),
             "pause() must NOT trip the cancel token"
+        );
+    }
+
+    /// The pause token built in `start()` is now threaded into
+    /// `OrchestratorRunOpts.pause`, so tripping it via `pause()` genuinely
+    /// reaches `run_workflow`. On the current-thread test runtime the spawned
+    /// run task has not been polled yet when `start()` returns, so pausing
+    /// before driving the task to completion lands the step-boundary pause
+    /// deterministically: the run finishes `Paused`, not `Completed`.
+    #[tokio::test]
+    async fn pause_token_reaches_run_workflow_and_pauses_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let wf_path = tmp.path().join("one-step.yaml");
+        std::fs::write(&wf_path, WF_ONE_STEP).unwrap();
+
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let exec = InProcessExecutor::new(
+            store,
+            "ws_test".into(),
+            tmp.path().to_path_buf(),
+            tmp.path().join("transcripts"),
+        );
+
+        let handle = exec
+            .start(
+                WorkflowRunOpts {
+                    workflow_path: wf_path,
+                    vars: Default::default(),
+                },
+                Arc::new(FakeFactory),
+            )
+            .await
+            .expect("start");
+
+        // Trip the pause token before the run task is first polled.
+        exec.pause(&handle.run_id).await.expect("pause");
+
+        // Drive the spawned run task to completion.
+        let join = {
+            let runs = exec.runs.lock().unwrap();
+            let state = runs.get(&handle.run_id).expect("run state").clone();
+            let taken = state.join.lock().unwrap().take();
+            taken
+        };
+        if let Some(join) = join {
+            let _ = join.await;
+        }
+
+        let rec = exec.run_store.load(&handle.run_id).expect("load run");
+        assert_eq!(
+            rec.status,
+            RunStatus::Paused,
+            "pause() token must reach run_workflow (opts.pause must be Some), \
+             so the run pauses at the step boundary instead of completing"
         );
     }
 

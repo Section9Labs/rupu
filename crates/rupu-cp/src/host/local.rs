@@ -217,14 +217,24 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| map_cancel_err(run_id, e))
     }
 
-    /// Cooperatively pause a `Pending`/`Running` run. See
-    /// `RunStore::pause`'s doc for the known live-interrupt-delivery
-    /// limitation (mirrors `cancel`'s own documented limitation).
+    /// Cooperatively pause a `Pending`/`Running` run.
+    ///
+    /// Flips the persisted status to `Paused` AND writes the pause marker so
+    /// a *detached* `rupu workflow run <id>` subprocess (the shape `cp serve`
+    /// launches) genuinely pauses: its marker poller trips the run's pause
+    /// token, and the T2/T3 machinery stops at the next safe boundary. The
+    /// status flip is done first (it validates the transition — a terminal or
+    /// already-paused run is refused); the marker is only written once the
+    /// flip succeeds.
     async fn pause_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
         let now = chrono::Utc::now();
         self.run_store
             .pause(run_id, now)
-            .map_err(|e| map_pause_err(run_id, e))
+            .map_err(|e| map_pause_err(run_id, e))?;
+        // Deliver the pause to a detached run process via the marker.
+        self.run_store
+            .set_pause_marker(run_id)
+            .map_err(|e| map_store_err(run_id, e))
     }
 
     /// Marker-only resume request for a `Paused` run — mirrors
@@ -236,6 +246,12 @@ impl HostConnector for LocalHostConnector {
     /// without `cp serve` running there is no worker to consume the marker.
     async fn resume_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
         let now = chrono::Utc::now();
+        // Marker-only request: the background resume worker consumes it and
+        // spawns a detached `rupu workflow resume <id>`. That subprocess is
+        // the *race-free* place to clear the pause marker — it does so only
+        // AFTER its duplicate-execution guard confirms the original process
+        // has exited (`runner_pid` no longer live), so clearing the marker
+        // can't un-pause an original that hasn't yet honored the pause.
         self.run_store
             .request_resume_approval(run_id, "connector", None, now)
             .map(|_| ())

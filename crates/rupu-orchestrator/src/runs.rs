@@ -1280,19 +1280,27 @@ impl RunStore {
     /// resume-with-seed decision is driven by
     /// [`read_paused_seed`](Self::read_paused_seed), not this field.
     ///
-    /// # Limitation
+    /// # Delivery
     ///
-    /// This only flips the *persisted* state — it mirrors the same
-    /// known limitation documented on [`cancel`](Self::cancel): a `cp
-    /// serve`-launched local run executes as a detached subprocess with no
-    /// live pause-signal receiver wired yet (that reach lands in a
-    /// follow-up CLI task; see
-    /// `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md`). A
-    /// still-running process is **not** interrupted by this call and will
-    /// overwrite this optimistic `Paused` mark with its own terminal status
-    /// when it finishes. `InProcessExecutor`-driven runs (rupu-app) DO
-    /// receive a live cooperative signal via `WorkflowExecutor::pause`,
-    /// which has the reach this store-level method does not.
+    /// This method only flips the *persisted* state; on its own it does not
+    /// reach a running process. Genuine cooperative interruption is delivered
+    /// by the callers that pair the status flip with a pause signal:
+    ///
+    /// * **Detached `cp serve` subprocess runs** — the connector's
+    ///   `pause_run` additionally writes the pause marker
+    ///   ([`set_pause_marker`](Self::set_pause_marker)). The `rupu workflow
+    ///   run <id>` subprocess polls
+    ///   [`pause_marker_path`](Self::pause_marker_path) (~every 250ms) and
+    ///   trips its [`OrchestratorRunOpts::pause`](crate::runner::OrchestratorRunOpts::pause)
+    ///   token, so the T2/T3 machinery stops the stream / lets the in-flight
+    ///   tool finish / checkpoints at the next safe boundary. The subprocess
+    ///   then re-writes the record as `Paused` with `runner_pid = None` — it
+    ///   does **not** overwrite `Paused` with a terminal status.
+    /// * **`InProcessExecutor`-driven runs (rupu-app)** — receive the live
+    ///   cooperative signal directly via `WorkflowExecutor::pause`, whose
+    ///   token is threaded into `run_workflow` (no marker needed).
+    ///
+    /// Both paths genuinely interrupt at the next safe boundary.
     pub fn pause(
         &self,
         run_id: &str,
@@ -1360,6 +1368,50 @@ impl RunStore {
         }
         Ok(())
     }
+
+    /// Path to the cooperative pause marker for a run: `<run_dir>/.pause`.
+    ///
+    /// This is the delivery channel for pausing a *detached* run process
+    /// (the `rupu workflow run <id>` subprocess `cp serve` launches). That
+    /// process cannot receive the executor's in-memory pause token, so it
+    /// polls this marker instead: when the file appears it trips its own
+    /// [`OrchestratorRunOpts::pause`](crate::runner::OrchestratorRunOpts::pause)
+    /// token, which the T2/T3 cooperative-pause machinery honors at the next
+    /// safe boundary. `RunStore` only *exposes the path* (and thin
+    /// write/clear/exists helpers) — the poller that consumes it lives in
+    /// the CLI, keeping the orchestrator ignorant of the file mechanism.
+    pub fn pause_marker_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join(".pause")
+    }
+
+    /// Write the pause marker so a detached run process cooperatively pauses
+    /// at its next safe boundary. Idempotent (re-writing an existing marker
+    /// is fine).
+    pub fn set_pause_marker(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let path = self.pause_marker_path(run_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, b"")?;
+        Ok(())
+    }
+
+    /// Remove the pause marker (idempotent — a missing marker is not an
+    /// error). Called at resume/re-launch so a resumed run does not
+    /// immediately re-pause, and defensively when a run reaches a terminal
+    /// state.
+    pub fn clear_pause_marker(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let path = self.pause_marker_path(run_id);
+        if path.is_file() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    /// True when the pause marker is present for this run.
+    pub fn pause_marker_exists(&self, run_id: &str) -> bool {
+        self.pause_marker_path(run_id).is_file()
+    }
 }
 
 /// Errors produced by [`RunStore::pause`].
@@ -1380,7 +1432,11 @@ pub enum PauseError {
 
 /// True when `pid` names a live process on this machine. Shells out to
 /// `/bin/kill -0` (the no-op signal): exit 0 means the process exists.
-fn pid_is_running(pid: u32) -> bool {
+///
+/// Exposed so the duplicate-execution guard on the resume path
+/// (`rupu workflow resume` / the CP resume worker) can refuse to spawn a
+/// second process while a run's recorded `runner_pid` is still live.
+pub fn pid_is_running(pid: u32) -> bool {
     std::process::Command::new("/bin/kill")
         .arg("-0")
         .arg(pid.to_string())

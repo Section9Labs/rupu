@@ -158,7 +158,7 @@ pub trait HostConnector: Send + Sync {
     /// launcher being configured. The default impl returns
     /// [`HostConnectorError::Unsupported`].
     async fn resume_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
-        Err(HostConnectorError::Unsupported("pause".into()))
+        Err(HostConnectorError::Unsupported("resume".into()))
     }
 
     /// Open a live SSE byte stream of `events.jsonl` for the given run. Each
