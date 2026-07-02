@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rupu_orchestrator::{
-    runs::{CancelError, RunStore},
+    runs::{CancelError, PauseError, RunStore},
     ApprovalError, RunStoreError,
 };
 
@@ -92,6 +92,13 @@ fn map_store_err(run_id: &str, e: RunStoreError) -> HostConnectorError {
 fn map_cancel_err(run_id: &str, e: CancelError) -> HostConnectorError {
     match e {
         CancelError::NotFound(_) => HostConnectorError::NotFound(run_id.to_string()),
+        other => HostConnectorError::Invalid(other.to_string()),
+    }
+}
+
+fn map_pause_err(run_id: &str, e: PauseError) -> HostConnectorError {
+    match e {
+        PauseError::NotFound(_) => HostConnectorError::NotFound(run_id.to_string()),
         other => HostConnectorError::Invalid(other.to_string()),
     }
 }
@@ -210,6 +217,47 @@ impl HostConnector for LocalHostConnector {
             .map_err(|e| map_cancel_err(run_id, e))
     }
 
+    /// Cooperatively pause a `Pending`/`Running` run.
+    ///
+    /// Flips the persisted status to `Paused` AND writes the pause marker so
+    /// a *detached* `rupu workflow run <id>` subprocess (the shape `cp serve`
+    /// launches) genuinely pauses: its marker poller trips the run's pause
+    /// token, and the T2/T3 machinery stops at the next safe boundary. The
+    /// status flip is done first (it validates the transition — a terminal or
+    /// already-paused run is refused); the marker is only written once the
+    /// flip succeeds.
+    async fn pause_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        let now = chrono::Utc::now();
+        self.run_store
+            .pause(run_id, now)
+            .map_err(|e| map_pause_err(run_id, e))?;
+        // Deliver the pause to a detached run process via the marker.
+        self.run_store
+            .set_pause_marker(run_id)
+            .map_err(|e| map_store_err(run_id, e))
+    }
+
+    /// Marker-only resume request for a `Paused` run — mirrors
+    /// `approve_run`'s marker-only design. The background resume worker
+    /// (spawned by `rupu cp serve`) picks it up via
+    /// `RunStore::list_pending_resume` and re-enters `run_workflow` via a
+    /// detached `rupu workflow resume <id>` subprocess. Callers (the CP API
+    /// handler) gate this on `AppState.launcher` being configured, since
+    /// without `cp serve` running there is no worker to consume the marker.
+    async fn resume_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        let now = chrono::Utc::now();
+        // Marker-only request: the background resume worker consumes it and
+        // spawns a detached `rupu workflow resume <id>`. That subprocess is
+        // the *race-free* place to clear the pause marker — it does so only
+        // AFTER its duplicate-execution guard confirms the original process
+        // has exited (`runner_pid` no longer live), so clearing the marker
+        // can't un-pause an original that hasn't yet honored the pause.
+        self.run_store
+            .request_resume_approval(run_id, "connector", None, now)
+            .map(|_| ())
+            .map_err(|e| map_approval_err(run_id, e))
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         // Verify the run exists before opening the tail.
         self.run_store
@@ -309,5 +357,123 @@ mod workspace_sync_tests {
 
         // Scratch base dir is removed after collect.
         assert!(!base.exists(), "scratch dir should be cleaned up");
+    }
+}
+
+#[cfg(test)]
+mod pause_resume_tests {
+    use super::*;
+    use rupu_orchestrator::{RunRecord, RunStatus};
+    use std::collections::BTreeMap;
+
+    fn local(global_dir: PathBuf) -> (LocalHostConnector, Arc<RunStore>) {
+        let run_store = Arc::new(RunStore::new(global_dir.join("runs")));
+        let conn =
+            LocalHostConnector::new(None, None, None, None, Arc::clone(&run_store), global_dir);
+        (conn, run_store)
+    }
+
+    fn record(id: &str, status: RunStatus) -> RunRecord {
+        RunRecord {
+            id: id.into(),
+            workflow_name: "wf".into(),
+            status,
+            inputs: BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_1".into(),
+            workspace_path: PathBuf::from("/tmp/proj"),
+            transcript_dir: PathBuf::from("/tmp/proj/.rupu/transcripts"),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            final_output: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_run_marks_running_as_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (conn, store) = local(tmp.path().to_path_buf());
+        store
+            .create(record("run_local_pause", RunStatus::Running), "name: x\n")
+            .unwrap();
+
+        conn.pause_run("run_local_pause").await.unwrap();
+
+        let loaded = store.load("run_local_pause").unwrap();
+        assert_eq!(loaded.status, RunStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn pause_run_rejects_terminal_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (conn, store) = local(tmp.path().to_path_buf());
+        store
+            .create(
+                record("run_local_pause_done", RunStatus::Completed),
+                "name: x\n",
+            )
+            .unwrap();
+
+        let err = conn
+            .pause_run("run_local_pause_done")
+            .await
+            .expect_err("pausing a completed run should fail");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn resume_run_sets_pending_resume_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (conn, store) = local(tmp.path().to_path_buf());
+        store
+            .create(record("run_local_resume", RunStatus::Paused), "name: x\n")
+            .unwrap();
+
+        conn.resume_run("run_local_resume").await.unwrap();
+
+        let loaded = store.load("run_local_resume").unwrap();
+        // Marker-only, same shape as `approve_run`: status is unchanged
+        // (still `Paused`) and a background worker consumes the marker.
+        assert_eq!(loaded.status, RunStatus::Paused);
+        assert!(loaded.resume_requested_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn resume_run_rejects_non_paused_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (conn, store) = local(tmp.path().to_path_buf());
+        store
+            .create(
+                record("run_local_resume_running", RunStatus::Running),
+                "name: x\n",
+            )
+            .unwrap();
+
+        let err = conn
+            .resume_run("run_local_resume_running")
+            .await
+            .expect_err("resuming a running (non-paused) run should fail");
+        assert!(matches!(err, HostConnectorError::Invalid(_)));
     }
 }

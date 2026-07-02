@@ -43,6 +43,7 @@
   --c-status-completed: 34 197 94;
   --c-status-failed: 239 68 68;
   --c-status-awaiting: 245 158 11;
+  --c-status-paused: 6 182 212;
   --c-status-pending: 148 163 184;
   --c-status-skipped: 203 213 225;
   --c-status-cancelled: 100 116 139;
@@ -83,6 +84,7 @@
   --c-status-completed: 74 222 128;
   --c-status-failed: 248 113 113;
   --c-status-awaiting: 251 191 36;
+  --c-status-paused: 34 211 238;
   --c-status-pending: 113 113 122;
   --c-status-skipped: 82 82 91;
   --c-status-cancelled: 161 161 170;

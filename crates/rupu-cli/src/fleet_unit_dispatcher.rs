@@ -408,6 +408,13 @@ mod tests {
         async fn cancel_run(&self, _run_id: &str) -> Result<(), HostConnectorError> {
             unimplemented!()
         }
+        // `pause_run`/`resume_run` are intentionally NOT overridden on any
+        // fake `HostConnector` in this module — the real fleet dispatch path
+        // (`FleetUnitDispatcher`) only ever launches + polls + collects a
+        // unit's output, never pausing/resuming a unit run, so every fake
+        // here inherits `HostConnector`'s default `Unsupported` impl, same as
+        // the unoverridden `stage_workspace`/`collect_workspace_delta` below
+        // (see `fleet_pause_resume_are_unsupported_by_default`).
         async fn stream_run_events(
             &self,
             _run_id: &str,
@@ -539,6 +546,25 @@ mod tests {
         assert!(!out.success);
         let err = out.error.expect("failed run must have an error field");
         assert!(err.contains("boom"), "expected 'boom' in error, got: {err}");
+    }
+
+    /// A fake fleet `HostConnector` (never overrides `pause_run`/`resume_run`)
+    /// surfaces `HostConnector`'s default `Unsupported` for both — the fleet
+    /// dispatch path has no pause/resume routing (T5's SSH/HttpCp remote
+    /// reach is a `HostConnector`-level concern; fan-out unit control is a
+    /// separate follow-up), so a caller reaching a fleet-dispatched unit
+    /// through this connector gets a clear error, never a silent no-op.
+    #[tokio::test]
+    async fn fleet_pause_resume_are_unsupported_by_default() {
+        let conn = FakeConnector::completed();
+        assert!(matches!(
+            conn.pause_run("run_x").await,
+            Err(HostConnectorError::Unsupported(_))
+        ));
+        assert!(matches!(
+            conn.resume_run("run_x").await,
+            Err(HostConnectorError::Unsupported(_))
+        ));
     }
 
     /// `from_connector` with a fake whose `launch_agent` returns `Unreachable`

@@ -29,6 +29,9 @@ const GLYPH_LABEL: Record<StepState, { glyph: string; label: string }> = {
   done: { glyph: '✓', label: 'done' },
   failed: { glyph: '✕', label: 'failed' },
   awaiting_approval: { glyph: '⏸', label: 'awaiting' },
+  // Distinct glyph from `awaiting_approval` (⏸ vs ❚❚) — a paused step is a
+  // deliberate operator pause mid-run, not a gate waiting on a decision.
+  paused: { glyph: '❚❚', label: 'paused' },
   pending: { glyph: '•', label: 'pending' },
   skipped: { glyph: '⤼', label: 'skipped' },
 };
@@ -39,6 +42,7 @@ const STATE_KEY: Record<StepState, ColorKey> = {
   done: 'status.done',
   failed: 'status.failed',
   awaiting_approval: 'status.awaiting',
+  paused: 'status.paused',
   pending: 'status.pending',
   skipped: 'status.skipped',
 };

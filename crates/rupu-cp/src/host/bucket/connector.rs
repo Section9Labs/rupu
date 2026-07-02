@@ -420,6 +420,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_pause_unsupported() {
+        // Bucket has no wiring to reach a node agent's cooperative-pause
+        // check (unlike cancel/approve/reject, which just queue a control
+        // envelope the node polls for) — it inherits `HostConnector`'s
+        // default `Unsupported` for both `pause_run` and `resume_run`
+        // rather than faking a pause that never actually lands.
+        let (conn, _run_store, bucket, _tmp) = make_conn();
+        let run_id = conn
+            .launch_run(LaunchRequest {
+                workflow: "wf".into(),
+                inputs: Default::default(),
+                mode: None,
+                target: None,
+                working_dir: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            conn.pause_run(&run_id).await,
+            Err(HostConnectorError::Unsupported(_))
+        ));
+        assert!(matches!(
+            conn.resume_run(&run_id).await,
+            Err(HostConnectorError::Unsupported(_))
+        ));
+        // No control envelope was written for either call.
+        let controls = bucket.list_control(&run_id).await.unwrap();
+        assert!(
+            controls.is_empty(),
+            "unsupported pause/resume must not queue any control envelope"
+        );
+    }
+
+    #[tokio::test]
     async fn approve_with_empty_mode_omits_mode_field() {
         let (conn, _run_store, bucket, _tmp) = make_conn();
         let run_id = conn

@@ -54,6 +54,18 @@ pub trait WorkflowExecutor: Send + Sync {
     async fn approve(&self, run_id: &str, approver: &str) -> Result<(), ExecutorError>;
     async fn reject(&self, run_id: &str, reason: &str) -> Result<(), ExecutorError>;
     async fn cancel(&self, run_id: &str) -> Result<(), ExecutorError>;
+    /// Request a cooperative pause: distinct from `cancel` (which is
+    /// terminal). The run's task honors this at the next safe boundary
+    /// (Task 2/3 threads the token into the agent/runner loop); this
+    /// method only trips the signal and returns immediately.
+    async fn pause(&self, run_id: &str) -> Result<(), ExecutorError>;
+    /// Resume a previously paused run from its persisted checkpoint.
+    /// `InProcessExecutor` cannot drive this today (it doesn't retain
+    /// the `StepFactory` a run was started with past `start()`
+    /// returning) — real resume is launcher-gated (`rupu workflow
+    /// resume` / the CP resume worker), which re-enters `run_workflow`
+    /// directly with a freshly built factory.
+    async fn resume(&self, run_id: &str) -> Result<(), ExecutorError>;
 }
 
 struct RunState {
@@ -63,6 +75,10 @@ struct RunState {
     #[allow(dead_code)]
     join: Mutex<Option<JoinHandle<()>>>,
     cancel: CancellationToken,
+    /// Cooperative pause signal, distinct from `cancel`. Cancelling
+    /// this token requests a pause (not a stop); the run task holds a
+    /// clone once Task 2/3 threads it into the agent/runner loop.
+    pause: CancellationToken,
     workflow_path: PathBuf,
 }
 
@@ -130,7 +146,15 @@ impl WorkflowExecutor for InProcessExecutor {
         }
         let fan_out = Arc::new(FanOutSink::new(fan_sinks));
 
-        // 5. Build OrchestratorRunOpts.
+        // 5. Cooperative-pause token — created here so it can be threaded
+        // into both `OrchestratorRunOpts.pause` (the run task honors it) and
+        // `RunState.pause` (what `InProcessExecutor::pause()` trips). No
+        // marker file is needed for the in-process path: the token is a
+        // direct in-memory handle to the running task.
+        let cancel = CancellationToken::new();
+        let pause = CancellationToken::new();
+
+        // 6. Build OrchestratorRunOpts.
         let orchestrator_opts = OrchestratorRunOpts {
             workflow,
             inputs: opts.vars.clone(),
@@ -148,15 +172,16 @@ impl WorkflowExecutor for InProcessExecutor {
             strict_templates: false,
             event_sink: Some(fan_out as Arc<dyn EventSink>),
             unit_dispatcher: None,
+            pause: Some(pause.clone()),
         };
 
-        // 6. Stash state before spawning (so tail() works immediately).
-        let cancel = CancellationToken::new();
+        // 7. Stash state before spawning (so tail() works immediately).
         let state = Arc::new(RunState {
             in_memory,
             jsonl,
             join: Mutex::new(None),
             cancel: cancel.clone(),
+            pause: pause.clone(),
             workflow_path: opts.workflow_path.clone(),
         });
 
@@ -165,7 +190,7 @@ impl WorkflowExecutor for InProcessExecutor {
             runs.insert(run_id.clone(), state.clone());
         }
 
-        // 7. Spawn the runner task.
+        // 8. Spawn the runner task.
         let join: JoinHandle<()> = tokio::spawn(async move {
             if let Err(e) = run_workflow(orchestrator_opts).await {
                 tracing::error!(error = %e, "InProcessExecutor: run_workflow failed");
@@ -320,11 +345,268 @@ impl WorkflowExecutor for InProcessExecutor {
         state.cancel.cancel();
         Ok(())
     }
+
+    async fn pause(&self, run_id: &str) -> Result<(), ExecutorError> {
+        let runs = self.runs.lock().unwrap();
+        let state = runs
+            .get(run_id)
+            .ok_or_else(|| ExecutorError::RunNotFound(run_id.to_string()))?
+            .clone();
+        drop(runs);
+        state.pause.cancel(); // "cancel" the pause token = request pause
+        Ok(())
+    }
+
+    async fn resume(&self, run_id: &str) -> Result<(), ExecutorError> {
+        // Re-entering `run_workflow` with `resume_from: Some(..)`
+        // requires the original `StepFactory` the run was started
+        // with (see `crate::runner::OrchestratorRunOpts::resume_from`);
+        // `RunState` doesn't retain it past `start()` returning, so
+        // this executor cannot drive a real resume on its own. Confirm
+        // the run at least exists (and surface a targeted error
+        // otherwise) before reporting the real limitation, so callers
+        // don't misread a typo'd run_id as "resume unsupported".
+        {
+            let runs = self.runs.lock().unwrap();
+            if !runs.contains_key(run_id) {
+                return Err(ExecutorError::RunNotFound(run_id.to_string()));
+            }
+        }
+        Err(ExecutorError::Unsupported(format!(
+            "InProcessExecutor cannot resume run `{run_id}` directly: \
+             resume needs the original StepFactory, which isn't retained \
+             past start(). Re-enter run_workflow via the launcher-gated \
+             resume path (`rupu workflow resume` / the CP resume worker)."
+        )))
+    }
 }
 
 fn map_approval_err(e: ApprovalError) -> ExecutorError {
     match e {
         ApprovalError::NotFound(id) => ExecutorError::RunNotFound(id),
         other => ExecutorError::Internal(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rupu_agent::runner::{BypassDecider, MockProvider, ScriptedTurn};
+    use rupu_agent::AgentRunOpts;
+    use rupu_providers::types::StopReason;
+    use rupu_tools::ToolContext;
+    use tempfile::TempDir;
+
+    /// Minimal `StepFactory` test double — mirrors the `FakeFactory` used
+    /// by `tests/executor_in_process.rs`, kept local here so this
+    /// module-internal unit test can reach `InProcessExecutor`'s private
+    /// `runs` map and `RunState`'s private `cancel`/`pause` tokens
+    /// directly (an external integration test cannot).
+    struct FakeFactory;
+
+    #[async_trait]
+    impl StepFactory for FakeFactory {
+        async fn build_opts_for_step(
+            &self,
+            step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: format!("step {step_id} agent {agent_name} echo: {rendered_prompt}"),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+            AgentRunOpts {
+                agent_name: format!("ag-{agent_name}"),
+                agent_system_prompt: "echo".into(),
+                agent_tools: None,
+                provider: Box::new(provider),
+                provider_name: "mock".into(),
+                model: "mock-1".into(),
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                max_turns: 5,
+                decider: Arc::new(BypassDecider),
+                tool_context: ToolContext::default(),
+                user_message: rendered_prompt,
+                initial_messages: Vec::new(),
+                turn_index_offset: 0,
+                mode_str: "bypass".into(),
+                no_stream: false,
+                suppress_stream_stdout: false,
+                mcp_registry: None,
+                effort: None,
+                context_window: None,
+                output_format: None,
+                anthropic_task_budget: None,
+                anthropic_context_management: None,
+                anthropic_speed: None,
+                parent_run_id: None,
+                depth: 0,
+                dispatchable_agents: None,
+                step_id: step_id.to_string(),
+                on_tool_call,
+                on_stream_event: None,
+                concerns: None,
+                max_tokens: rupu_agent::runner::DEFAULT_MAX_TOKENS,
+                scope_name: None,
+                surface_tag: None,
+                context_window_tokens: None,
+                compact_at_percent: None,
+                pause: None,
+            }
+        }
+    }
+
+    const WF_ONE_STEP: &str = r#"
+name: one-step
+steps:
+  - id: alpha
+    agent: ag
+    actions: []
+    prompt: "hello alpha"
+"#;
+
+    #[tokio::test]
+    async fn pause_sets_the_pause_signal_not_cancel() {
+        let tmp = TempDir::new().unwrap();
+        let wf_path = tmp.path().join("one-step.yaml");
+        std::fs::write(&wf_path, WF_ONE_STEP).unwrap();
+
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let exec = InProcessExecutor::new(
+            store,
+            "ws_test".into(),
+            tmp.path().to_path_buf(),
+            tmp.path().join("transcripts"),
+        );
+
+        let handle = exec
+            .start(
+                WorkflowRunOpts {
+                    workflow_path: wf_path,
+                    vars: Default::default(),
+                },
+                Arc::new(FakeFactory),
+            )
+            .await
+            .expect("start");
+
+        exec.pause(&handle.run_id).await.expect("pause");
+
+        let runs = exec.runs.lock().unwrap();
+        let state = runs
+            .get(&handle.run_id)
+            .expect("run state present after start");
+        assert!(
+            state.pause.is_cancelled(),
+            "pause() must trip the pause token"
+        );
+        assert!(
+            !state.cancel.is_cancelled(),
+            "pause() must NOT trip the cancel token"
+        );
+    }
+
+    /// The pause token built in `start()` is now threaded into
+    /// `OrchestratorRunOpts.pause`, so tripping it via `pause()` genuinely
+    /// reaches `run_workflow`. On the current-thread test runtime the spawned
+    /// run task has not been polled yet when `start()` returns, so pausing
+    /// before driving the task to completion lands the step-boundary pause
+    /// deterministically: the run finishes `Paused`, not `Completed`.
+    #[tokio::test]
+    async fn pause_token_reaches_run_workflow_and_pauses_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let wf_path = tmp.path().join("one-step.yaml");
+        std::fs::write(&wf_path, WF_ONE_STEP).unwrap();
+
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let exec = InProcessExecutor::new(
+            store,
+            "ws_test".into(),
+            tmp.path().to_path_buf(),
+            tmp.path().join("transcripts"),
+        );
+
+        let handle = exec
+            .start(
+                WorkflowRunOpts {
+                    workflow_path: wf_path,
+                    vars: Default::default(),
+                },
+                Arc::new(FakeFactory),
+            )
+            .await
+            .expect("start");
+
+        // Trip the pause token before the run task is first polled.
+        exec.pause(&handle.run_id).await.expect("pause");
+
+        // Drive the spawned run task to completion.
+        let join = {
+            let runs = exec.runs.lock().unwrap();
+            let state = runs.get(&handle.run_id).expect("run state").clone();
+            let taken = state.join.lock().unwrap().take();
+            taken
+        };
+        if let Some(join) = join {
+            let _ = join.await;
+        }
+
+        let rec = exec.run_store.load(&handle.run_id).expect("load run");
+        assert_eq!(
+            rec.status,
+            RunStatus::Paused,
+            "pause() token must reach run_workflow (opts.pause must be Some), \
+             so the run pauses at the step boundary instead of completing"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_on_unresumable_context_returns_a_clear_error() {
+        let tmp = TempDir::new().unwrap();
+        let wf_path = tmp.path().join("one-step.yaml");
+        std::fs::write(&wf_path, WF_ONE_STEP).unwrap();
+
+        let store = Arc::new(RunStore::new(tmp.path().join("runs")));
+        let exec = InProcessExecutor::new(
+            store,
+            "ws_test".into(),
+            tmp.path().to_path_buf(),
+            tmp.path().join("transcripts"),
+        );
+
+        let handle = exec
+            .start(
+                WorkflowRunOpts {
+                    workflow_path: wf_path,
+                    vars: Default::default(),
+                },
+                Arc::new(FakeFactory),
+            )
+            .await
+            .expect("start");
+
+        let err = exec
+            .resume(&handle.run_id)
+            .await
+            .expect_err("InProcessExecutor cannot drive resume on its own");
+        assert!(matches!(err, ExecutorError::Unsupported(_)));
+
+        let err = exec
+            .resume("run_does_not_exist")
+            .await
+            .expect_err("unknown run_id must not report Unsupported");
+        assert!(matches!(err, ExecutorError::RunNotFound(_)));
     }
 }

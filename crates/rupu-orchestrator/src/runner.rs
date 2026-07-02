@@ -27,13 +27,15 @@ use crate::workflow::{
     WorkspaceMode,
 };
 use async_trait::async_trait;
-use rupu_agent::{run_agent, AgentRunOpts, RunError};
+use rupu_agent::{run_agent, AgentRunOpts, RunError, RunResult};
+use rupu_providers::types::Message;
 use rupu_transcript::{Event, JsonlReader};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -152,6 +154,15 @@ pub enum RunWorkflowError {
         "resuming a workflow with a `workspace: sync` step is not supported (v1): re-run from the start instead"
     )]
     ResumeWithWorkspaceSync,
+    // TODO(pause-workspace-sync): support delta-persisting resume so workspace:sync
+    // workflows can pause/resume. Until then, pausing a workflow that contains a
+    // `workspace: sync` step is refused: a mid-flight pause would checkpoint only
+    // the coordinator's OUTPUTs, not the in-flight workspace deltas, so resuming
+    // would silently lose file edits (same hazard as ResumeWithWorkspaceSync).
+    #[error(
+        "pausing a workflow with a `workspace: sync` step is not supported (v1): let it run to completion instead"
+    )]
+    PauseWithWorkspaceSync,
 }
 
 /// Trait the orchestrator uses to construct per-unit [`AgentRunOpts`].
@@ -242,6 +253,30 @@ pub struct OrchestratorRunOpts {
     /// all units run locally (a `distribute:` step with `None` is a run
     /// error surfaced as a failed unit).
     pub unit_dispatcher: Option<Arc<dyn UnitDispatcher>>,
+    /// Cooperative pause signal. When `Some` and the token is cancelled, the
+    /// runner stops at the next safe boundary: mid-step for the in-flight
+    /// *linear* agent run (the agent's partial turn is dropped / a running
+    /// tool finishes, then the step is checkpointed as paused-incomplete), or
+    /// at the *step boundary* (before the next step is dispatched) for every
+    /// step shape. The run record flips to [`crate::runs::RunStatus::Paused`]
+    /// and a `RunPaused` event is emitted. Resume is a fresh `run_workflow`
+    /// with `resume_from` set (see [`ResumeState`]). `None` (default)
+    /// preserves today's behavior exactly. Fan-out / panel / parallel steps
+    /// pause only at the step boundary — mid-unit fan-out pause/resume is not
+    /// supported in v1 (same class of limitation as `workspace: sync`).
+    pub pause: Option<CancellationToken>,
+}
+
+/// Why a run paused. Threaded onto [`AwaitingInfo`] / [`ResumeState`] so the
+/// single resume path (`run_workflow` with `resume_from`) can distinguish an
+/// approval-gate pause (operator approves, then resumes) from a manual /
+/// operator-requested pause (cooperative interrupt, then resumes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseReason {
+    /// Paused before a step whose `approval:` gate required sign-off.
+    Approval,
+    /// Paused by the cooperative pause signal ([`OrchestratorRunOpts::pause`]).
+    Manual,
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +401,22 @@ pub struct AwaitingInfo {
     /// When the pending approval expires. `None` when the awaited
     /// step has no `timeout_seconds:` set.
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why the run paused (approval gate vs manual/cooperative pause).
+    pub reason: PauseReason,
+    /// Seed transcript for a paused-*incomplete* step (a manual pause that
+    /// landed mid-step). The caller round-trips this into
+    /// [`ResumeState::paused_step`] so the resumed run re-runs that exact step
+    /// from where the agent left off. Empty for approval and step-boundary
+    /// pauses (nothing to seed — the step runs fresh / was fully completed).
+    pub resume_seed: Vec<Message>,
+    /// Units of the paused fan-out (`for_each`/`distribute:`) step that
+    /// SUCCEEDED before the pause landed (merged with any units already
+    /// replayed from an earlier resume). Keyed by 0-based unit index. The
+    /// caller round-trips this into `ResumeState::completed_units[step_id]`
+    /// so the resumed run re-dispatches ONLY the paused / not-yet-started
+    /// units. Empty for every pause shape except a manual pause that landed
+    /// mid-fan-out.
+    pub fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
 }
 
 /// Caller-supplied resume context. When `OrchestratorRunOpts.resume_from`
@@ -390,6 +441,26 @@ pub struct ResumeState {
     /// path (which has no partially-completed fan-out steps).
     pub completed_units:
         std::collections::BTreeMap<String, std::collections::BTreeMap<usize, ItemResult>>,
+    /// Why the original run paused. `Approval` (default) drives the existing
+    /// approval-resume behavior unchanged; `Manual` marks a cooperative-pause
+    /// resume (emits `RunResumed` / `StepResumed`).
+    pub reason: PauseReason,
+    /// The step that paused mid-run (a manual pause that landed inside a
+    /// linear step). On resume this exact step re-runs seeded with its
+    /// persisted transcript (role-alternation-safe). `None` for approval and
+    /// step-boundary pauses.
+    pub paused_step: Option<PausedStep>,
+}
+
+/// A linear step that paused mid-run, carried on [`ResumeState`] so the
+/// resumed run re-seeds the agent from where it left off.
+#[derive(Debug, Clone)]
+pub struct PausedStep {
+    pub step_id: String,
+    /// The paused agent's transcript at the pause boundary (its
+    /// `RunResult::final_messages`). Ends at the last complete message /
+    /// tool result, ready to seed a resume.
+    pub seed_messages: Vec<Message>,
 }
 
 impl ResumeState {
@@ -406,6 +477,8 @@ impl ResumeState {
             prior_step_results,
             approved_step_id,
             completed_units: std::collections::BTreeMap::new(),
+            reason: PauseReason::Approval,
+            paused_step: None,
         }
     }
 }
@@ -426,13 +499,7 @@ pub async fn run_workflow(
     // This check fires only on the checkpoint-resume path (`resume_from`
     // is Some).  The non-resume path and resume of non-sync workflows are
     // unaffected.
-    if opts.resume_from.is_some()
-        && opts
-            .workflow
-            .steps
-            .iter()
-            .any(|s| effective_workspace_mode(s, &opts.workflow.defaults) == WorkspaceMode::Sync)
-    {
+    if opts.resume_from.is_some() && workflow_has_sync_step(&opts) {
         return Err(RunWorkflowError::ResumeWithWorkspaceSync);
     }
 
@@ -540,6 +607,21 @@ pub async fn run_workflow(
                 started_at: chrono::Utc::now(),
             },
         );
+        // A manual-pause resume additionally announces `RunResumed`. The
+        // approval-resume path (`PauseReason::Approval`) is left byte-for-byte
+        // unchanged — no extra event.
+        if opts
+            .resume_from
+            .as_ref()
+            .is_some_and(|r| r.reason == PauseReason::Manual)
+        {
+            sink.emit(
+                &run_id,
+                &crate::executor::Event::RunResumed {
+                    run_id: run_id.clone(),
+                },
+            );
+        }
     }
 
     let outcome = run_steps_inner(
@@ -571,16 +653,34 @@ pub async fn run_workflow(
                 record.active_step_kind = None;
                 record.active_step_agent = None;
                 record.active_step_transcript_path = None;
+                // Defensive: a completed run has no further use for a
+                // paused-step seed (there shouldn't be one, but a stale
+                // sidecar from an earlier pause/resume cycle must not
+                // leak into a future, unrelated pause).
+                if let Err(e) = store.clear_paused_seed(&record.id) {
+                    warn!(error = %e, "failed to clear paused-step seed on completion");
+                }
             }
             Ok(InnerOutcome::Paused {
                 step_id,
                 prompt,
                 timeout_seconds,
+                reason,
+                seed,
+                fanout_completed_units,
             }) => {
                 let now = chrono::Utc::now();
-                record.status = crate::runs::RunStatus::AwaitingApproval;
+                // Approval → non-terminal `AwaitingApproval` (existing shape).
+                // Manual   → non-terminal `Paused`.
+                record.status = match reason {
+                    PauseReason::Approval => crate::runs::RunStatus::AwaitingApproval,
+                    PauseReason::Manual => crate::runs::RunStatus::Paused,
+                };
                 record.awaiting_step_id = Some(step_id.clone());
-                record.approval_prompt = Some(prompt.clone());
+                record.approval_prompt = match reason {
+                    PauseReason::Approval => Some(prompt.clone()),
+                    PauseReason::Manual => None,
+                };
                 record.awaiting_since = Some(now);
                 record.expires_at =
                     timeout_seconds.map(|secs| now + chrono::Duration::seconds(secs as i64));
@@ -589,11 +689,24 @@ pub async fn run_workflow(
                 record.active_step_kind = None;
                 record.active_step_agent = None;
                 record.active_step_transcript_path = None;
+                // Persist the mid-step seed transcript (if any) so a resume
+                // in a fresh process (the CP-driven resume worker spawns a
+                // new `rupu workflow resume` subprocess) can reconstruct
+                // `ResumeState::paused_step` from disk. Empty for approval
+                // and step-boundary pauses — nothing to persist.
+                if *reason == PauseReason::Manual && !seed.is_empty() {
+                    if let Err(e) = store.write_paused_seed(&record.id, seed) {
+                        warn!(error = %e, "failed to persist paused-step seed");
+                    }
+                }
                 // Don't set finished_at — the run hasn't ended.
                 awaiting = Some(AwaitingInfo {
                     step_id: step_id.clone(),
                     prompt: prompt.clone(),
                     expires_at: record.expires_at,
+                    reason: *reason,
+                    resume_seed: seed.clone(),
+                    fanout_completed_units: fanout_completed_units.clone(),
                 });
             }
             Err(e) => {
@@ -605,6 +718,9 @@ pub async fn run_workflow(
                 record.active_step_kind = None;
                 record.active_step_agent = None;
                 record.active_step_transcript_path = None;
+                if let Err(e) = store.clear_paused_seed(&record.id) {
+                    warn!(error = %e, "failed to clear paused-step seed on failure");
+                }
             }
         }
         if let Err(persist_err) = store.update(record) {
@@ -614,9 +730,12 @@ pub async fn run_workflow(
         step_id,
         prompt,
         timeout_seconds,
+        reason,
+        seed,
+        fanout_completed_units,
     }) = &outcome
     {
-        // No store but the workflow asked for approval — surface
+        // No store but the run paused (approval gate or manual pause) — surface
         // the paused state to the caller anyway.
         let expires_at =
             timeout_seconds.map(|secs| chrono::Utc::now() + chrono::Duration::seconds(secs as i64));
@@ -624,6 +743,9 @@ pub async fn run_workflow(
             step_id: step_id.clone(),
             prompt: prompt.clone(),
             expires_at,
+            reason: *reason,
+            resume_seed: seed.clone(),
+            fanout_completed_units: fanout_completed_units.clone(),
         });
     }
 
@@ -651,10 +773,22 @@ pub async fn run_workflow(
                     },
                 );
             }
-            Ok(InnerOutcome::Paused { .. }) => {
-                // StepAwaitingApproval was already emitted before returning
-                // from run_steps_inner; no additional run-level event here.
-            }
+            Ok(InnerOutcome::Paused { reason, .. }) => match reason {
+                PauseReason::Approval => {
+                    // StepAwaitingApproval was already emitted before returning
+                    // from run_steps_inner; no additional run-level event here.
+                }
+                PauseReason::Manual => {
+                    // A cooperative pause. `StepPaused` (mid-step) was already
+                    // emitted by run_steps_inner; announce the run-level pause.
+                    sink.emit(
+                        &run_id,
+                        &crate::executor::Event::RunPaused {
+                            run_id: run_id.clone(),
+                        },
+                    );
+                }
+            },
         }
     }
 
@@ -664,6 +798,79 @@ pub async fn run_workflow(
         run_id,
         awaiting,
     })
+}
+
+/// True when a cooperative pause has been requested (the token exists and
+/// is cancelled). `false` for the no-pause path (token is `None`), so every
+/// pause check is a cheap no-op there.
+fn pause_triggered(pause: &Option<CancellationToken>) -> bool {
+    pause.as_ref().is_some_and(|t| t.is_cancelled())
+}
+
+/// True when any step in the workflow resolves to `workspace: sync`. Used to
+/// refuse both checkpoint-resume and pause of sync workflows (their in-flight
+/// deltas can't be checkpointed in v1).
+fn workflow_has_sync_step(opts: &OrchestratorRunOpts) -> bool {
+    opts.workflow
+        .steps
+        .iter()
+        .any(|s| effective_workspace_mode(s, &opts.workflow.defaults) == WorkspaceMode::Sync)
+}
+
+/// Outcome of a single linear step: it either completed (success or a
+/// tolerated failure) or paused mid-run (cooperative pause landed inside the
+/// agent turn). The paused arm carries the seed transcript so the resumed run
+/// can continue from where the agent left off.
+enum LinearStepOutcome {
+    Completed(StepResult),
+    Paused {
+        step_id: String,
+        /// The paused agent's `final_messages` (transcript through the last
+        /// complete message / tool result).
+        seed: Vec<Message>,
+    },
+}
+
+/// Outcome of a distributed fan-out (`for_each:` / `distribute:`) step: it
+/// either completed (every unit dispatched — success, tolerated failure, or
+/// replayed from a prior checkpoint) or paused MID-FAN-OUT (the cooperative
+/// pause token fired while units were still in flight). The paused arm
+/// carries every unit that already succeeded (freshly dispatched this pass
+/// plus any replayed from an earlier resume) so the next resume re-dispatches
+/// ONLY the paused / not-yet-started units — never a unit that already has a
+/// good result.
+enum FanoutStepOutcome {
+    Completed(StepResult),
+    Paused {
+        step_id: String,
+        completed_units: std::collections::BTreeMap<usize, ItemResult>,
+    },
+}
+
+/// Split a paused agent's seed transcript into `(initial_messages, user_message)`
+/// for a resumed [`run_agent`].
+///
+/// `run_agent` appends `Message::user(user_message)` on top of
+/// `initial_messages` ONLY when `user_message` is non-empty (an empty message
+/// is treated as "seed-only" — the transcript is already complete). We exploit
+/// that here: the resumed agent is seeded with the FULL paused transcript
+/// AS-IS and handed an EMPTY `user_message`, so exactly one fresh provider
+/// request is issued from the intact transcript with no extra turn.
+///
+/// This is lossless for BOTH pause shapes:
+///   * mid-stream pause — the seed ends in a plain-text user message (the seed
+///     prompt; partial assistant text was discarded on pause). Replaying it
+///     verbatim preserves role alternation.
+///   * tool-boundary pause — the seed ends in a user message carrying a
+///     `ToolResult` that pairs with the `ToolUse` block in the immediately
+///     preceding assistant message. Replaying it verbatim keeps the
+///     `tool_use`/`tool_result` pair intact — no dangling `tool_use`, so no
+///     Anthropic 400 "tool_use ids without tool_result blocks".
+///
+/// (If the seed instead ends in an assistant message, or is empty, an empty
+/// `user_message` likewise appends nothing and the request still alternates.)
+fn split_seed_for_resume(seed: Vec<Message>) -> (Vec<Message>, String) {
+    (seed, String::new())
 }
 
 /// Inner loop's terminal state. Distinguishes "ran to completion"
@@ -679,6 +886,16 @@ enum InnerOutcome {
         /// `expires_at = now() + timeout` so subsequent
         /// `rupu workflow approve` / `runs` can honor it.
         timeout_seconds: Option<u64>,
+        /// Approval-gate pause vs manual/cooperative pause.
+        reason: PauseReason,
+        /// Seed transcript for a manual pause that landed mid-step (the
+        /// paused-incomplete linear step's `final_messages`). Empty for
+        /// approval and step-boundary pauses.
+        seed: Vec<Message>,
+        /// Units of a paused fan-out step that already succeeded (see
+        /// [`AwaitingInfo::fanout_completed_units`]). Empty except for a
+        /// manual pause that landed mid-fan-out.
+        fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
     },
 }
 
@@ -705,11 +922,40 @@ async fn run_steps_inner(
     let already_done: std::collections::BTreeSet<String> =
         step_results.iter().map(|sr| sr.step_id.clone()).collect();
 
+    // The step (if any) that paused mid-run in a prior process and is being
+    // re-run now. Its `approval:` gate is suppressed and it is re-seeded from
+    // its persisted transcript (see `run_linear_step`).
+    let resume_paused_step_id: Option<&str> = opts
+        .resume_from
+        .as_ref()
+        .and_then(|r| r.paused_step.as_ref())
+        .map(|ps| ps.step_id.as_str());
+
     for step in &opts.workflow.steps {
         // Resume: skip steps that already ran in the prior process.
         if already_done.contains(&step.id) {
             info!(step = %step.id, "resume: skipping already-completed step");
             continue;
+        }
+
+        // Step-boundary pause: if a cooperative pause was requested, stop
+        // before dispatching the next step. Every step shape pauses cleanly
+        // here (fan-out / panel / parallel steps run to completion, then pause
+        // at the following boundary). A paused `workspace: sync` workflow is
+        // refused loudly — checkpointing it would drop in-flight deltas.
+        if pause_triggered(&opts.pause) {
+            if workflow_has_sync_step(opts) {
+                return Err(RunWorkflowError::PauseWithWorkspaceSync);
+            }
+            info!(step = %step.id, "cooperative pause at step boundary");
+            return Ok(InnerOutcome::Paused {
+                step_id: step.id.clone(),
+                prompt: String::new(),
+                timeout_seconds: None,
+                reason: PauseReason::Manual,
+                seed: Vec::new(),
+                fanout_completed_units: std::collections::BTreeMap::new(),
+            });
         }
 
         // Build template context from inputs + prior step outputs.
@@ -765,7 +1011,12 @@ async fn run_steps_inner(
         // id matches `approved_step_id`, so we skip the gate this
         // pass.
         if let Some(approval) = &step.approval {
-            if approval.required && approved_step_id != Some(step.id.as_str()) {
+            // Suppress the gate on resume for the approved step AND for a
+            // paused-mid-run step being re-run (it already cleared its gate
+            // in the prior process).
+            let gate_suppressed = approved_step_id == Some(step.id.as_str())
+                || resume_paused_step_id == Some(step.id.as_str());
+            if approval.required && !gate_suppressed {
                 let prompt = match &approval.prompt {
                     Some(template) => {
                         render_step_prompt(template, &ctx, render_mode(opts.strict_templates))
@@ -794,6 +1045,9 @@ async fn run_steps_inner(
                     step_id: step.id.clone(),
                     prompt,
                     timeout_seconds: approval.timeout_seconds,
+                    reason: PauseReason::Approval,
+                    seed: Vec::new(),
+                    fanout_completed_units: std::collections::BTreeMap::new(),
                 });
             }
         }
@@ -815,16 +1069,96 @@ async fn run_steps_inner(
                 },
             );
         }
+        // Resume: announce the paused-mid-run step is picking back up.
+        if resume_paused_step_id == Some(step.id.as_str()) {
+            if let Some(sink) = opts.event_sink.as_ref() {
+                sink.emit(
+                    run_id,
+                    &crate::executor::Event::StepResumed {
+                        run_id: run_id.to_string(),
+                        step_id: step.id.clone(),
+                    },
+                );
+            }
+        }
         let step_timer = std::time::Instant::now();
 
-        let dispatch_result = if step.panel.is_some() {
+        let dispatch_result: Result<StepResult, RunWorkflowError> = if step.panel.is_some() {
             run_panel_step(run_id, step, &ctx, opts, effective_continue_on_error).await
         } else if step.parallel.is_some() {
             run_parallel_step(step, &ctx, opts, effective_continue_on_error).await
         } else if step.for_each.is_some() {
-            run_fanout_step(run_id, step, &ctx, opts, effective_continue_on_error).await
+            // A distributed fan-out honors the cooperative pause token
+            // MID-UNIT (not just at the step boundary): a paused-incomplete
+            // fan-out unwinds here carrying the units that already succeeded,
+            // so the resumed run re-dispatches only the paused / not-yet-
+            // started ones.
+            match run_fanout_step(run_id, step, &ctx, opts, effective_continue_on_error).await {
+                Ok(FanoutStepOutcome::Paused {
+                    step_id,
+                    completed_units,
+                }) => {
+                    info!(step = %step_id, "cooperative pause mid-fan-out");
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepPaused {
+                                run_id: run_id.to_string(),
+                                step_id: step_id.clone(),
+                            },
+                        );
+                    }
+                    clear_active_step(opts, run_id, &step.id);
+                    return Ok(InnerOutcome::Paused {
+                        step_id,
+                        prompt: String::new(),
+                        timeout_seconds: None,
+                        reason: PauseReason::Manual,
+                        seed: Vec::new(),
+                        fanout_completed_units: completed_units,
+                    });
+                }
+                Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
+                Err(e) => Err(e),
+            }
         } else {
-            run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await
+            // The linear path is the only other shape that pauses mid-step
+            // (its agent run carries the cooperative pause token). A
+            // paused-incomplete step unwinds here into a manual-pause
+            // checkpoint carrying the seed.
+            match run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await {
+                Ok(LinearStepOutcome::Paused { step_id, seed }) => {
+                    // A `workspace: sync` workflow is refused loudly here too
+                    // — checkpointing mid-step would drop in-flight deltas
+                    // the same way a step-boundary/fan-out pause would.
+                    // Mirrors the step-boundary guard above and the fan-out
+                    // guard in `run_fanout_step`.
+                    if workflow_has_sync_step(opts) {
+                        return Err(RunWorkflowError::PauseWithWorkspaceSync);
+                    }
+                    info!(step = %step_id, "cooperative pause mid-step");
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepPaused {
+                                run_id: run_id.to_string(),
+                                step_id: step_id.clone(),
+                            },
+                        );
+                    }
+                    clear_active_step(opts, run_id, &step.id);
+                    return Ok(InnerOutcome::Paused {
+                        step_id,
+                        prompt: String::new(),
+                        timeout_seconds: None,
+                        reason: PauseReason::Manual,
+                        seed,
+                        fanout_completed_units: std::collections::BTreeMap::new(),
+                    });
+                }
+                Ok(LinearStepOutcome::Completed(sr)) => Ok(sr),
+                Err(e) => Err(e),
+            }
         };
 
         let duration_ms = step_timer.elapsed().as_millis() as u64;
@@ -1118,7 +1452,7 @@ async fn run_linear_step(
     ctx: &StepContext,
     opts: &OrchestratorRunOpts,
     continue_on_error: bool,
-) -> Result<StepResult, RunWorkflowError> {
+) -> Result<LinearStepOutcome, RunWorkflowError> {
     let prompt = step
         .prompt
         .as_deref()
@@ -1190,6 +1524,16 @@ async fn run_linear_step(
                     }) as rupu_agent::OnToolCallCallback
                 });
 
+            // Resume-seed: if this exact step paused mid-run in a prior
+            // process, re-seed the agent from its persisted transcript
+            // (role-alternation-safe — see `split_seed_for_resume`).
+            let resume_seed = opts
+                .resume_from
+                .as_ref()
+                .and_then(|r| r.paused_step.as_ref())
+                .filter(|ps| ps.step_id == step.id)
+                .map(|ps| split_seed_for_resume(ps.seed_messages.clone()));
+
             let outcome = dispatch_one(
                 &opts.factory,
                 &step.id,
@@ -1200,10 +1544,21 @@ async fn run_linear_step(
                 opts.workspace_path.clone(),
                 transcript_path.clone(),
                 on_tool_call,
+                opts.pause.clone(),
+                resume_seed,
             )
             .await;
 
             let success = match outcome {
+                // NOTE 2: branch on the paused outcome BEFORE the Ok/Err
+                // success check. A paused agent run is neither success nor
+                // failure — it unwinds into a manual-pause checkpoint.
+                Ok(rr) if rr.paused => {
+                    return Ok(LinearStepOutcome::Paused {
+                        step_id: step.id.clone(),
+                        seed: rr.final_messages,
+                    });
+                }
                 Ok(_) => true,
                 Err(source) => {
                     if continue_on_error {
@@ -1227,7 +1582,7 @@ async fn run_linear_step(
         }
     };
 
-    Ok(StepResult {
+    Ok(LinearStepOutcome::Completed(StepResult {
         step_id: step.id.clone(),
         rendered_prompt: rendered,
         run_id,
@@ -1237,7 +1592,7 @@ async fn run_linear_step(
         skipped: false,
         items: Vec::new(),
         ..Default::default()
-    })
+    }))
 }
 
 /// Fan-out step: render `for_each:` to a list, then dispatch the
@@ -1252,7 +1607,7 @@ async fn run_fanout_step(
     ctx: &StepContext,
     opts: &OrchestratorRunOpts,
     continue_on_error: bool,
-) -> Result<StepResult, RunWorkflowError> {
+) -> Result<FanoutStepOutcome, RunWorkflowError> {
     let for_each_expr = step
         .for_each
         .as_ref()
@@ -1266,7 +1621,7 @@ async fn run_fanout_step(
 
     if items.is_empty() {
         info!(step = %step.id, "for_each rendered to an empty list; recording as success with no items");
-        return Ok(StepResult {
+        return Ok(FanoutStepOutcome::Completed(StepResult {
             step_id: step.id.clone(),
             rendered_prompt: String::new(),
             run_id: String::new(),
@@ -1277,7 +1632,7 @@ async fn run_fanout_step(
             kind: crate::runs::StepKind::ForEach,
             items: Vec::new(),
             ..Default::default()
-        });
+        }));
     }
 
     let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
@@ -1378,6 +1733,13 @@ async fn run_fanout_step(
     let distribute_hosts: Option<Vec<String>> = step.distribute.as_ref().map(|d| d.hosts.clone());
     // Clone the dispatcher Arc once; each spawned task gets its own ref.
     let unit_dispatcher = opts.unit_dispatcher.clone();
+    // Cooperative pause token, cloned once; each spawned task gets its own
+    // handle. Threaded into the LOCAL agent dispatch below so an in-flight
+    // unit honors it mid-turn (same mechanism as a linear step's agent —
+    // see T2). Checked again after each unit acquires its semaphore permit
+    // so a unit that hasn't started yet is never dispatched (local OR
+    // remote) once a pause has landed.
+    let unit_pause = opts.pause.clone();
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path
@@ -1410,6 +1772,7 @@ async fn run_fanout_step(
         let unit_key = fanout_unit_key(&item_value);
         let unit_agent = agent_name_root.clone();
         let dispatcher_for_task = unit_dispatcher.clone();
+        let pause_for_task = unit_pause.clone();
         // Workspace path forwarded to the remote unit when sync mode is active.
         // None ⇒ self-contained; Some ⇒ unit mounts this path and returns a delta.
         let unit_workspace_path = sync.then(|| opts.workspace_path.clone());
@@ -1425,6 +1788,34 @@ async fn run_fanout_step(
             // branch consumes it, so both events and FanoutItemOutcome
             // carry the same host attribution.
             let placement_host = placement.clone();
+
+            // Cooperative pause, checked the instant this unit's semaphore
+            // permit is granted — i.e. BEFORE any work (local or remote) is
+            // dispatched. A unit that hasn't started is never a "safe
+            // boundary" problem: skip it outright so `run_fanout_step` can
+            // report it as not-yet-started and the next resume redispatches
+            // it fresh. Units already past this check when the pause lands
+            // keep running to their own safe boundary (a local unit's agent
+            // loop honors the SAME token mid-turn; a remote unit — no
+            // cancellation channel exists over the wire — runs to
+            // completion, which is its safe boundary).
+            if pause_triggered(&pause_for_task) {
+                return FanoutItemOutcome {
+                    idx,
+                    item: item_value,
+                    rendered_prompt: rendered,
+                    run_id,
+                    transcript_path,
+                    output: String::new(),
+                    success: false,
+                    error: None,
+                    raw_error: None,
+                    host: placement_host,
+                    workspace_delta: None,
+                    paused: true,
+                };
+            }
+
             if let Some(sink) = event_sink.as_ref() {
                 sink.emit(
                     &workflow_run_id,
@@ -1441,138 +1832,185 @@ async fn run_fanout_step(
             }
 
             // Branch: remote (placed) vs local (inline) path.
-            let (output, success, error_str, raw_error, workspace_delta) = if let Some(host) =
-                placement
-            {
-                // --- Remote dispatch path ---
-                //
-                // `distribute:` requires a `UnitDispatcher`. Its absence is a
-                // configuration error — the caller must supply one when running
-                // a workflow with `distribute:`.
-                match dispatcher_for_task {
-                    None => {
-                        let err = RunError::Provider(
-                            "distribute requires fleet access — run via the CP".into(),
-                        );
-                        let msg = err.to_string();
-                        // Minor 3: reuse `msg` instead of duplicating the literal.
-                        (msg.clone(), false, Some(msg), Some(err), None)
-                    }
-                    Some(dispatcher) => {
-                        let unit = UnitDispatch {
-                            step_id: step_id.clone(),
-                            agent: agent_name.clone(),
-                            rendered_prompt: rendered_clone.clone(),
-                            index: idx,
-                            run_id: run_id_clone.clone(),
-                            workspace_path: unit_workspace_path.clone(),
-                        };
-                        match dispatcher.dispatch_unit(unit, &host).await {
-                            Ok(outcome) => {
-                                // Important fix: when the agent ran but failed
-                                // (success=false), synthesize a raw_error so
-                                // the continue_on_error:false abort below fires
-                                // — symmetric with the local Err path.
-                                let err_str = outcome.error.clone();
-                                let raw = if !outcome.success {
-                                    Some(RunError::Provider(
-                                        outcome
-                                            .error
-                                            .clone()
-                                            .unwrap_or_else(|| "remote unit failed".into()),
-                                    ))
-                                } else {
-                                    None
-                                };
-                                let ws_delta = outcome.workspace_delta;
-                                (outcome.output, outcome.success, err_str, raw, ws_delta)
-                            }
-                            Err(first_err) => {
-                                // Reassign once to the next host and retry.
-                                let retry_host = fallback_host.as_deref().unwrap_or(&host);
-                                let retry_unit = UnitDispatch {
-                                    step_id: step_id.clone(),
-                                    agent: agent_name.clone(),
-                                    rendered_prompt: rendered_clone.clone(),
-                                    index: idx,
-                                    run_id: run_id_clone.clone(),
-                                    workspace_path: unit_workspace_path.clone(),
-                                };
-                                warn!(
-                                    step = %step_id,
-                                    index = idx,
-                                    host = %host,
-                                    retry = %retry_host,
-                                    error = %first_err,
-                                    "unit dispatch failed; retrying on next host"
-                                );
-                                match dispatcher.dispatch_unit(retry_unit, retry_host).await {
-                                    Ok(outcome) => {
-                                        // Same fix as primary path: synthesize
-                                        // raw_error for a failed-but-Ok outcome.
-                                        let err_str = outcome.error.clone();
-                                        let raw = if !outcome.success {
-                                            Some(RunError::Provider(
-                                                outcome
-                                                    .error
-                                                    .clone()
-                                                    .unwrap_or_else(|| "remote unit failed".into()),
-                                            ))
-                                        } else {
-                                            None
-                                        };
-                                        let ws_delta = outcome.workspace_delta;
-                                        (outcome.output, outcome.success, err_str, raw, ws_delta)
-                                    }
-                                    Err(second_err) => {
-                                        let msg = second_err.to_string();
-                                        (msg.clone(), false, Some(msg), Some(second_err), None)
+            let (output, success, error_str, raw_error, workspace_delta, paused) =
+                if let Some(host) = placement {
+                    // --- Remote dispatch path ---
+                    //
+                    // `distribute:` requires a `UnitDispatcher`. Its absence is a
+                    // configuration error — the caller must supply one when running
+                    // a workflow with `distribute:`.
+                    match dispatcher_for_task {
+                        None => {
+                            let err = RunError::Provider(
+                                "distribute requires fleet access — run via the CP".into(),
+                            );
+                            let msg = err.to_string();
+                            // Minor 3: reuse `msg` instead of duplicating the literal.
+                            (msg.clone(), false, Some(msg), Some(err), None, false)
+                        }
+                        Some(dispatcher) => {
+                            let unit = UnitDispatch {
+                                step_id: step_id.clone(),
+                                agent: agent_name.clone(),
+                                rendered_prompt: rendered_clone.clone(),
+                                index: idx,
+                                run_id: run_id_clone.clone(),
+                                workspace_path: unit_workspace_path.clone(),
+                            };
+                            match dispatcher.dispatch_unit(unit, &host).await {
+                                Ok(outcome) => {
+                                    // Important fix: when the agent ran but failed
+                                    // (success=false), synthesize a raw_error so
+                                    // the continue_on_error:false abort below fires
+                                    // — symmetric with the local Err path.
+                                    let err_str = outcome.error.clone();
+                                    let raw = if !outcome.success {
+                                        Some(RunError::Provider(
+                                            outcome
+                                                .error
+                                                .clone()
+                                                .unwrap_or_else(|| "remote unit failed".into()),
+                                        ))
+                                    } else {
+                                        None
+                                    };
+                                    let ws_delta = outcome.workspace_delta;
+                                    (
+                                        outcome.output,
+                                        outcome.success,
+                                        err_str,
+                                        raw,
+                                        ws_delta,
+                                        false,
+                                    )
+                                }
+                                Err(first_err) => {
+                                    // Reassign once to the next host and retry.
+                                    let retry_host = fallback_host.as_deref().unwrap_or(&host);
+                                    let retry_unit = UnitDispatch {
+                                        step_id: step_id.clone(),
+                                        agent: agent_name.clone(),
+                                        rendered_prompt: rendered_clone.clone(),
+                                        index: idx,
+                                        run_id: run_id_clone.clone(),
+                                        workspace_path: unit_workspace_path.clone(),
+                                    };
+                                    warn!(
+                                        step = %step_id,
+                                        index = idx,
+                                        host = %host,
+                                        retry = %retry_host,
+                                        error = %first_err,
+                                        "unit dispatch failed; retrying on next host"
+                                    );
+                                    match dispatcher.dispatch_unit(retry_unit, retry_host).await {
+                                        Ok(outcome) => {
+                                            // Same fix as primary path: synthesize
+                                            // raw_error for a failed-but-Ok outcome.
+                                            let err_str = outcome.error.clone();
+                                            let raw = if !outcome.success {
+                                                Some(RunError::Provider(
+                                                    outcome.error.clone().unwrap_or_else(|| {
+                                                        "remote unit failed".into()
+                                                    }),
+                                                ))
+                                            } else {
+                                                None
+                                            };
+                                            let ws_delta = outcome.workspace_delta;
+                                            (
+                                                outcome.output,
+                                                outcome.success,
+                                                err_str,
+                                                raw,
+                                                ws_delta,
+                                                false,
+                                            )
+                                        }
+                                        Err(second_err) => {
+                                            let msg = second_err.to_string();
+                                            (
+                                                msg.clone(),
+                                                false,
+                                                Some(msg),
+                                                Some(second_err),
+                                                None,
+                                                false,
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-            } else {
-                // --- Existing local (inline) path — UNCHANGED ---
-                let outcome = dispatch_one(
-                    &factory,
-                    &step_id,
-                    &agent_name,
-                    rendered_clone.clone(),
-                    run_id_clone.clone(),
-                    workspace_id,
-                    workspace_path,
-                    transcript_clone.clone(),
-                    None,
-                )
-                .await;
-                let (suc, err_str, raw) = match outcome {
-                    Ok(()) => (true, None, None),
-                    Err(e) => (false, Some(e.to_string()), Some(e)),
+                } else {
+                    // --- Local (inline) path ---
+                    //
+                    // The pause token IS threaded through here (unlike the
+                    // pre-T6 shape): a local unit's agent loop honors it
+                    // cooperatively mid-turn (same primitive a linear step's
+                    // agent uses — see T2), so an in-flight local unit
+                    // genuinely pauses instead of running to completion.
+                    let outcome = dispatch_one(
+                        &factory,
+                        &step_id,
+                        &agent_name,
+                        rendered_clone.clone(),
+                        run_id_clone.clone(),
+                        workspace_id,
+                        workspace_path,
+                        transcript_clone.clone(),
+                        None,
+                        pause_for_task.clone(),
+                        None,
+                    )
+                    .await;
+                    match outcome {
+                        // A cooperative pause landed mid-turn. Not a success,
+                        // not a failure — the unit is incomplete and must be
+                        // re-dispatched (fresh) on resume.
+                        Ok(rr) if rr.paused => (String::new(), false, None, None, None, true),
+                        Ok(_) => {
+                            let out = read_final_assistant_text(
+                                &transcript_clone,
+                                true,
+                                &run_id_clone,
+                                &step_id,
+                            );
+                            (out, true, None, None, None, false)
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            let out = read_final_assistant_text(
+                                &transcript_clone,
+                                false,
+                                &run_id_clone,
+                                &step_id,
+                            );
+                            (out, false, Some(msg), Some(e), None, false)
+                        }
+                    }
                 };
-                let out =
-                    read_final_assistant_text(&transcript_clone, suc, &run_id_clone, &step_id);
-                (out, suc, err_str, raw, None)
-            };
 
-            if let Some(sink) = event_sink.as_ref() {
-                // Tokens are not available from the dispatch result
-                // (`dispatch_one` returns `Result<()>`); emit 0 — the live
-                // view still tails the unit transcript for token deltas.
-                sink.emit(
-                    &workflow_run_id,
-                    &crate::executor::Event::UnitCompleted {
-                        run_id: workflow_run_id.clone(),
-                        step_id: step_id.clone(),
-                        index: idx,
-                        unit_key: unit_key.clone(),
-                        success,
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        host: placement_host.clone(),
-                    },
-                );
+            if !paused {
+                if let Some(sink) = event_sink.as_ref() {
+                    // Tokens are not available from the dispatch result
+                    // (`dispatch_one` returns `Result<()>`); emit 0 — the live
+                    // view still tails the unit transcript for token deltas.
+                    sink.emit(
+                        &workflow_run_id,
+                        &crate::executor::Event::UnitCompleted {
+                            run_id: workflow_run_id.clone(),
+                            step_id: step_id.clone(),
+                            index: idx,
+                            unit_key: unit_key.clone(),
+                            success,
+                            tokens_in: 0,
+                            tokens_out: 0,
+                            host: placement_host.clone(),
+                        },
+                    );
+                }
             }
             FanoutItemOutcome {
                 idx,
@@ -1586,6 +2024,7 @@ async fn run_fanout_step(
                 raw_error,
                 host: placement_host,
                 workspace_delta,
+                paused,
             }
         }));
     }
@@ -1609,16 +2048,21 @@ async fn run_fanout_step(
     }
     item_outcomes.sort_by_key(|o| o.idx);
 
-    // Persist every freshly-dispatched unit's checkpoint as soon as
-    // the fan-out's tasks have joined — BEFORE the `continue_on_error`
+    // Persist every freshly-dispatched, NON-PAUSED unit's checkpoint as soon
+    // as the fan-out's tasks have joined — BEFORE the `continue_on_error`
     // abort check below, so a crash/early-return mid-fan-out still
     // leaves the finished units (success AND failure) durable on disk
     // for `rupu workflow resume`. Replayed (`resumed`) units are
-    // already on disk from the prior run, so we don't re-append them.
-    // `workflow_run_id` is empty in the in-memory (no run-store) mode.
+    // already on disk from the prior run, so we don't re-append them. A
+    // paused unit (skipped outright, or cancelled mid-turn) did NOT
+    // finish — it gets no checkpoint entry, so a subsequent `read_unit_
+    // checkpoints` naturally omits it and the next resume redispatches it
+    // fresh (same "absent = incomplete" contract the existing failed-unit
+    // path already relies on). `workflow_run_id` is empty in the in-memory
+    // (no run-store) mode.
     if let Some(store) = &opts.run_store {
         if !workflow_run_id.is_empty() {
-            for o in &item_outcomes {
+            for o in item_outcomes.iter().filter(|o| !o.paused) {
                 let checkpoint = crate::runs::UnitCheckpoint {
                     step_id: step.id.clone(),
                     index: o.idx,
@@ -1637,10 +2081,11 @@ async fn run_fanout_step(
         }
     }
 
-    // Apply `continue_on_error`: if not set, the first failed item
-    // aborts the workflow. We surface the original RunError.
+    // Apply `continue_on_error`: if not set, the first REAL failure (not a
+    // paused unit — that's incomplete, not failed) aborts the workflow. We
+    // surface the original RunError.
     if !continue_on_error {
-        if let Some(failed) = item_outcomes.iter_mut().find(|o| !o.success) {
+        if let Some(failed) = item_outcomes.iter_mut().find(|o| !o.success && !o.paused) {
             if let Some(err) = failed.raw_error.take() {
                 return Err(RunWorkflowError::Agent {
                     step: format!("{}[{}]", step.id, failed.idx),
@@ -1648,6 +2093,44 @@ async fn run_fanout_step(
                 });
             }
         }
+    }
+
+    // Cooperative pause landed mid-fan-out: at least one unit was skipped
+    // outright (not yet started) or paused mid-turn. Stop here — don't
+    // aggregate a step result, don't apply sync workspace deltas (a
+    // `workspace: sync` step pausing mid-flight would otherwise silently
+    // drop the in-flight/not-yet-dispatched units' deltas, so it's refused
+    // instead, consistent with the existing step-boundary/checkpoint-resume
+    // guards for sync workflows). Report every unit that DID succeed this
+    // pass, merged with anything already replayed from an earlier resume,
+    // so the caller redispatches ONLY the paused / not-yet-started units.
+    if item_outcomes.iter().any(|o| o.paused) {
+        if sync {
+            return Err(RunWorkflowError::PauseWithWorkspaceSync);
+        }
+        let mut completed_units = resumed;
+        for o in &item_outcomes {
+            if o.paused || !o.success {
+                continue;
+            }
+            completed_units.insert(
+                o.idx,
+                ItemResult {
+                    index: o.idx,
+                    item: o.item.clone(),
+                    sub_id: String::new(),
+                    rendered_prompt: o.rendered_prompt.clone(),
+                    run_id: o.run_id.clone(),
+                    transcript_path: o.transcript_path.clone(),
+                    output: o.output.clone(),
+                    success: true,
+                },
+            );
+        }
+        return Ok(FanoutStepOutcome::Paused {
+            step_id: step.id.clone(),
+            completed_units,
+        });
     }
 
     // Merge freshly-dispatched outcomes with units replayed from a
@@ -1713,7 +2196,7 @@ async fn run_fanout_step(
         }
     }
 
-    Ok(StepResult {
+    Ok(FanoutStepOutcome::Completed(StepResult {
         step_id: step.id.clone(),
         // The for_each-rendered list of items doubles as the
         // top-level "rendered prompt" for audit purposes; per-item
@@ -1727,7 +2210,7 @@ async fn run_fanout_step(
         kind: crate::runs::StepKind::ForEach,
         items: items_vec,
         ..Default::default()
-    })
+    }))
 }
 
 /// Parallel step: render each sub-step's prompt against the same
@@ -1802,10 +2285,13 @@ async fn run_parallel_step(
                 workspace_path,
                 transcript_clone.clone(),
                 None,
+                // Parallel sub-steps pause at the step boundary, not mid-unit.
+                None,
+                None,
             )
             .await;
             let (success, error_str, raw_error) = match outcome {
-                Ok(()) => (true, None, None),
+                Ok(_) => (true, None, None),
                 Err(e) => (false, Some(e.to_string()), Some(e)),
             };
             let output = read_final_assistant_text(
@@ -1929,10 +2415,25 @@ struct FanoutItemOutcome {
     /// File-change set returned by a sync-mode unit. `None` for local
     /// (non-sync) units or when the unit returned no delta.
     workspace_delta: Option<WorkspaceDelta>,
+    /// `true` when this unit did NOT complete because a cooperative pause
+    /// landed — either it was skipped outright (pause already triggered when
+    /// its semaphore permit was granted, so it was never dispatched) or its
+    /// local agent loop paused mid-turn. `success` is always `false` when
+    /// this is `true`, but a paused unit is NOT a failure: it must be
+    /// excluded from the `continue_on_error` abort check and from the
+    /// on-disk checkpoint, and re-dispatched fresh on resume.
+    paused: bool,
 }
 
 /// Build the agent opts via the factory and dispatch one agent run.
-/// Shared by the linear and fan-out paths.
+/// Shared by the linear and fan-out paths. Returns the full [`RunResult`]
+/// so callers can distinguish a cooperative pause (`RunResult::paused`) from
+/// a completed run.
+///
+/// `pause` is the cooperative pause token, forced onto the factory-built opts
+/// (factories default it to `None`). `resume_seed`, when `Some`, overrides the
+/// factory-built `initial_messages` + `user_message` so a paused-incomplete
+/// step re-runs from its persisted transcript with correct role alternation.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_one(
     factory: &Arc<dyn StepFactory>,
@@ -1944,8 +2445,10 @@ async fn dispatch_one(
     workspace_path: PathBuf,
     transcript_path: PathBuf,
     on_tool_call: Option<rupu_agent::OnToolCallCallback>,
-) -> Result<(), RunError> {
-    let agent_opts = factory
+    pause: Option<CancellationToken>,
+    resume_seed: Option<(Vec<Message>, String)>,
+) -> Result<RunResult, RunError> {
+    let mut agent_opts = factory
         .build_opts_for_step(
             step_id,
             agent_name,
@@ -1957,7 +2460,13 @@ async fn dispatch_one(
             on_tool_call,
         )
         .await;
-    run_agent(agent_opts).await.map(|_| ())
+    // The orchestrator owns the pause signal, not the factory.
+    agent_opts.pause = pause;
+    if let Some((initial_messages, user_message)) = resume_seed {
+        agent_opts.initial_messages = initial_messages;
+        agent_opts.user_message = user_message;
+    }
+    run_agent(agent_opts).await
 }
 
 /// Read the just-finished transcript to extract the final assistant
@@ -2393,6 +2902,9 @@ async fn dispatch_fixer(
         opts.workspace_path.clone(),
         transcript_path.clone(),
         None,
+        // Panel fixer runs pause at the step boundary, not mid-unit.
+        None,
+        None,
     )
     .await;
     let success = outcome.is_ok();
@@ -2412,7 +2924,7 @@ async fn dispatch_fixer(
         );
     }
     match outcome {
-        Ok(()) => {
+        Ok(_) => {
             let output = read_final_assistant_text(&transcript_path, true, &run_id, &step.id);
             Ok(FixerOutcome::Ok { output })
         }
@@ -2527,10 +3039,13 @@ async fn run_panel_iteration(
                 workspace_path,
                 transcript_clone.clone(),
                 None,
+                // Panel panelists pause at the step boundary, not mid-unit.
+                None,
+                None,
             )
             .await;
             let (success, _err_str, raw_error) = match outcome {
-                Ok(()) => (true, None, None),
+                Ok(_) => (true, None, None),
                 Err(e) => (false, Some(e.to_string()), Some(e)),
             };
             let output = read_final_assistant_text(
@@ -2845,6 +3360,7 @@ mod tests {
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: Some(dispatcher),
+            pause: None,
         }
     }
 
@@ -3121,6 +3637,7 @@ steps:
             strict_templates: false,
             event_sink: None,
             unit_dispatcher: None,
+            pause: None,
         };
 
         let err = run_workflow(opts)
@@ -3418,6 +3935,8 @@ steps:
             prior_step_results: Vec::new(),
             approved_step_id: String::new(),
             completed_units: std::collections::BTreeMap::new(),
+            reason: PauseReason::Approval,
+            paused_step: None,
         });
         let err = run_workflow(opts)
             .await
@@ -3426,6 +3945,959 @@ steps:
             matches!(err, RunWorkflowError::ResumeWithWorkspaceSync),
             "expected ResumeWithWorkspaceSync, got: {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T3 — pause / resume (run + workflow)
+    // -----------------------------------------------------------------------
+
+    use rupu_agent::runner::{
+        CapturingMockProvider, MockProvider, ScriptedTurn, DEFAULT_MAX_TOKENS,
+    };
+    use rupu_agent::{AgentRunOpts, BypassDecider};
+    use rupu_providers::types::{
+        ContentBlock, LlmRequest, LlmResponse, Role, StopReason, StreamEvent,
+    };
+    use rupu_providers::{LlmProvider, ProviderError, ProviderId};
+    use std::time::Duration;
+
+    /// A provider whose `send` blocks (effectively) forever, so a pause token
+    /// wins the `run_agent` select! race deterministically.
+    struct BlockingProvider;
+
+    #[async_trait]
+    impl LlmProvider for BlockingProvider {
+        async fn send(&mut self, _req: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Err(ProviderError::Http("unreachable — pause should win".into()))
+        }
+        async fn stream(
+            &mut self,
+            req: &LlmRequest,
+            _on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, ProviderError> {
+            self.send(req).await
+        }
+        fn default_model(&self) -> &str {
+            "mock-1"
+        }
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Anthropic
+        }
+    }
+
+    /// A `StepFactory` that hands out a single pre-built provider (once).
+    struct OneShotFactory {
+        provider: Mutex<Option<Box<dyn LlmProvider>>>,
+    }
+    impl OneShotFactory {
+        fn new(p: Box<dyn LlmProvider>) -> Self {
+            Self {
+                provider: Mutex::new(Some(p)),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_agent_opts(
+        provider: Box<dyn LlmProvider>,
+        agent_name: &str,
+        rendered_prompt: String,
+        run_id: String,
+        workspace_id: String,
+        workspace_path: PathBuf,
+        transcript_path: PathBuf,
+        on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+    ) -> AgentRunOpts {
+        AgentRunOpts {
+            agent_name: agent_name.to_string(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider,
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id,
+            workspace_id,
+            workspace_path,
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext::default(),
+            user_message: rendered_prompt,
+            initial_messages: Vec::new(),
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            // The one-shot completions path races `provider.send` against the
+            // pause token — the deterministic pause boundary for these tests.
+            no_stream: true,
+            suppress_stream_stdout: true,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: String::new(),
+            on_tool_call,
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            context_window_tokens: None,
+            compact_at_percent: None,
+            scope_name: None,
+            surface_tag: None,
+            pause: None,
+        }
+    }
+
+    #[async_trait]
+    impl StepFactory for OneShotFactory {
+        async fn build_opts_for_step(
+            &self,
+            _step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            let provider = self
+                .provider
+                .lock()
+                .unwrap()
+                .take()
+                .expect("OneShotFactory: provider already taken");
+            make_agent_opts(
+                provider,
+                agent_name,
+                rendered_prompt,
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                on_tool_call,
+            )
+        }
+    }
+
+    /// Collecting event sink for pause/resume assertions.
+    #[derive(Default)]
+    struct CollectingSink {
+        labels: Mutex<Vec<String>>,
+    }
+    impl CollectingSink {
+        fn labels(&self) -> Vec<String> {
+            self.labels.lock().unwrap().clone()
+        }
+    }
+    impl crate::executor::EventSink for CollectingSink {
+        fn emit(&self, _run_id: &str, ev: &crate::executor::Event) {
+            let label = match ev {
+                crate::executor::Event::RunPaused { .. } => "RunPaused",
+                crate::executor::Event::RunResumed { .. } => "RunResumed",
+                crate::executor::Event::StepPaused { .. } => "StepPaused",
+                crate::executor::Event::StepResumed { .. } => "StepResumed",
+                crate::executor::Event::RunCompleted { .. } => "RunCompleted",
+                _ => return,
+            };
+            self.labels.lock().unwrap().push(label.to_string());
+        }
+    }
+
+    fn pause_opts(
+        wf: Workflow,
+        dir: PathBuf,
+        factory: Arc<dyn StepFactory>,
+        sink: Arc<dyn crate::executor::EventSink>,
+    ) -> OrchestratorRunOpts {
+        OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_pause".into(),
+            workspace_path: dir.clone(),
+            transcript_dir: dir,
+            factory,
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: None,
+            workflow_yaml: None,
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: Some(sink),
+            unit_dispatcher: None,
+            pause: None,
+        }
+    }
+
+    const WF_SOLO: &str = r#"
+name: pause-solo
+steps:
+  - id: solo
+    agent: worker
+    prompt: "do work"
+"#;
+
+    #[tokio::test]
+    async fn agent_run_pauses_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_SOLO).unwrap();
+
+        // --- Phase 1: pause mid-step. ---
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            token2.cancel();
+        });
+        let sink1 = Arc::new(CollectingSink::default());
+        let factory1 = Arc::new(OneShotFactory::new(Box::new(BlockingProvider)));
+        let mut opts1 = pause_opts(
+            wf.clone(),
+            dir.path().to_path_buf(),
+            factory1,
+            sink1.clone(),
+        );
+        opts1.pause = Some(token);
+
+        let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+        let awaiting = res1.awaiting.expect("run must have paused");
+        assert_eq!(awaiting.reason, PauseReason::Manual, "manual pause");
+        assert_eq!(awaiting.step_id, "solo");
+        assert!(
+            !awaiting.resume_seed.is_empty(),
+            "a mid-step pause carries a resume seed"
+        );
+        assert!(
+            res1.step_results.is_empty(),
+            "the paused step did not complete"
+        );
+        assert!(
+            sink1.labels().contains(&"RunPaused".to_string()),
+            "RunPaused must be emitted; got {:?}",
+            sink1.labels()
+        );
+        assert!(
+            sink1.labels().contains(&"StepPaused".to_string()),
+            "StepPaused must be emitted; got {:?}",
+            sink1.labels()
+        );
+
+        // --- Phase 2: resume → completes. ---
+        let sink2 = Arc::new(CollectingSink::default());
+        let factory2 = Arc::new(OneShotFactory::new(Box::new(MockProvider::new(vec![
+            ScriptedTurn::AssistantText {
+                text: "done".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]))));
+        let mut opts2 = pause_opts(wf, dir.path().to_path_buf(), factory2, sink2.clone());
+        opts2.resume_from = Some(ResumeState {
+            run_id: String::new(),
+            prior_step_results: Vec::new(),
+            approved_step_id: String::new(),
+            completed_units: std::collections::BTreeMap::new(),
+            reason: PauseReason::Manual,
+            paused_step: Some(PausedStep {
+                step_id: "solo".into(),
+                seed_messages: awaiting.resume_seed,
+            }),
+        });
+
+        let res2 = run_workflow(opts2).await.expect("resume completes");
+        assert!(res2.awaiting.is_none(), "resumed run runs to completion");
+        assert_eq!(res2.step_results.len(), 1);
+        assert!(res2.step_results[0].success);
+        assert_eq!(res2.step_results[0].output, "done");
+        let labels2 = sink2.labels();
+        assert!(
+            labels2.contains(&"RunResumed".to_string()),
+            "RunResumed must be emitted; got {labels2:?}"
+        );
+        assert!(
+            labels2.contains(&"StepResumed".to_string()),
+            "StepResumed must be emitted; got {labels2:?}"
+        );
+    }
+
+    /// A `UnitDispatcher` that cancels a pause token immediately after its
+    /// first dispatch — so step 1 completes, then the workflow pauses at the
+    /// boundary before step 2.
+    struct CancelAfterFirstDispatcher {
+        token: CancellationToken,
+        calls: Mutex<Vec<(usize, String)>>,
+    }
+    #[async_trait]
+    impl UnitDispatcher for CancelAfterFirstDispatcher {
+        async fn dispatch_unit(
+            &self,
+            unit: UnitDispatch,
+            host: &str,
+        ) -> Result<UnitOutcome, RunError> {
+            let first = self.calls.lock().unwrap().is_empty();
+            self.calls
+                .lock()
+                .unwrap()
+                .push((unit.index, host.to_string()));
+            if first {
+                self.token.cancel();
+            }
+            Ok(UnitOutcome {
+                output: format!("out-{}-on-{host}", unit.index),
+                success: true,
+                error: None,
+                workspace_delta: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_pauses_at_step_boundary_and_resumes_remaining() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_PLACED_TWO_STEP).unwrap();
+
+        // --- Phase 1: run step 1, pause before step 2. ---
+        let token = CancellationToken::new();
+        let dispatcher1 = Arc::new(CancelAfterFirstDispatcher {
+            token: token.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let sink1 = Arc::new(CollectingSink::default());
+        let factory: Arc<dyn StepFactory> = Arc::new(PanicFactory);
+        let mut opts1 = pause_opts(wf.clone(), dir.path().to_path_buf(), factory, sink1.clone());
+        opts1.unit_dispatcher = Some(dispatcher1.clone());
+        opts1.pause = Some(token);
+
+        let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+        let awaiting = res1.awaiting.expect("must pause at boundary");
+        assert_eq!(awaiting.reason, PauseReason::Manual);
+        assert_eq!(awaiting.step_id, "report", "paused BEFORE step 2");
+        assert_eq!(res1.step_results.len(), 1, "only step 1 completed");
+        assert_eq!(res1.step_results[0].step_id, "build");
+        assert_eq!(
+            dispatcher1.calls.lock().unwrap().clone(),
+            vec![(0, "worker-1".to_string())],
+            "only step 1 was dispatched"
+        );
+        assert!(sink1.labels().contains(&"RunPaused".to_string()));
+
+        // --- Phase 2: resume → step 2 only. ---
+        let dispatcher2 = Arc::new(FakeUnitDispatcher::new());
+        let sink2 = Arc::new(CollectingSink::default());
+        let factory2: Arc<dyn StepFactory> = Arc::new(PanicFactory);
+        let mut opts2 = pause_opts(wf, dir.path().to_path_buf(), factory2, sink2.clone());
+        opts2.unit_dispatcher = Some(dispatcher2.clone());
+        opts2.resume_from = Some(ResumeState {
+            run_id: String::new(),
+            prior_step_results: res1.step_results.clone(),
+            approved_step_id: String::new(),
+            completed_units: std::collections::BTreeMap::new(),
+            reason: PauseReason::Manual,
+            paused_step: None,
+        });
+
+        let res2 = run_workflow(opts2).await.expect("resume completes");
+        assert!(res2.awaiting.is_none());
+        assert_eq!(
+            res2.step_results.len(),
+            2,
+            "both steps present after resume"
+        );
+        assert_eq!(res2.step_results[1].step_id, "report");
+        assert_eq!(
+            dispatcher2.calls.lock().unwrap().clone(),
+            vec![(0, "worker-2".to_string())],
+            "resume dispatched ONLY step 2"
+        );
+        assert!(sink2.labels().contains(&"RunResumed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn workspace_sync_workflow_pause_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let disp = Arc::new(WorkspaceFakeDispatcher::new());
+        let wf = Workflow::parse(WF_PLACED_SYNC).unwrap();
+        let sink = Arc::new(CollectingSink::default());
+        let factory: Arc<dyn StepFactory> = Arc::new(PanicFactory);
+        let mut opts = pause_opts(wf, dir.path().to_path_buf(), factory, sink);
+        opts.unit_dispatcher = Some(disp);
+        // Pre-cancelled token: the boundary check fires before the first step.
+        let token = CancellationToken::new();
+        token.cancel();
+        opts.pause = Some(token);
+
+        let err = run_workflow(opts)
+            .await
+            .expect_err("pause of a workspace:sync workflow must be refused");
+        assert!(
+            matches!(err, RunWorkflowError::PauseWithWorkspaceSync),
+            "expected PauseWithWorkspaceSync, got: {err:?}"
+        );
+    }
+
+    /// A workflow whose FIRST step is a plain local (non-placed) linear step
+    /// and whose SECOND step is a placed `workspace: sync` step. The pause
+    /// token is cancelled mid-first-step (via `BlockingProvider`, same
+    /// mechanism as `agent_run_pauses_and_resumes`) — a step BOUNDARY was
+    /// never crossed, so only the mid-linear-step pause path
+    /// (`run_steps_inner`'s `LinearStepOutcome::Paused` arm) can catch this.
+    /// `workflow_has_sync_step` looks at every step in the workflow, not just
+    /// the currently-running one, so it still refuses.
+    const WF_SOLO_THEN_SYNC: &str = r#"
+name: pause-solo-then-sync
+steps:
+  - id: solo
+    agent: worker
+    prompt: "do work"
+  - id: edit
+    agent: coder
+    prompt: "edit"
+    host: worker-1
+    workspace: sync
+"#;
+
+    #[tokio::test]
+    async fn workspace_sync_workflow_mid_linear_step_pause_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_SOLO_THEN_SYNC).unwrap();
+
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            token2.cancel();
+        });
+        let sink = Arc::new(CollectingSink::default());
+        let factory = Arc::new(OneShotFactory::new(Box::new(BlockingProvider)));
+        let mut opts = pause_opts(wf, dir.path().to_path_buf(), factory, sink);
+        opts.unit_dispatcher = Some(Arc::new(WorkspaceFakeDispatcher::new()));
+        opts.pause = Some(token);
+
+        let err = run_workflow(opts).await.expect_err(
+            "a mid-linear-step pause of a workflow containing a workspace:sync step must be refused",
+        );
+        assert!(
+            matches!(err, RunWorkflowError::PauseWithWorkspaceSync),
+            "expected PauseWithWorkspaceSync, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_seed_preserves_role_alternation() {
+        // NOTE 3 (mid-stream pause): a paused-incomplete step re-runs seeded
+        // from its transcript. `run_agent` appends a fresh user turn only when
+        // `user_message` is non-empty; the resume path seeds the FULL transcript
+        // as-is with an EMPTY `user_message`, so no extra turn is appended and
+        // the seed replays verbatim. This asserts the resumed request's messages
+        // reconstruct the seed exactly and strictly alternate.
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_SOLO).unwrap();
+
+        // Seed transcript ends in a USER message (a tool result → user turn),
+        // the exact shape that would double-up without the fix.
+        let seed = vec![
+            Message::user("do work"),
+            Message::assistant("let me check"),
+            Message::user("tool result payload"),
+        ];
+
+        let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "final".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let captured = provider.captured.clone();
+        let factory = Arc::new(OneShotFactory::new(Box::new(provider)));
+        let sink = Arc::new(CollectingSink::default());
+        let mut opts = pause_opts(wf, dir.path().to_path_buf(), factory, sink);
+        opts.resume_from = Some(ResumeState {
+            run_id: String::new(),
+            prior_step_results: Vec::new(),
+            approved_step_id: String::new(),
+            completed_units: std::collections::BTreeMap::new(),
+            reason: PauseReason::Manual,
+            paused_step: Some(PausedStep {
+                step_id: "solo".into(),
+                seed_messages: seed.clone(),
+            }),
+        });
+
+        run_workflow(opts).await.expect("resume completes");
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "resume issues exactly one fresh request");
+        let msgs = &reqs[0].messages;
+        assert_eq!(
+            msgs.len(),
+            seed.len(),
+            "resumed request reconstructs the seed exactly (no extra turn)"
+        );
+        for pair in msgs.windows(2) {
+            assert!(
+                pair[0].role != pair[1].role,
+                "messages must strictly alternate roles; got {:?}",
+                msgs.iter().map(|m| &m.role).collect::<Vec<_>>()
+            );
+        }
+        // Last turn is the replayed trailing user message.
+        assert_eq!(msgs.last().unwrap().role, Role::User);
+    }
+
+    #[tokio::test]
+    async fn resume_seed_preserves_tool_boundary_pairing() {
+        // Tool-boundary pause: T2 lets a running tool finish, records its
+        // `tool_result`, THEN pauses — so the seed transcript ends in a USER
+        // message carrying a `ToolResult` block, preceded by an ASSISTANT
+        // message whose `ToolUse` block it answers. The resume must replay this
+        // pair INTACT: flattening the trailing `tool_result` to plain text (the
+        // old behavior) would strip it and strand the assistant's `tool_use`
+        // with no matching `tool_result` → real Anthropic returns 400
+        // "tool_use ids without tool_result blocks". This asserts the
+        // reconstructed request preserves the tool_use/tool_result pair, adds
+        // no doubled user turn, and keeps valid role/tool pairing.
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_SOLO).unwrap();
+
+        // Seed shape: user prompt → assistant(tool_use) → user(tool_result).
+        let seed = vec![
+            Message::user("do work"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_abc".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({ "path": "README.md" }),
+                }],
+            },
+            Message::tool_result("toolu_abc", "file contents here", false),
+        ];
+
+        let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "final".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let captured = provider.captured.clone();
+        let factory = Arc::new(OneShotFactory::new(Box::new(provider)));
+        let sink = Arc::new(CollectingSink::default());
+        let mut opts = pause_opts(wf, dir.path().to_path_buf(), factory, sink);
+        opts.resume_from = Some(ResumeState {
+            run_id: String::new(),
+            prior_step_results: Vec::new(),
+            approved_step_id: String::new(),
+            completed_units: std::collections::BTreeMap::new(),
+            reason: PauseReason::Manual,
+            paused_step: Some(PausedStep {
+                step_id: "solo".into(),
+                seed_messages: seed.clone(),
+            }),
+        });
+
+        run_workflow(opts).await.expect("resume completes");
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "resume issues exactly one fresh request");
+        let msgs = &reqs[0].messages;
+
+        // No doubled user turn: the request is the seed verbatim.
+        assert_eq!(
+            msgs.len(),
+            seed.len(),
+            "resumed request reconstructs the seed exactly (no doubled user turn)"
+        );
+
+        // The trailing tool_result is preserved as a ToolResult block (NOT
+        // flattened to plain text) and still references its tool_use id.
+        let tool_result_id = msgs.last().unwrap().content.iter().find_map(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            tool_result_id.as_deref(),
+            Some("toolu_abc"),
+            "trailing tool_result must survive intact, got {:?}",
+            msgs.last().unwrap().content
+        );
+
+        // The assistant tool_use it pairs with is still present — no dangling
+        // tool_use. Every tool_use id must have a matching tool_result.
+        let tool_use_ids: Vec<String> = msgs
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let tool_result_ids: Vec<String> = msgs
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_use_ids, vec!["toolu_abc".to_string()]);
+        for id in &tool_use_ids {
+            assert!(
+                tool_result_ids.contains(id),
+                "tool_use {id} has no matching tool_result (dangling tool_use)"
+            );
+        }
+
+        // Role/tool pairing is valid: strict alternation holds.
+        for pair in msgs.windows(2) {
+            assert!(
+                pair[0].role != pair[1].role,
+                "messages must strictly alternate roles; got {:?}",
+                msgs.iter().map(|m| &m.role).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // T6 — distributed fan-out pause/resume (mid-unit)
+    // -----------------------------------------------------------------------
+
+    const WF_FANOUT_DISTRIBUTE_PAUSE: &str = r#"
+name: fanout-distribute-pause
+steps:
+  - id: process
+    for_each: "a\nb\nc"
+    agent: dummy
+    prompt: "Process {{ item }}"
+    max_parallel: 1
+    distribute:
+      hosts: [h1]
+"#;
+
+    /// Mirrors `resume_reruns_only_failed_fanout_units` (a real, disk-backed
+    /// `RunStore`) but for a `distribute:` fan-out paused MID-FLIGHT rather
+    /// than a unit that genuinely failed. `max_parallel: 1` plus
+    /// `CancelAfterFirstDispatcher` (already used above for the step-boundary
+    /// pause test) makes the ordering deterministic: the semaphore holds
+    /// unit 1's permit until unit 0's ENTIRE dispatch — including the
+    /// token cancellation — has returned, so unit 1 (and unit 2, behind it)
+    /// always observe the pause as already triggered before they're ever
+    /// dispatched.
+    #[tokio::test]
+    async fn distributed_fanout_pauses_mid_flight_and_resumes_only_incomplete_units() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(WF_FANOUT_DISTRIBUTE_PAUSE).unwrap();
+
+        // --- Phase 1: pause mid-fan-out. ---
+        let token = CancellationToken::new();
+        let dispatcher1 = Arc::new(CancelAfterFirstDispatcher {
+            token: token.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let sink1 = Arc::new(CollectingSink::default());
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_fanout_pause".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().join("transcripts"),
+            factory: Arc::new(PanicFactory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(WF_FANOUT_DISTRIBUTE_PAUSE.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: Some(sink1.clone()),
+            unit_dispatcher: Some(dispatcher1.clone()),
+            pause: Some(token),
+        };
+
+        let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+        let awaiting = res1.awaiting.expect("must pause mid-fan-out");
+        assert_eq!(awaiting.reason, PauseReason::Manual);
+        assert_eq!(awaiting.step_id, "process");
+        assert!(
+            res1.step_results.is_empty(),
+            "the fan-out step did not complete"
+        );
+        assert!(sink1.labels().contains(&"RunPaused".to_string()));
+        assert!(sink1.labels().contains(&"StepPaused".to_string()));
+
+        // Only unit 0 ever reached the dispatcher — units 1 and 2 were
+        // never started.
+        assert_eq!(
+            dispatcher1.calls.lock().unwrap().clone(),
+            vec![(0, "h1".to_string())],
+            "only the first unit reached the dispatcher; the rest were never dispatched"
+        );
+
+        // `AwaitingInfo` also carries the completed-unit map directly.
+        assert_eq!(awaiting.fanout_completed_units.len(), 1);
+        assert!(awaiting.fanout_completed_units.contains_key(&0));
+
+        // The run record itself is durably `Paused`.
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        let run_id = listed[0].id.clone();
+        assert_eq!(listed[0].status, crate::runs::RunStatus::Paused);
+
+        // Exactly ONE unit checkpoint on disk — the completed unit. The
+        // not-yet-started units are simply ABSENT (incomplete), not
+        // recorded as failed.
+        let checkpoints = store.read_unit_checkpoints(&run_id).unwrap();
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "only the completed unit is checkpointed"
+        );
+        assert_eq!(checkpoints[0].index, 0);
+        assert!(checkpoints[0].success);
+
+        // Build resume state the way `rupu workflow resume` does: successful
+        // checkpoints replay from disk; everything else re-dispatches.
+        let mut completed_units: BTreeMap<String, BTreeMap<usize, ItemResult>> = BTreeMap::new();
+        for cp in checkpoints.iter().filter(|c| c.success) {
+            completed_units
+                .entry(cp.step_id.clone())
+                .or_default()
+                .insert(
+                    cp.index,
+                    ItemResult {
+                        index: cp.index,
+                        item: cp.item.clone(),
+                        sub_id: String::new(),
+                        rendered_prompt: String::new(),
+                        run_id: cp.run_id.clone(),
+                        transcript_path: cp.transcript_path.clone(),
+                        output: cp.output.clone(),
+                        success: true,
+                    },
+                );
+        }
+
+        // Flip the record back to Running (mirrors the CLI's `resume_run`).
+        let mut record = store.load(&run_id).unwrap();
+        record.status = crate::runs::RunStatus::Running;
+        record.finished_at = None;
+        store.update(&record).unwrap();
+
+        // --- Phase 2: resume. ---
+        let dispatcher2 = Arc::new(FakeUnitDispatcher::new());
+        let sink2 = Arc::new(CollectingSink::default());
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: record.workspace_id.clone(),
+            workspace_path: record.workspace_path.clone(),
+            transcript_dir: record.transcript_dir.clone(),
+            factory: Arc::new(PanicFactory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(WF_FANOUT_DISTRIBUTE_PAUSE.to_string()),
+            resume_from: Some(ResumeState {
+                run_id: run_id.clone(),
+                prior_step_results: Vec::new(),
+                approved_step_id: String::new(),
+                completed_units,
+                reason: PauseReason::Manual,
+                paused_step: None,
+            }),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: Some(sink2.clone()),
+            unit_dispatcher: Some(dispatcher2.clone()),
+            pause: None,
+        };
+
+        let res2 = run_workflow(opts2).await.expect("resume completes");
+        assert!(res2.awaiting.is_none(), "resumed run runs to completion");
+        assert_eq!(res2.step_results.len(), 1);
+        let step = &res2.step_results[0];
+        assert!(step.success);
+
+        // Resume dispatched ONLY units 1 and 2 — unit 0 is NOT re-run.
+        assert_eq!(
+            dispatcher2.calls.lock().unwrap().clone(),
+            vec![(1, "h1".to_string()), (2, "h1".to_string())],
+            "resume must re-dispatch only the paused/not-yet-started units"
+        );
+
+        // All three items present, in declared order; unit 0's output is
+        // the one preserved from the checkpoint (not re-dispatched).
+        assert_eq!(step.items.len(), 3);
+        assert_eq!(step.items[0].output, "out-0-on-h1");
+        assert_eq!(step.items[1].output, "out-1-on-h1");
+        assert_eq!(step.items[2].output, "out-2-on-h1");
+        assert!(sink2.labels().contains(&"RunResumed".to_string()));
+    }
+
+    // A `for_each` (no `distribute:`) fan-out whose units run LOCALLY
+    // through the real agent loop (T2's cooperative pause), rather than
+    // through a `UnitDispatcher`. Item 0 answers immediately; item 1 (the
+    // "SLOW" one) hangs on `BlockingProvider` until the pause token wins the
+    // race inside `run_agent`'s `select!` (see `agent_run_pauses_and_resumes`
+    // for the solo-step version of this same mechanism); item 2 must never
+    // be dispatched at all. `block_slow` lets phase 2 hand the SAME item
+    // ("SLOW-1") a normal, fast-completing provider instead.
+    struct FanoutPauseFactory {
+        block_slow: bool,
+        seen: Mutex<Vec<String>>,
+    }
+    impl FanoutPauseFactory {
+        fn new(block_slow: bool) -> Self {
+            Self {
+                block_slow,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl StepFactory for FanoutPauseFactory {
+        async fn build_opts_for_step(
+            &self,
+            _step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.seen.lock().unwrap().push(rendered_prompt.clone());
+            let provider: Box<dyn LlmProvider> =
+                if self.block_slow && rendered_prompt.contains("SLOW") {
+                    Box::new(BlockingProvider)
+                } else {
+                    Box::new(MockProvider::new(vec![ScriptedTurn::AssistantText {
+                        text: format!("done: {rendered_prompt}"),
+                        stop: StopReason::EndTurn,
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    }]))
+                };
+            make_agent_opts(
+                provider,
+                agent_name,
+                rendered_prompt,
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                on_tool_call,
+            )
+        }
+    }
+
+    const WF_FANOUT_LOCAL_PAUSE: &str = r#"
+name: fanout-local-pause
+steps:
+  - id: process
+    for_each: "ok-0\nSLOW-1\nok-2"
+    agent: worker
+    prompt: "{{ item }}"
+    max_parallel: 1
+"#;
+
+    #[tokio::test]
+    async fn fanout_pauses_mid_local_unit_and_resumes_only_incomplete_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_FANOUT_LOCAL_PAUSE).unwrap();
+
+        // --- Phase 1: pause while unit 1 is mid-turn. ---
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            token2.cancel();
+        });
+
+        let sink1 = Arc::new(CollectingSink::default());
+        let factory1 = Arc::new(FanoutPauseFactory::new(true));
+        let mut opts1 = pause_opts(
+            wf.clone(),
+            dir.path().to_path_buf(),
+            factory1.clone(),
+            sink1.clone(),
+        );
+        opts1.pause = Some(token);
+
+        let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+        let awaiting = res1.awaiting.expect("must pause mid-fan-out");
+        assert_eq!(awaiting.reason, PauseReason::Manual);
+        assert_eq!(awaiting.step_id, "process");
+        assert!(
+            res1.step_results.is_empty(),
+            "the fan-out step did not complete"
+        );
+        assert!(sink1.labels().contains(&"RunPaused".to_string()));
+        assert!(sink1.labels().contains(&"StepPaused".to_string()));
+
+        // Unit 2 ("ok-2") was never dispatched — only units 0 and 1 were.
+        assert_eq!(
+            factory1.seen.lock().unwrap().clone(),
+            vec!["ok-0".to_string(), "SLOW-1".to_string()],
+            "the not-yet-started unit must never reach the factory"
+        );
+
+        // Only the succeeded unit (index 0) is carried forward.
+        assert_eq!(awaiting.fanout_completed_units.len(), 1);
+        assert!(awaiting.fanout_completed_units.contains_key(&0));
+
+        // --- Phase 2: resume. ---
+        let sink2 = Arc::new(CollectingSink::default());
+        let factory2 = Arc::new(FanoutPauseFactory::new(false));
+        let mut opts2 = pause_opts(
+            wf,
+            dir.path().to_path_buf(),
+            factory2.clone(),
+            sink2.clone(),
+        );
+        let mut completed_units = BTreeMap::new();
+        completed_units.insert(
+            "process".to_string(),
+            awaiting.fanout_completed_units.clone(),
+        );
+        opts2.resume_from = Some(ResumeState {
+            run_id: String::new(),
+            prior_step_results: Vec::new(),
+            approved_step_id: String::new(),
+            completed_units,
+            reason: PauseReason::Manual,
+            paused_step: None,
+        });
+
+        let res2 = run_workflow(opts2).await.expect("resume completes");
+        assert!(res2.awaiting.is_none(), "resumed run runs to completion");
+        assert_eq!(res2.step_results.len(), 1);
+        let step = &res2.step_results[0];
+        assert!(step.success);
+
+        // Resume dispatched ONLY units 1 and 2 — unit 0 is NOT re-run.
+        assert_eq!(
+            factory2.seen.lock().unwrap().clone(),
+            vec!["SLOW-1".to_string(), "ok-2".to_string()],
+            "resume must re-dispatch only the paused/not-yet-started units"
+        );
+        assert_eq!(step.items.len(), 3);
+        assert_eq!(step.items[0].output, "done: ok-0");
+        assert_eq!(step.items[1].output, "done: SLOW-1");
+        assert_eq!(step.items[2].output, "done: ok-2");
+        assert!(sink2.labels().contains(&"RunResumed".to_string()));
     }
 }
 

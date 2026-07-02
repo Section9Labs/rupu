@@ -57,6 +57,7 @@ export type RunStatusStr =
   | 'completed'
   | 'failed'
   | 'awaiting_approval'
+  | 'paused'
   | 'rejected'
   | 'cancelled';
 
@@ -133,7 +134,11 @@ export type KnownRunEvent =
   | UnitCompletedEvent
   | PanelRoundEvent
   | RunCompletedEvent
-  | RunFailedEvent;
+  | RunFailedEvent
+  | RunPausedEvent
+  | RunResumedEvent
+  | StepPausedEvent
+  | StepResumedEvent;
 
 export type RunEvent = KnownRunEvent | UnknownRunEvent;
 
@@ -231,6 +236,30 @@ export interface RunFailedEvent extends RunEventBase {
   finished_at: string;
 }
 
+/** The run was paused by an operator (distinct from a terminal `cancelled`
+ *  status — a paused run expects a later `RunResumed`). */
+export interface RunPausedEvent extends RunEventBase {
+  type: 'run_paused';
+}
+
+/** A previously paused run resumed execution. */
+export interface RunResumedEvent extends RunEventBase {
+  type: 'run_resumed';
+}
+
+/** The step in flight when a pause was requested stopped cooperatively at a
+ *  checkpoint boundary. */
+export interface StepPausedEvent extends RunEventBase {
+  type: 'step_paused';
+  step_id: string;
+}
+
+/** A step resumed after a prior `StepPaused`. */
+export interface StepResumedEvent extends RunEventBase {
+  type: 'step_resumed';
+  step_id: string;
+}
+
 /** Catch-all for any variant not yet narrowed above. */
 export interface UnknownRunEvent extends RunEventBase {
   type: string;
@@ -250,6 +279,10 @@ const KNOWN_EVENT_TYPES: ReadonlySet<KnownRunEvent['type']> = new Set([
   'panel_round',
   'run_completed',
   'run_failed',
+  'run_paused',
+  'run_resumed',
+  'step_paused',
+  'step_resumed',
 ]);
 
 /**
@@ -1110,6 +1143,31 @@ export const api = {
     await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
       `/api/runs/${encodeURIComponent(id)}/cancel${qs}`,
       { method: 'POST', body: Object.keys(body).length ? JSON.stringify(body) : undefined },
+    );
+  },
+  /**
+   * Pause a running run at its next cooperative checkpoint (stays
+   * non-terminal — `status` flips to `"paused"` synchronously on this CP).
+   * Throws `ApiError` (409) when the run is not currently `running`.
+   */
+  async pauseRun(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
+      `/api/runs/${encodeURIComponent(id)}/pause${qs}`,
+      { method: 'POST' },
+    );
+  },
+  /**
+   * Request resume of a paused run — marker-only (the run stays `paused`
+   * until a worker picks it up and emits `run_resumed`/`step_resumed`).
+   * Throws `ApiError` (409) when the run isn't `paused`, or (501) when this
+   * deploy has no launcher (`rupu cp serve` not running).
+   */
+  async resumeRun(id: string, host?: string): Promise<void> {
+    const qs = host ? `?host=${encodeURIComponent(host)}` : '';
+    await request<{ run: RunRecord; steps: StepResultRecord[]; usage: UsageSummary }>(
+      `/api/runs/${encodeURIComponent(id)}/resume${qs}`,
+      { method: 'POST' },
     );
   },
   /** Archive a terminal run (hides it from the default run list). */

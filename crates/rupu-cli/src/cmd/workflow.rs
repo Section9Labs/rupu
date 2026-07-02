@@ -24,7 +24,7 @@ use clap_complete::ArgValueCompleter;
 use rupu_agent::load_agents as load_agent_specs;
 use rupu_app_canvas::{render_rows as render_graph_rows, GraphCell, NodeStatus};
 use rupu_orchestrator::runner::{run_workflow, OrchestratorRunOpts};
-use rupu_orchestrator::runs::{CancelError, CancelOutcome};
+use rupu_orchestrator::runs::{CancelError, CancelOutcome, PauseError};
 use rupu_orchestrator::{DefaultStepFactory, RunWorkflowError};
 use rupu_runtime::{
     ArtifactKind, ArtifactManifest, ArtifactRef, AutoflowEnvelope, ExecutionBackend,
@@ -72,6 +72,63 @@ fn live_view_enabled(stdout_is_tty: bool, plain: bool) -> bool {
         .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
         .unwrap_or(false);
     !env_off
+}
+
+/// Poll interval for the cooperative pause marker
+/// ([`rupu_orchestrator::RunStore::pause_marker_path`]).
+const PAUSE_MARKER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Spawn a lightweight task that watches a run's pause marker and trips
+/// `token` when it appears.
+///
+/// This is the delivery mechanism that lets a *detached* `rupu workflow run
+/// <id>` (or `resume`) subprocess honor a pause requested by another process
+/// — `cp serve`'s `pause_run` writes the marker
+/// ([`RunStore::set_pause_marker`](rupu_orchestrator::RunStore::set_pause_marker)),
+/// and this poller flips the subprocess's
+/// [`OrchestratorRunOpts::pause`](rupu_orchestrator::runner::OrchestratorRunOpts::pause)
+/// token so the T2/T3 cooperative-pause machinery stops at the next safe
+/// boundary. It checks once immediately (covering a pause requested before
+/// the run started polling) and then every
+/// [`PAUSE_MARKER_POLL_INTERVAL`] until the marker is seen; the caller
+/// aborts the returned handle once the run finishes so the poller never
+/// outlives its run.
+fn spawn_pause_marker_poller(
+    store: Arc<rupu_orchestrator::RunStore>,
+    run_id: String,
+    token: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if token.is_cancelled() {
+                // Already paused/cancelled by another path; nothing to do.
+                return;
+            }
+            if store.pause_marker_exists(&run_id) {
+                token.cancel();
+                return;
+            }
+            tokio::time::sleep(PAUSE_MARKER_POLL_INTERVAL).await;
+        }
+    })
+}
+
+/// Duplicate-execution guard for the resume path: returns the still-live
+/// `runner_pid` (a reason to REFUSE resume) when a run's original process is
+/// still running.
+///
+/// A cooperatively-`Paused` run whose process is still alive has NOT honored
+/// the pause yet — the process clears `runner_pid` only once it stops at a
+/// safe boundary. Re-launching now would spawn a SECOND process racing the
+/// first over the same run dir (duplicate side effects). `own_pid` is excluded
+/// so a run resumed in-process (whose `runner_pid` is us) is never mistaken
+/// for a foreign live process. Returns `None` (not blocked) for a cleared
+/// pid, our own pid, or a dead pid.
+fn resume_blocked_by_live_runner(runner_pid: Option<u32>, own_pid: u32) -> Option<u32> {
+    match runner_pid {
+        Some(pid) if pid != own_pid && rupu_orchestrator::runs::pid_is_running(pid) => Some(pid),
+        _ => None,
+    }
 }
 
 /// Drive `run_workflow(opts)` while painting the live three-zone view in
@@ -274,6 +331,17 @@ pub enum Action {
         /// `rupu workflow run`.
         run_id: String,
     },
+    /// Cooperatively pause a running workflow run at its next safe boundary,
+    /// leaving it non-terminal and resumable via `rupu workflow resume`.
+    ///
+    /// This is the primitive a remote transport (SSH) reaches over `ssh` the
+    /// same way it reaches `cancel`/`approve`/`reject` — see
+    /// `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md` Task 5.
+    Pause {
+        /// Full run id (`run_<ULID>`) as printed by
+        /// `rupu workflow run`.
+        run_id: String,
+    },
     /// Resume a failed/cancelled run, re-running only the agent runs
     /// that didn't succeed.
     Resume {
@@ -421,6 +489,7 @@ pub async fn handle(action: Action, global_format: Option<OutputFormat>) -> Exit
         Action::Approve { run_id, mode } => approve(&run_id, mode.as_deref()).await,
         Action::Reject { run_id, reason } => reject(&run_id, reason.as_deref()).await,
         Action::Cancel { run_id } => cancel(&run_id).await,
+        Action::Pause { run_id } => pause(&run_id).await,
         Action::Resume {
             run_id,
             mode,
@@ -448,6 +517,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Approve { .. } => ("workflow approve", report::TABLE_ONLY),
         Action::Reject { .. } => ("workflow reject", report::TABLE_ONLY),
         Action::Cancel { .. } => ("workflow cancel", report::TABLE_ONLY),
+        Action::Pause { .. } => ("workflow pause", report::TABLE_ONLY),
         Action::Resume { .. } => ("workflow resume", report::TABLE_ONLY),
         Action::ArchiveRun { .. } => ("workflow archive-run", report::TABLE_ONLY),
         Action::RestoreRun { .. } => ("workflow restore-run", report::TABLE_ONLY),
@@ -2081,13 +2151,25 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resume a terminal (`failed` / `cancelled` / `rejected`) run,
-/// re-running only the agent runs that didn't already succeed.
-/// Completed steps are skipped wholesale (their `step_results.jsonl`
-/// rows are replayed into context); a partially-completed fan-out
-/// step re-runs but its already-succeeded units are replayed from the
-/// `unit_checkpoints.jsonl` instead of re-dispatched.
-async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Result<()> {
+/// Resume a terminal (`failed` / `cancelled` / `rejected`) run, or a
+/// cooperatively-`paused` one, re-running only the agent runs that didn't
+/// already succeed. Completed steps are skipped wholesale (their
+/// `step_results.jsonl` rows are replayed into context); a
+/// partially-completed fan-out step re-runs but its already-succeeded units
+/// are replayed from the `unit_checkpoints.jsonl` instead of re-dispatched.
+///
+/// A `Paused` run additionally carries a persisted mid-step seed transcript
+/// (`RunStore::read_paused_seed`) when the pause landed inside a linear
+/// step's agent turn (see `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md`
+/// Task 4) — when present it seeds `ResumeState::paused_step` so the exact
+/// paused step re-runs from where the agent left off instead of from
+/// scratch. A step-boundary pause (no seed) just replays like a terminal
+/// resume.
+pub(crate) async fn resume_run(
+    run_id: &str,
+    mode: Option<&str>,
+    plain: bool,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
@@ -2103,6 +2185,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
     // Guard: don't double-run an in-flight run, and don't re-run a
     // run that already completed.
     use rupu_orchestrator::RunStatus;
+    let original_status = record.status;
     match record.status {
         RunStatus::Running | RunStatus::Pending => {
             anyhow::bail!(
@@ -2118,8 +2201,29 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
                 "run {run_id} is awaiting approval — use `rupu workflow approve {run_id}` (or `reject`) instead of `resume`"
             );
         }
-        // Resume applies to terminal failure states.
-        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => {}
+        // Resume applies to terminal failure states AND a cooperatively
+        // paused run (non-terminal, but equally "not currently running").
+        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled | RunStatus::Paused => {}
+    }
+
+    // Duplicate-execution guard. A cooperatively `Paused` run whose original
+    // process is still alive has NOT honored the pause yet — the process
+    // clears `runner_pid` only once it stops at a safe boundary and re-writes
+    // the record as `Paused`. Re-launching now would spawn a SECOND process
+    // racing the first over the same run dir (duplicate side effects). Refuse
+    // until the original exits; the caller (operator or CP resume worker)
+    // retries shortly. Terminal states (Failed/Rejected/Cancelled) carry
+    // `runner_pid = None`, so this only fires for a still-stopping pause.
+    if let Some(pid) = resume_blocked_by_live_runner(record.runner_pid, std::process::id()) {
+        anyhow::bail!(
+            "run {run_id} is still stopping (runner pid {pid} is live) — the pause hasn't taken effect yet; retry `rupu workflow resume {run_id}` shortly"
+        );
+    }
+
+    // Clear any pause marker so the resumed run isn't immediately re-paused
+    // by its own marker poller (see `spawn_pause_marker_poller`).
+    if let Err(e) = store.clear_pause_marker(run_id) {
+        tracing::warn!(run_id, error = %e, "failed to clear pause marker on resume");
     }
 
     // Rebuild context from disk: workflow YAML snapshot + prior step
@@ -2240,12 +2344,57 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
         openai_compatible,
     });
 
+    // A cooperatively-paused run may carry a persisted mid-step seed
+    // transcript (written by `run_workflow` when a linear step's agent
+    // paused mid-turn — see `RunStore::write_paused_seed`). Read + clear it
+    // now, before the resumed run potentially pauses again and writes a
+    // fresh one. `None`/empty for a step-boundary pause or a terminal
+    // (Failed/Rejected/Cancelled) resume — those replay from
+    // `step_results.jsonl` alone, same as today.
+    let (reason, paused_step) = if original_status == RunStatus::Paused {
+        // Distinguish "no sidecar" (a step-boundary pause — expected empty)
+        // from a real read/parse failure of an existing seed. `read_paused_seed`
+        // returns an empty `Vec` for a missing file and an `Err` only for an
+        // IO/JSON failure; surface the latter loudly rather than silently
+        // resuming from scratch and dropping a mid-step transcript.
+        let seed = match store.read_paused_seed(run_id) {
+            Ok(seed) => seed,
+            Err(e) => {
+                tracing::warn!(
+                    run_id,
+                    error = %e,
+                    "failed to read persisted paused-step seed; resuming from the step boundary without the mid-step transcript (the paused step will re-run from its prompt)"
+                );
+                Vec::new()
+            }
+        };
+        if let Err(e) = store.clear_paused_seed(run_id) {
+            tracing::warn!(run_id, error = %e, "failed to clear persisted paused-step seed");
+        }
+        let paused_step = if seed.is_empty() {
+            None
+        } else {
+            record
+                .awaiting_step_id
+                .clone()
+                .map(|step_id| rupu_orchestrator::PausedStep {
+                    step_id,
+                    seed_messages: seed,
+                })
+        };
+        (rupu_orchestrator::PauseReason::Manual, paused_step)
+    } else {
+        (rupu_orchestrator::PauseReason::Approval, None)
+    };
+
     let already_done_steps: Vec<String> = done_step_ids.iter().cloned().collect();
     let resume = rupu_orchestrator::ResumeState {
         run_id: run_id.to_string(),
         prior_step_results,
         approved_step_id: String::new(),
         completed_units,
+        reason,
+        paused_step,
     };
 
     let event_sink_for_resume = {
@@ -2265,6 +2414,14 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
     let unit_dispatcher =
         build_dispatcher_if_needed(&workflow, &global, Arc::clone(&store), cfg.pricing.clone());
 
+    // Same cooperative-pause delivery as a fresh run: hand the resumed
+    // (possibly detached) process a token + marker poller so it can be
+    // paused again. The marker was cleared above, so the poller starts
+    // clean.
+    let pause_token = tokio_util::sync::CancellationToken::new();
+    let pause_poller =
+        spawn_pause_marker_poller(Arc::clone(&store), run_id.to_string(), pause_token.clone());
+
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -2282,6 +2439,7 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
         strict_templates: false,
         event_sink: event_sink_for_resume,
         unit_dispatcher,
+        pause: Some(pause_token.clone()),
     };
 
     println!("rupu: resuming run {run_id}");
@@ -2318,6 +2476,9 @@ async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Re
     } else {
         run_workflow(opts).await?
     };
+    // The resumed run has finished (terminal or paused again); stop the
+    // marker poller so it doesn't outlive the run.
+    pause_poller.abort();
     for sr in &result.step_results {
         if sr.run_id.is_empty() {
             continue;
@@ -2425,6 +2586,66 @@ fn cancel_with_store(
             CancelError::NotFound(_) => anyhow::anyhow!("load run record: {e}"),
             CancelError::Store(_) => anyhow::anyhow!("cancel run: {e}"),
         })
+}
+
+/// Cooperatively pause a `Pending`/`Running` run: flips the persisted record
+/// to `Paused` ([`rupu_orchestrator::RunStore::pause`]) then writes the
+/// pause marker ([`rupu_orchestrator::RunStore::set_pause_marker`]) that a
+/// *detached* `rupu workflow run <id>` subprocess polls (~every 250ms) to
+/// cooperatively stop at its next safe boundary.
+///
+/// This is the exact mechanism `LocalHostConnector::pause_run` uses
+/// in-process; exposing it as a bare CLI command gives the SSH transport a
+/// one-shot remote command to reach it (mirrors how `rupu workflow cancel`
+/// gives `cancel_run` its remote reach) — see
+/// `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md` Task 5.
+///
+/// `pub(crate)` so `rupu run pause <run_id>` (Task 7,
+/// `crate::cmd::run::RunCommand::Pause`) can delegate here directly —
+/// same primitive, same user-facing message, no parallel implementation.
+pub(crate) async fn pause(run_id: &str) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    pause_with_store(&store, run_id)?;
+    println!(
+        "rupu: pause requested for run {run_id} (resume with `rupu workflow resume {run_id}`)"
+    );
+    Ok(())
+}
+
+/// Delegates to [`rupu_orchestrator::RunStore::pause`] (Pending/Running →
+/// `Paused`; already-paused/awaiting-approval → `PauseError::NotRunning`;
+/// terminal → `PauseError::AlreadyTerminal`), then writes the pause marker
+/// so a detached runner process cooperatively stops at its next safe
+/// boundary. Maps the library's [`PauseError`] onto an `anyhow::Error` with
+/// a stable user-facing message shape (mirrors `cancel_with_store`).
+///
+/// `pub(crate)` so the live-run view's Esc handler
+/// ([`crate::output::live_run`], Task 7) can request a pause for the run
+/// it is tailing using the exact same primitive, without going through
+/// `pause`'s stdout `println!` (which would corrupt the alt-screen).
+pub(crate) fn pause_with_store(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    store.pause(run_id, now).map_err(|e| match e {
+        PauseError::AlreadyTerminal(status) => {
+            anyhow::anyhow!("run {run_id} is already terminal ({})", status.as_str())
+        }
+        PauseError::NotRunning(status) => {
+            anyhow::anyhow!(
+                "run {run_id} is `{}` — only a running run can be paused",
+                status.as_str()
+            )
+        }
+        PauseError::NotFound(_) => anyhow::anyhow!("load run record: {e}"),
+        PauseError::Store(_) => anyhow::anyhow!("pause run: {e}"),
+    })?;
+    // Deliver the pause to the detached runner process via the marker.
+    store
+        .set_pause_marker(run_id)
+        .map_err(|e| anyhow::anyhow!("set pause marker: {e}"))
 }
 
 async fn archive_run(run_id: &str) -> anyhow::Result<()> {
@@ -3226,6 +3447,7 @@ fn run_result_status(status: rupu_orchestrator::RunStatus) -> RunResultStatus {
         | rupu_orchestrator::RunStatus::Cancelled => RunResultStatus::Failed,
         rupu_orchestrator::RunStatus::Pending
         | rupu_orchestrator::RunStatus::Running
+        | rupu_orchestrator::RunStatus::Paused
         | rupu_orchestrator::RunStatus::Completed => RunResultStatus::Completed,
     }
 }
@@ -3382,6 +3604,20 @@ async fn execute_workflow_invocation(
         cfg.pricing.clone(),
     );
 
+    // Cooperative pause delivery for this (possibly detached) run process.
+    // `cp serve` launches runs as detached `rupu workflow run <id>`
+    // subprocesses that can't receive an in-memory pause signal, so we build
+    // a token, hand it to `run_workflow`, and spawn a poller that trips it
+    // when `cp serve`'s `pause_run` writes the pause marker. Backward
+    // compatible: if no marker is ever written the token never trips and the
+    // run behaves exactly as before.
+    let pause_token = tokio_util::sync::CancellationToken::new();
+    let pause_poller = spawn_pause_marker_poller(
+        Arc::clone(&run_store_for_resume),
+        run_id.clone(),
+        pause_token.clone(),
+    );
+
     let opts = OrchestratorRunOpts {
         workflow,
         inputs: inputs_map,
@@ -3399,6 +3635,7 @@ async fn execute_workflow_invocation(
         strict_templates,
         event_sink: event_sink_for_run,
         unit_dispatcher,
+        pause: Some(pause_token.clone()),
     };
 
     // Opt-in live three-zone view (dashboard + git-graph spine + focus
@@ -3577,6 +3814,7 @@ async fn execute_workflow_invocation(
                         strict_templates,
                         event_sink: resume_event_sink,
                         unit_dispatcher: resume_unit_dispatcher,
+                        pause: Some(pause_token.clone()),
                     };
                     current_runner = tokio::spawn(run_workflow(resume_opts));
                     current_run_id = result.run_id.clone();
@@ -3595,6 +3833,10 @@ async fn execute_workflow_invocation(
             .await
             .map_err(|e| to_anyhow_with_input_snippet(e, &path, &body))?
     };
+
+    // The run has finished (terminal or paused); the marker poller has no
+    // further use — stop it so it never outlives the run.
+    pause_poller.abort();
 
     let artifact_manifest_path = persist_portable_run_metadata(
         run_store_for_resume.as_ref(),
@@ -3788,6 +4030,65 @@ mod tests {
     }
 
     #[test]
+    fn resume_blocked_by_live_runner_covers_all_cases() {
+        let own_pid = std::process::id();
+
+        // No recorded runner_pid → nothing to be blocked by.
+        assert_eq!(resume_blocked_by_live_runner(None, own_pid), None);
+
+        // The recorded pid IS us (e.g. an in-process resume) → not a
+        // foreign live process, safe to resume.
+        assert_eq!(resume_blocked_by_live_runner(Some(own_pid), own_pid), None);
+
+        // A dead pid (process no longer running) → safe to resume.
+        // u32::MAX is not a valid pid on any supported platform.
+        let dead_pid = u32::MAX;
+        assert!(!rupu_orchestrator::runs::pid_is_running(dead_pid));
+        assert_eq!(resume_blocked_by_live_runner(Some(dead_pid), own_pid), None);
+
+        // A live, FOREIGN pid → blocked. Use our own process's pid as the
+        // "live" pid but pass a different `own_pid` sentinel so the guard
+        // sees it as a foreign live runner.
+        let live_pid = own_pid;
+        let different_own_pid = own_pid.wrapping_add(1);
+        assert_ne!(live_pid, different_own_pid);
+        assert!(rupu_orchestrator::runs::pid_is_running(live_pid));
+        assert_eq!(
+            resume_blocked_by_live_runner(Some(live_pid), different_own_pid),
+            Some(live_pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_marker_poller_trips_token_when_marker_appears() {
+        // The delivery mechanism for a pause requested against a detached
+        // run process: the poller watches `RunStore::pause_marker_exists`
+        // and trips `token` once the marker file shows up.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let run_id = "run_poll_test".to_string();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let handle = spawn_pause_marker_poller(store.clone(), run_id.clone(), token.clone());
+
+        // No marker yet — give the poller a couple of ticks; it must not
+        // trip the token on its own.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!token.is_cancelled());
+
+        store.set_pause_marker(&run_id).unwrap();
+
+        // Poll interval is 250ms; wait up to ~1s for the poller to notice.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !token.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(token.is_cancelled());
+
+        handle.abort();
+    }
+
+    #[test]
     fn cancel_with_store_marks_running_run_failed() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
@@ -3841,5 +4142,48 @@ mod tests {
             persisted.error_message.as_deref(),
             Some("rejected: cancelled by operator")
         );
+    }
+
+    #[test]
+    fn pause_with_store_marks_running_run_paused_and_writes_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::Running, Some(999_999));
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        pause_with_store(&store, "run_test_cancel").unwrap();
+
+        let persisted = store.load("run_test_cancel").unwrap();
+        assert_eq!(persisted.status, RunStatus::Paused);
+        assert!(
+            store.pause_marker_exists("run_test_cancel"),
+            "pause_with_store must deliver the marker so a detached runner honors it"
+        );
+    }
+
+    #[test]
+    fn pause_with_store_rejects_terminal_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::Completed, None);
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        let err = pause_with_store(&store, "run_test_cancel").unwrap_err();
+        assert!(err.to_string().contains("already terminal"));
+        assert!(
+            !store.pause_marker_exists("run_test_cancel"),
+            "a rejected pause must not write the marker"
+        );
+    }
+
+    #[test]
+    fn pause_with_store_rejects_already_paused_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));
+        let record = sample_run_record(RunStatus::Paused, None);
+        store.create(record, "name: sample\nsteps: []\n").unwrap();
+
+        let err = pause_with_store(&store, "run_test_cancel").unwrap_err();
+        assert!(err.to_string().contains("only a running run can be paused"));
     }
 }

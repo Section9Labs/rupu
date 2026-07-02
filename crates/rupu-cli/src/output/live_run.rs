@@ -365,6 +365,26 @@ impl LiveRunState {
                 self.status = RunStatus::Failed;
                 self.finished_at = Some(*finished_at);
             }
+            WfEvent::RunPaused { .. } => {
+                self.status = RunStatus::Paused;
+            }
+            WfEvent::RunResumed { .. } => {
+                self.status = RunStatus::Running;
+            }
+            WfEvent::StepPaused { step_id, .. } => {
+                // No dedicated `NodeStatus::Paused` glyph yet (tracked for
+                // the CP web Paused-node work); reuse `Awaiting`'s pause
+                // glyph (`⏸`, see `node_glyph`) as the closest visual match
+                // until that lands.
+                if let Some(step) = self.step_mut(step_id) {
+                    step.status = NodeStatus::Awaiting;
+                }
+            }
+            WfEvent::StepResumed { step_id, .. } => {
+                if let Some(step) = self.step_mut(step_id) {
+                    step.status = NodeStatus::Working;
+                }
+            }
             // PanelRound drives the web Control Plane's live round
             // counter; the CLI live view does not render it, so no
             // per-step state change is needed here.
@@ -475,6 +495,7 @@ impl LiveRunState {
             RunStatus::Rejected => ("rejected", FAILED),
             RunStatus::Cancelled => ("cancelled", FAILED),
             RunStatus::Pending => ("pending", DIM),
+            RunStatus::Paused => ("paused", palette::AWAITING),
         }
     }
 }
@@ -892,7 +913,18 @@ pub fn render_focus(
     // Body window. Reserve 2 rows for borders.
     let body_rows = height.saturating_sub(2).max(1);
     let failed = matches!(state.status, RunStatus::Failed | RunStatus::Rejected);
-    let resume_hint = failed.then(|| format!("↳ rupu workflow resume {}", state.run_id));
+    let resume_hint = if state.status == RunStatus::Paused {
+        // Cooperatively paused (operator pressed Esc, or `rupu workflow
+        // pause`/`rupu run pause` from another terminal) — offer the
+        // resume path right in the focus panel, same spot the failed-run
+        // hint uses below.
+        Some(format!(
+            "↳ paused — resume with: rupu workflow resume {}",
+            state.run_id
+        ))
+    } else {
+        failed.then(|| format!("↳ rupu workflow resume {}", state.run_id))
+    };
     let reserve = if resume_hint.is_some() { 1 } else { 0 };
     let feed_rows = body_rows.saturating_sub(reserve);
 
@@ -1114,18 +1146,23 @@ fn clamp_rows_width(rows: Vec<String>, width: usize) -> Vec<String> {
 // Live loop (best-effort; cursor control validated by running it)
 // ---------------------------------------------------------------------------
 
-/// RAII guard that owns the alternate screen for the live view. On entry
-/// it switches to the alt screen and hides the cursor; on `Drop` it shows
-/// the cursor and leaves the alt screen — restoring the user's normal
-/// terminal on EVERY exit path (normal return, early return, panic,
-/// Ctrl-C). Mirrors `session.rs`'s `SessionScreenGuard`.
+/// RAII guard that owns the alternate screen (+ raw mode) for the live
+/// view. On entry it enables raw mode, switches to the alt screen, and
+/// hides the cursor; on `Drop` it restores the normal terminal — on
+/// EVERY exit path (normal return, early return, panic, Ctrl-C). Mirrors
+/// `session.rs`'s `SessionScreenGuard` / `RawModeGuard`.
+///
+/// Raw mode is required for [`run_live_view`]'s Esc-to-pause handling:
+/// without it, keystrokes are line-buffered by the terminal driver and
+/// Esc would not reach `crossterm::event::read` until Enter was pressed.
 struct AltScreenGuard;
 
 impl AltScreenGuard {
     fn enter() -> std::io::Result<Self> {
         use crossterm::cursor::Hide;
         use crossterm::execute;
-        use crossterm::terminal::EnterAlternateScreen;
+        use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+        enable_raw_mode()?;
         execute!(std::io::stdout(), EnterAlternateScreen, Hide)?;
         Ok(Self)
     }
@@ -1135,8 +1172,50 @@ impl Drop for AltScreenGuard {
     fn drop(&mut self) {
         use crossterm::cursor::Show;
         use crossterm::execute;
-        use crossterm::terminal::LeaveAlternateScreen;
+        use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
         let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
+}
+
+/// Pure keypress handler for the live-run view's alt-screen loop.
+///
+/// `Esc` requests a cooperative pause of the run being tailed via the
+/// exact primitive `rupu workflow pause <run_id>` uses
+/// ([`crate::cmd::workflow::pause_with_store`]: `RunStore::pause` + the
+/// pause marker a detached runner process polls) — NOT a copy of the
+/// logic, the same function, so there is exactly one pause code path.
+/// `pause_with_store` writes straight to the run store rather than
+/// stdout, so it is safe to call while the alt screen owns the
+/// terminal (unlike `crate::cmd::workflow::pause`, which `println!`s a
+/// confirmation that would corrupt the frame).
+///
+/// On success, an immediate feed line gives the operator feedback ahead
+/// of the round-trip `RunPaused` event (emitted once the run actually
+/// stops at a safe boundary, which flips [`LiveRunState::status`] via
+/// [`LiveRunState::apply`]). A failed request (already paused, or the
+/// run just reached a terminal state) is swallowed — the state already
+/// reflects reality, so no user-facing action is needed. Any other key,
+/// or a non-Press event (key-repeat/release under kitty-protocol
+/// terminals), is a no-op.
+fn handle_live_run_keypress(
+    key: crossterm::event::KeyEvent,
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+    state: &mut LiveRunState,
+) {
+    use crossterm::event::{KeyCode, KeyEventKind};
+    if key.kind != KeyEventKind::Press || key.code != KeyCode::Esc {
+        return;
+    }
+    if crate::cmd::workflow::pause_with_store(store, run_id).is_ok() {
+        state.push_activity(
+            Utc::now(),
+            ActivityKind::Text,
+            format!(
+                "pause requested — will stop at next safe boundary (resume: rupu workflow resume {run_id})"
+            ),
+        );
     }
 }
 
@@ -1185,6 +1264,16 @@ pub async fn run_live_view(
     loop {
         interval.tick().await;
         tick += 1;
+
+        // Non-blocking keypress check: `Esc` requests a cooperative
+        // pause (see `handle_live_run_keypress`). Drains every pending
+        // key event this tick so a held/repeated Esc doesn't queue up
+        // stale reads for the next iteration.
+        while crossterm::event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+            if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
+                handle_live_run_keypress(key, &store, &run_id, &mut state);
+            }
+        }
 
         // Drain workflow events. `UnitStarted` may re-point the focus to
         // a fan-out unit's transcript (see below).
@@ -1277,7 +1366,14 @@ pub async fn run_live_view(
         }
         let _ = stdout.flush();
 
-        if state.status.is_terminal() {
+        // `Paused` is deliberately NOT in `RunStatus::is_terminal()` (a
+        // paused run is fully resumable, unlike Completed/Failed/
+        // Rejected/Cancelled) — but the process driving THIS view exits
+        // once its `run_workflow` future returns from the cooperative
+        // pause, so the loop must stop here too or it would spin forever
+        // waiting for a status that will only change in a *different*
+        // (resumed) process/run.
+        if state.status.is_terminal() || state.status == RunStatus::Paused {
             break;
         }
     }
@@ -2086,5 +2182,176 @@ mod tests {
 
         // A string that already fits is returned unchanged.
         assert_eq!(truncate_to_width("hi", 10), "hi");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 7 — RunPaused/RunResumed apply(), paused resume hint, Esc handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_run_paused_sets_status() {
+        let mut state = fanout_state(true);
+        assert_eq!(state.status, RunStatus::Running);
+        state.apply(&WfEvent::RunPaused {
+            run_id: "run_01ABC".into(),
+        });
+        assert_eq!(state.status, RunStatus::Paused);
+    }
+
+    #[test]
+    fn apply_run_resumed_sets_status_running() {
+        let mut state = fanout_state(true);
+        state.status = RunStatus::Paused;
+        state.apply(&WfEvent::RunResumed {
+            run_id: "run_01ABC".into(),
+        });
+        assert_eq!(state.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn focus_paused_run_shows_resume_hint() {
+        let mut state = fanout_state(true);
+        state.status = RunStatus::Paused;
+        let rows = stripped(render_focus(&state, ts(33), 79, 8));
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("paused") && r.contains("rupu workflow resume run_01ABC")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn focus_failed_hint_unchanged_by_paused_addition() {
+        // Regression guard: the pre-existing Failed/Rejected hint text
+        // must be untouched by the new Paused branch.
+        let mut state = fanout_state(true);
+        state.status = RunStatus::Rejected;
+        let rows = stripped(render_focus(&state, ts(33), 79, 8));
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("↳ rupu workflow resume run_01ABC")),
+            "{rows:#?}"
+        );
+        assert!(!rows.iter().any(|r| r.contains("paused")), "{rows:#?}");
+    }
+
+    /// Minimal persisted `RunRecord` for the run-store round-trip in
+    /// [`esc_keypress_requests_pause_and_pushes_activity_line`] — field
+    /// set mirrors `cmd::workflow::tests::sample_run_record`.
+    fn minimal_run_record(id: &str, status: RunStatus) -> rupu_orchestrator::RunRecord {
+        rupu_orchestrator::RunRecord {
+            id: id.to_string(),
+            workflow_name: "sample".into(),
+            status,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: "ws_test".into(),
+            workspace_path: std::path::PathBuf::from("/tmp/workspace"),
+            transcript_dir: std::path::PathBuf::from("/tmp/transcripts"),
+            started_at: Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            final_output: None,
+        }
+    }
+
+    #[test]
+    fn esc_keypress_requests_pause_and_pushes_activity_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(
+                minimal_run_record("run_01ABC", RunStatus::Running),
+                "name: sample\nsteps: []\n",
+            )
+            .unwrap();
+
+        let mut state = fanout_state(true);
+        assert!(state.active.feed.is_empty());
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+
+        assert!(
+            state
+                .active
+                .feed
+                .iter()
+                .any(|line| line.text.contains("pause requested")),
+            "{:#?}",
+            state.active.feed
+        );
+        let persisted = store.load("run_01ABC").unwrap();
+        assert_eq!(persisted.status, RunStatus::Paused);
+        assert!(store.pause_marker_exists("run_01ABC"));
+    }
+
+    #[test]
+    fn esc_keypress_noop_on_already_terminal_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(
+                minimal_run_record("run_01ABC", RunStatus::Completed),
+                "name: sample\nsteps: []\n",
+            )
+            .unwrap();
+
+        let mut state = fanout_state(true);
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+
+        assert!(
+            state.active.feed.is_empty(),
+            "a rejected pause request must not push a feed line: {:#?}",
+            state.active.feed
+        );
+    }
+
+    #[test]
+    fn non_esc_keypress_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = rupu_orchestrator::RunStore::new(tmp.path().to_path_buf());
+        store
+            .create(
+                minimal_run_record("run_01ABC", RunStatus::Running),
+                "name: sample\nsteps: []\n",
+            )
+            .unwrap();
+
+        let mut state = fanout_state(true);
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        handle_live_run_keypress(key, &store, "run_01ABC", &mut state);
+
+        assert!(state.active.feed.is_empty());
+        assert_eq!(store.load("run_01ABC").unwrap().status, RunStatus::Running);
     }
 }

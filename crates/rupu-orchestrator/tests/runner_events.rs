@@ -82,6 +82,7 @@ impl StepFactory for FakeFactory {
             surface_tag: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            pause: None,
         }
     }
 }
@@ -122,7 +123,8 @@ async fn run_workflow_emits_run_and_step_events_in_order() {
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -208,7 +210,8 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -264,7 +267,8 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -401,6 +405,7 @@ async fn panel_gate_emits_panel_round_events() {
                 surface_tag: None,
                 context_window_tokens: None,
                 compact_at_percent: None,
+                pause: None,
             }
         }
     }
@@ -438,7 +443,8 @@ steps:
         strict_templates: false,
         event_sink: Some(sink.clone() as Arc<dyn EventSink>),
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     run_workflow(opts).await.unwrap();
 
@@ -491,7 +497,8 @@ async fn no_event_sink_does_not_emit_any_events() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     let res = run_workflow(opts).await.unwrap();
     assert_eq!(res.step_results.len(), 2);

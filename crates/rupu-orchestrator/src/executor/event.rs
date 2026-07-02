@@ -126,6 +126,17 @@ pub enum Event {
         error: String,
         finished_at: DateTime<Utc>,
     },
+    /// The run was paused by an operator (distinct from `RunCompleted`
+    /// with a `Cancelled` status — a paused run expects a later
+    /// `RunResumed`).
+    RunPaused { run_id: String },
+    /// A previously paused run resumed execution.
+    RunResumed { run_id: String },
+    /// The step in flight when a pause was requested stopped
+    /// cooperatively at a checkpoint boundary.
+    StepPaused { run_id: String, step_id: String },
+    /// A step resumed after a prior `StepPaused`.
+    StepResumed { run_id: String, step_id: String },
 }
 
 impl Event {
@@ -142,7 +153,11 @@ impl Event {
             | Event::UnitCompleted { run_id, .. }
             | Event::PanelRound { run_id, .. }
             | Event::RunCompleted { run_id, .. }
-            | Event::RunFailed { run_id, .. } => run_id,
+            | Event::RunFailed { run_id, .. }
+            | Event::RunPaused { run_id, .. }
+            | Event::RunResumed { run_id, .. }
+            | Event::StepPaused { run_id, .. }
+            | Event::StepResumed { run_id, .. } => run_id,
         }
     }
 }
@@ -217,7 +232,10 @@ mod tests {
             transcript_path: Some(PathBuf::from("/t/run_X.jsonl")),
         };
         let json = serde_json::to_string(&ev).expect("serialize");
-        assert!(json.contains(r#""transcript_path":"/t/run_X.jsonl""#), "json: {json}");
+        assert!(
+            json.contains(r#""transcript_path":"/t/run_X.jsonl""#),
+            "json: {json}"
+        );
         let back: Event = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(
             back,
@@ -230,7 +248,13 @@ mod tests {
         // Older event logs / tool-call pings without the field still deserialize.
         let json = r#"{"type":"step_working","run_id":"r1","step_id":"build","note":null}"#;
         let back: Event = serde_json::from_str(json).expect("deserialize legacy");
-        assert!(matches!(back, Event::StepWorking { transcript_path: None, .. }));
+        assert!(matches!(
+            back,
+            Event::StepWorking {
+                transcript_path: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -291,6 +315,46 @@ mod tests {
         assert!(val["max_severity_remaining"].is_null());
         let back: Event = serde_json::from_value(val).expect("deserialize");
         assert_eq!(back.run_id(), "r");
+    }
+
+    #[test]
+    fn run_paused_resumed_round_trip() {
+        let ev = Event::RunPaused {
+            run_id: "r1".into(),
+        };
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("run_paused") || j.contains("RunPaused"));
+        let back: Event = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back, Event::RunPaused { .. }));
+
+        let ev = Event::RunResumed {
+            run_id: "r1".into(),
+        };
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("run_resumed") || j.contains("RunResumed"));
+        let back: Event = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back, Event::RunResumed { .. }));
+    }
+
+    #[test]
+    fn step_paused_resumed_round_trip() {
+        let ev = Event::StepPaused {
+            run_id: "r1".into(),
+            step_id: "s1".into(),
+        };
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("step_paused") || j.contains("StepPaused"));
+        let back: Event = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back, Event::StepPaused { .. }));
+
+        let ev = Event::StepResumed {
+            run_id: "r1".into(),
+            step_id: "s1".into(),
+        };
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("step_resumed") || j.contains("StepResumed"));
+        let back: Event = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back, Event::StepResumed { .. }));
     }
 
     #[test]

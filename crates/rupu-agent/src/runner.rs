@@ -616,6 +616,15 @@ pub struct AgentRunOpts {
     /// The workflow step factory sets this to `"workflow"` so coverage events
     /// from workflow runs are correctly attributed to the workflow surface.
     pub surface_tag: Option<String>,
+    /// Cooperative pause signal. When `Some` and the token is cancelled,
+    /// the loop stops at the next safe boundary — after the in-flight
+    /// stream is dropped (partial assistant text is discarded, not
+    /// committed) or after a running tool finishes and its result is
+    /// recorded — and `run_agent` returns a `RunResult` with
+    /// `paused == true` instead of erroring. A resume is just another
+    /// `run_agent` call seeded with the persisted transcript messages.
+    /// `None` (default) preserves today's behavior exactly.
+    pub pause: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Outcome of a finished run.
@@ -625,6 +634,52 @@ pub struct RunResult {
     pub total_tokens_in: u64,
     pub total_tokens_out: u64,
     pub final_messages: Vec<Message>,
+    /// `true` when the run stopped at a cooperative pause boundary rather
+    /// than completing or erroring (see [`AgentRunOpts::pause`]). The
+    /// transcript / `final_messages` are persisted through the last
+    /// complete message or tool result, ready to seed a resume. On a
+    /// paused outcome `status` is [`RunStatus::Aborted`] for transcript
+    /// compatibility; callers (the orchestrator) map `paused` to their
+    /// own `RunStatus::Paused`.
+    pub paused: bool,
+}
+
+/// Await a cooperative pause signal. Resolves when the token is cancelled;
+/// never resolves when there is no token (so a `select!` arm using it is
+/// inert on the no-pause path — today's behavior).
+async fn wait_pause(pause: &Option<tokio_util::sync::CancellationToken>) {
+    match pause {
+        Some(t) => t.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Whether the pause token is currently set. Used at the after-tool
+/// boundary to decide whether to stop before the next turn.
+fn is_paused(pause: &Option<tokio_util::sync::CancellationToken>) -> bool {
+    pause.as_ref().is_some_and(|t| t.is_cancelled())
+}
+
+/// Result of a single provider call attempt inside the retry loop.
+enum CallStep {
+    Ok(LlmResponse),
+    Err(rupu_providers::ProviderError),
+    /// The pause token fired while the provider call was in flight; the
+    /// in-flight stream was dropped and any partial text discarded.
+    Paused,
+}
+
+/// Outcome of the provider-call retry loop for one turn.
+enum CallOutcome {
+    Response(LlmResponse),
+    Paused,
+}
+
+/// Terminal outcome of the turn loop. `Paused` is a cooperative-pause
+/// outcome (not an error); the caller maps it to a paused `RunResult`.
+enum LoopOutcome {
+    Status(RunStatus),
+    Paused,
 }
 
 /// Drive one agent run to completion. Writes a JSONL transcript at
@@ -775,12 +830,27 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     let tool_defs = registry.to_tool_definitions();
 
     let mut messages: Vec<Message> = opts.initial_messages.clone();
-    messages.push(Message::user(&opts.user_message));
+    // Conditional user-turn append. An EMPTY `user_message` means "seed-only":
+    // the caller has supplied a complete, ready-to-send transcript via
+    // `initial_messages` (e.g. the orchestrator resuming a tool-boundary pause,
+    // where the seed already ends in a `tool_result` that pairs with the
+    // preceding assistant `tool_use`). Appending a fresh user turn there would
+    // either double the user turn or — worse — strand the assistant's
+    // `tool_use` with no matching `tool_result`, which real Anthropic rejects
+    // with a 400. So we only append when there is an actual message to add.
+    // Every existing caller passes a non-empty `user_message` and is unaffected.
+    if !opts.user_message.is_empty() {
+        messages.push(Message::user(&opts.user_message));
+    }
     let mut turn_idx: u32 = opts.turn_index_offset;
     let initial_turn_idx = turn_idx;
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
     let mut runtime_mode = parse_mode_for_runtime(&opts.mode_str);
+    // Clone the cooperative pause token so it can be awaited in `select!`
+    // arms without borrowing `opts` (which the provider call borrows
+    // mutably). Cheap: `CancellationToken` is `Arc`-backed.
+    let pause = opts.pause.clone();
 
     // -----------------------------------------------------------------------
     // Inner fallible block.  Every `?` inside here propagates out to
@@ -790,9 +860,9 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
     // -----------------------------------------------------------------------
     let inner_result: Result<RunResult, RunError> = async {
         let mut compaction_seq = 0u32;
-        let result_status = loop {
+        let loop_outcome = 'turns: loop {
             if turn_idx >= opts.max_turns {
-                break RunStatus::Error;
+                break 'turns LoopOutcome::Status(RunStatus::Error);
             }
             writer.write(&Event::TurnStart { turn_idx })?;
             let mut req = LlmRequest {
@@ -813,11 +883,18 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             };
             let mut trim_attempts = 0u32;
             let mut http_retries = 0u32;
-            let resp: LlmResponse = loop {
-                let send_result: Result<LlmResponse, rupu_providers::ProviderError> = if opts
-                    .no_stream
-                {
-                    opts.provider.send(&req).await
+            let call_outcome: CallOutcome = loop {
+                let step: CallStep = if opts.no_stream {
+                    // Race the one-shot completion against the pause token so a
+                    // pause takes effect immediately rather than only after the
+                    // provider returns.
+                    tokio::select! {
+                        r = opts.provider.send(&req) => match r {
+                            Ok(x) => CallStep::Ok(x),
+                            Err(e) => CallStep::Err(e),
+                        },
+                        _ = wait_pause(&pause) => CallStep::Paused,
+                    }
                 } else {
                     let suppress = opts.suppress_stream_stdout;
                     let mut stream_transcript_error: Option<rupu_transcript::WriteError> = None;
@@ -847,20 +924,37 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                             StreamEvent::ToolUseStart { .. } | StreamEvent::InputJsonDelta(_) => {}
                         }
                     };
-                    let result = opts.provider.stream(&req, &mut on_event).await;
-                    if result.is_ok() {
-                        if !suppress {
-                            println!();
-                        }
-                        if let Some(err) = stream_transcript_error {
-                            return Err(RunError::Transcript(err));
+                    // Race the stream against the pause token. On pause the
+                    // stream future is dropped mid-flight and the partial
+                    // assistant text streamed so far is discarded: the assistant
+                    // message is committed to `messages` only after a *complete*
+                    // response (below), so no dangling partial is ever persisted.
+                    let streamed = tokio::select! {
+                        r = opts.provider.stream(&req, &mut on_event) => Some(r),
+                        _ = wait_pause(&pause) => None,
+                    };
+                    match streamed {
+                        None => CallStep::Paused,
+                        Some(result) => {
+                            if result.is_ok() {
+                                if !suppress {
+                                    println!();
+                                }
+                                if let Some(err) = stream_transcript_error {
+                                    return Err(RunError::Transcript(err));
+                                }
+                            }
+                            match result {
+                                Ok(x) => CallStep::Ok(x),
+                                Err(e) => CallStep::Err(e),
+                            }
                         }
                     }
-                    result
                 };
-                match send_result {
-                    Ok(r) => break r,
-                    Err(e) => {
+                match step {
+                    CallStep::Ok(r) => break CallOutcome::Response(r),
+                    CallStep::Paused => break CallOutcome::Paused,
+                    CallStep::Err(e) => {
                         let e_str = e.to_string();
                         if is_context_overflow(&e_str) && trim_attempts <= 64 {
                             if trim_oldest_exchange(&mut req.messages) > 0 {
@@ -922,6 +1016,14 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
                         return Err(RunError::Provider(e_str));
                     }
                 }
+            };
+            // A pause during the provider call stops the run at this safe
+            // boundary. The partial response is dropped: no assistant message
+            // was committed for this turn, so the transcript ends at the last
+            // complete message and is ready to seed a resume.
+            let resp: LlmResponse = match call_outcome {
+                CallOutcome::Response(r) => r,
+                CallOutcome::Paused => break 'turns LoopOutcome::Paused,
             };
             total_in += resp.usage.input_tokens as u64;
             total_out += resp.usage.output_tokens as u64;
@@ -1150,8 +1252,20 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             // only a hint: an unrecognized/absent value deserializes to `None`,
             // so it must not be the sole terminator.
             if !made_tool_calls {
-                break RunStatus::Ok;
+                break 'turns LoopOutcome::Status(RunStatus::Ok);
             }
+            // Cooperative pause after a full tool-calling turn: the tool(s) ran
+            // to completion and their results are recorded in both the
+            // transcript and `messages` (no dangling tool_call). Stop here,
+            // before issuing the next turn's provider request.
+            if is_paused(&pause) {
+                break 'turns LoopOutcome::Paused;
+            }
+        };
+
+        let (result_status, paused) = match loop_outcome {
+            LoopOutcome::Status(s) => (s, false),
+            LoopOutcome::Paused => (RunStatus::Aborted, true),
         };
 
         writer.write(&Event::RunComplete {
@@ -1159,7 +1273,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             status: result_status,
             total_tokens: total_in + total_out,
             duration_ms: started.elapsed().as_millis() as u64,
-            error: None,
+            error: if paused { Some("paused".into()) } else { None },
         })?;
         writer.flush()?;
 
@@ -1176,6 +1290,7 @@ pub async fn run_agent(mut opts: AgentRunOpts) -> Result<RunResult, RunError> {
             total_tokens_in: total_in,
             total_tokens_out: total_out,
             final_messages: messages,
+            paused,
         })
     }
     .await;
@@ -1334,6 +1449,7 @@ mod on_tool_call_tests {
             surface_tag: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            pause: None,
         };
 
         run_agent(opts).await.expect("agent run succeeds");
@@ -1415,6 +1531,7 @@ mod on_tool_call_tests {
             surface_tag: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            pause: None,
         };
 
         let result = run_agent(opts)
@@ -1488,6 +1605,7 @@ mod on_tool_call_tests {
             surface_tag: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            pause: None,
         };
 
         run_agent(opts).await.expect("agent run succeeds");
@@ -2213,6 +2331,7 @@ mod compaction_tests {
             surface_tag: None,
             context_window_tokens: Some(1_000_000),
             compact_at_percent: Some(75),
+            pause: None,
         };
 
         let mut messages = vec![
@@ -2317,5 +2436,391 @@ mod compaction_tests {
             result.expect("no error").is_none(),
             "2-message history should return None"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative pause tests (T2). Exercise the pause token at both safe
+// boundaries: mid-stream (drop the partial) and after a running tool finishes.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// Provider whose `stream` emits one partial delta then blocks for a long
+    /// time. The pause `select!` cancels the in-flight stream, so the full
+    /// response is never produced and no assistant message is committed.
+    struct SlowStreamProvider;
+
+    #[async_trait]
+    impl LlmProvider for SlowStreamProvider {
+        async fn send(
+            &mut self,
+            _req: &LlmRequest,
+        ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+            Ok(LlmResponse {
+                id: "slow".into(),
+                model: "mock-1".into(),
+                content: vec![ContentBlock::Text {
+                    text: "unused".into(),
+                }],
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage::default(),
+            })
+        }
+
+        async fn stream(
+            &mut self,
+            _req: &LlmRequest,
+            on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, rupu_providers::ProviderError> {
+            // Simulate the model emitting some text, then a long generation
+            // that the pause `select!` will cancel before it completes.
+            on_event(StreamEvent::TextDelta(
+                "partial answer that must be dropped".into(),
+            ));
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(LlmResponse {
+                id: "slow".into(),
+                model: "mock-1".into(),
+                content: vec![ContentBlock::Text {
+                    text: "the full answer".into(),
+                }],
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage::default(),
+            })
+        }
+
+        fn default_model(&self) -> &str {
+            "mock-1"
+        }
+
+        fn provider_id(&self) -> rupu_providers::ProviderId {
+            rupu_providers::ProviderId::Anthropic
+        }
+    }
+
+    fn opts_for(
+        provider: Box<dyn LlmProvider>,
+        pause: Option<CancellationToken>,
+        workspace: &std::path::Path,
+        transcript_path: PathBuf,
+        initial_messages: Vec<Message>,
+        user_message: &str,
+    ) -> AgentRunOpts {
+        AgentRunOpts {
+            agent_name: "test-agent".into(),
+            agent_system_prompt: "test".into(),
+            agent_tools: None,
+            provider,
+            provider_name: "mock".into(),
+            model: "mock-1".into(),
+            run_id: "run_pause_test".into(),
+            workspace_id: "ws_test".into(),
+            workspace_path: workspace.to_path_buf(),
+            transcript_path,
+            max_turns: 5,
+            decider: Arc::new(BypassDecider),
+            tool_context: rupu_tools::ToolContext {
+                workspace_path: workspace.to_path_buf(),
+                ..Default::default()
+            },
+            user_message: user_message.into(),
+            initial_messages,
+            turn_index_offset: 0,
+            mode_str: "bypass".into(),
+            // Exercise the streaming path — that is what pause races against.
+            no_stream: false,
+            suppress_stream_stdout: true,
+            mcp_registry: None,
+            effort: None,
+            context_window: None,
+            output_format: None,
+            anthropic_task_budget: None,
+            anthropic_context_management: None,
+            anthropic_speed: None,
+            parent_run_id: None,
+            depth: 0,
+            dispatchable_agents: None,
+            step_id: "s1".into(),
+            on_tool_call: None,
+            on_stream_event: None,
+            concerns: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            scope_name: None,
+            surface_tag: None,
+            context_window_tokens: None,
+            compact_at_percent: None,
+            pause,
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_during_stream_stops_and_drops_partial_text() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token2.cancel();
+        });
+
+        let opts = opts_for(
+            Box::new(SlowStreamProvider),
+            Some(token),
+            tmp.path(),
+            transcript_path.clone(),
+            Vec::new(),
+            "hi",
+        );
+        let result = run_agent(opts).await.expect("paused run returns Ok result");
+
+        assert!(result.paused, "run must report a paused outcome");
+        // Only the seed user message survives — no partial assistant message.
+        assert_eq!(
+            result.final_messages.len(),
+            1,
+            "no assistant message should be committed on a paused stream"
+        );
+        assert_eq!(result.final_messages[0].role, Role::User);
+
+        // The transcript must not carry a committed AssistantMessage; the
+        // streamed deltas are UI-only and the message is never finalized.
+        let body = std::fs::read_to_string(&transcript_path).expect("read transcript");
+        let has_assistant_msg = body
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Event>(l).ok())
+            .any(|e| matches!(e, Event::AssistantMessage { .. }));
+        assert!(
+            !has_assistant_msg,
+            "a paused partial stream must not persist an assistant message"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_during_tool_lets_it_finish_and_records_result() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token2.cancel();
+        });
+
+        // Turn 0 asks for a bash tool that sleeps; pause fires while it runs.
+        // Turn 1 would be a final answer but must NOT be reached.
+        let provider = MockProvider::new(vec![
+            ScriptedTurn::AssistantToolUse {
+                text: None,
+                tool_id: "call_sleep".into(),
+                tool_name: "bash".into(),
+                tool_input: serde_json::json!({ "command": "sleep 0.3" }),
+                stop: StopReason::ToolUse,
+            },
+            ScriptedTurn::AssistantText {
+                text: "should not be reached".into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        ]);
+
+        let opts = opts_for(
+            Box::new(provider),
+            Some(token),
+            tmp.path(),
+            transcript_path.clone(),
+            Vec::new(),
+            "run the tool",
+        );
+        let result = run_agent(opts).await.expect("paused run returns Ok result");
+
+        assert!(result.paused, "run must report a paused outcome");
+
+        let events: Vec<Event> = std::fs::read_to_string(&transcript_path)
+            .expect("read transcript")
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let tool_calls = events
+            .iter()
+            .filter(|e| matches!(e, Event::ToolCall { .. }))
+            .count();
+        let tool_results = events
+            .iter()
+            .filter(|e| matches!(e, Event::ToolResult { .. }))
+            .count();
+        assert_eq!(tool_calls, 1, "exactly one tool call was issued");
+        assert_eq!(
+            tool_results, 1,
+            "the mid-flight tool must finish and record its result before pausing"
+        );
+
+        // The tool_result is appended to the message history (no dangling
+        // tool_call without a matching result).
+        let has_tool_result = result.final_messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        });
+        assert!(
+            has_tool_result,
+            "the recorded tool result must be present in the persisted messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_continues_from_transcript() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+
+        // Phase 1: pause during a running tool to produce a persisted transcript.
+        let t1 = tmp.path().join("run1.jsonl");
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            token2.cancel();
+        });
+        let provider1 = MockProvider::new(vec![ScriptedTurn::AssistantToolUse {
+            text: None,
+            tool_id: "call_sleep".into(),
+            tool_name: "bash".into(),
+            tool_input: serde_json::json!({ "command": "sleep 0.3" }),
+            stop: StopReason::ToolUse,
+        }]);
+        let opts1 = opts_for(
+            Box::new(provider1),
+            Some(token),
+            tmp.path(),
+            t1,
+            Vec::new(),
+            "start",
+        );
+        let paused = run_agent(opts1).await.expect("first run pauses");
+        assert!(paused.paused, "first run must be paused");
+        let seed = paused.final_messages;
+
+        // Phase 2: resume, seeded with the persisted transcript. A fresh
+        // provider request must be issued and the run must complete.
+        let t2 = tmp.path().join("run2.jsonl");
+        let provider2 = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "final answer".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let captured = provider2.captured.clone();
+        let opts2 = opts_for(Box::new(provider2), None, tmp.path(), t2, seed, "continue");
+        let result = run_agent(opts2).await.expect("resume completes");
+
+        assert_eq!(result.status, RunStatus::Ok, "resumed run completes Ok");
+        assert!(!result.paused, "resumed run is not paused");
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "resume must issue exactly one fresh provider request"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_user_message_seeds_transcript_without_appending() {
+        // Seed-only contract: when `user_message` is empty, `run_agent` must
+        // NOT append a fresh user turn — the caller (the orchestrator resuming a
+        // tool-boundary pause) has supplied a complete, ready-to-send seed via
+        // `initial_messages`. The outbound request messages must equal the seed
+        // exactly. A tool-boundary seed ends in a `tool_result` paired with the
+        // preceding assistant `tool_use`; an extra user turn (or, worse, a
+        // flattened tool_result) would strand that tool_use and trigger a
+        // provider 400.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+
+        let seed = vec![
+            Message::user("do work"),
+            Message {
+                role: rupu_providers::types::Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({ "path": "x" }),
+                }],
+            },
+            Message::tool_result("toolu_1", "contents", false),
+        ];
+
+        let provider = CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "final".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let captured = provider.captured.clone();
+        let opts = opts_for(
+            Box::new(provider),
+            None,
+            tmp.path(),
+            transcript_path,
+            seed.clone(),
+            "", // empty → seed-only, no appended user turn
+        );
+        let result = run_agent(opts).await.expect("run completes");
+        assert_eq!(result.status, RunStatus::Ok);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1, "exactly one fresh provider request");
+        let msgs = &reqs[0].messages;
+        assert_eq!(
+            msgs.len(),
+            seed.len(),
+            "request messages must equal the seed (no appended user turn)"
+        );
+        // Roles match position-for-position and the trailing tool_result is
+        // preserved as a ToolResult block (not flattened / not doubled).
+        for (got, want) in msgs.iter().zip(seed.iter()) {
+            assert_eq!(got.role, want.role);
+        }
+        let last_is_tool_result = msgs
+            .last()
+            .unwrap()
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "toolu_1"));
+        assert!(
+            last_is_tool_result,
+            "trailing tool_result must survive intact, got {:?}",
+            msgs.last().unwrap().content
+        );
+    }
+
+    #[tokio::test]
+    async fn no_pause_token_behaves_exactly_as_today() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let transcript_path = tmp.path().join("run.jsonl");
+
+        let provider = MockProvider::new(vec![ScriptedTurn::AssistantText {
+            text: "done".into(),
+            stop: StopReason::EndTurn,
+            input_tokens: 1,
+            output_tokens: 1,
+        }]);
+        let opts = opts_for(
+            Box::new(provider),
+            None,
+            tmp.path(),
+            transcript_path,
+            Vec::new(),
+            "hi",
+        );
+        let result = run_agent(opts).await.expect("run completes");
+
+        assert_eq!(result.status, RunStatus::Ok);
+        assert!(!result.paused, "a None pause token never pauses");
+        assert_eq!(result.turns, 1);
     }
 }

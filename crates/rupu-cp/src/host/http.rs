@@ -273,6 +273,32 @@ impl HostConnector for HttpHostConnector {
         .map(|_| ())
     }
 
+    /// POST to the remote CP's `POST /api/runs/:id/pause` — the remote,
+    /// running this same feature, cooperatively pauses the run on its own
+    /// in-process executor (or its own host-routing, for a further hop).
+    async fn pause_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.send(
+            self.client
+                .post(self.url(&format!("/api/runs/{run_id}/pause")))
+                .json(&serde_json::json!({})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// POST to the remote CP's `POST /api/runs/:id/resume`. Launcher-gated
+    /// on the remote (a read-only remote deploy surfaces a `Remote(501, _)`
+    /// error, mapped through unchanged — never a silent no-op).
+    async fn resume_run(&self, run_id: &str) -> Result<(), HostConnectorError> {
+        self.send(
+            self.client
+                .post(self.url(&format!("/api/runs/{run_id}/resume")))
+                .json(&serde_json::json!({})),
+        )
+        .await
+        .map(|_| ())
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         let req = self
             .client

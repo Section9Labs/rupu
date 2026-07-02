@@ -1902,6 +1902,9 @@ fn workflow_status_ui(record: &RunRecord) -> UiStatus {
         rupu_orchestrator::RunStatus::Failed
         | rupu_orchestrator::RunStatus::Rejected
         | rupu_orchestrator::RunStatus::Cancelled => UiStatus::Failed,
+        // No dedicated "paused" glyph yet; reuse `Awaiting`'s pause glyph
+        // (`⏸`) as the closest visual match until a dedicated status lands.
+        rupu_orchestrator::RunStatus::Paused => UiStatus::Awaiting,
     }
 }
 
@@ -3463,6 +3466,7 @@ fn workflow_ticker_message(workflow_name: &str, record: Option<&RunRecord>) -> S
             let step = record.awaiting_step_id.as_deref().unwrap_or("approval");
             format!("workflow {workflow_name}  ·  awaiting {step}")
         }
+        rupu_orchestrator::RunStatus::Paused => format!("workflow {workflow_name}  ·  paused"),
     }
 }
 

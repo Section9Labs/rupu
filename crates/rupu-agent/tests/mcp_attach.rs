@@ -62,6 +62,7 @@ async fn mcp_registry_attaches_tools_to_run() {
         surface_tag: None,
         context_window_tokens: None,
         compact_at_percent: None,
+        pause: None,
     };
 
     run_agent(opts).await.unwrap();

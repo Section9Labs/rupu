@@ -189,6 +189,7 @@ impl AgentDispatcher for CliAgentDispatcher {
             surface_tag: None,
             context_window_tokens: spec.context_window_tokens,
             compact_at_percent: spec.compact_at_percent,
+            pause: None,
         };
 
         let started = std::time::Instant::now();

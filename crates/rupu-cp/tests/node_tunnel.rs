@@ -1182,6 +1182,30 @@ mod tunnel_connector {
         }
     }
 
+    /// Tunnel has no `Frame::Pause`/`Frame::Resume` variant — the node side
+    /// has no cooperative-pause wiring, so `pause_run`/`resume_run` inherit
+    /// `HostConnector`'s default `Unsupported` rather than faking a pause
+    /// the node could never honor.
+    #[tokio::test]
+    async fn tunnel_pause_unsupported() {
+        let dir = tempdir().unwrap();
+        let (conn, mut rx, _store) = setup("node-pause", dir.path());
+
+        assert!(matches!(
+            conn.pause_run("run_01PAUSE").await,
+            Err(HostConnectorError::Unsupported(_))
+        ));
+        assert!(matches!(
+            conn.resume_run("run_01PAUSE").await,
+            Err(HostConnectorError::Unsupported(_))
+        ));
+        // No frame was sent to the node for either call.
+        assert!(
+            rx.try_recv().is_err(),
+            "unsupported pause/resume must not send any frame"
+        );
+    }
+
     /// `approve_run` and `reject_run` on an OFFLINE node return `Unreachable`.
     #[tokio::test]
     async fn approve_reject_offline_node_returns_unreachable() {

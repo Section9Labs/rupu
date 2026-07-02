@@ -21,7 +21,7 @@ const DASHBOARD: DashboardResponse = {
   runs: {
     total: 9,
     by_status: {
-      running: 1, awaiting_approval: 2, pending: 0,
+      running: 1, awaiting_approval: 2, paused: 0, pending: 0,
       completed: 4, failed: 1, rejected: 1, cancelled: 0,
     },
   },

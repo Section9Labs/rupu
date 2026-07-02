@@ -23,6 +23,7 @@ export type StepState =
   | 'pending'
   | 'running'
   | 'awaiting_approval'
+  | 'paused'
   | 'done'
   | 'failed'
   | 'skipped';
@@ -83,6 +84,7 @@ function emptyByState(): Record<StepState, number> {
     pending: 0,
     running: 0,
     awaiting_approval: 0,
+    paused: 0,
     done: 0,
     failed: 0,
     skipped: 0,
@@ -241,10 +243,24 @@ export function buildRunGraphModel(
         if (n) n.round = { current: ev.round, max: ev.max_iterations };
         break;
       }
+      case 'step_paused': {
+        const node = nodeMap.get(ev.step_id);
+        if (node) node.state = 'paused';
+        break;
+      }
+      case 'step_resumed': {
+        const node = nodeMap.get(ev.step_id);
+        if (node) node.state = 'running';
+        break;
+      }
       case 'run_started':
       case 'run_completed':
       case 'run_failed':
-        // Run-level events — no per-step state change needed here.
+      case 'run_paused':
+      case 'run_resumed':
+        // Run-level events — no per-step state change needed here (the
+        // in-flight step's own `step_paused`/`step_resumed` event, above,
+        // carries the per-node transition).
         break;
     }
   }

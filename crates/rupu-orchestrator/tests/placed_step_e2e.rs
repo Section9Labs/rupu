@@ -81,6 +81,7 @@ impl StepFactory for FakeFactory {
             surface_tag: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            pause: None,
         }
     }
 }
@@ -187,6 +188,7 @@ async fn placed_steps_run_remotely_and_chain() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: Some(dispatcher.clone()),
+        pause: None,
     };
 
     let res = run_workflow(opts)
@@ -284,6 +286,7 @@ async fn no_host_control_runs_locally() {
         strict_templates: false,
         event_sink: None,
         unit_dispatcher: None,
+        pause: None,
     };
 
     let res = run_workflow(opts)

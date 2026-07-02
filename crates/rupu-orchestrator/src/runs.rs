@@ -26,6 +26,7 @@
 
 use crate::runner::{ItemResult, StepResult};
 use chrono::{DateTime, Utc};
+use rupu_providers::types::Message;
 use rupu_runtime::{ArtifactManifest, RunEnvelope};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -48,6 +49,10 @@ use thiserror::Error;
 /// - `Pending`/`Running` → `Cancelled` on `rupu workflow cancel` (or
 ///   the web/CP cancel control): a deliberate operator stop, distinct
 ///   from `Failed` (a run that errored on its own).
+/// - `Running` → `Paused` on an operator-requested pause (distinct
+///   from `Cancelled`: a paused run is expected to `resume` later
+///   from its checkpoint rather than being abandoned). `Paused` is
+///   **not** terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -59,6 +64,7 @@ pub enum RunStatus {
     AwaitingApproval,
     Rejected,
     Cancelled,
+    Paused,
 }
 
 impl RunStatus {
@@ -71,11 +77,14 @@ impl RunStatus {
             Self::AwaitingApproval => "awaiting_approval",
             Self::Rejected => "rejected",
             Self::Cancelled => "cancelled",
+            Self::Paused => "paused",
         }
     }
 
     /// True when no further state transitions are expected. Used by
     /// `rupu workflow runs` to bucket terminal vs in-flight rows.
+    /// `Paused` is deliberately excluded: a paused run is expected to
+    /// resume.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -1032,22 +1041,25 @@ impl RunStore {
     /// worker doesn't strand the resume.
     pub const RESUME_LEASE: chrono::Duration = chrono::Duration::minutes(5);
 
-    /// Web/delegated approve flow — **marker-only**. Validates the run
-    /// is still `AwaitingApproval` (same expire-check + `NotAwaiting`
-    /// error as [`approve`](Self::approve)), then records the
-    /// `resume_requested_at` marker and persists. It does **not** flip
-    /// the status or clear any pause fields: the run stays
-    /// `AwaitingApproval` so a background worker — not the approving
-    /// HTTP request — picks it up via
-    /// [`list_pending_resume`](Self::list_pending_resume), calls
-    /// [`approve`](Self::approve) (which yields the awaited step id),
-    /// and re-enters `run_workflow`. Leaving the run in
-    /// `AwaitingApproval` with `awaiting_step_id` intact is what lets
-    /// the worker recover which gate to resume.
+    /// Web/delegated resume flow — **marker-only**. Validates the run is
+    /// still `AwaitingApproval` OR cooperatively `Paused` (same
+    /// expire-check + `NotAwaiting` error as [`approve`](Self::approve) for
+    /// the approval-gate case), then records the `resume_requested_at`
+    /// marker and persists. It does **not** flip the status or clear any
+    /// pause fields: the run stays `AwaitingApproval`/`Paused` so a
+    /// background worker — not the approving/resuming HTTP request — picks
+    /// it up via [`list_pending_resume`](Self::list_pending_resume) and
+    /// re-enters `run_workflow` (via [`approve`](Self::approve) for the
+    /// approval-gate case, or `rupu workflow resume` for a manual pause).
+    /// Leaving the run in its paused status with `awaiting_step_id` intact
+    /// is what lets the worker recover which gate/step to resume.
     ///
     /// Returns `Approved { step_id }` with the still-present
-    /// `awaiting_step_id` so the web endpoint can report which gate the
-    /// operator approved.
+    /// `awaiting_step_id` so the caller can report which gate/step the
+    /// operator resumed. `step_id` is empty for a `Paused` run with no
+    /// `awaiting_step_id` (an externally-triggered pause that never
+    /// recorded one) — the resume path doesn't need it in that case, it
+    /// replays from `step_results.jsonl` instead.
     ///
     /// `mode` is the permission mode the operator chose for the resumed
     /// run (`ask` / `bypass` / `readonly`). It is validated and stored on
@@ -1072,19 +1084,32 @@ impl RunStore {
                     .unwrap_or_else(|| "paused run timed out".into()),
             ));
         }
-        if record.status != RunStatus::AwaitingApproval {
+        if !matches!(
+            record.status,
+            RunStatus::AwaitingApproval | RunStatus::Paused
+        ) {
             return Err(ApprovalError::NotAwaiting(
                 record.status.as_str().to_string(),
             ));
         }
-        let step_id = record
-            .awaiting_step_id
-            .clone()
-            .ok_or(ApprovalError::NoAwaitingStep)?;
+        // The approval-gate case always has `awaiting_step_id` set (the
+        // runner persists it alongside the gate); keep that a hard error so
+        // a corrupt AwaitingApproval record still surfaces loudly. A
+        // `Paused` run may not have one (an externally-triggered pause with
+        // no known active step) — the resume path doesn't need it, so fall
+        // back to empty rather than erroring.
+        let step_id = if record.status == RunStatus::AwaitingApproval {
+            record
+                .awaiting_step_id
+                .clone()
+                .ok_or(ApprovalError::NoAwaitingStep)?
+        } else {
+            record.awaiting_step_id.clone().unwrap_or_default()
+        };
         let _ = approver; // identity recorded in transcript via runner re-entry
-                          // Marker-only: leave status AwaitingApproval and keep
+                          // Marker-only: leave status AwaitingApproval/Paused and keep
                           // awaiting_step_id / approval_prompt / awaiting_since /
-                          // expires_at intact for the worker to approve+resume.
+                          // expires_at intact for the worker to resume.
         record.resume_requested_at = Some(now);
         record.resume_mode = mode
             .filter(|m| matches!(*m, "ask" | "bypass" | "readonly"))
@@ -1096,17 +1121,20 @@ impl RunStore {
         })
     }
 
-    /// Runs that a web/delegated approval marked for resume and that no
-    /// worker currently holds a live lease on. A run is pending when it
-    /// is still `AwaitingApproval`, has a `resume_requested_at` marker,
-    /// AND either has no claim or a claim older than
-    /// [`RESUME_LEASE`](Self::RESUME_LEASE).
+    /// Runs that a web/delegated approval OR manual-pause resume request
+    /// marked for resume and that no worker currently holds a live lease
+    /// on. A run is pending when it is still `AwaitingApproval` or
+    /// `Paused`, has a `resume_requested_at` marker, AND either has no
+    /// claim or a claim older than [`RESUME_LEASE`](Self::RESUME_LEASE).
     ///
-    /// The `AwaitingApproval` requirement guards against a
-    /// reject-after-approve race: if the run was rejected (or otherwise
-    /// finished) after the marker was set, its status is no longer
-    /// `AwaitingApproval` and the stale marker must not cause the worker
-    /// to resume a terminal run.
+    /// The `AwaitingApproval | Paused` requirement guards against a
+    /// reject/cancel-after-request race: if the run was rejected/cancelled
+    /// (or otherwise finished) after the marker was set, its status is no
+    /// longer one of those two and the stale marker must not cause the
+    /// worker to resume a terminal run. The caller (the `cp serve` resume
+    /// worker) dispatches on `status` to pick the right subprocess:
+    /// `AwaitingApproval` → `rupu workflow approve`; `Paused` → `rupu
+    /// workflow resume`.
     pub fn list_pending_resume(
         &self,
         now: chrono::DateTime<chrono::Utc>,
@@ -1114,7 +1142,7 @@ impl RunStore {
         Ok(self
             .list()?
             .into_iter()
-            .filter(|r| r.status == RunStatus::AwaitingApproval)
+            .filter(|r| matches!(r.status, RunStatus::AwaitingApproval | RunStatus::Paused))
             .filter(|r| r.resume_requested_at.is_some())
             .filter(|r| match r.resume_claimed_at {
                 None => true,
@@ -1207,7 +1235,7 @@ impl RunStore {
                     })?;
                 Ok(CancelOutcome::RejectedAwaitingApproval)
             }
-            RunStatus::Pending | RunStatus::Running => {
+            RunStatus::Pending | RunStatus::Running | RunStatus::Paused => {
                 let pid = record.runner_pid;
                 let was_running = pid.is_some_and(pid_is_running);
                 // Only signal a pid that is live AND is NOT our own
@@ -1241,11 +1269,174 @@ impl RunStore {
             }
         }
     }
+
+    /// Cooperatively pause a `Pending`/`Running` run: flips the persisted
+    /// record to the non-terminal [`RunStatus::Paused`] so `POST
+    /// /api/runs/:id/resume` (or `rupu workflow resume`, which also drives
+    /// the manual-pause resume — see
+    /// [`request_resume_approval`](Self::request_resume_approval)) can
+    /// later continue it. `awaiting_step_id` is best-effort copied from
+    /// `active_step_id` (if any) purely for observability — the actual
+    /// resume-with-seed decision is driven by
+    /// [`read_paused_seed`](Self::read_paused_seed), not this field.
+    ///
+    /// # Delivery
+    ///
+    /// This method only flips the *persisted* state; on its own it does not
+    /// reach a running process. Genuine cooperative interruption is delivered
+    /// by the callers that pair the status flip with a pause signal:
+    ///
+    /// * **Detached `cp serve` subprocess runs** — the connector's
+    ///   `pause_run` additionally writes the pause marker
+    ///   ([`set_pause_marker`](Self::set_pause_marker)). The `rupu workflow
+    ///   run <id>` subprocess polls
+    ///   [`pause_marker_path`](Self::pause_marker_path) (~every 250ms) and
+    ///   trips its [`OrchestratorRunOpts::pause`](crate::runner::OrchestratorRunOpts::pause)
+    ///   token, so the T2/T3 machinery stops the stream / lets the in-flight
+    ///   tool finish / checkpoints at the next safe boundary. The subprocess
+    ///   then re-writes the record as `Paused` with `runner_pid = None` — it
+    ///   does **not** overwrite `Paused` with a terminal status.
+    /// * **`InProcessExecutor`-driven runs (rupu-app)** — receive the live
+    ///   cooperative signal directly via `WorkflowExecutor::pause`, whose
+    ///   token is threaded into `run_workflow` (no marker needed).
+    ///
+    /// Both paths genuinely interrupt at the next safe boundary.
+    pub fn pause(
+        &self,
+        run_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), PauseError> {
+        let mut record = self.load(run_id).map_err(|e| match e {
+            RunStoreError::NotFound(s) => PauseError::NotFound(s),
+            other => PauseError::Store(other.to_string()),
+        })?;
+        match record.status {
+            RunStatus::Completed
+            | RunStatus::Failed
+            | RunStatus::Rejected
+            | RunStatus::Cancelled => return Err(PauseError::AlreadyTerminal(record.status)),
+            RunStatus::Paused | RunStatus::AwaitingApproval => {
+                return Err(PauseError::NotRunning(record.status))
+            }
+            RunStatus::Pending | RunStatus::Running => {}
+        }
+        record.status = RunStatus::Paused;
+        record.awaiting_step_id = record.active_step_id.clone();
+        record.awaiting_since = Some(now);
+        self.update(&record)
+            .map_err(|e| PauseError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    fn paused_seed_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("paused_seed.json")
+    }
+
+    /// Persist the seed transcript for a run that paused mid-step
+    /// (`PauseReason::Manual` landing inside a linear step's agent turn).
+    /// A sidecar file (like `unit_checkpoints.jsonl`) rather than a
+    /// `RunRecord` field, so adding it doesn't ripple through every
+    /// `RunRecord { .. }` struct literal in the workspace. Written by
+    /// `run_workflow`'s pause checkpoint; read + cleared by the resume
+    /// path (`rupu workflow resume`) so the resumed run re-seeds the exact
+    /// paused step instead of re-running it from scratch.
+    pub fn write_paused_seed(&self, run_id: &str, seed: &[Message]) -> Result<(), RunStoreError> {
+        write_atomic(&self.paused_seed_path(run_id), &serde_json::to_vec(seed)?)?;
+        Ok(())
+    }
+
+    /// Read a persisted paused-step seed. Returns an empty `Vec` (not an
+    /// error) when no sidecar file exists — the common case for a
+    /// step-boundary pause or a run that never paused mid-step.
+    pub fn read_paused_seed(&self, run_id: &str) -> Result<Vec<Message>, RunStoreError> {
+        let path = self.paused_seed_path(run_id);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let body = std::fs::read(&path)?;
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    /// Best-effort remove the paused-step seed sidecar (idempotent — a
+    /// missing file is not an error). Called once the seed has been
+    /// consumed by a resume, and defensively when a run reaches a terminal
+    /// state, so a later unrelated pause never sees a stale seed.
+    pub fn clear_paused_seed(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let path = self.paused_seed_path(run_id);
+        if path.is_file() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    /// Path to the cooperative pause marker for a run: `<run_dir>/.pause`.
+    ///
+    /// This is the delivery channel for pausing a *detached* run process
+    /// (the `rupu workflow run <id>` subprocess `cp serve` launches). That
+    /// process cannot receive the executor's in-memory pause token, so it
+    /// polls this marker instead: when the file appears it trips its own
+    /// [`OrchestratorRunOpts::pause`](crate::runner::OrchestratorRunOpts::pause)
+    /// token, which the T2/T3 cooperative-pause machinery honors at the next
+    /// safe boundary. `RunStore` only *exposes the path* (and thin
+    /// write/clear/exists helpers) — the poller that consumes it lives in
+    /// the CLI, keeping the orchestrator ignorant of the file mechanism.
+    pub fn pause_marker_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join(".pause")
+    }
+
+    /// Write the pause marker so a detached run process cooperatively pauses
+    /// at its next safe boundary. Idempotent (re-writing an existing marker
+    /// is fine).
+    pub fn set_pause_marker(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let path = self.pause_marker_path(run_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, b"")?;
+        Ok(())
+    }
+
+    /// Remove the pause marker (idempotent — a missing marker is not an
+    /// error). Called at resume/re-launch so a resumed run does not
+    /// immediately re-pause, and defensively when a run reaches a terminal
+    /// state.
+    pub fn clear_pause_marker(&self, run_id: &str) -> Result<(), RunStoreError> {
+        let path = self.pause_marker_path(run_id);
+        if path.is_file() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    /// True when the pause marker is present for this run.
+    pub fn pause_marker_exists(&self, run_id: &str) -> bool {
+        self.pause_marker_path(run_id).is_file()
+    }
+}
+
+/// Errors produced by [`RunStore::pause`].
+#[derive(Debug, thiserror::Error)]
+pub enum PauseError {
+    /// The run is already in a terminal state and cannot be paused.
+    #[error("run is already terminal (`{}`)", .0.as_str())]
+    AlreadyTerminal(RunStatus),
+    /// The run isn't currently running (already paused, or awaiting a
+    /// human approval decision) — nothing to cooperatively interrupt.
+    #[error("run is `{}`; only a running run can be paused", .0.as_str())]
+    NotRunning(RunStatus),
+    #[error("run not found: {0}")]
+    NotFound(String),
+    #[error("store: {0}")]
+    Store(String),
 }
 
 /// True when `pid` names a live process on this machine. Shells out to
 /// `/bin/kill -0` (the no-op signal): exit 0 means the process exists.
-fn pid_is_running(pid: u32) -> bool {
+///
+/// Exposed so the duplicate-execution guard on the resume path
+/// (`rupu workflow resume` / the CP resume worker) can refuse to spawn a
+/// second process while a run's recorded `runner_pid` is still live.
+pub fn pid_is_running(pid: u32) -> bool {
     std::process::Command::new("/bin/kill")
         .arg("-0")
         .arg(pid.to_string())
@@ -1286,6 +1477,16 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use tempfile::TempDir;
+
+    #[test]
+    fn paused_status_serializes_and_is_non_terminal() {
+        assert_eq!(RunStatus::Paused.as_str(), "paused");
+        // round-trip through the record's serde
+        let j = serde_json::to_string(&RunStatus::Paused).unwrap();
+        let back: RunStatus = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, RunStatus::Paused);
+        assert!(!RunStatus::Paused.is_terminal());
+    }
 
     fn sample_record(id: &str) -> RunRecord {
         RunRecord {
@@ -1838,6 +2039,177 @@ mod tests {
     }
 
     #[test]
+    fn request_resume_approval_accepts_paused_status() {
+        // T4: the manual-pause resume path (`POST /api/runs/:id/resume`,
+        // `LocalHostConnector::resume_run`) reuses this same marker-only
+        // method for a `Paused` run, not just `AwaitingApproval`.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_resume_paused");
+        rec.status = RunStatus::Paused;
+        rec.awaiting_step_id = Some("build".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let now = Utc::now();
+        let decision = store
+            .request_resume_approval(&rec.id, "web", None, now)
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Approved {
+                run_id: rec.id.clone(),
+                step_id: "build".into(),
+            }
+        );
+
+        let reloaded = store.load(&rec.id).unwrap();
+        // Marker-only: status stays Paused; only the resume marker is added.
+        assert_eq!(reloaded.status, RunStatus::Paused);
+        assert_eq!(reloaded.resume_requested_at, Some(now));
+    }
+
+    #[test]
+    fn request_resume_approval_accepts_paused_status_without_awaiting_step_id() {
+        // An externally-triggered pause (`RunStore::pause`) may not know a
+        // specific step id. Unlike the `AwaitingApproval` case (which hard-
+        // errors on a missing `awaiting_step_id` — that would mean a
+        // corrupt record), a `Paused` run with none falls back to an empty
+        // step id rather than erroring — the resume path doesn't need it.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_resume_paused_nostep");
+        rec.status = RunStatus::Paused;
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let decision = store
+            .request_resume_approval(&rec.id, "web", None, Utc::now())
+            .unwrap();
+        assert_eq!(
+            decision,
+            ApprovalDecision::Approved {
+                run_id: rec.id.clone(),
+                step_id: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn pause_marks_running_as_paused() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_pause_running");
+        rec.status = RunStatus::Running;
+        rec.active_step_id = Some("build".into());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        store.pause(&rec.id, Utc::now()).unwrap();
+
+        let reloaded = store.load(&rec.id).unwrap();
+        assert_eq!(reloaded.status, RunStatus::Paused);
+        // Best-effort observability: the active step is copied over.
+        assert_eq!(reloaded.awaiting_step_id.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn pause_rejects_terminal_run() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let mut rec = sample_record("run_pause_done");
+        rec.status = RunStatus::Completed;
+        rec.finished_at = Some(Utc::now());
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        let err = store.pause(&rec.id, Utc::now()).unwrap_err();
+        assert!(matches!(
+            err,
+            PauseError::AlreadyTerminal(RunStatus::Completed)
+        ));
+    }
+
+    #[test]
+    fn pause_rejects_already_paused_or_awaiting() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+
+        let mut paused = sample_record("run_pause_twice");
+        paused.status = RunStatus::Paused;
+        store.create(paused.clone(), SAMPLE_YAML).unwrap();
+        assert!(matches!(
+            store.pause(&paused.id, Utc::now()).unwrap_err(),
+            PauseError::NotRunning(RunStatus::Paused)
+        ));
+
+        let mut awaiting = sample_record("run_pause_awaiting");
+        awaiting.status = RunStatus::AwaitingApproval;
+        store.create(awaiting.clone(), SAMPLE_YAML).unwrap();
+        assert!(matches!(
+            store.pause(&awaiting.id, Utc::now()).unwrap_err(),
+            PauseError::NotRunning(RunStatus::AwaitingApproval)
+        ));
+    }
+
+    #[test]
+    fn paused_seed_round_trips_through_disk() {
+        // The crux of T4: a mid-step manual pause's seed transcript must
+        // survive a process restart (the CP-driven resume worker spawns a
+        // FRESH `rupu workflow resume` subprocess) so the resume can
+        // reconstruct `ResumeState::paused_step` from disk, not memory.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_seed");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        // No sidecar written yet — reads back empty, not an error.
+        assert!(store.read_paused_seed(&rec.id).unwrap().is_empty());
+
+        let seed = vec![
+            Message::user("do the thing"),
+            Message::assistant("working on it"),
+            Message::tool_result("toolu_1", "partial output", false),
+        ];
+        store.write_paused_seed(&rec.id, &seed).unwrap();
+
+        let reloaded = store.read_paused_seed(&rec.id).unwrap();
+        assert_eq!(reloaded.len(), seed.len());
+        assert_eq!(reloaded[0].role, seed[0].role);
+
+        store.clear_paused_seed(&rec.id).unwrap();
+        assert!(store.read_paused_seed(&rec.id).unwrap().is_empty());
+        // Clearing an already-cleared (or never-written) seed is a no-op,
+        // not an error.
+        store.clear_paused_seed(&rec.id).unwrap();
+    }
+
+    #[test]
+    fn pause_marker_round_trips_through_disk() {
+        // The delivery channel for a *detached* run process (T4): `cp
+        // serve`'s `pause_run` writes the marker, and the CLI's poller
+        // (`spawn_pause_marker_poller`) watches `pause_marker_exists` to
+        // trip its own cancellation token. Exercise the write/exists/clear
+        // cycle directly against disk.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_pause_marker");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        assert!(!store.pause_marker_exists(&rec.id));
+        assert!(!store.pause_marker_path(&rec.id).exists());
+
+        store.set_pause_marker(&rec.id).unwrap();
+        assert!(store.pause_marker_exists(&rec.id));
+        assert!(store.pause_marker_path(&rec.id).is_file());
+
+        store.clear_pause_marker(&rec.id).unwrap();
+        assert!(!store.pause_marker_exists(&rec.id));
+
+        // Clearing an already-cleared (or never-written) marker is a
+        // no-op, not an error — the poller and the resume path both call
+        // this defensively without checking existence first.
+        store.clear_pause_marker(&rec.id).unwrap();
+        assert!(!store.pause_marker_exists(&rec.id));
+    }
+
+    #[test]
     fn list_pending_resume_filters_on_marker_and_lease() {
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
@@ -1880,6 +2252,31 @@ mod tests {
         let mut ids_later: Vec<&str> = pending_later.iter().map(|r| r.id.as_str()).collect();
         ids_later.sort();
         assert_eq!(ids_later, vec!["run_fresh_claim", "run_marked"]);
+    }
+
+    #[test]
+    fn list_pending_resume_also_includes_marked_paused_runs() {
+        // T4: a manual-pause resume request (`POST /api/runs/:id/resume`)
+        // marks a `Paused` run the exact same way an approval resume marks
+        // an `AwaitingApproval` one — the worker's `list_pending_resume`
+        // poll must surface both so it can dispatch the right subcommand.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let now = Utc::now();
+
+        let mut paused = sample_record("run_paused_marked");
+        paused.status = RunStatus::Paused;
+        paused.resume_requested_at = Some(now);
+        store.create(paused, SAMPLE_YAML).unwrap();
+
+        // A Paused run with NO marker is still excluded (marker-gated).
+        let mut paused_unmarked = sample_record("run_paused_unmarked");
+        paused_unmarked.status = RunStatus::Paused;
+        store.create(paused_unmarked, SAMPLE_YAML).unwrap();
+
+        let pending = store.list_pending_resume(now).unwrap();
+        let ids: Vec<&str> = pending.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["run_paused_marked"]);
     }
 
     #[test]
@@ -2189,10 +2586,7 @@ mod tests {
         assert_eq!(back.step_id, "scan_each");
 
         // None host: field is absent from JSON (skip_serializing_if).
-        let cp_local = UnitCheckpoint {
-            host: None,
-            ..cp
-        };
+        let cp_local = UnitCheckpoint { host: None, ..cp };
         let val_local = serde_json::to_value(&cp_local).expect("serialize local");
         assert!(
             val_local.get("host").is_none(),

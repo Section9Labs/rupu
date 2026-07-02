@@ -18,6 +18,7 @@ import {
   Clock,
   Loader2,
   Pause,
+  PauseCircle,
   SkipForward,
   XCircle,
   XOctagon,
@@ -32,6 +33,7 @@ export type StatusKey =
   | 'completed'
   | 'failed'
   | 'awaiting_approval'
+  | 'paused'
   | 'rejected'
   | 'cancelled'
   | 'skipped';
@@ -93,6 +95,17 @@ export const STATUS: Record<StatusKey, StatusDescriptor> = {
     dotClass: 'bg-status-awaiting',
     pillClass: 'bg-status-awaiting/10 text-status-awaiting ring-status-awaiting/30',
   },
+  // Distinct icon + color from `awaiting_approval` — a paused run is a
+  // deliberate operator pause mid-run (resumes from checkpoint), not a run
+  // blocked on an approval decision.
+  paused: {
+    label: 'Paused',
+    hex: '#06b6d4',
+    tint: '#ecfeff',
+    icon: PauseCircle,
+    dotClass: 'bg-status-paused',
+    pillClass: 'bg-status-paused/10 text-status-paused ring-status-paused/30',
+  },
   rejected: {
     label: 'Rejected',
     hex: '#ef4444',
@@ -127,6 +140,7 @@ export type StepStateInput =
   | 'pending'
   | 'running'
   | 'awaiting_approval'
+  | 'paused'
   | 'done'
   | 'completed'
   | 'failed'

@@ -292,6 +292,7 @@ impl StepFactory for DefaultStepFactory {
             surface_tag: Some("workflow".to_string()),
             context_window_tokens: spec.context_window_tokens,
             compact_at_percent: spec.compact_at_percent,
+            pause: None,
         }
     }
 }

@@ -31,8 +31,9 @@ pub use generate::{
 };
 pub use runner::{
     read_final_assistant_text, resolve_inputs, run_workflow, AwaitingInfo, Finding, ItemResult,
-    OrchestratorRunOpts, OrchestratorRunResult, ResumeState, RunWorkflowError, StepFactory,
-    StepResult, UnitDispatch, UnitDispatcher, UnitOutcome, WorkspaceConflict, WorkspaceDelta,
+    OrchestratorRunOpts, OrchestratorRunResult, PauseReason, PausedStep, ResumeState,
+    RunWorkflowError, StepFactory, StepResult, UnitDispatch, UnitDispatcher, UnitOutcome,
+    WorkspaceConflict, WorkspaceDelta,
 };
 pub use runs::{
     ApprovalDecision, ApprovalError, FindingRecord, ItemResultRecord, RunRecord, RunStatus,

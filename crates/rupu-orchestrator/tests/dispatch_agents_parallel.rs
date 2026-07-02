@@ -216,6 +216,7 @@ impl StepFactory for ParallelFactory {
             surface_tag: None,
             context_window_tokens: None,
             compact_at_percent: None,
+            pause: None,
         }
     }
 }
@@ -256,7 +257,8 @@ async fn parent_step_fans_out_two_children_and_aggregates() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     let res = run_workflow(opts).await.expect("workflow runs");
     assert_eq!(res.step_results.len(), 1);
@@ -313,7 +315,8 @@ async fn one_child_failure_marks_all_succeeded_false_but_parent_continues() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     let res = run_workflow(opts).await.expect("workflow runs");
     let step = &res.step_results[0];
@@ -362,7 +365,8 @@ async fn allowlist_violation_blocks_dispatch_at_the_parallel_layer() {
         strict_templates: false,
         event_sink: None,
                 unit_dispatcher: None,
-    };
+                pause: None,
+            };
 
     run_workflow(opts).await.expect("workflow runs");
 

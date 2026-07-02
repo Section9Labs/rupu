@@ -53,6 +53,7 @@ export default {
           completed: 'rgb(var(--c-status-completed) / <alpha-value>)',
           failed:    'rgb(var(--c-status-failed) / <alpha-value>)',
           awaiting:  'rgb(var(--c-status-awaiting) / <alpha-value>)',
+          paused:    'rgb(var(--c-status-paused) / <alpha-value>)',
           pending:   'rgb(var(--c-status-pending) / <alpha-value>)',
           skipped:   'rgb(var(--c-status-skipped) / <alpha-value>)',
           cancelled: 'rgb(var(--c-status-cancelled) / <alpha-value>)',
