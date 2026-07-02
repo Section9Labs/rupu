@@ -409,6 +409,14 @@ pub struct AwaitingInfo {
     /// from where the agent left off. Empty for approval and step-boundary
     /// pauses (nothing to seed — the step runs fresh / was fully completed).
     pub resume_seed: Vec<Message>,
+    /// Units of the paused fan-out (`for_each`/`distribute:`) step that
+    /// SUCCEEDED before the pause landed (merged with any units already
+    /// replayed from an earlier resume). Keyed by 0-based unit index. The
+    /// caller round-trips this into `ResumeState::completed_units[step_id]`
+    /// so the resumed run re-dispatches ONLY the paused / not-yet-started
+    /// units. Empty for every pause shape except a manual pause that landed
+    /// mid-fan-out.
+    pub fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
 }
 
 /// Caller-supplied resume context. When `OrchestratorRunOpts.resume_from`
@@ -659,6 +667,7 @@ pub async fn run_workflow(
                 timeout_seconds,
                 reason,
                 seed,
+                fanout_completed_units,
             }) => {
                 let now = chrono::Utc::now();
                 // Approval → non-terminal `AwaitingApproval` (existing shape).
@@ -697,6 +706,7 @@ pub async fn run_workflow(
                     expires_at: record.expires_at,
                     reason: *reason,
                     resume_seed: seed.clone(),
+                    fanout_completed_units: fanout_completed_units.clone(),
                 });
             }
             Err(e) => {
@@ -722,6 +732,7 @@ pub async fn run_workflow(
         timeout_seconds,
         reason,
         seed,
+        fanout_completed_units,
     }) = &outcome
     {
         // No store but the run paused (approval gate or manual pause) — surface
@@ -734,6 +745,7 @@ pub async fn run_workflow(
             expires_at,
             reason: *reason,
             resume_seed: seed.clone(),
+            fanout_completed_units: fanout_completed_units.clone(),
         });
     }
 
@@ -819,6 +831,22 @@ enum LinearStepOutcome {
     },
 }
 
+/// Outcome of a distributed fan-out (`for_each:` / `distribute:`) step: it
+/// either completed (every unit dispatched — success, tolerated failure, or
+/// replayed from a prior checkpoint) or paused MID-FAN-OUT (the cooperative
+/// pause token fired while units were still in flight). The paused arm
+/// carries every unit that already succeeded (freshly dispatched this pass
+/// plus any replayed from an earlier resume) so the next resume re-dispatches
+/// ONLY the paused / not-yet-started units — never a unit that already has a
+/// good result.
+enum FanoutStepOutcome {
+    Completed(StepResult),
+    Paused {
+        step_id: String,
+        completed_units: std::collections::BTreeMap<usize, ItemResult>,
+    },
+}
+
 /// Split a paused agent's seed transcript into `(initial_messages, user_message)`
 /// for a resumed [`run_agent`].
 ///
@@ -864,6 +892,10 @@ enum InnerOutcome {
         /// paused-incomplete linear step's `final_messages`). Empty for
         /// approval and step-boundary pauses.
         seed: Vec<Message>,
+        /// Units of a paused fan-out step that already succeeded (see
+        /// [`AwaitingInfo::fanout_completed_units`]). Empty except for a
+        /// manual pause that landed mid-fan-out.
+        fanout_completed_units: std::collections::BTreeMap<usize, ItemResult>,
     },
 }
 
@@ -922,6 +954,7 @@ async fn run_steps_inner(
                 timeout_seconds: None,
                 reason: PauseReason::Manual,
                 seed: Vec::new(),
+                fanout_completed_units: std::collections::BTreeMap::new(),
             });
         }
 
@@ -1014,6 +1047,7 @@ async fn run_steps_inner(
                     timeout_seconds: approval.timeout_seconds,
                     reason: PauseReason::Approval,
                     seed: Vec::new(),
+                    fanout_completed_units: std::collections::BTreeMap::new(),
                 });
             }
         }
@@ -1054,11 +1088,44 @@ async fn run_steps_inner(
         } else if step.parallel.is_some() {
             run_parallel_step(step, &ctx, opts, effective_continue_on_error).await
         } else if step.for_each.is_some() {
-            run_fanout_step(run_id, step, &ctx, opts, effective_continue_on_error).await
+            // A distributed fan-out honors the cooperative pause token
+            // MID-UNIT (not just at the step boundary): a paused-incomplete
+            // fan-out unwinds here carrying the units that already succeeded,
+            // so the resumed run re-dispatches only the paused / not-yet-
+            // started ones.
+            match run_fanout_step(run_id, step, &ctx, opts, effective_continue_on_error).await {
+                Ok(FanoutStepOutcome::Paused {
+                    step_id,
+                    completed_units,
+                }) => {
+                    info!(step = %step_id, "cooperative pause mid-fan-out");
+                    if let Some(sink) = opts.event_sink.as_ref() {
+                        sink.emit(
+                            run_id,
+                            &crate::executor::Event::StepPaused {
+                                run_id: run_id.to_string(),
+                                step_id: step_id.clone(),
+                            },
+                        );
+                    }
+                    clear_active_step(opts, run_id, &step.id);
+                    return Ok(InnerOutcome::Paused {
+                        step_id,
+                        prompt: String::new(),
+                        timeout_seconds: None,
+                        reason: PauseReason::Manual,
+                        seed: Vec::new(),
+                        fanout_completed_units: completed_units,
+                    });
+                }
+                Ok(FanoutStepOutcome::Completed(sr)) => Ok(sr),
+                Err(e) => Err(e),
+            }
         } else {
-            // The linear path is the only shape that pauses mid-step (its agent
-            // run carries the cooperative pause token). A paused-incomplete step
-            // unwinds here into a manual-pause checkpoint carrying the seed.
+            // The linear path is the only other shape that pauses mid-step
+            // (its agent run carries the cooperative pause token). A
+            // paused-incomplete step unwinds here into a manual-pause
+            // checkpoint carrying the seed.
             match run_linear_step(run_id, step, &ctx, opts, effective_continue_on_error).await {
                 Ok(LinearStepOutcome::Paused { step_id, seed }) => {
                     info!(step = %step_id, "cooperative pause mid-step");
@@ -1078,6 +1145,7 @@ async fn run_steps_inner(
                         timeout_seconds: None,
                         reason: PauseReason::Manual,
                         seed,
+                        fanout_completed_units: std::collections::BTreeMap::new(),
                     });
                 }
                 Ok(LinearStepOutcome::Completed(sr)) => Ok(sr),
@@ -1531,7 +1599,7 @@ async fn run_fanout_step(
     ctx: &StepContext,
     opts: &OrchestratorRunOpts,
     continue_on_error: bool,
-) -> Result<StepResult, RunWorkflowError> {
+) -> Result<FanoutStepOutcome, RunWorkflowError> {
     let for_each_expr = step
         .for_each
         .as_ref()
@@ -1545,7 +1613,7 @@ async fn run_fanout_step(
 
     if items.is_empty() {
         info!(step = %step.id, "for_each rendered to an empty list; recording as success with no items");
-        return Ok(StepResult {
+        return Ok(FanoutStepOutcome::Completed(StepResult {
             step_id: step.id.clone(),
             rendered_prompt: String::new(),
             run_id: String::new(),
@@ -1556,7 +1624,7 @@ async fn run_fanout_step(
             kind: crate::runs::StepKind::ForEach,
             items: Vec::new(),
             ..Default::default()
-        });
+        }));
     }
 
     let max_parallel = step.max_parallel.unwrap_or(1).max(1) as usize;
@@ -1657,6 +1725,13 @@ async fn run_fanout_step(
     let distribute_hosts: Option<Vec<String>> = step.distribute.as_ref().map(|d| d.hosts.clone());
     // Clone the dispatcher Arc once; each spawned task gets its own ref.
     let unit_dispatcher = opts.unit_dispatcher.clone();
+    // Cooperative pause token, cloned once; each spawned task gets its own
+    // handle. Threaded into the LOCAL agent dispatch below so an in-flight
+    // unit honors it mid-turn (same mechanism as a linear step's agent —
+    // see T2). Checked again after each unit acquires its semaphore permit
+    // so a unit that hasn't started yet is never dispatched (local OR
+    // remote) once a pause has landed.
+    let unit_pause = opts.pause.clone();
     let mut handles = Vec::with_capacity(total);
     for (idx, item_value, rendered, run_id, transcript_path) in prepared {
         // Compute host placement for this unit. `None` → local inline path
@@ -1689,6 +1764,7 @@ async fn run_fanout_step(
         let unit_key = fanout_unit_key(&item_value);
         let unit_agent = agent_name_root.clone();
         let dispatcher_for_task = unit_dispatcher.clone();
+        let pause_for_task = unit_pause.clone();
         // Workspace path forwarded to the remote unit when sync mode is active.
         // None ⇒ self-contained; Some ⇒ unit mounts this path and returns a delta.
         let unit_workspace_path = sync.then(|| opts.workspace_path.clone());
@@ -1704,6 +1780,34 @@ async fn run_fanout_step(
             // branch consumes it, so both events and FanoutItemOutcome
             // carry the same host attribution.
             let placement_host = placement.clone();
+
+            // Cooperative pause, checked the instant this unit's semaphore
+            // permit is granted — i.e. BEFORE any work (local or remote) is
+            // dispatched. A unit that hasn't started is never a "safe
+            // boundary" problem: skip it outright so `run_fanout_step` can
+            // report it as not-yet-started and the next resume redispatches
+            // it fresh. Units already past this check when the pause lands
+            // keep running to their own safe boundary (a local unit's agent
+            // loop honors the SAME token mid-turn; a remote unit — no
+            // cancellation channel exists over the wire — runs to
+            // completion, which is its safe boundary).
+            if pause_triggered(&pause_for_task) {
+                return FanoutItemOutcome {
+                    idx,
+                    item: item_value,
+                    rendered_prompt: rendered,
+                    run_id,
+                    transcript_path,
+                    output: String::new(),
+                    success: false,
+                    error: None,
+                    raw_error: None,
+                    host: placement_host,
+                    workspace_delta: None,
+                    paused: true,
+                };
+            }
+
             if let Some(sink) = event_sink.as_ref() {
                 sink.emit(
                     &workflow_run_id,
@@ -1720,142 +1824,185 @@ async fn run_fanout_step(
             }
 
             // Branch: remote (placed) vs local (inline) path.
-            let (output, success, error_str, raw_error, workspace_delta) = if let Some(host) =
-                placement
-            {
-                // --- Remote dispatch path ---
-                //
-                // `distribute:` requires a `UnitDispatcher`. Its absence is a
-                // configuration error — the caller must supply one when running
-                // a workflow with `distribute:`.
-                match dispatcher_for_task {
-                    None => {
-                        let err = RunError::Provider(
-                            "distribute requires fleet access — run via the CP".into(),
-                        );
-                        let msg = err.to_string();
-                        // Minor 3: reuse `msg` instead of duplicating the literal.
-                        (msg.clone(), false, Some(msg), Some(err), None)
-                    }
-                    Some(dispatcher) => {
-                        let unit = UnitDispatch {
-                            step_id: step_id.clone(),
-                            agent: agent_name.clone(),
-                            rendered_prompt: rendered_clone.clone(),
-                            index: idx,
-                            run_id: run_id_clone.clone(),
-                            workspace_path: unit_workspace_path.clone(),
-                        };
-                        match dispatcher.dispatch_unit(unit, &host).await {
-                            Ok(outcome) => {
-                                // Important fix: when the agent ran but failed
-                                // (success=false), synthesize a raw_error so
-                                // the continue_on_error:false abort below fires
-                                // — symmetric with the local Err path.
-                                let err_str = outcome.error.clone();
-                                let raw = if !outcome.success {
-                                    Some(RunError::Provider(
-                                        outcome
-                                            .error
-                                            .clone()
-                                            .unwrap_or_else(|| "remote unit failed".into()),
-                                    ))
-                                } else {
-                                    None
-                                };
-                                let ws_delta = outcome.workspace_delta;
-                                (outcome.output, outcome.success, err_str, raw, ws_delta)
-                            }
-                            Err(first_err) => {
-                                // Reassign once to the next host and retry.
-                                let retry_host = fallback_host.as_deref().unwrap_or(&host);
-                                let retry_unit = UnitDispatch {
-                                    step_id: step_id.clone(),
-                                    agent: agent_name.clone(),
-                                    rendered_prompt: rendered_clone.clone(),
-                                    index: idx,
-                                    run_id: run_id_clone.clone(),
-                                    workspace_path: unit_workspace_path.clone(),
-                                };
-                                warn!(
-                                    step = %step_id,
-                                    index = idx,
-                                    host = %host,
-                                    retry = %retry_host,
-                                    error = %first_err,
-                                    "unit dispatch failed; retrying on next host"
-                                );
-                                match dispatcher.dispatch_unit(retry_unit, retry_host).await {
-                                    Ok(outcome) => {
-                                        // Same fix as primary path: synthesize
-                                        // raw_error for a failed-but-Ok outcome.
-                                        let err_str = outcome.error.clone();
-                                        let raw = if !outcome.success {
-                                            Some(RunError::Provider(
-                                                outcome
-                                                    .error
-                                                    .clone()
-                                                    .unwrap_or_else(|| "remote unit failed".into()),
-                                            ))
-                                        } else {
-                                            None
-                                        };
-                                        let ws_delta = outcome.workspace_delta;
-                                        (outcome.output, outcome.success, err_str, raw, ws_delta)
-                                    }
-                                    Err(second_err) => {
-                                        let msg = second_err.to_string();
-                                        (msg.clone(), false, Some(msg), Some(second_err), None)
+            let (output, success, error_str, raw_error, workspace_delta, paused) =
+                if let Some(host) = placement {
+                    // --- Remote dispatch path ---
+                    //
+                    // `distribute:` requires a `UnitDispatcher`. Its absence is a
+                    // configuration error — the caller must supply one when running
+                    // a workflow with `distribute:`.
+                    match dispatcher_for_task {
+                        None => {
+                            let err = RunError::Provider(
+                                "distribute requires fleet access — run via the CP".into(),
+                            );
+                            let msg = err.to_string();
+                            // Minor 3: reuse `msg` instead of duplicating the literal.
+                            (msg.clone(), false, Some(msg), Some(err), None, false)
+                        }
+                        Some(dispatcher) => {
+                            let unit = UnitDispatch {
+                                step_id: step_id.clone(),
+                                agent: agent_name.clone(),
+                                rendered_prompt: rendered_clone.clone(),
+                                index: idx,
+                                run_id: run_id_clone.clone(),
+                                workspace_path: unit_workspace_path.clone(),
+                            };
+                            match dispatcher.dispatch_unit(unit, &host).await {
+                                Ok(outcome) => {
+                                    // Important fix: when the agent ran but failed
+                                    // (success=false), synthesize a raw_error so
+                                    // the continue_on_error:false abort below fires
+                                    // — symmetric with the local Err path.
+                                    let err_str = outcome.error.clone();
+                                    let raw = if !outcome.success {
+                                        Some(RunError::Provider(
+                                            outcome
+                                                .error
+                                                .clone()
+                                                .unwrap_or_else(|| "remote unit failed".into()),
+                                        ))
+                                    } else {
+                                        None
+                                    };
+                                    let ws_delta = outcome.workspace_delta;
+                                    (
+                                        outcome.output,
+                                        outcome.success,
+                                        err_str,
+                                        raw,
+                                        ws_delta,
+                                        false,
+                                    )
+                                }
+                                Err(first_err) => {
+                                    // Reassign once to the next host and retry.
+                                    let retry_host = fallback_host.as_deref().unwrap_or(&host);
+                                    let retry_unit = UnitDispatch {
+                                        step_id: step_id.clone(),
+                                        agent: agent_name.clone(),
+                                        rendered_prompt: rendered_clone.clone(),
+                                        index: idx,
+                                        run_id: run_id_clone.clone(),
+                                        workspace_path: unit_workspace_path.clone(),
+                                    };
+                                    warn!(
+                                        step = %step_id,
+                                        index = idx,
+                                        host = %host,
+                                        retry = %retry_host,
+                                        error = %first_err,
+                                        "unit dispatch failed; retrying on next host"
+                                    );
+                                    match dispatcher.dispatch_unit(retry_unit, retry_host).await {
+                                        Ok(outcome) => {
+                                            // Same fix as primary path: synthesize
+                                            // raw_error for a failed-but-Ok outcome.
+                                            let err_str = outcome.error.clone();
+                                            let raw = if !outcome.success {
+                                                Some(RunError::Provider(
+                                                    outcome.error.clone().unwrap_or_else(|| {
+                                                        "remote unit failed".into()
+                                                    }),
+                                                ))
+                                            } else {
+                                                None
+                                            };
+                                            let ws_delta = outcome.workspace_delta;
+                                            (
+                                                outcome.output,
+                                                outcome.success,
+                                                err_str,
+                                                raw,
+                                                ws_delta,
+                                                false,
+                                            )
+                                        }
+                                        Err(second_err) => {
+                                            let msg = second_err.to_string();
+                                            (
+                                                msg.clone(),
+                                                false,
+                                                Some(msg),
+                                                Some(second_err),
+                                                None,
+                                                false,
+                                            )
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-            } else {
-                // --- Existing local (inline) path — UNCHANGED ---
-                let outcome = dispatch_one(
-                    &factory,
-                    &step_id,
-                    &agent_name,
-                    rendered_clone.clone(),
-                    run_id_clone.clone(),
-                    workspace_id,
-                    workspace_path,
-                    transcript_clone.clone(),
-                    None,
-                    // Fan-out units don't carry the pause token — they pause at
-                    // the step boundary (see run_steps_inner), not mid-unit.
-                    None,
-                    None,
-                )
-                .await;
-                let (suc, err_str, raw) = match outcome {
-                    Ok(_) => (true, None, None),
-                    Err(e) => (false, Some(e.to_string()), Some(e)),
+                } else {
+                    // --- Local (inline) path ---
+                    //
+                    // The pause token IS threaded through here (unlike the
+                    // pre-T6 shape): a local unit's agent loop honors it
+                    // cooperatively mid-turn (same primitive a linear step's
+                    // agent uses — see T2), so an in-flight local unit
+                    // genuinely pauses instead of running to completion.
+                    let outcome = dispatch_one(
+                        &factory,
+                        &step_id,
+                        &agent_name,
+                        rendered_clone.clone(),
+                        run_id_clone.clone(),
+                        workspace_id,
+                        workspace_path,
+                        transcript_clone.clone(),
+                        None,
+                        pause_for_task.clone(),
+                        None,
+                    )
+                    .await;
+                    match outcome {
+                        // A cooperative pause landed mid-turn. Not a success,
+                        // not a failure — the unit is incomplete and must be
+                        // re-dispatched (fresh) on resume.
+                        Ok(rr) if rr.paused => (String::new(), false, None, None, None, true),
+                        Ok(_) => {
+                            let out = read_final_assistant_text(
+                                &transcript_clone,
+                                true,
+                                &run_id_clone,
+                                &step_id,
+                            );
+                            (out, true, None, None, None, false)
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            let out = read_final_assistant_text(
+                                &transcript_clone,
+                                false,
+                                &run_id_clone,
+                                &step_id,
+                            );
+                            (out, false, Some(msg), Some(e), None, false)
+                        }
+                    }
                 };
-                let out =
-                    read_final_assistant_text(&transcript_clone, suc, &run_id_clone, &step_id);
-                (out, suc, err_str, raw, None)
-            };
 
-            if let Some(sink) = event_sink.as_ref() {
-                // Tokens are not available from the dispatch result
-                // (`dispatch_one` returns `Result<()>`); emit 0 — the live
-                // view still tails the unit transcript for token deltas.
-                sink.emit(
-                    &workflow_run_id,
-                    &crate::executor::Event::UnitCompleted {
-                        run_id: workflow_run_id.clone(),
-                        step_id: step_id.clone(),
-                        index: idx,
-                        unit_key: unit_key.clone(),
-                        success,
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        host: placement_host.clone(),
-                    },
-                );
+            if !paused {
+                if let Some(sink) = event_sink.as_ref() {
+                    // Tokens are not available from the dispatch result
+                    // (`dispatch_one` returns `Result<()>`); emit 0 — the live
+                    // view still tails the unit transcript for token deltas.
+                    sink.emit(
+                        &workflow_run_id,
+                        &crate::executor::Event::UnitCompleted {
+                            run_id: workflow_run_id.clone(),
+                            step_id: step_id.clone(),
+                            index: idx,
+                            unit_key: unit_key.clone(),
+                            success,
+                            tokens_in: 0,
+                            tokens_out: 0,
+                            host: placement_host.clone(),
+                        },
+                    );
+                }
             }
             FanoutItemOutcome {
                 idx,
@@ -1869,6 +2016,7 @@ async fn run_fanout_step(
                 raw_error,
                 host: placement_host,
                 workspace_delta,
+                paused,
             }
         }));
     }
@@ -1892,16 +2040,21 @@ async fn run_fanout_step(
     }
     item_outcomes.sort_by_key(|o| o.idx);
 
-    // Persist every freshly-dispatched unit's checkpoint as soon as
-    // the fan-out's tasks have joined — BEFORE the `continue_on_error`
+    // Persist every freshly-dispatched, NON-PAUSED unit's checkpoint as soon
+    // as the fan-out's tasks have joined — BEFORE the `continue_on_error`
     // abort check below, so a crash/early-return mid-fan-out still
     // leaves the finished units (success AND failure) durable on disk
     // for `rupu workflow resume`. Replayed (`resumed`) units are
-    // already on disk from the prior run, so we don't re-append them.
-    // `workflow_run_id` is empty in the in-memory (no run-store) mode.
+    // already on disk from the prior run, so we don't re-append them. A
+    // paused unit (skipped outright, or cancelled mid-turn) did NOT
+    // finish — it gets no checkpoint entry, so a subsequent `read_unit_
+    // checkpoints` naturally omits it and the next resume redispatches it
+    // fresh (same "absent = incomplete" contract the existing failed-unit
+    // path already relies on). `workflow_run_id` is empty in the in-memory
+    // (no run-store) mode.
     if let Some(store) = &opts.run_store {
         if !workflow_run_id.is_empty() {
-            for o in &item_outcomes {
+            for o in item_outcomes.iter().filter(|o| !o.paused) {
                 let checkpoint = crate::runs::UnitCheckpoint {
                     step_id: step.id.clone(),
                     index: o.idx,
@@ -1920,10 +2073,11 @@ async fn run_fanout_step(
         }
     }
 
-    // Apply `continue_on_error`: if not set, the first failed item
-    // aborts the workflow. We surface the original RunError.
+    // Apply `continue_on_error`: if not set, the first REAL failure (not a
+    // paused unit — that's incomplete, not failed) aborts the workflow. We
+    // surface the original RunError.
     if !continue_on_error {
-        if let Some(failed) = item_outcomes.iter_mut().find(|o| !o.success) {
+        if let Some(failed) = item_outcomes.iter_mut().find(|o| !o.success && !o.paused) {
             if let Some(err) = failed.raw_error.take() {
                 return Err(RunWorkflowError::Agent {
                     step: format!("{}[{}]", step.id, failed.idx),
@@ -1931,6 +2085,44 @@ async fn run_fanout_step(
                 });
             }
         }
+    }
+
+    // Cooperative pause landed mid-fan-out: at least one unit was skipped
+    // outright (not yet started) or paused mid-turn. Stop here — don't
+    // aggregate a step result, don't apply sync workspace deltas (a
+    // `workspace: sync` step pausing mid-flight would otherwise silently
+    // drop the in-flight/not-yet-dispatched units' deltas, so it's refused
+    // instead, consistent with the existing step-boundary/checkpoint-resume
+    // guards for sync workflows). Report every unit that DID succeed this
+    // pass, merged with anything already replayed from an earlier resume,
+    // so the caller redispatches ONLY the paused / not-yet-started units.
+    if item_outcomes.iter().any(|o| o.paused) {
+        if sync {
+            return Err(RunWorkflowError::PauseWithWorkspaceSync);
+        }
+        let mut completed_units = resumed;
+        for o in &item_outcomes {
+            if o.paused || !o.success {
+                continue;
+            }
+            completed_units.insert(
+                o.idx,
+                ItemResult {
+                    index: o.idx,
+                    item: o.item.clone(),
+                    sub_id: String::new(),
+                    rendered_prompt: o.rendered_prompt.clone(),
+                    run_id: o.run_id.clone(),
+                    transcript_path: o.transcript_path.clone(),
+                    output: o.output.clone(),
+                    success: true,
+                },
+            );
+        }
+        return Ok(FanoutStepOutcome::Paused {
+            step_id: step.id.clone(),
+            completed_units,
+        });
     }
 
     // Merge freshly-dispatched outcomes with units replayed from a
@@ -1996,7 +2188,7 @@ async fn run_fanout_step(
         }
     }
 
-    Ok(StepResult {
+    Ok(FanoutStepOutcome::Completed(StepResult {
         step_id: step.id.clone(),
         // The for_each-rendered list of items doubles as the
         // top-level "rendered prompt" for audit purposes; per-item
@@ -2010,7 +2202,7 @@ async fn run_fanout_step(
         kind: crate::runs::StepKind::ForEach,
         items: items_vec,
         ..Default::default()
-    })
+    }))
 }
 
 /// Parallel step: render each sub-step's prompt against the same
@@ -2215,6 +2407,14 @@ struct FanoutItemOutcome {
     /// File-change set returned by a sync-mode unit. `None` for local
     /// (non-sync) units or when the unit returned no delta.
     workspace_delta: Option<WorkspaceDelta>,
+    /// `true` when this unit did NOT complete because a cooperative pause
+    /// landed — either it was skipped outright (pause already triggered when
+    /// its semaphore permit was granted, so it was never dispatched) or its
+    /// local agent loop paused mid-turn. `success` is always `false` when
+    /// this is `true`, but a paused unit is NOT a failure: it must be
+    /// excluded from the `continue_on_error` abort check and from the
+    /// on-disk checkpoint, and re-dispatched fresh on resume.
+    paused: bool,
 }
 
 /// Build the agent opts via the factory and dispatch one agent run.
@@ -4309,6 +4509,340 @@ steps:
                 msgs.iter().map(|m| &m.role).collect::<Vec<_>>()
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // T6 — distributed fan-out pause/resume (mid-unit)
+    // -----------------------------------------------------------------------
+
+    const WF_FANOUT_DISTRIBUTE_PAUSE: &str = r#"
+name: fanout-distribute-pause
+steps:
+  - id: process
+    for_each: "a\nb\nc"
+    agent: dummy
+    prompt: "Process {{ item }}"
+    max_parallel: 1
+    distribute:
+      hosts: [h1]
+"#;
+
+    /// Mirrors `resume_reruns_only_failed_fanout_units` (a real, disk-backed
+    /// `RunStore`) but for a `distribute:` fan-out paused MID-FLIGHT rather
+    /// than a unit that genuinely failed. `max_parallel: 1` plus
+    /// `CancelAfterFirstDispatcher` (already used above for the step-boundary
+    /// pause test) makes the ordering deterministic: the semaphore holds
+    /// unit 1's permit until unit 0's ENTIRE dispatch — including the
+    /// token cancellation — has returned, so unit 1 (and unit 2, behind it)
+    /// always observe the pause as already triggered before they're ever
+    /// dispatched.
+    #[tokio::test]
+    async fn distributed_fanout_pauses_mid_flight_and_resumes_only_incomplete_units() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::runs::RunStore::new(tmp.path().join("runs")));
+        let wf = Workflow::parse(WF_FANOUT_DISTRIBUTE_PAUSE).unwrap();
+
+        // --- Phase 1: pause mid-fan-out. ---
+        let token = CancellationToken::new();
+        let dispatcher1 = Arc::new(CancelAfterFirstDispatcher {
+            token: token.clone(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let sink1 = Arc::new(CollectingSink::default());
+        let opts1 = OrchestratorRunOpts {
+            workflow: wf.clone(),
+            inputs: BTreeMap::new(),
+            workspace_id: "ws_fanout_pause".into(),
+            workspace_path: tmp.path().to_path_buf(),
+            transcript_dir: tmp.path().join("transcripts"),
+            factory: Arc::new(PanicFactory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(WF_FANOUT_DISTRIBUTE_PAUSE.to_string()),
+            resume_from: None,
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: Some(sink1.clone()),
+            unit_dispatcher: Some(dispatcher1.clone()),
+            pause: Some(token),
+        };
+
+        let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+        let awaiting = res1.awaiting.expect("must pause mid-fan-out");
+        assert_eq!(awaiting.reason, PauseReason::Manual);
+        assert_eq!(awaiting.step_id, "process");
+        assert!(
+            res1.step_results.is_empty(),
+            "the fan-out step did not complete"
+        );
+        assert!(sink1.labels().contains(&"RunPaused".to_string()));
+        assert!(sink1.labels().contains(&"StepPaused".to_string()));
+
+        // Only unit 0 ever reached the dispatcher — units 1 and 2 were
+        // never started.
+        assert_eq!(
+            dispatcher1.calls.lock().unwrap().clone(),
+            vec![(0, "h1".to_string())],
+            "only the first unit reached the dispatcher; the rest were never dispatched"
+        );
+
+        // `AwaitingInfo` also carries the completed-unit map directly.
+        assert_eq!(awaiting.fanout_completed_units.len(), 1);
+        assert!(awaiting.fanout_completed_units.contains_key(&0));
+
+        // The run record itself is durably `Paused`.
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        let run_id = listed[0].id.clone();
+        assert_eq!(listed[0].status, crate::runs::RunStatus::Paused);
+
+        // Exactly ONE unit checkpoint on disk — the completed unit. The
+        // not-yet-started units are simply ABSENT (incomplete), not
+        // recorded as failed.
+        let checkpoints = store.read_unit_checkpoints(&run_id).unwrap();
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "only the completed unit is checkpointed"
+        );
+        assert_eq!(checkpoints[0].index, 0);
+        assert!(checkpoints[0].success);
+
+        // Build resume state the way `rupu workflow resume` does: successful
+        // checkpoints replay from disk; everything else re-dispatches.
+        let mut completed_units: BTreeMap<String, BTreeMap<usize, ItemResult>> = BTreeMap::new();
+        for cp in checkpoints.iter().filter(|c| c.success) {
+            completed_units
+                .entry(cp.step_id.clone())
+                .or_default()
+                .insert(
+                    cp.index,
+                    ItemResult {
+                        index: cp.index,
+                        item: cp.item.clone(),
+                        sub_id: String::new(),
+                        rendered_prompt: String::new(),
+                        run_id: cp.run_id.clone(),
+                        transcript_path: cp.transcript_path.clone(),
+                        output: cp.output.clone(),
+                        success: true,
+                    },
+                );
+        }
+
+        // Flip the record back to Running (mirrors the CLI's `resume_run`).
+        let mut record = store.load(&run_id).unwrap();
+        record.status = crate::runs::RunStatus::Running;
+        record.finished_at = None;
+        store.update(&record).unwrap();
+
+        // --- Phase 2: resume. ---
+        let dispatcher2 = Arc::new(FakeUnitDispatcher::new());
+        let sink2 = Arc::new(CollectingSink::default());
+        let opts2 = OrchestratorRunOpts {
+            workflow: wf,
+            inputs: BTreeMap::new(),
+            workspace_id: record.workspace_id.clone(),
+            workspace_path: record.workspace_path.clone(),
+            transcript_dir: record.transcript_dir.clone(),
+            factory: Arc::new(PanicFactory),
+            event: None,
+            issue: None,
+            issue_ref: None,
+            run_store: Some(Arc::clone(&store)),
+            workflow_yaml: Some(WF_FANOUT_DISTRIBUTE_PAUSE.to_string()),
+            resume_from: Some(ResumeState {
+                run_id: run_id.clone(),
+                prior_step_results: Vec::new(),
+                approved_step_id: String::new(),
+                completed_units,
+                reason: PauseReason::Manual,
+                paused_step: None,
+            }),
+            run_id_override: None,
+            strict_templates: false,
+            event_sink: Some(sink2.clone()),
+            unit_dispatcher: Some(dispatcher2.clone()),
+            pause: None,
+        };
+
+        let res2 = run_workflow(opts2).await.expect("resume completes");
+        assert!(res2.awaiting.is_none(), "resumed run runs to completion");
+        assert_eq!(res2.step_results.len(), 1);
+        let step = &res2.step_results[0];
+        assert!(step.success);
+
+        // Resume dispatched ONLY units 1 and 2 — unit 0 is NOT re-run.
+        assert_eq!(
+            dispatcher2.calls.lock().unwrap().clone(),
+            vec![(1, "h1".to_string()), (2, "h1".to_string())],
+            "resume must re-dispatch only the paused/not-yet-started units"
+        );
+
+        // All three items present, in declared order; unit 0's output is
+        // the one preserved from the checkpoint (not re-dispatched).
+        assert_eq!(step.items.len(), 3);
+        assert_eq!(step.items[0].output, "out-0-on-h1");
+        assert_eq!(step.items[1].output, "out-1-on-h1");
+        assert_eq!(step.items[2].output, "out-2-on-h1");
+        assert!(sink2.labels().contains(&"RunResumed".to_string()));
+    }
+
+    // A `for_each` (no `distribute:`) fan-out whose units run LOCALLY
+    // through the real agent loop (T2's cooperative pause), rather than
+    // through a `UnitDispatcher`. Item 0 answers immediately; item 1 (the
+    // "SLOW" one) hangs on `BlockingProvider` until the pause token wins the
+    // race inside `run_agent`'s `select!` (see `agent_run_pauses_and_resumes`
+    // for the solo-step version of this same mechanism); item 2 must never
+    // be dispatched at all. `block_slow` lets phase 2 hand the SAME item
+    // ("SLOW-1") a normal, fast-completing provider instead.
+    struct FanoutPauseFactory {
+        block_slow: bool,
+        seen: Mutex<Vec<String>>,
+    }
+    impl FanoutPauseFactory {
+        fn new(block_slow: bool) -> Self {
+            Self {
+                block_slow,
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl StepFactory for FanoutPauseFactory {
+        async fn build_opts_for_step(
+            &self,
+            _step_id: &str,
+            agent_name: &str,
+            rendered_prompt: String,
+            run_id: String,
+            workspace_id: String,
+            workspace_path: PathBuf,
+            transcript_path: PathBuf,
+            on_tool_call: Option<rupu_agent::OnToolCallCallback>,
+        ) -> AgentRunOpts {
+            self.seen.lock().unwrap().push(rendered_prompt.clone());
+            let provider: Box<dyn LlmProvider> =
+                if self.block_slow && rendered_prompt.contains("SLOW") {
+                    Box::new(BlockingProvider)
+                } else {
+                    Box::new(MockProvider::new(vec![ScriptedTurn::AssistantText {
+                        text: format!("done: {rendered_prompt}"),
+                        stop: StopReason::EndTurn,
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    }]))
+                };
+            make_agent_opts(
+                provider,
+                agent_name,
+                rendered_prompt,
+                run_id,
+                workspace_id,
+                workspace_path,
+                transcript_path,
+                on_tool_call,
+            )
+        }
+    }
+
+    const WF_FANOUT_LOCAL_PAUSE: &str = r#"
+name: fanout-local-pause
+steps:
+  - id: process
+    for_each: "ok-0\nSLOW-1\nok-2"
+    agent: worker
+    prompt: "{{ item }}"
+    max_parallel: 1
+"#;
+
+    #[tokio::test]
+    async fn fanout_pauses_mid_local_unit_and_resumes_only_incomplete_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let wf = Workflow::parse(WF_FANOUT_LOCAL_PAUSE).unwrap();
+
+        // --- Phase 1: pause while unit 1 is mid-turn. ---
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            token2.cancel();
+        });
+
+        let sink1 = Arc::new(CollectingSink::default());
+        let factory1 = Arc::new(FanoutPauseFactory::new(true));
+        let mut opts1 = pause_opts(
+            wf.clone(),
+            dir.path().to_path_buf(),
+            factory1.clone(),
+            sink1.clone(),
+        );
+        opts1.pause = Some(token);
+
+        let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+        let awaiting = res1.awaiting.expect("must pause mid-fan-out");
+        assert_eq!(awaiting.reason, PauseReason::Manual);
+        assert_eq!(awaiting.step_id, "process");
+        assert!(
+            res1.step_results.is_empty(),
+            "the fan-out step did not complete"
+        );
+        assert!(sink1.labels().contains(&"RunPaused".to_string()));
+        assert!(sink1.labels().contains(&"StepPaused".to_string()));
+
+        // Unit 2 ("ok-2") was never dispatched — only units 0 and 1 were.
+        assert_eq!(
+            factory1.seen.lock().unwrap().clone(),
+            vec!["ok-0".to_string(), "SLOW-1".to_string()],
+            "the not-yet-started unit must never reach the factory"
+        );
+
+        // Only the succeeded unit (index 0) is carried forward.
+        assert_eq!(awaiting.fanout_completed_units.len(), 1);
+        assert!(awaiting.fanout_completed_units.contains_key(&0));
+
+        // --- Phase 2: resume. ---
+        let sink2 = Arc::new(CollectingSink::default());
+        let factory2 = Arc::new(FanoutPauseFactory::new(false));
+        let mut opts2 = pause_opts(
+            wf,
+            dir.path().to_path_buf(),
+            factory2.clone(),
+            sink2.clone(),
+        );
+        let mut completed_units = BTreeMap::new();
+        completed_units.insert(
+            "process".to_string(),
+            awaiting.fanout_completed_units.clone(),
+        );
+        opts2.resume_from = Some(ResumeState {
+            run_id: String::new(),
+            prior_step_results: Vec::new(),
+            approved_step_id: String::new(),
+            completed_units,
+            reason: PauseReason::Manual,
+            paused_step: None,
+        });
+
+        let res2 = run_workflow(opts2).await.expect("resume completes");
+        assert!(res2.awaiting.is_none(), "resumed run runs to completion");
+        assert_eq!(res2.step_results.len(), 1);
+        let step = &res2.step_results[0];
+        assert!(step.success);
+
+        // Resume dispatched ONLY units 1 and 2 — unit 0 is NOT re-run.
+        assert_eq!(
+            factory2.seen.lock().unwrap().clone(),
+            vec!["SLOW-1".to_string(), "ok-2".to_string()],
+            "resume must re-dispatch only the paused/not-yet-started units"
+        );
+        assert_eq!(step.items.len(), 3);
+        assert_eq!(step.items[0].output, "done: ok-0");
+        assert_eq!(step.items[1].output, "done: SLOW-1");
+        assert_eq!(step.items[2].output, "done: ok-2");
+        assert!(sink2.labels().contains(&"RunResumed".to_string()));
     }
 }
 
