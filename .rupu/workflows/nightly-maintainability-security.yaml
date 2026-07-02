@@ -1,0 +1,103 @@
+name: nightly-maintainability-security
+description: >
+  Nightly maintainability + security sweep across the rupu workspace.
+  Report-only: no auto-fix, no PR. Findings are posted to one rolling
+  issue per category (dedup by exact title — comment on the existing
+  open issue if present, else open a new one).
+autoflow:
+  enabled: true
+trigger:
+  on: cron
+  cron: "0 7 * * *"
+steps:
+  - id: review
+    actions: []
+    panel:
+      panelists:
+        - maintainability-reviewer
+        - security-reviewer
+      subject: |
+        Review the rupu workspace for maintainability and security concerns.
+
+        Crates (each has its own `src/`):
+        crates/rupu-agent, crates/rupu-app, crates/rupu-app-canvas,
+        crates/rupu-auth, crates/rupu-cli, crates/rupu-config,
+        crates/rupu-coverage, crates/rupu-cp, crates/rupu-keychain-acl,
+        crates/rupu-mcp, crates/rupu-orchestrator, crates/rupu-providers,
+        crates/rupu-runtime, crates/rupu-scm, crates/rupu-tools,
+        crates/rupu-transcript, crates/rupu-webhook, crates/rupu-workspace.
+
+        Use read_file/grep/glob to sample each crate's `src/` tree — you do
+        not have time to read every file, so prioritize entry points, public
+        APIs, and anything that looks unusually large or complex. This is a
+        report-only sweep: do not propose diffs or make any code changes,
+        just report findings per your system prompt's JSON contract.
+      max_parallel: 2
+
+  - id: report_maintainability
+    agent: repo-investigator
+    actions: []
+    prompt: |
+      You have a `bash` tool. The `gh` CLI is installed and authenticated
+      against this repo's GitHub remote — use it to file today's
+      maintainability report. Do not modify any repository files and do not
+      open a pull request; this step only reads/writes GitHub issues.
+
+      Rolling issue title (must match exactly, character for character):
+      Nightly maintainability findings
+
+      Steps:
+      1. Run `gh issue list --state open --search "\"Nightly maintainability findings\" in:title" --json number,title`
+         and check whether an open issue with that *exact* title already exists.
+      2. Build the report body from the findings below. If there are no
+         maintainability findings today, the body should say so plainly
+         (e.g. "No maintainability findings today.").
+      3. If a matching open issue exists, post the body as a comment on it
+         (`gh issue comment <number> --body-file -`, piping the body in).
+         Otherwise open a new one
+         (`gh issue create --title "Nightly maintainability findings" --body-file - --label nightly,maintainability`,
+         piping the body in — omit `--label` if label creation would fail).
+      4. Do not close, re-label, or otherwise alter any other issue.
+
+      Today's maintainability findings (from the review panel; empty means none):
+      Max severity: {{ steps.review.max_severity }}
+      {% for f in steps.review.findings %}{% if f.source == "maintainability-reviewer" %}
+      - [{{ f.severity }}] {{ f.title }}: {{ f.body }}
+      {% endif %}{% endfor %}
+
+      Final response must state: whether an existing issue was found (and its
+      number) or a new one was created, and the exact `gh` command(s) run.
+
+  - id: report_security
+    agent: repo-investigator
+    actions: []
+    prompt: |
+      You have a `bash` tool. The `gh` CLI is installed and authenticated
+      against this repo's GitHub remote — use it to file today's security
+      report. Do not modify any repository files and do not open a pull
+      request; this step only reads/writes GitHub issues.
+
+      Rolling issue title (must match exactly, character for character):
+      Nightly security findings
+
+      Steps:
+      1. Run `gh issue list --state open --search "\"Nightly security findings\" in:title" --json number,title`
+         and check whether an open issue with that *exact* title already exists.
+      2. Build the report body from the findings below. If there are no
+         security findings today, the body should say so plainly
+         (e.g. "No security findings today.").
+      3. If a matching open issue exists, post the body as a comment on it
+         (`gh issue comment <number> --body-file -`, piping the body in).
+         Otherwise open a new one
+         (`gh issue create --title "Nightly security findings" --body-file - --label nightly,security`,
+         piping the body in — omit `--label` if label creation would fail).
+      4. Do not close, re-label, or otherwise alter any other issue.
+
+      Today's security findings (from the review panel; empty means none):
+      Max severity: {{ steps.review.max_severity }}
+      {% for f in steps.review.findings %}{% if f.source == "security-reviewer" %}
+      - [{{ f.severity }}] {{ f.title }}: {{ f.body }}
+      {% endif %}{% endfor %}
+
+      Final response must state: whether an existing issue was found (and its
+      number) or a new one was created, and the exact `gh` command(s) run.
