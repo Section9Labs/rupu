@@ -3953,6 +3953,65 @@ mod tests {
     }
 
     #[test]
+    fn resume_blocked_by_live_runner_covers_all_cases() {
+        let own_pid = std::process::id();
+
+        // No recorded runner_pid → nothing to be blocked by.
+        assert_eq!(resume_blocked_by_live_runner(None, own_pid), None);
+
+        // The recorded pid IS us (e.g. an in-process resume) → not a
+        // foreign live process, safe to resume.
+        assert_eq!(resume_blocked_by_live_runner(Some(own_pid), own_pid), None);
+
+        // A dead pid (process no longer running) → safe to resume.
+        // u32::MAX is not a valid pid on any supported platform.
+        let dead_pid = u32::MAX;
+        assert!(!rupu_orchestrator::runs::pid_is_running(dead_pid));
+        assert_eq!(resume_blocked_by_live_runner(Some(dead_pid), own_pid), None);
+
+        // A live, FOREIGN pid → blocked. Use our own process's pid as the
+        // "live" pid but pass a different `own_pid` sentinel so the guard
+        // sees it as a foreign live runner.
+        let live_pid = own_pid;
+        let different_own_pid = own_pid.wrapping_add(1);
+        assert_ne!(live_pid, different_own_pid);
+        assert!(rupu_orchestrator::runs::pid_is_running(live_pid));
+        assert_eq!(
+            resume_blocked_by_live_runner(Some(live_pid), different_own_pid),
+            Some(live_pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_marker_poller_trips_token_when_marker_appears() {
+        // The delivery mechanism for a pause requested against a detached
+        // run process: the poller watches `RunStore::pause_marker_exists`
+        // and trips `token` once the marker file shows up.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(rupu_orchestrator::RunStore::new(tmp.path().join("runs")));
+        let run_id = "run_poll_test".to_string();
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let handle = spawn_pause_marker_poller(store.clone(), run_id.clone(), token.clone());
+
+        // No marker yet — give the poller a couple of ticks; it must not
+        // trip the token on its own.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!token.is_cancelled());
+
+        store.set_pause_marker(&run_id).unwrap();
+
+        // Poll interval is 250ms; wait up to ~1s for the poller to notice.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !token.is_cancelled() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(token.is_cancelled());
+
+        handle.abort();
+    }
+
+    #[test]
     fn cancel_with_store_marks_running_run_failed() {
         let tmp = tempfile::tempdir().unwrap();
         let store = rupu_orchestrator::RunStore::new(tmp.path().join("runs"));

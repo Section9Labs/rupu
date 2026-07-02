@@ -2181,6 +2181,35 @@ mod tests {
     }
 
     #[test]
+    fn pause_marker_round_trips_through_disk() {
+        // The delivery channel for a *detached* run process (T4): `cp
+        // serve`'s `pause_run` writes the marker, and the CLI's poller
+        // (`spawn_pause_marker_poller`) watches `pause_marker_exists` to
+        // trip its own cancellation token. Exercise the write/exists/clear
+        // cycle directly against disk.
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().to_path_buf());
+        let rec = sample_record("run_pause_marker");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+
+        assert!(!store.pause_marker_exists(&rec.id));
+        assert!(!store.pause_marker_path(&rec.id).exists());
+
+        store.set_pause_marker(&rec.id).unwrap();
+        assert!(store.pause_marker_exists(&rec.id));
+        assert!(store.pause_marker_path(&rec.id).is_file());
+
+        store.clear_pause_marker(&rec.id).unwrap();
+        assert!(!store.pause_marker_exists(&rec.id));
+
+        // Clearing an already-cleared (or never-written) marker is a
+        // no-op, not an error — the poller and the resume path both call
+        // this defensively without checking existence first.
+        store.clear_pause_marker(&rec.id).unwrap();
+        assert!(!store.pause_marker_exists(&rec.id));
+    }
+
+    #[test]
     fn list_pending_resume_filters_on_marker_and_lease() {
         let tmp = TempDir::new().unwrap();
         let store = RunStore::new(tmp.path().to_path_buf());
