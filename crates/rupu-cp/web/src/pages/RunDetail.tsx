@@ -359,11 +359,17 @@ export default function RunDetail() {
   // `pending`, and not `awaiting_approval` — those have their own gate).
   const isPausable = effectiveStatus === 'running';
   const isPaused = effectiveStatus === 'paused';
-  // Cancel is offered on any non-terminal run.
+  // Cancel is offered on any non-terminal run — including `paused` (the
+  // backend treats a paused run as non-terminal too: RunStatus::Paused is
+  // cancellable the same as Pending/Running in rupu-orchestrator's runs.rs).
+  // NOTE: the header's Pause/Cancel controls only render while `isRunning`
+  // (running/pending), so the paused case is surfaced separately — the Cancel
+  // affordance in the Paused banner below, next to Resume.
   const cancellable =
     effectiveStatus === 'running' ||
     effectiveStatus === 'pending' ||
-    effectiveStatus === 'awaiting_approval';
+    effectiveStatus === 'awaiting_approval' ||
+    effectiveStatus === 'paused';
   const cancelled = effectiveStatus === 'cancelled';
 
   // Approval recorded — either persisted (resume_requested_at) or optimistic.
@@ -797,15 +803,27 @@ export default function RunDetail() {
                 </div>
               ) : (
                 <div className="mt-2 space-y-2">
-                  <button
-                    type="button"
-                    onClick={() => void onResume()}
-                    disabled={resumePending}
-                    aria-label="Resume run"
-                    className="inline-flex items-center rounded-md bg-ok px-3 py-1.5 text-ui font-medium text-white hover:bg-ok disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {resumePending ? 'Working…' : 'Resume'}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void onResume()}
+                      disabled={resumePending}
+                      aria-label="Resume run"
+                      className="inline-flex items-center rounded-md bg-ok px-3 py-1.5 text-ui font-medium text-white hover:bg-ok disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {resumePending ? 'Working…' : 'Resume'}
+                    </button>
+                    {cancellable && (
+                      <Button
+                        variant="secondary"
+                        onClick={onCancel}
+                        disabled={cancelPending}
+                        aria-label="Cancel run"
+                      >
+                        {cancelPending ? 'Cancelling…' : 'Cancel'}
+                      </Button>
+                    )}
+                  </div>
 
                   {resumeReadOnly && (
                     <div role="alert" className="rounded-lg border border-warn/30 bg-warn-bg px-3 py-2 text-ui text-warn">
@@ -817,6 +835,12 @@ export default function RunDetail() {
                   {resumeError && (
                     <p className="text-note font-medium text-err" role="alert">
                       {resumeError}
+                    </p>
+                  )}
+
+                  {cancelError && (
+                    <p className="text-note font-medium text-err" role="alert">
+                      {cancelError}
                     </p>
                   )}
                 </div>

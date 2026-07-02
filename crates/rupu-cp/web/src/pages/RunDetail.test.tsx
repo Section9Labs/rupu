@@ -418,6 +418,25 @@ describe('RunDetail shell', () => {
     expect(screen.getByText(/rupu cp serve/)).toBeInTheDocument();
   });
 
+  it('cancels a paused run via the Cancel button in the Paused banner (after confirm)', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(PAUSED_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    const cancelSpy = vi.spyOn(api, 'cancelRun').mockResolvedValue(undefined);
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    renderPage();
+
+    // Resume and Cancel are both reachable from the Paused banner.
+    await screen.findByRole('button', { name: 'Resume run' });
+    const cancelBtn = await screen.findByRole('button', { name: 'Cancel run' });
+    fireEvent.click(cancelBtn);
+
+    expect(confirmSpy).toHaveBeenCalled();
+    await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith('run-1'));
+  });
+
   it('renders the server message when resume is rejected with a 4xx (non-501)', async () => {
     vi.spyOn(api, 'getRunGraph').mockResolvedValue(PAUSED_GRAPH);
     vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
@@ -566,6 +585,60 @@ describe('RunDetail — remote host (?host=)', () => {
     await waitFor(() =>
       expect(approveSpy).toHaveBeenCalledWith('run-1', 'ask', 'h-abc'),
     );
+  });
+
+  it('passes host to pauseRun when pausing a remote running run', async () => {
+    const remoteRunning: RunGraphResponse = {
+      run: {
+        id: 'run-1',
+        workflow_name: 'remote-scan',
+        status: 'running',
+        started_at: '2026-06-01T00:00:00Z',
+      } as RunGraphResponse['run'],
+      workflow: { steps: [{ id: 'step_a', kind: 'step', agent: 'reviewer' }] },
+      step_results: [],
+      units: [],
+      usage: EMPTY_USAGE,
+    };
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(remoteRunning);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    const pauseSpy = vi.spyOn(api, 'pauseRun').mockResolvedValue(undefined);
+
+    renderRemotePage();
+
+    const pauseBtn = await screen.findByRole('button', { name: 'Pause run' });
+    fireEvent.click(pauseBtn);
+
+    await waitFor(() => expect(pauseSpy).toHaveBeenCalledWith('run-1', 'h-abc'));
+  });
+
+  it('passes host to resumeRun when resuming a remote paused run', async () => {
+    const remotePaused: RunGraphResponse = {
+      run: {
+        id: 'run-1',
+        workflow_name: 'remote-scan',
+        status: 'paused',
+        started_at: '2026-06-01T00:00:00Z',
+      } as RunGraphResponse['run'],
+      workflow: { steps: [{ id: 'step_a', kind: 'step', agent: 'reviewer' }] },
+      step_results: [],
+      units: [],
+      usage: EMPTY_USAGE,
+    };
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(remotePaused);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    const resumeSpy = vi.spyOn(api, 'resumeRun').mockResolvedValue(undefined);
+
+    renderRemotePage();
+
+    const resumeBtn = await screen.findByRole('button', { name: 'Resume run' });
+    fireEvent.click(resumeBtn);
+
+    await waitFor(() => expect(resumeSpy).toHaveBeenCalledWith('run-1', 'h-abc'));
   });
 
   it('shows the host badge in the header for remote runs', async () => {
