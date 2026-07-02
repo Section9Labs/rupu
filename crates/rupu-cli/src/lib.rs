@@ -45,8 +45,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// One-shot agent run.
-    Run(cmd::run::Args),
+    /// One-shot agent run, or `pause`/`resume` a run by id.
+    Run {
+        #[command(subcommand)]
+        action: cmd::run::RunCommand,
+    },
     /// Manage agents.
     Agent {
         #[command(subcommand)]
@@ -192,7 +195,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     // else keeps stderr.
     let is_output_cmd = matches!(
         cli.command,
-        Cmd::Run(_)
+        Cmd::Run { .. }
             | Cmd::Watch(_)
             | Cmd::Session {
                 action: cmd::session::Action::Start(_)
@@ -214,7 +217,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
     }
 
     match cli.command {
-        Cmd::Run(args) => cmd::run::handle(args).await,
+        Cmd::Run { action } => cmd::run::handle(action).await,
         Cmd::Agent { action } => cmd::agent::handle(action, cli.format).await,
         Cmd::Workflow { action } => cmd::workflow::handle(action, cli.format).await,
         Cmd::Autoflow { action } => cmd::autoflow::handle(action, cli.format).await,
@@ -247,7 +250,7 @@ fn ensure_output_format_supported(
     format: output::formats::OutputFormat,
 ) -> anyhow::Result<()> {
     match command {
-        Cmd::Run(_) => output::formats::ensure_supported(
+        Cmd::Run { .. } => output::formats::ensure_supported(
             "run",
             format,
             &[output::formats::OutputFormat::Table],
@@ -314,5 +317,112 @@ fn ensure_output_format_supported(
             format,
             &[output::formats::OutputFormat::Table],
         ),
+    }
+}
+
+/// Arg-parse tests (Task 7): `rupu run pause|resume <id>` and `rupu
+/// workflow pause|resume <id>` parse to the expected typed variants.
+/// These are pure clap-derive checks — no I/O, no run-store — so they
+/// stay fast and independent of the heavier end-to-end tests in
+/// `tests/cli_run.rs` / `tests/cli_workflow.rs`.
+#[cfg(test)]
+mod arg_parse_tests {
+    use super::*;
+
+    #[test]
+    fn run_pause_parses_run_id() {
+        let cli = Cli::try_parse_from(["rupu", "run", "pause", "run_01ABC"]).unwrap();
+        match cli.command {
+            Cmd::Run {
+                action: cmd::run::RunCommand::Pause { run_id },
+            } => assert_eq!(run_id, "run_01ABC"),
+            other => panic!("expected Run(Pause), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_resume_parses_run_id_and_flags() {
+        let cli = Cli::try_parse_from([
+            "rupu",
+            "run",
+            "resume",
+            "run_01ABC",
+            "--mode",
+            "bypass",
+            "--plain",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Run {
+                action:
+                    cmd::run::RunCommand::Resume {
+                        run_id,
+                        mode,
+                        plain,
+                    },
+            } => {
+                assert_eq!(run_id, "run_01ABC");
+                assert_eq!(mode.as_deref(), Some("bypass"));
+                assert!(plain);
+            }
+            other => panic!("expected Run(Resume), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_launch_still_captures_agent_invocation() {
+        // Back-compat: `rupu run <agent> ...` (agent name != "pause"/"resume")
+        // must still fall through to the launcher, unchanged from before
+        // Task 7 introduced the `pause`/`resume` subcommands.
+        let cli =
+            Cli::try_parse_from(["rupu", "run", "echo", "--mode", "bypass", "say hi"]).unwrap();
+        match cli.command {
+            Cmd::Run {
+                action: cmd::run::RunCommand::Launch(argv),
+            } => {
+                assert_eq!(argv, vec!["echo", "--mode", "bypass", "say hi"]);
+            }
+            other => panic!("expected Run(Launch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_pause_parses_run_id() {
+        let cli = Cli::try_parse_from(["rupu", "workflow", "pause", "run_01ABC"]).unwrap();
+        match cli.command {
+            Cmd::Workflow {
+                action: cmd::workflow::Action::Pause { run_id },
+            } => assert_eq!(run_id, "run_01ABC"),
+            other => panic!("expected Workflow(Pause), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_resume_parses_run_id_and_flags() {
+        let cli = Cli::try_parse_from([
+            "rupu",
+            "workflow",
+            "resume",
+            "run_01ABC",
+            "--mode",
+            "ask",
+            "--plain",
+        ])
+        .unwrap();
+        match cli.command {
+            Cmd::Workflow {
+                action:
+                    cmd::workflow::Action::Resume {
+                        run_id,
+                        mode,
+                        plain,
+                    },
+            } => {
+                assert_eq!(run_id, "run_01ABC");
+                assert_eq!(mode.as_deref(), Some("ask"));
+                assert!(plain);
+            }
+            other => panic!("expected Workflow(Resume), got {other:?}"),
+        }
     }
 }

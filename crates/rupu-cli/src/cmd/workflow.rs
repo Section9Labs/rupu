@@ -2165,7 +2165,11 @@ async fn approve(run_id: &str, mode: Option<&str>) -> anyhow::Result<()> {
 /// paused step re-runs from where the agent left off instead of from
 /// scratch. A step-boundary pause (no seed) just replays like a terminal
 /// resume.
-async fn resume_run(run_id: &str, mode: Option<&str>, plain: bool) -> anyhow::Result<()> {
+pub(crate) async fn resume_run(
+    run_id: &str,
+    mode: Option<&str>,
+    plain: bool,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let runs_dir = global.join("runs");
@@ -2595,7 +2599,11 @@ fn cancel_with_store(
 /// one-shot remote command to reach it (mirrors how `rupu workflow cancel`
 /// gives `cancel_run` its remote reach) — see
 /// `docs/superpowers/plans/2026-07-01-rupu-pause-resume-plan.md` Task 5.
-async fn pause(run_id: &str) -> anyhow::Result<()> {
+///
+/// `pub(crate)` so `rupu run pause <run_id>` (Task 7,
+/// `crate::cmd::run::RunCommand::Pause`) can delegate here directly —
+/// same primitive, same user-facing message, no parallel implementation.
+pub(crate) async fn pause(run_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let store = rupu_orchestrator::RunStore::new(global.join("runs"));
     pause_with_store(&store, run_id)?;
@@ -2611,7 +2619,15 @@ async fn pause(run_id: &str) -> anyhow::Result<()> {
 /// so a detached runner process cooperatively stops at its next safe
 /// boundary. Maps the library's [`PauseError`] onto an `anyhow::Error` with
 /// a stable user-facing message shape (mirrors `cancel_with_store`).
-fn pause_with_store(store: &rupu_orchestrator::RunStore, run_id: &str) -> anyhow::Result<()> {
+///
+/// `pub(crate)` so the live-run view's Esc handler
+/// ([`crate::output::live_run`], Task 7) can request a pause for the run
+/// it is tailing using the exact same primitive, without going through
+/// `pause`'s stdout `println!` (which would corrupt the alt-screen).
+pub(crate) fn pause_with_store(
+    store: &rupu_orchestrator::RunStore,
+    run_id: &str,
+) -> anyhow::Result<()> {
     let now = chrono::Utc::now();
     store.pause(run_id, now).map_err(|e| match e {
         PauseError::AlreadyTerminal(status) => {

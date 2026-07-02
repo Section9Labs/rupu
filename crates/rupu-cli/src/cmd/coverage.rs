@@ -1046,7 +1046,10 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
         tmp: false,
         run_id: None,
     };
-    let code = crate::cmd::run::handle(args).await;
+    let code = match crate::cmd::run::run_inner(args).await {
+        Ok(()) => ExitCode::from(0),
+        Err(e) => crate::output::diag::fail(e),
+    };
 
     println!();
     println!(
