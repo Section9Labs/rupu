@@ -39,6 +39,7 @@ export const RUN_STATUS_STYLES: Record<RunStatusStr, StatusStyle> = {
   completed: toPillStyle(STATUS.completed),
   failed: toPillStyle(STATUS.failed),
   awaiting_approval: toPillStyle(STATUS.awaiting_approval),
+  paused: toPillStyle(STATUS.paused),
   rejected: toPillStyle(STATUS.rejected),
   cancelled: toPillStyle(STATUS.cancelled),
 };

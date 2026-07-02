@@ -151,6 +151,22 @@ export default function RunDetail() {
   const [cancelPending, setCancelPending] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
 
+  // Pause local state — pausing is synchronous on this CP (the run's own
+  // status flips to `paused` in the same response), so a success optimistically
+  // updates `liveRunStatus` the same way Cancel does.
+  const [pausePending, setPausePending] = useState(false);
+  const [pauseError, setPauseError] = useState<string | null>(null);
+
+  // Resume local state — resuming is marker-only (mirrors Approve): the run
+  // STAYS `paused` until a worker picks it up and the live stream emits
+  // `run_resumed`, so a success only flips `resumeRequested` (never
+  // `liveRunStatus` directly). `resumeReadOnly` is set on a 501 (no launcher —
+  // `rupu cp serve` isn't running); `resumeError` surfaces any other failure.
+  const [resumePending, setResumePending] = useState(false);
+  const [pausedResumeRequested, setPausedResumeRequested] = useState(false);
+  const [resumeReadOnly, setResumeReadOnly] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
+
   // Archive / delete local state (terminal runs only).
   const [actionPending, setActionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -175,6 +191,12 @@ export default function RunDetail() {
     setApproveMode('ask');
     setCancelPending(false);
     setCancelError(null);
+    setPausePending(false);
+    setPauseError(null);
+    setResumePending(false);
+    setPausedResumeRequested(false);
+    setResumeReadOnly(false);
+    setResumeError(null);
     setActionPending(false);
     setActionError(null);
     seededSelRef.current = false;
@@ -260,6 +282,8 @@ export default function RunDetail() {
         if (isKnownRunEvent(ev)) {
           if (ev.type === 'run_completed') setLiveRunStatus(ev.status);
           else if (ev.type === 'run_failed') setLiveRunStatus('failed');
+          else if (ev.type === 'run_paused') setLiveRunStatus('paused');
+          else if (ev.type === 'run_resumed') setLiveRunStatus('running');
         }
       },
       () => setConnection('reconnecting'),
@@ -331,6 +355,10 @@ export default function RunDetail() {
 
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
+  // Pause is only offered while the run is actively `running` (not merely
+  // `pending`, and not `awaiting_approval` — those have their own gate).
+  const isPausable = effectiveStatus === 'running';
+  const isPaused = effectiveStatus === 'paused';
   // Cancel is offered on any non-terminal run.
   const cancellable =
     effectiveStatus === 'running' ||
@@ -377,6 +405,51 @@ export default function RunDetail() {
       setCancelError(e instanceof Error ? e.message : 'Failed to cancel run');
     } finally {
       setCancelPending(false);
+    }
+  }
+
+  async function onPause() {
+    if (!run || pausePending) return;
+    setPausePending(true);
+    setPauseError(null);
+    try {
+      if (host) {
+        await api.pauseRun(run.id, host);
+      } else {
+        await api.pauseRun(run.id);
+      }
+      // Optimistic — pausing is synchronous on this CP (the response already
+      // carries `status: "paused"`); the live stream / next poll reconciles.
+      setLiveRunStatus('paused');
+    } catch (e: unknown) {
+      setPauseError(e instanceof Error ? e.message : 'Failed to pause run');
+    } finally {
+      setPausePending(false);
+    }
+  }
+
+  async function onResume() {
+    if (!run || resumePending) return;
+    setResumePending(true);
+    setResumeError(null);
+    setResumeReadOnly(false);
+    try {
+      if (host) {
+        await api.resumeRun(run.id, host);
+      } else {
+        await api.resumeRun(run.id);
+      }
+      // Marker-only (mirrors Approve) — the run stays `paused` until a worker
+      // picks it up and the live stream emits `run_resumed`.
+      setPausedResumeRequested(true);
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.status === 501) {
+        setResumeReadOnly(true);
+      } else {
+        setResumeError(e instanceof Error ? e.message : 'Failed to resume run');
+      }
+    } finally {
+      setResumePending(false);
     }
   }
 
@@ -526,14 +599,32 @@ export default function RunDetail() {
 
           {isRunning && (
             <div className="flex shrink-0 flex-col items-end gap-1">
-              <Button
-                variant="danger-outline"
-                onClick={onCancel}
-                disabled={cancelPending}
-                aria-label="Cancel run"
-              >
-                {cancelPending ? 'Cancelling…' : 'Cancel'}
-              </Button>
+              <div className="flex items-center gap-2">
+                {isPausable && (
+                  <Button
+                    variant="secondary"
+                    onClick={() => void onPause()}
+                    disabled={pausePending}
+                    aria-label="Pause run"
+                    className="gap-1.5"
+                  >
+                    <Pause size={14} /> {pausePending ? 'Pausing…' : 'Pause'}
+                  </Button>
+                )}
+                <Button
+                  variant="danger-outline"
+                  onClick={onCancel}
+                  disabled={cancelPending}
+                  aria-label="Cancel run"
+                >
+                  {cancelPending ? 'Cancelling…' : 'Cancel'}
+                </Button>
+              </div>
+              {pauseError && (
+                <p className="text-note font-medium text-err" role="alert">
+                  {pauseError}
+                </p>
+              )}
               {cancelError && (
                 <p className="text-note font-medium text-err" role="alert">
                   {cancelError}
@@ -679,6 +770,53 @@ export default function RunDetail() {
                   {gateError && (
                     <p className="text-note font-medium text-err" role="alert">
                       {gateError}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {isPaused && (
+          <div className="mt-3 flex items-start gap-3 rounded-lg border border-status-paused/30 bg-status-paused/10 px-4 py-3">
+            <Pause size={16} className="mt-0.5 shrink-0 text-status-paused" />
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-status-paused">Paused</div>
+              <p className="mt-0.5 text-ui text-status-paused">
+                This run is paused at a checkpoint. Resume to continue execution.
+              </p>
+
+              {pausedResumeRequested ? (
+                <div className="mt-2 flex items-center gap-2 text-ui font-medium text-ok">
+                  <span
+                    className="inline-block h-2 w-2 animate-pulse rounded-full bg-ok"
+                    aria-hidden="true"
+                  />
+                  Resume requested — resuming…
+                </div>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => void onResume()}
+                    disabled={resumePending}
+                    aria-label="Resume run"
+                    className="inline-flex items-center rounded-md bg-ok px-3 py-1.5 text-ui font-medium text-white hover:bg-ok disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {resumePending ? 'Working…' : 'Resume'}
+                  </button>
+
+                  {resumeReadOnly && (
+                    <div role="alert" className="rounded-lg border border-warn/30 bg-warn-bg px-3 py-2 text-ui text-warn">
+                      This is a read-only deploy — resuming a run requires{' '}
+                      <code className="font-mono">rupu cp serve</code>.
+                    </div>
+                  )}
+
+                  {resumeError && (
+                    <p className="text-note font-medium text-err" role="alert">
+                      {resumeError}
                     </p>
                   )}
                 </div>

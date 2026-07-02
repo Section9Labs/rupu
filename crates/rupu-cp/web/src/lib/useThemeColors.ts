@@ -36,6 +36,7 @@ const VARS = {
   'status.completed': '--c-status-completed',
   'status.failed': '--c-status-failed',
   'status.awaiting': '--c-status-awaiting',
+  'status.paused': '--c-status-paused',
   'status.pending': '--c-status-pending',
   'status.skipped': '--c-status-skipped',
   'status.cancelled': '--c-status-cancelled',
@@ -65,6 +66,7 @@ export interface ThemeColors {
     completed: string;
     failed: string;
     awaiting: string;
+    paused: string;
     pending: string;
     skipped: string;
     cancelled: string;
@@ -117,6 +119,7 @@ export function readThemeColors(): ThemeColors {
       completed: get('status.completed'),
       failed: get('status.failed'),
       awaiting: get('status.awaiting'),
+      paused: get('status.paused'),
       pending: get('status.pending'),
       skipped: get('status.skipped'),
       cancelled: get('status.cancelled'),

@@ -592,3 +592,45 @@ describe('panel units fold onto fanout', () => {
     expect(node.fanout!.units[1].state).toBe('failed');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 10. Pause / resume events (Task 8) — a step_paused/step_resumed pair flips
+// the paused step's node state; the run-level run_paused/run_resumed events
+// carry no step_id and are a no-op at the per-step level (mirroring
+// run_started/run_completed/run_failed).
+// ---------------------------------------------------------------------------
+
+describe('pause / resume events', () => {
+  it('step_paused sets the node state to paused', () => {
+    const g = makeGraph({ steps: [STEP_A, STEP_B, STEP_C] });
+    const events: RunEvent[] = [
+      { type: 'step_started', run_id: runId(), step_id: 'a', kind: 'step', agent: 'agent-a' },
+      { type: 'run_paused', run_id: runId() },
+      { type: 'step_paused', run_id: runId(), step_id: 'a' },
+    ];
+    const model = buildRunGraphModel(g, events);
+    expect(model.nodeById('a')!.state).toBe('paused');
+    // Untouched steps stay pending.
+    expect(model.nodeById('b')!.state).toBe('pending');
+  });
+
+  it('step_resumed reverts a paused node back to running', () => {
+    const g = makeGraph({ steps: [STEP_A] });
+    const events: RunEvent[] = [
+      { type: 'step_started', run_id: runId(), step_id: 'a', kind: 'step', agent: 'agent-a' },
+      { type: 'step_paused', run_id: runId(), step_id: 'a' },
+      { type: 'run_resumed', run_id: runId() },
+      { type: 'step_resumed', run_id: runId(), step_id: 'a' },
+    ];
+    const model = buildRunGraphModel(g, events);
+    expect(model.nodeById('a')!.state).toBe('running');
+  });
+
+  it('step_paused for an unknown step_id is a no-op (does not throw)', () => {
+    const g = makeGraph({ steps: [STEP_A] });
+    const events: RunEvent[] = [
+      { type: 'step_paused', run_id: runId(), step_id: 'nonexistent' },
+    ];
+    expect(() => buildRunGraphModel(g, events)).not.toThrow();
+  });
+});

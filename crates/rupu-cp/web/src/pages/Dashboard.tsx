@@ -61,6 +61,7 @@ function statusFill(colors: ReturnType<typeof useThemeColors>): Record<RunStatus
     completed: colors.status.completed,
     failed: colors.status.failed,
     awaiting_approval: colors.status.awaiting,
+    paused: colors.status.paused,
     pending: colors.status.pending,
     rejected: colors.status.rejected,
     cancelled: colors.status.cancelled,
@@ -68,7 +69,7 @@ function statusFill(colors: ReturnType<typeof useThemeColors>): Record<RunStatus
 }
 
 const STATUS_ORDER: RunStatusStr[] = [
-  'running', 'awaiting_approval', 'pending', 'completed', 'failed', 'rejected', 'cancelled',
+  'running', 'awaiting_approval', 'paused', 'pending', 'completed', 'failed', 'rejected', 'cancelled',
 ];
 
 const STATUS_LABEL: Record<RunStatusStr, string> = {
@@ -76,6 +77,7 @@ const STATUS_LABEL: Record<RunStatusStr, string> = {
   completed:         'Completed',
   failed:            'Failed',
   awaiting_approval: 'Awaiting approval',
+  paused:            'Paused',
   pending:           'Pending',
   rejected:          'Rejected',
   cancelled:         'Cancelled',

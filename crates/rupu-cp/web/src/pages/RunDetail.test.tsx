@@ -19,6 +19,7 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/re
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import {
   api,
+  ApiError,
   type RunGraphResponse,
   type FindingsResponse,
 } from '../lib/api';
@@ -144,6 +145,19 @@ const RUNNING_GRAPH: RunGraphResponse = {
     id: 'run-1',
     workflow_name: 'nightly-scan',
     status: 'running',
+    started_at: '2026-06-01T00:00:00Z',
+  } as RunGraphResponse['run'],
+  workflow: { steps: [{ id: 'step_a', kind: 'step', agent: 'reviewer' }] },
+  step_results: [],
+  units: [],
+};
+
+// A paused run — eligible for Resume from the paused banner.
+const PAUSED_GRAPH: RunGraphResponse = {
+  run: {
+    id: 'run-1',
+    workflow_name: 'nightly-scan',
+    status: 'paused',
     started_at: '2026-06-01T00:00:00Z',
   } as RunGraphResponse['run'],
   workflow: { steps: [{ id: 'step_a', kind: 'step', agent: 'reviewer' }] },
@@ -331,6 +345,94 @@ describe('RunDetail shell', () => {
 
     expect(confirmSpy).toHaveBeenCalled();
     await waitFor(() => expect(cancelSpy).toHaveBeenCalledWith('run-1'));
+  });
+
+  it('shows Pause on a Running run and calls POST /api/runs/:id/pause when clicked', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(RUNNING_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    const pauseSpy = vi.spyOn(api, 'pauseRun').mockResolvedValue(undefined);
+
+    renderPage();
+
+    const pauseBtn = await screen.findByRole('button', { name: 'Pause run' });
+    // No Resume control before the run is paused.
+    expect(screen.queryByRole('button', { name: 'Resume run' })).not.toBeInTheDocument();
+
+    fireEvent.click(pauseBtn);
+
+    await waitFor(() => expect(pauseSpy).toHaveBeenCalledWith('run-1'));
+    // Pausing succeeded (optimistic update) — the run now shows Resume instead.
+    await screen.findByRole('button', { name: 'Resume run' });
+  });
+
+  it('surfaces a failed pause via the server error message (no silent no-op)', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(RUNNING_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'pauseRun').mockRejectedValue(new ApiError(409, 'run run-1 is not running'));
+
+    renderPage();
+
+    const pauseBtn = await screen.findByRole('button', { name: 'Pause run' });
+    fireEvent.click(pauseBtn);
+
+    await screen.findByText('run run-1 is not running');
+  });
+
+  it('shows Resume on a Paused run and calls POST /api/runs/:id/resume when clicked', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(PAUSED_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    const resumeSpy = vi.spyOn(api, 'resumeRun').mockResolvedValue(undefined);
+
+    renderPage();
+
+    // No Pause control on a paused (non-running) run.
+    expect(screen.queryByRole('button', { name: 'Pause run' })).not.toBeInTheDocument();
+
+    const resumeBtn = await screen.findByRole('button', { name: 'Resume run' });
+    fireEvent.click(resumeBtn);
+
+    await waitFor(() => expect(resumeSpy).toHaveBeenCalledWith('run-1'));
+  });
+
+  it('renders a read-only-deploy message when resume returns 501', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(PAUSED_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'resumeRun').mockRejectedValue(
+      new ApiError(501, 'resuming a paused run requires `rupu cp serve`'),
+    );
+
+    renderPage();
+
+    const resumeBtn = await screen.findByRole('button', { name: 'Resume run' });
+    fireEvent.click(resumeBtn);
+
+    await screen.findByText(/requires/i);
+    expect(screen.getByText(/rupu cp serve/)).toBeInTheDocument();
+  });
+
+  it('renders the server message when resume is rejected with a 4xx (non-501)', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(PAUSED_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    vi.spyOn(api, 'resumeRun').mockRejectedValue(
+      new ApiError(409, 'run run-1 is `running`, not `paused`'),
+    );
+
+    renderPage();
+
+    const resumeBtn = await screen.findByRole('button', { name: 'Resume run' });
+    fireEvent.click(resumeBtn);
+
+    await screen.findByText('run run-1 is `running`, not `paused`');
   });
 
   it('approves an awaiting run in the selected (Bypass) mode', async () => {
