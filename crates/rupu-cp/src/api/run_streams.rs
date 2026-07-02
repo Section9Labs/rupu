@@ -238,7 +238,7 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
             agent: None,
             session_id: dto.session_id,
             trigger_source: dto.trigger_source,
-            status: None, // standalone meta does not carry run status
+            status: None,     // standalone meta does not carry run status
             started_at: None, // standalone meta does not carry a started_at field
             transcript_path,
             usage: crate::usage::UsageSummary::default(),
@@ -296,10 +296,7 @@ fn collect_session_runs_from_dir(root: &std::path::Path, out: &mut Vec<AgentRunR
                     agent: dto.agent_name.clone(),
                     session_id: dto.session_id.clone(),
                     trigger_source: None,
-                    status: run
-                        .status
-                        .as_ref()
-                        .and_then(stringify_status),
+                    status: run.status.as_ref().and_then(stringify_status),
                     started_at: run.started_at,
                     transcript_path: run.transcript_path,
                     usage: crate::usage::UsageSummary::default(),
@@ -341,12 +338,23 @@ impl AgentRunsQuery {
 fn agent_in_lifecycle(status: Option<&str>, group: Option<&str>) -> bool {
     match group {
         None => true,
-        Some("active") => matches!(status, Some("running") | Some("awaiting_approval") | Some("pending")),
-        Some("failed") => matches!(status, Some("error") | Some("failed") | Some("rejected") | Some("aborted")),
-        Some("completed") => !matches!(
+        Some("active") => matches!(
             status,
             Some("running") | Some("awaiting_approval") | Some("pending")
-                | Some("error") | Some("failed") | Some("rejected") | Some("aborted")
+        ),
+        Some("failed") => matches!(
+            status,
+            Some("error") | Some("failed") | Some("rejected") | Some("aborted")
+        ),
+        Some("completed") => !matches!(
+            status,
+            Some("running")
+                | Some("awaiting_approval")
+                | Some("pending")
+                | Some("error")
+                | Some("failed")
+                | Some("rejected")
+                | Some("aborted")
         ),
         _ => true, // unknown group → no filter
     }
@@ -356,7 +364,7 @@ fn agent_in_lifecycle(status: Option<&str>, group: Option<&str>) -> bool {
 // Shared fan-out helpers (re-exported from host_fanout)
 // ---------------------------------------------------------------------------
 
-use crate::api::host_fanout::{fan_out_rows, sort_values_newest_first};
+use crate::api::host_fanout::{fan_out_via, sort_values_newest_first};
 
 // ---------------------------------------------------------------------------
 // `GET /api/runs/agents`
@@ -382,27 +390,17 @@ async fn list_agent_runs(
     // ── Single remote host ────────────────────────────────────────────────────
     if host != "local" && host != "all" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        let path = {
-            let mut p = "/api/runs/agents?host=local".to_string();
-            if let Some(lc) = &q.lifecycle {
-                p.push_str("&lifecycle=");
-                p.push_str(lc);
-            }
-            if let Some(off) = q.offset {
-                p.push_str(&format!("&offset={off}"));
-            }
-            if let Some(lim) = q.limit {
-                p.push_str(&format!("&limit={lim}"));
-            }
-            p
-        };
-        let v = conn
-            .proxy_get_json(&path)
+        // Structured agent-run listing — works for SSH hosts (which can't serve
+        // the generic proxy) by shelling `rupu transcript list`.
+        let mut rows = conn
+            .list_agent_runs()
             .await
             .map_err(|e| crate::error::ApiError::internal(e.to_string()))?;
-        let arr = v.as_array().cloned().unwrap_or_default();
+        let lifecycle = q.lifecycle.as_deref();
+        rows.retain(|r| agent_in_lifecycle(r.get("status").and_then(|v| v.as_str()), lifecycle));
         return Ok(Json(
-            arr.into_iter()
+            crate::pagination::paginate(rows, &q.page())
+                .into_iter()
                 .map(|mut row| {
                     row["host_id"] = serde_json::json!(host);
                     row
@@ -433,10 +431,8 @@ async fn list_agent_runs(
         for row in &mut page_rows {
             row.host_id = Some("local".to_string());
             if let Some(tp) = &row.transcript_path {
-                let m = crate::usage::run_metrics_paths(
-                    &[std::path::PathBuf::from(tp)],
-                    &s.pricing,
-                );
+                let m =
+                    crate::usage::run_metrics_paths(&[std::path::PathBuf::from(tp)], &s.pricing);
                 row.usage = m.usage;
                 row.turns = m.turns;
                 row.duration_ms = m.duration_ms;
@@ -459,15 +455,10 @@ async fn list_agent_runs(
         })
         .collect();
 
-    let remote_path = format!(
-        "/api/runs/agents?host=local&limit=10000{}",
-        q.lifecycle
-            .as_deref()
-            .map(|lc| format!("&lifecycle={lc}"))
-            .unwrap_or_default()
-    );
-
-    let mut all_values = fan_out_rows(&s.hosts, &remote_path, local_values).await;
+    let mut all_values = fan_out_via(&s.hosts, local_values, "agent_runs", |c| async move {
+        c.list_agent_runs().await
+    })
+    .await;
 
     sort_values_newest_first(&mut all_values, "started_at");
 
@@ -481,10 +472,8 @@ async fn list_agent_runs(
     for row in &mut page_values {
         if row["host_id"].as_str() == Some("local") {
             if let Some(tp) = row["transcript_path"].as_str() {
-                let m = crate::usage::run_metrics_paths(
-                    &[std::path::PathBuf::from(tp)],
-                    &s.pricing,
-                );
+                let m =
+                    crate::usage::run_metrics_paths(&[std::path::PathBuf::from(tp)], &s.pricing);
                 row["usage"] = serde_json::to_value(m.usage).unwrap();
                 row["turns"] = serde_json::json!(m.turns);
                 row["duration_ms"] = serde_json::to_value(m.duration_ms).unwrap();
@@ -539,23 +528,15 @@ async fn list_autoflow_runs(
     // ── Single remote host ────────────────────────────────────────────────────
     if host != "local" && host != "all" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        let path = {
-            let mut p = "/api/runs/autoflows?host=local".to_string();
-            if let Some(off) = q.offset {
-                p.push_str(&format!("&offset={off}"));
-            }
-            if let Some(lim) = q.limit {
-                p.push_str(&format!("&limit={lim}"));
-            }
-            p
-        };
-        let v = conn
-            .proxy_get_json(&path)
+        // Structured autoflow-cycle listing — SSH hosts aggregate cycles from
+        // `rupu autoflow history` instead of the generic proxy.
+        let rows = conn
+            .list_autoflow_runs()
             .await
             .map_err(|e| crate::error::ApiError::internal(e.to_string()))?;
-        let arr = v.as_array().cloned().unwrap_or_default();
         return Ok(Json(
-            arr.into_iter()
+            crate::pagination::paginate(rows, &q.page())
+                .into_iter()
                 .map(|mut row| {
                     row["host_id"] = serde_json::json!(host);
                     row
@@ -574,8 +555,10 @@ async fn list_autoflow_runs(
         }
         Err(e) => return Err(crate::error::ApiError::internal(e.to_string())),
     };
-    let local_rows: Vec<AutoflowCycleRow> =
-        local_records.into_iter().map(AutoflowCycleRow::from).collect();
+    let local_rows: Vec<AutoflowCycleRow> = local_records
+        .into_iter()
+        .map(AutoflowCycleRow::from)
+        .collect();
 
     // ── Local-only path ───────────────────────────────────────────────────────
     if host == "local" {
@@ -608,8 +591,10 @@ async fn list_autoflow_runs(
         })
         .collect();
 
-    let mut all_values =
-        fan_out_rows(&s.hosts, "/api/runs/autoflows?host=local&limit=10000", local_values).await;
+    let mut all_values = fan_out_via(&s.hosts, local_values, "autoflow_runs", |c| async move {
+        c.list_autoflow_runs().await
+    })
+    .await;
 
     sort_values_newest_first(&mut all_values, "started_at");
 
@@ -702,23 +687,15 @@ async fn list_autoflow_events(
     // ── Single remote host ────────────────────────────────────────────────────
     if host != "local" && host != "all" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
-        let path = {
-            let mut p = "/api/runs/autoflows/events?host=local".to_string();
-            if let Some(off) = q.offset {
-                p.push_str(&format!("&offset={off}"));
-            }
-            if let Some(lim) = q.limit {
-                p.push_str(&format!("&limit={lim}"));
-            }
-            p
-        };
-        let v = conn
-            .proxy_get_json(&path)
+        // Structured autoflow-event listing — SSH hosts source events from
+        // `rupu autoflow history` instead of the generic proxy.
+        let rows = conn
+            .list_autoflow_events()
             .await
             .map_err(|e| crate::error::ApiError::internal(e.to_string()))?;
-        let arr = v.as_array().cloned().unwrap_or_default();
         return Ok(Json(
-            arr.into_iter()
+            crate::pagination::paginate(rows, &q.page())
+                .into_iter()
                 .map(|mut row| {
                     row["host_id"] = serde_json::json!(host);
                     row
@@ -783,11 +760,9 @@ async fn list_autoflow_events(
         })
         .collect();
 
-    let mut all_values = fan_out_rows(
-        &s.hosts,
-        "/api/runs/autoflows/events?host=local&limit=10000",
-        local_values,
-    )
+    let mut all_values = fan_out_via(&s.hosts, local_values, "autoflow_events", |c| async move {
+        c.list_autoflow_events().await
+    })
     .await;
 
     sort_values_newest_first(&mut all_values, "at");
@@ -798,13 +773,12 @@ async fn list_autoflow_events(
     for row in &mut page_values {
         if row["host_id"].as_str() == Some("local") {
             if let Some(run_id) = row["run_id"].as_str() {
-                row["usage"] =
-                    serde_json::to_value(crate::usage::summarize_run(
-                        &s.run_store,
-                        run_id,
-                        &s.pricing,
-                    ))
-                    .unwrap();
+                row["usage"] = serde_json::to_value(crate::usage::summarize_run(
+                    &s.run_store,
+                    run_id,
+                    &s.pricing,
+                ))
+                .unwrap();
             }
         }
     }

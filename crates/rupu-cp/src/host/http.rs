@@ -330,6 +330,27 @@ impl HostConnector for HttpHostConnector {
         Ok(v.as_array().cloned().unwrap_or_default())
     }
 
+    async fn list_agent_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let v = self
+            .proxy_get_json("/api/runs/agents?host=local&limit=10000")
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    async fn list_autoflow_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let v = self
+            .proxy_get_json("/api/runs/autoflows?host=local&limit=10000")
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
+    async fn list_autoflow_events(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let v = self
+            .proxy_get_json("/api/runs/autoflows/events?host=local&limit=10000")
+            .await?;
+        Ok(v.as_array().cloned().unwrap_or_default())
+    }
+
     /// POST the wire-encoded payload to the remote CP's `/api/workspace/stage`;
     /// the remote stages it under its own cache and returns `{working_dir}`.
     async fn stage_workspace(&self, payload: Vec<u8>) -> Result<String, HostConnectorError> {

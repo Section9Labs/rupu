@@ -102,6 +102,189 @@ pub(crate) fn parse_tail_marker(line: &str) -> Option<&str> {
     }
 }
 
+// ── Remote-CLI → CP wire-row reshaping ─────────────────────────────────────────
+//
+// SSH hosts can't serve the CP HTTP API, so list views are sourced by shelling
+// `rupu` over ssh and reshaping the CLI's report rows into the CP wire shapes
+// the web UI expects. The mappings are lossy where the CLI omits a field
+// (per-run cost/turns/duration, cycle ran/skipped/failed counts) — those render
+// blank rather than wrong.
+
+/// A zero `UsageSummary` JSON object with `total_tokens` set to `total`.
+fn usage_json(total: u64, runs: u64) -> serde_json::Value {
+    serde_json::json!({
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "total_tokens": total,
+        "cost_usd": serde_json::Value::Null,
+        "priced": false,
+        "runs": runs,
+    })
+}
+
+/// `"-"` / `""` / missing → JSON null; otherwise the string value.
+fn dash_or_null(row: &serde_json::Value, key: &str) -> serde_json::Value {
+    match row.get(key).and_then(|v| v.as_str()) {
+        Some("-") | Some("") | None => serde_json::Value::Null,
+        Some(s) => serde_json::Value::String(s.to_string()),
+    }
+}
+
+/// `rupu transcript list` row → `AgentRunRow` wire shape (`/api/runs/agents`).
+pub(crate) fn transcript_row_to_agent_run(row: &serde_json::Value) -> serde_json::Value {
+    let total = row
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let null = serde_json::Value::Null;
+    serde_json::json!({
+        "run_id": row.get("run_id").cloned().unwrap_or(null.clone()),
+        "source": "standalone",
+        "agent": row.get("agent").cloned().unwrap_or(null.clone()),
+        "session_id": null,
+        "trigger_source": null,
+        "status": row.get("status").cloned().unwrap_or(null.clone()),
+        "started_at": row.get("started_at").cloned().unwrap_or(null.clone()),
+        "transcript_path": null,
+        "usage": usage_json(total, 1),
+        "turns": 0,
+        "duration_ms": null,
+    })
+}
+
+/// `rupu autoflow history` row → `AutoflowEventRow` wire shape
+/// (`/api/runs/autoflows/events`).
+pub(crate) fn history_row_to_autoflow_event(row: &serde_json::Value) -> serde_json::Value {
+    // event_id must be a stable non-null key for the UI list; prefer the wake
+    // id, else synthesize from cycle_id + timestamp.
+    let event_id = match row.get("wake").and_then(|v| v.as_str()) {
+        Some(w) if w != "-" && !w.is_empty() => w.to_string(),
+        _ => format!(
+            "{}:{}",
+            row.get("cycle_id").and_then(|v| v.as_str()).unwrap_or(""),
+            row.get("at").and_then(|v| v.as_str()).unwrap_or(""),
+        ),
+    };
+    let null = serde_json::Value::Null;
+    serde_json::json!({
+        "event_id": event_id,
+        "cycle_id": row.get("cycle_id").cloned().unwrap_or(null.clone()),
+        "at": row.get("at").cloned().unwrap_or(null.clone()),
+        "kind": row.get("event").cloned().unwrap_or(null.clone()),
+        "workflow": dash_or_null(row, "workflow"),
+        "issue_display_ref": dash_or_null(row, "issue"),
+        "run_id": dash_or_null(row, "run"),
+        "status": null,
+        "worker_name": dash_or_null(row, "worker"),
+        "usage": usage_json(0, 0),
+    })
+}
+
+/// Aggregate `rupu autoflow history` event rows into `AutoflowCycleRow` wire
+/// shapes (`/api/runs/autoflows`), grouped by `cycle_id`, newest-first. The CLI
+/// event stream lacks the ran/skipped/failed breakdown, so those are 0.
+pub(crate) fn history_rows_to_autoflow_cycles(
+    rows: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    use std::collections::BTreeMap;
+    // Preserve first-seen order (rows arrive newest-first from the CLI).
+    let mut order: Vec<String> = Vec::new();
+    let mut by_cycle: BTreeMap<
+        String,
+        (
+            String,
+            Option<String>,
+            String,
+            String,
+            Vec<String>,
+            Vec<String>,
+        ),
+    > = BTreeMap::new();
+    for row in rows {
+        let cycle_id = match row.get("cycle_id").and_then(|v| v.as_str()) {
+            Some(c) if !c.is_empty() && c != "-" => c.to_string(),
+            _ => continue,
+        };
+        let at = row
+            .get("at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mode = row
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let worker = row
+            .get("worker")
+            .and_then(|v| v.as_str())
+            .filter(|w| *w != "-" && !w.is_empty())
+            .map(|w| w.to_string());
+        let workflow = row
+            .get("workflow")
+            .and_then(|v| v.as_str())
+            .filter(|w| *w != "-" && !w.is_empty())
+            .map(|w| w.to_string());
+        let run = row
+            .get("run")
+            .and_then(|v| v.as_str())
+            .filter(|r| *r != "-" && !r.is_empty())
+            .map(|r| r.to_string());
+
+        let entry = by_cycle.entry(cycle_id.clone()).or_insert_with(|| {
+            order.push(cycle_id.clone());
+            (
+                mode.clone(),
+                worker.clone(),
+                at.clone(),
+                at.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+        });
+        // entry = (mode, worker, earliest_at, latest_at, workflows, run_ids)
+        if !at.is_empty() {
+            if at < entry.2 {
+                entry.2 = at.clone();
+            }
+            if at > entry.3 {
+                entry.3 = at.clone();
+            }
+        }
+        if let Some(w) = workflow {
+            if !entry.4.contains(&w) {
+                entry.4.push(w);
+            }
+        }
+        if let Some(r) = run {
+            if !entry.5.contains(&r) {
+                entry.5.push(r);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|cid| {
+            let (mode, worker, started_at, finished_at, workflows, run_ids) =
+                by_cycle.remove(&cid).unwrap();
+            serde_json::json!({
+                "cycle_id": cid,
+                "mode": mode,
+                "worker_name": worker,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "workflow_count": workflows.len(),
+                "ran_cycles": 0,
+                "skipped_cycles": 0,
+                "failed_cycles": 0,
+                "run_ids": run_ids,
+                "usage": usage_json(0, 0),
+            })
+        })
+        .collect()
+}
+
 // ── RemoteExec trait + types ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -585,6 +768,34 @@ impl SshHostConnector {
         }
         Ok(())
     }
+
+    /// Run a one-shot `rupu <argv...>` over ssh and return the `rows` array of
+    /// the CLI's `--format json` report. Used by the list-view connectors.
+    async fn remote_json_rows(
+        &self,
+        argv: &[&str],
+    ) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let owned: Vec<String> = std::iter::once("rupu".to_string())
+            .chain(argv.iter().map(|s| s.to_string()))
+            .collect();
+        let cmd = build_remote_command(&owned);
+        let out = self
+            .exec
+            .run(&cmd)
+            .await
+            .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
+        if !out.success {
+            return Err(HostConnectorError::Unreachable(out.stderr));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).map_err(|e| {
+            HostConnectorError::Remote(0, format!("parse `rupu {}` output: {e}", argv.join(" ")))
+        })?;
+        Ok(parsed
+            .get("rows")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
 }
 
 #[async_trait::async_trait]
@@ -785,6 +996,33 @@ impl HostConnector for SshHostConnector {
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Standalone agent runs via `rupu transcript list --format json`, reshaped
+    /// to the `AgentRunRow` wire shape. Covers standalone `rupu run` runs; it
+    /// does not include session-owned runs (which the local view merges in).
+    async fn list_agent_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let rows = self
+            .remote_json_rows(&["transcript", "list", "--format", "json"])
+            .await?;
+        Ok(rows.iter().map(transcript_row_to_agent_run).collect())
+    }
+
+    /// Autoflow cycle summaries aggregated from `rupu autoflow history`.
+    async fn list_autoflow_runs(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let rows = self
+            .remote_json_rows(&["autoflow", "history", "--format", "json"])
+            .await?;
+        Ok(history_rows_to_autoflow_cycles(&rows))
+    }
+
+    /// Autoflow events via `rupu autoflow history --format json`, reshaped to
+    /// the `AutoflowEventRow` wire shape.
+    async fn list_autoflow_events(&self) -> Result<Vec<serde_json::Value>, HostConnectorError> {
+        let rows = self
+            .remote_json_rows(&["autoflow", "history", "--format", "json"])
+            .await?;
+        Ok(rows.iter().map(history_row_to_autoflow_event).collect())
     }
 
     // ── Workspace sync ─────────────────────────────────────────────────────────
@@ -1168,6 +1406,71 @@ mod tests {
         // Archived scope → adds --archived.
         conn.list_sessions(Some("archived")).await.unwrap();
         assert!(stub.last_cmd.lock().unwrap().contains("--archived"));
+    }
+
+    #[test]
+    fn transcript_row_maps_to_agent_run_shape() {
+        let row = serde_json::json!({
+            "run_id": "run_1", "scope": "active", "title": null,
+            "agent": "oracle-enumerator-glm", "status": "rejected",
+            "total_tokens": 42, "started_at": "2026-07-02 00:15:04"
+        });
+        let m = transcript_row_to_agent_run(&row);
+        assert_eq!(m["run_id"], "run_1");
+        assert_eq!(m["source"], "standalone");
+        assert_eq!(m["agent"], "oracle-enumerator-glm");
+        assert_eq!(m["status"], "rejected");
+        assert_eq!(m["usage"]["total_tokens"], 42);
+        assert_eq!(m["turns"], 0);
+        assert!(m["session_id"].is_null());
+        assert!(m["duration_ms"].is_null());
+    }
+
+    #[test]
+    fn history_row_maps_to_autoflow_event_shape() {
+        let row = serde_json::json!({
+            "at": "2026-05-14T22:58:15Z", "cycle_id": "afc_1", "mode": "serve",
+            "worker": "matt@host", "event": "wake_consumed",
+            "issue": "github:o/r/issues/20", "source": "-", "workflow": "-",
+            "repo": "github:o/r", "run": "-", "wake": "wake_9", "detail": "cronpoll"
+        });
+        let m = history_row_to_autoflow_event(&row);
+        assert_eq!(m["event_id"], "wake_9");
+        assert_eq!(m["cycle_id"], "afc_1");
+        assert_eq!(m["kind"], "wake_consumed");
+        assert_eq!(m["issue_display_ref"], "github:o/r/issues/20");
+        assert!(m["workflow"].is_null(), "dash → null");
+        assert!(m["run_id"].is_null(), "dash → null");
+        assert_eq!(m["worker_name"], "matt@host");
+
+        // No wake → synthesized stable event_id from cycle_id:at.
+        let row2 = serde_json::json!({
+            "at": "2026-05-14T22:58:15Z", "cycle_id": "afc_2", "event": "cycle_started", "wake": "-"
+        });
+        assert_eq!(
+            history_row_to_autoflow_event(&row2)["event_id"],
+            "afc_2:2026-05-14T22:58:15Z"
+        );
+    }
+
+    #[test]
+    fn history_rows_aggregate_into_cycles() {
+        let rows = vec![
+            serde_json::json!({"at":"2026-05-14T10:00:00Z","cycle_id":"afc_1","mode":"serve","worker":"w","event":"cycle_started","workflow":"wf-a","run":"run_1"}),
+            serde_json::json!({"at":"2026-05-14T10:05:00Z","cycle_id":"afc_1","mode":"serve","worker":"w","event":"run_finished","workflow":"wf-b","run":"run_2"}),
+            serde_json::json!({"at":"2026-05-14T09:00:00Z","cycle_id":"afc_2","mode":"serve","worker":"w","event":"cycle_started","workflow":"-","run":"-"}),
+        ];
+        let cycles = history_rows_to_autoflow_cycles(&rows);
+        assert_eq!(cycles.len(), 2);
+        let c1 = cycles.iter().find(|c| c["cycle_id"] == "afc_1").unwrap();
+        assert_eq!(c1["started_at"], "2026-05-14T10:00:00Z");
+        assert_eq!(c1["finished_at"], "2026-05-14T10:05:00Z");
+        assert_eq!(c1["workflow_count"], 2);
+        assert_eq!(c1["run_ids"].as_array().unwrap().len(), 2);
+        let c2 = cycles.iter().find(|c| c["cycle_id"] == "afc_2").unwrap();
+        assert_eq!(c2["workflow_count"], 0);
+        assert_eq!(c2["run_ids"].as_array().unwrap().len(), 0);
+        assert_eq!(c2["ran_cycles"], 0);
     }
 
     #[tokio::test]
