@@ -208,16 +208,35 @@
       </tbody>
     </table>
 
-    <h2>Distribute a step across the fleet</h2>
-    <p>A <code class="inline">for_each</code> step can spread its units across multiple <a class="link" href="/docs/multi-host.html">hosts</a> with a <code class="inline">distribute:</code> block — units are assigned <strong>round-robin</strong> to the named fleet hosts, run there, and their results aggregate back exactly like a local fan-out. Omit <code class="inline">distribute:</code> and the step runs locally, unchanged.</p>
-    <pre class="code"><span class="k">steps</span>:
-  - <span class="k">id</span>: <span class="v">review_each</span>
+    <h2>Run steps across the fleet</h2>
+    <p>Any step can execute on a remote <a class="link" href="/docs/multi-host.html">host</a> instead of the local machine. There are two placements plus an opt-in file sync — omit them all and everything runs locally, exactly as before.</p>
+
+    <h3>Fan out a <code class="inline">for_each</code> across hosts</h3>
+    <p>A <code class="inline">distribute:</code> block spreads a <code class="inline">for_each</code> step's units <strong>round-robin</strong> across the named hosts; results aggregate back like a local fan-out.</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">review_each</span>
     <span class="k">agent</span>: <span class="v">code-reviewer</span>
     <span class="k">for_each</span>: <span class="s">"&#123;&#123; inputs.files &#125;&#125;"</span>
     <span class="k">distribute</span>:
       <span class="k">hosts</span>: [<span class="v">gpu-box</span>, <span class="v">build-box</span>]   <span class="c"># round-robin across fleet hosts</span>
     <span class="k">prompt</span>: <span class="s">"Review &#123;&#123; item &#125;&#125;."</span></pre>
-    <div class="callout"><strong>Valid only on <code class="inline">for_each</code> steps</strong>, and <code class="inline">hosts</code> must be non-empty. Each unit's run is attributed to the host it ran on (visible in the control plane), and a remote unit failure is handled per the step's <code class="inline">continue_on_error</code>. Register the hosts first — see <a class="link" href="/docs/multi-host.html">Multi-host</a>.</div>
+    <p><code class="inline">for_each</code>-only; <code class="inline">hosts</code> must be non-empty; each unit is attributed to its host; failures honor <code class="inline">continue_on_error</code>.</p>
+
+    <h3>Pin a single step to a host</h3>
+    <p>A <code class="inline">host:</code> on a <strong>linear</strong> step (agent + prompt) runs just that step on one host — good for a step that needs a specific machine (a GPU box, a licensed toolchain).</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">heavy_analysis</span>
+    <span class="k">agent</span>: <span class="v">analyzer</span>
+    <span class="k">host</span>: <span class="v">gpu-box</span>
+    <span class="k">prompt</span>: <span class="s">"Analyze &#123;&#123; steps.collect.output &#125;&#125;."</span></pre>
+    <p><code class="inline">host:</code> is valid only on a linear step (not <code class="inline">for_each</code>/<code class="inline">parallel</code>/<code class="inline">panel</code>) and must be non-empty.</p>
+
+    <h3>Let a remote step touch the repo — <code class="inline">workspace: sync</code></h3>
+    <p>By default a remote step is <strong>self-contained</strong>: it sees only its rendered prompt and prior steps' string outputs, never your files. To let a remote step read and write real project files, add <code class="inline">workspace: sync</code> — the coordinator ships the workspace to the host (<strong>auto git-or-tar</strong>), the agent works on it, and the changed files are propagated back so downstream steps see them.</p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">apply_fix</span>
+    <span class="k">agent</span>: <span class="v">developer</span>
+    <span class="k">host</span>: <span class="v">build-box</span>
+    <span class="k">workspace</span>: <span class="v">sync</span>          <span class="c"># file-mutating step, run remotely</span>
+    <span class="k">prompt</span>: <span class="s">"Apply the change and run the tests."</span></pre>
+    <div class="callout"><strong>Register the hosts first</strong> (see <a class="link" href="/docs/multi-host.html">Multi-host</a>). <code class="inline">workspace: sync</code> is only valid on a remote step (one with <code class="inline">host:</code> or <code class="inline">distribute:</code>); the git-or-tar mode is detected automatically, no config needed.</div>
 
     <h2>Template expressions</h2>
     <p>

@@ -177,6 +177,18 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
         scheduled, trigger-driven workflows — from the same place you watch them
         run.
       </li>
+      <li>
+        <strong>Archive, restore &amp; delete.</strong> Tidy up the workspace by
+        <strong>archiving</strong> finished runs and sessions (moving them out of
+        the active lists without losing them), <strong>restoring</strong> them
+        when you need them back, or <strong>deleting</strong> them for good.
+        Archived items honour retention windows from config — the
+        <code class="inline">[storage]</code> section's
+        <code class="inline">archived_session_retention</code> and
+        <code class="inline">archived_transcript_retention</code> (e.g.
+        <code class="inline">30d</code>) set how long archived artifacts are kept
+        before they're pruned.
+      </li>
     </ul>
     <div class="callout">
       <strong>Same engine, new surface.</strong> The control plane doesn't
@@ -214,6 +226,49 @@ $ rupu cp <span class="k">serve</span> <span class="v">--bind</span> <span class
       vocabulary and inserts at the cursor. Validity is checked live — at the
       field, on the node, and in a header badge — so mistakes show up before you
       ever save.
+    </p>
+
+    <h2>Settings &amp; project config</h2>
+    <p>
+      You can edit rupu's configuration from the browser. A <strong>global
+      Settings</strong> page writes the global
+      <code class="inline">~/.rupu/config.toml</code>, and a <strong>Config</strong>
+      tab on each Project detail view writes that project's
+      <code class="inline">.rupu/config.toml</code>. Config is layered
+      <strong>global &rarr; project &rarr; env</strong>, and the control plane
+      shows the <strong>effective</strong> value for every key together with its
+      <strong>provenance</strong> — which layer won.
+    </p>
+    <p>
+      Each surface is hybrid: a typed <strong>Form</strong> tab with per-field
+      validation, plus a <strong>raw TOML</strong> tab with validate-on-save, both
+      writing the same file. Alongside them sit a <strong>policy</strong> view
+      (what's locked) and a <strong>runtime status</strong> view — the latter
+      shows restart-required settings such as <code class="inline">bind</code> and
+      <code class="inline">token</code> read-only (the token masked).
+    </p>
+    <p>
+      <strong>Policy enforcement.</strong> An admin can <strong>lock</strong>
+      specific settings at the global level so projects — and the UI — can't
+      override them. Locked keys are pinned to the global value wherever config is
+      resolved (CLI, agent runs, cron, and the control plane alike), and appear
+      read-only on the project Config tab. Locks are declared as dotted key paths
+      in a <code class="inline">[policy]</code> section of the global config:
+    </p>
+    <pre class="code"><span class="c"># ~/.rupu/config.toml — lock keys so projects can't override them</span>
+<span class="k">[policy]</span>
+lock = [<span class="s">"permission_mode"</span>, <span class="s">"autoflow.max_active"</span>, <span class="s">"cp.max_workspace_bytes"</span>]
+
+<span class="c"># control-plane runtime settings live in their own section</span>
+<span class="k">[cp]</span>
+max_workspace_bytes = <span class="v">104857600</span></pre>
+    <p>
+      Writes go through validated config endpoints — GET the effective config with
+      provenance, and PUT the global config, a project's config, or the policy
+      lock list. Every write is validated, backed up, and written atomically;
+      project-config paths are confined under the project's
+      <code class="inline">.rupu/</code> (no path traversal), and writes require
+      the full <code class="inline">rupu cp serve</code> runtime.
     </p>
 
     <h2>Multi-host</h2>

@@ -212,8 +212,12 @@ $ pass show rupu/prod | rupu host <span class="k">add</span> <span class="s">pro
       remote so it survives the SSH session), then keeps a long-lived
       <code class="inline">ssh … tail -f</code> pump that mirrors the run's
       artifact files back into the central run store — so the run shows up in the
-      same host-aware lists, detail, and live events as any other. Register it
-      with the <code class="inline">--ssh</code> destination:
+      same host-aware lists, detail, and live events as any other. SSH hosts are
+      <strong>fully at parity</strong> with the other transports: they report the
+      remote rupu <strong>version</strong> and list <strong>sessions</strong>,
+      <strong>agent + autoflow runs</strong>, and <strong>events</strong> just like
+      HTTP hosts do. Register it with the <code class="inline">--ssh</code>
+      destination:
     </p>
     <pre class="code"><span class="c"># register an SSH host — destination is user@host or a ~/.ssh/config alias</span>
 $ rupu host <span class="k">add</span> <span class="s">build-box</span> <span class="v">--ssh</span> <span class="s">deploy@build.example.com</span> <span class="v">--port</span> <span class="s">22</span> <span class="v">--identity</span> <span class="s">~/.ssh/id_ed25519</span>
@@ -390,14 +394,24 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
 
     <h2>Distribute work across the fleet</h2>
     <p>
-      Beyond running a whole workflow on one host, a single workflow run can
-      <strong>spread a <code class="inline">for_each</code> step's units across the
-      fleet</strong>. Add a <code class="inline">distribute:</code> block naming the
-      hosts; rupu assigns the units <strong>round-robin</strong>, dispatches each to
-      its host, attributes the unit's run to that host, and aggregates the results
-      back into the step — partial failures honored per
-      <code class="inline">continue_on_error</code>. It works over every transport
-      (HTTP / SSH / tunnel / bucket).
+      Beyond running a whole workflow on one host, a single workflow run can place
+      individual <a class="link" href="/docs/workflows.html">workflow</a> steps —
+      or spread one step's units — across the fleet. Three placement controls ship
+      today, and they all work over every transport (HTTP / SSH / tunnel / bucket):
+      <strong>fan-out units</strong>, <strong>per-step placement</strong>, and
+      <strong>workspace sync</strong> so a remotely-placed step can read and write
+      your real project files.
+    </p>
+
+    <h3>Fan-out units across hosts</h3>
+    <p>
+      A <code class="inline">for_each</code> step's units can be
+      <strong>spread across the fleet</strong>. Add a
+      <code class="inline">distribute:</code> block naming the hosts; rupu assigns
+      the units <strong>round-robin</strong>, dispatches each to its host,
+      attributes the unit's run to that host, and aggregates the results back into
+      the step — partial failures honored per
+      <code class="inline">continue_on_error</code>.
     </p>
     <pre class="code">  - <span class="k">id</span>: <span class="v">review_each</span>
     <span class="k">agent</span>: <span class="v">code-reviewer</span>
@@ -405,7 +419,52 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
     <span class="k">distribute</span>:
       <span class="k">hosts</span>: [<span class="v">gpu-box</span>, <span class="v">build-box</span>]
     <span class="k">prompt</span>: <span class="s">"Review &#123;&#123; item &#125;&#125;."</span></pre>
-    <p>See <a class="link" href="/docs/workflows.html">Workflows</a> for the step format. Host-placement of individual file-mutating steps (which needs cross-host workspace sync) is still in progress — see below.</p>
+
+    <h3>Per-step host placement</h3>
+    <p>
+      A single <strong>linear step</strong> (one with an <code class="inline">agent</code>
+      and a <code class="inline">prompt</code>) can run on a named fleet host with a
+      <code class="inline">host:</code> field. The whole step's agent runs on that
+      host instead of locally, and its output feeds downstream steps exactly as a
+      local step would. <code class="inline">host:</code> is <strong>linear-only</strong> —
+      it's rejected on <code class="inline">for_each</code>,
+      <code class="inline">parallel</code>, and <code class="inline">panel</code>
+      steps (use <code class="inline">distribute:</code> to spread a
+      <code class="inline">for_each</code>), and it must name a non-empty host.
+      Absent, the step runs locally, exactly as before.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">train</span>
+    <span class="k">agent</span>: <span class="v">model-trainer</span>
+    <span class="k">host</span>: <span class="v">gpu-box</span>
+    <span class="k">prompt</span>: <span class="s">"Fine-tune on &#123;&#123; inputs.dataset &#125;&#125;."</span></pre>
+
+    <h3>Workspace sync for remote steps</h3>
+    <p>
+      By default a remotely-placed step is <strong>self-contained</strong> — it sees
+      only its rendered prompt plus prior steps' string outputs, not your files. Add
+      <code class="inline">workspace: sync</code> to a <strong>remote step</strong>
+      (one with <code class="inline">host:</code> or
+      <code class="inline">distribute:</code>) and the coordinator ships its
+      <strong>file workspace</strong> to the host: the step's agent reads and writes
+      the real project files, and the changed files are propagated back so
+      downstream steps see them. This is how <strong>file-mutating steps</strong> can
+      now run remotely.
+    </p>
+    <p>
+      The mechanism is <strong>auto git-or-tar</strong>: if the workspace is a git
+      repo it syncs via git (patch / 3-way merge on the return path); otherwise it
+      packs a gitignore-aware tar and returns a changed-files delta. Detection is
+      automatic — <strong>no extra config</strong>, and no git/tar tooling needs to
+      be installed on the host (rupu carries a vendored libgit2 and tar). It's
+      <strong>opt-in</strong> and only valid on a remote step; on a purely-local
+      step <code class="inline">workspace: sync</code> is rejected as a no-op.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">refactor</span>
+    <span class="k">agent</span>: <span class="v">refactorer</span>
+    <span class="k">host</span>: <span class="v">gpu-box</span>
+    <span class="k">workspace</span>: <span class="v">sync</span>
+    <span class="k">prompt</span>: <span class="s">"Apply the migration across the crate."</span></pre>
+    <p>See <a class="link" href="/docs/workflows.html">Workflows</a> for the full step format.</p>
 
     <h2>Choosing a transport</h2>
     <p>
@@ -435,10 +494,12 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
 
     <h2>Still coming</h2>
     <p>
-      All five transports above are <strong>shipped today</strong>. The
-      architecture was built around one transport port
-      (<code class="inline">HostConnector</code>) so the remaining work slots in
-      without disturbing the surfaces above. These are genuinely
+      All five transports above are <strong>shipped today</strong>, as are the three
+      placement controls in <em>Distribute work across the fleet</em> (fan-out units,
+      per-step <code class="inline">host:</code>, and
+      <code class="inline">workspace: sync</code>). The architecture was built around
+      one transport port (<code class="inline">HostConnector</code>) so the remaining
+      work slots in without disturbing the surfaces above. These are genuinely
       <strong>not done yet</strong>:
     </p>
     <table>
@@ -446,10 +507,6 @@ removed host_01J9Z4W7Q0X8Y6V5K3M2N1P0R8</pre>
         <tr><th>Coming later</th><th>What it adds</th></tr>
       </thead>
       <tbody>
-        <tr>
-          <td>Per-step host placement &amp; workspace sync</td>
-          <td>A <code class="inline">host:</code> on an individual (non-fan-out) step, plus cross-host <strong>workspace / file sync</strong> so file-mutating steps can run remotely. (Distributing a <code class="inline">for_each</code> step's units across hosts already ships — see <em>Distribute work across the fleet</em> above.)</td>
-        </tr>
         <tr>
           <td>Auto-placement</td>
           <td><strong>Capability-based scheduling</strong> — picking the host for a run automatically from its advertised backends and capabilities.</td>
