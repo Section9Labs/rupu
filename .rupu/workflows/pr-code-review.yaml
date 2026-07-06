@@ -1,0 +1,60 @@
+name: pr-code-review
+description: >
+  Comment-only PR code-review autoflow. Runs the security /
+  maintainability / performance panel over the PR diff and posts one
+  summary review comment via the native `scm.prs.comment` tool. No
+  approve, no merge, no code changes.
+autoflow:
+  enabled: true
+  entity: pull_request
+  selector:
+    states: [open]
+    draft: exclude
+    authors_from: collaborators
+  wake_on:
+    - github.pr.opened
+    - github.pr.updated
+    - github.pr.ready_for_review
+  reconcile_every: "10m"
+  claim:
+    key: pr_head_sha
+steps:
+  - id: review
+    actions: []
+    panel:
+      panelists:
+        - security-reviewer
+        - maintainability-reviewer
+        - performance-reviewer
+      subject: "{{ event.pull_request.diff }}"
+      max_parallel: 3
+      # No `gate:` here (unlike a fixer workflow): this autoflow is
+      # comment-only per spec — a fix-loop would need a fixer agent with
+      # write access to the repo and a re-push, which is out of scope for
+      # a review-and-comment autoflow.
+
+  - id: post_review
+    agent: scm-pr-review
+    actions: ["scm.prs.comment"]
+    prompt: |
+      Post exactly one summary review comment on PR
+      #{{ event.pull_request.number }} ({{ event.pull_request.url }},
+      reviewed at {{ event.pull_request.head_sha }}) via the native
+      `scm.prs.comment` tool.
+
+      This is a comment-only review — do not approve, request changes, or
+      merge; no such native tool is used even if one happens to be
+      available to you.
+
+      Compose the comment from this panel result:
+
+      Max severity: {{ steps.review.max_severity }}
+      Findings count: {{ steps.review.findings | length }}
+
+      {% for f in steps.review.findings %}
+      - [{{ f.severity }}] {{ f.title }} ({{ f.source }}): {{ f.body }}
+      {% endfor %}
+
+      If there are no findings, the comment should say so plainly (e.g.
+      "No security, maintainability, or performance issues found in this
+      diff.").
