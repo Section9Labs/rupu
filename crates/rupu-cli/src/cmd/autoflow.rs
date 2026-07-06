@@ -1703,11 +1703,12 @@ async fn run(
     let issue = fetch_issue(&resolved.cfg, resolver.as_ref(), &fetch_ref).await?;
     let issue_ref_text = format_issue_ref(&issue.r);
     ensure_manual_run_can_take_claim(&claim_store, &issue_ref_text)?;
+    let subject = AutoflowSubject::Issue(issue);
     execute_autoflow_cycle(
         &global,
         &claim_store,
         &resolved,
-        &issue,
+        &subject,
         &issue_ref_text,
         mode,
         true,
@@ -9686,12 +9687,80 @@ pub(crate) fn active_or_fallback_contenders(
     }]
 }
 
+/// Entity-generic dispatch subject for an autoflow cycle.
+///
+/// The claim / lease / max-active / reconcile scaffolding keys on a ref string
+/// and is already entity-agnostic. This enum is the seam at the *dispatch*
+/// layer, where a cycle must turn the concrete entity into a [`RunTarget`] and
+/// a run-context subject field. Today only [`AutoflowSubject::Issue`] exists;
+/// a `Pr` variant lands alongside PR fetch + collection in the follow-up task.
+pub(crate) enum AutoflowSubject {
+    Issue(Issue),
+    // PR slot: a `Pr(Pr)` (or `Pr(PrSubject)`) variant is added here in the
+    // follow-up task. `run_target`, `as_issue`, and `fetch_subject` each gain a
+    // corresponding arm; the Issue arm below stays byte-for-byte unchanged.
+}
+
+/// Which concrete entity a [`fetch_subject`] call should resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoflowSubjectKind {
+    Issue,
+    // PR slot: `Pr` is added here in the follow-up task.
+}
+
+impl AutoflowSubject {
+    /// The concrete [`RunTarget`] this subject dispatches against. The run
+    /// layer is already entity-generic (`RunTarget` has both `Issue` and `Pr`
+    /// variants); this is the dispatch-layer seam that selects the right one.
+    ///
+    /// The Issue arm produces exactly the `RunTarget::Issue { tracker, project,
+    /// number }` the cycle built inline before this seam existed.
+    pub(crate) fn run_target(&self) -> crate::run_target::RunTarget {
+        match self {
+            AutoflowSubject::Issue(issue) => crate::run_target::RunTarget::Issue {
+                tracker: issue.r.tracker,
+                project: issue.r.project.clone(),
+                number: issue.r.number,
+            },
+        }
+    }
+
+    /// Borrow the wrapped [`Issue`]. Issue-specific claim metadata (title,
+    /// state, url, display ref) and the `issue:` run-context payload are built
+    /// from this today. The PR arm will supply its own metadata path rather
+    /// than routing through this accessor.
+    fn as_issue(&self) -> &Issue {
+        match self {
+            AutoflowSubject::Issue(issue) => issue,
+        }
+    }
+}
+
+/// Fetch the dispatch subject for a claim's ref text. This is the entity-generic
+/// counterpart to [`fetch_issue`]: the reconcile loop resolves a subject through
+/// here rather than assuming Issue. The Issue arm delegates to today's
+/// [`fetch_issue`]; the PR arm is added in the follow-up task.
+pub(crate) async fn fetch_subject(
+    kind: AutoflowSubjectKind,
+    cfg: &Config,
+    resolver: &dyn CredentialResolver,
+    ref_text: &str,
+) -> anyhow::Result<AutoflowSubject> {
+    match kind {
+        AutoflowSubjectKind::Issue => {
+            let issue_ref = parse_issue_ref_text(ref_text)?;
+            let issue = fetch_issue(cfg, resolver, &issue_ref).await?;
+            Ok(AutoflowSubject::Issue(issue))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_autoflow_cycle(
     global: &Path,
     claim_store: &AutoflowClaimStore,
     resolved: &ResolvedAutoflowWorkflow,
-    issue: &Issue,
+    subject: &AutoflowSubject,
     issue_ref_text: &str,
     mode_override: Option<&str>,
     attach_ui: bool,
@@ -9701,6 +9770,7 @@ pub(crate) async fn execute_autoflow_cycle(
     shared_printer: Option<Arc<Mutex<LineStreamPrinter>>>,
     live_cycle_recorder: Option<Arc<crate::cmd::autoflow_runtime::LiveCycleRecorder>>,
 ) -> anyhow::Result<()> {
+    let issue = subject.as_issue();
     let autoflow = resolved.autoflow()?;
     let issue_payload = issue_payload(&resolved.cfg, issue)?;
     let workspace_strategy = resolve_workspace_strategy(&resolved.cfg.autoflow, autoflow);
@@ -9814,11 +9884,7 @@ pub(crate) async fn execute_autoflow_cycle(
             issue: Some(issue_payload),
             issue_ref: Some(issue_ref_text.to_string()),
             system_prompt_suffix: Some(crate::run_target::format_run_target_for_prompt(
-                &crate::run_target::RunTarget::Issue {
-                    tracker: issue.r.tracker,
-                    project: issue.r.project.clone(),
-                    number: issue.r.number,
-                },
+                &subject.run_target(),
             )),
             attach_ui,
             run_id_override: None,
@@ -10587,7 +10653,7 @@ pub(crate) async fn execute_pending_dispatch_workflow(
     claim_store: &AutoflowClaimStore,
     base_resolved: &ResolvedAutoflowWorkflow,
     claim: &mut AutoflowClaimRecord,
-    issue: &Issue,
+    subject: &AutoflowSubject,
     issue_ref_text: &str,
     workflow_name: &str,
     inputs: BTreeMap<String, String>,
@@ -10612,6 +10678,7 @@ pub(crate) async fn execute_pending_dispatch_workflow(
         root: global.join("workspaces"),
     };
     let ws = rupu_workspace::upsert(&ws_store, &workspace_path)?;
+    let issue = subject.as_issue();
     let issue_payload = issue_payload(&cfg, issue)?;
     let permission_mode =
         resolve_autoflow_permission_mode(None, cfg.autoflow.permission_mode.as_deref())?;
@@ -10637,11 +10704,7 @@ pub(crate) async fn execute_pending_dispatch_workflow(
             issue: Some(issue_payload),
             issue_ref: Some(issue_ref_text.to_string()),
             system_prompt_suffix: Some(crate::run_target::format_run_target_for_prompt(
-                &crate::run_target::RunTarget::Issue {
-                    tracker: issue.r.tracker,
-                    project: issue.r.project.clone(),
-                    number: issue.r.number,
-                },
+                &subject.run_target(),
             )),
             attach_ui,
             run_id_override: None,
@@ -12044,6 +12107,42 @@ steps:
             autoflow,
             &issue(&["autoflow", "bug", "blocked"])
         ));
+    }
+
+    #[test]
+    fn autoflow_subject_issue_arm_builds_issue_run_target() {
+        // Characterization test for the entity-generic dispatch seam: the Issue
+        // arm of `AutoflowSubject::run_target` must reproduce exactly the
+        // `RunTarget::Issue { tracker, project, number }` the cycle built inline
+        // before the seam existed. A future `Pr` arm is added with confidence
+        // against this baseline.
+        let issue = Issue {
+            r: IssueRef {
+                tracker: IssueTracker::Github,
+                project: "Section9Labs/rupu".into(),
+                number: 42,
+            },
+            title: "x".into(),
+            body: String::new(),
+            state: IssueState::Open,
+            labels: vec![],
+            label_colors: BTreeMap::new(),
+            author: "matt".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let subject = AutoflowSubject::Issue(issue.clone());
+        assert_eq!(
+            subject.run_target(),
+            crate::run_target::RunTarget::Issue {
+                tracker: issue.r.tracker,
+                project: issue.r.project.clone(),
+                number: issue.r.number,
+            }
+        );
+        // The seam's `as_issue` accessor returns the wrapped issue verbatim, so
+        // the issue-specific claim/context path stays byte-for-byte.
+        assert_eq!(subject.as_issue(), &issue);
     }
 
     #[test]

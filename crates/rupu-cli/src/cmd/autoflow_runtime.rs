@@ -367,10 +367,11 @@ pub(crate) async fn tick_with_options(
                                 );
                                 return Ok(false);
                             }
-                            let issue = legacy::fetch_issue(
+                            let subject = legacy::fetch_subject(
+                                legacy::AutoflowSubjectKind::Issue,
                                 &resolved.cfg,
                                 resolver.as_ref(),
-                                &legacy::parse_issue_ref_text(&issue_ref_text)?,
+                                &issue_ref_text,
                             )
                             .await?;
                             if legacy::workflow_declares_autoflow_for_repo(
@@ -389,7 +390,7 @@ pub(crate) async fn tick_with_options(
                                     &global,
                                     &claim_store,
                                     &resolved,
-                                    &issue,
+                                    &subject,
                                     &issue_ref_text,
                                     None,
                                     attach_workflow_ui,
@@ -407,7 +408,7 @@ pub(crate) async fn tick_with_options(
                                     &claim_store,
                                     &resolved,
                                     &mut current,
-                                    &issue,
+                                    &subject,
                                     &issue_ref_text,
                                     &dispatch.workflow,
                                     dispatch.inputs,
@@ -433,17 +434,18 @@ pub(crate) async fn tick_with_options(
                             tick_started_at,
                             &wake_hints.events_for(&issue_ref_text, &current.repo_ref),
                         )? {
-                            let issue = legacy::fetch_issue(
+                            let subject = legacy::fetch_subject(
+                                legacy::AutoflowSubjectKind::Issue,
                                 &resolved.cfg,
                                 resolver.as_ref(),
-                                &legacy::parse_issue_ref_text(&issue_ref_text)?,
+                                &issue_ref_text,
                             )
                             .await?;
                             legacy::execute_autoflow_cycle(
                                 &global,
                                 &claim_store,
                                 &resolved,
-                                &issue,
+                                &subject,
                                 &issue_ref_text,
                                 None,
                                 attach_workflow_ui,
@@ -487,11 +489,12 @@ pub(crate) async fn tick_with_options(
                 if active >= max_active {
                     return Ok(false);
                 }
+                let winner_subject = legacy::AutoflowSubject::Issue(winner.issue.clone());
                 legacy::execute_autoflow_cycle(
                     &global,
                     &claim_store,
                     &winner.resolved,
-                    &winner.issue,
+                    &winner_subject,
                     &winner.issue_ref_text,
                     None,
                     attach_workflow_ui,
