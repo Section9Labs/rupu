@@ -36,17 +36,15 @@ steps:
       max_parallel: 2
 
   - id: report_maintainability
-    # NOTE (native-tool gap — see task report): repo-investigator's
-    # `.rupu/agents/repo-investigator.md` frontmatter currently declares
-    # `tools: [bash, read_file, grep, glob]` only — no `issues.*` tools. A
-    # step's `actions:` allowlist below is an audit-log allowlist for the
-    # action-protocol (crates/rupu-orchestrator/src/action_protocol.rs), NOT
-    # a tool grant: the runtime tool roster comes solely from the agent's own
-    # frontmatter `tools:` list (crates/rupu-orchestrator/src/step_factory.rs
-    # `agent_tools: spec.tools`). This step cannot actually call
-    # `issues.list`/`issues.comment`/`issues.create` until repo-investigator
-    # (or a dedicated reporting agent) has them added to its `tools:` list —
-    # tracked as a prerequisite, out of scope for this YAML-only change.
+    # NOTE: this step runs as `issue-reporter`, whose
+    # `.rupu/agents/issue-reporter.md` frontmatter `tools:` list declares
+    # `issues.list` / `issues.comment` / `issues.create` — the runtime tool
+    # roster comes solely from the agent's own frontmatter
+    # (crates/rupu-orchestrator/src/step_factory.rs `agent_tools: spec.tools`),
+    # so this step can call these native tools directly. The `actions:`
+    # allowlist below is a separate audit-log allowlist for the
+    # action-protocol (crates/rupu-orchestrator/src/action_protocol.rs), not
+    # the tool grant.
     agent: issue-reporter
     actions: ["issues.list", "issues.comment", "issues.create"]
     prompt: |
@@ -79,8 +77,9 @@ steps:
       number) or a new one was created, and which native tool call(s) were made.
 
   - id: report_security
-    # NOTE (native-tool gap): same as report_maintainability above — see that
-    # step's comment.
+    # NOTE: same as report_maintainability above — this step runs as
+    # `issue-reporter`, which has native `issues.*` tools via its own
+    # frontmatter; see that step's comment.
     agent: issue-reporter
     actions: ["issues.list", "issues.comment", "issues.create"]
     prompt: |

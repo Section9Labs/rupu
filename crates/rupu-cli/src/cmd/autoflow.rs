@@ -9556,6 +9556,27 @@ pub(crate) async fn collect_issue_matches(
             }
         };
         issues.retain(|issue| selector_matches(autoflow, issue));
+
+        // Author allowlist. `is_collaborator` is resolved via the repo
+        // connector for this source's repo (only `EventSourceRef::Repo`
+        // sources have one; `TrackerProject` sources fail closed below).
+        // Mirrors `select_eligible_prs`'s author gate exactly.
+        let repo_ref = match &source_ref {
+            EventSourceRef::Repo { repo } => Some(repo.clone()),
+            EventSourceRef::TrackerProject { .. } => None,
+        };
+        let repo_connector = match &repo_ref {
+            Some(repo) => registry.repo(repo.platform),
+            None => None,
+        };
+        issues = filter_issues_by_author_allowlist(
+            repo_connector.as_deref(),
+            repo_ref.as_ref(),
+            autoflow,
+            issues,
+        )
+        .await;
+
         issues.sort_by_key(|issue| issue.r.number);
         if let Some(limit) = autoflow.selector.limit {
             issues.truncate(limit as usize);
@@ -9569,6 +9590,108 @@ pub(crate) async fn collect_issue_matches(
         }
     }
     Ok(out)
+}
+
+/// Selection core: apply the author allowlist to a set of already
+/// selector-matched issues. The issue analogue of `select_eligible_prs`'s
+/// author gate — `is_collaborator` is consulted only when the selector needs
+/// it (`authors_from` is set and the explicit `authors` list doesn't already
+/// cover this author), fail-closed on error, and never aborts collection.
+///
+/// When neither `authors` nor `authors_from` is configured, this returns
+/// `issues` unchanged without ever touching `repo_connector` — existing
+/// gate-less issue autoflows (e.g. `phase-delivery-cycle`,
+/// `issue-supervisor-dispatch`) see no behavior change and pay no extra
+/// network round-trip.
+///
+/// `repo_connector`/`repo` are `None` when the issue source has no backing
+/// repo (a `TrackerProject` source such as Linear/Jira, which have no
+/// `is_collaborator` API today); in that case an author-restricted selector
+/// fails closed for every issue from that source, matching the
+/// can't-verify-so-deny rule used for a hard `is_collaborator` error.
+async fn filter_issues_by_author_allowlist(
+    repo_connector: Option<&dyn RepoConnector>,
+    repo: Option<&RepoRef>,
+    autoflow: &rupu_orchestrator::Autoflow,
+    issues: Vec<Issue>,
+) -> Vec<Issue> {
+    let selector = &autoflow.selector;
+    if selector.authors.is_empty() && selector.authors_from.is_none() {
+        return issues;
+    }
+
+    let mut out = Vec::with_capacity(issues.len());
+    // Cache collaborator lookups per tick so N issues by one author cost one call.
+    let mut collab_cache: BTreeMap<String, bool> = BTreeMap::new();
+
+    for issue in issues {
+        let explicitly_allowed =
+            !selector.authors.is_empty() && selector.authors.iter().any(|a| a == &issue.author);
+        let needs_collab = !explicitly_allowed && selector.authors_from.is_some();
+        let is_collab = if needs_collab {
+            if let Some(cached) = collab_cache.get(&issue.author) {
+                *cached
+            } else {
+                let value = match (repo_connector, repo) {
+                    (Some(connector), Some(repo)) => {
+                        match connector.is_collaborator(repo, &issue.author).await {
+                            Ok(value) => value,
+                            Err(err) => {
+                                // Fail closed: an author we can't verify is
+                                // treated as NOT allowed. Never aborts the tick.
+                                warn!(
+                                    repo = %format!("{}/{}", repo.owner, repo.repo),
+                                    issue = issue.r.number,
+                                    author = %issue.author,
+                                    error = %err,
+                                    "is_collaborator check failed; treating issue author as not allowed (fail-closed)"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    _ => {
+                        // No repo connector to verify against (e.g. a
+                        // TrackerProject source with no repo binding).
+                        // Fail closed rather than silently skip the gate.
+                        warn!(
+                            issue = issue.r.number,
+                            author = %issue.author,
+                            "no repo connector available to verify issue author's collaborator status; treating as not allowed (fail-closed)"
+                        );
+                        false
+                    }
+                };
+                collab_cache.insert(issue.author.clone(), value);
+                value
+            }
+        } else {
+            false
+        };
+
+        if !author_allowed(selector, &issue.author, is_collab) {
+            if matches!(
+                selector.on_skip,
+                Some(rupu_orchestrator::SkipAction::LabelNeedsHuman)
+            ) {
+                // No issue-label-add API exists on `IssueConnector` today (unlike
+                // `add_pr_labels` on `RepoConnector`), so `label_needs_human` for
+                // issues degrades to a plain skip. Follow-up: add an
+                // `add_issue_labels` method to `IssueConnector` if this needs
+                // parity with the PR path.
+                warn!(
+                    issue = issue.r.number,
+                    author = %issue.author,
+                    "on_skip label_needs_human is not yet supported for issues (no issue label-add API); skipping issue instead"
+                );
+            }
+            continue;
+        }
+
+        out.push(issue);
+    }
+
+    out
 }
 
 pub(crate) fn choose_winning_matches(matches: Vec<IssueMatch>) -> BTreeMap<String, IssueMatch> {
@@ -17079,6 +17202,308 @@ steps:
             assert_eq!(
                 subject_kind_for_ref("github:Section9Labs/rupu/issues/42"),
                 AutoflowSubjectKind::Issue
+            );
+        }
+    }
+
+    // ---- issue autoflow author allowlist gate ------------------------------
+    //
+    // Final-review finding: `select_eligible_prs` gates PR candidates on the
+    // author allowlist, but `collect_issue_matches` never did — an issue
+    // autoflow declaring `authors_from: collaborators` was a silent no-op.
+    // These tests exercise `filter_issues_by_author_allowlist`, the issue
+    // analogue of `select_eligible_prs`'s author gate, mirroring the shape of
+    // the `pr_autoflow::is_collaborator_error_skips_pr_not_tick` /
+    // `selects_eligible_filters_draft_and_skips_non_collaborator` tests above.
+    mod issue_autoflow {
+        use super::*;
+        use async_trait::async_trait;
+        use rupu_orchestrator::{
+            AuthorScope, Autoflow, AutoflowEntity, AutoflowIssueState, AutoflowSelector,
+        };
+        use rupu_scm::{
+            Branch, Comment, CreatePr, Diff, FileContent, Pr, PrFilter, PrRef, Repo, ScmError,
+        };
+
+        /// Minimal fake `RepoConnector` for issue author-gate tests. Only
+        /// `is_collaborator` is meaningful; every other method is unreachable
+        /// from `filter_issues_by_author_allowlist`.
+        struct FakeIssueRepoConnector {
+            collaborators: Vec<String>,
+            collab_errors: bool,
+        }
+
+        #[async_trait]
+        impl RepoConnector for FakeIssueRepoConnector {
+            fn platform(&self) -> Platform {
+                Platform::Github
+            }
+            async fn list_repos(&self) -> Result<Vec<Repo>, ScmError> {
+                unimplemented!()
+            }
+            async fn get_repo(&self, _r: &RepoRef) -> Result<Repo, ScmError> {
+                unimplemented!()
+            }
+            async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
+                unimplemented!()
+            }
+            async fn create_branch(
+                &self,
+                _r: &RepoRef,
+                _name: &str,
+                _from_sha: &str,
+            ) -> Result<Branch, ScmError> {
+                unimplemented!()
+            }
+            async fn read_file(
+                &self,
+                _r: &RepoRef,
+                _path: &str,
+                _ref_: Option<&str>,
+            ) -> Result<FileContent, ScmError> {
+                unimplemented!()
+            }
+            async fn list_prs(&self, _r: &RepoRef, _f: PrFilter) -> Result<Vec<Pr>, ScmError> {
+                unimplemented!()
+            }
+            async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
+                unimplemented!()
+            }
+            async fn diff_pr(&self, _p: &PrRef) -> Result<Diff, ScmError> {
+                unimplemented!()
+            }
+            async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
+                unimplemented!()
+            }
+            async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
+                unimplemented!()
+            }
+            async fn clone_to(&self, _r: &RepoRef, _dir: &Path) -> Result<(), ScmError> {
+                unimplemented!()
+            }
+            async fn is_collaborator(&self, _r: &RepoRef, login: &str) -> Result<bool, ScmError> {
+                if self.collab_errors {
+                    return Err(ScmError::BadRequest {
+                        message: "boom".into(),
+                    });
+                }
+                Ok(self.collaborators.iter().any(|c| c == login))
+            }
+        }
+
+        fn test_repo() -> RepoRef {
+            RepoRef {
+                platform: Platform::Github,
+                owner: "acme".into(),
+                repo: "widget".into(),
+            }
+        }
+
+        fn make_issue(number: u64, author: &str) -> Issue {
+            Issue {
+                r: IssueRef {
+                    tracker: IssueTracker::Github,
+                    project: "acme/widget".into(),
+                    number,
+                },
+                title: format!("issue #{number}"),
+                body: String::new(),
+                state: IssueState::Open,
+                labels: Vec::new(),
+                label_colors: BTreeMap::new(),
+                author: author.into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }
+        }
+
+        /// Selector: `{authors_from: collaborators}` — no other restriction,
+        /// so this isolates the author gate under test.
+        fn collaborator_only_autoflow() -> Autoflow {
+            Autoflow {
+                enabled: true,
+                entity: AutoflowEntity::Issue,
+                source: Some("github:acme/widget".into()),
+                priority: 0,
+                selector: AutoflowSelector {
+                    states: vec![AutoflowIssueState::Open],
+                    labels_all: Vec::new(),
+                    labels_any: Vec::new(),
+                    labels_none: Vec::new(),
+                    limit: None,
+                    draft: None,
+                    base: None,
+                    authors: Vec::new(),
+                    authors_from: Some(AuthorScope::Collaborators),
+                    on_skip: None,
+                },
+                wake_on: Vec::new(),
+                reconcile_every: None,
+                claim: None,
+                workspace: None,
+                outcome: None,
+            }
+        }
+
+        /// No `authors` / `authors_from` at all — the pre-existing shape of
+        /// gate-less issue autoflows like `phase-delivery-cycle` /
+        /// `issue-supervisor-dispatch`.
+        fn no_author_restriction_autoflow() -> Autoflow {
+            let mut af = collaborator_only_autoflow();
+            af.selector.authors_from = None;
+            af
+        }
+
+        #[tokio::test]
+        async fn non_collaborator_issue_is_skipped_not_collection() {
+            let repo = test_repo();
+            let connector = FakeIssueRepoConnector {
+                collaborators: vec!["collab".into()],
+                collab_errors: false,
+            };
+            let af = collaborator_only_autoflow();
+            let issues = vec![make_issue(1, "stranger")];
+
+            let out =
+                filter_issues_by_author_allowlist(Some(&connector), Some(&repo), &af, issues).await;
+
+            assert!(
+                out.is_empty(),
+                "issue by a non-collaborator must be dropped when authors_from: collaborators is set"
+            );
+        }
+
+        #[tokio::test]
+        async fn collaborator_issue_is_collected() {
+            let repo = test_repo();
+            let connector = FakeIssueRepoConnector {
+                collaborators: vec!["collab".into()],
+                collab_errors: false,
+            };
+            let af = collaborator_only_autoflow();
+            let issues = vec![make_issue(1, "collab")];
+
+            let out =
+                filter_issues_by_author_allowlist(Some(&connector), Some(&repo), &af, issues).await;
+
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].r.number, 1);
+        }
+
+        #[tokio::test]
+        async fn is_collaborator_error_skips_issue_not_collection() {
+            let repo = test_repo();
+            let connector = FakeIssueRepoConnector {
+                collaborators: vec!["collab".into()],
+                collab_errors: true, // is_collaborator returns Err -> fail closed
+            };
+            let af = collaborator_only_autoflow();
+            let issues = vec![make_issue(1, "collab")];
+
+            // The gate must NOT abort collection — it returns the issue
+            // filtered out, same as `select_eligible_prs`'s fail-closed path.
+            let out =
+                filter_issues_by_author_allowlist(Some(&connector), Some(&repo), &af, issues).await;
+
+            assert!(
+                out.is_empty(),
+                "is_collaborator error must fail closed (skip), not abort collection"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_author_restriction_collects_all_issues_unchanged() {
+            // A connector whose `is_collaborator` panics: proves the gate
+            // never even resolves collaborator status when neither `authors`
+            // nor `authors_from` is configured (backward compat + no
+            // unnecessary network call).
+            struct PanicsIfCalled;
+            #[async_trait]
+            impl RepoConnector for PanicsIfCalled {
+                fn platform(&self) -> Platform {
+                    Platform::Github
+                }
+                async fn list_repos(&self) -> Result<Vec<Repo>, ScmError> {
+                    unimplemented!()
+                }
+                async fn get_repo(&self, _r: &RepoRef) -> Result<Repo, ScmError> {
+                    unimplemented!()
+                }
+                async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
+                    unimplemented!()
+                }
+                async fn create_branch(
+                    &self,
+                    _r: &RepoRef,
+                    _name: &str,
+                    _from_sha: &str,
+                ) -> Result<Branch, ScmError> {
+                    unimplemented!()
+                }
+                async fn read_file(
+                    &self,
+                    _r: &RepoRef,
+                    _path: &str,
+                    _ref_: Option<&str>,
+                ) -> Result<FileContent, ScmError> {
+                    unimplemented!()
+                }
+                async fn list_prs(&self, _r: &RepoRef, _f: PrFilter) -> Result<Vec<Pr>, ScmError> {
+                    unimplemented!()
+                }
+                async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
+                    unimplemented!()
+                }
+                async fn diff_pr(&self, _p: &PrRef) -> Result<Diff, ScmError> {
+                    unimplemented!()
+                }
+                async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
+                    unimplemented!()
+                }
+                async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
+                    unimplemented!()
+                }
+                async fn clone_to(&self, _r: &RepoRef, _dir: &Path) -> Result<(), ScmError> {
+                    unimplemented!()
+                }
+                async fn is_collaborator(
+                    &self,
+                    _r: &RepoRef,
+                    _login: &str,
+                ) -> Result<bool, ScmError> {
+                    panic!("is_collaborator must not be called when no author restriction is configured");
+                }
+            }
+
+            let repo = test_repo();
+            let connector = PanicsIfCalled;
+            let af = no_author_restriction_autoflow();
+            let issues = vec![make_issue(1, "stranger"), make_issue(2, "anyone")];
+
+            let out =
+                filter_issues_by_author_allowlist(Some(&connector), Some(&repo), &af, issues).await;
+
+            assert_eq!(
+                out.len(),
+                2,
+                "no author restriction -> all issues pass through unchanged"
+            );
+        }
+
+        #[tokio::test]
+        async fn no_repo_connector_fails_closed_for_tracker_project_source() {
+            // A `TrackerProject` issue source has no backing `RepoRef`, so
+            // there is no `is_collaborator` API to consult. An
+            // author-restricted selector must still fail closed rather than
+            // silently letting every issue through.
+            let af = collaborator_only_autoflow();
+            let issues = vec![make_issue(1, "anyone")];
+
+            let out = filter_issues_by_author_allowlist(None, None, &af, issues).await;
+
+            assert!(
+                out.is_empty(),
+                "no repo connector to verify collaborator status must fail closed"
             );
         }
     }

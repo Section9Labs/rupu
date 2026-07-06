@@ -43,17 +43,14 @@ steps:
       captured failing output.
 
   - id: report_health
-    # NOTE (native-tool gap — see task report): repo-investigator's
-    # frontmatter (`tools: [bash, read_file, grep, glob]`) does not declare
-    # `issues.list` / `issues.comment` / `issues.create` / `issues.update_state`.
-    # A step's `actions:` allowlist is an audit-log allowlist for the
-    # action-protocol (crates/rupu-orchestrator/src/action_protocol.rs), NOT a
-    # tool grant — the runtime tool roster comes solely from the agent's own
-    # frontmatter `tools:` list (crates/rupu-orchestrator/src/step_factory.rs
-    # `agent_tools: spec.tools`). This step cannot actually call these native
-    # tools until repo-investigator (or a dedicated reporting agent) has them
-    # added — tracked as a prerequisite, out of scope for this YAML-only
-    # change.
+    # NOTE: this step runs as `issue-reporter`, whose frontmatter `tools:`
+    # list declares `issues.list` / `issues.comment` / `issues.create` /
+    # `issues.update_state` — the runtime tool roster comes solely from the
+    # agent's own frontmatter (crates/rupu-orchestrator/src/step_factory.rs
+    # `agent_tools: spec.tools`), so this step can call these native tools
+    # directly. The `actions:` allowlist below is a separate audit-log
+    # allowlist for the action-protocol
+    # (crates/rupu-orchestrator/src/action_protocol.rs), not the tool grant.
     agent: issue-reporter
     actions: ["issues.list", "issues.comment", "issues.create", "issues.update_state"]
     prompt: |
