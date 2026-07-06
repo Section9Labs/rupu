@@ -1,0 +1,57 @@
+name: issue-triage
+description: >
+  Read-mostly issue triage autoflow. On a newly opened issue from a known
+  collaborator, produces a triage assessment and posts it as a single
+  comment via the native `issues.comment` tool. No repo writes; see the
+  `post_triage` step for why it cannot itself apply the "triaged" label.
+autoflow:
+  enabled: true
+  entity: issue
+  selector:
+    states: [open]
+    labels_none: [triaged]
+    authors_from: collaborators
+  wake_on:
+    - github.issue.opened
+    - github.issue.labeled
+  reconcile_every: "15m"
+  claim:
+    key: issue
+steps:
+  - id: assess
+    agent: issue-understander
+    actions: []
+    prompt: |
+      Triage issue #{{ issue.number }} ({{ issue.ref }}).
+
+      Title: {{ issue.title }}
+      Author: {{ issue.author }}
+      Current labels: {{ issue.labels | join(", ") }}
+
+      Body:
+      {{ issue.body }}
+
+      Produce a triage assessment with these sections:
+      - Summary: one paragraph on what's being asked or reported
+      - Priority: low|medium|high|critical, with a one-line reason
+      - Type: bug|feature|question|chore
+      - Suggested labels: a short comma-separated list
+      - Open questions / missing info: anything blocking action, or "none"
+
+  - id: post_triage
+    agent: issue-commenter
+    actions: ["issues.comment"]
+    prompt: |
+      Post exactly one comment on issue #{{ issue.number }} ({{ issue.ref }})
+      via the native `issues.comment` tool, using this triage assessment as
+      the body:
+
+      {{ steps.assess.output }}
+
+      Append a closing line to the comment noting: this autoflow can only
+      comment — the sole state-changing native tool available,
+      `issues.update_state`, toggles open/closed and cannot apply a label —
+      so a human (or a follow-up label-writing automation) should apply the
+      "triaged" label from the "Suggested labels" list above once this
+      triage is reviewed, so the issue drops out of this autoflow's
+      `labels_none: [triaged]` selector on the next tick.
