@@ -28,6 +28,21 @@ pub(crate) mod test_support {
     use tokio::sync::Mutex;
 
     pub static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Installs the process-level rustls `CryptoProvider` once per test
+    /// binary. `main.rs` does this at real-binary startup (the dep tree
+    /// enables both the `aws-lc-rs` and `ring` rustls providers, so rustls
+    /// 0.23 can't auto-select one), but `cargo test --lib` never runs
+    /// `main()`. Any test that builds a real `RepoConnector` (github/gitlab/
+    /// jira/linear reqwest clients) needs a provider installed before its
+    /// first TLS-capable request or it panics. Idempotent and safe to call
+    /// from every test, even ones that don't touch a connector.
+    pub fn ensure_crypto_provider() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
 }
 
 use clap::{CommandFactory, Parser, Subcommand};

@@ -10130,9 +10130,16 @@ pub(crate) async fn select_eligible_prs(
     let selector = &autoflow.selector;
     // Server-side narrowing: `list_prs` supports state/author/limit only.
     // Everything else (draft/base/labels) is applied client-side below.
+    // `states: [closed]` must include merged PRs (see `pr_selector_matches`
+    // below, which treats `Closed` as `Closed | Merged`), but connectors'
+    // `list_prs` state filter narrows to a single server-side state ("closed"
+    // on GitHub/GitLab) that does not reliably include merged PRs (GitLab in
+    // particular distinguishes `state=merged` from `state=closed`). Narrowing
+    // to `PrState::Closed` server-side would silently drop merged PRs before
+    // the client-side check ever sees them, so list everything and let
+    // `pr_selector_matches` be the sole authority for the closed case.
     let state = match selector.states.as_slice() {
         [rupu_orchestrator::AutoflowIssueState::Open] => Some(PrState::Open),
-        [rupu_orchestrator::AutoflowIssueState::Closed] => Some(PrState::Closed),
         _ => None,
     };
     let filter = PrFilter {
@@ -12026,7 +12033,7 @@ fn format_contenders(contenders: &[AutoflowContender]) -> String {
 mod tests {
     use super::*;
     use crate::cmd::autoflow_wake;
-    use crate::test_support::ENV_LOCK;
+    use crate::test_support::{ensure_crypto_provider, ENV_LOCK};
     use httpmock::Method::{GET, POST};
     use httpmock::MockServer;
     use rupu_auth::in_memory::InMemoryResolver;
@@ -13931,6 +13938,7 @@ steps:
 
     #[tokio::test]
     async fn tick_preserves_await_human_claims_while_run_is_awaiting_approval() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -14099,6 +14107,7 @@ steps:
 
     #[tokio::test]
     async fn tick_reconciles_await_human_claim_once_run_completes() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -14285,6 +14294,7 @@ steps:
 
     #[tokio::test]
     async fn tick_executes_pending_dispatch_on_next_pass() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -14478,6 +14488,7 @@ steps:
 
     #[tokio::test]
     async fn tick_executes_pending_dispatch_to_non_autoflow_workflow() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -14621,6 +14632,7 @@ steps:
 
     #[tokio::test]
     async fn tick_discovers_tracked_repo_and_runs_autoflow_cycle() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -14720,8 +14732,146 @@ steps:
             .contains("issue-123"));
     }
 
+    /// The PR analogue of `tick_discovers_tracked_repo_and_runs_autoflow_cycle`
+    /// above — closes the review's flagged end-to-end gap. The 6 PR unit
+    /// tests in `pr_autoflow` below exercise `select_eligible_prs` directly;
+    /// nothing previously drove a PR through the FULL shared reconcile loop
+    /// (`collect_pr_matches` -> winner selection -> `execute_autoflow_cycle`
+    /// dispatching an `AutoflowSubject::Pr`). This seeds an `entity:
+    /// pull_request` autoflow + a mocked GitHub connector returning one
+    /// eligible open PR, drives a real `tick_with_resolver`, and asserts the
+    /// PR actually reached dispatch: a claim was created at the `pr:...`
+    /// head-SHA ref (not an issue ref), its dispatch context used the PR
+    /// arm of `build_dispatch_context` (PR-derived branch + `owner/repo#n`
+    /// display ref, never the issue's templated `workspace.branch`), and the
+    /// rendered step prompt actually saw the `event.pull_request` payload —
+    /// i.e. the PR genuinely traversed the shared engine end-to-end.
+    #[tokio::test]
+    async fn tick_discovers_pr_autoflow_and_dispatches_through_shared_engine() {
+        ensure_crypto_provider();
+        let _guard = ENV_LOCK.lock().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("home");
+        let project = tmp.path().join("repo");
+        init_git_repo(&project);
+
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(GET).path("/repos/Section9Labs/rupu/pulls");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(github_fixture("prs_list_happy.json"));
+        });
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/repos/Section9Labs/rupu/pulls/42")
+                .header("accept", "application/vnd.github.v3.diff");
+            then.status(200)
+                .header("content-type", "text/plain")
+                .body(github_fixture("pr_diff_happy.patch"));
+        });
+
+        write_autoflow_project(
+            &project,
+            &server.base_url(),
+            "pr-code-review",
+            r#"name: pr-code-review
+autoflow:
+  enabled: true
+  entity: pull_request
+  priority: 100
+  selector:
+    states: ["open"]
+  reconcile_every: "10m"
+  claim:
+    ttl: "3h"
+  outcome:
+    output: result
+contracts:
+  outputs:
+    result:
+      from_step: decide
+      format: json
+      schema: autoflow_outcome_v1
+steps:
+  - id: decide
+    agent: echo
+    actions: []
+    prompt: "pr={{ event.pull_request.number }} sha={{ event.pull_request.head_sha }}"
+"#,
+        );
+
+        std::fs::create_dir_all(&global).unwrap();
+        let repo_store = RepoRegistryStore {
+            root: paths::repos_dir(&global),
+        };
+        repo_store
+            .upsert(
+                "github:Section9Labs/rupu",
+                &project,
+                Some("https://github.com/Section9Labs/rupu.git"),
+                Some("HEAD"),
+            )
+            .unwrap();
+
+        let resolver = Arc::new(InMemoryResolver::new());
+        resolver
+            .put(
+                rupu_auth::backend::ProviderId::Github,
+                AuthMode::ApiKey,
+                StoredCredential::api_key("ghp_test"),
+            )
+            .await;
+
+        std::env::set_var("RUPU_HOME", &global);
+        std::env::set_var("RUPU_MOCK_PROVIDER_SCRIPT", COMPLETE_SCRIPT);
+
+        tick_with_resolver(resolver).await.unwrap();
+
+        std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+        std::env::remove_var("RUPU_HOME");
+
+        // `prs_list_happy.json`'s PR #42 is open, head sha `deadbeef` — this
+        // is the exact `pr_claim_ref` the shared reconcile loop must have
+        // claimed under for the PR (not issue) arm to have run at all.
+        let claim_store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(&global),
+        };
+        let claim = claim_store
+            .load("pr:github:Section9Labs/rupu#42@deadbeef")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.status, ClaimStatus::Complete);
+        let run_id = claim.last_run_id.clone().expect("run dispatched");
+
+        // PR-specific dispatch metadata (`build_dispatch_context`'s PR arm):
+        // the worktree branch is PR-number/head-sha derived, never the
+        // issue-only `workspace.branch` Jinja template, and the display ref
+        // is `owner/repo#number` rather than an issue number.
+        assert_eq!(claim.branch.as_deref(), Some("rupu/pr-42-deadbeef"));
+        assert_eq!(
+            claim.issue_display_ref.as_deref(),
+            Some("Section9Labs/rupu#42")
+        );
+
+        // The dispatched run's rendered prompt saw the real `event.pull_request`
+        // payload `collect_pr_matches` fetched (number + head sha) — proof
+        // the run itself was reached via the PR path, not merely that a claim
+        // record was written.
+        let run_store = RunStore::new(global.join("runs"));
+        let rows = run_store.read_step_results(&run_id).unwrap();
+        assert!(
+            rows.iter().any(|row| row.rendered_prompt.contains("pr=42")
+                && row.rendered_prompt.contains("sha=deadbeef")),
+            "expected a step result whose rendered prompt saw the PR event payload, got {:?}",
+            rows.iter().map(|r| &r.rendered_prompt).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn serve_runs_one_cycle_persists_worker_and_releases_lock() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -14902,6 +15052,7 @@ steps:
 
     #[tokio::test]
     async fn serve_hook_receives_per_cycle_reports() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -15011,6 +15162,7 @@ steps:
 
     #[tokio::test]
     async fn serve_respects_repo_filter() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -15146,6 +15298,7 @@ steps:
 
     #[tokio::test]
     async fn serve_enqueues_follow_up_dispatch_wake() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -15285,6 +15438,7 @@ steps:
 
     #[tokio::test]
     async fn tick_releases_idle_claim_for_higher_priority_winner() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -15470,6 +15624,7 @@ steps:
 
     #[tokio::test]
     async fn tick_uses_polled_wake_events_to_resume_await_external_claims() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -15648,6 +15803,7 @@ steps:
 
     #[tokio::test]
     async fn tick_uses_webhook_wake_events_to_resume_await_external_claims() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -15892,6 +16048,7 @@ steps:
 
     #[tokio::test]
     async fn tick_reaps_stale_orphan_lock_and_runs_cycle() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -16002,6 +16159,7 @@ steps:
 
     #[tokio::test]
     async fn tick_ignores_complete_claims_when_enforcing_max_active() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -16165,6 +16323,7 @@ base_url = "{}"
 
     #[tokio::test]
     async fn tick_frees_capacity_after_existing_claim_completes() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -16343,6 +16502,7 @@ base_url = "{}"
 
     #[tokio::test]
     async fn tick_continues_after_issue_level_failure() {
+        ensure_crypto_provider();
         let _guard = ENV_LOCK.lock().await;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -16589,8 +16749,22 @@ steps:
             ) -> Result<FileContent, ScmError> {
                 unimplemented!()
             }
-            async fn list_prs(&self, _r: &RepoRef, _f: PrFilter) -> Result<Vec<Pr>, ScmError> {
-                Ok(self.prs.clone())
+            async fn list_prs(&self, _r: &RepoRef, f: PrFilter) -> Result<Vec<Pr>, ScmError> {
+                // Simulate a real connector's server-side state narrowing
+                // (worst case: like GitLab, `state=closed` matches ONLY the
+                // literal closed state, never merged). This is what makes
+                // `states_closed_selector_matches_merged_prs_not_just_literal_closed`
+                // below actually exercise the `select_eligible_prs` selector-map
+                // fix rather than trivially passing.
+                Ok(match f.state {
+                    Some(state) => self
+                        .prs
+                        .iter()
+                        .filter(|pr| pr.state == state)
+                        .cloned()
+                        .collect(),
+                    None => self.prs.clone(),
+                })
             }
             async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
                 unimplemented!()
@@ -16796,6 +16970,79 @@ steps:
                 .load(&pr_claim_ref(&repo, 3, "sha-c"))
                 .unwrap()
                 .is_none());
+        }
+
+        /// Selector: `{states:[closed]}` — no draft/author restriction, so
+        /// this isolates the closed-vs-merged behavior under test.
+        fn closed_states_review_autoflow() -> Autoflow {
+            Autoflow {
+                enabled: true,
+                entity: AutoflowEntity::PullRequest,
+                source: Some("github:acme/widget".into()),
+                priority: 0,
+                selector: AutoflowSelector {
+                    states: vec![AutoflowIssueState::Closed],
+                    labels_all: Vec::new(),
+                    labels_any: Vec::new(),
+                    labels_none: Vec::new(),
+                    limit: None,
+                    draft: None,
+                    base: None,
+                    authors: Vec::new(),
+                    authors_from: None,
+                    on_skip: None,
+                },
+                wake_on: Vec::new(),
+                reconcile_every: None,
+                claim: None,
+                workspace: None,
+                outcome: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn states_closed_selector_matches_merged_prs_not_just_literal_closed() {
+            // Review fix: `select_eligible_prs` used to narrow `list_prs`
+            // server-side to `PrState::Closed` for a `states:[closed]`
+            // selector, even though `pr_selector_matches` treats `Closed` as
+            // `Closed | Merged`. A connector whose server-side state filter
+            // does not itself fold merged into closed (like `FakePrConnector`
+            // here, modeling GitLab's `state=closed` semantics) would drop
+            // merged PRs before the client-side check ever ran. `list_prs`
+            // must now be called with `state: None` for this selector so
+            // `pr_selector_matches` is the sole authority.
+            let tmp = TempDir::new().unwrap();
+            let store = claim_store_in(&tmp);
+            let repo = test_repo();
+            let mut merged = make_pr(5, "collab", false, "sha-merged");
+            merged.state = PrState::Merged;
+            let mut closed = make_pr(6, "collab", false, "sha-closed");
+            closed.state = PrState::Closed;
+            let open = make_pr(7, "collab", false, "sha-open"); // state: Open by default
+            let connector = FakePrConnector {
+                prs: vec![merged, closed, open],
+                collaborators: vec!["collab".into()],
+                collab_errors: false,
+            };
+            let af = closed_states_review_autoflow();
+
+            let eligible = select_eligible_prs(&connector, &store, &af, &repo)
+                .await
+                .unwrap();
+
+            let numbers: Vec<u32> = eligible.iter().map(|e| e.pr.r.number).collect();
+            assert!(
+                numbers.contains(&5),
+                "states:[closed] must match a MERGED pr; got {numbers:?}"
+            );
+            assert!(
+                numbers.contains(&6),
+                "states:[closed] must match a literal-closed pr; got {numbers:?}"
+            );
+            assert!(
+                !numbers.contains(&7),
+                "states:[closed] must not match an open pr; got {numbers:?}"
+            );
         }
 
         #[test]
