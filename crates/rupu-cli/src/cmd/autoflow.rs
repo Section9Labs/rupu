@@ -36,15 +36,18 @@ use rupu_auth::{CredentialResolver, KeychainResolver};
 use rupu_config::{AutoflowCheckout, Config, PollSourceEntry};
 use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
-    AutoflowWorkspaceStrategy, ContractFormat, RunStatus, RunStore, StepKind, StepResultRecord,
-    Workflow, WorkflowOutputContract,
+    author_allowed, pr_event_context, AutoflowWorkspaceStrategy, ContractFormat, RunStatus,
+    RunStore, StepKind, StepResultRecord, Workflow, WorkflowOutputContract,
 };
 use rupu_runtime::{
     AutoflowCycleEvent, AutoflowCycleRecord, AutoflowHistoryEventRecord, AutoflowHistoryStore,
     RunTriggerSource, WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeRecord,
     WakeSource, WakeStore, WakeStoreError,
 };
-use rupu_scm::{EventSourceRef, Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform};
+use rupu_scm::{
+    EventSourceRef, Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, Pr, PrFilter,
+    PrRef, PrState, RepoConnector, RepoRef,
+};
 use rupu_transcript::event::{Event as TranscriptEvent, FileEditKind};
 use rupu_transcript::reader::JsonlReader;
 use rupu_workspace::autoflow_claim_store::issue_key;
@@ -9525,6 +9528,11 @@ pub(crate) async fn collect_issue_matches(
     let mut out = Vec::new();
     for resolved in discovered {
         let autoflow = resolved.autoflow()?;
+        // PR-entity autoflows are collected by `collect_pr_matches`; skip them
+        // here so a `pull_request` autoflow never gets listed as issues.
+        if autoflow.entity != rupu_orchestrator::AutoflowEntity::Issue {
+            continue;
+        }
         let source_ref = match resolved_event_source(resolved) {
             Ok(source_ref) => source_ref,
             Err(err) => {
@@ -9637,16 +9645,16 @@ pub(crate) fn summarize_issue_contenders(
 
 pub(crate) fn claim_should_yield_to_winner(
     claim: &AutoflowClaimRecord,
-    winner: Option<&IssueMatch>,
+    winner_workflow: Option<&str>,
     active_lock_held: bool,
 ) -> bool {
     if active_lock_held {
         return false;
     }
-    let Some(winner) = winner else {
+    let Some(winner_workflow) = winner_workflow else {
         return false;
     };
-    if winner.resolved.workflow.name == claim.workflow {
+    if winner_workflow == claim.workflow {
         return false;
     }
     !matches!(
@@ -9696,16 +9704,36 @@ pub(crate) fn active_or_fallback_contenders(
 /// a `Pr` variant lands alongside PR fetch + collection in the follow-up task.
 pub(crate) enum AutoflowSubject {
     Issue(Issue),
-    // PR slot: a `Pr(Pr)` (or `Pr(PrSubject)`) variant is added here in the
-    // follow-up task. `run_target`, `as_issue`, and `fetch_subject` each gain a
-    // corresponding arm; the Issue arm below stays byte-for-byte unchanged.
+    Pr(PrSubject),
+}
+
+/// A pull-request dispatch subject: the fetched PR plus its unified diff.
+///
+/// The diff is carried alongside the `Pr` because the PR run-context
+/// ([`pr_event_context`]) embeds it, and re-fetching it at dispatch time would
+/// double the connector round-trips. Collection fetches it once (leaving a PR
+/// unclaimed if the diff fetch fails) and hands it through to the cycle.
+pub(crate) struct PrSubject {
+    pub(crate) pr: Pr,
+    pub(crate) diff: String,
 }
 
 /// Which concrete entity a [`fetch_subject`] call should resolve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AutoflowSubjectKind {
     Issue,
-    // PR slot: `Pr` is added here in the follow-up task.
+    Pr,
+}
+
+/// Classify a claim ref string into the entity it names. PR claim refs are
+/// minted with a `pr:` prefix (see [`pr_claim_ref`]); everything else is an
+/// issue ref (`<tracker>:<project>/issues/<N>`).
+pub(crate) fn subject_kind_for_ref(ref_text: &str) -> AutoflowSubjectKind {
+    if ref_text.starts_with("pr:") {
+        AutoflowSubjectKind::Pr
+    } else {
+        AutoflowSubjectKind::Issue
+    }
 }
 
 impl AutoflowSubject {
@@ -9722,16 +9750,28 @@ impl AutoflowSubject {
                 project: issue.r.project.clone(),
                 number: issue.r.number,
             },
+            AutoflowSubject::Pr(subject) => {
+                let repo = &subject.pr.r.repo;
+                crate::run_target::RunTarget::Pr {
+                    platform: repo.platform,
+                    owner: repo.owner.clone(),
+                    repo: repo.repo.clone(),
+                    number: subject.pr.r.number,
+                }
+            }
         }
     }
 
     /// Borrow the wrapped [`Issue`]. Issue-specific claim metadata (title,
     /// state, url, display ref) and the `issue:` run-context payload are built
-    /// from this today. The PR arm will supply its own metadata path rather
-    /// than routing through this accessor.
+    /// from this. The PR arm supplies its own metadata path (see
+    /// [`build_dispatch_context`]) rather than routing through this accessor,
+    /// so calling it on a PR subject is a caller bug.
+    #[cfg(test)]
     fn as_issue(&self) -> &Issue {
         match self {
             AutoflowSubject::Issue(issue) => issue,
+            AutoflowSubject::Pr(_) => panic!("as_issue called on a PR subject"),
         }
     }
 }
@@ -9752,7 +9792,585 @@ pub(crate) async fn fetch_subject(
             let issue = fetch_issue(cfg, resolver, &issue_ref).await?;
             Ok(AutoflowSubject::Issue(issue))
         }
+        AutoflowSubjectKind::Pr => {
+            let pr_ref = parse_pr_ref_text(ref_text)?;
+            let (pr, diff) = fetch_pr(cfg, resolver, &pr_ref).await?;
+            Ok(AutoflowSubject::Pr(PrSubject { pr, diff }))
+        }
     }
+}
+
+/// The entity-specific inputs to a dispatch cycle: the workspace branch, the
+/// run-context payload (`issue:` for issues, `event:` for PRs), and the claim
+/// display metadata. The rest of [`execute_autoflow_cycle`] is entity-generic.
+struct AutoflowDispatchContext {
+    branch: String,
+    run_issue: Option<serde_json::Value>,
+    run_event: Option<serde_json::Value>,
+    display_ref: String,
+    title: String,
+    url: Option<String>,
+    state_name: Option<String>,
+    tracker: Option<String>,
+}
+
+/// Build the entity-specific dispatch context for a cycle. The Issue arm
+/// reproduces exactly what the cycle built inline before the PR seam existed
+/// (issue payload + templated branch + issue claim metadata); the PR arm builds
+/// a `pr_event_context` run payload and a PR-derived worktree branch.
+fn build_dispatch_context(
+    subject: &AutoflowSubject,
+    cfg: &Config,
+    autoflow: &rupu_orchestrator::Autoflow,
+    ref_text: &str,
+    inputs: &BTreeMap<String, String>,
+) -> anyhow::Result<AutoflowDispatchContext> {
+    match subject {
+        AutoflowSubject::Issue(issue) => {
+            let payload = issue_payload(cfg, issue)?;
+            let branch = resolve_branch_name(
+                autoflow
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.branch.as_deref()),
+                &payload,
+                ref_text,
+                inputs,
+            )?;
+            Ok(AutoflowDispatchContext {
+                branch,
+                run_issue: Some(payload),
+                run_event: None,
+                display_ref: issue_display_ref(issue),
+                title: issue.title.clone(),
+                url: issue_url(cfg, issue),
+                state_name: Some(issue_state_name(issue).to_string()),
+                tracker: Some(issue.r.tracker.as_str().to_string()),
+            })
+        }
+        AutoflowSubject::Pr(subject) => {
+            let pr = &subject.pr;
+            let repo = &pr.r.repo;
+            let repo_full = format!("{}/{}", repo.owner, repo.repo);
+            let event = pr_event_context(
+                u64::from(pr.r.number),
+                &pr.title,
+                &pr.base_branch,
+                &pr.head_branch,
+                &pr.head_sha,
+                &pr.author,
+                &pr_web_url(repo, pr.r.number),
+                &subject.diff,
+                &repo_full,
+            );
+            // A unique worktree branch per (PR, head SHA) so re-review after a
+            // push never collides with the previous review's worktree branch.
+            let branch = format!("rupu/pr-{}-{}", pr.r.number, short_sha(&pr.head_sha));
+            Ok(AutoflowDispatchContext {
+                branch,
+                run_issue: None,
+                run_event: Some(event),
+                display_ref: format!("{repo_full}#{}", pr.r.number),
+                title: pr.title.clone(),
+                url: Some(pr_web_url(repo, pr.r.number)),
+                state_name: Some(pr_state_name(&pr.state).to_string()),
+                tracker: None,
+            })
+        }
+    }
+}
+
+/// The `(issue:, event:)` run-context pair for a subject, without the branch /
+/// claim-metadata that [`build_dispatch_context`] also computes. Used by the
+/// pending-dispatch path, which reuses an existing worktree.
+fn dispatch_run_context(
+    subject: &AutoflowSubject,
+    cfg: &Config,
+) -> anyhow::Result<(Option<serde_json::Value>, Option<serde_json::Value>)> {
+    match subject {
+        AutoflowSubject::Issue(issue) => Ok((Some(issue_payload(cfg, issue)?), None)),
+        AutoflowSubject::Pr(subject) => {
+            let pr = &subject.pr;
+            let repo = &pr.r.repo;
+            let event = pr_event_context(
+                u64::from(pr.r.number),
+                &pr.title,
+                &pr.base_branch,
+                &pr.head_branch,
+                &pr.head_sha,
+                &pr.author,
+                &pr_web_url(repo, pr.r.number),
+                &subject.diff,
+                &format!("{}/{}", repo.owner, repo.repo),
+            );
+            Ok((None, Some(event)))
+        }
+    }
+}
+
+fn short_sha(head_sha: &str) -> String {
+    head_sha.chars().take(12).collect()
+}
+
+fn pr_state_name(state: &PrState) -> &'static str {
+    match state {
+        PrState::Open => "open",
+        PrState::Closed => "closed",
+        PrState::Merged => "merged",
+    }
+}
+
+fn pr_web_url(repo: &RepoRef, number: u32) -> String {
+    match repo.platform {
+        Platform::Github => format!(
+            "https://github.com/{}/{}/pull/{number}",
+            repo.owner, repo.repo
+        ),
+        Platform::Gitlab => format!(
+            "https://gitlab.com/{}/{}/-/merge_requests/{number}",
+            repo.owner, repo.repo
+        ),
+    }
+}
+
+/// Synthetic claim ref encoding `(repo, pr_number, head_sha)`. A new head SHA
+/// yields a new ref (fresh claim = re-review on push); an unchanged SHA hits the
+/// same claim (already-claimed = skip). The `pr:` prefix lets
+/// [`subject_kind_for_ref`] route reconcile back through [`fetch_pr`].
+fn pr_claim_ref(repo: &RepoRef, number: u32, head_sha: &str) -> String {
+    format!(
+        "pr:{}:{}/{}#{number}@{head_sha}",
+        repo.platform.as_str(),
+        repo.owner,
+        repo.repo
+    )
+}
+
+/// Parse a [`pr_claim_ref`] back into a [`PrRef`]. The head SHA is part of the
+/// claim key but not the `PrRef`, so it is discarded here — reconcile re-fetches
+/// the PR's current head via the connector.
+pub(crate) fn parse_pr_ref_text(value: &str) -> anyhow::Result<PrRef> {
+    let rest = value
+        .strip_prefix("pr:")
+        .ok_or_else(|| anyhow!("invalid pr ref `{value}`"))?;
+    let (platform, rest) = rest
+        .split_once(':')
+        .ok_or_else(|| anyhow!("invalid pr ref `{value}`"))?;
+    // Drop the `@<head_sha>` suffix if present.
+    let rest = rest.split_once('@').map(|(head, _)| head).unwrap_or(rest);
+    let (repo_part, number) = rest
+        .rsplit_once('#')
+        .ok_or_else(|| anyhow!("invalid pr ref `{value}`"))?;
+    let (owner, repo) = repo_part
+        .split_once('/')
+        .ok_or_else(|| anyhow!("invalid pr ref `{value}`"))?;
+    Ok(PrRef {
+        repo: RepoRef {
+            platform: platform.parse::<Platform>().map_err(|err| anyhow!(err))?,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        },
+        number: number
+            .parse()
+            .map_err(|err| anyhow!("invalid pr number in `{value}`: {err}"))?,
+    })
+}
+
+/// Fetch a PR and its diff for dispatch. The entity-generic counterpart to
+/// [`fetch_issue`], used by [`fetch_subject`] on the PR reconcile path.
+pub(crate) async fn fetch_pr(
+    cfg: &Config,
+    resolver: &dyn CredentialResolver,
+    pr_ref: &PrRef,
+) -> anyhow::Result<(Pr, String)> {
+    let registry = Arc::new(rupu_scm::Registry::discover(resolver, cfg).await);
+    let connector = registry.repo(pr_ref.repo.platform).ok_or_else(|| {
+        anyhow!(
+            "no {} credential — run `rupu auth login --provider {}`",
+            pr_ref.repo.platform.as_str(),
+            pr_ref.repo.platform.as_str()
+        )
+    })?;
+    let pr = connector
+        .get_pr(pr_ref)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let diff = connector
+        .diff_pr(pr_ref)
+        .await
+        .map_err(anyhow::Error::from)?
+        .patch;
+    Ok((pr, diff))
+}
+
+/// A pull-request candidate discovered by the PR collection phase: the PR, its
+/// fetched diff, and the `(repo, pr, head_sha)` claim ref. The PR analogue of
+/// [`IssueMatch`]; both feed the shared reconcile loop via [`AutoflowWinner`].
+#[derive(Clone)]
+pub(crate) struct PrMatch {
+    pub(crate) resolved: ResolvedAutoflowWorkflow,
+    pub(crate) pr: Pr,
+    pub(crate) diff: String,
+    pub(crate) ref_text: String,
+}
+
+/// An eligible PR (passed selector + author gate + diff fetch) with its claim
+/// ref. The collection core returns these; [`collect_pr_matches`] pairs each
+/// with its resolved workflow to form a [`PrMatch`].
+pub(crate) struct EligiblePr {
+    pub(crate) pr: Pr,
+    pub(crate) diff: String,
+    pub(crate) ref_text: String,
+}
+
+/// A dispatch winner for one claim ref: either an issue or a PR. The reconcile
+/// loop is entity-generic (it keys on the ref string), so both variants flow
+/// through the same per-claim cycle; only the subject construction differs.
+#[derive(Clone)]
+pub(crate) enum AutoflowWinner {
+    Issue(IssueMatch),
+    Pr(PrMatch),
+}
+
+impl AutoflowWinner {
+    pub(crate) fn resolved(&self) -> &ResolvedAutoflowWorkflow {
+        match self {
+            AutoflowWinner::Issue(matched) => &matched.resolved,
+            AutoflowWinner::Pr(matched) => &matched.resolved,
+        }
+    }
+
+    pub(crate) fn ref_text(&self) -> &str {
+        match self {
+            AutoflowWinner::Issue(matched) => &matched.issue_ref_text,
+            AutoflowWinner::Pr(matched) => &matched.ref_text,
+        }
+    }
+
+    pub(crate) fn subject(&self) -> AutoflowSubject {
+        match self {
+            AutoflowWinner::Issue(matched) => AutoflowSubject::Issue(matched.issue.clone()),
+            AutoflowWinner::Pr(matched) => AutoflowSubject::Pr(PrSubject {
+                pr: matched.pr.clone(),
+                diff: matched.diff.clone(),
+            }),
+        }
+    }
+}
+
+/// Discover every `entity: pull_request` autoflow's matching PRs, gated by the
+/// selector + author allowlist, skipping any `(repo, pr, head_sha)` already
+/// claimed (dedup by head SHA). Returns candidates for the shared reconcile
+/// loop; claiming + dispatch happen in [`execute_autoflow_cycle`]. The PR
+/// analogue of [`collect_issue_matches`].
+pub(crate) async fn collect_pr_matches(
+    discovered: &[ResolvedAutoflowWorkflow],
+    claim_store: &AutoflowClaimStore,
+    resolver: &dyn CredentialResolver,
+) -> anyhow::Result<Vec<PrMatch>> {
+    let mut out = Vec::new();
+    for resolved in discovered {
+        let autoflow = resolved.autoflow()?;
+        if autoflow.entity != rupu_orchestrator::AutoflowEntity::PullRequest {
+            continue;
+        }
+        let source_ref = match resolved_event_source(resolved) {
+            Ok(source_ref) => source_ref,
+            Err(err) => {
+                warn!(workflow = %resolved.name, repo_ref = %resolved.repo_ref, error = %err, "skipping PR autoflow because source resolution failed");
+                continue;
+            }
+        };
+        let repo = match source_ref {
+            EventSourceRef::Repo { repo } => repo,
+            EventSourceRef::TrackerProject { .. } => {
+                warn!(workflow = %resolved.name, repo_ref = %resolved.repo_ref, "pull_request autoflow source is a tracker project, not a repo; skipping");
+                continue;
+            }
+        };
+        let registry = Arc::new(rupu_scm::Registry::discover(resolver, &resolved.cfg).await);
+        let Some(connector) = registry.repo(repo.platform) else {
+            warn!(source = %resolved.repo_ref, workflow = %resolved.name, "skipping PR autoflow because no repo connector is configured");
+            continue;
+        };
+        let eligible = match select_eligible_prs(connector.as_ref(), claim_store, autoflow, &repo)
+            .await
+        {
+            Ok(eligible) => eligible,
+            Err(err) => {
+                warn!(source = %resolved.repo_ref, workflow = %resolved.name, error = %err, "skipping PR autoflow because PR selection failed");
+                continue;
+            }
+        };
+        for candidate in eligible {
+            out.push(PrMatch {
+                resolved: resolved.clone(),
+                pr: candidate.pr,
+                diff: candidate.diff,
+                ref_text: candidate.ref_text,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Selection core: list PRs for `repo`, filter by the selector, apply the
+/// author allowlist (querying `is_collaborator` only when `authors_from` is set,
+/// fail-closed on error), skip already-claimed `(repo, pr, head_sha)`, and fetch
+/// the diff for each survivor (leaving a PR unclaimed if the diff fetch fails).
+/// Unit-testable with a fake connector + temp-dir claim store.
+pub(crate) async fn select_eligible_prs(
+    connector: &dyn RepoConnector,
+    claim_store: &AutoflowClaimStore,
+    autoflow: &rupu_orchestrator::Autoflow,
+    repo: &RepoRef,
+) -> anyhow::Result<Vec<EligiblePr>> {
+    use anyhow::Context as _;
+
+    let selector = &autoflow.selector;
+    // Server-side narrowing: `list_prs` supports state/author/limit only.
+    // Everything else (draft/base/labels) is applied client-side below.
+    let state = match selector.states.as_slice() {
+        [rupu_orchestrator::AutoflowIssueState::Open] => Some(PrState::Open),
+        [rupu_orchestrator::AutoflowIssueState::Closed] => Some(PrState::Closed),
+        _ => None,
+    };
+    let filter = PrFilter {
+        state,
+        author: None,
+        limit: selector.limit,
+    };
+    let prs = connector
+        .list_prs(repo, filter)
+        .await
+        .with_context(|| format!("list_prs for {}/{}", repo.owner, repo.repo))?;
+
+    let mut out = Vec::new();
+    // Cache collaborator lookups per tick so N PRs by one author cost one call.
+    let mut collab_cache: BTreeMap<String, bool> = BTreeMap::new();
+
+    for pr in prs {
+        if !pr_selector_matches(selector, &pr) {
+            continue;
+        }
+
+        // Author allowlist. `is_collaborator` is consulted only when the
+        // selector needs it — `authors_from` is set and the explicit `authors`
+        // list doesn't already cover this author.
+        let explicitly_allowed =
+            !selector.authors.is_empty() && selector.authors.iter().any(|a| a == &pr.author);
+        let needs_collab = !explicitly_allowed && selector.authors_from.is_some();
+        let is_collab = if needs_collab {
+            if let Some(cached) = collab_cache.get(&pr.author) {
+                *cached
+            } else {
+                let value = match connector.is_collaborator(repo, &pr.author).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        // Fail closed: an author we can't verify is treated as
+                        // NOT allowed. Never aborts the tick.
+                        warn!(
+                            repo = %format!("{}/{}", repo.owner, repo.repo),
+                            author = %pr.author,
+                            error = %err,
+                            "is_collaborator check failed; treating author as not allowed (fail-closed)"
+                        );
+                        false
+                    }
+                };
+                collab_cache.insert(pr.author.clone(), value);
+                value
+            }
+        } else {
+            false
+        };
+
+        if !author_allowed(selector, &pr.author, is_collab) {
+            if matches!(
+                selector.on_skip,
+                Some(rupu_orchestrator::SkipAction::LabelNeedsHuman)
+            ) {
+                if let Err(err) = connector
+                    .add_pr_labels(&pr.r, &["needs-human".to_string()])
+                    .await
+                {
+                    warn!(
+                        repo = %format!("{}/{}", repo.owner, repo.repo),
+                        pr = pr.r.number,
+                        error = %err,
+                        "on_skip label_needs_human failed; skipping PR anyway"
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Claim unit: (repo, pr_number, head_sha). Skip if already claimed for
+        // this exact head SHA (already reviewed; no re-dispatch).
+        let ref_text = pr_claim_ref(repo, pr.r.number, &pr.head_sha);
+        if claim_store.load(&ref_text)?.is_some() {
+            continue;
+        }
+
+        // Fetch the diff BEFORE the engine claims so a transient diff failure
+        // leaves the PR unclaimed (retried next tick) rather than claimed but
+        // never reviewed.
+        let diff = match connector.diff_pr(&pr.r).await {
+            Ok(diff) => diff.patch,
+            Err(err) => {
+                warn!(
+                    repo = %format!("{}/{}", repo.owner, repo.repo),
+                    pr = pr.r.number,
+                    error = %err,
+                    "diff_pr failed; leaving PR unclaimed to retry next tick"
+                );
+                continue;
+            }
+        };
+
+        out.push(EligiblePr { pr, diff, ref_text });
+    }
+
+    Ok(out)
+}
+
+/// Client-side selector match for a PR (the fields `list_prs` can't narrow:
+/// draft / base branch / labels; state is re-checked for the mixed-states case).
+fn pr_selector_matches(selector: &rupu_orchestrator::AutoflowSelector, pr: &Pr) -> bool {
+    if !selector.states.is_empty() {
+        let ok = selector.states.iter().any(|state| {
+            matches!(
+                (state, &pr.state),
+                (rupu_orchestrator::AutoflowIssueState::Open, PrState::Open)
+                    | (
+                        rupu_orchestrator::AutoflowIssueState::Closed,
+                        PrState::Closed
+                    )
+                    | (
+                        rupu_orchestrator::AutoflowIssueState::Closed,
+                        PrState::Merged
+                    )
+            )
+        });
+        if !ok {
+            return false;
+        }
+    }
+    if let Some(draft) = selector.draft {
+        match draft {
+            rupu_orchestrator::DraftFilter::Include => {}
+            rupu_orchestrator::DraftFilter::Exclude => {
+                if pr.draft {
+                    return false;
+                }
+            }
+            rupu_orchestrator::DraftFilter::Only => {
+                if !pr.draft {
+                    return false;
+                }
+            }
+        }
+    }
+    if let Some(base) = &selector.base {
+        if &pr.base_branch != base {
+            return false;
+        }
+    }
+    if !selector
+        .labels_all
+        .iter()
+        .all(|label| pr.labels.iter().any(|existing| existing == label))
+    {
+        return false;
+    }
+    if !selector.labels_any.is_empty()
+        && !selector
+            .labels_any
+            .iter()
+            .any(|label| pr.labels.iter().any(|existing| existing == label))
+    {
+        return false;
+    }
+    if selector
+        .labels_none
+        .iter()
+        .any(|label| pr.labels.iter().any(|existing| existing == label))
+    {
+        return false;
+    }
+    true
+}
+
+/// The PR analogue of [`choose_winning_matches`]: highest-priority workflow
+/// (ties broken by name) wins each `(repo, pr, head_sha)` claim ref.
+pub(crate) fn choose_winning_pr_matches(matches: Vec<PrMatch>) -> BTreeMap<String, PrMatch> {
+    let mut grouped: BTreeMap<String, Vec<PrMatch>> = BTreeMap::new();
+    for item in matches {
+        grouped.entry(item.ref_text.clone()).or_default().push(item);
+    }
+    let mut winners = BTreeMap::new();
+    for (ref_text, mut items) in grouped {
+        items.sort_by(|left, right| {
+            right
+                .resolved
+                .autoflow()
+                .expect("autoflow")
+                .priority
+                .cmp(&left.resolved.autoflow().expect("autoflow").priority)
+                .then_with(|| {
+                    left.resolved
+                        .workflow
+                        .name
+                        .cmp(&right.resolved.workflow.name)
+                })
+        });
+        if let Some(winner) = items.into_iter().next() {
+            winners.insert(ref_text, winner);
+        }
+    }
+    winners
+}
+
+/// The PR analogue of [`summarize_issue_contenders`]: the ranked set of
+/// workflows competing for each PR claim ref, for the reconcile printer.
+pub(crate) fn summarize_pr_contenders(
+    matches: &[PrMatch],
+) -> BTreeMap<String, Vec<AutoflowContender>> {
+    let mut grouped: BTreeMap<String, Vec<AutoflowContender>> = BTreeMap::new();
+    for item in matches {
+        grouped
+            .entry(item.ref_text.clone())
+            .or_default()
+            .push(AutoflowContender {
+                workflow: item.resolved.workflow.name.clone(),
+                priority: item.resolved.autoflow().expect("autoflow").priority,
+                scope: Some(item.resolved.scope.clone()),
+                selected: false,
+            });
+    }
+    for contenders in grouped.values_mut() {
+        contenders.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.workflow.cmp(&right.workflow))
+        });
+        let mut deduped = Vec::with_capacity(contenders.len());
+        for contender in contenders.drain(..) {
+            if deduped
+                .iter()
+                .any(|existing: &AutoflowContender| existing.workflow == contender.workflow)
+            {
+                continue;
+            }
+            deduped.push(contender);
+        }
+        if let Some(first) = deduped.first_mut() {
+            first.selected = true;
+        }
+        *contenders = deduped;
+    }
+    grouped
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9770,19 +10388,15 @@ pub(crate) async fn execute_autoflow_cycle(
     shared_printer: Option<Arc<Mutex<LineStreamPrinter>>>,
     live_cycle_recorder: Option<Arc<crate::cmd::autoflow_runtime::LiveCycleRecorder>>,
 ) -> anyhow::Result<()> {
-    let issue = subject.as_issue();
     let autoflow = resolved.autoflow()?;
-    let issue_payload = issue_payload(&resolved.cfg, issue)?;
     let workspace_strategy = resolve_workspace_strategy(&resolved.cfg.autoflow, autoflow);
-    let branch = resolve_branch_name(
-        autoflow
-            .workspace
-            .as_ref()
-            .and_then(|workspace| workspace.branch.as_deref()),
-        &issue_payload,
-        issue_ref_text,
-        &inputs,
-    )?;
+    // Entity-specific dispatch context: the run-context payload (`issue:` vs
+    // `event:`), the workspace branch, and the claim display metadata differ
+    // per entity. Everything below (lease, claim record, run, reconcile) is
+    // entity-generic and shared with the issue path byte-for-byte.
+    let dispatch_ctx =
+        build_dispatch_context(subject, &resolved.cfg, autoflow, issue_ref_text, &inputs)?;
+    let branch = dispatch_ctx.branch.clone();
     let workspace_path = match workspace_strategy {
         AutoflowWorkspaceStrategy::Worktree => {
             let root = resolve_worktree_root(global, &resolved.cfg.autoflow)?;
@@ -9849,11 +10463,11 @@ pub(crate) async fn execute_autoflow_cycle(
             .clone()
             .unwrap_or_else(|| resolved.repo_ref.clone())
     }));
-    claim.issue_display_ref = Some(issue_display_ref(issue));
-    claim.issue_title = Some(issue.title.clone());
-    claim.issue_url = issue_url(&resolved.cfg, issue);
-    claim.issue_state_name = Some(issue_state_name(issue).to_string());
-    claim.issue_tracker = Some(issue.r.tracker.as_str().to_string());
+    claim.issue_display_ref = Some(dispatch_ctx.display_ref.clone());
+    claim.issue_title = Some(dispatch_ctx.title.clone());
+    claim.issue_url = dispatch_ctx.url.clone();
+    claim.issue_state_name = dispatch_ctx.state_name.clone();
+    claim.issue_tracker = dispatch_ctx.tracker.clone();
     claim.workflow = resolved.workflow.name.clone();
     claim.status = ClaimStatus::Running;
     claim.worktree_path = Some(workspace_path.display().to_string());
@@ -9880,8 +10494,8 @@ pub(crate) async fn execute_autoflow_cycle(
             inputs: inputs.into_iter().collect(),
             mode: permission_mode,
             invocation_source: RunTriggerSource::Autoflow,
-            event: None,
-            issue: Some(issue_payload),
+            event: dispatch_ctx.run_event,
+            issue: dispatch_ctx.run_issue,
             issue_ref: Some(issue_ref_text.to_string()),
             system_prompt_suffix: Some(crate::run_target::format_run_target_for_prompt(
                 &subject.run_target(),
@@ -10678,8 +11292,9 @@ pub(crate) async fn execute_pending_dispatch_workflow(
         root: global.join("workspaces"),
     };
     let ws = rupu_workspace::upsert(&ws_store, &workspace_path)?;
-    let issue = subject.as_issue();
-    let issue_payload = issue_payload(&cfg, issue)?;
+    // Entity-specific run-context payload; the pending-dispatch scaffolding
+    // (worktree reuse, claim status transitions) is entity-generic.
+    let (run_issue, run_event) = dispatch_run_context(subject, &cfg)?;
     let permission_mode =
         resolve_autoflow_permission_mode(None, cfg.autoflow.permission_mode.as_deref())?;
 
@@ -10700,8 +11315,8 @@ pub(crate) async fn execute_pending_dispatch_workflow(
             inputs: inputs.into_iter().collect(),
             mode: permission_mode,
             invocation_source: RunTriggerSource::Autoflow,
-            event: None,
-            issue: Some(issue_payload),
+            event: run_event,
+            issue: run_issue,
             issue_ref: Some(issue_ref_text.to_string()),
             system_prompt_suffix: Some(crate::run_target::format_run_target_for_prompt(
                 &subject.run_target(),
@@ -12433,10 +13048,15 @@ steps:
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        assert!(claim_should_yield_to_winner(&claim, Some(&winner), false));
-        assert!(!claim_should_yield_to_winner(&claim, Some(&winner), true));
+        let winner_workflow = Some(winner.resolved.workflow.name.as_str());
+        assert!(claim_should_yield_to_winner(&claim, winner_workflow, false));
+        assert!(!claim_should_yield_to_winner(&claim, winner_workflow, true));
         claim.status = ClaimStatus::AwaitHuman;
-        assert!(!claim_should_yield_to_winner(&claim, Some(&winner), false));
+        assert!(!claim_should_yield_to_winner(
+            &claim,
+            winner_workflow,
+            false
+        ));
     }
 
     #[test]
@@ -15915,5 +16535,304 @@ steps:
             .contains("output failed schema"));
         assert_eq!(good_claim.status, ClaimStatus::Complete);
         assert!(good_claim.last_run_id.is_some());
+    }
+
+    // ---- PR autoflow seam + collection --------------------------------------
+
+    mod pr_autoflow {
+        use super::*;
+        use async_trait::async_trait;
+        use rupu_orchestrator::{AuthorScope, DraftFilter};
+        use rupu_orchestrator::{Autoflow, AutoflowEntity, AutoflowIssueState, AutoflowSelector};
+        use rupu_scm::{
+            Branch, Comment, CreatePr, Diff, FileContent, Pr, PrFilter, PrRef, PrState, Repo,
+            RepoRef, ScmError,
+        };
+        use tempfile::TempDir;
+
+        /// Minimal fake `RepoConnector` for PR-collection tests. Only the
+        /// methods the collection phase exercises (`list_prs`,
+        /// `is_collaborator`, `diff_pr`) are meaningful.
+        struct FakePrConnector {
+            prs: Vec<Pr>,
+            collaborators: Vec<String>,
+            collab_errors: bool,
+        }
+
+        #[async_trait]
+        impl RepoConnector for FakePrConnector {
+            fn platform(&self) -> Platform {
+                Platform::Github
+            }
+            async fn list_repos(&self) -> Result<Vec<Repo>, ScmError> {
+                unimplemented!()
+            }
+            async fn get_repo(&self, _r: &RepoRef) -> Result<Repo, ScmError> {
+                unimplemented!()
+            }
+            async fn list_branches(&self, _r: &RepoRef) -> Result<Vec<Branch>, ScmError> {
+                unimplemented!()
+            }
+            async fn create_branch(
+                &self,
+                _r: &RepoRef,
+                _name: &str,
+                _from_sha: &str,
+            ) -> Result<Branch, ScmError> {
+                unimplemented!()
+            }
+            async fn read_file(
+                &self,
+                _r: &RepoRef,
+                _path: &str,
+                _ref_: Option<&str>,
+            ) -> Result<FileContent, ScmError> {
+                unimplemented!()
+            }
+            async fn list_prs(&self, _r: &RepoRef, _f: PrFilter) -> Result<Vec<Pr>, ScmError> {
+                Ok(self.prs.clone())
+            }
+            async fn get_pr(&self, _p: &PrRef) -> Result<Pr, ScmError> {
+                unimplemented!()
+            }
+            async fn diff_pr(&self, p: &PrRef) -> Result<Diff, ScmError> {
+                Ok(Diff {
+                    patch: format!("diff for #{}", p.number),
+                    files_changed: 1,
+                    additions: 1,
+                    deletions: 0,
+                })
+            }
+            async fn comment_pr(&self, _p: &PrRef, _body: &str) -> Result<Comment, ScmError> {
+                unimplemented!()
+            }
+            async fn create_pr(&self, _r: &RepoRef, _opts: CreatePr) -> Result<Pr, ScmError> {
+                unimplemented!()
+            }
+            async fn clone_to(&self, _r: &RepoRef, _dir: &Path) -> Result<(), ScmError> {
+                unimplemented!()
+            }
+            async fn is_collaborator(&self, _r: &RepoRef, login: &str) -> Result<bool, ScmError> {
+                if self.collab_errors {
+                    return Err(ScmError::BadRequest {
+                        message: "boom".into(),
+                    });
+                }
+                Ok(self.collaborators.iter().any(|c| c == login))
+            }
+        }
+
+        fn test_repo() -> RepoRef {
+            RepoRef {
+                platform: Platform::Github,
+                owner: "acme".into(),
+                repo: "widget".into(),
+            }
+        }
+
+        fn make_pr(number: u32, author: &str, draft: bool, head_sha: &str) -> Pr {
+            Pr {
+                r: PrRef {
+                    repo: test_repo(),
+                    number,
+                },
+                title: format!("PR #{number}"),
+                body: String::new(),
+                state: PrState::Open,
+                head_branch: format!("feature-{number}"),
+                base_branch: "main".into(),
+                head_sha: head_sha.into(),
+                draft,
+                labels: Vec::new(),
+                author: author.into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            }
+        }
+
+        /// Selector: `{states:[open], draft: exclude, authors_from: collaborators}`.
+        fn collaborator_review_autoflow() -> Autoflow {
+            Autoflow {
+                enabled: true,
+                entity: AutoflowEntity::PullRequest,
+                source: Some("github:acme/widget".into()),
+                priority: 0,
+                selector: AutoflowSelector {
+                    states: vec![AutoflowIssueState::Open],
+                    labels_all: Vec::new(),
+                    labels_any: Vec::new(),
+                    labels_none: Vec::new(),
+                    limit: None,
+                    draft: Some(DraftFilter::Exclude),
+                    base: None,
+                    authors: Vec::new(),
+                    authors_from: Some(AuthorScope::Collaborators),
+                    on_skip: None,
+                },
+                wake_on: Vec::new(),
+                reconcile_every: None,
+                claim: None,
+                workspace: None,
+                outcome: None,
+            }
+        }
+
+        fn claim_store_in(tmp: &TempDir) -> AutoflowClaimStore {
+            let root = tmp.path().join("claims");
+            std::fs::create_dir_all(&root).unwrap();
+            AutoflowClaimStore { root }
+        }
+
+        #[tokio::test]
+        async fn selects_eligible_filters_draft_and_skips_non_collaborator() {
+            let tmp = TempDir::new().unwrap();
+            let store = claim_store_in(&tmp);
+            let repo = test_repo();
+            let connector = FakePrConnector {
+                prs: vec![
+                    make_pr(1, "collab", true, "sha-a"),    // draft -> filtered
+                    make_pr(2, "stranger", false, "sha-b"), // non-collab -> skipped
+                    make_pr(3, "collab", false, "sha-c"),   // eligible
+                ],
+                collaborators: vec!["collab".into()],
+                collab_errors: false,
+            };
+            let af = collaborator_review_autoflow();
+
+            let eligible = select_eligible_prs(&connector, &store, &af, &repo)
+                .await
+                .unwrap();
+
+            // Only PR #3 survives; its claim ref includes the head SHA and its
+            // diff was fetched.
+            assert_eq!(eligible.len(), 1);
+            assert_eq!(eligible[0].pr.r.number, 3);
+            assert_eq!(eligible[0].diff, "diff for #3");
+            assert_eq!(eligible[0].ref_text, pr_claim_ref(&repo, 3, "sha-c"));
+        }
+
+        #[tokio::test]
+        async fn skips_already_claimed_head_sha_and_dispatches_new_one() {
+            let tmp = TempDir::new().unwrap();
+            let store = claim_store_in(&tmp);
+            let repo = test_repo();
+            let af = collaborator_review_autoflow();
+            let build = |sha: &str| FakePrConnector {
+                prs: vec![make_pr(3, "collab", false, sha)],
+                collaborators: vec!["collab".into()],
+                collab_errors: false,
+            };
+
+            // First tick: eligible.
+            let first = select_eligible_prs(&build("sha-c"), &store, &af, &repo)
+                .await
+                .unwrap();
+            assert_eq!(first.len(), 1);
+
+            // Simulate the engine claiming the head SHA.
+            let ref_text = pr_claim_ref(&repo, 3, "sha-c");
+            store
+                .save(&AutoflowClaimRecord {
+                    issue_ref: ref_text.clone(),
+                    repo_ref: "github:acme/widget".into(),
+                    source_ref: None,
+                    issue_display_ref: None,
+                    issue_title: None,
+                    issue_url: None,
+                    issue_state_name: None,
+                    issue_tracker: None,
+                    workflow: "pr-review".into(),
+                    status: ClaimStatus::Running,
+                    worktree_path: None,
+                    branch: None,
+                    last_run_id: None,
+                    last_error: None,
+                    last_summary: None,
+                    pr_url: None,
+                    artifacts: None,
+                    artifact_manifest_path: None,
+                    next_retry_at: None,
+                    claim_owner: None,
+                    lease_expires_at: None,
+                    pending_dispatch: None,
+                    contenders: vec![],
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                })
+                .unwrap();
+
+            // Same head SHA -> already claimed -> not re-dispatched.
+            let same = select_eligible_prs(&build("sha-c"), &store, &af, &repo)
+                .await
+                .unwrap();
+            assert!(same.is_empty());
+
+            // A new push -> new head SHA -> fresh claim ref -> re-review.
+            let pushed = select_eligible_prs(&build("sha-d"), &store, &af, &repo)
+                .await
+                .unwrap();
+            assert_eq!(pushed.len(), 1);
+            assert_eq!(pushed[0].ref_text, pr_claim_ref(&repo, 3, "sha-d"));
+        }
+
+        #[tokio::test]
+        async fn is_collaborator_error_skips_pr_not_tick() {
+            let tmp = TempDir::new().unwrap();
+            let store = claim_store_in(&tmp);
+            let repo = test_repo();
+            let af = collaborator_review_autoflow();
+            let connector = FakePrConnector {
+                prs: vec![make_pr(3, "collab", false, "sha-c")],
+                collaborators: vec!["collab".into()],
+                collab_errors: true, // is_collaborator returns Err -> fail closed
+            };
+
+            // The collection must NOT abort — it returns Ok with the PR skipped.
+            let eligible = select_eligible_prs(&connector, &store, &af, &repo)
+                .await
+                .expect("is_collaborator error must not abort the collection");
+            assert!(eligible.is_empty());
+            // Nothing was claimed.
+            assert!(store
+                .load(&pr_claim_ref(&repo, 3, "sha-c"))
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
+        fn run_target_pr_arm_builds_pr_run_target() {
+            // Parallels the 5b-i Issue characterization test: the PR arm of
+            // `AutoflowSubject::run_target` builds `RunTarget::Pr`.
+            let subject = AutoflowSubject::Pr(PrSubject {
+                pr: make_pr(7, "collab", false, "sha-z"),
+                diff: "diff for #7".into(),
+            });
+            assert_eq!(
+                subject.run_target(),
+                crate::run_target::RunTarget::Pr {
+                    platform: Platform::Github,
+                    owner: "acme".into(),
+                    repo: "widget".into(),
+                    number: 7,
+                }
+            );
+        }
+
+        #[test]
+        fn pr_claim_ref_round_trips_through_parse() {
+            let repo = test_repo();
+            let ref_text = pr_claim_ref(&repo, 42, "deadbeef");
+            assert_eq!(subject_kind_for_ref(&ref_text), AutoflowSubjectKind::Pr);
+            let parsed = parse_pr_ref_text(&ref_text).unwrap();
+            assert_eq!(parsed.repo, repo);
+            assert_eq!(parsed.number, 42);
+        }
+
+        #[test]
+        fn subject_kind_for_ref_classifies_issue_refs() {
+            assert_eq!(
+                subject_kind_for_ref("github:Section9Labs/rupu/issues/42"),
+                AutoflowSubjectKind::Issue
+            );
+        }
     }
 }
