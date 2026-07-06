@@ -1,9 +1,10 @@
 name: nightly-maintainability-security
 description: >
-  Nightly maintainability + security sweep across the rupu workspace.
-  Report-only: no auto-fix, no PR. Findings are posted to one rolling
-  issue per category (dedup by exact title — comment on the existing
-  open issue if present, else open a new one).
+  Nightly maintainability + security sweep across the rupu workspace,
+  report-only (no auto-fix, no PR). Findings are posted to one rolling
+  issue per category via native `issues.*` tools (dedup: `issues.list`
+  finds an existing open issue by exact title, then `issues.comment`;
+  otherwise `issues.create`). No `gh`/bash for SCM.
 autoflow:
   enabled: true
 trigger:
@@ -35,28 +36,37 @@ steps:
       max_parallel: 2
 
   - id: report_maintainability
+    # NOTE (native-tool gap — see task report): repo-investigator's
+    # `.rupu/agents/repo-investigator.md` frontmatter currently declares
+    # `tools: [bash, read_file, grep, glob]` only — no `issues.*` tools. A
+    # step's `actions:` allowlist below is an audit-log allowlist for the
+    # action-protocol (crates/rupu-orchestrator/src/action_protocol.rs), NOT
+    # a tool grant: the runtime tool roster comes solely from the agent's own
+    # frontmatter `tools:` list (crates/rupu-orchestrator/src/step_factory.rs
+    # `agent_tools: spec.tools`). This step cannot actually call
+    # `issues.list`/`issues.comment`/`issues.create` until repo-investigator
+    # (or a dedicated reporting agent) has them added to its `tools:` list —
+    # tracked as a prerequisite, out of scope for this YAML-only change.
     agent: repo-investigator
-    actions: []
+    actions: ["issues.list", "issues.comment", "issues.create"]
     prompt: |
-      You have a `bash` tool. The `gh` CLI is installed and authenticated
-      against this repo's GitHub remote — use it to file today's
-      maintainability report. Do not modify any repository files and do not
-      open a pull request; this step only reads/writes GitHub issues.
+      File today's maintainability report using the native `issues.list`,
+      `issues.comment`, and `issues.create` tools — do not use `gh` or any
+      shell command for this; do not modify any repository files and do not
+      open a pull request.
 
       Rolling issue title (must match exactly, character for character):
       Nightly maintainability findings
 
       Steps:
-      1. Run `gh issue list --state open --search "\"Nightly maintainability findings\" in:title" --json number,title`
-         and check whether an open issue with that *exact* title already exists.
+      1. Call `issues.list` (state: open) and look for an existing issue
+         whose title is exactly "Nightly maintainability findings".
       2. Build the report body from the findings below. If there are no
          maintainability findings today, the body should say so plainly
          (e.g. "No maintainability findings today.").
-      3. If a matching open issue exists, post the body as a comment on it
-         (`gh issue comment <number> --body-file -`, piping the body in).
-         Otherwise open a new one
-         (`gh issue create --title "Nightly maintainability findings" --body-file - --label nightly,maintainability`,
-         piping the body in — omit `--label` if label creation would fail).
+      3. If a matching open issue exists, call `issues.comment` on it with
+         the body. Otherwise call `issues.create` with title "Nightly
+         maintainability findings" and the body.
       4. Do not close, re-label, or otherwise alter any other issue.
 
       Today's maintainability findings (from the review panel; empty means none):
@@ -66,31 +76,31 @@ steps:
       {% endif %}{% endfor %}
 
       Final response must state: whether an existing issue was found (and its
-      number) or a new one was created, and the exact `gh` command(s) run.
+      number) or a new one was created, and which native tool call(s) were made.
 
   - id: report_security
+    # NOTE (native-tool gap): same as report_maintainability above — see that
+    # step's comment.
     agent: repo-investigator
-    actions: []
+    actions: ["issues.list", "issues.comment", "issues.create"]
     prompt: |
-      You have a `bash` tool. The `gh` CLI is installed and authenticated
-      against this repo's GitHub remote — use it to file today's security
-      report. Do not modify any repository files and do not open a pull
-      request; this step only reads/writes GitHub issues.
+      File today's security report using the native `issues.list`,
+      `issues.comment`, and `issues.create` tools — do not use `gh` or any
+      shell command for this; do not modify any repository files and do not
+      open a pull request.
 
       Rolling issue title (must match exactly, character for character):
       Nightly security findings
 
       Steps:
-      1. Run `gh issue list --state open --search "\"Nightly security findings\" in:title" --json number,title`
-         and check whether an open issue with that *exact* title already exists.
+      1. Call `issues.list` (state: open) and look for an existing issue
+         whose title is exactly "Nightly security findings".
       2. Build the report body from the findings below. If there are no
-         security findings today, the body should say so plainly
-         (e.g. "No security findings today.").
-      3. If a matching open issue exists, post the body as a comment on it
-         (`gh issue comment <number> --body-file -`, piping the body in).
-         Otherwise open a new one
-         (`gh issue create --title "Nightly security findings" --body-file - --label nightly,security`,
-         piping the body in — omit `--label` if label creation would fail).
+         security findings today, the body should say so plainly (e.g.
+         "No security findings today.").
+      3. If a matching open issue exists, call `issues.comment` on it with
+         the body. Otherwise call `issues.create` with title "Nightly
+         security findings" and the body.
       4. Do not close, re-label, or otherwise alter any other issue.
 
       Today's security findings (from the review panel; empty means none):
@@ -100,4 +110,4 @@ steps:
       {% endif %}{% endfor %}
 
       Final response must state: whether an existing issue was found (and its
-      number) or a new one was created, and the exact `gh` command(s) run.
+      number) or a new one was created, and which native tool call(s) were made.

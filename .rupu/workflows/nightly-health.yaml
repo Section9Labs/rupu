@@ -1,8 +1,10 @@
 name: nightly-health
 description: >
   Nightly build/test/clippy health check over the whole workspace, using
-  the repo's pinned toolchain. Opens or updates a rolling "CI health" issue
-  on failure (dedup by exact title), and closes/comments it once green.
+  the repo's pinned toolchain. Opens or updates a rolling "CI health"
+  issue on failure (dedup by exact title, via native `issues.*` tools),
+  and closes/comments it once green. No `gh`/bash for SCM (bash is used
+  only to run the build/test/clippy commands, not for SCM effects).
 autoflow:
   enabled: true
 trigger:
@@ -41,13 +43,25 @@ steps:
       captured failing output.
 
   - id: report_health
+    # NOTE (native-tool gap — see task report): repo-investigator's
+    # frontmatter (`tools: [bash, read_file, grep, glob]`) does not declare
+    # `issues.list` / `issues.comment` / `issues.create` / `issues.update_state`.
+    # A step's `actions:` allowlist is an audit-log allowlist for the
+    # action-protocol (crates/rupu-orchestrator/src/action_protocol.rs), NOT a
+    # tool grant — the runtime tool roster comes solely from the agent's own
+    # frontmatter `tools:` list (crates/rupu-orchestrator/src/step_factory.rs
+    # `agent_tools: spec.tools`). This step cannot actually call these native
+    # tools until repo-investigator (or a dedicated reporting agent) has them
+    # added — tracked as a prerequisite, out of scope for this YAML-only
+    # change.
     agent: repo-investigator
-    actions: []
+    actions: ["issues.list", "issues.comment", "issues.create", "issues.update_state"]
     prompt: |
-      You have a `bash` tool. The `gh` CLI is installed and authenticated
-      against this repo's GitHub remote. Do not modify any repository files
-      and do not open a pull request; this step only reads/writes GitHub
-      issues based on the health check result below.
+      Use the native `issues.list`, `issues.comment`, `issues.create`, and
+      `issues.update_state` tools — do not use `gh` or any shell command for
+      this. Do not modify any repository files and do not open a pull
+      request; this step only reads/writes GitHub issues based on the health
+      check result below.
 
       Rolling issue title (must match exactly, character for character):
       CI health: nightly build/test/clippy
@@ -55,24 +69,21 @@ steps:
       Health check result from the previous step:
       {{ steps.health_check.output }}
 
-      1. Run `gh issue list --state open --search "\"CI health: nightly build/test/clippy\" in:title" --json number,title`
-         and check whether an open issue with that *exact* title already exists.
+      1. Call `issues.list` (state: open) and check whether an open issue
+         with that *exact* title already exists.
       2. If the health check result starts with `HEALTH: fail`:
          - Compose a comment/issue body naming the failing command(s) and
            including the captured failing output.
-         - If a matching open issue exists, post the body as a comment
-           (`gh issue comment <number> --body-file -`).
-           Otherwise create it
-           (`gh issue create --title "CI health: nightly build/test/clippy" --body-file - --label nightly,ci-health`,
-           omit `--label` if label creation would fail).
+         - If a matching open issue exists, call `issues.comment` with the
+           body. Otherwise call `issues.create` with title "CI health:
+           nightly build/test/clippy" and the body.
       3. If the health check result starts with `HEALTH: pass`:
-         - If a matching open issue exists, post a short comment noting the
-           workspace is green again, then close it
-           (`gh issue comment <number> --body "..."` followed by
-           `gh issue close <number>`).
+         - If a matching open issue exists, call `issues.comment` with a
+           short note that the workspace is green again, then call
+           `issues.update_state` to set it to `closed`.
          - If no matching open issue exists, do nothing further — do not
            open a new issue on a passing run.
 
       Final response must state: pass or fail, whether a matching issue was
-      found (and its number), and whatever `gh` command(s) were actually run
-      (or that nothing was needed).
+      found (and its number), and which native tool call(s) were actually
+      made (or that nothing was needed).
