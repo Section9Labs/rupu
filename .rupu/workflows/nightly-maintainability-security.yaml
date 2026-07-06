@@ -47,7 +47,7 @@ steps:
     # `issues.list`/`issues.comment`/`issues.create` until repo-investigator
     # (or a dedicated reporting agent) has them added to its `tools:` list —
     # tracked as a prerequisite, out of scope for this YAML-only change.
-    agent: repo-investigator
+    agent: issue-reporter
     actions: ["issues.list", "issues.comment", "issues.create"]
     prompt: |
       File today's maintainability report using the native `issues.list`,
@@ -81,7 +81,7 @@ steps:
   - id: report_security
     # NOTE (native-tool gap): same as report_maintainability above — see that
     # step's comment.
-    agent: repo-investigator
+    agent: issue-reporter
     actions: ["issues.list", "issues.comment", "issues.create"]
     prompt: |
       File today's security report using the native `issues.list`,

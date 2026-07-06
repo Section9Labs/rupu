@@ -54,7 +54,7 @@ steps:
     # tools until repo-investigator (or a dedicated reporting agent) has them
     # added — tracked as a prerequisite, out of scope for this YAML-only
     # change.
-    agent: repo-investigator
+    agent: issue-reporter
     actions: ["issues.list", "issues.comment", "issues.create", "issues.update_state"]
     prompt: |
       Use the native `issues.list`, `issues.comment`, `issues.create`, and
