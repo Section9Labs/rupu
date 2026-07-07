@@ -1,0 +1,86 @@
+name: nightly-health
+description: >
+  Nightly build/test/clippy health check over the whole workspace, using
+  the repo's pinned toolchain. Opens or updates a rolling "CI health"
+  issue on failure (dedup by exact title, via native `issues.*` tools),
+  and closes/comments it once green. No `gh`/bash for SCM (bash is used
+  only to run the build/test/clippy commands, not for SCM effects).
+autoflow:
+  enabled: true
+trigger:
+  on: cron
+  cron: "0 6 * * *"
+steps:
+  - id: health_check
+    agent: repo-investigator
+    actions: []
+    prompt: |
+      Run this repo's CI health checks using the repo's PINNED toolchain
+      declared in `rust-toolchain.toml` at the repo root — do NOT override
+      it with `+stable`, `+nightly`, or any other explicit toolchain
+      selector. Running plain `cargo ...` from inside the repo already
+      picks up the pinned toolchain via rustup's directory override, so
+      just invoke `cargo` normally from the repo root.
+
+      Run, from the repo root, in this exact order:
+      1. `cargo build --workspace`
+      2. `cargo test --workspace`
+      3. `cargo clippy --workspace --no-deps`
+
+      Do NOT run `cargo fmt --check` — this repo's main branch is known to
+      be fmt-dirty under the pinned rustfmt version, so a fmt gate would be
+      permanently red and is out of scope for this check.
+
+      For each command, capture: exit status, and — if non-zero — enough of
+      the failing output to diagnose it (command name, first error(s),
+      offending file:line). Do not modify any files; this is a read-only
+      health check.
+
+      Final response must start with exactly one of these two lines:
+      `HEALTH: pass`
+      `HEALTH: fail`
+      followed by a per-command PASS/FAIL line, and for any FAIL, the
+      captured failing output.
+
+  - id: report_health
+    # NOTE: this step runs as `issue-reporter`, whose frontmatter `tools:`
+    # list declares `issues.list` / `issues.comment` / `issues.create` /
+    # `issues.update_state` — the runtime tool roster comes solely from the
+    # agent's own frontmatter (crates/rupu-orchestrator/src/step_factory.rs
+    # `agent_tools: spec.tools`), so this step can call these native tools
+    # directly. The `actions:` allowlist below is a separate audit-log
+    # allowlist for the action-protocol
+    # (crates/rupu-orchestrator/src/action_protocol.rs), not the tool grant.
+    agent: issue-reporter
+    actions: ["issues.list", "issues.comment", "issues.create", "issues.update_state"]
+    prompt: |
+      Use the native `issues.list`, `issues.comment`, `issues.create`, and
+      `issues.update_state` tools — do not use `gh` or any shell command for
+      this. Do not modify any repository files and do not open a pull
+      request; this step only reads/writes GitHub issues based on the health
+      check result below.
+
+      Rolling issue title (must match exactly, character for character):
+      CI health: nightly build/test/clippy
+
+      Health check result from the previous step:
+      {{ steps.health_check.output }}
+
+      1. Call `issues.list` (state: open) and check whether an open issue
+         with that *exact* title already exists.
+      2. If the health check result starts with `HEALTH: fail`:
+         - Compose a comment/issue body naming the failing command(s) and
+           including the captured failing output.
+         - If a matching open issue exists, call `issues.comment` with the
+           body. Otherwise call `issues.create` with title "CI health:
+           nightly build/test/clippy" and the body.
+      3. If the health check result starts with `HEALTH: pass`:
+         - If a matching open issue exists, call `issues.comment` with a
+           short note that the workspace is green again, then call
+           `issues.update_state` to set it to `closed`.
+         - If no matching open issue exists, do nothing further — do not
+           open a new issue on a passing run.
+
+      Final response must state: pass or fail, whether a matching issue was
+      found (and its number), and which native tool call(s) were actually
+      made (or that nothing was needed).

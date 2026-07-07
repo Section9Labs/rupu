@@ -214,6 +214,32 @@ fn translate_mr_to_pr(repo: RepoRef, v: &serde_json::Value) -> Result<Pr, ScmErr
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&chrono::Utc))
         .unwrap_or_else(chrono::Utc::now);
+    // GitLab exposes the MR head commit as `sha` (aka `diff_refs.head_sha`);
+    // draft status via `draft`/`work_in_progress`; labels as a string array.
+    let head_sha = v
+        .get("sha")
+        .and_then(|x| x.as_str())
+        .or_else(|| {
+            v.get("diff_refs")
+                .and_then(|d| d.get("head_sha"))
+                .and_then(|x| x.as_str())
+        })
+        .unwrap_or_default()
+        .to_string();
+    let draft = v
+        .get("draft")
+        .and_then(|x| x.as_bool())
+        .or_else(|| v.get("work_in_progress").and_then(|x| x.as_bool()))
+        .unwrap_or(false);
+    let labels = v
+        .get("labels")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(Pr {
         r: PrRef {
             repo,
@@ -224,6 +250,9 @@ fn translate_mr_to_pr(repo: RepoRef, v: &serde_json::Value) -> Result<Pr, ScmErr
         state,
         head_branch,
         base_branch,
+        head_sha,
+        draft,
+        labels,
         author,
         created_at,
         updated_at,

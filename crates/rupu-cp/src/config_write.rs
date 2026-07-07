@@ -209,6 +209,7 @@ mod tests {
     fn effective_limit_uses_config_then_default() {
         let cp = rupu_config::CpConfig {
             max_workspace_bytes: Some(1024),
+            ..rupu_config::CpConfig::default()
         };
         assert_eq!(effective_max_workspace_bytes(&cp), 1024);
         let cp_def = rupu_config::CpConfig::default();

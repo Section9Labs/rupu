@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 
 use crate::connectors::RepoConnector;
-use crate::error::ScmError;
+use crate::error::{classify_scm_error, ScmError};
 use crate::platform::Platform;
 use crate::types::{
     Branch, Comment, CreatePr, Diff, FileContent, Pr, PrFilter, PrRef, Repo, RepoRef,
@@ -373,6 +373,66 @@ impl RepoConnector for GithubRepoConnector {
         Ok(pr_from_octocrab(repo_ref, pr))
     }
 
+    async fn is_collaborator(&self, r: &RepoRef, login: &str) -> Result<bool, ScmError> {
+        let _permit = self.client.permit().await;
+        let path = format!("/repos/{}/{}/collaborators/{}", r.owner, r.repo, login);
+        let inner = self.client.inner.clone();
+        self.client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let path = path.clone();
+                async move {
+                    // Don't route through `map_github_error`: GitHub uses a
+                    // bodyless 204/404 pair to signal true/false here, and
+                    // `map_github_error` would treat the 404 as a hard error.
+                    let response = inner
+                        ._get_with_headers(&path as &str, None)
+                        .await
+                        .map_err(super::client::classify_octocrab_error)?;
+                    match response.status().as_u16() {
+                        204 => Ok(true),
+                        404 => Ok(false),
+                        other => {
+                            let headers = response.headers().clone();
+                            let body = inner.body_to_string(response).await.unwrap_or_default();
+                            Err(classify_scm_error(Platform::Github, other, &body, &headers))
+                        }
+                    }
+                }
+            })
+            .await
+    }
+
+    async fn add_pr_labels(&self, p: &PrRef, labels: &[String]) -> Result<(), ScmError> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let _permit = self.client.permit().await;
+        let inner = self.client.inner.clone();
+        let owner = p.repo.owner.clone();
+        let repo = p.repo.repo.clone();
+        let number = p.number;
+        let labels = labels.to_vec();
+        self.client
+            .with_retry(|| {
+                let inner = inner.clone();
+                let owner = owner.clone();
+                let repo = repo.clone();
+                let labels = labels.clone();
+                async move {
+                    // PR labels are managed through the shared issues
+                    // endpoint (`POST /repos/{o}/{r}/issues/{n}/labels`).
+                    inner
+                        .issues(&owner, &repo)
+                        .add_labels(number as u64, &labels)
+                        .await
+                        .map(|_| ())
+                        .map_err(super::client::classify_octocrab_error)
+                }
+            })
+            .await
+    }
+
     async fn clone_to(&self, r: &RepoRef, dir: &std::path::Path) -> Result<(), ScmError> {
         let token = self.client.token.clone();
         let owner = r.owner.clone();
@@ -422,6 +482,14 @@ fn pr_from_octocrab(repo: RepoRef, pr: octocrab::models::pulls::PullRequest) -> 
         },
         head_branch: pr.head.ref_field,
         base_branch: pr.base.ref_field,
+        head_sha: pr.head.sha,
+        draft: pr.draft.unwrap_or(false),
+        labels: pr
+            .labels
+            .unwrap_or_default()
+            .into_iter()
+            .map(|l| l.name)
+            .collect(),
         author: pr.user.map(|u| u.login).unwrap_or_default(),
         created_at: pr.created_at.unwrap_or_else(chrono::Utc::now),
         updated_at: pr.updated_at.unwrap_or_else(chrono::Utc::now),

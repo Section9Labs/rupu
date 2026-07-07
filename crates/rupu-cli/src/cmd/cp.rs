@@ -45,6 +45,16 @@ pub async fn handle(action: Action) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // `[cp]` runtime settings gate the two background-tick loops
+            // below (autoflow reconcile / cron tick). A missing/malformed
+            // config file just falls back to `CpConfig::default()` — both
+            // loops enabled, 60s cadence — same as an absent `[cp]` section.
+            let cp_runtime_cfg = {
+                let global_cfg_path = global_dir.join("config.toml");
+                rupu_config::layer_files(Some(&global_cfg_path), None)
+                    .unwrap_or_default()
+                    .cp
+            };
             // Spawn the background resume worker. It builds the SAME
             // RunStore the CP's AppState does (`<global_dir>/runs`), so it
             // claims/approves/resumes runs the web UI marked for resume.
@@ -65,6 +75,52 @@ pub async fn handle(action: Action) -> ExitCode {
                 Arc::clone(&store),
                 rupu_workspace::HostStore { root: global_dir.join("hosts") },
                 shutdown_tx.subscribe(),
+            ));
+
+            // Autoflow reconcile loop (T6, dogfood-autoflows): periodically
+            // calls the SAME entrypoint `rupu autoflow tick` uses
+            // (`autoflow_runtime::tick_with_resolver`, covering both issue
+            // and PR entity autoflows) so `cp serve` fires autoflows
+            // without a separate `rupu autoflow serve` process or external
+            // scheduler. Gated by `[cp].autoflow_reconcile_enabled`
+            // (default: on); cadence from `[cp].autoflow_reconcile_interval_secs`
+            // (default: 60s).
+            let autoflow_resolver: Arc<dyn rupu_auth::CredentialResolver> =
+                Arc::new(rupu_auth::KeychainResolver::new());
+            let autoflow_reconcile_handle = tokio::spawn(run_periodic_tick(
+                "autoflow-reconcile",
+                cp_runtime_cfg.autoflow_reconcile_enabled,
+                Duration::from_secs(cp_runtime_cfg.autoflow_reconcile_interval_secs.max(1)),
+                shutdown_tx.subscribe(),
+                move || {
+                    let resolver = Arc::clone(&autoflow_resolver);
+                    async move {
+                        if let Err(e) =
+                            crate::cmd::autoflow_runtime::tick_with_resolver(resolver).await
+                        {
+                            tracing::warn!(error = %e, "cp serve: autoflow reconcile tick failed");
+                        }
+                    }
+                },
+            ));
+
+            // Cron / event-trigger tick loop (T6, dogfood-autoflows):
+            // periodically calls the SAME entrypoint `rupu cron tick` uses
+            // (`crate::cmd::cron::tick`, covering both cron-scheduled and
+            // polled-event workflow fires) so nightly/event-triggered
+            // workflows fire without an external `cron` entry. Gated by
+            // `[cp].cron_tick_enabled` (default: on); cadence from
+            // `[cp].cron_tick_interval_secs` (default: 60s).
+            let cron_tick_handle = tokio::spawn(run_periodic_tick(
+                "cron-tick",
+                cp_runtime_cfg.cron_tick_enabled,
+                Duration::from_secs(cp_runtime_cfg.cron_tick_interval_secs.max(1)),
+                shutdown_tx.subscribe(),
+                || async {
+                    if let Err(e) = crate::cmd::cron::tick(false, false, false).await {
+                        tracing::warn!(error = %e, "cp serve: cron tick failed");
+                    }
+                },
             ));
 
             // Adapter for rupu-cp's RunLauncher port: spawns detached
@@ -138,10 +194,12 @@ pub async fn handle(action: Action) -> ExitCode {
             })
             .await;
 
-            // Signal both background workers to stop and wait for them to drain.
+            // Signal every background loop to stop and wait for them to drain.
             let _ = shutdown_tx.send(true);
             let _ = worker_handle.await;
             let _ = poller_handle.await;
+            let _ = autoflow_reconcile_handle.await;
+            let _ = cron_tick_handle.await;
 
             serve_result
         }
@@ -153,6 +211,52 @@ pub async fn handle(action: Action) -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Generic periodic-tick loop shared by the autoflow-reconcile and
+/// cron-tick background loops (T6, dogfood-autoflows). Mirrors the
+/// sleep-vs-shutdown `tokio::select!` shape of [`run_bucket_poller`] /
+/// [`run_resume_worker`], but takes the per-iteration unit of work as an
+/// injected closure so the two concrete loops below can share one tested
+/// implementation instead of hand-rolling the same interval/shutdown
+/// plumbing twice.
+///
+/// When `enabled` is `false` the loop never starts (`tick` is never
+/// called, not even once) — this is the `[cp]` config flag's off switch,
+/// not a silent no-op: it's the documented way to disable a loop, logged
+/// once at startup.
+async fn run_periodic_tick<F, Fut>(
+    loop_name: &'static str,
+    enabled: bool,
+    interval: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    mut tick: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if !enabled {
+        tracing::info!(loop_name = %loop_name, "background loop disabled via [cp] config");
+        return;
+    }
+    tracing::info!(
+        loop_name = %loop_name,
+        interval_secs = interval.as_secs(),
+        "background loop active"
+    );
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    tracing::info!(loop_name = %loop_name, "background loop shutting down");
+                    break;
+                }
+                continue;
+            }
+        }
+        tick().await;
     }
 }
 
@@ -222,8 +326,7 @@ async fn run_bucket_poller(
                 Ok(runs) => runs
                     .into_iter()
                     .filter(|r| {
-                        r.worker_id.as_deref() == Some(host.id.as_str())
-                            && !r.status.is_terminal()
+                        r.worker_id.as_deref() == Some(host.id.as_str()) && !r.status.is_terminal()
                     })
                     .map(|r| r.id)
                     .collect(),
@@ -414,5 +517,75 @@ async fn run_resume_worker(
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_periodic_tick;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// T6 (dogfood-autoflows): the shared loop body must invoke the
+    /// injected tick fn once per interval, N times over N intervals. No
+    /// real autoflow reconciler or cron tick runs here — the tick fn is a
+    /// plain counter that flips the SAME `watch` channel the loop is
+    /// already select!-ing on once it's been called `N` times, so the
+    /// test is deterministic (no wall-clock race): the loop's next
+    /// `shutdown.changed()` observes the flip immediately and exits.
+    #[tokio::test]
+    async fn run_periodic_tick_invokes_injected_fn_once_per_interval_until_shutdown() {
+        const N: usize = 3;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_tick = Arc::clone(&counter);
+        let shutdown_tx_for_tick = shutdown_tx.clone();
+
+        run_periodic_tick(
+            "test-loop",
+            true,
+            Duration::from_millis(1),
+            shutdown_rx,
+            move || {
+                let counter = Arc::clone(&counter_for_tick);
+                let shutdown_tx = shutdown_tx_for_tick.clone();
+                async move {
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n >= N {
+                        let _ = shutdown_tx.send(true);
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), N);
+    }
+
+    /// T6: `enabled: false` must be a hard off switch — the injected tick
+    /// fn never runs, not even once, and the loop returns immediately
+    /// instead of hanging.
+    #[tokio::test]
+    async fn run_periodic_tick_disabled_never_invokes_injected_fn() {
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_tick = Arc::clone(&counter);
+
+        run_periodic_tick(
+            "test-loop-disabled",
+            false,
+            Duration::from_millis(1),
+            shutdown_rx,
+            move || {
+                let counter = Arc::clone(&counter_for_tick);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 }

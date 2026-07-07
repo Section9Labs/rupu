@@ -283,7 +283,15 @@ fn ui_prefs(no_color: bool) -> anyhow::Result<crate::cmd::ui::UiPrefs> {
     ))
 }
 
-async fn tick(dry_run: bool, skip_events: bool, only_events: bool) -> anyhow::Result<()> {
+/// The `rupu cron tick` core: fires due cron-scheduled workflows, then
+/// polls event-triggered workflows. `pub(crate)` so `rupu cp serve`'s
+/// cron-tick background loop (`crate::cmd::cp`) can call the exact same
+/// entrypoint on a timer instead of reimplementing the tick logic.
+pub(crate) async fn tick(
+    dry_run: bool,
+    skip_events: bool,
+    only_events: bool,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
 
     if !only_events {
@@ -963,6 +971,32 @@ mod tests {
     use rupu_config::PollSourceSpec;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// Smoke test for T6 (dogfood-autoflows): `cp serve`'s cron-tick
+    /// background loop calls this exact `tick()` fn on a timer instead of
+    /// reimplementing the tick logic — this just proves the factored-out
+    /// core is callable end-to-end (dry-run, events skipped so no network
+    /// connector is built) and returns `Ok`.
+    #[tokio::test]
+    async fn tick_core_is_callable_dry_run() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        crate::test_support::ensure_crypto_provider();
+        let tmp = TempDir::new().unwrap();
+        let global = tmp.path().join("home");
+        let old_home = std::env::var_os("RUPU_HOME");
+        std::env::set_var("RUPU_HOME", &global);
+
+        let result = tick(/* dry_run */ true, /* skip_events */ true, false).await;
+
+        match old_home {
+            Some(value) => std::env::set_var("RUPU_HOME", value),
+            None => std::env::remove_var("RUPU_HOME"),
+        }
+        assert!(
+            result.is_ok(),
+            "cron tick core should be callable: {result:?}"
+        );
+    }
 
     #[test]
     fn last_fired_round_trip() {

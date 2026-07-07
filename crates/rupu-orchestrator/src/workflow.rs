@@ -79,6 +79,13 @@ pub enum WorkflowParseError {
     #[error("autoflow outcome references unknown workflow output `{output}`")]
     AutoflowOutcomeUnknownOutput { output: String },
     #[error(
+        "autoflow.selector.{field} is only valid when `entity: pull_request` (this workflow declares `entity: {entity}`)"
+    )]
+    AutoflowSelectorFieldWrongEntity {
+        field: &'static str,
+        entity: &'static str,
+    },
+    #[error(
         "workflow output `{output}` and step `{step}` contract disagree on `{field}`: workflow declares `{workflow_declared}`, step declares `{step_declared}`"
     )]
     ContractStepMismatch {
@@ -263,6 +270,16 @@ pub struct Autoflow {
 pub enum AutoflowEntity {
     #[default]
     Issue,
+    PullRequest,
+}
+
+impl AutoflowEntity {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pull_request",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -278,6 +295,95 @@ pub struct AutoflowSelector {
     pub labels_none: Vec<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Filter on draft status. Only meaningful for `entity:
+    /// pull_request`; rejected on `entity: issue` (see
+    /// [`WorkflowParseError::AutoflowSelectorFieldWrongEntity`]).
+    #[serde(default)]
+    pub draft: Option<DraftFilter>,
+    /// Restrict to pull requests targeting this base branch (e.g.
+    /// `main`). Only meaningful for `entity: pull_request`; rejected
+    /// on `entity: issue`.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Explicit allowlist of author logins. Empty (the default) means
+    /// no explicit-list restriction; see [`author_allowed`].
+    #[serde(default)]
+    pub authors: Vec<String>,
+    /// Broader author-scope check (e.g. "any repo collaborator").
+    /// `None` (the default) means no scope-based restriction.
+    #[serde(default)]
+    pub authors_from: Option<AuthorScope>,
+    /// What to do when an event is skipped because its author isn't
+    /// allowed. `None` behaves as [`SkipAction::Skip`].
+    #[serde(default)]
+    pub on_skip: Option<SkipAction>,
+}
+
+/// Broader author-scope check used by [`AutoflowSelector::authors_from`].
+/// Whether a given login satisfies one of these scopes is resolved by
+/// the SCM connector at tick time; this crate only carries the enum and
+/// the pure allow/deny decision in [`author_allowed`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthorScope {
+    /// Author must be a collaborator on the repository.
+    Collaborators,
+    /// Author must be a member of the repository's owning organization.
+    OrgMembers,
+}
+
+/// What an autoflow tick should do when an otherwise-eligible event is
+/// excluded solely by the author allowlist.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipAction {
+    /// Silently skip the event (default).
+    Skip,
+    /// Skip, but label the issue/PR to flag it for a human.
+    LabelNeedsHuman,
+}
+
+/// Pure author-eligibility gate for autoflow selectors.
+///
+/// The network/SCM lookup (is this login a collaborator or org member?)
+/// happens in the tick/SCM layer; this function only encodes the
+/// decision rule so it stays unit-testable without any I/O:
+///
+/// - If `selector.authors` is non-empty and contains `author_login`,
+///   the author is allowed regardless of `authors_from`.
+/// - Otherwise, if `selector.authors_from` is set, the author is
+///   allowed iff `is_collaborator` is `true` (the caller has already
+///   resolved whatever scope `authors_from` names against the SCM).
+/// - Otherwise, if both `authors` is empty and `authors_from` is
+///   `None`, there is no author restriction at all: allowed (this
+///   preserves the behavior of existing autoflows that predate the
+///   author-allowlist fields).
+/// - Otherwise (`authors` is non-empty, no match, and `authors_from`
+///   is `None`), the author is denied.
+pub fn author_allowed(
+    selector: &AutoflowSelector,
+    author_login: &str,
+    is_collaborator: bool,
+) -> bool {
+    if !selector.authors.is_empty() && selector.authors.iter().any(|a| a == author_login) {
+        return true;
+    }
+    if selector.authors_from.is_some() {
+        return is_collaborator;
+    }
+    selector.authors.is_empty()
+}
+
+/// Draft-status filter for `entity: pull_request` autoflows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftFilter {
+    /// Match both draft and ready-for-review pull requests.
+    Include,
+    /// Match only ready-for-review pull requests (exclude drafts).
+    Exclude,
+    /// Match only draft pull requests.
+    Only,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -301,6 +407,7 @@ pub struct AutoflowClaim {
 pub enum AutoflowClaimKey {
     #[default]
     Issue,
+    PrHeadSha,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1233,6 +1340,20 @@ fn validate_autoflow(wf: &Workflow) -> Result<(), WorkflowParseError> {
             });
         }
     }
+    if autoflow.entity != AutoflowEntity::PullRequest {
+        if autoflow.selector.draft.is_some() {
+            return Err(WorkflowParseError::AutoflowSelectorFieldWrongEntity {
+                field: "draft",
+                entity: autoflow.entity.name(),
+            });
+        }
+        if autoflow.selector.base.is_some() {
+            return Err(WorkflowParseError::AutoflowSelectorFieldWrongEntity {
+                field: "base",
+                entity: autoflow.entity.name(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1593,5 +1714,127 @@ steps:
 "#;
         let wf = Workflow::parse(yaml).expect("should parse");
         assert!(wf.concerns.is_none(), "concerns should be None by default");
+    }
+}
+
+#[cfg(test)]
+mod pull_request_autoflow_tests {
+    use super::*;
+
+    #[test]
+    fn pull_request_entity_and_selector_parse() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: pull_request\n  selector:\n    states: [open]\n    draft: exclude\n    base: main\n  claim:\n    key: pr_head_sha\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        let wf = Workflow::parse(y).unwrap();
+        let af = wf.autoflow.unwrap();
+        assert_eq!(af.entity, AutoflowEntity::PullRequest);
+        assert_eq!(af.selector.base.as_deref(), Some("main"));
+        assert_eq!(af.selector.draft, Some(DraftFilter::Exclude));
+        assert_eq!(af.claim.unwrap().key, AutoflowClaimKey::PrHeadSha);
+    }
+
+    #[test]
+    fn draft_filter_on_issue_entity_is_rejected() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: issue\n  selector:\n    draft: exclude\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        assert!(Workflow::parse(y).is_err());
+    }
+
+    #[test]
+    fn base_on_issue_entity_is_rejected() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: issue\n  selector:\n    base: main\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        assert!(Workflow::parse(y).is_err());
+    }
+
+    #[test]
+    fn issue_autoflow_without_pr_fields_still_parses() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: issue\n  selector:\n    states: [open]\n    labels_all: [triaged]\n  claim:\n    key: issue\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        let wf = Workflow::parse(y).unwrap();
+        let af = wf.autoflow.unwrap();
+        assert_eq!(af.entity, AutoflowEntity::Issue);
+        assert!(af.selector.draft.is_none());
+        assert!(af.selector.base.is_none());
+        assert_eq!(af.claim.unwrap().key, AutoflowClaimKey::Issue);
+    }
+}
+
+#[cfg(test)]
+mod author_allowlist_tests {
+    use super::*;
+
+    fn selector_with(authors: Vec<&str>, authors_from: Option<AuthorScope>) -> AutoflowSelector {
+        AutoflowSelector {
+            authors: authors.into_iter().map(String::from).collect(),
+            authors_from,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explicit_author_in_list_is_allowed() {
+        let sel = selector_with(vec!["alice", "bob"], None);
+        assert!(author_allowed(&sel, "alice", false));
+    }
+
+    #[test]
+    fn authors_from_collaborators_allows_collaborator() {
+        let sel = selector_with(vec![], Some(AuthorScope::Collaborators));
+        assert!(author_allowed(&sel, "carol", true));
+    }
+
+    #[test]
+    fn authors_from_collaborators_denies_non_collaborator_not_in_list() {
+        let sel = selector_with(vec![], Some(AuthorScope::Collaborators));
+        assert!(!author_allowed(&sel, "mallory", false));
+    }
+
+    #[test]
+    fn no_authors_and_no_authors_from_allows_everyone() {
+        let sel = selector_with(vec![], None);
+        assert!(author_allowed(&sel, "anyone", false));
+        assert!(author_allowed(&sel, "anyone", true));
+    }
+
+    #[test]
+    fn authors_set_but_no_match_and_no_authors_from_is_denied() {
+        let sel = selector_with(vec!["alice", "bob"], None);
+        assert!(!author_allowed(&sel, "mallory", false));
+        // Even a collaborator not on the explicit list is denied, since
+        // authors_from wasn't specified to broaden the check.
+        assert!(!author_allowed(&sel, "mallory", true));
+    }
+
+    #[test]
+    fn authors_from_org_members_allows_collaborator() {
+        let sel = selector_with(vec![], Some(AuthorScope::OrgMembers));
+        assert!(author_allowed(&sel, "dave", true));
+    }
+
+    #[test]
+    fn selector_with_author_fields_parses() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: issue\n  selector:\n    authors: [alice, bob]\n    authors_from: collaborators\n  claim:\n    key: issue\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        let wf = Workflow::parse(y).unwrap();
+        let af = wf.autoflow.unwrap();
+        assert_eq!(
+            af.selector.authors,
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        assert_eq!(af.selector.authors_from, Some(AuthorScope::Collaborators));
+    }
+
+    #[test]
+    fn selector_without_author_fields_still_parses_backward_compat() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: issue\n  selector:\n    states: [open]\n  claim:\n    key: issue\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        let wf = Workflow::parse(y).unwrap();
+        let af = wf.autoflow.unwrap();
+        assert!(af.selector.authors.is_empty());
+        assert!(af.selector.authors_from.is_none());
+        assert!(af.selector.on_skip.is_none());
+    }
+
+    #[test]
+    fn on_skip_label_needs_human_parses() {
+        let y = "name: x\nautoflow:\n  enabled: true\n  entity: issue\n  selector:\n    on_skip: label_needs_human\n  claim:\n    key: issue\nsteps:\n  - id: s1\n    agent: a\n    prompt: p\n";
+        let wf = Workflow::parse(y).unwrap();
+        let af = wf.autoflow.unwrap();
+        assert_eq!(af.selector.on_skip, Some(SkipAction::LabelNeedsHuman));
     }
 }

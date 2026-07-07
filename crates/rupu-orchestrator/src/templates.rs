@@ -290,6 +290,93 @@ impl StepContext {
     }
 }
 
+/// Maximum diff size (bytes) embedded verbatim into the PR event
+/// context before truncation. PR diffs can run into the megabytes for
+/// large refactors; without a cap a single huge diff would balloon
+/// every step prompt that references `event.pull_request.diff` and
+/// risks blowing a provider's context window. 100 KiB comfortably
+/// covers the vast majority of real-world PRs while keeping a hard
+/// ceiling on the pathological case.
+pub const MAX_PR_DIFF_BYTES: usize = 100 * 1024;
+
+/// Build the `event` payload for a PR-triggered autoflow run.
+///
+/// Returns the JSON value to pass to [`StepContext::with_event`] — the
+/// `event` key itself comes from that struct field (see the doc
+/// comment on `StepContext::event`), so the value produced here is the
+/// *content* of `event`, not a further-wrapped `{"event": ...}`
+/// object. Callers do:
+///
+/// ```
+/// # use rupu_orchestrator::templates::{StepContext, pr_event_context};
+/// let ctx = StepContext::new().with_event(pr_event_context(
+///     42, "Fix flaky test", "main", "feature/fix", "abc123",
+///     "octocat", "https://github.com/owner/repo/pull/42",
+///     "diff --git a/x b/x\n+hello\n", "owner/repo",
+/// ));
+/// ```
+///
+/// and templates then read `{{ event.pull_request.number }}`,
+/// `{{ event.pull_request.diff }}`, `{{ event.repository.full_name }}`,
+/// etc. — mirroring the existing webhook `event` shape used by
+/// `event_tests` above.
+///
+/// Takes primitive fields rather than `rupu_scm::Pr` / `Diff` so this
+/// template-rendering module doesn't need to reach into SCM connector
+/// types for a handful of scalar values; callers that already hold a
+/// `Pr` + `Diff` destructure them at the call site.
+///
+/// `diff` is bounded to [`MAX_PR_DIFF_BYTES`]: larger diffs are
+/// truncated with a trailing note so a single oversized PR can't
+/// balloon every step prompt that references `event.pull_request.diff`
+/// or blow a provider's context window.
+#[allow(clippy::too_many_arguments)]
+pub fn pr_event_context(
+    number: u64,
+    title: &str,
+    base: &str,
+    head: &str,
+    head_sha: &str,
+    author: &str,
+    url: &str,
+    diff: &str,
+    repo_full_name: &str,
+) -> serde_json::Value {
+    let diff = truncate_diff(diff);
+    serde_json::json!({
+        "pull_request": {
+            "number": number,
+            "title": title,
+            "base": base,
+            "head": head,
+            "head_sha": head_sha,
+            "author": author,
+            "url": url,
+            "diff": diff,
+        },
+        "repository": {
+            "full_name": repo_full_name,
+        }
+    })
+}
+
+/// Truncate `diff` to at most [`MAX_PR_DIFF_BYTES`], appending a
+/// trailing note when truncation happened. Cuts on a UTF-8 char
+/// boundary at or before the byte cap so a multi-byte sequence is
+/// never split.
+fn truncate_diff(diff: &str) -> String {
+    if diff.len() <= MAX_PR_DIFF_BYTES {
+        return diff.to_string();
+    }
+    let mut end = MAX_PR_DIFF_BYTES;
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = diff[..end].to_string();
+    out.push_str("\n… (diff truncated)");
+    out
+}
+
 /// Render `template` against `ctx`. Returns the rendered string or a
 /// `RenderError` for invalid syntax. Missing variables become empty
 /// strings (v0 default). We use [`UndefinedBehavior::Chainable`] so
@@ -529,6 +616,83 @@ mod event_tests {
         )
         .expect("render");
         assert!(!take, "merged=false should be falsy");
+    }
+}
+
+#[cfg(test)]
+mod pr_event_tests {
+    use super::*;
+
+    #[test]
+    fn pr_event_fields_render_in_prompt() {
+        let ctx = StepContext::new().with_event(pr_event_context(
+            42,
+            "Fix flaky test",
+            "main",
+            "feature/fix",
+            "abc123",
+            "octocat",
+            "https://github.com/Section9Labs/rupu/pull/42",
+            "diff --git a/x b/x\n+hello\n",
+            "Section9Labs/rupu",
+        ));
+        let out = render_step_prompt(
+            "{{ event.pull_request.number }} {{ event.pull_request.head_sha }} {{ event.pull_request.author }} {{ event.pull_request.base }}",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("render");
+        assert_eq!(out, "42 abc123 octocat main");
+    }
+
+    #[test]
+    fn pr_event_context_carries_full_shape() {
+        let ctx = StepContext::new().with_event(pr_event_context(
+            7,
+            "Title",
+            "main",
+            "feat",
+            "sha1",
+            "author",
+            "https://example.com/pr/7",
+            "diff content",
+            "owner/repo",
+        ));
+        let out = render_step_prompt(
+            "{{ event.pull_request.title }}|{{ event.pull_request.head }}|{{ event.pull_request.url }}|{{ event.pull_request.diff }}|{{ event.repository.full_name }}",
+            &ctx,
+            RenderMode::Permissive,
+        )
+        .expect("render");
+        assert_eq!(
+            out,
+            "Title|feat|https://example.com/pr/7|diff content|owner/repo"
+        );
+    }
+
+    #[test]
+    fn oversized_diff_is_truncated() {
+        let huge = "x".repeat(MAX_PR_DIFF_BYTES + 500);
+        let value = pr_event_context(1, "t", "b", "h", "sha", "a", "u", &huge, "r");
+        let diff = value["pull_request"]["diff"].as_str().expect("diff string");
+        assert!(
+            diff.contains("(diff truncated)"),
+            "should contain truncation note: {diff}"
+        );
+        assert!(diff.len() < huge.len(), "should be shorter than original");
+        assert!(
+            diff.len() <= MAX_PR_DIFF_BYTES + 64,
+            "should be bounded near threshold + note length, got {}",
+            diff.len()
+        );
+    }
+
+    #[test]
+    fn undersized_diff_is_not_truncated() {
+        let small = "small diff".to_string();
+        let value = pr_event_context(1, "t", "b", "h", "sha", "a", "u", &small, "r");
+        let diff = value["pull_request"]["diff"].as_str().expect("diff string");
+        assert_eq!(diff, "small diff");
     }
 }
 

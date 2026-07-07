@@ -53,6 +53,8 @@ async fn get_pr_translates() {
     assert_eq!(p.title, "fix: streaming tokens");
     assert_eq!(p.head_branch, "feat/stream");
     assert_eq!(p.base_branch, "main");
+    assert_eq!(p.head_sha, "deadbeef");
+    assert!(!p.draft);
     assert_eq!(p.author, "matias");
 }
 
@@ -272,6 +274,56 @@ async fn comment_pr_posts_body() {
     assert_eq!(comment.id, "555");
     assert_eq!(comment.author, "matias");
     assert_eq!(comment.body, "LGTM, ship it.");
+}
+
+#[tokio::test]
+async fn is_collaborator_204_is_true() {
+    let server = MockServer::start();
+    let m = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/collaborators/octocat");
+        then.status(204);
+    });
+    let c = common::github_connector_against(&server);
+    let is_collab = c
+        .is_collaborator(
+            &rupu_scm::RepoRef {
+                platform: Platform::Github,
+                owner: "section9labs".into(),
+                repo: "rupu".into(),
+            },
+            "octocat",
+        )
+        .await
+        .unwrap();
+    m.assert();
+    assert!(is_collab);
+}
+
+#[tokio::test]
+async fn is_collaborator_404_is_false() {
+    let server = MockServer::start();
+    let m = server.mock(|when, then| {
+        when.method(GET)
+            .path("/repos/section9labs/rupu/collaborators/octocat");
+        then.status(404)
+            .header("content-type", "application/json")
+            .json_body(serde_json::json!({ "message": "Not Found" }));
+    });
+    let c = common::github_connector_against(&server);
+    let is_collab = c
+        .is_collaborator(
+            &rupu_scm::RepoRef {
+                platform: Platform::Github,
+                owner: "section9labs".into(),
+                repo: "rupu".into(),
+            },
+            "octocat",
+        )
+        .await
+        .unwrap();
+    m.assert();
+    assert!(!is_collab);
 }
 
 #[tokio::test]

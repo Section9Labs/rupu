@@ -233,8 +233,20 @@ pub(crate) async fn tick_with_options(
         let matches = legacy::collect_issue_matches(&discovered, resolver.as_ref())
             .await
             .context("discover autoflow issue matches")?;
-        let contenders_by_issue = legacy::summarize_issue_contenders(&matches);
-        let winners = legacy::choose_winning_matches(matches);
+        let pr_matches = legacy::collect_pr_matches(&discovered, &claim_store, resolver.as_ref())
+            .await
+            .context("discover autoflow pull-request matches")?;
+        let mut contenders_by_issue = legacy::summarize_issue_contenders(&matches);
+        contenders_by_issue.extend(legacy::summarize_pr_contenders(&pr_matches));
+        // Issue and PR winners share one claim keyspace (issue refs vs `pr:`
+        // refs never collide) and flow through the same reconcile loop below.
+        let mut winners: BTreeMap<String, legacy::AutoflowWinner> = BTreeMap::new();
+        for (key, matched) in legacy::choose_winning_matches(matches) {
+            winners.insert(key, legacy::AutoflowWinner::Issue(matched));
+        }
+        for (key, matched) in legacy::choose_winning_pr_matches(pr_matches) {
+            winners.insert(key, legacy::AutoflowWinner::Pr(matched));
+        }
         let mut claims_by_issue: BTreeMap<String, AutoflowClaimRecord> = claim_store
             .list()?
             .into_iter()
@@ -266,7 +278,7 @@ pub(crate) async fn tick_with_options(
                 .or_else(|| {
                     winner
                         .as_ref()
-                        .map(|matched| matched.resolved.repo_ref.clone())
+                        .map(|matched| matched.resolved().repo_ref.clone())
                 });
             let workflow_hint = claim
                 .as_ref()
@@ -274,7 +286,7 @@ pub(crate) async fn tick_with_options(
                 .or_else(|| {
                     winner
                         .as_ref()
-                        .map(|matched| matched.resolved.workflow.name.clone())
+                        .map(|matched| matched.resolved().workflow.name.clone())
                 });
             let before_claim = claim.clone();
 
@@ -317,14 +329,14 @@ pub(crate) async fn tick_with_options(
 
                         if legacy::claim_should_yield_to_winner(
                             &current,
-                            winner.as_ref(),
+                            winner.as_ref().map(|w| w.resolved().workflow.name.as_str()),
                             active_lock.is_some(),
                         ) {
                             if let Some(winner) = winner.as_ref() {
                                 current.contenders = legacy::active_or_fallback_contenders(
                                     &contenders,
-                                    Some(&winner.resolved),
-                                    &winner.resolved.workflow.name,
+                                    Some(winner.resolved()),
+                                    &winner.resolved().workflow.name,
                                 );
                             }
                             current.status = ClaimStatus::Released;
@@ -367,10 +379,11 @@ pub(crate) async fn tick_with_options(
                                 );
                                 return Ok(false);
                             }
-                            let issue = legacy::fetch_issue(
+                            let subject = legacy::fetch_subject(
+                                legacy::subject_kind_for_ref(&issue_ref_text),
                                 &resolved.cfg,
                                 resolver.as_ref(),
-                                &legacy::parse_issue_ref_text(&issue_ref_text)?,
+                                &issue_ref_text,
                             )
                             .await?;
                             if legacy::workflow_declares_autoflow_for_repo(
@@ -389,7 +402,7 @@ pub(crate) async fn tick_with_options(
                                     &global,
                                     &claim_store,
                                     &resolved,
-                                    &issue,
+                                    &subject,
                                     &issue_ref_text,
                                     None,
                                     attach_workflow_ui,
@@ -407,7 +420,7 @@ pub(crate) async fn tick_with_options(
                                     &claim_store,
                                     &resolved,
                                     &mut current,
-                                    &issue,
+                                    &subject,
                                     &issue_ref_text,
                                     &dispatch.workflow,
                                     dispatch.inputs,
@@ -433,17 +446,18 @@ pub(crate) async fn tick_with_options(
                             tick_started_at,
                             &wake_hints.events_for(&issue_ref_text, &current.repo_ref),
                         )? {
-                            let issue = legacy::fetch_issue(
+                            let subject = legacy::fetch_subject(
+                                legacy::subject_kind_for_ref(&issue_ref_text),
                                 &resolved.cfg,
                                 resolver.as_ref(),
-                                &legacy::parse_issue_ref_text(&issue_ref_text)?,
+                                &issue_ref_text,
                             )
                             .await?;
                             legacy::execute_autoflow_cycle(
                                 &global,
                                 &claim_store,
                                 &resolved,
-                                &issue,
+                                &subject,
                                 &issue_ref_text,
                                 None,
                                 attach_workflow_ui,
@@ -478,40 +492,45 @@ pub(crate) async fn tick_with_options(
                 let Some(winner) = winner else {
                     return Ok(false);
                 };
-                let max_active =
-                    winner.resolved.cfg.autoflow.max_active.unwrap_or(u32::MAX) as usize;
+                let max_active = winner
+                    .resolved()
+                    .cfg
+                    .autoflow
+                    .max_active
+                    .unwrap_or(u32::MAX) as usize;
                 let active = active_claim_counts
-                    .get(&winner.resolved.repo_ref)
+                    .get(&winner.resolved().repo_ref)
                     .copied()
                     .unwrap_or_default();
                 if active >= max_active {
                     return Ok(false);
                 }
+                let winner_subject = winner.subject();
                 legacy::execute_autoflow_cycle(
                     &global,
                     &claim_store,
-                    &winner.resolved,
-                    &winner.issue,
-                    &winner.issue_ref_text,
+                    winner.resolved(),
+                    &winner_subject,
+                    winner.ref_text(),
                     None,
                     attach_workflow_ui,
                     BTreeMap::new(),
                     legacy::active_or_fallback_contenders(
                         &contenders,
-                        Some(&winner.resolved),
-                        &winner.resolved.workflow.name,
+                        Some(winner.resolved()),
+                        &winner.resolved().workflow.name,
                     ),
                     options.worker.clone(),
                     options.shared_printer.clone(),
                     live_cycle_recorder.clone(),
                 )
                 .await?;
-                enqueue_follow_up_wake(&global, &claim_store, &winner.issue_ref_text)?;
+                enqueue_follow_up_wake(&global, &claim_store, winner.ref_text())?;
                 legacy::adjust_active_claim_count(
                     &mut active_claim_counts,
-                    &winner.resolved.repo_ref,
+                    &winner.resolved().repo_ref,
                     None,
-                    Some(load_claim_status(&claim_store, &winner.issue_ref_text)?),
+                    Some(load_claim_status(&claim_store, winner.ref_text())?),
                 );
                 Ok(true)
             }

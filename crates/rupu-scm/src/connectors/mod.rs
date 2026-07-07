@@ -46,6 +46,38 @@ pub trait RepoConnector: Send + Sync {
     /// Clone the repo to a local directory using the platform's
     /// HTTPS clone URL with the connector's stored credential.
     async fn clone_to(&self, r: &RepoRef, dir: &Path) -> Result<(), ScmError>;
+
+    /// Is `login` a collaborator on `r`? Backs the autoflow
+    /// author-allowlist (dogfood autoflows spec): a workflow trigger
+    /// fired by a PR/issue author who isn't a collaborator is dropped
+    /// rather than run with elevated trust.
+    ///
+    /// Default is unimplemented — `ScmError` has no dedicated
+    /// "unsupported operation" variant, so this returns the closest
+    /// existing one (`BadRequest`, which is non-recoverable and won't
+    /// get silently retried). Only GitHub implements this for now;
+    /// platforms without an override fail closed rather than allowing
+    /// an unverified author through.
+    async fn is_collaborator(&self, r: &RepoRef, login: &str) -> Result<bool, ScmError> {
+        let _ = (r, login);
+        Err(ScmError::BadRequest {
+            message: format!("is_collaborator is not supported by {}", self.platform()),
+        })
+    }
+
+    /// Add labels to a pull request. Backs the autoflow author-allowlist
+    /// `on_skip: label_needs_human` action, which flags a PR from a
+    /// non-collaborator for human attention rather than running an agent
+    /// on it. Default is unimplemented (returns the closest existing
+    /// `ScmError`); only platforms that override it can label. Callers
+    /// treat an `Err` here as a best-effort miss (log + still skip the
+    /// PR) — labeling never gates the safety skip.
+    async fn add_pr_labels(&self, p: &PrRef, labels: &[String]) -> Result<(), ScmError> {
+        let _ = (p, labels);
+        Err(ScmError::BadRequest {
+            message: format!("add_pr_labels is not supported by {}", self.platform()),
+        })
+    }
 }
 
 #[async_trait]
