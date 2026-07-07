@@ -1,6 +1,7 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
     api::fs_safety::{validate_name, write_atomic},
+    api::repo_scope::distinct_repo_workspaces,
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
     session_starter::{SessionStartError, SessionStartRequest, SessionStarter},
@@ -12,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use rupu_agent::loader::{load_agent, load_agents, AgentLoadError};
-use rupu_workspace::WorkspaceStore;
+use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -40,8 +41,17 @@ fn store(s: &AppState) -> WorkspaceStore {
     }
 }
 
+fn repo_store(s: &AppState) -> RepoRegistryStore {
+    RepoRegistryStore {
+        root: s.global_dir.join("repos"),
+    }
+}
+
 /// Scope tag for a registered project: the workspace path's basename,
 /// falling back to the workspace id if the path has no basename (e.g. `/`).
+/// Used by [`load_detail`]'s single-name fallback lookup, which walks every
+/// registered workspace (not deduped by repo — the first workspace with a
+/// matching file wins, same as before).
 fn project_scope_name(w: &rupu_workspace::Workspace) -> String {
     std::path::Path::new(&w.path)
         .file_name()
@@ -135,7 +145,14 @@ pub(crate) struct AgentDto {
     /// else `"global"`. Defaults to `"global"` for the global-only endpoints.
     pub(crate) scope: String,
     /// Aggregate token + cost usage across every run attributed to this agent.
-    /// Defaults to empty; populated only by the list handler.
+    /// Defaults to empty; populated only by the list handler. Usage is
+    /// grouped by agent NAME alone (the transcript rows the breakdown is
+    /// computed from don't record which scope's definition ran), so only ONE
+    /// canonical row per name (the `scope == "global"` row if one exists,
+    /// else the first row for that name in sorted order) carries the
+    /// aggregate — other same-named rows across different repos are left
+    /// zeroed rather than showing duplicated combined usage. Per-scope usage
+    /// attribution is a follow-up.
     pub(crate) usage: crate::usage::UsageSummary,
     /// Distinct runs attributed to this agent. Defaults to `0`.
     pub(crate) run_count: u64,
@@ -169,13 +186,18 @@ struct AgentDetailDto {
     raw: String,
 }
 
-/// `GET /api/agents` — global agent definitions plus every registered
-/// project's `<path>/.rupu/agents/*.md`, sorted by name then scope.
+/// `GET /api/agents` — global agent definitions plus one representative
+/// workspace per distinct repo among the registered projects'
+/// `<path>/.rupu/agents/*.md` (see [`distinct_repo_workspaces`]), sorted by
+/// name then scope. Many registered workspaces are autoflow run-worktrees of
+/// the same repo; scanning every registered workspace would otherwise emit
+/// one duplicate row per worktree.
 ///
-/// Each row is tagged `scope: "global"` or the owning project's name. A
-/// project def shadows a same-named GLOBAL row; two different projects
-/// defining the same name both appear (distinguished by `scope`). With no
-/// registered projects this is byte-for-byte the prior global-only behavior.
+/// Each row is tagged `scope: "global"` or the representative workspace's
+/// path basename. A project def shadows a same-named GLOBAL row; two
+/// different repos defining the same name both appear (distinguished by
+/// `scope`). With no registered projects this is byte-for-byte the prior
+/// global-only behavior.
 ///
 /// A malformed project agent file only drops that project's rows (logged via
 /// `tracing::warn!`) rather than failing the whole list; the global scan's
@@ -187,10 +209,12 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
         .map(|spec| AgentDto::from_spec(spec, "global"))
         .collect();
 
+    let workspaces = store(&s).list().unwrap_or_default();
+    let repos = distinct_repo_workspaces(workspaces, &repo_store(&s));
     let mut project_dtos: Vec<AgentDto> = Vec::new();
-    for w in store(&s).list().unwrap_or_default() {
-        let scope = project_scope_name(&w);
-        let rupu_dir = std::path::Path::new(&w.path).join(".rupu");
+    for r in repos {
+        let scope = r.scope;
+        let rupu_dir = std::path::Path::new(&r.workspace.path).join(".rupu");
         match load_agents(&rupu_dir, None) {
             Ok(specs) => project_dtos.extend(
                 specs
@@ -209,6 +233,12 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     dtos.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.scope.cmp(&b.scope)));
 
     // Aggregate every run's transcript, grouped by agent, to attach usage.
+    // The breakdown is keyed by agent NAME alone (transcript rows don't
+    // record which scope's definition ran), so — same as the workflows list
+    // — attach it to only ONE canonical row per name (preferring
+    // `scope == "global"`, else the first row for that name in the
+    // already-sorted order) rather than duplicating it onto every same-named
+    // row. See the doc comment on `AgentDto::usage`.
     let runs = s.run_store.list().unwrap_or_default();
     let mut all_paths: Vec<std::path::PathBuf> = Vec::new();
     for r in &runs {
@@ -216,8 +246,22 @@ async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>
     }
     let rows = rupu_transcript::aggregate(&all_paths, rupu_transcript::TimeWindow::default());
     let breakdown = crate::usage::breakdown(&rows, &s.pricing, crate::usage::GroupBy::Agent);
-    for dto in &mut dtos {
-        if let Some(b) = breakdown.iter().find(|b| b.agent == dto.name) {
+
+    let mut canonical_dto_for_name: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (i, dto) in dtos.iter().enumerate() {
+        canonical_dto_for_name
+            .entry(dto.name.clone())
+            .and_modify(|idx| {
+                if dto.scope == "global" {
+                    *idx = i;
+                }
+            })
+            .or_insert(i);
+    }
+    for (name, idx) in canonical_dto_for_name {
+        if let Some(b) = breakdown.iter().find(|b| b.agent == name) {
+            let dto = &mut dtos[idx];
             dto.usage = crate::usage::UsageSummary {
                 input_tokens: b.input_tokens,
                 output_tokens: b.output_tokens,
@@ -725,11 +769,25 @@ mod tests {
     /// Register a workspace record `<global_dir>/workspaces/<id>.toml` whose
     /// `path` points at `project_root`.
     fn register_workspace(tmp: &tempfile::TempDir, id: &str, project_root: &std::path::Path) {
+        register_workspace_with_remote(tmp, id, project_root, None);
+    }
+
+    /// Same as [`register_workspace`], optionally tagging the record with a
+    /// `repo_remote` (simulating autoflow run-worktrees of the same repo).
+    fn register_workspace_with_remote(
+        tmp: &tempfile::TempDir,
+        id: &str,
+        project_root: &std::path::Path,
+        repo_remote: Option<&str>,
+    ) {
         std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        let remote_line = repo_remote
+            .map(|u| format!("repo_remote = \"{u}\"\n"))
+            .unwrap_or_default();
         std::fs::write(
             tmp.path().join("workspaces").join(format!("{id}.toml")),
             format!(
-                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                "id = \"{id}\"\npath = \"{}\"\n{remote_line}created_at = \"2026-01-01T00:00:00Z\"\n",
                 project_root.display()
             ),
         )
@@ -794,5 +852,241 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(resp.0.summary.scope, expected_scope);
+    }
+
+    #[tokio::test]
+    async fn same_repo_worktrees_dedupe_to_one_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        // Three registered workspaces = run-worktrees of the SAME repo, each
+        // carrying its own copy of `.rupu/agents/code-reviewer.md`.
+        let remote = "git@github.com:acme/widgets.git";
+        for (id, name) in [
+            ("ws_a", "worktree-a"),
+            ("ws_b", "worktree-b"),
+            ("ws_c", "worktree-c"),
+        ] {
+            let root = tmp.path().join(name);
+            let proj_agents = root.join(".rupu").join("agents");
+            std::fs::create_dir_all(&proj_agents).unwrap();
+            std::fs::write(proj_agents.join("code-reviewer.md"), VALID_MD).unwrap();
+            register_workspace_with_remote(&tmp, id, &root, Some(remote));
+        }
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(
+            rows.len(),
+            1,
+            "code-reviewer must appear exactly once despite 3 worktrees of the same repo"
+        );
+        assert_eq!(rows[0].name, "code-reviewer");
+        // No tracked-repo record was seeded, so the tie-break is the
+        // deterministic path sort: "worktree-a" sorts first.
+        assert_eq!(rows[0].scope, "worktree-a");
+    }
+
+    #[tokio::test]
+    async fn different_repos_same_def_name_both_appear() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj_x = tmp.path().join("proj-x");
+        let agents_x = proj_x.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_x).unwrap();
+        std::fs::write(agents_x.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace_with_remote(&tmp, "ws_x", &proj_x, Some("git@github.com:acme/x.git"));
+
+        let proj_y = tmp.path().join("proj-y");
+        let agents_y = proj_y.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_y).unwrap();
+        std::fs::write(agents_y.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace_with_remote(&tmp, "ws_y", &proj_y, Some("git@github.com:acme/y.git"));
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 2, "different repos are distinct groups");
+        let scopes: std::collections::BTreeSet<&str> =
+            rows.iter().map(|r| r.scope.as_str()).collect();
+        assert_eq!(
+            scopes,
+            std::collections::BTreeSet::from(["proj-x", "proj-y"])
+        );
+        assert!(rows.iter().all(|r| r.name == "code-reviewer"));
+    }
+
+    #[tokio::test]
+    async fn no_repo_remote_scans_every_standalone_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        const OTHER_MD: &str = "---\nname: doc-writer\nmodel: opus\n---\nWrite docs.\n";
+
+        let proj_a = tmp.path().join("standalone-a");
+        let agents_a = proj_a.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_a).unwrap();
+        std::fs::write(agents_a.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace(&tmp, "ws_a", &proj_a);
+
+        let proj_b = tmp.path().join("standalone-b");
+        let agents_b = proj_b.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_b).unwrap();
+        std::fs::write(agents_b.join("doc-writer.md"), OTHER_MD).unwrap();
+        register_workspace(&tmp, "ws_b", &proj_b);
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both standalone (no repo_remote) dirs are scanned"
+        );
+        let names: std::collections::BTreeSet<&str> =
+            rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["code-reviewer", "doc-writer"])
+        );
+    }
+
+    /// Write a single-event transcript (`RunStart` only, no `Usage` events) so
+    /// `rupu_transcript::aggregate` emits exactly one zero-token row for
+    /// `agent`, bumping that row's `runs` by 1.
+    fn write_agent_transcript(path: &std::path::Path, agent: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let ev = rupu_transcript::Event::RunStart {
+            run_id: "r1".into(),
+            workspace_id: "ws1".into(),
+            agent: agent.into(),
+            provider: "anthropic".into(),
+            model: "claude-opus-4-8".into(),
+            started_at: chrono::Utc::now(),
+            mode: rupu_transcript::RunMode::Ask,
+        };
+        let mut line = serde_json::to_vec(&ev).unwrap();
+        line.push(b'\n');
+        std::fs::write(path, &line).unwrap();
+    }
+
+    /// Register a run of `workflow_name` bound to `workspace_id`, with one
+    /// completed step whose transcript attributes usage to `agent`.
+    fn seed_run_with_agent_usage(
+        s: &AppState,
+        run_id: &str,
+        workspace_id: &str,
+        agent: &str,
+        transcript_path: &std::path::Path,
+    ) {
+        let record = rupu_orchestrator::RunRecord {
+            id: run_id.into(),
+            workflow_name: "wf".into(),
+            status: rupu_orchestrator::RunStatus::Completed,
+            inputs: std::collections::BTreeMap::new(),
+            event: None,
+            workspace_id: workspace_id.into(),
+            workspace_path: PathBuf::from("/tmp/proj"),
+            transcript_dir: PathBuf::from("/tmp/proj/.rupu/transcripts"),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            error_message: None,
+            awaiting_step_id: None,
+            approval_prompt: None,
+            awaiting_since: None,
+            expires_at: None,
+            issue_ref: None,
+            issue: None,
+            parent_run_id: None,
+            backend_id: None,
+            worker_id: None,
+            artifact_manifest_path: None,
+            runner_pid: None,
+            source_wake_id: None,
+            active_step_id: None,
+            active_step_kind: None,
+            active_step_agent: None,
+            active_step_transcript_path: None,
+            resume_requested_at: None,
+            resume_claimed_at: None,
+            resume_claimed_by: None,
+            resume_mode: None,
+            final_output: None,
+        };
+        s.run_store.create(record, "name: wf\n").unwrap();
+        write_agent_transcript(transcript_path, agent);
+        s.run_store
+            .append_step_result(
+                run_id,
+                &rupu_orchestrator::runs::StepResultRecord {
+                    step_id: "s1".into(),
+                    run_id: run_id.into(),
+                    transcript_path: transcript_path.to_path_buf(),
+                    output: String::new(),
+                    success: true,
+                    skipped: false,
+                    rendered_prompt: String::new(),
+                    kind: rupu_orchestrator::runs::StepKind::Linear,
+                    items: vec![],
+                    findings: vec![],
+                    iterations: 0,
+                    resolved: true,
+                    finished_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_named_rows_from_different_repos_do_not_both_show_combined_usage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj_x = tmp.path().join("proj-x");
+        let agents_x = proj_x.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_x).unwrap();
+        std::fs::write(agents_x.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace_with_remote(&tmp, "ws_x", &proj_x, Some("git@github.com:acme/x.git"));
+
+        let proj_y = tmp.path().join("proj-y");
+        let agents_y = proj_y.join(".rupu").join("agents");
+        std::fs::create_dir_all(&agents_y).unwrap();
+        std::fs::write(agents_y.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace_with_remote(&tmp, "ws_y", &proj_y, Some("git@github.com:acme/y.git"));
+
+        // Two runs, both attributing usage to agent "code-reviewer" — as far
+        // as the transcript breakdown is concerned they're indistinguishable
+        // by scope (grouped by agent name alone).
+        seed_run_with_agent_usage(
+            &s,
+            "run_1",
+            "ws_x",
+            "code-reviewer",
+            &tmp.path().join("t1.jsonl"),
+        );
+        seed_run_with_agent_usage(
+            &s,
+            "run_2",
+            "ws_y",
+            "code-reviewer",
+            &tmp.path().join("t2.jsonl"),
+        );
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.name == "code-reviewer"));
+
+        let run_counts: Vec<u64> = rows.iter().map(|r| r.run_count).collect();
+        assert_eq!(
+            run_counts.iter().sum::<u64>(),
+            2,
+            "the 2 runs are counted exactly once between the two rows combined"
+        );
+        assert_eq!(
+            run_counts.iter().filter(|&&c| c == 2).count(),
+            1,
+            "exactly one row carries the combined run_count"
+        );
+        assert_eq!(
+            run_counts.iter().filter(|&&c| c == 0).count(),
+            1,
+            "the other same-named row stays zeroed rather than duplicating usage"
+        );
     }
 }
