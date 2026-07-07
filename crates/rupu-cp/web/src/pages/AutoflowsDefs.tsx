@@ -7,6 +7,7 @@ import { api, type AutoflowDefRow } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Button } from '../components/ui/Button';
+import { ScopeChip } from '../components/ScopeChip';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 
@@ -22,21 +23,6 @@ function TriggerChip({ trigger }: { trigger: string }) {
   return (
     <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
       {trigger}
-    </span>
-  );
-}
-
-const SCOPE_CLS: Record<string, string> = {
-  workspace:  'bg-surface text-ink ring-border',
-  repository: 'bg-ok-bg text-ok ring-ok/30',
-  global:     'bg-indigo-50 text-indigo-700 ring-indigo-200',
-};
-
-function ScopeChip({ scope }: { scope: string }) {
-  const cls = SCOPE_CLS[scope] ?? 'bg-surface text-ink ring-border';
-  return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium px-1.5 py-0.5', cls)}>
-      {scope}
     </span>
   );
 }

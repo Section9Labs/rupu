@@ -10,7 +10,7 @@ import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { api, type AgentDetail } from '../lib/api';
+import { api, type AgentDetail, type AgentSummary } from '../lib/api';
 
 const navigateMock = vi.fn();
 vi.mock('react-router-dom', async () => {
@@ -42,6 +42,7 @@ const CREATED: AgentDetail = {
   description: 'A short description.',
   provider: 'anthropic',
   model: 'claude-sonnet-4-6',
+  scope: 'global',
   usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: true, runs: 0 },
   run_count: 0,
   system_prompt: 'You are a helpful agent. ...',
@@ -75,5 +76,37 @@ describe('Agents new-agent flow', () => {
     await waitFor(() => expect(createSpy).toHaveBeenCalledTimes(1));
     expect(createSpy.mock.calls[0][0]).toContain('name: my-agent');
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/agents/my-agent'));
+  });
+});
+
+const USAGE = {
+  input_tokens: 0,
+  output_tokens: 0,
+  cached_tokens: 0,
+  total_tokens: 0,
+  cost_usd: null,
+  priced: true,
+  runs: 0,
+};
+
+const SCOPE_ROWS: AgentSummary[] = [
+  { name: 'reviewer', scope: 'global', usage: USAGE, run_count: 2 },
+  { name: 'my-project-fixer', scope: 'my-project', usage: USAGE, run_count: 0 },
+];
+
+describe('Agents scope column', () => {
+  it('renders a scope chip per row, distinguishing global from project-scoped', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue(SCOPE_ROWS);
+
+    render(
+      <MemoryRouter initialEntries={['/agents']}>
+        <Agents />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('reviewer')).toBeInTheDocument());
+
+    expect(screen.getByText('global')).toBeInTheDocument();
+    expect(screen.getByText('my-project')).toBeInTheDocument();
   });
 });

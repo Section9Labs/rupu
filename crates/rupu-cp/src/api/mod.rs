@@ -13,6 +13,7 @@ pub mod host_fanout;
 pub mod host_info;
 pub mod hosts;
 pub mod projects;
+pub mod repo_scope;
 pub mod repos;
 pub mod run_streams;
 pub mod runs;

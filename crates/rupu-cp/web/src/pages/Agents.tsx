@@ -10,6 +10,7 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import CodeEditor from '../components/CodeEditor';
 import { Button } from '../components/ui/Button';
+import { ScopeChip } from '../components/ScopeChip';
 import { formatTokens, formatCost } from '../lib/usage';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
@@ -312,6 +313,14 @@ const AGENT_COLUMNS: Column<AgentSummary>[] = [
         {a.effort && <MetaChip>effort: {a.effort}</MetaChip>}
       </div>
     ),
+  },
+  {
+    key: 'scope',
+    header: 'Scope',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (a) => a.scope,
+    render: (a) => <ScopeChip scope={a.scope} />,
   },
   {
     key: 'description',

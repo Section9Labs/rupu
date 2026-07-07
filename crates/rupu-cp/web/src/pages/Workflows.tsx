@@ -10,6 +10,7 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import LauncherSheet from '../components/LauncherSheet';
 import CodeEditor from '../components/CodeEditor';
 import { Button } from '../components/ui/Button';
+import { ScopeChip } from '../components/ScopeChip';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
@@ -318,16 +319,21 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       sortable: true,
       sortValue: (w) => w.name,
       render: (w) => (
-        <div className="flex items-center gap-2 min-w-0">
-          <Link
-            to={`/workflows/${encodeURIComponent(w.name)}`}
-            className="text-sm font-medium text-ink truncate hover:underline"
-          >
-            {w.name}
-          </Link>
-          <ScopeChip scope={w.scope} />
-        </div>
+        <Link
+          to={`/workflows/${encodeURIComponent(w.name)}`}
+          className="text-sm font-medium text-ink truncate hover:underline"
+        >
+          {w.name}
+        </Link>
       ),
+    },
+    {
+      key: 'scope',
+      header: 'Scope',
+      width: 'w-24',
+      sortable: true,
+      sortValue: (w) => w.scope,
+      render: (w) => <ScopeChip scope={w.scope} />,
     },
     {
       key: 'runs',
@@ -390,22 +396,6 @@ function workflowColumns(onRun: (name: string) => void): Column<WorkflowSummary>
       ),
     },
   ];
-}
-
-export function ScopeChip({ scope }: { scope: string }) {
-  const isGlobal = scope.toLowerCase() === 'global';
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center rounded px-2 py-0.5 text-note font-medium ring-1',
-        isGlobal
-          ? 'bg-violet-50 text-violet-700 ring-violet-200'
-          : 'bg-surface text-ink-mute ring-border',
-      )}
-    >
-      {scope}
-    </span>
-  );
 }
 
 function EmptyState() {
