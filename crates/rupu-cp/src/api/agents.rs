@@ -11,7 +11,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rupu_agent::loader::{load_agent, load_agents};
+use rupu_agent::loader::{load_agent, load_agents, AgentLoadError};
+use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -31,6 +32,21 @@ pub fn routes() -> Router<AppState> {
 /// Directory where global agent `.md` definitions live.
 fn agents_dir(s: &AppState) -> PathBuf {
     s.global_dir.join("agents")
+}
+
+fn store(s: &AppState) -> WorkspaceStore {
+    WorkspaceStore {
+        root: s.global_dir.join("workspaces"),
+    }
+}
+
+/// Scope tag for a registered project: the workspace path's basename,
+/// falling back to the workspace id if the path has no basename (e.g. `/`).
+fn project_scope_name(w: &rupu_workspace::Workspace) -> String {
+    std::path::Path::new(&w.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| w.id.clone())
 }
 
 /// Pure core of `PUT /api/agents/:name`: validate the url name, parse + validate
@@ -70,21 +86,36 @@ fn create_agent_file(global_dir: &FsPath, raw: &str) -> Result<PathBuf, ApiError
     Ok(target)
 }
 
-/// Load agent `name` and build the full detail DTO. Shared by GET / PUT / POST.
-fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
-    let spec = load_agent(&s.global_dir, None, name).map_err(|e| match e {
-        rupu_agent::loader::AgentLoadError::NotFound(_) => {
-            ApiError::not_found(format!("agent {name} not found"))
-        }
-        other => ApiError::internal(other.to_string()),
-    })?;
+/// Build the detail DTO from a loaded spec, tagged with `scope`.
+fn detail_from_spec(spec: rupu_agent::spec::AgentSpec, scope: impl Into<String>) -> AgentDetailDto {
     let system_prompt = spec.system_prompt.clone();
     let raw = spec.raw.clone();
-    Ok(AgentDetailDto {
+    AgentDetailDto {
         system_prompt,
         raw,
-        summary: AgentDto::from_spec(spec, "global"),
-    })
+        summary: AgentDto::from_spec(spec, scope),
+    }
+}
+
+/// Load agent `name` and build the full detail DTO. Shared by GET / PUT / POST.
+///
+/// Project-aware: resolves `name` in the global layer first, falling back to
+/// every registered project's `.rupu/agents/` (first match) so a
+/// project-only agent's detail route doesn't 404.
+fn load_detail(s: &AppState, name: &str) -> ApiResult<AgentDetailDto> {
+    match load_agent(&s.global_dir, None, name) {
+        Ok(spec) => Ok(detail_from_spec(spec, "global")),
+        Err(AgentLoadError::NotFound(_)) => {
+            for w in store(s).list().unwrap_or_default() {
+                let rupu_dir = std::path::Path::new(&w.path).join(".rupu");
+                if let Ok(spec) = load_agent(&rupu_dir, None, name) {
+                    return Ok(detail_from_spec(spec, project_scope_name(&w)));
+                }
+            }
+            Err(ApiError::not_found(format!("agent {name} not found")))
+        }
+        Err(other) => Err(ApiError::internal(other.to_string())),
+    }
 }
 
 #[derive(Serialize)]
@@ -102,7 +133,7 @@ pub(crate) struct AgentDto {
     pub(crate) max_tokens: Option<u32>,
     /// `"project"` when the spec was loaded from `<project>/.rupu/agents`,
     /// else `"global"`. Defaults to `"global"` for the global-only endpoints.
-    pub(crate) scope: &'static str,
+    pub(crate) scope: String,
     /// Aggregate token + cost usage across every run attributed to this agent.
     /// Defaults to empty; populated only by the list handler.
     pub(crate) usage: crate::usage::UsageSummary,
@@ -113,7 +144,7 @@ pub(crate) struct AgentDto {
 impl AgentDto {
     /// Map a loaded [`rupu_agent::spec::AgentSpec`] to the wire DTO, tagging
     /// it with the given scope.
-    pub(crate) fn from_spec(spec: rupu_agent::spec::AgentSpec, scope: &'static str) -> Self {
+    pub(crate) fn from_spec(spec: rupu_agent::spec::AgentSpec, scope: impl Into<String>) -> Self {
         AgentDto {
             name: spec.name,
             description: spec.description,
@@ -121,7 +152,7 @@ impl AgentDto {
             model: spec.model,
             effort: spec.effort.map(|e| format!("{e:?}")),
             max_tokens: spec.max_tokens,
-            scope,
+            scope: scope.into(),
             usage: crate::usage::UsageSummary::default(),
             run_count: 0,
         }
@@ -138,12 +169,44 @@ struct AgentDetailDto {
     raw: String,
 }
 
+/// `GET /api/agents` — global agent definitions plus every registered
+/// project's `<path>/.rupu/agents/*.md`, sorted by name then scope.
+///
+/// Each row is tagged `scope: "global"` or the owning project's name. A
+/// project def shadows a same-named GLOBAL row; two different projects
+/// defining the same name both appear (distinguished by `scope`). With no
+/// registered projects this is byte-for-byte the prior global-only behavior.
+///
+/// A malformed project agent file only drops that project's rows (logged via
+/// `tracing::warn!`) rather than failing the whole list; the global scan's
+/// error behavior is unchanged.
 async fn list_agents(State(s): State<AppState>) -> ApiResult<Json<Vec<AgentDto>>> {
     let specs = load_agents(&s.global_dir, None).map_err(|e| ApiError::internal(e.to_string()))?;
     let mut dtos: Vec<AgentDto> = specs
         .into_iter()
         .map(|spec| AgentDto::from_spec(spec, "global"))
         .collect();
+
+    let mut project_dtos: Vec<AgentDto> = Vec::new();
+    for w in store(&s).list().unwrap_or_default() {
+        let scope = project_scope_name(&w);
+        let rupu_dir = std::path::Path::new(&w.path).join(".rupu");
+        match load_agents(&rupu_dir, None) {
+            Ok(specs) => project_dtos.extend(
+                specs
+                    .into_iter()
+                    .map(|spec| AgentDto::from_spec(spec, scope.clone())),
+            ),
+            Err(err) => {
+                tracing::warn!("agents: skipping project {scope}: {err}");
+            }
+        }
+    }
+    let project_names: std::collections::BTreeSet<&str> =
+        project_dtos.iter().map(|d| d.name.as_str()).collect();
+    dtos.retain(|d| !project_names.contains(d.name.as_str()));
+    dtos.extend(project_dtos);
+    dtos.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.scope.cmp(&b.scope)));
 
     // Aggregate every run's transcript, grouped by agent, to attach usage.
     let runs = s.run_store.list().unwrap_or_default();
@@ -657,5 +720,79 @@ mod tests {
         };
         let err = generate_agent(State(state), Json(body)).await.unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// Register a workspace record `<global_dir>/workspaces/<id>.toml` whose
+    /// `path` points at `project_root`.
+    fn register_workspace(tmp: &tempfile::TempDir, id: &str, project_root: &std::path::Path) {
+        std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        std::fs::write(
+            tmp.path().join("workspaces").join(format!("{id}.toml")),
+            format!(
+                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                project_root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_no_projects_is_global_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        save_agent_file(&s.global_dir, "code-reviewer", VALID_MD).expect("seed");
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "code-reviewer");
+        assert_eq!(rows[0].scope, "global");
+    }
+
+    #[tokio::test]
+    async fn list_includes_project_defs_tagged_with_project_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        std::fs::write(proj_agents.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let Json(rows) = list_agents(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        let expected_scope = proj
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(rows[0].name, "code-reviewer");
+        assert_eq!(rows[0].scope, expected_scope);
+    }
+
+    #[tokio::test]
+    async fn agent_detail_resolves_project_def() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp); // no global agents
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_agents = proj.path().join(".rupu").join("agents");
+        std::fs::create_dir_all(&proj_agents).unwrap();
+        std::fs::write(proj_agents.join("code-reviewer.md"), VALID_MD).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        // Absent from global, present only in the project — must resolve, not 404.
+        let resp = get_agent(State(s), Path("code-reviewer".into()))
+            .await
+            .expect("project-only agent should resolve via detail");
+        assert_eq!(resp.0.summary.name, "code-reviewer");
+        let expected_scope = proj
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(resp.0.summary.scope, expected_scope);
     }
 }

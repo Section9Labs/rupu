@@ -1,6 +1,7 @@
 use crate::{error::ApiResult, state::AppState};
 use axum::{extract::State, routing::get, Json, Router};
 use rupu_orchestrator::Workflow;
+use rupu_workspace::WorkspaceStore;
 use serde::Serialize;
 
 pub fn routes() -> Router<AppState> {
@@ -17,8 +18,27 @@ pub(crate) struct AutoflowDefRow {
     pub(crate) slug: String,
     /// `TriggerKind` as a lowercase string: `"manual"`, `"cron"`, or `"event"`.
     pub(crate) trigger: String,
-    /// `"global"` or `"project"` depending on the layer the file came from.
-    pub(crate) scope: &'static str,
+    /// `"global"` or the registered project's name, depending on the layer
+    /// the file came from.
+    pub(crate) scope: String,
+}
+
+fn store(s: &AppState) -> WorkspaceStore {
+    WorkspaceStore {
+        root: s.global_dir.join("workspaces"),
+    }
+}
+
+/// Scope tag for a registered project: the workspace path's basename,
+/// falling back to the workspace id if the path has no basename (e.g. `/`).
+/// Unlike display-oriented "project name" helpers elsewhere in this crate
+/// (which fall back to the full path), the fallback here is the id so the
+/// `scope` tag never becomes an unwieldy absolute path.
+fn project_scope_name(w: &rupu_workspace::Workspace) -> String {
+    std::path::Path::new(&w.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| w.id.clone())
 }
 
 /// Scan `<dir>/*.{yaml,yml}`, parse each, and keep only those whose
@@ -27,8 +47,9 @@ pub(crate) struct AutoflowDefRow {
 /// (tolerated). Unparseable files are skipped with a `tracing::warn!`.
 pub(crate) fn scan_autoflow_defs(
     dir: &std::path::Path,
-    scope: &'static str,
+    scope: impl Into<String>,
 ) -> Vec<AutoflowDefRow> {
+    let scope = scope.into();
     if !dir.is_dir() {
         return vec![];
     }
@@ -89,7 +110,7 @@ pub(crate) fn scan_autoflow_defs(
                 name: workflow.name,
                 slug,
                 trigger,
-                scope,
+                scope: scope.clone(),
             })
         })
         .collect();
@@ -100,15 +121,37 @@ pub(crate) fn scan_autoflow_defs(
 
 /// `GET /api/autoflows`
 ///
-/// Scans `<global>/workflows/*.yaml`, parses each with [`Workflow::parse`],
+/// Scans `<global>/workflows/*.yaml` plus every registered project's
+/// `<path>/.rupu/workflows/*.yaml`, parses each with [`Workflow::parse`],
 /// keeps only those where `autoflow.enabled == true` (matching the CLI's
-/// `autoflow list` predicate), and returns them sorted by name.
+/// `autoflow list` predicate), and returns them sorted by name then scope.
+///
+/// Each row is tagged `scope: "global"` or the owning project's name. A
+/// project def shadows a same-named GLOBAL row; two different projects
+/// defining the same name both appear (distinguished by `scope`). With no
+/// registered projects this is byte-for-byte the prior global-only behavior.
 ///
 /// A missing workflows directory → `[]` (not an error).
 /// An unparseable YAML file is skipped with a `tracing::warn!`.
 async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
-    let dir = s.global_dir.join("workflows");
-    Ok(Json(scan_autoflow_defs(&dir, "global")))
+    let mut rows = scan_autoflow_defs(&s.global_dir.join("workflows"), "global");
+
+    let mut project_rows: Vec<AutoflowDefRow> = Vec::new();
+    for w in store(&s).list().unwrap_or_default() {
+        let scope = project_scope_name(&w);
+        let dir = std::path::Path::new(&w.path)
+            .join(".rupu")
+            .join("workflows");
+        project_rows.extend(scan_autoflow_defs(&dir, scope));
+    }
+
+    let project_names: std::collections::BTreeSet<&str> =
+        project_rows.iter().map(|r| r.name.as_str()).collect();
+    rows.retain(|r| !project_names.contains(r.name.as_str()));
+    rows.extend(project_rows);
+    rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.scope.cmp(&b.scope)));
+
+    Ok(Json(rows))
 }
 
 #[cfg(test)]
@@ -134,5 +177,70 @@ mod tests {
         assert_eq!(rows.len(), 1, "the enabled autoflow should be returned");
         assert_eq!(rows[0].name, "parsed-name");
         assert_eq!(rows[0].slug, "my-file-stem");
+    }
+
+    const ENABLED_AUTOFLOW: &str =
+        "name: nightly\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n";
+
+    fn test_state(tmp: &tempfile::TempDir) -> AppState {
+        AppState::new(
+            tmp.path().to_path_buf(),
+            rupu_config::PricingConfig::default(),
+        )
+        .with_workspace_dir(tmp.path().to_path_buf())
+    }
+
+    /// Register a workspace record `<global_dir>/workspaces/<id>.toml` whose
+    /// `path` points at `project_root`.
+    fn register_workspace(tmp: &tempfile::TempDir, id: &str, project_root: &std::path::Path) {
+        std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        std::fs::write(
+            tmp.path().join("workspaces").join(format!("{id}.toml")),
+            format!(
+                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                project_root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_no_projects_is_global_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
+        std::fs::write(
+            tmp.path().join("workflows").join("nightly.yaml"),
+            ENABLED_AUTOFLOW,
+        )
+        .unwrap();
+        let s = test_state(&tmp);
+
+        let Json(rows) = list_autoflow_defs(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, "global");
+    }
+
+    #[tokio::test]
+    async fn list_includes_project_defs_tagged_with_project_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap(); // empty global
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(proj_workflows.join("nightly.yaml"), ENABLED_AUTOFLOW).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let s = test_state(&tmp);
+        let Json(rows) = list_autoflow_defs(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        let expected_scope = proj
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(rows[0].scope, expected_scope);
+        assert_eq!(rows[0].name, "nightly");
     }
 }

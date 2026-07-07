@@ -11,6 +11,7 @@ use axum::{
     Json, Router,
 };
 use rupu_orchestrator::Workflow;
+use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
@@ -35,6 +36,42 @@ fn workflows_dir(s: &AppState) -> std::path::PathBuf {
     s.global_dir.join("workflows")
 }
 
+fn store(s: &AppState) -> WorkspaceStore {
+    WorkspaceStore {
+        root: s.global_dir.join("workspaces"),
+    }
+}
+
+/// Scope tag for a registered project: the workspace path's basename,
+/// falling back to the workspace id if the path has no basename (e.g. `/`).
+fn project_scope_name(w: &rupu_workspace::Workspace) -> String {
+    std::path::Path::new(&w.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| w.id.clone())
+}
+
+/// Resolve `name` to a workflow YAML path: the global layer first, then
+/// (if absent there) each registered project's `<path>/.rupu/workflows/`, in
+/// `store().list()` order. First match wins; a later task may thread the
+/// resolved scope through to the caller for a disambiguating URL.
+fn resolve_workflow_path(s: &AppState, name: &str) -> Option<std::path::PathBuf> {
+    let global = workflows_dir(s).join(format!("{name}.yaml"));
+    if global.exists() {
+        return Some(global);
+    }
+    for w in store(s).list().unwrap_or_default() {
+        let candidate = std::path::Path::new(&w.path)
+            .join(".rupu")
+            .join("workflows")
+            .join(format!("{name}.yaml"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[derive(Serialize)]
 pub(crate) struct WorkflowDto {
     pub(crate) name: String,
@@ -47,7 +84,11 @@ pub(crate) struct WorkflowDto {
 /// Scan `<dir>/*.yaml` and return one [`WorkflowDto`] per file stem, tagged
 /// with `scope`, sorted by name. A missing/unreadable directory yields an
 /// empty vec (tolerated, not an error) so the caller can merge layers freely.
-pub(crate) fn scan_workflow_names(dir: &std::path::Path, scope: &'static str) -> Vec<WorkflowDto> {
+pub(crate) fn scan_workflow_names(
+    dir: &std::path::Path,
+    scope: impl Into<String>,
+) -> Vec<WorkflowDto> {
+    let scope = scope.into();
     if !dir.is_dir() {
         return vec![];
     }
@@ -73,7 +114,7 @@ pub(crate) fn scan_workflow_names(dir: &std::path::Path, scope: &'static str) ->
         .into_iter()
         .map(|name| WorkflowDto {
             name,
-            scope: scope.to_string(),
+            scope: scope.clone(),
             usage: crate::usage::UsageSummary::default(),
             run_count: 0,
             last_run: None,
@@ -81,8 +122,31 @@ pub(crate) fn scan_workflow_names(dir: &std::path::Path, scope: &'static str) ->
         .collect()
 }
 
+/// `GET /api/workflows` — global workflow definitions plus every registered
+/// project's `<path>/.rupu/workflows/*.yaml`, sorted by name then scope.
+///
+/// Each row is tagged `scope: "global"` or the owning project's name. A
+/// project def shadows a same-named GLOBAL row; two different projects
+/// defining the same name both appear (distinguished by `scope`). With no
+/// registered projects this is byte-for-byte the prior global-only behavior.
 async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<WorkflowDto>>> {
     let mut rows = scan_workflow_names(&s.global_dir.join("workflows"), "global");
+
+    let mut project_rows: Vec<WorkflowDto> = Vec::new();
+    for w in store(&s).list().unwrap_or_default() {
+        let scope = project_scope_name(&w);
+        let dir = std::path::Path::new(&w.path)
+            .join(".rupu")
+            .join("workflows");
+        project_rows.extend(scan_workflow_names(&dir, scope));
+    }
+
+    let project_names: std::collections::BTreeSet<&str> =
+        project_rows.iter().map(|r| r.name.as_str()).collect();
+    rows.retain(|r| !project_names.contains(r.name.as_str()));
+    rows.extend(project_rows);
+    rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.scope.cmp(&b.scope)));
+
     let runs = s.run_store.list().unwrap_or_default();
     let rollups = crate::usage::rollup_by(&s.run_store, &runs, &s.pricing, |r| {
         Some(r.workflow_name.clone())
@@ -99,11 +163,13 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
 
 /// Load workflow `name` and build the full detail DTO (`workflow` + raw `yaml` +
 /// aggregate `usage`). Shared by GET / PUT / POST.
+///
+/// Project-aware: resolves `name` in the global layer first, falling back to
+/// every registered project's `.rupu/workflows/` (first match) so a
+/// project-only workflow's detail route doesn't 404.
 fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Value>> {
-    let path = workflows_dir(s).join(format!("{name}.yaml"));
-    if !path.exists() {
-        return Err(ApiError::not_found(format!("workflow {name} not found")));
-    }
+    let path = resolve_workflow_path(s, name)
+        .ok_or_else(|| ApiError::not_found(format!("workflow {name} not found")))?;
     let yaml = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
     let workflow = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
 
@@ -572,5 +638,75 @@ mod tests {
             .await
             .expect_err("absent");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Register a workspace record `<global_dir>/workspaces/<id>.toml` whose
+    /// `path` points at `project_root`.
+    fn register_workspace(tmp: &tempfile::TempDir, id: &str, project_root: &std::path::Path) {
+        std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        std::fs::write(
+            tmp.path().join("workspaces").join(format!("{id}.toml")),
+            format!(
+                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                project_root.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_no_projects_is_global_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(wf_path(&s, "demo"), VALID_YAML).unwrap();
+
+        let Json(rows) = list_workflows(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "demo");
+        assert_eq!(rows[0].scope, "global");
+    }
+
+    #[tokio::test]
+    async fn list_includes_project_defs_tagged_with_project_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap(); // empty global
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(proj_workflows.join("proj-only.yaml"), VALID_YAML).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        let Json(rows) = list_workflows(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 1);
+        let expected_scope = proj
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(rows[0].name, "proj-only");
+        assert_eq!(rows[0].scope, expected_scope);
+    }
+
+    #[tokio::test]
+    async fn workflow_detail_resolves_project_def() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap(); // empty global
+
+        let proj = tempfile::TempDir::new().unwrap();
+        let proj_workflows = proj.path().join(".rupu").join("workflows");
+        std::fs::create_dir_all(&proj_workflows).unwrap();
+        std::fs::write(proj_workflows.join("demo.yaml"), VALID_YAML).unwrap();
+        register_workspace(&tmp, "ws_a", proj.path());
+
+        // Absent from global, present only in the project — must resolve, not 404.
+        let resp = get_workflow(State(s), Path("demo".into()))
+            .await
+            .expect("project-only workflow should resolve via detail");
+        assert_eq!(resp.0["yaml"], serde_json::json!(VALID_YAML));
     }
 }
