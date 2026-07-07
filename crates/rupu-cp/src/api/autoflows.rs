@@ -1,7 +1,7 @@
-use crate::{error::ApiResult, state::AppState};
+use crate::{api::repo_scope::distinct_repo_workspaces, error::ApiResult, state::AppState};
 use axum::{extract::State, routing::get, Json, Router};
 use rupu_orchestrator::Workflow;
-use rupu_workspace::WorkspaceStore;
+use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
 use serde::Serialize;
 
 pub fn routes() -> Router<AppState> {
@@ -29,16 +29,10 @@ fn store(s: &AppState) -> WorkspaceStore {
     }
 }
 
-/// Scope tag for a registered project: the workspace path's basename,
-/// falling back to the workspace id if the path has no basename (e.g. `/`).
-/// Unlike display-oriented "project name" helpers elsewhere in this crate
-/// (which fall back to the full path), the fallback here is the id so the
-/// `scope` tag never becomes an unwieldy absolute path.
-fn project_scope_name(w: &rupu_workspace::Workspace) -> String {
-    std::path::Path::new(&w.path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| w.id.clone())
+fn repo_store(s: &AppState) -> RepoRegistryStore {
+    RepoRegistryStore {
+        root: s.global_dir.join("repos"),
+    }
 }
 
 /// Scan `<dir>/*.{yaml,yml}`, parse each, and keep only those whose
@@ -121,28 +115,34 @@ pub(crate) fn scan_autoflow_defs(
 
 /// `GET /api/autoflows`
 ///
-/// Scans `<global>/workflows/*.yaml` plus every registered project's
-/// `<path>/.rupu/workflows/*.yaml`, parses each with [`Workflow::parse`],
-/// keeps only those where `autoflow.enabled == true` (matching the CLI's
-/// `autoflow list` predicate), and returns them sorted by name then scope.
+/// Scans `<global>/workflows/*.yaml` plus one representative workspace per
+/// distinct repo among the registered projects' `<path>/.rupu/workflows/*.yaml`
+/// (see [`distinct_repo_workspaces`]) — many registered workspaces are
+/// autoflow run-worktrees of the same repo, so scanning every registered
+/// workspace would emit one duplicate row per worktree. Each kept file is
+/// parsed with [`Workflow::parse`]; only those where `autoflow.enabled ==
+/// true` (matching the CLI's `autoflow list` predicate) are returned, sorted
+/// by name then scope.
 ///
-/// Each row is tagged `scope: "global"` or the owning project's name. A
-/// project def shadows a same-named GLOBAL row; two different projects
-/// defining the same name both appear (distinguished by `scope`). With no
-/// registered projects this is byte-for-byte the prior global-only behavior.
+/// Each row is tagged `scope: "global"` or the representative workspace's
+/// path basename. A project def shadows a same-named GLOBAL row; two
+/// different repos defining the same name both appear (distinguished by
+/// `scope`). With no registered projects this is byte-for-byte the prior
+/// global-only behavior.
 ///
 /// A missing workflows directory → `[]` (not an error).
 /// An unparseable YAML file is skipped with a `tracing::warn!`.
 async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<AutoflowDefRow>>> {
     let mut rows = scan_autoflow_defs(&s.global_dir.join("workflows"), "global");
 
+    let workspaces = store(&s).list().unwrap_or_default();
+    let repos = distinct_repo_workspaces(workspaces, &repo_store(&s));
     let mut project_rows: Vec<AutoflowDefRow> = Vec::new();
-    for w in store(&s).list().unwrap_or_default() {
-        let scope = project_scope_name(&w);
-        let dir = std::path::Path::new(&w.path)
+    for r in repos {
+        let dir = std::path::Path::new(&r.workspace.path)
             .join(".rupu")
             .join("workflows");
-        project_rows.extend(scan_autoflow_defs(&dir, scope));
+        project_rows.extend(scan_autoflow_defs(&dir, r.scope));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -193,11 +193,25 @@ mod tests {
     /// Register a workspace record `<global_dir>/workspaces/<id>.toml` whose
     /// `path` points at `project_root`.
     fn register_workspace(tmp: &tempfile::TempDir, id: &str, project_root: &std::path::Path) {
+        register_workspace_with_remote(tmp, id, project_root, None);
+    }
+
+    /// Same as [`register_workspace`], optionally tagging the record with a
+    /// `repo_remote` (simulating autoflow run-worktrees of the same repo).
+    fn register_workspace_with_remote(
+        tmp: &tempfile::TempDir,
+        id: &str,
+        project_root: &std::path::Path,
+        repo_remote: Option<&str>,
+    ) {
         std::fs::create_dir_all(tmp.path().join("workspaces")).unwrap();
+        let remote_line = repo_remote
+            .map(|u| format!("repo_remote = \"{u}\"\n"))
+            .unwrap_or_default();
         std::fs::write(
             tmp.path().join("workspaces").join(format!("{id}.toml")),
             format!(
-                "id = \"{id}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+                "id = \"{id}\"\npath = \"{}\"\n{remote_line}created_at = \"2026-01-01T00:00:00Z\"\n",
                 project_root.display()
             ),
         )
@@ -242,5 +256,118 @@ mod tests {
             .into_owned();
         assert_eq!(rows[0].scope, expected_scope);
         assert_eq!(rows[0].name, "nightly");
+    }
+
+    /// Seed a `.rupu/workflows/issue-triage.yaml` under `root` (an
+    /// autoflow-enabled def named `issue-triage`).
+    fn seed_issue_triage(root: &std::path::Path) {
+        let workflows = root.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("issue-triage.yaml"),
+            "name: issue-triage\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_repo_worktrees_dedupe_to_one_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap(); // empty global
+
+        // Three registered workspaces = run-worktrees of the SAME repo, each
+        // carrying its own copy of `.rupu/workflows/issue-triage.yaml`.
+        let remote = "git@github.com:acme/widgets.git";
+        for (id, name) in [
+            ("ws_a", "worktree-a"),
+            ("ws_b", "worktree-b"),
+            ("ws_c", "worktree-c"),
+        ] {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            seed_issue_triage(&root);
+            register_workspace_with_remote(&tmp, id, &root, Some(remote));
+        }
+
+        let s = test_state(&tmp);
+        let Json(rows) = list_autoflow_defs(State(s)).await.expect("ok");
+        assert_eq!(
+            rows.len(),
+            1,
+            "issue-triage must appear exactly once despite 3 worktrees of the same repo"
+        );
+        assert_eq!(rows[0].name, "issue-triage");
+        // No tracked-repo record was seeded, so the tie-break is the
+        // deterministic path sort: "worktree-a" sorts first.
+        assert_eq!(rows[0].scope, "worktree-a");
+    }
+
+    #[tokio::test]
+    async fn different_repos_same_def_name_both_appear() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap(); // empty global
+
+        const FOO_WORKFLOW: &str =
+            "name: foo\nautoflow:\n  enabled: true\nsteps:\n  - id: s1\n    agent: ag\n    actions: []\n    prompt: p\n";
+
+        let proj_x = tmp.path().join("proj-x");
+        let workflows_x = proj_x.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_x).unwrap();
+        std::fs::write(workflows_x.join("foo.yaml"), FOO_WORKFLOW).unwrap();
+        register_workspace_with_remote(&tmp, "ws_x", &proj_x, Some("git@github.com:acme/x.git"));
+
+        let proj_y = tmp.path().join("proj-y");
+        let workflows_y = proj_y.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_y).unwrap();
+        std::fs::write(workflows_y.join("foo.yaml"), FOO_WORKFLOW).unwrap();
+        register_workspace_with_remote(&tmp, "ws_y", &proj_y, Some("git@github.com:acme/y.git"));
+
+        let s = test_state(&tmp);
+        let Json(rows) = list_autoflow_defs(State(s)).await.expect("ok");
+        assert_eq!(rows.len(), 2, "different repos are distinct groups");
+        let scopes: std::collections::BTreeSet<&str> =
+            rows.iter().map(|r| r.scope.as_str()).collect();
+        assert_eq!(
+            scopes,
+            std::collections::BTreeSet::from(["proj-x", "proj-y"])
+        );
+        assert!(rows.iter().all(|r| r.name == "foo"));
+    }
+
+    #[tokio::test]
+    async fn no_repo_remote_scans_every_standalone_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("workflows")).unwrap(); // empty global
+
+        let proj_a = tmp.path().join("standalone-a");
+        let workflows_a = proj_a.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_a).unwrap();
+        std::fs::write(
+            workflows_a.join("alpha.yaml"),
+            ENABLED_AUTOFLOW.replace("nightly", "alpha"),
+        )
+        .unwrap();
+        register_workspace(&tmp, "ws_a", &proj_a);
+
+        let proj_b = tmp.path().join("standalone-b");
+        let workflows_b = proj_b.join(".rupu").join("workflows");
+        std::fs::create_dir_all(&workflows_b).unwrap();
+        std::fs::write(
+            workflows_b.join("beta.yaml"),
+            ENABLED_AUTOFLOW.replace("nightly", "beta"),
+        )
+        .unwrap();
+        register_workspace(&tmp, "ws_b", &proj_b);
+
+        let s = test_state(&tmp);
+        let Json(rows) = list_autoflow_defs(State(s)).await.expect("ok");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both standalone (no repo_remote) dirs are scanned"
+        );
+        let names: std::collections::BTreeSet<&str> =
+            rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, std::collections::BTreeSet::from(["alpha", "beta"]));
     }
 }
