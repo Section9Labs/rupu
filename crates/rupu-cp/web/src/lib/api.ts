@@ -481,11 +481,12 @@ export interface AgentSummary {
   effort?: string | null;
   max_tokens?: number | null;
   /**
-   * `"project"` | `"global"` — only populated by the per-project endpoint
-   * (`/api/projects/:wsId/agents`); the global `/api/agents` list always
-   * returns `"global"`.
+   * `"global"` or a registered project's path basename. Always present on
+   * the wire — the global `/api/agents` list tags every row `"global"`; the
+   * per-project endpoint (`/api/projects/:wsId/agents`) tags project-local
+   * defs with the project name.
    */
-  scope?: string;
+  scope: string;
   usage: UsageSummary;
   run_count: number;
 }

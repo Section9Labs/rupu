@@ -8,7 +8,7 @@ import { lazy, Suspense, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Trash2 } from 'lucide-react';
 import { api, type AgentSummary, type WorkflowDetail } from '../lib/api';
-import { ScopeChip } from './Workflows';
+import { ScopeChip } from '../components/ScopeChip';
 import LauncherSheet from '../components/LauncherSheet';
 import { Button } from '../components/ui/Button';
 

@@ -39,6 +39,7 @@ const AGENT: AgentDetail = {
   description: 'Reviews code.',
   provider: 'anthropic',
   model: 'claude-sonnet-4-6',
+  scope: 'global',
   usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0, total_tokens: 0, cost_usd: null, priced: true, runs: 0 },
   run_count: 0,
   system_prompt: 'You review code.',
