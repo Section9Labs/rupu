@@ -1,6 +1,7 @@
-// Autoflow run-stream page — leads with individual launched runs (clickable),
-// not opaque batch cycle ticks. A secondary "Cycles" tab keeps the batch view,
-// and a "Claims" tab exposes the worker's leased issues with requeue/release.
+// Autoflow run-stream page — mirrors Runs → Workflows: the PRIMARY view is a
+// clean run list (same SortableTable shape, row click → /runs/:id). The
+// existing "Cycles" (batch view) and "Claims" (requeue/release) views are
+// kept as secondary tabs, functionality untouched.
 //
 // All three tabs render via the shared SortableTable; the page chrome (tab
 // switcher, refresh, per-tab pagination, empty/loading states) is preserved.
@@ -21,6 +22,7 @@ import UsageChip from '../../components/UsageChip';
 import { Button } from '../../components/ui/Button';
 import { cn } from '../../lib/cn';
 import { durationBetween, relativeTime } from '../../lib/time';
+import { formatTokens, formatCost } from '../../lib/usage';
 import { shortId } from '../../lib/shortId';
 import { useInfiniteScroll } from '../../lib/useInfiniteScroll';
 
@@ -114,8 +116,21 @@ function cycleDurationMs(c: AutoflowCycleRow): number | null {
   return Math.max(0, end - start);
 }
 
+/** Build the detail link for a launched-run event, including ?host= for
+ *  remote runs. `undefined` when the event has no run (e.g. an awaiting /
+ *  failed signal) — SortableTable leaves those rows unlinked. */
+function eventHref(e: AutoflowEventRow): string | undefined {
+  if (!e.run_id) return undefined;
+  const hostSuffix = e.host_id && e.host_id !== 'local'
+    ? `?host=${encodeURIComponent(e.host_id)}`
+    : '';
+  return `/runs/${encodeURIComponent(e.run_id)}${hostSuffix}`;
+}
+
 // ---------------------------------------------------------------------------
-// Launched-runs (events) columns
+// Runs (launched-run events) columns — mirrors WorkflowRuns' column set
+// (Workflow / Host / Status / token + cost breakdown / Started), plus the
+// autoflow-specific Kind, Issue Ref, and Worker columns.
 // ---------------------------------------------------------------------------
 
 const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
@@ -127,6 +142,15 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
     render: (e) => (
       <span className="text-sm font-medium text-ink truncate">
         {e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' ')}
+      </span>
+    ),
+  },
+  {
+    key: 'run',
+    header: 'Run',
+    render: (e) => (
+      <span className="text-note text-ink-mute font-mono">
+        {e.run_id ? shortId(e.run_id) : '—'}
       </span>
     ),
   },
@@ -150,11 +174,13 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
       ),
   },
   {
-    key: 'time',
-    header: 'Time',
+    key: 'host',
+    header: 'Host',
     sortable: true,
-    sortValue: (e) => (e.at ? Date.parse(e.at) : null),
-    render: (e) => <span className="text-ink-mute">{relativeTime(e.at)}</span>,
+    sortValue: (e) => e.host_id ?? 'local',
+    render: (e) => (
+      <span className="text-note text-ink-mute font-mono">{e.host_id ?? 'local'}</span>
+    ),
   },
   {
     key: 'worker',
@@ -181,37 +207,54 @@ const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
       ),
   },
   {
-    key: 'run',
-    header: 'Run',
-    render: (e) => {
-      if (!e.run_id) return <span className="text-ink-mute">—</span>;
-      const hostSuffix = e.host_id && e.host_id !== 'local'
-        ? `?host=${encodeURIComponent(e.host_id)}`
-        : '';
-      return (
-        <Link
-          to={`/runs/${encodeURIComponent(e.run_id)}${hostSuffix}`}
-          className="text-note font-mono text-brand-600 hover:underline"
-        >
-          {shortId(e.run_id)}
-        </Link>
-      );
-    },
-  },
-  {
-    key: 'host',
-    header: 'Host',
-    sortable: true,
-    sortValue: (e) => e.host_id ?? 'local',
-    render: (e) => (
-      <span className="text-note text-ink-mute font-mono">{e.host_id ?? 'local'}</span>
-    ),
-  },
-  {
-    key: 'usage',
-    header: 'Usage',
+    key: 'in',
+    header: 'In',
     align: 'right',
-    render: (e) => <UsageChip usage={e.usage} />,
+    width: 'w-20',
+    sortable: true,
+    sortValue: (e) => e.usage.input_tokens,
+    render: (e) => <span className="text-ink-dim">{formatTokens(e.usage.input_tokens)}</span>,
+  },
+  {
+    key: 'out',
+    header: 'Out',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (e) => e.usage.output_tokens,
+    render: (e) => <span className="text-ink-dim">{formatTokens(e.usage.output_tokens)}</span>,
+  },
+  {
+    key: 'cached',
+    header: 'Cached',
+    align: 'right',
+    width: 'w-20',
+    sortable: true,
+    sortValue: (e) => e.usage.cached_tokens,
+    render: (e) =>
+      e.usage.cached_tokens ? (
+        <span className="text-ink-dim">{formatTokens(e.usage.cached_tokens)}</span>
+      ) : (
+        <span className="text-ink-mute">—</span>
+      ),
+  },
+  {
+    key: 'cost',
+    header: 'Cost',
+    align: 'right',
+    width: 'w-24',
+    sortable: true,
+    sortValue: (e) => e.usage.cost_usd,
+    render: (e) => <span className="text-ink font-medium">{formatCost(e.usage.cost_usd)}</span>,
+  },
+  {
+    key: 'started',
+    header: 'Started',
+    align: 'right',
+    width: 'w-28',
+    sortable: true,
+    sortValue: (e) => (e.at ? Date.parse(e.at) : null),
+    render: (e) => <span className="text-ink-mute">{relativeTime(e.at)}</span>,
   },
 ];
 
@@ -439,7 +482,7 @@ export default function AutoflowRuns() {
     return () => window.clearInterval(t);
   }, [refresh]);
 
-  // Two independent infinite lists: the "Launched runs" events feed and the
+  // Two independent infinite lists: the primary "Runs" (events) feed and the
   // "Cycles" feed each get their own pagination state + sentinel.
   const loadMoreEvents = async () => {
     const current = events ?? [];
@@ -583,7 +626,7 @@ export default function AutoflowRuns() {
             tab === 'runs' ? 'bg-surface text-ink' : 'text-ink-dim hover:text-ink',
           )}
         >
-          Launched runs
+          Runs
         </button>
         <button
           onClick={() => setTab('cycles')}
@@ -638,12 +681,13 @@ export default function AutoflowRuns() {
           <AutoflowEventsEmpty />
         ) : (
           <section>
-            <SectionHeader tone="muted" label="Activity" count={eventRows.length} />
+            <SectionHeader tone="muted" label="Runs" count={eventRows.length} />
             <SortableTable<AutoflowEventRow>
               columns={EVENT_COLUMNS}
               rows={eventRows}
               rowKey={(e) => e.event_id}
-              initialSort={{ key: 'time', dir: 'desc' }}
+              rowHref={eventHref}
+              initialSort={{ key: 'started', dir: 'desc' }}
             />
             <div ref={eventsSentinelRef} className="py-2 text-center text-note text-ink-mute">
               {eventsLoading ? 'loading more…' : eventsHasMore ? 'scroll for more' : `— end of ${eventRows.length} —`}
