@@ -720,6 +720,16 @@ const AUTOFLOW_CONTEXT: AutoflowRunContext = {
       skipped_cycles: 0,
       failed_cycles: 0,
       worker_name: 'local',
+      events: [
+        {
+          kind: 'run_launched',
+          issue_ref: 'github:Section9Labs/rupu/issues/42',
+          issue_display_ref: 'acme/rupu#42',
+          workflow: 'issue-supervisor-dispatch',
+          run_id: 'run-old-1',
+          status: 'completed',
+        },
+      ],
     },
   ],
 };
@@ -751,8 +761,9 @@ describe('RunDetail — Autoflow panel', () => {
     // is derived from workspace_path.
     expect(panel).toHaveTextContent('local');
     expect(panel).toHaveTextContent('42');
-    // Prior cycle for the same entity.
-    expect(panel).toHaveTextContent('afc_ctx_old');
+    // The full cycle history moved to the Cycles TAB — the panel no longer
+    // duplicates the prior-cycle list (see the "Cycles tab" describe block).
+    expect(panel).not.toHaveTextContent('afc_ctx_old');
   });
 
   it('renders NO Autoflow panel for a plain (non-autoflow) run', async () => {
@@ -763,6 +774,50 @@ describe('RunDetail — Autoflow panel', () => {
 
     await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
     expect(screen.queryByTestId('autoflow-panel')).not.toBeInTheDocument();
+  });
+});
+
+// ---- Cycles tab -------------------------------------------------------------
+
+describe('RunDetail — Cycles tab', () => {
+  function stubApi() {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+  }
+
+  it('shows a Cycles tab for an autoflow run; clicking it renders the linked cycle table', async () => {
+    stubApi();
+    vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(AUTOFLOW_CONTEXT);
+
+    renderPage();
+
+    const cyclesTabBtn = await screen.findByRole('button', { name: 'Cycles' });
+    fireEvent.click(cyclesTabBtn);
+
+    const table = await screen.findByTestId('cycles-tab');
+    // Current cycle row (this run) — cycle id + "current" badge.
+    expect(table).toHaveTextContent('afc_ctx_new');
+    expect(table).toHaveTextContent('current');
+    // Prior cycle row — cycle id, its resolved workflow/run.
+    expect(table).toHaveTextContent('afc_ctx_old');
+    expect(table).toHaveTextContent('issue-supervisor-dispatch');
+
+    // The prior cycle's row (which carries a run_id via its event log) links
+    // to that run — the Run column shows the (truncated) run id.
+    const priorRunLink = screen.getByRole('link', { name: /run-old-/ });
+    expect(priorRunLink).toHaveAttribute('href', '/runs/run-old-1');
+  });
+
+  it('shows NO Cycles tab for a plain (non-autoflow) run', async () => {
+    stubApi();
+    vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(null);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Cycles' })).not.toBeInTheDocument();
   });
 });
 

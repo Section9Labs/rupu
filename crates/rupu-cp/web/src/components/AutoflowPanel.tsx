@@ -1,12 +1,16 @@
 // Autoflow panel — renders on RunDetail when the run was launched by the
 // autoflow worker (GET /api/runs/:id/autoflow returned a context, not null).
 // Surfaces the entity the run drove, the claim's lease/status, which cycle
-// launched it (+ prior cycles for the same entity), and which project/host
-// it ran on. Mirrors the "chrome" panel styling RunDetail already uses for
-// its persistent sections (bg-panel/border-border/rounded-xl/shadow-card).
+// launched it, and which project/host it ran on. Mirrors the "chrome" panel
+// styling RunDetail already uses for its persistent sections
+// (bg-panel/border-border/rounded-xl/shadow-card).
+//
+// The full cycle history (this cycle + prior cycles for the same entity)
+// lives in the Cycles TAB (components/run/CyclesTab.tsx) as a linked table,
+// not here — this panel stays a compact entity/claim/scope summary.
 
 import { Link } from 'react-router-dom';
-import type { AutoflowClaim, AutoflowPriorCycle, AutoflowRunContext } from '../lib/api';
+import type { AutoflowClaim, AutoflowRunContext } from '../lib/api';
 import { ScopeChip } from './ScopeChip';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
@@ -74,18 +78,6 @@ function EntityLink({ context, claim }: { context: AutoflowRunContext; claim: Au
   );
 }
 
-function PriorCycleRow({ cycle }: { cycle: AutoflowPriorCycle }) {
-  return (
-    <li className="flex items-center justify-between gap-2 py-1 text-note">
-      <span className="font-mono text-ink-dim">{shortId(cycle.cycle_id, 12)}</span>
-      <span className="text-ink-mute">{relativeTime(cycle.started_at)}</span>
-      <span className={cn('font-medium', cycle.failed_cycles > 0 ? 'text-err' : 'text-ink-mute')}>
-        {cycle.failed_cycles > 0 ? 'failed' : 'ok'}
-      </span>
-    </li>
-  );
-}
-
 /** Last path segment of a workspace path, for a compact project chip. */
 function projectLabel(workspacePath: string): string {
   const parts = workspacePath.split('/').filter(Boolean);
@@ -148,19 +140,6 @@ export default function AutoflowPanel({ context }: { context: AutoflowRunContext
           </div>
         </div>
       </div>
-
-      {context.prior_cycles.length > 0 && (
-        <div className="mt-3">
-          <div className="text-meta uppercase tracking-wide text-ink-mute">
-            Prior cycles for this entity
-          </div>
-          <ul className="mt-1 divide-y divide-border">
-            {context.prior_cycles.map((c) => (
-              <PriorCycleRow key={c.cycle_id} cycle={c} />
-            ))}
-          </ul>
-        </div>
-      )}
     </section>
   );
 }
