@@ -126,21 +126,25 @@ const DEFAULT_RECENT_EVENTS_LIMIT: usize = 200;
 /// best-effort "recent" page rather than a complete one.
 const MAX_RUNS_SCANNED: usize = 20;
 
-/// `GET /api/events?limit=<n>&before_ts=<unix-ms>` — recent events aggregated
-/// from recent runs' `events.jsonl`, returned newest-first and
-/// cursor-paginated. This is the "load history" counterpart to the live SSE
-/// firehose (`GET /api/events/stream`, no `?run=`/`?host=`): each row is the
-/// same JSON shape an SSE frame's `data:` payload carries (the tagged
-/// [`Event`], which already carries its own `run_id`), plus an injected `ts`
-/// (unix-ms) field so the frontend can sort/merge history rows and live SSE
-/// rows uniformly even though most `Event` variants carry no timestamp of
-/// their own.
+/// `GET /api/events?limit=<n>&before_ts=<unix-ms>&before_run=<id>&before_pos=<n>`
+/// — recent events aggregated from recent runs' `events.jsonl`, returned
+/// newest-first and cursor-paginated. This is the "load history" counterpart
+/// to the live SSE firehose (`GET /api/events/stream`, no `?run=`/`?host=`):
+/// each row is the same JSON shape an SSE frame's `data:` payload carries
+/// (the tagged [`Event`], which already carries its own `run_id`), plus an
+/// injected `ts` (unix-ms) and `pos` (0-based line index within that run's
+/// `events.jsonl`) field so the frontend can sort/merge/cursor history rows
+/// and live SSE rows uniformly even though most `Event` variants carry no
+/// timestamp of their own.
 ///
 /// No new persistent store: aggregates directly from disk, bounded by
 /// [`MAX_RUNS_SCANNED`] and by `limit` (see [`collect_recent_events`]).
-/// `?before_ts=` is a cursor — only events strictly older than it are
-/// returned, so a client can page backward through history without missing
-/// or repeating rows at the boundary.
+/// `?before_ts=` alone reproduces the legacy strictly-less-than-`ts` filter,
+/// which under-returns when many events share one run's fallback `ts` (see
+/// [`EventsCursor`]); the frontend always additionally sends `?before_run=`
+/// and `?before_pos=` (both present on every row this endpoint returns) so
+/// pagination resumes exactly at the last-returned event instead of at a
+/// `ts` boundary, and therefore never permanently skips same-`ts` siblings.
 async fn recent_events(
     State(s): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -151,10 +155,64 @@ async fn recent_events(
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_RECENT_EVENTS_LIMIT);
     let before_ts = params.get("before_ts").and_then(|v| v.parse::<i64>().ok());
+    let before_run = params.get("before_run").cloned();
+    let before_pos = params
+        .get("before_pos")
+        .and_then(|v| v.parse::<usize>().ok());
+    let cursor = EventsCursor::from_parts(before_ts, before_run, before_pos);
 
-    let rows = collect_recent_events(&s.run_store, limit, before_ts)
+    let rows = collect_recent_events(&s.run_store, limit, cursor)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(rows))
+}
+
+/// Pagination cursor for [`recent_events`] / [`collect_recent_events`].
+///
+/// step/unit `Event` variants carry no timestamp of their own (see
+/// [`event_own_ts_ms`]), so they all fall back to their run's single
+/// `events.jsonl` mtime — one shared `ts` for the *entire* run. A cursor
+/// keyed on `ts` alone (`TsOnly`) excludes every event at that shared `ts`
+/// once it's used as `before_ts`, not just the ones already returned, so a
+/// run emitting more events than one page permanently loses the rest.
+///
+/// `Compound` fixes this by keying on `(ts, run_id, pos)` — `pos` is each
+/// event's 0-based line index within its own run's file, which together
+/// with `run_id` totally orders even events that share an identical
+/// fallback `ts` (appends are chronological within one file, so a higher
+/// `pos` is a later event). Every row `GET /api/events` returns carries all
+/// three fields, so a client can always build the next page's `Compound`
+/// cursor from the last row of the current page.
+enum EventsCursor {
+    /// No cursor — return the newest page.
+    None,
+    /// Legacy/degrade form (`?before_ts=` with no `?before_run=`/`?before_pos=`).
+    /// Reproduces the pre-fix strictly-less-than-`ts` filter.
+    TsOnly(i64),
+    /// `(ts, run_id, pos)` of the last-returned row on the previous page.
+    Compound(i64, String, usize),
+}
+
+impl EventsCursor {
+    fn from_parts(ts: Option<i64>, run: Option<String>, pos: Option<usize>) -> Self {
+        match (ts, run, pos) {
+            (Some(ts), Some(run), Some(pos)) => Self::Compound(ts, run, pos),
+            (Some(ts), _, _) => Self::TsOnly(ts),
+            _ => Self::None,
+        }
+    }
+
+    /// Whether a candidate event with this `(ts, run_id, pos)` key comes
+    /// strictly after this cursor in the newest-first ordering (i.e. should
+    /// be included in the next page).
+    fn admits(&self, ts: i64, run_id: &str, pos: usize) -> bool {
+        match self {
+            Self::None => true,
+            Self::TsOnly(before_ts) => ts < *before_ts,
+            Self::Compound(before_ts, before_run, before_pos) => {
+                (ts, run_id, pos) < (*before_ts, before_run.as_str(), *before_pos)
+            }
+        }
+    }
 }
 
 /// The own timestamp (unix-ms) carried by the handful of [`Event`] variants
@@ -190,22 +248,23 @@ fn event_own_ts_ms(ev: &Event) -> Option<i64> {
 /// two runs' lifetimes overlap, so stopping on count alone can drop a
 /// genuinely-newer event in favor of an older one from a run that merely
 /// started later. The [`MAX_RUNS_SCANNED`] cap is therefore the sole bound;
-/// within that scanned window the final merge sorts newest-first by `ts`
-/// (breaking ties by each event's position within its own file — appends
-/// are chronological within one file, so a higher position is a later
-/// event) before truncating to `limit`.
+/// within that scanned window the final merge sorts newest-first by
+/// `(ts, run_id, pos)` (see [`EventsCursor`] for why `run_id` + `pos` are
+/// needed as tie-breakers, not `ts` alone) before truncating to `limit`.
 fn collect_recent_events(
     run_store: &RunStore,
     limit: usize,
-    before_ts: Option<i64>,
+    cursor: EventsCursor,
 ) -> Result<Vec<serde_json::Value>, RunStoreError> {
     let runs = run_store.list()?;
 
-    // (ts, in-file order, row). `order` only breaks ties between events that
-    // share a `ts` (most commonly: several fallback-mtime events from the
-    // same file) — appends are chronological within one file, so a higher
-    // `order` is a later (newer) event.
-    let mut candidates: Vec<(i64, usize, serde_json::Value)> = Vec::new();
+    // (ts, run_id, pos-within-file, row). `run_id` + `pos` break ties
+    // between events that share a `ts` (most commonly: every fallback-mtime
+    // event from one run's file, since it's the same file's single mtime) —
+    // appends are chronological within one file, so a higher `pos` is a
+    // later (newer) event; `run_id` only matters when two *different* runs'
+    // fallback `ts` happen to collide exactly.
+    let mut candidates: Vec<(i64, String, usize, serde_json::Value)> = Vec::new();
 
     for run in runs.iter().take(MAX_RUNS_SCANNED) {
         let path = run_store.events_path(&run.id);
@@ -219,7 +278,7 @@ fn collect_recent_events(
             .map(|d| d.as_millis() as i64)
             .unwrap_or_else(|| run.started_at.timestamp_millis());
 
-        for (order, line) in BufReader::new(file).lines().enumerate() {
+        for (pos, line) in BufReader::new(file).lines().enumerate() {
             let Ok(line) = line else { continue };
             if line.trim().is_empty() {
                 continue;
@@ -228,7 +287,7 @@ fn collect_recent_events(
                 continue;
             };
             let ts = event_own_ts_ms(&event).unwrap_or(fallback_ts);
-            if before_ts.is_some_and(|cursor| ts >= cursor) {
+            if !cursor.admits(ts, &run.id, pos) {
                 continue;
             }
             let Ok(mut row) = serde_json::to_value(&event) else {
@@ -236,21 +295,22 @@ fn collect_recent_events(
             };
             if let Some(obj) = row.as_object_mut() {
                 obj.insert("ts".to_string(), serde_json::json!(ts));
+                obj.insert("pos".to_string(), serde_json::json!(pos));
             }
-            candidates.push((ts, order, row));
+            candidates.push((ts, run.id.clone(), pos, row));
         }
     }
 
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2)));
     candidates.truncate(limit);
-    Ok(candidates.into_iter().map(|(_, _, row)| row).collect())
+    Ok(candidates.into_iter().map(|(_, _, _, row)| row).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{DateTime, TimeZone, Utc};
-    use rupu_orchestrator::runs::{RunRecord, RunStatus};
+    use rupu_orchestrator::runs::{RunRecord, RunStatus, StepKind};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -369,7 +429,7 @@ mod tests {
         let store = RunStore::new(tmp.path().join("runs"));
         let [_t0, _t1, t2, t3] = seed_two_runs_four_events(&store);
 
-        let rows = collect_recent_events(&store, 2, None).expect("collect");
+        let rows = collect_recent_events(&store, 2, EventsCursor::None).expect("collect");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["ts"], serde_json::json!(t3));
         assert_eq!(rows[0]["type"], "run_completed");
@@ -388,7 +448,7 @@ mod tests {
         // Cursor at t2 (run_a's RunCompleted): only events strictly older
         // than t2 should come back — t1 (run_b RunStarted) then t0 (run_a
         // RunStarted), newest-first.
-        let rows = collect_recent_events(&store, 100, Some(t2)).expect("collect");
+        let rows = collect_recent_events(&store, 100, EventsCursor::TsOnly(t2)).expect("collect");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["ts"], serde_json::json!(t1));
         assert_eq!(rows[0]["type"], "run_started");
@@ -403,7 +463,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = RunStore::new(tmp.path().join("runs"));
 
-        let rows = collect_recent_events(&store, 200, None).expect("collect");
+        let rows = collect_recent_events(&store, 200, EventsCursor::None).expect("collect");
         assert!(rows.is_empty());
     }
 
@@ -435,7 +495,7 @@ mod tests {
             );
         }
 
-        let rows = collect_recent_events(&store, 10_000, None).expect("collect");
+        let rows = collect_recent_events(&store, 10_000, EventsCursor::None).expect("collect");
         // Bounded to at most MAX_RUNS_SCANNED runs' worth of events (one
         // event per run here), never the full `total_runs`.
         assert_eq!(rows.len(), MAX_RUNS_SCANNED);
@@ -447,5 +507,69 @@ mod tests {
         // The most-recently-started run must be present.
         let newest_id = format!("run_{:03}", total_runs - 1);
         assert!(rows.iter().any(|r| r["run_id"] == newest_id.as_str()));
+    }
+
+    /// Regression test for the `before_ts` pagination gap: a single run
+    /// emitting more events than one page, every one of them a variant with
+    /// no own timestamp (`StepStarted`) — so [`event_own_ts_ms`] returns
+    /// `None` for all of them and they share one fallback `ts` (the run's
+    /// `events.jsonl` mtime). A `before_ts`-only cursor at that shared value
+    /// would exclude ALL of them once used, permanently stranding whatever
+    /// didn't fit on the first page. Paginating with the full
+    /// `(ts, run_id, pos)` `EventsCursor::Compound` cursor instead must
+    /// reach every event exactly once.
+    #[test]
+    fn recent_events_compound_cursor_reaches_every_event_at_a_shared_fallback_ts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        seed_run(&store, "run_big", ts(1_000));
+
+        let total_events = 23usize;
+        let events: Vec<Event> = (0..total_events)
+            .map(|i| Event::StepStarted {
+                run_id: "run_big".into(),
+                step_id: format!("step_{i:03}"),
+                kind: StepKind::Linear,
+                agent: None,
+                host: None,
+            })
+            .collect();
+        write_events(&store, "run_big", &events);
+
+        let limit = 5;
+        let mut seen_step_ids = std::collections::HashSet::new();
+        let mut cursor = EventsCursor::None;
+        let mut pages = 0;
+        loop {
+            let rows = collect_recent_events(&store, limit, cursor).expect("collect");
+            if rows.is_empty() {
+                break;
+            }
+            pages += 1;
+            assert!(
+                pages <= total_events,
+                "pagination did not terminate — likely stuck re-returning the same page"
+            );
+            assert!(rows.len() <= limit);
+            for row in &rows {
+                let step_id = row["step_id"].as_str().unwrap().to_string();
+                assert!(
+                    seen_step_ids.insert(step_id.clone()),
+                    "duplicate row for {step_id} across pages"
+                );
+            }
+            let last = rows.last().unwrap();
+            cursor = EventsCursor::Compound(
+                last["ts"].as_i64().unwrap(),
+                last["run_id"].as_str().unwrap().to_string(),
+                last["pos"].as_u64().unwrap() as usize,
+            );
+        }
+
+        assert_eq!(
+            seen_step_ids.len(),
+            total_events,
+            "every event sharing the fallback ts must eventually surface via 'load older', none permanently skipped"
+        );
     }
 }
