@@ -19,6 +19,7 @@ import {
   api,
   ApiError,
   isKnownRunEvent,
+  type AutoflowRunContext,
   type FindingsResponse,
   type RunEvent,
   type RunGraphResponse,
@@ -36,6 +37,7 @@ import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components
 import TranscriptPanel from '../components/TranscriptPanel';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
+import AutoflowPanel from '../components/AutoflowPanel';
 import { buildRunGraphModel, type GraphNode, type RunGraphModel } from '../lib/runGraphModel';
 import { layoutGraph, type Pos } from '../lib/graphLayout';
 import { absoluteTime } from '../lib/time';
@@ -135,6 +137,12 @@ export default function RunDetail() {
   const [findingsError, setFindingsError] = useState<string | null>(null);
   const findingsRequestedRef = useRef(false);
 
+  // Autoflow-history context — `null` means either "not fetched yet" or "this
+  // run has no autoflow trail" (a plain, non-autoflow run); either way no
+  // panel renders. Fetched independently of the graph/usage-timeline effects
+  // below so a slow/failed autoflow lookup never blocks the rest of the page.
+  const [autoflowCtx, setAutoflowCtx] = useState<AutoflowRunContext | null>(null);
+
   // Approval-gate local state. `gateDecision` reflects an optimistic local
   // decision (the live stream / next poll catches up); `gatePending` disables
   // the controls mid-request; `gateError` surfaces a failed approve/reject.
@@ -203,6 +211,7 @@ export default function RunDetail() {
     setFindings(null);
     setFindingsError(null);
     findingsRequestedRef.current = false;
+    setAutoflowCtx(null);
 
     fetchRunGraphWithRetry(id, () => cancelled, host)
       .then((res) => {
@@ -237,6 +246,29 @@ export default function RunDetail() {
       cancelled = true;
     };
   }, [id, host]);
+
+  // Autoflow-history context — independent of ?host= (the endpoint is
+  // global-history-only today; see api.ts's getRunAutoflow doc comment).
+  // Tolerates a 404/error the same way getRunAutoflow already does internally
+  // (resolves null): this is a signal, not a failure.
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    setAutoflowCtx(null);
+    api
+      .getRunAutoflow(id)
+      .then((ctx) => {
+        if (cancelled) return;
+        setAutoflowCtx(ctx);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setAutoflowCtx(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
 
   // Lazy-load this run's findings the first time the Findings tab is opened.
   // Keyed on (id, tab); the ref guard ensures a single fetch per run id.
@@ -870,6 +902,9 @@ export default function RunDetail() {
           </h2>
           <RunUsageTimeline series={series} separators />
         </section>
+
+        {/* Autoflow panel — only when this run has an autoflow-history trail. */}
+        {autoflowCtx && <AutoflowPanel context={autoflowCtx} />}
       </div>
 
       <div className="mt-4">

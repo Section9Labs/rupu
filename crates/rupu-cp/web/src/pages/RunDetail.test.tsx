@@ -14,12 +14,13 @@
 // include the host param.
 
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import {
   api,
   ApiError,
+  type AutoflowRunContext,
   type RunGraphResponse,
   type FindingsResponse,
 } from '../lib/api';
@@ -89,6 +90,14 @@ vi.mock('../components/charts/RunUsageTimeline', () => ({
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+});
+
+// Every test in this file exercises RunDetail, which now always fetches
+// GET /api/runs/:id/autoflow alongside the graph. Default it to "not an
+// autoflow run" (null → no panel) so the many pre-existing tests below don't
+// need to know about it; the dedicated Autoflow-panel tests re-stub it.
+beforeEach(() => {
+  vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(null);
 });
 
 // ---- Fixtures ------------------------------------------------------------
@@ -670,5 +679,138 @@ describe('RunDetail — remote host (?host=)', () => {
 
     await waitFor(() => expect(screen.getByText('remote-scan')).toBeInTheDocument());
     expect(screen.getByText('my-staging-host')).toBeInTheDocument();
+  });
+});
+
+// ---- Autoflow panel --------------------------------------------------------
+
+const AUTOFLOW_CONTEXT: AutoflowRunContext = {
+  repo_ref: 'github:Section9Labs/rupu',
+  issue_ref: 'github:Section9Labs/rupu/issues/42',
+  entity: '42',
+  workflow_name: 'issue-supervisor-dispatch',
+  status: 'completed',
+  failure: null,
+  cycle_id: 'afc_ctx_new',
+  workspace_path: '/home/matt/.rupu/autoflows/worktrees/rupu/42',
+  host_id: null,
+  claim: {
+    issue_ref: 'github:Section9Labs/rupu/issues/42',
+    issue_display_ref: 'acme/rupu#42',
+    repo_ref: 'github:Section9Labs/rupu',
+    issue_title: 'Flaky retry path',
+    issue_url: 'https://example.test/issues/42',
+    workflow: 'issue-supervisor-dispatch',
+    status: 'running',
+    last_run_id: 'run-1',
+    last_error: null,
+    last_summary: null,
+    pr_url: null,
+    claim_owner: 'worker-1',
+    lease_expires_at: '2026-07-08T00:00:00Z',
+    updated_at: '2026-07-07T00:00:00Z',
+  },
+  prior_cycles: [
+    {
+      cycle_id: 'afc_ctx_old',
+      mode: 'tick',
+      started_at: '2026-07-01T10:00:00Z',
+      finished_at: '2026-07-01T10:00:05Z',
+      ran_cycles: 1,
+      skipped_cycles: 0,
+      failed_cycles: 0,
+      worker_name: 'local',
+    },
+  ],
+};
+
+describe('RunDetail — Autoflow panel', () => {
+  function stubApi() {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+  }
+
+  it('renders the Autoflow panel (entity link, claim status, cycle, project/host) for an autoflow run', async () => {
+    stubApi();
+    vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(AUTOFLOW_CONTEXT);
+
+    renderPage();
+
+    const panel = await screen.findByTestId('autoflow-panel');
+    // Entity: linked issue ref + title from the claim.
+    const entityLink = screen.getByRole('link', { name: 'acme/rupu#42' });
+    expect(entityLink).toHaveAttribute('href', 'https://example.test/issues/42');
+    expect(panel).toHaveTextContent('Flaky retry path');
+    // Claim status.
+    expect(panel).toHaveTextContent('Running');
+    // Cycle id.
+    expect(panel).toHaveTextContent('afc_ctx_new');
+    // Project/host chips — host_id is null (local) and the project basename
+    // is derived from workspace_path.
+    expect(panel).toHaveTextContent('local');
+    expect(panel).toHaveTextContent('42');
+    // Prior cycle for the same entity.
+    expect(panel).toHaveTextContent('afc_ctx_old');
+  });
+
+  it('renders NO Autoflow panel for a plain (non-autoflow) run', async () => {
+    stubApi();
+    vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(null);
+
+    renderPage();
+
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    expect(screen.queryByTestId('autoflow-panel')).not.toBeInTheDocument();
+  });
+});
+
+// ---- Failed / unpersisted run ---------------------------------------------
+
+// Mirrors the shape `synthesize_unpersisted_run` + `unpersisted_run_dag`
+// produce server-side for an autoflow run that failed before ever writing
+// `run.json` (crates/rupu-cp/src/api/runs.rs / graph.rs): a single "run" step,
+// `status: "failed"`, and `error_message` carrying the failure detail.
+const FAILED_UNPERSISTED_GRAPH: RunGraphResponse = {
+  run: {
+    id: 'run_01KWYZ2QY4XYZ',
+    workflow_name: 'issue-supervisor-dispatch',
+    status: 'failed',
+    started_at: '2026-07-01T10:00:00Z',
+    finished_at: '2026-07-01T10:00:00Z',
+    error_message: '401 invalid x-api-key',
+  } as RunGraphResponse['run'],
+  workflow: { steps: [{ id: 'run', kind: 'step', agent: 'issue-supervisor-dispatch' }] },
+  step_results: [],
+  units: [],
+  usage: EMPTY_USAGE,
+};
+
+describe('RunDetail — failed / unpersisted run', () => {
+  it('shows the failure reason instead of crashing or spinning forever', async () => {
+    vi.spyOn(api, 'getRunGraph').mockResolvedValue(FAILED_UNPERSISTED_GRAPH);
+    vi.spyOn(api, 'getRunUsageTimeline').mockResolvedValue([]);
+    vi.spyOn(api, 'getFindings').mockResolvedValue(FINDINGS);
+    vi.spyOn(api, 'subscribeRunLog').mockImplementation(() => () => {});
+    // Also an autoflow-history hit (this IS the autoflow run that failed to
+    // dispatch) — but the panel isn't the point of this test, so keep it null
+    // to isolate the assertion to the failed-run chrome.
+    vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(null);
+
+    render(
+      <MemoryRouter initialEntries={['/runs/run_01KWYZ2QY4XYZ']}>
+        <Routes>
+          <Route path="/runs/:id" element={<RunDetailLoaded />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByText('issue-supervisor-dispatch')).toBeInTheDocument());
+    expect(screen.getByText('401 invalid x-api-key')).toBeInTheDocument();
+    // The graph still renders (single synthesized "run" node) rather than
+    // getting stuck on "Loading run…".
+    expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument();
+    expect(screen.queryByText('Loading run…')).not.toBeInTheDocument();
   });
 });
