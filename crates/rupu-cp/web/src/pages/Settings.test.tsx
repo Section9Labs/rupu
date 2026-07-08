@@ -10,6 +10,20 @@ import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/re
 import { MemoryRouter } from 'react-router-dom';
 import { api, ApiError, type ConfigView } from '../lib/api';
 
+// Mock CodeEditor to a controlled <textarea> — keeps the lazy CodeMirror
+// chunk out of this test, same approach as AgentDetail.test.tsx.
+vi.mock('../components/CodeEditor', () => ({
+  __esModule: true,
+  default: ({ value, onChange, ariaLabel }: { value: string; onChange: (v: string) => void; ariaLabel?: string }) => (
+    <textarea
+      data-testid="code-editor"
+      aria-label={ariaLabel}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+    />
+  ),
+}));
+
 import Settings from './Settings';
 
 // ---------------------------------------------------------------------------
@@ -270,9 +284,9 @@ describe('Settings page', () => {
     );
   });
 
-  // ── Raw TOML tab (T5) ────────────────────────────────────────────────────
+  // ── Raw TOML tab — single view + edit-mode (matches agent/workflow) ──────
 
-  it('Raw tab shows raw_global highlighted and in an editable textarea', async () => {
+  it('Raw tab shows raw_global as a read-only highlighted view with an Edit button, no textarea', async () => {
     vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
 
     render(
@@ -289,12 +303,59 @@ describe('Settings page', () => {
     expect(highlighted).not.toBeNull();
     expect(highlighted!.textContent).toContain(MOCK_CONFIG.raw_global);
 
-    // Separate editable textarea, seeded with the same text.
-    const editor = screen.getByLabelText(/edit raw toml/i) as HTMLTextAreaElement;
-    expect(editor.value).toBe(MOCK_CONFIG.raw_global);
+    // No editor visible until Edit is clicked.
+    expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
   });
 
-  it('editing the Raw tab and clicking Save posts { raw } to putGlobalConfig', async () => {
+  it('clicking Edit reveals the editor seeded with the saved raw, with Cancel + Save (disabled until changed)', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+
+    const editor = (await screen.findByTestId('code-editor')) as HTMLTextAreaElement;
+    expect(editor.value).toBe(MOCK_CONFIG.raw_global);
+
+    const saveBtn = screen.getByRole('button', { name: /^save$/i });
+    expect(saveBtn).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+
+    fireEvent.change(editor, { target: { value: `${MOCK_CONFIG.raw_global}\n` } });
+    expect(saveBtn).not.toBeDisabled();
+  });
+
+  it('Cancel discards the draft and returns to the read-only view', async () => {
+    vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <Settings />
+      </MemoryRouter>,
+    );
+
+    await screen.findByLabelText('Default model');
+    fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+
+    const editor = (await screen.findByTestId('code-editor')) as HTMLTextAreaElement;
+    fireEvent.change(editor, { target: { value: 'default_model = "claude-opus-4-6"\n' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
+    const highlighted = document.querySelector('code.hljs');
+    expect(highlighted!.textContent).toContain(MOCK_CONFIG.raw_global);
+  });
+
+  it('editing the Raw tab and clicking Save posts { raw } to putGlobalConfig and returns to view mode', async () => {
     vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
     const putSpy = vi.spyOn(api, 'putGlobalConfig').mockResolvedValue({ ok: true, restart_required: [] });
 
@@ -306,8 +367,9 @@ describe('Settings page', () => {
 
     await screen.findByLabelText('Default model');
     fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
 
-    const editor = screen.getByLabelText(/edit raw toml/i) as HTMLTextAreaElement;
+    const editor = (await screen.findByTestId('code-editor')) as HTMLTextAreaElement;
     const nextRaw = 'default_model = "claude-opus-4-6"\n';
     fireEvent.change(editor, { target: { value: nextRaw } });
 
@@ -315,9 +377,10 @@ describe('Settings page', () => {
 
     await waitFor(() => expect(putSpy).toHaveBeenCalledTimes(1));
     expect(putSpy.mock.calls[0][0]).toEqual({ raw: nextRaw });
+    await waitFor(() => expect(screen.queryByTestId('code-editor')).not.toBeInTheDocument());
   });
 
-  it('surfaces a 400 validation error inline in the raw editor', async () => {
+  it('surfaces a 400 validation error inline in the raw editor and stays in edit mode', async () => {
     vi.spyOn(api, 'getConfig').mockResolvedValue(MOCK_CONFIG);
     vi.spyOn(api, 'putGlobalConfig').mockRejectedValue(
       new ApiError(400, 'invalid TOML: expected an equals, found a newline at line 1 column 5'),
@@ -331,12 +394,15 @@ describe('Settings page', () => {
 
     await screen.findByLabelText('Default model');
     fireEvent.click(screen.getByRole('button', { name: 'Raw' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
 
-    const editor = screen.getByLabelText(/edit raw toml/i) as HTMLTextAreaElement;
+    const editor = (await screen.findByTestId('code-editor')) as HTMLTextAreaElement;
     fireEvent.change(editor, { target: { value: 'not valid toml =' } });
     fireEvent.click(screen.getByRole('button', { name: /^save$/i }));
 
     expect(await screen.findByText(/invalid toml/i)).toBeInTheDocument();
+    // Stays in edit mode so the operator can fix it.
+    expect(screen.getByTestId('code-editor')).toBeInTheDocument();
   });
 
   // ── Policy tab (T5) ──────────────────────────────────────────────────────

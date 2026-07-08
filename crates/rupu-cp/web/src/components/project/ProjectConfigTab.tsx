@@ -17,7 +17,7 @@
 //  - The Raw tab edits `raw_project` (this workspace's own file), not the
 //    merged/global text.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Cpu, DollarSign, FileCode, GitBranch, Server, SlidersHorizontal, Workflow } from 'lucide-react';
 import { api, ApiError, type ConfigView } from '../../lib/api';
 import { TabBar, TabButton } from '../TabBar';
@@ -36,22 +36,18 @@ export default function ProjectConfigTab({ wsId }: { wsId: string }) {
   const [readOnly, setReadOnly] = useState(false);
   const [tab, setTab] = useState<ProjectConfigSubTab>('general');
 
-  // ── Raw TOML tab state — mirrors Settings' baseline-tracking so an
-  // unrelated form-tab Save doesn't clobber an in-flight, unsaved Raw edit.
-  const [rawDraft, setRawDraft] = useState('');
+  // ── Raw TOML tab state ──────────────────────────────────────────────────
+  // The draft itself lives inside `RawTab` (self-contained edit-mode), seeded
+  // from `configView.raw_project` only when the operator clicks Edit — so an
+  // unrelated reload (e.g. a form-tab Save) can't clobber an in-flight edit.
   const [rawSaving, setRawSaving] = useState(false);
   const [rawError, setRawError] = useState<string | null>(null);
-  const rawBaselineRef = useRef('');
 
   function reload(): Promise<void> {
     return api
       .getConfig(wsId)
       .then((data) => {
         setConfigView(data);
-        const prevRawBaseline = rawBaselineRef.current;
-        const nextRaw = data.raw_project ?? '';
-        setRawDraft((prevDraft) => (prevDraft === prevRawBaseline ? nextRaw : prevDraft));
-        rawBaselineRef.current = nextRaw;
         setLoadError(null);
       })
       .catch((e: unknown) => {
@@ -131,12 +127,12 @@ export default function ProjectConfigTab({ wsId }: { wsId: string }) {
     }
   }
 
-  async function handleRawSave() {
+  async function handleRawSave(draft: string) {
     setRawSaving(true);
     setRawError(null);
     setReadOnly(false);
     try {
-      await api.putProjectConfig(wsId, { raw: rawDraft });
+      await api.putProjectConfig(wsId, { raw: draft });
       await reload();
     } catch (e: unknown) {
       if (e instanceof ApiError && e.status === 501) {
@@ -144,6 +140,7 @@ export default function ProjectConfigTab({ wsId }: { wsId: string }) {
       } else {
         setRawError(e instanceof Error ? e.message : 'Failed to save raw project config');
       }
+      throw e;
     } finally {
       setRawSaving(false);
     }
@@ -278,11 +275,9 @@ export default function ProjectConfigTab({ wsId }: { wsId: string }) {
               </>
             }
             savedRaw={configView.raw_project ?? ''}
-            draft={rawDraft}
-            onChangeDraft={setRawDraft}
-            onSave={() => void handleRawSave()}
+            onSave={handleRawSave}
             saving={rawSaving}
-            error={rawError}
+            saveError={rawError}
             emptyPlaceholder="# empty — no project config.toml written yet\n"
           />
         )}

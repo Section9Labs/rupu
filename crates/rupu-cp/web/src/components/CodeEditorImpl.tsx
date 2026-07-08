@@ -56,8 +56,14 @@ const CONTAINER_CLASS =
   'overflow-hidden rounded-xl border border-border bg-panel font-mono text-ui ' +
   'leading-relaxed shadow-card focus-within:border-brand-500';
 
-function languageExtension(language: 'markdown' | 'yaml'): Extension {
-  return language === 'yaml' ? yaml() : markdown();
+// No dedicated `@codemirror/lang-toml` package is a workspace dependency, so
+// `toml` gets no syntax-highlighting extension — it still edits as plain
+// text (matching `CodeHighlight`'s `ini`-grammar-as-toml-substitute approach
+// would require pulling in a new dependency, which this change avoids).
+function languageExtension(language: 'markdown' | 'yaml' | 'toml'): Extension[] {
+  if (language === 'yaml') return [yaml()];
+  if (language === 'toml') return [];
+  return [markdown()];
 }
 
 // A small editor theme on top of the syntax highlight style (which supplies the
@@ -162,7 +168,7 @@ export default function CodeEditorImpl({
       doc: value,
       extensions: [
         ...baseExtensions(mode),
-        languageExtension(language),
+        ...languageExtension(language),
         updateListener,
       ],
     });

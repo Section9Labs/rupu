@@ -12,13 +12,14 @@
 // never editable from this form.
 //
 // Three more tabs round out the page:
-//  - Raw: the global `config.toml` shown highlighted (read-only reference)
-//    plus an editable textarea seeded from `raw_global`. Save posts the full
-//    text as `{ raw }` to `PUT /api/config/global`, which validates against
-//    the typed schema before writing anything — there is no separate
-//    non-persisting "validate" endpoint on the backend, so Save both
+//  - Raw: the global `config.toml` shown highlighted, read-only, until Edit is
+//    clicked (same single-view + edit-mode pattern as the agent/workflow
+//    Definition views) — an editable draft seeded from `raw_global`. Save
+//    posts the full text as `{ raw }` to `PUT /api/config/global`, which
+//    validates against the typed schema before writing anything — there is no
+//    separate non-persisting "validate" endpoint on the backend, so Save both
 //    validates and persists in one step; a 400 renders the server's message
-//    inline next to the editor.
+//    inline and keeps the tab in edit mode.
 //  - Policy: a consolidated view of every dotted key with known provenance,
 //    each with a lock checkbox seeded from `provenance[key].locked`. Edits
 //    are staged locally and committed together via a Save button that PUTs
@@ -245,15 +246,12 @@ export default function Settings() {
   const [tab, setTab] = useState<SettingsTab>('general');
 
   // ── Raw TOML tab state ──────────────────────────────────────────────────
-  // `rawBaselineRef` tracks the last raw text known from the server. On
-  // reload, the draft is only replaced with the fresh `raw_global` when it
-  // still matches that baseline (i.e. the user has no in-flight, unsaved
-  // edit) — otherwise an unrelated Save (e.g. a form-tab patch, which also
-  // rewrites the file) would silently clobber the Raw tab's draft.
-  const [rawDraft, setRawDraft] = useState('');
+  // The draft itself lives inside `RawTab` (self-contained edit-mode, like
+  // AgentDetail) and is only seeded from `configView.raw_global` when the
+  // operator clicks Edit — so an unrelated reload (e.g. a form-tab Save,
+  // which also rewrites the file) can't clobber an in-flight, unsaved edit.
   const [rawSaving, setRawSaving] = useState(false);
   const [rawError, setRawError] = useState<string | null>(null);
-  const rawBaselineRef = useRef('');
 
   // ── Policy tab state ────────────────────────────────────────────────────
   // `null` means "no staged edits yet" — the checkboxes mirror `lockList`
@@ -272,13 +270,6 @@ export default function Settings() {
         const locks = getPath(data.effective, 'policy.lock');
         const nextLocks = Array.isArray(locks) ? locks.filter((l): l is string => typeof l === 'string') : [];
         setLockList(nextLocks);
-        // Capture the OLD baseline before overwriting the ref below — the
-        // functional updaters run later (React's render phase), by which
-        // point the ref would already hold the NEW value if reassigned first,
-        // making the "still in sync" comparison always false.
-        const prevRawBaseline = rawBaselineRef.current;
-        setRawDraft((prevDraft) => (prevDraft === prevRawBaseline ? data.raw_global : prevDraft));
-        rawBaselineRef.current = data.raw_global;
         // Only clear staged Policy-tab edits when they're still in sync with
         // the previously-known lock list — an unrelated reload (e.g. a
         // General-tab Save, which rewrites the same file) must not discard an
@@ -372,12 +363,12 @@ export default function Settings() {
     }
   }
 
-  async function handleRawSave() {
+  async function handleRawSave(draft: string) {
     setRawSaving(true);
     setRawError(null);
     setReadOnly(false);
     try {
-      await api.putGlobalConfig({ raw: rawDraft });
+      await api.putGlobalConfig({ raw: draft });
       await reload();
     } catch (e: unknown) {
       if (e instanceof ApiError && e.status === 501) {
@@ -385,6 +376,7 @@ export default function Settings() {
       } else {
         setRawError(e instanceof Error ? e.message : 'Failed to save raw config');
       }
+      throw e;
     } finally {
       setRawSaving(false);
     }
@@ -562,11 +554,9 @@ export default function Settings() {
               </>
             }
             savedRaw={configView.raw_global}
-            draft={rawDraft}
-            onChangeDraft={setRawDraft}
-            onSave={() => void handleRawSave()}
+            onSave={handleRawSave}
             saving={rawSaving}
-            error={rawError}
+            saveError={rawError}
             emptyPlaceholder="# empty — no global config.toml written yet\n"
           />
         )}

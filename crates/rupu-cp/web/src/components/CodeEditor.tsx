@@ -13,7 +13,7 @@ import { ThemeContext, type Mode } from './theme/ThemeProvider';
 export interface CodeEditorProps {
   value: string;
   onChange: (v: string) => void;
-  language?: 'markdown' | 'yaml';
+  language?: 'markdown' | 'yaml' | 'toml';
   ariaLabel?: string;
   /** Resolved theme mode — injected by the wrapper so the imperative CodeMirror
    *  view picks the matching highlight + editor theme and reconfigures on toggle. */
