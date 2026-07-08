@@ -24,7 +24,7 @@ export type NavLeaf = {
 
 // String-literal union — keeps group ids type-safe and distinct from
 // any NavLeaf.to (the latter are paths starting with `/`).
-export type GroupID = 'runs' | 'observe' | 'build' | 'fleet';
+export type GroupID = 'runs' | 'observe' | 'security' | 'build' | 'fleet';
 
 // One nav-group renders as a collapsible section header followed by
 // its `items`.
@@ -56,8 +56,12 @@ export const sidebarNav: NavSection[] = [
   { kind: 'group', group: {
     id: 'observe', label: 'Observe', items: [
       { to: '/events',   label: 'Live Events', icon: Radio,       enabled: true },
-      { to: '/coverage', label: 'Coverage',    icon: ShieldCheck, enabled: true },
-      { to: '/findings', label: 'Findings',    icon: ShieldAlert, enabled: true },
+    ],
+  }},
+  { kind: 'group', group: {
+    id: 'security', label: 'Security', items: [
+      { to: '/coverage', label: 'Coverage', icon: ShieldCheck, enabled: true },
+      { to: '/findings', label: 'Findings', icon: ShieldAlert, enabled: true },
     ],
   }},
   { kind: 'group', group: {
