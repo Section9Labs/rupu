@@ -520,6 +520,13 @@ export interface AutoflowDefRow {
   scope: string;
 }
 
+/** Response from `POST /api/autoflows/:name/enable` and `.../disable` —
+ *  mirrors `SetEnabledResponse` in `rupu-cp/src/api/autoflows.rs`. */
+export interface SetAutoflowEnabledResponse {
+  name: string;
+  enabled: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard
 // ---------------------------------------------------------------------------
@@ -1342,6 +1349,18 @@ export const api = {
   },
   getAutoflowDefs(): Promise<AutoflowDefRow[]> {
     return request<AutoflowDefRow[]>('/api/autoflows');
+  },
+  /**
+   * Enable or disable an autoflow — writes `autoflow.enabled` to the on-disk
+   * workflow YAML. Throws `ApiError` (501) when this deploy has no launcher
+   * (`rupu cp serve` not running), or (404) when `name` doesn't resolve to a
+   * known autoflow. Resolves to the updated `{ name, enabled }` state.
+   */
+  setAutoflowEnabled(name: string, enabled: boolean): Promise<SetAutoflowEnabledResponse> {
+    return request<SetAutoflowEnabledResponse>(
+      `/api/autoflows/${encodeURIComponent(name)}/${enabled ? 'enable' : 'disable'}`,
+      { method: 'POST' },
+    );
   },
 
   // --- Agents ---
