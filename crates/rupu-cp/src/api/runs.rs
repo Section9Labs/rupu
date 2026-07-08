@@ -725,15 +725,25 @@ async fn get_run_from_host(s: &AppState, host_id: &str, id: &str) -> ApiResult<s
 /// silently defaulting — the point is to surface the failure, not pretend a
 /// real run executed. Shared by `get_run` and `run_graph` so both
 /// endpoints' `"run"` key stays byte-for-byte the same shape.
+///
+/// `error_message` is only populated for a terminal-failure `status`
+/// (`Failed`) — a synthesized `Running`/`AwaitingApproval` record has no
+/// failure yet, so showing one would misrepresent an in-flight/awaiting run
+/// as broken.
+///
+/// `issue_ref` is the resolver's full stable ref (e.g.
+/// `github:owner/repo/issues/42`, from [`super::run_resolve::RunLocation::Unpersisted`]'s
+/// `issue_ref` field) — not the bare display number.
 pub(crate) fn synthesize_unpersisted_run(
     id: &str,
     cycle_id: &str,
     status: RunStatus,
     failure: &str,
     workflow_name: &str,
-    entity: Option<&str>,
+    issue_ref: Option<&str>,
 ) -> serde_json::Value {
     let now = chrono::Utc::now();
+    let error_message = matches!(status, RunStatus::Failed).then(|| failure.to_string());
     let record = RunRecord {
         id: id.to_string(),
         workflow_name: workflow_name.to_string(),
@@ -745,12 +755,12 @@ pub(crate) fn synthesize_unpersisted_run(
         transcript_dir: PathBuf::new(),
         started_at: now,
         finished_at: Some(now),
-        error_message: Some(failure.to_string()),
+        error_message,
         awaiting_step_id: None,
         approval_prompt: None,
         awaiting_since: None,
         expires_at: None,
-        issue_ref: entity.map(str::to_string),
+        issue_ref: issue_ref.map(str::to_string),
         issue: None,
         parent_run_id: None,
         backend_id: None,
@@ -810,7 +820,8 @@ async fn get_run(
             status,
             failure,
             workflow_name,
-            entity,
+            issue_ref,
+            ..
         } => {
             let run = synthesize_unpersisted_run(
                 &id,
@@ -818,7 +829,7 @@ async fn get_run(
                 status,
                 &failure,
                 &workflow_name,
-                entity.as_deref(),
+                issue_ref.as_deref(),
             );
             Ok(Json(serde_json::json!({
                 "run": run,
@@ -1931,6 +1942,48 @@ mod tests {
         assert_eq!(
             body["run"]["cycle_id"],
             serde_json::json!("afc_unpersisted")
+        );
+        assert_eq!(
+            body["run"]["issue_ref"],
+            serde_json::json!("github:Section9Labs/rupu/issues/42"),
+            "the synthesized record's issue_ref must be the resolver's full \
+             stable ref, not the bare display number"
+        );
+    }
+
+    /// FIX 2: a synthesized run whose status is NOT a terminal failure (here
+    /// `running`, from an `AutoflowClaimRecord`/history status that hasn't
+    /// failed) must not carry an `error_message` — showing one would
+    /// misrepresent an in-flight run as broken.
+    #[tokio::test]
+    async fn get_run_unpersisted_running_has_no_error_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+        write_cycle_with_run(
+            &tmp,
+            "2026-07-01",
+            "afc_running",
+            "run_still_running",
+            "running",
+            "github:Section9Labs/rupu/issues/42",
+            "issue-supervisor-dispatch",
+            None,
+            None,
+        );
+
+        let resp = get_run(
+            State(s),
+            Path("run_still_running".into()),
+            Query(RunDetailQuery { host: None }),
+        )
+        .await
+        .expect("unpersisted running autoflow run should synthesize a record, not 404");
+
+        let body = resp.0;
+        assert_eq!(body["run"]["status"], serde_json::json!("running"));
+        assert!(
+            body["run"]["error_message"].is_null(),
+            "a synthesized non-failed record must not carry a failure message: {body:?}"
         );
     }
 

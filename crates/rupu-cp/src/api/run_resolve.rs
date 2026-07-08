@@ -46,12 +46,16 @@
 //! Open Questions).
 
 use crate::{api::repo_scope::distinct_repo_workspaces, state::AppState};
-use rupu_orchestrator::{runs::RunStore, RunStatus};
+use rupu_orchestrator::{
+    runs::{RunStore, RunStoreError},
+    RunStatus,
+};
 use rupu_runtime::{
     AutoflowCycleEvent, AutoflowCycleEventKind, AutoflowCycleRecord, AutoflowHistoryEventRecord,
 };
 use rupu_workspace::{AutoflowClaimRecord, AutoflowClaimStore, RepoRegistryStore, WorkspaceStore};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -76,6 +80,13 @@ pub enum RunLocation {
         failure: String,
         workflow_name: String,
         entity: Option<String>,
+        /// The full stable issue ref (e.g. `github:owner/repo/issues/42`),
+        /// straight from [`AutoflowRunContext::issue_ref`] — distinct from
+        /// `entity`, which is often just a bare display number like `"42"`.
+        /// Callers should thread this into the synthesized `RunRecord`'s
+        /// `issue_ref` field rather than `entity` (see
+        /// `synthesize_unpersisted_run` in `api::runs`).
+        issue_ref: Option<String>,
     },
     /// Global + every project-local store + autoflow history + every
     /// registered host all missed.
@@ -113,13 +124,78 @@ pub struct AutoflowRunContext {
 
 // ── Resolver ───────────────────────────────────────────────────────────────
 
+/// How long a resolved [`RunLocation`] is reused for the same `run_id`
+/// without re-resolving. A single RunDetail page load hits ~4 resolving
+/// endpoints (`get_run`, `run_graph`, the log tail, the usage timeline) in
+/// quick succession; without this, each one independently walks the global
+/// store, every project-local store, autoflow history, and (worst case) the
+/// host-probe fallback for the same run. A short TTL collapses that to one
+/// resolution per page load while staying well clear of "a newly-appearing
+/// run stays hidden" territory — `NotFound` is cached too (so a rapid
+/// double-click on a bad id doesn't re-probe), but only for this same short
+/// window.
+const RUN_LOCATION_CACHE_TTL: Duration = Duration::from_secs(8);
+
+/// Bound on the host-probe fallback's per-host HTTP call. Deliberately much
+/// shorter than an explicit `?host=<id>` request (which keeps the default,
+/// effectively-unbounded `reqwest::Client` — a caller who names a host
+/// explicitly may accept a longer wait): this path fires at *every*
+/// registered host speculatively, so a single unreachable one must fail fast
+/// rather than stalling on the OS's TCP connect timeout (which can be
+/// minutes).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Resolve where `run_id`'s artifacts live. See the module doc for the full
 /// order + rationale. Async because the bounded host-probe fallback makes
 /// real network calls (`HostConnector::proxy_get_json`); every other step is
 /// pure filesystem I/O.
+///
+/// Memoized per `run_id` for [`RUN_LOCATION_CACHE_TTL`] — see that constant's
+/// doc for why.
 pub async fn resolve_run_location(s: &AppState, run_id: &str) -> RunLocation {
-    if s.run_store.load(run_id).is_ok() {
-        return RunLocation::Global;
+    if let Some(loc) = cached_run_location(s, run_id) {
+        return loc;
+    }
+
+    let loc = resolve_run_location_uncached(s, run_id).await;
+    cache_run_location(s, run_id, loc.clone());
+    loc
+}
+
+/// Look up a still-fresh cached resolution for `run_id`, if any.
+fn cached_run_location(s: &AppState, run_id: &str) -> Option<RunLocation> {
+    let guard = s.run_location_cache.lock().unwrap();
+    let (at, loc) = guard.get(run_id)?;
+    if at.elapsed() < RUN_LOCATION_CACHE_TTL {
+        Some(loc.clone())
+    } else {
+        None
+    }
+}
+
+/// Cache `loc` for `run_id`, opportunistically dropping expired entries so
+/// the map doesn't grow unbounded across the process lifetime.
+fn cache_run_location(s: &AppState, run_id: &str, loc: RunLocation) {
+    let mut guard = s.run_location_cache.lock().unwrap();
+    let now = Instant::now();
+    guard.retain(|_, (at, _)| now.duration_since(*at) < RUN_LOCATION_CACHE_TTL);
+    guard.insert(run_id.to_string(), (now, loc));
+}
+
+/// The uncached resolution walk — see [`resolve_run_location`] for the
+/// memoization wrapper and the module doc for the full order + rationale.
+async fn resolve_run_location_uncached(s: &AppState, run_id: &str) -> RunLocation {
+    match s.run_store.load(run_id) {
+        Ok(_) => return RunLocation::Global,
+        // Not in the global store: keep resolving elsewhere (project-local,
+        // autoflow history, host probe).
+        Err(RunStoreError::NotFound(_)) => {}
+        // A *global* `run.json` exists but is corrupt/unparseable (or some
+        // other non-NotFound store error). Don't silently fall through to
+        // the probe-then-404 path — that would swallow a real 500. Report
+        // `Global` so the caller re-loads via the same store and surfaces
+        // the actual error (see `run_not_found_or_internal`).
+        Err(_) => return RunLocation::Global,
     }
 
     if let Some(path) = find_project_local(s, run_id) {
@@ -138,6 +214,7 @@ pub async fn resolve_run_location(s: &AppState, run_id: &str) -> RunLocation {
                 .unwrap_or_else(|| "autoflow run failed; no failure detail recorded".to_string()),
             workflow_name: ctx.workflow_name,
             entity: ctx.entity,
+            issue_ref: ctx.issue_ref,
         };
     }
 
@@ -181,12 +258,17 @@ fn find_project_local(s: &AppState, run_id: &str) -> Option<PathBuf> {
 /// *registered* host (never unbounded — bounded by whatever `rupu host add`
 /// produced) and take the first hit. `"local"` is skipped: the global +
 /// project-local checks above already cover this machine.
+///
+/// Each probe uses [`HostRegistry::resolve_for_probe`] rather than the
+/// normal (cached) [`HostRegistry::resolve`] — a registered-but-unreachable
+/// host must fail fast (bounded by [`PROBE_TIMEOUT`]) here, without changing
+/// the timeout behavior of the connector an explicit `?host=` request uses.
 async fn probe_hosts(s: &AppState, run_id: &str) -> Option<String> {
     for host in s.hosts.list_hosts() {
         if host.id == "local" {
             continue;
         }
-        let Ok(conn) = s.hosts.resolve(&host.id) else {
+        let Ok(conn) = s.hosts.resolve_for_probe(&host.id, PROBE_TIMEOUT) else {
             continue;
         };
         if conn
@@ -616,12 +698,17 @@ mod tests {
                 failure,
                 workflow_name,
                 entity,
+                issue_ref,
             } => {
                 assert_eq!(cycle_id, "afc_001");
                 assert_eq!(status, RunStatus::Failed);
                 assert_eq!(failure, "401 invalid x-api-key");
                 assert_eq!(workflow_name, "issue-supervisor-dispatch");
                 assert_eq!(entity.as_deref(), Some("42"));
+                assert_eq!(
+                    issue_ref.as_deref(),
+                    Some("github:Section9Labs/rupu/issues/42")
+                );
             }
             other => panic!("expected Unpersisted, got {other:?}"),
         }
@@ -738,6 +825,121 @@ mod tests {
 
         let loc = resolve_run_location(&s, "run_does_not_exist").await;
         assert_eq!(loc, RunLocation::NotFound);
+    }
+
+    // ── FIX 1: bounded + memoized host-probe ───────────────────────────
+
+    /// A registered-but-unreachable `HttpCp` host must not stall
+    /// `resolve_run_location` — the probe's own bounded client (not a
+    /// connection refusal) has to be what ends the call. Simulate
+    /// "unreachable" with a TCP listener that accepts the connection but
+    /// never writes a response, so only `PROBE_TIMEOUT` can end it.
+    #[tokio::test]
+    async fn probe_hosts_bounded_timeout_prevents_stalling_on_unreachable_host() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                drop(stream);
+            }
+        });
+
+        let host_store = rupu_workspace::HostStore {
+            root: tmp.path().join("hosts"),
+        };
+        host_store
+            .save(&rupu_workspace::Host {
+                id: "host_hangs".into(),
+                name: "hangs".into(),
+                transport: rupu_workspace::HostTransport::HttpCp {
+                    base_url: format!("http://{addr}"),
+                },
+                token_hash: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: None,
+            })
+            .unwrap();
+        let local = crate::host::local::LocalHostConnector::new(
+            None,
+            None,
+            None,
+            None,
+            std::sync::Arc::clone(&s.run_store),
+            tmp.path().to_path_buf(),
+        );
+        let registry = std::sync::Arc::new(crate::host::registry::HostRegistry::new(
+            host_store,
+            std::sync::Arc::new(local),
+        ));
+        let s = s.with_hosts(registry);
+
+        let start = std::time::Instant::now();
+        let loc = resolve_run_location(&s, "run_never_exists_anywhere").await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(loc, RunLocation::NotFound);
+        // Bound generously above `PROBE_TIMEOUT` itself (reqwest can retry
+        // once internally on a timed-out idle connection, roughly doubling
+        // wall time in practice) but still far under the listener's 30s
+        // hang and *nowhere near* the OS default TCP connect timeout (tens
+        // of seconds to minutes) an unbounded client would be subject to.
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "resolve_run_location took {elapsed:?}; expected the bounded probe (~{PROBE_TIMEOUT:?}) to fail fast rather than stall"
+        );
+    }
+
+    /// A second `resolve_run_location` call for the same `run_id` within the
+    /// cache TTL must reuse the first resolution rather than re-walking
+    /// storage (and, worst case, re-probing every registered host). Prove
+    /// it by making the *ground truth* change between calls: if the second
+    /// call re-resolved, it would see the newly-created global run and
+    /// return `Global` instead of the cached `NotFound`.
+    #[tokio::test]
+    async fn cached_resolution_is_reused_within_ttl_not_re_resolved() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let first = resolve_run_location(&s, "run_cache_me").await;
+        assert_eq!(first, RunLocation::NotFound);
+
+        s.run_store
+            .create(
+                run_record("run_cache_me", "wf", RunStatus::Completed),
+                "name: wf\nsteps: []\n",
+            )
+            .unwrap();
+
+        let second = resolve_run_location(&s, "run_cache_me").await;
+        assert_eq!(
+            second,
+            RunLocation::NotFound,
+            "expected the memoized NotFound to be reused instead of re-resolving"
+        );
+    }
+
+    // ── FIX 4: corrupt global run.json must not silently 404 ───────────
+
+    #[tokio::test]
+    async fn corrupt_global_run_json_surfaces_as_global_not_silent_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = test_state(&tmp);
+
+        let run_dir = tmp.path().join("runs").join("run_corrupt");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("run.json"), b"{ not valid json").unwrap();
+
+        let loc = resolve_run_location(&s, "run_corrupt").await;
+        assert_eq!(
+            loc,
+            RunLocation::Global,
+            "a corrupt global run.json must resolve to Global so the endpoint \
+             re-loads it and surfaces the real parse error, not a misleading 404"
+        );
     }
 
     // ── autoflow_run_context / entity_cycles ───────────────────────────

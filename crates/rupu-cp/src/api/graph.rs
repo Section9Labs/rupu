@@ -142,7 +142,8 @@ async fn run_graph(
             status,
             failure,
             workflow_name,
-            entity,
+            issue_ref,
+            ..
         } => {
             let run = synthesize_unpersisted_run(
                 &id,
@@ -150,7 +151,7 @@ async fn run_graph(
                 status,
                 &failure,
                 &workflow_name,
-                entity.as_deref(),
+                issue_ref.as_deref(),
             );
             let dag = unpersisted_run_dag(&workflow_name);
             Ok(Json(serde_json::json!({
